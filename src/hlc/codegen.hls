@@ -704,6 +704,28 @@ fn call_result_fresh(ctx: Ctx, e: int) -> bool {
     || name == "net_tls_get" {
         return true
     }
+    # Stage 125 (v0.143.0-alpha): the fresh-str/fresh-list builtins the
+    # balance instrument caught missing from this table. Each returns a
+    # refcnt=1 object straight from the C runtime (hl_str_join since
+    # Stage 19; sys_hostname/read_line/proc_child_read since the
+    # process-IO stages; env_get/cwd_get since Stage 48; fs_read_dir
+    # since Stage 36) — but the table's default said BORROWED, so every
+    # binding of their result was emitted as `hl_retain(<fresh>)`, the
+    # cleanup released only the extra retain, and the underlying object
+    # leaked: two mallocs per str (struct + data), more for a list.
+    # The GC-ed interpreter cannot see native-only leaks and the
+    # differential suite compares output, not memory — so every native
+    # program that called join (80+ call sites across the stdlib: url,
+    # log, io, session, sse, json, ...), env_get, cwd_get, read_line,
+    # fs_read_dir, sys_hostname or proc_child_read in a loop has been
+    # leaking since the day the builtin shipped. Found by hls-rss, the
+    # Stage 125 RSS-stability verifier, on its first stdlib workload;
+    # its acceptance gate pins the balance for every one of these.
+    if name == "join" || name == "sys_hostname" || name == "read_line"
+    || name == "proc_child_read" || name == "env_get" || name == "cwd_get"
+    || name == "fs_read_dir" {
+        return true
+    }
     if name == "range" || name == "chr" {
         return true
     }
@@ -1105,22 +1127,59 @@ fn method_arg_borrowed(op: str, i: int) -> bool {
 # ctx.out for statement-level hoists, or a match arm's local block
 # for arm-local hoists (pattern bindings only exist there).
 fn hoist_all(ctx: Ctx, dst: list[str], ind: str) -> void {
+    # Stage 125 (v0.143.0-alpha): TWO PHASES — name first, generate
+    # second. The single-phase loop (generate node, then set its
+    # name) had a cycle in it: gen_expr of a hoisted MATCH (or a
+    # &&/|| right operand, or a qmark) runs a NESTED hoist_all, which
+    # walked the same map and found the OUTER pass's still-unnamed
+    # keys — including the very node being materialised and its
+    # siblings — and regenerated them; gen_expr of those fell through
+    # the "reserved but unnamed" case and regenerated the match
+    # again, closing an infinite mutual recursion. A `match` inside a
+    # concat inside a call argument (`println("k " + match e {...})`)
+    # segfaulted the native compiler (C stack exhausted) and panicked
+    # the interpreter (recursion too deep) — a pre-existing bug the
+    # Stage 125 suite run tripped over through the Stage 121 corpus
+    # fixture. Naming every reserved node BEFORE any gen_expr runs
+    # breaks the cycle structurally: a nested pass finds non-empty
+    # names, renders the temps, regenerates nothing.
+    #
+    # Phase 1 names the keys reserved by THIS pass (snapshot first —
+    # a nested pass during phase 2 may reserve and name its own, and
+    # emits those declarations itself into its own dst; the `mine`
+    # list keeps this pass from double-declaring them). Keys already
+    # named (an enclosing pass, or an earlier statement's leftovers)
+    # and keys IN FLIGHT (an enclosing pass is materialising them —
+    # their declarations are already ordered above us) are left
+    # alone.
     let keys: list[str] = ctx.hoist_map.keys()
+    let mine: list[str] = []
     let mut i: int = 0
     while i < keys.len() {
         let key: str = keys.get(i)
-        if ctx.hoist_map.get_or(key, "") != "" {
-            # Already materialised (nested collect pass) — skip.
-            i = i + 1
-            continue
+        if ctx.hoist_map.get_or(key, "") == "" && !list_has(ctx.hoist_flight, key) {
+            ctx.hoist_map.set(key, fresh_tmp(ctx, "hlc_h"))
+            mine.push(key)
         }
+        i = i + 1
+    }
+    # Phase 2 emits the declarations in reservation order — children
+    # before the parents that reference them (hoist_child reserves
+    # the node's children first, so map insertion order is the
+    # dependency order). The flight mark makes the node's own
+    # initializer render its body (see gen_expr) while every nested
+    # reference — an arm, a sibling, a later key — renders the temp.
+    i = 0
+    while i < mine.len() {
+        let key: str = mine.get(i)
         let e: int = key.to_int()
-        let tmp: str = fresh_tmp(ctx, "hlc_h")
+        let tname: str = ctx.hoist_map.get_or(key, "")
         let t: str = inst_t(ctx, ctx.exprs[e].t)
+        ctx.hoist_flight.push(key)
         let v: str = gen_expr(ctx, e)
-        dst.push(ind + c_type(ctx, t) + " " + tmp
+        ctx.hoist_flight.pop()
+        dst.push(ind + c_type(ctx, t) + " " + tname
         + " __attribute__((cleanup(" + cleanup_fn_for(ctx, t) + "))) = " + v + ";")
-        ctx.hoist_map.set(key, tmp)
         i = i + 1
     }
 }
