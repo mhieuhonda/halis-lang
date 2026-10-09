@@ -13,6 +13,100 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.143.0-alpha] — Stage 125: `hls-rss`, GC-free runtime verification (RSS stability)
+- Stage 8 made the runtime garbage-collector-free; Stage 125 makes the
+  claim VERIFIED instead of believed. `tools/hls-rss.py` runs any
+  Halis workload natively under two independent instruments and
+  certifies — or refuses to certify — that resident memory does not
+  grow with the work performed. The TIMELINE is the OS-level truth: a
+  pty stdout (glibc line-buffers a tty, so each println reaches the
+  parent as written), a 10 ms ticker over /proc/<pid>/statm for the
+  continuous trace and high-water, and a reader that takes its own
+  reading the instant it sees a cycle marker — cycle-aligned
+  (cycle, t, rss) points with no timer skew in the x coordinate. The
+  RETAINED SET is the deterministic truth: the same binary run at the
+  full plan and at warmup-only, compared through the link-time
+  interposer `tools/rss_parts/malloc_balance_wrap.c` — malloc/calloc/
+  realloc/free counted (atomics; the runtime spawns real pthreads),
+  the LIVE balance printed at exit. A leak retains an object per
+  cycle and moves the live delta; page granularity cannot hide it,
+  and the interposer in turn cannot see address-space effects, which
+  is what the RSS high-water comparison beside it is for. Theil-Sen
+  slope (median of pairwise slopes — robust to allocator heap-top
+  steps) with a name-seeded bootstrap CI; verdicts STABLE / LEAK /
+  INCONCLUSIVE per instrument, composed by the strictest voice; exit
+  0 certifies, 1 is not-certified, 2 is usage. Native only on
+  purpose (the interpreter's RSS is Python's), /proc sampler,
+  GNU-ld --wrap probed per run and skipped honestly when absent.
+- **The first measurement found real leaks.** The flagship workload
+  (tests/rss_libs/server_rss.hls — a JSON request-parse-respond
+  loop) LEAKED 576,000 live objects over a 250-cycle run. Root
+  cause one: seven builtins returning FRESH heap values were missing
+  from call_result_fresh's whitelist — `join` (since Stage 19!),
+  `sys_hostname`, `read_line`, `proc_child_read`, `env_get`,
+  `cwd_get`, `fs_read_dir` — so every binding of their result was
+  emitted `hl_retain(<fresh>)` and the cleanup released only the
+  extra retain: one leaked object per call, every loop iteration,
+  through 80+ join call sites across the stdlib (url, log, io,
+  session, sse, json...). The GC-ed interpreter and the
+  output-comparing differential suite were structurally blind to it.
+  Root cause two: the `return` statement path never ran
+  collect_hoist/hoist_all on its value expression (every other
+  value-bearing statement kind does) — fresh values in borrowed
+  positions inside return expressions leaked, four hl_str per
+  json_stringify(object) call (the "{"/"}" literals, the inner
+  concat, the join result). Both fixed; the gate pins a balance
+  census over every registered builtin.
+- **And a pre-existing compiler crash.** Re-running the full suite
+  surfaced a third, older bug: hoist_all's single-phase loop
+  (generate a node, then set its temp name) admitted an infinite
+  mutual recursion with gen_expr through nested hoisting passes — a
+  `match` inside a concat inside a call argument
+  (`println("k " + match e {...})`, the Stage 121 corpus shape)
+  segfaulted the native compiler and panicked the interpreter at
+  every release back to v0.140.0-alpha. hoist_all is now two-phase
+  (name every reserved node BEFORE generating any of them, with an
+  in-flight guard so a node's own initializer renders its body,
+  never its own temp name) — the cycle is broken structurally, and
+  the gate compiles, runs and balance-checks the regression shape.
+- The interposer earned its own honesty rules, each the product of a
+  wrong draft: only frees of pointers the interposer itself
+  allocated count (libc-internal buffers handed back to free() —
+  getcwd's — pass through as FOREIGN_FREE, not a misbalance; the
+  counting-only draft read LIVE=-1994 for 2000 cwd_get calls); and
+  the tracking table grows through __real_malloc directly so the
+  instrument's footprint stays proportional to the live set (the
+  static-table draft hash-spread one pointer per page and added
+  ~7500 resident pages to a 250-page program — the verifier
+  measuring the measurement).
+- Convention (the established one — naming plus data, zero checker
+  or codegen edits): a workload is an ordinary program; a CYCLE
+  MARKER is a line `__HLRSS_CYCLE__ <i>` printed once per
+  steady-state cycle (reserved-prefix discipline: records parse
+  exactly, look-alikes fail loudly, ordinary output survives); the
+  plan is driven through argv[1] (a cooperative workload reads its
+  cycle count from args().get(1)); no markers -> honest time-based
+  analysis; argv ignored -> the retained instrument skips itself
+  with the reason. Workloads ship in tests/rss_libs/ — churn_rss
+  (every heap shape), server_rss (the JSON request loop),
+  leak_canary (64 KiB retained per cycle behind transient churn that
+  outruns allocator recycling, an in-scope exit(0) so the balance
+  sees the payloads — the control sample that proves the verifier
+  can fail, and it does: LEAK, exit 1, both instruments firing).
+- Acceptance (`make rss-acceptance`): 8 sections, 71 checks over the
+  REAL CLI — the convention and refusal matrix, the sampler and
+  protocol shape (cycle-aligned points, zombie and pre-exec windows
+  never enter the trace), the statistics against hand-computed
+  values (Theil-Sen, bootstrap determinism and collapse, the verdict
+  lattice), the interposer census (every fresh-result builtin
+  balances, FOREIGN_FREE honesty, the in-scope exit(0) retention
+  count), the report and --json layout, the two-run comparison and
+  the honest skips, the differential and the leak matrix (the ok
+  fixture byte-identical on both backends, churn/server STABLE, the
+  canary LEAK, the match-in-concat regression), and the corpus
+  hygiene. The full suite stays green and bootstrap stays
+  deterministic.
+
 ## [v0.142.0-alpha] — Stage 124: `hls-bench`, the criterion-style micro-benchmark runner
 - The benchmark stops being a stopwatch in a shell loop and becomes a
   measured, compared, classified number. `tools/hls-bench.py` is a
