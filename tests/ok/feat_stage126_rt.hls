@@ -1,0 +1,489 @@
+# ============================================================================
+# tests/ok/feat_stage126_rt.hls — Stage 126 acceptance: the core.rt model
+# exercised end to end
+# ----------------------------------------------------------------------------
+# A hosted crate exercising `core.rt` on every surface the mode's users
+# touch: verdict names/codes, budget validation, the classify order
+# (allocs, bytes, nanos) and the unchecked-axis rule, overrun amounts,
+# the canonical violation messages (the EXACT strings the C runtime
+# dies with and the hls-rt verifier quotes), enforce-within,
+# utilisation, the ledger-level leak indicator, and the window
+# analytics (max/median/jitter/over-count/window verdict/witness cycle)
+# over a simulated steady-state ledger.
+#
+# The differential law: the ledger here is pure data, so the interpreter
+# and the native binary must agree byte for byte — the output is one
+# summary line, and any failed assertion returns its number as the exit
+# code on BOTH backends. Each check group lives in its own function
+# (the linter's long-function rule is a design rule, not a nuisance):
+# a helper returns the running assertion count, or the NEGATIVE number
+# of the assertion that failed.
+# ============================================================================
+
+import "core.rt"
+
+# --- group 1: verdict names and codes (assertions 1..8) -------------------
+fn check_names(base: int) -> int {
+    if rt_verdict_name(RtVerdict.Within) != "within" {
+        return -(base + 1)
+    }
+    if rt_verdict_name(RtVerdict.OverAllocs) != "over-allocs" {
+        return -(base + 2)
+    }
+    if rt_verdict_name(RtVerdict.OverBytes) != "over-bytes" {
+        return -(base + 3)
+    }
+    if rt_verdict_name(RtVerdict.OverTime) != "over-time" {
+        return -(base + 4)
+    }
+    if rt_verdict_code(RtVerdict.Within) != 0 {
+        return -(base + 5)
+    }
+    if rt_verdict_code(RtVerdict.OverAllocs) != 1 {
+        return -(base + 6)
+    }
+    if rt_verdict_code(RtVerdict.OverBytes) != 2 {
+        return -(base + 7)
+    }
+    if rt_verdict_code(RtVerdict.OverTime) != 3 {
+        return -(base + 8)
+    }
+    return base + 8
+}
+
+# --- group 2: budgets (assertions 9..14) -----------------------------------
+fn check_budgets(base: int) -> int {
+    let b: RtBudget = rt_budget_new(100, 4096, 1000000)
+    if b.max_allocs != 100 || b.max_bytes != 4096 || b.max_nanos != 1000000 {
+        return -(base + 1)
+    }
+    let b_allocs: RtBudget = rt_budget_new(50, 0, 0)
+    if b_allocs.max_bytes != 0 || b_allocs.max_nanos != 0 {
+        return -(base + 2)
+    }
+    let b_bytes: RtBudget = rt_budget_new(0, 8192, 0)
+    if b_bytes.max_allocs != 0 {
+        return -(base + 3)
+    }
+    let b_time: RtBudget = rt_budget_new(0, 0, 250000)
+    if b_time.max_nanos != 250000 {
+        return -(base + 4)
+    }
+    let b_all: RtBudget = rt_budget_new(1, 1, 1)
+    if rt_verdict_code(rt_cycle_classify(
+    RtCycle {
+        index: 0, allocs: 1, bytes: 1, live_bytes: 0, nanos: 1
+    },
+    b_all)) != 0 {
+        return -(base + 5)
+    }
+    # the returned budget is a value: a second construction with the
+    # same numbers is the same budget (no hidden state)
+    let again: RtBudget = rt_budget_new(100, 4096, 1000000)
+    if again.max_allocs != b.max_allocs || again.max_bytes != b.max_bytes {
+        return -(base + 6)
+    }
+    return base + 6
+}
+
+# --- group 3: classification (assertions 15..26) ---------------------------
+fn check_classify(base: int) -> int {
+    let b: RtBudget = rt_budget_new(100, 4096, 1000000)
+    let b_allocs: RtBudget = rt_budget_new(50, 0, 0)
+    let b_bytes: RtBudget = rt_budget_new(0, 8192, 0)
+    let b_time: RtBudget = rt_budget_new(0, 0, 250000)
+    let b_allocs_hi: RtBudget = rt_budget_new(100, 0, 0)
+    let c_in: RtCycle = RtCycle {
+        index: 0, allocs: 100, bytes: 4096,
+        live_bytes: 512, nanos: 1000000
+    }
+    if rt_verdict_code(rt_cycle_classify(c_in, b)) != 0 {
+        return -(base + 1)
+    }
+    let c_over_a: RtCycle = RtCycle {
+        index: 3, allocs: 101, bytes: 4096,
+        live_bytes: 512, nanos: 1000000
+    }
+    if rt_verdict_code(rt_cycle_classify(c_over_a, b)) != 1 {
+        return -(base + 2)
+    }
+    let c_over_b: RtCycle = RtCycle {
+        index: 4, allocs: 100, bytes: 4097,
+        live_bytes: 512, nanos: 1000000
+    }
+    if rt_verdict_code(rt_cycle_classify(c_over_b, b)) != 2 {
+        return -(base + 3)
+    }
+    let c_over_t: RtCycle = RtCycle {
+        index: 5, allocs: 100, bytes: 4096,
+        live_bytes: 512, nanos: 1000001
+    }
+    if rt_verdict_code(rt_cycle_classify(c_over_t, b)) != 3 {
+        return -(base + 4)
+    }
+    # the order is canonical: over on ALL axes classifies as OverAllocs
+    let c_all_over: RtCycle = RtCycle {
+        index: 6, allocs: 999,
+        bytes: 99999, live_bytes: 512,
+        nanos: 99999999
+    }
+    if rt_verdict_code(rt_cycle_classify(c_all_over, b)) != 1 {
+        return -(base + 5)
+    }
+    # an unchecked axis never binds (0 = unbounded, not "nothing")
+    if rt_verdict_code(rt_cycle_classify(c_over_b, b_allocs_hi)) != 0 {
+        return -(base + 6)
+    }
+    if rt_verdict_code(rt_cycle_classify(c_over_a, b_bytes)) != 0 {
+        return -(base + 7)
+    }
+    if rt_verdict_code(rt_cycle_classify(c_over_t, b_time)) != 3 {
+        return -(base + 8)
+    }
+    # exactly AT a budget is within (the budget is a ceiling, not a floor)
+    let c_at: RtCycle = RtCycle {
+        index: 7, allocs: 100, bytes: 4096,
+        live_bytes: 0, nanos: 1000000
+    }
+    if rt_verdict_code(rt_cycle_classify(c_at, b)) != 0 {
+        return -(base + 9)
+    }
+    let c_under: RtCycle = RtCycle {
+        index: 8, allocs: 99, bytes: 4095,
+        live_bytes: 0, nanos: 999999
+    }
+    if rt_verdict_code(rt_cycle_classify(c_under, b)) != 0 {
+        return -(base + 10)
+    }
+    let c_zero: RtCycle = RtCycle {
+        index: 9, allocs: 0, bytes: 0,
+        live_bytes: 0, nanos: 0
+    }
+    if rt_verdict_code(rt_cycle_classify(c_zero, b)) != 0 {
+        return -(base + 11)
+    }
+    if rt_verdict_code(rt_cycle_classify(c_over_a, b_allocs)) != 1 {
+        return -(base + 12)
+    }
+    return base + 12
+}
+
+# --- group 4: overrun amounts (assertions 27..30) --------------------------
+fn check_overrun(base: int) -> int {
+    let b: RtBudget = rt_budget_new(100, 4096, 1000000)
+    let c_in: RtCycle = RtCycle {
+        index: 0, allocs: 100, bytes: 4096,
+        live_bytes: 512, nanos: 1000000
+    }
+    if rt_cycle_overrun(c_in, b) != 0 {
+        return -(base + 1)
+    }
+    let c_over_a: RtCycle = RtCycle {
+        index: 3, allocs: 101, bytes: 4096,
+        live_bytes: 512, nanos: 1000000
+    }
+    if rt_cycle_overrun(c_over_a, b) != 1 {
+        return -(base + 2)
+    }
+    let c_over_b: RtCycle = RtCycle {
+        index: 4, allocs: 100, bytes: 4097,
+        live_bytes: 512, nanos: 1000000
+    }
+    if rt_cycle_overrun(c_over_b, b) != 1 {
+        return -(base + 3)
+    }
+    let c_over_t: RtCycle = RtCycle {
+        index: 5, allocs: 100, bytes: 4096,
+        live_bytes: 512, nanos: 1000001
+    }
+    if rt_cycle_overrun(c_over_t, b) != 1 {
+        return -(base + 4)
+    }
+    return base + 4
+}
+
+# --- group 5: the canonical violation messages (assertions 31..34) ---------
+fn check_messages(base: int) -> int {
+    let m_a: RtCycle = RtCycle {
+        index: 7, allocs: 1200, bytes: 0,
+        live_bytes: 0, nanos: 0
+    }
+    let mb_a: RtBudget = rt_budget_new(1000, 0, 0)
+    if rt_violation_message(m_a, mb_a)
+    != "soft real-time violation: cycle 7 made 1200 allocations (budget 1000)" {
+        return -(base + 1)
+    }
+    let m_b: RtCycle = RtCycle {
+        index: 7, allocs: 0, bytes: 9500,
+        live_bytes: 0, nanos: 0
+    }
+    let mb_b: RtBudget = rt_budget_new(0, 8192, 0)
+    if rt_violation_message(m_b, mb_b)
+    != "soft real-time violation: cycle 7 allocated 9500 bytes (budget 8192)" {
+        return -(base + 2)
+    }
+    let m_t: RtCycle = RtCycle {
+        index: 7, allocs: 0, bytes: 0,
+        live_bytes: 0, nanos: 1500000
+    }
+    let mb_t: RtBudget = rt_budget_new(0, 0, 1000000)
+    if rt_violation_message(m_t, mb_t)
+    != "soft real-time violation: cycle 7 took 1500000 ns (deadline 1000000 ns)" {
+        return -(base + 3)
+    }
+    # a within cycle has a within message (totality, not enforcement)
+    let c_in: RtCycle = RtCycle {
+        index: 0, allocs: 100, bytes: 4096,
+        live_bytes: 512, nanos: 1000000
+    }
+    let b: RtBudget = rt_budget_new(100, 4096, 1000000)
+    if rt_violation_message(c_in, b)
+    != "soft real-time violation: cycle 0 is within budget" {
+        return -(base + 4)
+    }
+    return base + 4
+}
+
+# --- group 6: enforce-within + utilisation (assertions 35..41) -------------
+fn check_enforce_util(base: int) -> int {
+    let b: RtBudget = rt_budget_new(100, 4096, 1000000)
+    let b_allocs: RtBudget = rt_budget_new(50, 0, 0)
+    let b_allocs_hi: RtBudget = rt_budget_new(100, 0, 0)
+    let c_in: RtCycle = RtCycle {
+        index: 0, allocs: 100, bytes: 4096,
+        live_bytes: 512, nanos: 1000000
+    }
+    let c_zero: RtCycle = RtCycle {
+        index: 9, allocs: 0, bytes: 0,
+        live_bytes: 0, nanos: 0
+    }
+    # enforce-within returns; enforce-over panics — that leg lives in
+    # panic_stage126_rt.hls, the exit-101 fixture
+    rt_cycle_enforce(c_in, b)
+    rt_cycle_enforce(c_zero, b)
+
+    let u_half: RtCycle = RtCycle {
+        index: 0, allocs: 50, bytes: 2048,
+        live_bytes: 0, nanos: 500000
+    }
+    if rt_utilisation_pct(u_half, b) != 50 {
+        return -(base + 1)
+    }
+    # the binding axis is the MAX ratio: bytes at 50%, allocs at 80%
+    let u_bind: RtCycle = RtCycle {
+        index: 0, allocs: 80, bytes: 2560,
+        live_bytes: 0, nanos: 250000
+    }
+    if rt_utilisation_pct(u_bind, b) != 80 {
+        return -(base + 2)
+    }
+    # over 100 is reported, not clamped
+    let u_over: RtCycle = RtCycle {
+        index: 0, allocs: 200, bytes: 0,
+        live_bytes: 0, nanos: 0
+    }
+    if rt_utilisation_pct(u_over, b_allocs) != 400 {
+        return -(base + 3)
+    }
+    # unchecked axes do not bind: 0% on the one checked axis
+    if rt_utilisation_pct(c_zero, b_allocs) != 0 {
+        return -(base + 4)
+    }
+    # exactly at the budget: 100
+    let c_at: RtCycle = RtCycle {
+        index: 7, allocs: 100, bytes: 4096,
+        live_bytes: 0, nanos: 1000000
+    }
+    if rt_utilisation_pct(c_at, b_allocs_hi) != 100 {
+        return -(base + 5)
+    }
+    return base + 5
+}
+
+# --- group 7: the window analytics over a simulated ledger (42..59) --------
+fn check_window(base: int) -> int {
+    let mut cs: list[RtCycle] = []
+    let mut i: int = 0
+    while i < 10 {
+        cs.push(RtCycle {
+            index: i, allocs: 900 + i, bytes: 45000,
+            live_bytes: 2048 + i, nanos: 1800000
+        })
+        i = i + 1
+    }
+    # the slow, fat cycle the window must surface
+    cs.push(RtCycle {
+        index: 10, allocs: 3000, bytes: 90000,
+        live_bytes: 4096, nanos: 7500000
+    })
+
+    if rt_window_max_allocs(cs) != 3000 {
+        return -(base + 1)
+    }
+    if rt_window_max_bytes(cs) != 90000 {
+        return -(base + 2)
+    }
+    if rt_window_max_nanos(cs) != 7500000 {
+        return -(base + 3)
+    }
+    if rt_window_min_nanos(cs) != 1800000 {
+        return -(base + 4)
+    }
+    if rt_window_jitter_nanos(cs) != 5700000 {
+        return -(base + 5)
+    }
+    # the median of 1800000 x10 and 7500000: even count, the middles
+    # are 1800000 and 1800000
+    if rt_window_median_nanos(cs) != 1800000 {
+        return -(base + 6)
+    }
+    # an odd-count median that actually selects: three cycles, times
+    # 100 / 300 / 200 -> sorted 100,200,300 -> 200
+    let mut cs3: list[RtCycle] = []
+    cs3.push(RtCycle {
+        index: 0, allocs: 1, bytes: 1, live_bytes: 0,
+        nanos: 100
+    })
+    cs3.push(RtCycle {
+        index: 1, allocs: 1, bytes: 1, live_bytes: 0,
+        nanos: 300
+    })
+    cs3.push(RtCycle {
+        index: 2, allocs: 1, bytes: 1, live_bytes: 0,
+        nanos: 200
+    })
+    if rt_window_median_nanos(cs3) != 200 {
+        return -(base + 7)
+    }
+    # an even-count median floors the average: 100 / 201 -> 150
+    let mut cs2: list[RtCycle] = []
+    cs2.push(RtCycle {
+        index: 0, allocs: 1, bytes: 1, live_bytes: 0,
+        nanos: 100
+    })
+    cs2.push(RtCycle {
+        index: 1, allocs: 1, bytes: 1, live_bytes: 0,
+        nanos: 201
+    })
+    if rt_window_median_nanos(cs2) != 150 {
+        return -(base + 8)
+    }
+
+    # window classification over a budget sized for the steady cycles:
+    # the fat cycle is over all three axes and the verdict names the
+    # canonical first axis
+    let steady_b: RtBudget = rt_budget_new(1000, 60000, 2000000)
+    if rt_verdict_code(rt_window_classify(cs, steady_b)) != 1 {
+        return -(base + 9)
+    }
+    let bytes_only_b: RtBudget = rt_budget_new(0, 50000, 0)
+    if rt_verdict_code(rt_window_classify(cs, bytes_only_b)) != 2 {
+        return -(base + 10)
+    }
+    let time_only_b: RtBudget = rt_budget_new(0, 0, 2000000)
+    if rt_verdict_code(rt_window_classify(cs, time_only_b)) != 3 {
+        return -(base + 11)
+    }
+    let loose_b: RtBudget = rt_budget_new(4000, 100000, 8000000)
+    if rt_verdict_code(rt_window_classify(cs, loose_b)) != 0 {
+        return -(base + 12)
+    }
+    # exactly at every ceiling: still Within
+    let at_b: RtBudget = rt_budget_new(3000, 90000, 7500000)
+    if rt_verdict_code(rt_window_classify(cs, at_b)) != 0 {
+        return -(base + 13)
+    }
+    if rt_window_over_count(cs, steady_b) != 1 {
+        return -(base + 14)
+    }
+    if rt_window_over_count(cs, loose_b) != 0 {
+        return -(base + 15)
+    }
+    # the witness cycle is the FIRST cycle earning the worst verdict
+    let w: RtCycle = rt_window_worst_cycle(cs, steady_b)
+    if w.index != 10 || w.allocs != 3000 {
+        return -(base + 16)
+    }
+    let wb: RtCycle = rt_window_worst_cycle(cs, bytes_only_b)
+    if wb.index != 10 {
+        return -(base + 17)
+    }
+    # the ledger-level leak indicator: the steady line grows by one
+    # i-step each cycle (2048+i), the fat cycle jumps
+    let g: int = rt_cycle_live_growth(cs.get(0), cs.get(1))
+    if g != 1 {
+        return -(base + 18)
+    }
+    if rt_cycle_live_growth(cs.get(9), cs.get(10)) != 2039 {
+        return -(base + 19)
+    }
+    return base + 19
+}
+
+# --- group 8: the steady line (60..63) --------------------------------------
+fn check_steady_line(base: int) -> int {
+    # ten IDENTICAL cycles classify identically and the window stats
+    # collapse onto the per-cycle values — the property the hls-rt
+    # verifier's determinism check asserts on a real ledger
+    # (max == median, jitter 0)
+    let mut flat: list[RtCycle] = []
+    let mut k: int = 0
+    while k < 10 {
+        flat.push(RtCycle {
+            index: k, allocs: 912, bytes: 54328,
+            live_bytes: 4216, nanos: 1810000
+        })
+        k = k + 1
+    }
+    if rt_window_max_allocs(flat) != 912 {
+        return -(base + 1)
+    }
+    if rt_window_median_nanos(flat) != 1810000 {
+        return -(base + 2)
+    }
+    if rt_window_jitter_nanos(flat) != 0 {
+        return -(base + 3)
+    }
+    let steady_b: RtBudget = rt_budget_new(1000, 60000, 2000000)
+    if rt_verdict_code(rt_window_classify(flat, steady_b)) != 0 {
+        return -(base + 4)
+    }
+    return base + 4
+}
+
+fn main() -> int uses IO {
+    let mut n: int = check_names(0)
+    if n < 0 {
+        return -n
+    }
+    n = check_budgets(n)
+    if n < 0 {
+        return -n
+    }
+    n = check_classify(n)
+    if n < 0 {
+        return -n
+    }
+    n = check_overrun(n)
+    if n < 0 {
+        return -n
+    }
+    n = check_messages(n)
+    if n < 0 {
+        return -n
+    }
+    n = check_enforce_util(n)
+    if n < 0 {
+        return -n
+    }
+    n = check_window(n)
+    if n < 0 {
+        return -n
+    }
+    n = check_steady_line(n)
+    if n < 0 {
+        return -n
+    }
+    println("rt model ok: " + n.to_str() + " assertions")
+    return 0
+}
