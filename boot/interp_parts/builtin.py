@@ -1107,6 +1107,17 @@ class InterpBuiltin(object):
         # Returns Some(v) if the future is ready, None otherwise.
         if name == "future_poll":
             fut = args[0]
+            if self.conc.det is not None:
+                # Stage 127 trace parity: the native poll is len-then-recv
+                # — a recv that only happens when a message is there — so
+                # the det rotation sees (and traces) exactly that recv.
+                # The peek itself is safe without the runtime lock: in
+                # det mode only the baton holder runs user code, and the
+                # caller is the holder.
+                if fut.q:
+                    v = self.conc.recv(fut, line)
+                    return {"enum": "Option", "var": "Some", "data": [v]}
+                return {"enum": "Option", "var": "None", "data": []}
             with self.conc.cv:
                 if fut.q:
                     v = fut.q.pop(0)
@@ -1194,9 +1205,15 @@ class InterpBuiltin(object):
             self.conc.register(out_s)
             conc = self.conc
             interp = self
+            # Stage 127: the take worker's spawn — id, node, rotation.
+            det_node = None
+            if conc.det is not None:
+                det_node, _ = conc.det.spawn_op()
 
             def take_runner():
                 try:
+                    if conc.det is not None:
+                        conc.det.tramp_enter(det_node)
                     count = 0
                     while count < n:
                         v = conc.recv(in_s, interp.line)
@@ -1217,12 +1234,16 @@ class InterpBuiltin(object):
                 with conc.cv:
                     conc.tasks_alive -= 1
                     conc.cv.notify_all()
+                if conc.det is not None:
+                    conc.det.retire_baton()
 
             with self.conc.cv:
                 self.conc.tasks_alive += 1
             t = threading.Thread(target=take_runner)
             t.daemon = True
             t.start()
+            if self.conc.det is not None:
+                self.conc.det.yield_baton()
             return out_s
         # stream_merge_int(a, b) -> Stream[int] — interleave two streams.
         if name == "stream_merge_int":
@@ -1232,9 +1253,15 @@ class InterpBuiltin(object):
             self.conc.register(out_s)
             conc = self.conc
             interp = self
+            # Stage 127: the merge worker's spawn — id, node, rotation.
+            det_node = None
+            if conc.det is not None:
+                det_node, _ = conc.det.spawn_op()
 
             def merge_runner():
                 try:
+                    if conc.det is not None:
+                        conc.det.tramp_enter(det_node)
                     a_done = False
                     b_done = False
                     while not a_done or not b_done:
@@ -1263,12 +1290,16 @@ class InterpBuiltin(object):
                 with conc.cv:
                     conc.tasks_alive -= 1
                     conc.cv.notify_all()
+                if conc.det is not None:
+                    conc.det.retire_baton()
 
             with self.conc.cv:
                 self.conc.tasks_alive += 1
             t = threading.Thread(target=merge_runner)
             t.daemon = True
             t.start()
+            if self.conc.det is not None:
+                self.conc.det.yield_baton()
             return out_s
         raise HLPanic("unknown builtin function: %s" % name, line)
 

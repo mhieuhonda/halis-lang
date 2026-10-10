@@ -1179,7 +1179,19 @@ def main():
                          "change; verify mode never writes)")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="show skip reasons")
+    ap.add_argument("--det", action="store_true",
+                    help="run every test under the Stage 127 deterministic "
+                         "scheduler (the FIFO baton rotation; SPEC section "
+                         "67) — concurrent tests become reproducible")
     args = ap.parse_args()
+
+    # Stage 127: --det arms the deterministic scheduler through the
+    # HL_DET_SCHED environment variable BEFORE the pool spawns — every
+    # worker (and every Interp it builds) inherits it, and boot.py's
+    # env fallback does the arming. The mode is an execution property,
+    # so the flag composes with every other one.
+    if args.det:
+        os.environ["HL_DET_SCHED"] = "1"
 
     # Combine positional files and --dir entries, then discover.
     inputs = list(args.files) + list(args.dir)

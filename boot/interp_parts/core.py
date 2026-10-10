@@ -8,7 +8,8 @@ from .rt import (
 from ..compat import zip_strict
 
 class InterpCore(object):
-    def __init__(self, program, argv, out, contracts=False):
+    def __init__(self, program, argv, out, contracts=False, det=False,
+                 det_trace=False):
         self.p = program
         self.fns = program["fns"]
         self.structs = program["structs"]
@@ -47,7 +48,12 @@ class InterpCore(object):
         # Stage 16 (v0.27.0-alpha): the concurrency runtime — real Python
         # threads, one global mutex + condvar (mirrors the native C
         # runtime's design so differential behaviour matches).
-        self.conc = ConcRuntime()
+        # Stage 127 (v0.145.0-alpha): det=True arms the deterministic
+        # scheduler (the mode the native runtime arms through
+        # HL_DET_SCHED) — the FIFO baton rotation that makes a
+        # concurrent program's output and interleaving identical on
+        # every run (SPEC section 67).
+        self.conc = ConcRuntime(det=det, trace=det_trace)
         # Stage 37 (v0.56.0-alpha): socket-fd table for the net_tcp_* /
         # net_udp_* builtins. The fd namespace is a monotonic counter
         # (starting at 1) so Halis fds do NOT collide with the C

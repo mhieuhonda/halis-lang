@@ -27,9 +27,20 @@ class InterpSpawn(object):
         conc = self.conc
         task = HLTask(None)
         interp = self
+        # Stage 127 (v0.145.0-alpha): the deterministic scheduler. The
+        # spawn op enters the rotation, mints the child's task id, and
+        # enqueues the child's node BEFORE the thread even starts — the
+        # rotation order is fixed by the SPAWNER, not by when the OS
+        # happens to schedule the new thread (the native runtime's
+        # hl_spawn does exactly the same).
+        det_node = None
+        if conc.det is not None:
+            det_node, task.det_id = conc.det.spawn_op()
 
         def runner():
             try:
+                if conc.det is not None:
+                    conc.det.tramp_enter(det_node)
                 result = interp.call_fn(fn_key, values)
             except HLPanic as ex:
                 # Safe-halt semantics: a panic in ANY task halts the whole
@@ -56,6 +67,10 @@ class InterpSpawn(object):
                 sys.stderr.write("panic: %s (in task)\n" % ex)
                 os._exit(101)
             conc.task_finished(task, result)
+            # task_finished retired the node (finish op); a defensive
+            # re-retire is the no-op the native trampoline performs.
+            if conc.det is not None:
+                conc.det.retire_baton()
 
         with conc.cv:
             conc.tasks_alive += 1
@@ -68,6 +83,10 @@ class InterpSpawn(object):
         t.daemon = True
         task.thread = t
         t.start()
+        if conc.det is not None:
+            # The spawner's own yield — AFTER the child was enqueued, so
+            # the child's first turn comes before the parent's next one.
+            conc.det.yield_baton()
         return task
 
     # ---------- Stage 33 (v0.52.0-alpha): async_spawn ----------
@@ -97,9 +116,15 @@ class InterpSpawn(object):
         self.conc.register(result_chan)
         conc = self.conc
         interp = self
+        # Stage 127: the async spawn is a spawn — id, node, rotation.
+        det_node = None
+        if conc.det is not None:
+            det_node, _ = conc.det.spawn_op()
 
         def runner():
             try:
+                if conc.det is not None:
+                    conc.det.tramp_enter(det_node)
                 result = interp.call_fn(fn_key, values)
                 # Send the result on the channel. On a cap-1 bounded
                 # channel this blocks until the consumer takes it
@@ -131,12 +156,19 @@ class InterpSpawn(object):
             with conc.cv:
                 conc.tasks_alive -= 1
                 conc.cv.notify_all()
+            # Stage 127: an async task has no finish op and no joiners —
+            # it simply leaves the rotation (the native async entry's
+            # g_rt_tasks-- + retire, mirrored).
+            if conc.det is not None:
+                conc.det.retire_baton()
 
         with conc.cv:
             conc.tasks_alive += 1
         t = threading.Thread(target=runner)
         t.daemon = True
         t.start()
+        if conc.det is not None:
+            conc.det.yield_baton()
         # The Future IS the result channel (same runtime representation).
         return result_chan
 
@@ -166,9 +198,15 @@ class InterpSpawn(object):
             values.append(v)
         conc = self.conc
         interp = self
+        # Stage 127: the generator spawn — id, node, rotation.
+        det_node = None
+        if conc.det is not None:
+            det_node, _ = conc.det.spawn_op()
 
         def runner():
             try:
+                if conc.det is not None:
+                    conc.det.tramp_enter(det_node)
                 # The generator function takes (stream, args...) and
                 # returns void (it just writes to the stream).
                 interp.call_fn(fn_key, values)
@@ -188,12 +226,18 @@ class InterpSpawn(object):
             with conc.cv:
                 conc.tasks_alive -= 1
                 conc.cv.notify_all()
+            # Stage 127: the generator task leaves the rotation (no
+            # finish op, no joiners — the stream sentinel ends it).
+            if conc.det is not None:
+                conc.det.retire_baton()
 
         with conc.cv:
             conc.tasks_alive += 1
         t = threading.Thread(target=runner)
         t.daemon = True
         t.start()
+        if conc.det is not None:
+            conc.det.yield_baton()
         return stream
 
     # ---------- Stage 34: stream combinators ----------
@@ -230,9 +274,26 @@ class InterpSpawn(object):
         self.conc.register(out_stream)
         conc = self.conc
         interp = self
+        # Stage 127: the combinator's worker spawn — id, node, rotation.
+        det_node = None
+        if conc.det is not None:
+            det_node, _ = conc.det.spawn_op()
 
         def runner():
+            # Deep-scan-31 (found by the Stage 127 det scheduler): the
+            # sentinel arms of the three loops below RETURN from inside
+            # the try — which used to skip the tasks_alive decrement
+            # AND (now) the det retire. Pre-det the leak only inflated
+            # the deadlock detector's alive count (a stream pipeline
+            # that retired a worker could never be declared dead
+            # afterwards); under det the same return dropped the baton
+            # on the floor and stalled the whole rotation. The finally
+            # runs on every non-os._exit path (os._exit kills the
+            # process before it) — the decrement and the retire always
+            # happen now, in every mode.
             try:
+                if conc.det is not None:
+                    conc.det.tramp_enter(det_node)
                 if kind == "stream_map_int":
                     while True:
                         v = conc.recv(in_stream, interp.line)
@@ -277,15 +338,21 @@ class InterpSpawn(object):
                 interp.out.flush()
                 sys.stderr.write("panic: %s (in stream combinator)\n" % ex)
                 os._exit(101)
-            with conc.cv:
-                conc.tasks_alive -= 1
-                conc.cv.notify_all()
+            finally:
+                with conc.cv:
+                    conc.tasks_alive -= 1
+                    conc.cv.notify_all()
+                # Stage 127: the combinator worker leaves the rotation.
+                if conc.det is not None:
+                    conc.det.retire_baton()
 
         with conc.cv:
             conc.tasks_alive += 1
         t = threading.Thread(target=runner)
         t.daemon = True
         t.start()
+        if conc.det is not None:
+            conc.det.yield_baton()
         return out_stream
 
     def deep_clone(self, v, _seen=None):

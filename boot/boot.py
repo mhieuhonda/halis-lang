@@ -13,6 +13,13 @@ Flags:
   --check    type-check + effects-check only, no execution.
   --audit    print the capability / effect tree of every function
              (declared vs computed, with a clear OK/VIOLATION status).
+  --det      Stage 127: arm the deterministic scheduler — the FIFO
+             baton rotation that makes a concurrent program's output
+             and interleaving identical on every run (the interpreter
+             half of the mode the native runtime arms through the
+             HL_DET_SCHED environment variable; SPEC section 67).
+             HL_DET_TRACE=1 additionally traces every scheduling
+             point to stderr as `__HLDET_STEP__ <seq> t<task> <op>`.
 
   --check and --audit are mutually exclusive. If neither flag is given,
   the program is type-checked, effects-checked, and executed.
@@ -271,6 +278,7 @@ def run_cli():
     contracts = False      # Stage 17: --contracts — runtime requires/ensures checks
     target_feature = None  # Stage 21: --target-feature — SIMD feature dispatch
     fast_mode = False      # Stage 17: --fast / -O fast — proof-driven check elision report
+    det_mode = False       # Stage 127: --det — the deterministic scheduler
     # BUG (deep-scan-5): remove() only deleted the FIRST occurrence — a
     # duplicated flag (e.g. `--check --check f.hls`) leaked the stray copy
     # into the filename argument. Strip ALL occurrences of each flag.
@@ -280,6 +288,14 @@ def run_cli():
     while "--audit" in args:
         audit_only = True
         args.remove("--audit")
+    # Stage 127 (v0.145.0-alpha): --det — arm the deterministic
+    # scheduler. Composable with every other mode (it is an execution
+    # property, not a compile property). The HL_DET_SCHED environment
+    # variable arms it too, so the native binary and the interpreter
+    # can be driven the same way by tools (hls-det does exactly that).
+    while "--det" in args:
+        det_mode = True
+        args.remove("--det")
     # Deep-scan-7 fix: --emit / --target / --sandbox only handled the
     # FIRST occurrence — a duplicated flag (e.g. `boot.py --emit ir
     # --emit llvm f.hls`) leaked the stray copy into the filename
@@ -562,7 +578,9 @@ def run_cli():
         from boot.interp import _set_sandbox_root
         _set_sandbox_root(None)
         os.environ.pop("HLS_SANDBOX_ROOT", None)
-    interp = Interp(program, prog_args, sys.stdout.buffer, contracts=contracts)
+    interp = Interp(program, prog_args, sys.stdout.buffer, contracts=contracts,
+                    det=det_mode or (os.environ.get("HL_DET_SCHED", "") != ""),
+                    det_trace=(os.environ.get("HL_DET_TRACE", "") != ""))
     return interp.run()
 
 
