@@ -1,0 +1,89 @@
+# feat_stage127_det.hls — Stage 127 (v0.145.0-alpha): the deterministic
+# scheduler. HL_DET_SCHED=1 replaces the preemptive interleaving with a
+# FIFO baton rotation (every spawn/send/try_send/recv/recv_or/select/
+# join/finish is a scheduling point; the woken task runs ahead of its
+# waker; a spawned task's first turn comes before its parent's next).
+# HL_DET_TRACE=1 additionally traces every scheduling point to stderr —
+# byte-identically on the interpreter and the native backend.
+#
+# Every exchange below is deterministic BY DESIGN as well (one sender
+# and one receiver per channel at a time, sums over commutative
+# results), so the program prints the same output preemptive and det —
+# hls-det certifies the stronger property: the interleaving itself.
+
+fn pipeline_worker(jobs: Chan[int], results: Chan[int]) -> int uses Conc {
+    let mut total: int = 0
+    let mut go: int = 1
+    while go == 1 {
+        let j: int = jobs.recv()
+        if j < 0 {
+            go = 0
+        } else {
+            total = total + j
+            results.send(j * 2)
+        }
+    }
+    return total
+}
+
+fn cell_worker(id: int, x: int, results: Chan[int]) -> int uses Conc {
+    results.send(x * 10 + id)
+    return id
+}
+
+fn main() -> int uses IO, Conc {
+    # 1. A request/reply pipeline (single consumer each way).
+    let jobs: Chan[int] = chan_new()
+    let results: Chan[int] = chan_new()
+    let w: Task[int] = spawn(pipeline_worker, clone(jobs), clone(results))
+    jobs.send(1)
+    jobs.send(2)
+    jobs.send(3)
+    jobs.send(-1)
+    let mut doubled: int = 0
+    let mut i: int = 0
+    while i < 3 {
+        let v: int = results.recv()
+        doubled = doubled + v
+        i = i + 1
+    }
+    let total: int = w.join()
+
+    # 2. Two independent workers, one results channel: whichever order
+    # the two sends land in, the sum is the same.
+    let cells: Chan[int] = chan_new()
+    let c1: Task[int] = spawn(cell_worker, 1, 5, clone(cells))
+    let c2: Task[int] = spawn(cell_worker, 2, 6, clone(cells))
+    let mut acc: int = 0
+    let mut k: int = 0
+    while k < 2 {
+        let v: int = cells.recv()
+        acc = acc + v
+        k = k + 1
+    }
+    let r1: int = c1.join()
+    let r2: int = c2.join()
+
+    # 3. recv_or / try_send round-trip (pre-loaded: deterministic).
+    let b: Chan[int] = chan_new_bounded(2)
+    let sent_ok: bool = b.try_send(40)
+    b.send(2)
+    let got: int = b.recv_or(-1)
+    let missed: int = b.recv_or(-1)
+    let extra: int = b.recv_or(-1)
+
+    # 4. select over pre-loaded channels (list order decides).
+    let a: Chan[int] = chan_new()
+    let d: Chan[int] = chan_new()
+    d.send(1)
+    let chs: list[Chan[int]] = [a, d]
+    let idx: int = select(chs)
+    let da: int = a.recv_or(0)
+    let dd: int = d.recv()
+
+    println("doubled=" + doubled.to_str() + " total=" + total.to_str())
+    println("acc=" + acc.to_str() + " r1=" + r1.to_str() + " r2=" + r2.to_str())
+    println("sent_ok=" + sent_ok.to_str() + " got=" + got.to_str() + " missed=" + missed.to_str() + " extra=" + extra.to_str())
+    println("idx=" + idx.to_str() + " da=" + da.to_str() + " dd=" + dd.to_str())
+    return 0
+}
