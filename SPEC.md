@@ -8192,3 +8192,182 @@ freestanding do not, an uninstrumented binary ignores its own
 markers), the enforcement matrix, the honesty gates, the report and
 its hand-computed statistics, the differential and the corpus
 hygiene.
+
+
+---
+
+## 67. The deterministic scheduler (Stage 127 — v0.145.0-alpha)
+
+Stage 16's task model is data-race-free: no mutable value is visible
+to two threads at once, every crossing is a transfer or a channel.
+What it never fixed is the INTERLEAVING — which task runs when is the
+OS's business, so a concurrent program's output order is a coin the
+scheduler flips, and a test that observes it is flaky by
+construction. Stage 127 makes the interleaving a language-level,
+testable property: an option that replaces the preemptive scheduling
+with a deterministic rotation, so a concurrent program's output and
+interleaving are identical on every run.
+
+### 67.1. Arming
+
+The mode is environmental — one variable, no compile flag, no checker
+or codegen semantics change:
+
+| Where | Arming | Trace |
+|---|---|---|
+| native binary | `HL_DET_SCHED=1` (non-empty) | `HL_DET_TRACE=1` |
+| Stage-0 interpreter | `boot.py --det` or the same env | the same env |
+| `hltest` | `--det` (arms the env for the pool) | the same env |
+| `hls-det` (the verifier) | arms both, always | arms both, always |
+
+The SAME native binary runs either way, which is what makes the mode a
+TESTING option rather than a build mode. An unarmed program pays one
+global test per communicating op; a `--no-libc` or freestanding
+emission carries none of the mode (opaque fields + stub macros that
+expand to exactly the statements the preemptive runtime always used —
+byte-for-byte the old behaviour). Hosted-libc only, like every
+env-driven mode before it.
+
+### 67.2. The rotation
+
+At most ONE thread runs user code at any instant — the baton holder.
+The ready queue is FIFO; a task holds the baton for exactly one
+scheduling point's segment (the op plus the user code up to its next
+op), then requeues itself at the tail and parks until its turn comes
+round again.
+
+**Scheduling points.** The communicating operations are the yield
+points: `spawn`, `send`, `try_send`, `recv`, `recv_or`, `select`,
+`join`, `finish`. Quiet operations (`chan_new`, `chan.len()`, channel
+`clone()`/release) never touch the rotation — they run inside the
+owner's segment (strict serialisation makes them safe) and cannot
+affect another task's progress.
+
+**Wake order.** When an op satisfies parked waiters — a send makes
+receivers runnable, a dequeue frees bounded capacity for a parked
+sender, a `finish` releases join waiters — the woken nodes join the
+ready queue in their park order and BEFORE the waker requeues itself:
+the wakee runs ahead of the waker.
+
+**Child order.** A spawned task's node is enqueued by the SPAWNER,
+before the spawner requeues itself: the child's first turn comes
+before the parent's next, whatever the OS does with the underlying
+thread (the rotation order is fixed by the program text, not by
+thread startup timing).
+
+**Retire.** A finished task leaves the rotation for good (it does not
+requeue) and releases its join waiters. Async tasks and stream
+workers (which have no join handle) retire at their trampoline's end
+without a `finish` op.
+
+**Parking.** A blocking op parks in the wait list of what it waits
+on: a `recv` on the channel's receiver list, a full-bounded `send` on
+the channel's sender list, a `join` on the task's joiner list, a
+`select` on EVERY listed channel's receiver list (the wake dedups
+through the queued flag; a stale cell on an unfed channel is skipped
+as dead and drained by that channel's next wake). A parked sender
+that wakes to find the slot taken re-parks — the race loser is
+rotated, not dropped.
+
+### 67.3. Deadlock
+
+When a task leaves the rotation and the ready queue is EMPTY, every
+remaining thread is parked on a channel or a join; the leaving owner
+runs the det scan:
+
+- a pending message with a parked receiver, or free bounded capacity
+  with a parked sender, is a **missed wake** — a scheduler bug, dying
+  loudly as `det scheduler bug: missed wake (...)`, never papered
+  over as a deadlock;
+- otherwise, any live waiter means the canonical Stage 16 verdict —
+  `deadlock: all tasks are blocked on channel operations (no possible
+  progress)`, exit 101 — the SAME message the preemptive scan gives;
+- no waiter at all is a program simply finishing (the last runnable
+  thread exiting with nothing parked).
+
+### 67.4. The trace
+
+`HL_DET_TRACE=1` writes one line per scheduling point to stderr, at
+the moment the op's turn begins:
+
+    __HLDET_STEP__ <seq> t<task> <op>[ <detail>]
+
+- `seq` is dense from 0;
+- `t<task>`: task ids by spawn order, main = `t0`, first spawn `t1`;
+- `<op>` is one of `spawn send try_send recv recv_or select join
+  finish`;
+- `<detail>`: `t<n>` for `spawn` (the child) and `join` (the target),
+  `ch<n>[,ch<m>...]` for `select` (list order), `ch<n>` for the
+  channel ops, absent for `finish`;
+- channel ids are by creation order (`ch0`..), minted at
+  `chan_new`/`chan_new_bounded`.
+
+The reserved-prefix discipline (Stage 119/124/125/126): a stderr line
+starting with `__HLDET_STEP__ ` must parse exactly and continue the
+dense sequence; a line merely containing `__HLDET_` — on either
+stream — is a protocol error. Program chatter on stderr is fine; it
+is kept out of every comparison. The interpreter and the native
+runtime emit byte-identical traces for the same program — the
+acceptance's Section 2 asserts the traces of three fixtures
+line-by-line against HAND-COMPUTED policy derivations, on both
+backends.
+
+### 67.5. `hls-det` — the verifier
+
+`tools/hls-det.py` certifies instead of believing:
+
+1. the NATIVE leg — the house recipe (bin/hlc + gcc -O2 -lm -pthread),
+   `--runs` times (default 5) under the mode with the trace on;
+   stdout, trace and exit must be byte-identical across runs. A
+   deterministic panic certifies (the exit code is named: "the
+   interleaving is certified, not the health").
+2. the PARITY leg — `boot.py --det` on the same workload; the
+   interpreter must agree on stdout, trace and exit. `--no-parity`
+   skips it and says so; a skipped leg is never a pass.
+
+Honesty gates: a clock-reading workload is NOT DETERMINISTIC (exit 1 —
+the comparison is real); a forged step line is a loud protocol error;
+`--observe-preemptive` reports what unarmed runs did as an
+OBSERVATION, never a certificate (preemptive stability over N runs is
+evidence, not proof — that asymmetry is the mode's reason to exist).
+`--json` carries the config, per-run digests, the parity leg and the
+stats (steps, task count, op histogram). Exit 0 certifies, 1 is
+not-certified with the reason named, 2 is usage (`--runs < 2` is
+refused: a determinism claim needs at least two runs).
+
+### 67.6. Boundaries
+
+The mode covers the TASK MODEL — spawn/chan/select/join and the async
+and stream workers built on them. It does not schedule: the wall
+clock or any other external input (a clock-reading program stays
+nondeterministic however it is scheduled — `hls-det` refuses it); the
+LLVM/wasm backends' own runtimes (the C backend is the reference);
+and a `--no-libc` or freestanding build carries none of it. A channel
+operation from a thread the scheduler does not know dies loudly (the
+defensive refusal — unreachable from user code today, since every
+user-facing thread is a task) rather than letting an unscheduled
+interleaving silently void the certificate.
+
+### 67.7. What the tests prove
+
+`tests/ok/feat_stage127_det.hls` is deterministic BY DESIGN and BY
+ROTATION — the same output preemptive and det, the same trace every
+det run, both backends. `tests/ok/panic_stage127_det.hls` pins the
+deadlock verdict: exit 101, the canonical message, both schedulers,
+both backends, both modes. `tests/det_libs/` carries the witnesses:
+`rotation` / `park_wake` / `bounded_wake` (the hand-computed traces —
+the FIFO queue, the wakee ahead of the waker, the bounded re-park),
+`select_rotation` (the multi-channel park and the stale-cell dedup),
+`fairness_poll` (the recv_or loop's exact rotation answer — the
+fairness a cooperative scheduler must prove), `deadlock`, the
+`nondet_source` honesty fixture (refused), the `lookalike` protocol
+forgery (refused), and `rotation_test` (the hltest witness, green
+armed and unarmed). `make det-acceptance` (8 sections, 90 checks)
+drives the real CLI, both real runtimes and the verifier's own
+validator: the refusals, the hand-computed policy traces on both
+backends, the emitted-C wiring (hosted carries the region and the arm
+call; `--no-libc` carries the stubs and none of the mode; unarmed
+parity holds), the certification matrix, the fairness matrix, the
+deadlock and panic parity, the honesty gates, and the differential +
+corpus hygiene (stdout, trace and exit identical across backends for
+the whole fixture set).

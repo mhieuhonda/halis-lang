@@ -13,6 +13,110 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.145.0-alpha] — Stage 127: deterministic-scheduler option (testing concurrency)
+- Stage 16 made the task model data-race-free; Stage 127 makes its
+  INTERLEAVING testable. `HL_DET_SCHED=1` (the interpreter: `boot.py
+  --det`, `hltest --det`) replaces the preemptive OS scheduling with
+  the FIFO baton rotation SPEC section 67 specifies: every
+  spawn/send/try_send/recv/recv_or/select/join/finish is a scheduling
+  point, the task that satisfied a waiter requeues itself AFTER the
+  waiters it woke (the wakee runs ahead of the waker), a spawned
+  task's node is enqueued by the spawner before the spawner requeues
+  itself (the child's first turn comes before the parent's next), and
+  a finished task retires without requeueing while releasing its join
+  waiters. At most one thread runs user code at any instant — the
+  baton holder — so a concurrent program's output and interleaving
+  are identical on every run. The stage lands as three agreeing
+  halves: the RUNTIME wiring in the hosted C backend (the region, the
+  env arming, the hooks), the DetCore in the Stage-0 interpreter
+  (mirrored op-for-op), and the verifier `tools/hls-det.py`.
+- **Arming is environmental, on purpose.** No compile flag, no checker
+  or codegen semantics change: the SAME binary runs preemptive or
+  deterministic (`HL_DET_SCHED=1 ./prog`), which is what makes the
+  mode a testing option rather than a build mode — and what lets the
+  verifier drive both legs from one artifact. An unarmed program pays
+  one `g_det_on` test per communicating op (the Stage 126 precedent:
+  the mode costs a branch when it is off); a `--no-libc` or
+  freestanding emission carries the opaque fields and stub macros
+  only — none of the mode, the honest "not available" those builds
+  practice for every hosted feature.
+- **The interleaving is a first-class witness.** `HL_DET_TRACE=1`
+  traces every scheduling point to stderr as
+  `__HLDET_STEP__ <seq> t<task> <op>[ <detail>]` — task ids by spawn
+  order (main = t0), channel ids by creation order (ch0..), a dense
+  sequence from 0, the reserved-prefix discipline of Stage 119/124/
+  125/126 (a line starting with the stem must parse exactly; a line
+  merely containing `__HLDET_` on either stream is a loud protocol
+  error, never a silent skip). The interpreter and the native runtime
+  emit BYTE-IDENTICAL traces for the same program — the acceptance
+  asserts the traces line-by-line against HAND-COMPUTED policy
+  derivations (the rotation, the park/wake order, the bounded
+  backpressure with the race-loser re-park), which is the strongest
+  form the differential suite's interpreter↔native discipline takes:
+  not just the output, but the order of every operation agrees.
+- **The verifier is honest about what it cannot certify.**
+  `tools/hls-det.py` compiles the workload with the house recipe
+  (bin/hlc + gcc -O2 -lm -pthread), runs it `--runs` times (default
+  5) under the mode with the trace on, and requires byte-identical
+  stdout, trace and exit across runs; a PARITY leg runs the same
+  workload through `boot.py --det` and requires the interpreter to
+  agree on all three (`--no-parity` skips it and says so — a skipped
+  leg is never a pass). A program may die — a deterministic panic is
+  a deterministic interleaving, certified with the exit code named
+  ("the interleaving is certified, not the health"). A clock-reading
+  workload is refused (NOT DETERMINISTIC — the comparison is real);
+  `--observe-preemptive` runs the same binary unarmed and reports
+  what it saw, honestly labelled an observation over N runs, never a
+  certificate — that asymmetry is the reason this stage exists.
+  `--json` carries the config, every run's digests, the parity leg,
+  and the stats (steps, task count, the op histogram). Exit 0
+  certifies, 1 is not-certified (the reason named), 2 is usage
+  (`--runs < 2` is refused: a determinism claim needs at least two
+  runs).
+- **Deadlock parity survives the new scheduler.** The rotation's own
+  all-blocked moment — a task leaving the rotation with an empty
+  ready queue — runs a scan with the same canonical Stage 16 verdict
+  the preemptive counter-based scan gives (both backends, both modes,
+  exit 101, the identical message). A satisfied-but-unwoken waiter
+  (a pending message with a parked receiver, free bounded capacity
+  with a parked sender) would be a MISSED WAKE — a scheduler bug,
+  reported loudly as such, never papered over as a deadlock. No
+  waiter at all is a program simply finishing.
+- **The first measurement found a real bug.** Driving the stream
+  corpus under the new scheduler exposed a latent interpreter defect:
+  the stream combinator workers' sentinel arms RETURN from inside
+  their try block, skipping the `tasks_alive` decrement — pre-det
+  the leak only inflated the deadlock detector's alive count (a
+  pipeline that retired a worker could never be declared dead
+  afterwards); under det the same return dropped the baton on the
+  floor and stalled the whole rotation. The runners' cleanup now runs
+  in a `finally` (every non-os._exit path), in every mode. The
+  exposure is the mode working as designed: a deterministic
+  scheduler turns "sometimes hangs" into "always hangs at step N",
+  which is a fixable bug.
+- `hltest --det` runs every test under the mode through the
+  HL_DET_SCHED environment (inherited by the pool workers; boot.py's
+  env fallback does the arming) — the roadmap's stated purpose,
+  "testing concurrency", as a runner flag. `examples/det_demo.hls`
+  demonstrates the contrast end to end: a two-worker pipeline whose
+  reply ORDER is interleaving-sensitive — preemptively unstable,
+  under the mode always `first=51 second=62` with the trace naming
+  who ran what.
+- Acceptance (`make det-acceptance`): 8 sections, 90 checks over the
+  REAL CLI, both REAL runtimes and the verifier's own validator: the
+  convention and refusals, the hand-computed policy traces on both
+  backends, the runtime wiring (region + arm call in the hosted
+  emission, stubs and nothing in a --no-libc emission, unarmed
+  parity), the certification matrix (every fixture, --json, --runs 8,
+  argv passthrough), the fairness witness (the recv_or poll loop's
+  exact rotation answer; the hltest witness green armed and unarmed),
+  the deadlock and panic parity, the honesty gates (the clock refused,
+  the forged step line, the validator's unit checks), and the
+  differential + corpus hygiene (stdout/trace/exit identical across
+  backends for the whole fixture set; hlfmt-canonical, hllint-clean,
+  checker-booting new files; no litter). The full suite stays green
+  and bootstrap stays deterministic.
+
 ## [v0.144.0-alpha] — Stage 126: soft-real-time mode (bounded allocation per cycle)
 - Stage 125 verified that a steady-state workload's resident memory
   does not grow; Stage 126 adds the discipline a soft-real-time

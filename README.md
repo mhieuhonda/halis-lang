@@ -199,6 +199,14 @@ python3 tools/hls-rss.py workload.hls    # Stage 125: RSS-stability
 make rss-acceptance           # Stage 125 gate: the RSS-stability battery
                                # (churn/server STABLE, the leak canary
                                # earns LEAK, the builtin balance census)
+python3 tools/hls-det.py examples/det_demo.hls   # Stage 127: certify a
+                               # concurrent program's interleaving (FIFO
+                               # baton rotation, N runs byte-identical,
+                               # interpreter parity, --trace names every
+                               # scheduling point)
+make det-acceptance           # Stage 127 gate: the determinism battery
+                               # (hand-computed policy traces, fairness,
+                               # deadlock parity, the honesty gates)
 
 # 13. Stage 15-alpha: Safe C FFI (v0.13.0-alpha)
 python3 boot/boot.py examples/ffi_demo.hls           # call libc functions
