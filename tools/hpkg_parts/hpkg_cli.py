@@ -6,7 +6,8 @@ _TOOLS_DIR = _os.path.dirname(_os.path.abspath(__file__))
 if _TOOLS_DIR not in _sys.path:
     _sys.path.insert(0, _TOOLS_DIR)
 from hpkg_cmds import (
-    cmd_add, cmd_audit, cmd_build, cmd_init, cmd_lock, cmd_log, cmd_publish, cmd_verify,
+    cmd_add, cmd_audit, cmd_build, cmd_init, cmd_lock, cmd_log, cmd_publish,
+    cmd_semver, cmd_verify,
 )
 from hpkg_common import (
     argparse, sys,
@@ -34,6 +35,14 @@ def main():
     p_add.add_argument("path")
     p_add.add_argument("--tag", default=None)
     p_add.add_argument("--branch", default=None)
+    # Stage 131 (v0.149.0-alpha): --version REQ — record a semver
+    # requirement in the manifest's dependency table. The grammar is
+    # validated here (cmd_add refuses a bad one before writing); lock
+    # enforces that the pinned ref satisfies it.
+    p_add.add_argument("--version", default=None, dest="version",
+                       metavar="REQ",
+                       help="semver requirement for this dependency "
+                            "(e.g. ^1.2.3, ~2.0, >=1.0.0 <2.0.0, 1.2.*)")
     p_add.set_defaults(func=cmd_add, audit_op=hal_ops.PKG_ADD)
 
     p_lock = sub.add_parser("lock", help="Resolve dependencies and write hls-pkg.lock.")
@@ -101,6 +110,34 @@ def main():
     p_log.add_argument("--verify", action="store_true",
                        help="Verify the chain hashes of the log.")
     p_log.set_defaults(func=cmd_log)
+
+    # Stage 131 (v0.149.0-alpha): the semver laws as a CLI — the same
+    # grammar, precedence and satisfaction the manifest enforcement
+    # uses, reachable from scripts and CI without a manifest.
+    p_semver = sub.add_parser("semver",
+                              help="Check, compare, bump or test semver "
+                                   "versions (Stage 131).")
+    semver_sub = p_semver.add_subparsers(dest="semver_cmd", required=True)
+    sv_check = semver_sub.add_parser(
+        "check", help="Validate a version (exit 0 valid, 1 invalid).")
+    sv_check.add_argument("version")
+    sv_check.set_defaults(func=cmd_semver)
+    sv_cmp = semver_sub.add_parser(
+        "cmp", help="Print -1/0/1: precedence of A vs B (build ignored).")
+    sv_cmp.add_argument("a")
+    sv_cmp.add_argument("b")
+    sv_cmp.set_defaults(func=cmd_semver)
+    sv_bump = semver_sub.add_parser(
+        "bump", help="Print the version after bumping major/minor/patch.")
+    sv_bump.add_argument("part", choices=["major", "minor", "patch"])
+    sv_bump.add_argument("version")
+    sv_bump.set_defaults(func=cmd_semver)
+    sv_sat = semver_sub.add_parser(
+        "sat", help="Exit 0 when VERSION satisfies REQUIREMENT, 1 when "
+                     "not, 2 when either is malformed.")
+    sv_sat.add_argument("version")
+    sv_sat.add_argument("requirement")
+    sv_sat.set_defaults(func=cmd_semver)
 
     args = parser.parse_args()
     # BUG-DS4-25: manifest/lockfile problems used to escape as raw

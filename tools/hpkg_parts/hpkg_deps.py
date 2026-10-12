@@ -29,16 +29,15 @@ def resolve_dependency(name: str, source: Dict, cache_dir: str = CACHE_DIR) -> s
     if not isinstance(source, dict):
         raise ValueError("dependency %s: source must be a table, got %s"
                          % (name, type(source).__name__))
-    if "path" in source:
-        # Path dependency. Resolve relative to the repo root — and CONFINED
-        # to it (BUG-DS4-22).
-        p = _confine(REPO_ROOT, source["path"], "dependency %s" % name)
-        if os.path.isdir(p):
-            return p  # multi-file package directory
-        if not os.path.isfile(p):
-            raise FileNotFoundError(
-                "dependency %s: path not found: %s" % (name, p))
-        return p
+    # Stage 131 (v0.149.0-alpha): a `git` source takes the GIT branch,
+    # even when it also carries a `path` (the file INSIDE the clone —
+    # the documented shape `{ git = "...", path = "src/math.hls",
+    # tag = "v1.0.0" }`). The old path-first ordering made every
+    # git+path manifest resolve as a REPO-ROOT path dep — the clone
+    # never happened, the tag was never checked out, and the
+    # requirement/tag enforcement could not see the pinned ref at
+    # all. A bare `path` (no git) stays exactly what it was: a path
+    # dependency confined to the repo root.
     if "git" in source:
         _validate_git_arg(source["git"], "dependency %s git URL" % name)
         # Git dependency. Clone into cache.
@@ -93,6 +92,17 @@ def resolve_dependency(name: str, source: Dict, cache_dir: str = CACHE_DIR) -> s
             raise FileNotFoundError(
                 "dependency %s: path not found in repo: %s" % (name, full))
         return full
+    if "path" in source:
+        # Path dependency. Resolve relative to the repo root — and
+        # CONFINED to it (BUG-DS4-22). Reached only when there is no
+        # `git` (see the Stage 131 note above).
+        p = _confine(REPO_ROOT, source["path"], "dependency %s" % name)
+        if os.path.isdir(p):
+            return p  # multi-file package directory
+        if not os.path.isfile(p):
+            raise FileNotFoundError(
+                "dependency %s: path not found: %s" % (name, p))
+        return p
     raise ValueError("dependency %s has no git/path source" % name)
 
 
@@ -188,6 +198,19 @@ def extract_effects(file_path: str) -> Tuple[List[str], List[str]]:
     # declared and computed effect sets.
     declared = set()
     computed = set()
+    # Stage 131 (v0.149.0-alpha): count the audit rows we actually
+    # parsed. The fail-closed heuristic below used to fire on ANY
+    # non-empty audit output — and the audit's trailer always
+    # mentions effect names ("Active effects: IO, Fs, ..."), so a
+    # crate that audited CLEAN and PURE (every row OK, no effects
+    # anywhere) was recorded as if it had used the whole effect
+    # family. The documented workflow (init → add a pure std lib →
+    # lock with effects.allowed = []) could never go green. The
+    # heuristic's real job is to catch the case where the output
+    # format drifted and NO rows parsed — so that is what it now
+    # checks. A parsed-but-empty effect set is the honest result for
+    # a pure crate, and pure is what the ledger records.
+    rows_seen = 0
     # Stage 10/11 deep-scan fix: include Net, Rand, Proc so audit output
     # for a dependency using net_lookup / rand_int / proc_exec is parsed
     # correctly (was missing, so those effects were silently dropped,
@@ -209,6 +232,7 @@ def extract_effects(file_path: str) -> Tuple[List[str], List[str]]:
             cols = _re_mod.split(r"\s{2,}", stripped)
             if len(cols) < 4:
                 continue
+            rows_seen += 1
             # cols[0] = function name, cols[1] = declared, cols[2] = computed,
             # cols[3] = status (OK / VIOLATION: ...).
             # Parse comma-separated effect names from each column.
@@ -236,7 +260,13 @@ def extract_effects(file_path: str) -> Tuple[List[str], List[str]]:
     # rows (format drift, or the wrapper import resolved to a different
     # file), the old code returned ([], []) — recording the dependency
     # as PURE. Fail closed instead.
-    if not declared and not computed:
+    #
+    # Stage 131 correction: the trigger is now "zero rows parsed",
+    # which is what this guard was always about. A clean audit of a
+    # pure crate parses rows and yields an empty effect set — that is
+    # the TRUE result, not an unauditable one, and it no longer lands
+    # in the fail-closed net.
+    if rows_seen == 0:
         # Heuristic: if the audit output mentioned any KNOWN_EFFECT name
         # at all (e.g. in a status line we missed), fail closed.
         stdout_lower = result.stdout

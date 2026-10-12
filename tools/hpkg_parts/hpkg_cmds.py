@@ -18,6 +18,16 @@ from hpkg_log import (
 from hpkg_manifest import (
     parse_manifest, write_manifest,
 )
+# Stage 131 (v0.149.0-alpha): semantic-versioning enforcement. Every
+# place a version enters the toolchain — add, lock, build, publish,
+# verify — goes through this module's laws; the header of
+# hpkg_semver.py documents the three (grammar, precedence, compat).
+from hpkg_semver import (
+    check_publish_immutability, compare_versions, bump_version,
+    enforce_dep_requirement, parse_requirement, parse_version,
+    require_dependency_requirements, require_package_version,
+    requirement_holds, requirement_string, tag_version, version_string,
+)
 from hpkg_util import (
     _validate_dep_name, _validate_git_arg, sha256_bytes, sha256_file,
 )
@@ -120,15 +130,33 @@ def cmd_add(args):
     except ValueError as ex:
         print("error: %s" % ex, file=sys.stderr)
         return 1
+    # Stage 131 (v0.149.0-alpha): --version REQ — a semver requirement
+    # the manifest records and lock/verify enforce. The grammar is
+    # checked HERE, before the requirement reaches the manifest: a
+    # typo like ^1.2..3 is refused at the keyboard, not at the next
+    # lock (where it would be a resolver failure named after a
+    # manifest line nobody remembers writing).
+    requirement = getattr(args, "version", None)
+    if requirement:
+        try:
+            req = parse_requirement(
+                requirement, "dependency %s version requirement" % args.name)
+        except ValueError as ex:
+            print("error: %s" % ex, file=sys.stderr)
+            return 1
     source = {"git": args.git, "path": args.path}
     if args.tag:
         source["tag"] = args.tag
     if args.branch:
         source["branch"] = args.branch
+    if requirement:
+        source["version"] = requirement
     deps[args.name] = source
     write_manifest(manifest, manifest_path)
     print("Added dependency: %s" % args.name)
     print("  source: %s" % source)
+    if requirement:
+        print("  requirement: %s (%s)" % (requirement, req))
     # Stage 112: editing the manifest's dependency set is privileged.
     hal_ops.record(hal_ops.PKG_ADD, "ok", subject=args.name,
                    detail={"git": source.get("git", ""),
@@ -154,6 +182,19 @@ def cmd_lock(args):
         return 1
     pkg_version = manifest.get("package", {}).get("version", "0.0.0")
     pkg_name = manifest.get("package", {}).get("name", "<unnamed>")
+    # Stage 131 (v0.149.0-alpha): the package's own version must be a
+    # valid semver when present (the lockfile quotes it in every
+    # transparency-log record — a ledger full of "1.0" and "final"
+    # rows is a ledger nothing can order), and every dependency's
+    # `version` requirement must parse BEFORE anything is resolved —
+    # a bad requirement is refused at the grammar, not after a
+    # network fetch named the failure.
+    try:
+        require_package_version(manifest, "hls-pkg lock")
+        dep_reqs = require_dependency_requirements(deps)
+    except ValueError as ex:
+        print("error: %s" % ex, file=sys.stderr)
+        return 1
     # Stage 22 (v0.41.0-alpha): record the target triple in the lockfile.
     # When --target is given, the lockfile is stamped with the target;
     # `hls-pkg verify --target <triple>` checks that the lockfile's target
@@ -170,6 +211,21 @@ def cmd_lock(args):
             return 1
         sha = _sha256_directory(resolved_path) if os.path.isdir(resolved_path) \
             else sha256_file(resolved_path)
+        # Stage 131 (v0.149.0-alpha): the requirement law. A dependency
+        # that declares `version = "<req>"` must be pinned to a ref
+        # that SATISFIES it — a semver tag directly, or (for a moving
+        # ref) the dependency's own manifest version. A requirement
+        # that cannot be checked is a refusal: lock exits 1 and writes
+        # nothing.
+        requirement = dep_reqs.get(name)
+        req_text = requirement.text if requirement else None
+        if requirement is not None:
+            try:
+                enforce_dep_requirement(name, requirement, source,
+                                        resolved_path)
+            except ValueError as ex:
+                print("FAILED: %s" % ex)
+                return 1
         declared, computed = extract_effects(resolved_path)
         # Stage 13 release: record the resolved version + commit hash so
         # `verify` can detect a moved tag (TOCTOU on the git cache).
@@ -202,6 +258,7 @@ def cmd_lock(args):
             "name": name,
             "source": source,
             "version": resolved_version,
+            "requirement": req_text,
             "commit": commit,
             "sha256": sha,
             "effects": declared,
@@ -357,6 +414,29 @@ def cmd_verify(args):
                   "target)" % (actual_target, actual_target))
     failures = 0
     warnings = 0
+    # Stage 131 (v0.149.0-alpha): the drift law. The lockfile recorded
+    # the requirement each dependency was locked under; the manifest
+    # in front of us is what the user wants NOW. When they disagree —
+    # a requirement edited after the lock, or added to a dep whose
+    # lockfile entry predates requirements — verification FAILS and
+    # names both texts: running a build against a lock that satisfies
+    # an outdated requirement is exactly the staleness the lockfile
+    # exists to prevent.
+    manifest_reqs: Dict[str, str] = {}
+    manifest_path = os.path.join(os.getcwd(), "hls-pkg.toml")
+    if os.path.isfile(manifest_path):
+        try:
+            _manifest = parse_manifest(manifest_path)
+            _deps = _manifest.get("dependencies", {})
+            for dep_name, dep_source in (
+                    _deps.items() if isinstance(_deps, dict) else []):
+                if isinstance(dep_source, dict) and dep_source.get("version"):
+                    manifest_reqs[dep_name] = str(dep_source["version"])
+        except (ValueError, OSError, AttributeError):
+            # A corrupt manifest is reported by lock/build; verify
+            # still runs its content checks and the drift table
+            # simply stays empty.
+            pass
     for pkg in lockfile["packages"]:
         if not isinstance(pkg, dict):
             print("  [FAIL] <malformed entry>: not an object")
@@ -383,6 +463,43 @@ def cmd_verify(args):
             continue
         # Stage 13 release: verify the git commit (if recorded).
         recorded_commit = pkg.get("commit")
+        # Stage 131 (v0.149.0-alpha): the requirement law, re-checked.
+        # (a) manifest/lockfile drift — the manifest's CURRENT
+        #     requirement must be the one the lock recorded;
+        # (b) the locked ref must still satisfy the recorded
+        #     requirement (a tag parsed as semver is checked directly;
+        #     a moving ref is out of verify's reach — the hash check
+        #     above already pins its bytes).
+        locked_req = pkg.get("requirement")
+        current_req = manifest_reqs.get(name)
+        if locked_req is None and current_req is not None:
+            print("  [FAIL] %s: manifest requires %r but the lockfile "
+                  "entry predates requirements — run `hls-pkg lock`"
+                  % (name, current_req))
+            failures += 1
+            continue
+        if locked_req is not None and current_req != locked_req:
+            print("  [FAIL] %s: manifest/lockfile drift (manifest "
+                  "requires %r, locked with %r) — run `hls-pkg lock`"
+                  % (name, current_req, locked_req))
+            failures += 1
+            continue
+        if locked_req is not None:
+            lv = tag_version(str(pkg.get("version", "")))
+            if lv is not None:
+                try:
+                    req = parse_requirement(locked_req,
+                                            "dependency %s requirement" % name)
+                except ValueError as ex:
+                    print("  [FAIL] %s: %s" % (name, ex))
+                    failures += 1
+                    continue
+                if not requirement_holds(req, lv):
+                    print("  [FAIL] %s: locked %s does not satisfy "
+                          "requirement %r" % (name, pkg.get("version"),
+                                              locked_req))
+                    failures += 1
+                    continue
         if recorded_commit and isinstance(recorded_commit, str) and \
                 _re_mod.fullmatch(r"[0-9a-f]{40}", recorded_commit):
             # Reconstruct the clone_dir for git deps.
@@ -445,7 +562,17 @@ def cmd_build(args):
         print("error: no hls-pkg.toml in current directory", file=sys.stderr)
         return 1
     # Parse the manifest to validate it early.
-    parse_manifest(manifest_path)
+    # Stage 131 (v0.149.0-alpha): the same semver law lock applies,
+    # before a single line is compiled — a manifest whose own version
+    # (or any dependency requirement) does not parse is refused here,
+    # not at the next lock someone remembers to run.
+    _manifest = parse_manifest(manifest_path)
+    try:
+        require_package_version(_manifest, "hls-pkg build")
+        require_dependency_requirements(_manifest.get("dependencies", {}))
+    except ValueError as ex:
+        print("error: %s" % ex, file=sys.stderr)
+        return 1
     entry = args.entry or "main.hls"
     if not os.path.isfile(entry):
         print("error: entry file not found: %s" % entry, file=sys.stderr)
@@ -628,7 +755,19 @@ def cmd_publish(args):
         print("error: [package] section is corrupt", file=sys.stderr)
         return 1
     name = pkg_section.get("name", "<unnamed>")
-    version = pkg_section.get("version", "0.0.0")
+    # Stage 131 (v0.149.0-alpha): a publish NAMES its version. The old
+    # silent "0.0.0" fallback would have published every
+    # version-less manifest under the same ledger row — an identity
+    # collision the transparency log could never untangle. And the
+    # version must be valid semver: the ledger is ordered by these
+    # strings.
+    try:
+        version_v = require_package_version(manifest, "hls-pkg publish",
+                                            required=True)
+    except ValueError as ex:
+        print("error: %s" % ex, file=sys.stderr)
+        return 1
+    version = version_string(version_v)
     # Compute the content SHA-256 over the package's HLS sources.
     cwd = os.getcwd()
     sources = []
@@ -656,6 +795,36 @@ def cmd_publish(args):
                 h.update(chunk)
         h.update(b"\x00")
     content_sha = h.hexdigest()
+    # Stage 131 (v0.149.0-alpha): the immutability law. name@version
+    # is a contract with the content it was first published with — a
+    # republish with DIFFERENT content is a hard refusal (semver
+    # requires a bump, not a rewrite), and an identical republish is
+    # a no-op for the LEDGER (it is not spammed; CI stays
+    # idempotent) while still being a RECORDED op — the audit trail
+    # records runs, and a no-op run quotes the seq it matched.
+    # Build metadata does not change the identity: 1.2.3+a and
+    # 1.2.3+b are one version (spec §10).
+    verdict, existing_seq, refusal = check_publish_immutability(
+        name, version_v, content_sha, TRANSPARENCY_LOG)
+    if verdict == "identical":
+        print("Already published %s@%s — identical content, nothing to do"
+              % (name, version))
+        print("  content sha256: %s" % content_sha)
+        print("  ledger seq: %s (unchanged)" % existing_seq)
+        hal_ops.record(hal_ops.PKG_PUBLISH, "ok",
+                       subject="%s@%s" % (name, version),
+                       detail={"content_sha256": content_sha,
+                               "files": len(sources),
+                               "ledger_seq": existing_seq,
+                               "already_published": True})
+        return 0
+    if verdict == "refuse":
+        print("error: %s" % refusal, file=sys.stderr)
+        hal_ops.record(hal_ops.PKG_PUBLISH, "refused", subject="%s@%s"
+                       % (name, version),
+                       detail={"reason": "version already published with "
+                               "different content"})
+        return 1
     # Append to the transparency log.
     rec = transparency_log_append({
         "name": name,
@@ -718,6 +887,65 @@ def cmd_log(args):
     return 0
 
 
+def cmd_semver(args):
+    """Stage 131 (v0.149.0-alpha): the semver laws as a CLI.
+
+    hls-pkg semver check VERSION   — 0 valid (prints the canonical
+                                     form), 1 invalid (stderr names
+                                     the failing clause)
+    hls-pkg semver cmp A B         — prints -1 / 0 / 1 by spec §11
+                                     precedence (build ignored)
+    hls-pkg semver bump PART V     — prints the bumped version
+    hls-pkg semver sat V REQ       — 0 satisfies, 1 does not, 2 the
+                                     version or the requirement is
+                                     malformed (both named)
+
+    Exit-code convention (matching hls-migrate): 2 is a usage /
+    convention error, 1 is a refusal or a negative verdict."""
+    sub = getattr(args, "semver_cmd", "")
+    if sub == "check":
+        try:
+            v = parse_version(args.version, "version")
+        except ValueError as ex:
+            print("error: %s" % ex, file=sys.stderr)
+            return 1
+        print(version_string(v))
+        return 0
+    if sub == "cmp":
+        try:
+            a = parse_version(args.a, "first version")
+            b = parse_version(args.b, "second version")
+        except ValueError as ex:
+            print("error: %s" % ex, file=sys.stderr)
+            return 2
+        print(compare_versions(a, b))
+        return 0
+    if sub == "bump":
+        try:
+            v = parse_version(args.version, "version")
+            print(version_string(bump_version(v, args.part)))
+        except ValueError as ex:
+            print("error: %s" % ex, file=sys.stderr)
+            return 2
+        return 0
+    if sub == "sat":
+        try:
+            v = parse_version(args.version, "version")
+            req = parse_requirement(args.requirement, "requirement")
+        except ValueError as ex:
+            print("error: %s" % ex, file=sys.stderr)
+            return 2
+        if requirement_holds(req, v):
+            print("%s satisfies %s" % (version_string(v),
+                                       requirement_string(req)))
+            return 0
+        print("%s does NOT satisfy %s" % (version_string(v),
+                                          requirement_string(req)))
+        return 1
+    print("error: unknown semver subcommand: %r" % sub, file=sys.stderr)
+    return 2
+
+
 # ---------------------------------------------------------------------------
 # CLI entry point.
 # ---------------------------------------------------------------------------
@@ -734,5 +962,6 @@ __all__ = [
     "cmd_lock",
     "cmd_log",
     "cmd_publish",
+    "cmd_semver",
     "cmd_verify",
 ]

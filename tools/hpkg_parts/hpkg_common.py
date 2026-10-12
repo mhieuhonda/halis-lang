@@ -73,13 +73,16 @@ Stage 13 release — version verification:
 
 Commands:
   hls-pkg init NAME           Create a new package skeleton.
-  hls-pkg add NAME GIT PATH   Add a git dependency (--tag XOR --branch).
+  hls-pkg add NAME GIT PATH   Add a git dependency (--tag XOR --branch,
+                              --version REQ for a semver requirement).
   hls-pkg lock                Resolve deps, write lockfile, append to log.
   hls-pkg audit               Print the total effect report of the dep tree.
   hls-pkg build [--entry F]   Compile the package with resolved deps.
   hls-pkg verify              Verify lockfile hashes + commits + log entries.
   hls-pkg publish             Append the current package to the log.
   hls-pkg log [--verify]      Print the transparency log / verify its chain.
+  hls-pkg semver ...          check / cmp / bump / sat — the semver laws
+                              as a CLI (Stage 131).
 
 Status: release. The transparency log is a local JSON-lines file today;
 the Stage 13 release-target decentralised registry is the Stage 20
@@ -106,8 +109,17 @@ from typing import Dict, List, Optional, Tuple
 # Certificate Transparency's Head/X/Y structure on a single-host scale).
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-CACHE_DIR = os.path.join(REPO_ROOT, ".hls-pkg-cache")
-TRANSPARENCY_LOG = os.path.join(REPO_ROOT, ".hls-pkg-transparency.log")
+# Stage 131 (v0.149.0-alpha): the cache and the transparency log honour
+# environment overrides (HLS_PKG_CACHE, HLS_PKG_TRANSPARENCY_LOG). The
+# acceptance gates for the semver enforcement need ISOLATED logs — a
+# gate that appended its publishes into the developer's real ledger
+# would both pollute it and depend on it — and parallel CI runs of
+# `hls-pkg lock` need caches that don't fight over one clone dir. The
+# defaults are unchanged; the override is opt-in, one variable each.
+CACHE_DIR = os.environ.get("HLS_PKG_CACHE") or \
+    os.path.join(REPO_ROOT, ".hls-pkg-cache")
+TRANSPARENCY_LOG = os.environ.get("HLS_PKG_TRANSPARENCY_LOG") or \
+    os.path.join(REPO_ROOT, ".hls-pkg-transparency.log")
 
 
 
