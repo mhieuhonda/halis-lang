@@ -8565,3 +8565,107 @@ one-time audit whose output is the ledger, re-runnable at will with
 the interpreter-facing language and stdlib — historical snapshots are
 not compared, because outputs may drift for sanctioned reasons, which
 is precisely what the drift ledger exists to name.
+
+
+## 69. The migration tool (Stage 129 — v0.147.0-alpha)
+
+Stage 128's ledger tells you what changed and why it was sanctioned;
+the source a sanctioned change left behind still has to be updated.
+Stage 129 closes that loop: `tools/hls-migrate.py` (`hls migrate`) is
+a codemod engine whose rules are derived from the project's real,
+documented breaking changes — the same events the Stage 128 ledger
+records — each carrying the release that introduced it (`since`).
+Where the ledger is the record of drift, `hls migrate` is the repair.
+
+### 69.1. The rules
+
+Six rules, oldest first, each the mechanical half of one historical
+change:
+
+| rule | since | what it does |
+|---|---|---|
+| `html-escape-slash` | v0.8.0-alpha | a golden literal compared against a direct `html_escape(<literal>)` call is re-rendered to today's exact output (the forward slash escaped as `&#x2F;` onwards); the input literal is never touched |
+| `rename-project` | v0.20.0-alpha | every "Hieu Louis"/"Hieu-Louis" becomes "Halis", in strings and comments alike |
+| `import-guard` | v0.51.1-alpha | an absolute import path is rewritten to file-relative form (AUTO); a `..` segment is reported MANUAL and never rewritten |
+| `xxh64-spec` | v0.82.0-alpha | a pinned digest expectation on a literal input is recomputed with the spec-correct XXH64 the tool itself carries (the five libxxhash-0.8.3 vectors) and rewritten only when it disagrees |
+| `asm-width` | v0.102.0-alpha | every 8/16/32-bit GPR spelling inside an asm! constraint becomes its full 64-bit name (bool operands included — Stage 83 carries a bool through an int64 register variable; template width modifiers untouched) |
+| `hex64-word` | v0.103.0-alpha | a string literal compared against `hex64(...)` is re-parsed from the minimal-digit and negative `-0x` forms and re-rendered as the full 16-digit unsigned word |
+
+The `..` case deserves the emphasis it gets: the deep-scan-19 guard
+exists because a `..` import is a local-file-inclusion vector for any
+service that compiles untrusted HLS. A codemod that silently rewrote
+one would change what the program LOADS — the one thing a migration
+must never do — so the rule reports it MANUAL with the reason, and
+the fix (move the module below the importer, import downward) stays a
+human decision.
+
+### 69.2. The walk and the gate
+
+A file is migrated by walking it through history: the rules run
+oldest-first, each seeing the previous rule's output, so a file
+crosses every release boundary in order — the journey its author's
+tree took, compressed into one pass. Every rule is individually
+idempotent (a recomputed digest, a re-rendered word and a renamed
+string are all fixed points), so the pipeline is idempotent:
+`--apply` twice leaves the second run with exactly the MANUAL
+findings it started with and zero new edits.
+
+`--from` names the dialect the source is written in (a release tag;
+default v0.1.0-alpha), `--to` the target (default: the tool's
+version). A rule fires only when `since > --from` — code written at
+or after a breaking change already conforms to it. The roadmap
+phrase is a real command: `hls migrate v0.34.0-alpha --to v1.0` over
+a v0.34-era tree fires exactly the four post-v0.34 rules and gates
+the two pre-v0.34 dialects off. The boundary is honest in both
+directions: a v0.110 dialect is CLEAN on the whole migration bed,
+and a rule is gated AT its own release (`--from v0.103.0-alpha` does
+not re-fire hex64-word — code written at the breaking release
+already carries it).
+
+### 69.3. The honesty rules
+
+A plan never touches a file. `--apply` writes a `.bak` beside every
+file it rewrites — the FIRST backup wins, so the oldest original is
+never lost — and reports every edit with file:line precision and the
+reason quoted. `--verify` runs the checker (`boot.py --check`) on
+every file the tool rewrote and fails loudly on the first error,
+naming the file and the checker's first line — but SKIPS files that
+still carry unresolved MANUAL findings, named: the tool refuses to
+certify a file it knows is still broken for a reason it could not
+fix. A golden the string decoder cannot read is MANUAL advice, never
+a rewrite: the decoder implements exactly the lexer's four escapes
+(`\n`, `\t`, `\\`, `\"`) and refuses everything else rather than
+guessing. Exit codes: 0 = CLEAN or APPLIED, 1 = findings or a
+verification failure, 2 = usage.
+
+### 69.4. The migration bed and what the tests prove
+
+`tests/migrate_tree/` is a v0.34-era tree carrying every
+pre-migration pattern: an absolute import, two pre-rename strings, a
+pre-slash html golden, a minimal-digit hex64 golden, a pre-spec
+pinned digest, four asm! helpers covering every narrow GPR family
+(32-bit names, a 16-bit port form, an 8-bit low form, a narrow
+clobber, a 32-bit name on a bool operand), and a `legacy/` file
+whose `..` import is the MANUAL case. Pre-migration the checker
+rejects it in exactly three places; post-migration the app and
+digest programs run green on BOTH backends and the kernel crate
+checks clean.
+
+`tests/ok/feat_stage129_migrate.hls` pins the codemod's arithmetic
+as executable checks: the version-gate law (the six real
+since-versions, the 4/2 AUTO/GATED split the roadmap phrase
+produces), the migration verdict lattice (CLEAN, AUTO, MANUAL,
+GATED), the hex64 word law as `mig_hex64` (the reference rendering,
+nibble for nibble the core.section definition), the five XXH64
+digest pins, the html golden with the escaped slash, and the import
+guard's decision table. `make migrate-acceptance` (8 sections) is
+the gate: the convention and its refusals, the registry and the unit
+laws, the plan over the bed (byte-identical afterwards — a plan
+never touches a file), the walk with verify and backups, the version
+gate (the phrase verbatim, the CLEAN boundaries, --only/--skip), the
+idempotence and honesty gates (the fixed point, first-backup-wins,
+unified diffs, the undecodable golden), the verify gate (failures
+named, MANUAL skips named), and the corpus hygiene. The gate can run
+in pieces (`--sections` or `HLS_MIGRATE_GATE_SECTIONS`) for CI step
+timeouts — a subset run says which sections it ran, never a silent
+skip.

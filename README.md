@@ -220,6 +220,17 @@ make compat-acceptance        # Stage 128 gate: the compatibility battery
                                # (the census laws, the ledger discipline,
                                # the regression alarm, the time-travel
                                # witness, the native differential)
+python3 tools/hls-migrate.py   # Stage 129: upgrade a v0.34-era tree to
+    tests/migrate_tree         # today (six rules from the real, ledgered
+    --from v0.34.0-alpha       # breaking changes; the version gate fires
+    --to v1.0                  # exactly the four post-v0.34 rules; --apply
+                               # walks a file through history oldest-first,
+                               # backs up the original, and --verify runs
+                               # the checker on every rewritten file)
+make migrate-acceptance       # Stage 129 gate: the migration battery
+                               # (the plan census over the real bed, the
+                               # walk with backups and verify, the version
+                               # gate, idempotence, the honesty rules)
 
 # 13. Stage 15-alpha: Safe C FFI (v0.13.0-alpha)
 python3 boot/boot.py examples/ffi_demo.hls           # call libc functions

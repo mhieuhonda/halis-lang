@@ -199,7 +199,7 @@ remains green.
 | 126 | Soft-real-time mode (bounded allocation per cycle) | ✅ | (done in v0.144.0-alpha) |
 | 127 | Deterministic-scheduler option (testing concurrency) | ✅ | (done in v0.145.0-alpha) |
 | 128 | Backwards-compatibility test suite (every prior version's ok/) | ✅ | (done in v0.146.0-alpha) |
-| 129 | Migration tooling (`hls migrate v0.34 -> v1.0`) | ⬜ | 4 weeks |
+| 129 | Migration tooling (`hls migrate v0.34 -> v1.0`) | ✅ | (done in v0.147.0-alpha) |
 | 130 | Deprecation mechanism (`@deprecated` attribute + lint) | ⬜ | 3 weeks |
 | 131 | Semantic-versioning enforcement in `hls-pkg` | ⬜ | 3 weeks |
 | 132 | LTS branch policy (backport-only after v1.0) | ⬜ | 2 weeks |
