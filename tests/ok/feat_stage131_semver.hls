@@ -1,0 +1,409 @@
+# feat_stage131_semver.hls — Stage 131 (v0.149.0-alpha): the
+# semantic-versioning enforcement in `hls-pkg`.
+#
+# What this fixture pins is the ARITHMETIC the enforcement lives on —
+# the same laws `tools/hpkg_parts/hpkg_semver.py` applies when it
+# judges a manifest, a tag or a requirement:
+#
+#   hls-pkg semver check | cmp | bump | sat
+#
+#   1. the grammar law  — a core component is digits only, no leading
+#      zero (semver 2.0.0's <numeric identifier>: "0" is legal,
+#      "01" is not — and "01" sorting as 1 is exactly the accident
+#      the law refuses);
+#   2. the precedence law (spec §11 on the core) — numeric compare,
+#      so 9 < 10 < 100: the string sort that ranks "10" below "9" is
+#      the bug every changelog tool eventually ships;
+#   3. the pre-release law (spec §11.3/§11.4) — identifiers compare
+#      numeric-first (encoded kind 0) and alphanumerics ASCII-wise
+#      (kind 1), numeric < alphanumeric, and a longer identifier list
+#      beats its own prefix (alpha < alpha.1) while everything is
+#      still below the release (§11.2 — encoded as the release flag);
+#   4. the bump laws — a bumped component zeroes everything below it
+#      and drops the pre-release (1.2.3-alpha bump minor = 1.3.0);
+#   5. the caret law — the first NON-ZERO component pins the range:
+#      ^1.2.3 -> <2.0.0, ^0.2.3 -> <0.3.0, ^0.0.3 -> <0.0.4.
+#
+# The program exits 0 when every law holds, 10+section otherwise —
+# the differential suite runs it on the interpreter AND natively and
+# requires byte-identical output.
+#
+# This file enters the corpus at this release — green the day it is
+# born, already written in the dialect the enforcement speaks.
+
+# ----------------------------------------------------------------------
+# The grammar law: a component is digits only, no leading zero.
+# ----------------------------------------------------------------------
+fn digits_to_int(s: str) -> int {
+    let n: int = s.len()
+    if n == 0 {
+        return -1
+    }
+    if n > 1 {
+        if s.byte_at(0) == 48 {
+            return -1
+        }
+    }
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < n {
+        let b: int = s.byte_at(i)
+        if b < 48 || b > 57 {
+            return -1
+        }
+        v = v * 10 + (b - 48)
+        i = i + 1
+    }
+    return v
+}
+
+# The version core as one comparable integer: major * 10^6 +
+# minor * 10^3 + patch (the same encoding tools/hls-migrate.py has
+# used for release tags since Stage 129).
+fn sem_key(major: int, minor: int, patch: int) -> int {
+    return major * 1000000 + minor * 1000 + patch
+}
+
+# Parse "MAJOR.MINOR.PATCH" into its key, -1 when any component
+# breaks the grammar (a digit string with a leading zero, an empty
+# component, a non-digit, or the wrong component count).
+fn sem_parse_core(s: str) -> int {
+    let n: int = s.len()
+    let mut cur: str = ""
+    let mut comps: list[int] = []
+    let mut i: int = 0
+    while i < n {
+        let c: str = s.slice(i, i + 1)
+        if c == "." {
+            comps.push(digits_to_int(cur))
+            cur = ""
+        } else {
+            cur = cur + c
+        }
+        i = i + 1
+    }
+    comps.push(digits_to_int(cur))
+    if comps.len() != 3 {
+        return -1
+    }
+    if comps[0] < 0 || comps[1] < 0 || comps[2] < 0 {
+        return -1
+    }
+    return sem_key(comps[0], comps[1], comps[2])
+}
+
+# ----------------------------------------------------------------------
+# The precedence law on the core (§11.1): compare numerically.
+# ----------------------------------------------------------------------
+fn core_cmp(a: int, b: int) -> int {
+    if a < b {
+        return -1
+    }
+    if a > b {
+        return 1
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------
+# The pre-release law (§11.3/§11.4). An identifier is encoded as
+# kind * 1000 + value: kind 0 numeric (1.0.0-alpha.1's "1"), kind 1
+# alphanumeric (ASCII rank — 'a' < 'b', so alpha=1, beta=2, rc=3).
+# A pre-release list is list[int]; §11.2's release flag lives in the
+# caller (a release passes the empty list plus flag 1, a pre-release
+# its identifiers plus flag 0).
+# ----------------------------------------------------------------------
+fn ident_num(n: int) -> int {
+    return n
+}
+
+fn ident_alpha(rank: int) -> int {
+    return 1000 + rank
+}
+
+fn pre_cmp(a: list[int], b: list[int]) -> int {
+    let an: int = a.len()
+    let bn: int = b.len()
+    let mut i: int = 0
+    while i < an && i < bn {
+        if a[i] < b[i] {
+            return -1
+        }
+        if a[i] > b[i] {
+            return 1
+        }
+        i = i + 1
+    }
+    # All shared positions equal: the longer list wins (§11.3 —
+    # alpha < alpha.1), the pure prefix loses.
+    if an < bn {
+        return -1
+    }
+    if an > bn {
+        return 1
+    }
+    return 0
+}
+
+# Full §11 over (core key, pre-release list, release flag): the flag
+# ranks every pre-release (0) below its own release (1) — §11.2.
+fn version_cmp(ka: int, prea: list[int], rela: int,
+kb: int, preb: list[int], relb: int) -> int {
+    let c: int = core_cmp(ka, kb)
+    if c != 0 {
+        return c
+    }
+    if rela != relb {
+        if rela > relb {
+            return 1
+        }
+        return -1
+    }
+    return pre_cmp(prea, preb)
+}
+
+# ----------------------------------------------------------------------
+# The bump laws: the bumped component rises, everything below zeroes,
+# the pre-release drops (the tag of an unfinished release is not
+# carried onto the next one).
+# ----------------------------------------------------------------------
+fn bump_major(k: int) -> int {
+    let major: int = k / 1000000
+    return sem_key(major + 1, 0, 0)
+}
+
+fn bump_minor(k: int) -> int {
+    let major: int = k / 1000000
+    let minor: int = (k / 1000) % 1000
+    return sem_key(major, minor + 1, 0)
+}
+
+fn bump_patch(k: int) -> int {
+    let major: int = k / 1000000
+    let minor: int = (k / 1000) % 1000
+    let patch: int = k % 1000
+    return sem_key(major, minor, patch + 1)
+}
+
+# ----------------------------------------------------------------------
+# The caret law: the first NON-ZERO component pins the upper bound
+# (^1.2.3 -> <2.0.0; ^0.2.3 -> <0.3.0; ^0.0.3 -> <0.0.4). Returns the
+# EXCLUSIVE upper bound as a key.
+# ----------------------------------------------------------------------
+fn caret_upper(major: int, minor: int, patch: int) -> int {
+    if major > 0 {
+        return sem_key(major + 1, 0, 0)
+    }
+    if minor > 0 {
+        return sem_key(0, minor + 1, 0)
+    }
+    return sem_key(0, 0, patch + 1)
+}
+
+fn in_caret(major: int, minor: int, patch: int, v: int) -> bool {
+    return v >= sem_key(major, minor, patch) && v < caret_upper(major, minor, patch)
+}
+
+# ----------------------------------------------------------------------
+# The test sections. Each returns 0 when its laws hold.
+# ----------------------------------------------------------------------
+fn test_grammar() -> int {
+    if sem_parse_core("1.2.3") != sem_key(1, 2, 3) {
+        return 1
+    }
+    # "0" is a legal component; "01" is not.
+    if sem_parse_core("0.0.0") != sem_key(0, 0, 0) {
+        return 2
+    }
+    if sem_parse_core("01.2.3") != -1 {
+        return 3
+    }
+    if sem_parse_core("1.02.3") != -1 {
+        return 4
+    }
+    if sem_parse_core("1.2.03") != -1 {
+        return 5
+    }
+    # Wrong shape: too few, too many, empty, non-digit.
+    if sem_parse_core("1.2") != -1 {
+        return 6
+    }
+    if sem_parse_core("1.2.3.4") != -1 {
+        return 7
+    }
+    if sem_parse_core("1..3") != -1 {
+        return 8
+    }
+    if sem_parse_core("1.x.3") != -1 {
+        return 9
+    }
+    return 0
+}
+
+fn test_precedence() -> int {
+    # Numeric, not lexicographic: 9 < 10 < 100.
+    if core_cmp(sem_key(0, 0, 9), sem_key(0, 0, 10)) != -1 {
+        return 1
+    }
+    if core_cmp(sem_key(0, 0, 10), sem_key(0, 0, 100)) != -1 {
+        return 2
+    }
+    if core_cmp(sem_key(0, 9, 0), sem_key(0, 10, 0)) != -1 {
+        return 3
+    }
+    if core_cmp(sem_key(9, 0, 0), sem_key(10, 0, 0)) != -1 {
+        return 4
+    }
+    # Major dominates minor dominates patch.
+    if core_cmp(sem_key(1, 99, 99), sem_key(2, 0, 0)) != -1 {
+        return 5
+    }
+    if core_cmp(sem_key(1, 2, 99), sem_key(1, 3, 0)) != -1 {
+        return 6
+    }
+    return 0
+}
+
+fn test_prerelease() -> int {
+    let alpha: list[int] = [ident_alpha(1)]
+    let alpha1: list[int] = [ident_alpha(1), ident_num(1)]
+    let alphabeta: list[int] = [ident_alpha(1), ident_alpha(2)]
+    let beta: list[int] = [ident_alpha(2)]
+    let beta2: list[int] = [ident_alpha(2), ident_num(2)]
+    let beta11: list[int] = [ident_alpha(2), ident_num(11)]
+    let rc1: list[int] = [ident_alpha(3), ident_num(1)]
+    let none: list[int] = []
+    let k: int = sem_key(1, 0, 0)
+    # The canonical §11 chain: alpha < alpha.1 < alpha.beta < beta
+    #   < beta.2 < beta.11 < rc.1 < 1.0.0.
+    if version_cmp(k, alpha, 0, k, alpha1, 0) != -1 {
+        return 1
+    }
+    if version_cmp(k, alpha1, 0, k, alphabeta, 0) != -1 {
+        return 2
+    }
+    if version_cmp(k, alphabeta, 0, k, beta, 0) != -1 {
+        return 3
+    }
+    if version_cmp(k, beta, 0, k, beta2, 0) != -1 {
+        return 4
+    }
+    # Numeric identifiers compare numerically: beta.2 < beta.11.
+    if version_cmp(k, beta2, 0, k, beta11, 0) != -1 {
+        return 5
+    }
+    if version_cmp(k, beta11, 0, k, rc1, 0) != -1 {
+        return 6
+    }
+    # §11.2: every pre-release sits below its own release.
+    if version_cmp(k, rc1, 0, k, none, 1) != -1 {
+        return 7
+    }
+    if version_cmp(k, alpha, 0, k, none, 1) != -1 {
+        return 8
+    }
+    # Numeric < alphanumeric (§11.4): alpha.1 < alpha.beta — encoded
+    # kinds 0 < 1 make the tuple comparison decide.
+    if version_cmp(k, alpha1, 0, k, alphabeta, 0) != -1 {
+        return 9
+    }
+    # Equal identifiers + equal flag = equal precedence, regardless
+    # of build metadata (§10) — the flag IS the identity here.
+    if version_cmp(k, alpha, 0, k, alpha, 0) != 0 {
+        return 10
+    }
+    return 0
+}
+
+fn test_bump() -> int {
+    let k: int = sem_key(1, 2, 3)
+    if bump_major(k) != sem_key(2, 0, 0) {
+        return 1
+    }
+    if bump_minor(k) != sem_key(1, 3, 0) {
+        return 2
+    }
+    if bump_patch(k) != sem_key(1, 2, 4) {
+        return 3
+    }
+    # The pre-release does not survive a bump: bump works on the
+    # core key, and the caller's release flag is 1 after a bump —
+    # 1.2.3-alpha bump minor = 1.3.0, never 1.3.0-alpha.
+    if bump_minor(sem_key(1, 2, 3)) != sem_key(1, 3, 0) {
+        return 4
+    }
+    # Zeroes reset downward too: 1.2.9 bump patch -> 1.2.10, and the
+    # numeric compare still orders it above 1.2.9.
+    if bump_patch(sem_key(1, 2, 9)) != sem_key(1, 2, 10) {
+        return 5
+    }
+    if core_cmp(sem_key(1, 2, 9), sem_key(1, 2, 10)) != -1 {
+        return 6
+    }
+    return 0
+}
+
+fn test_caret() -> int {
+    if caret_upper(1, 2, 3) != sem_key(2, 0, 0) {
+        return 1
+    }
+    if caret_upper(0, 2, 3) != sem_key(0, 3, 0) {
+        return 2
+    }
+    if caret_upper(0, 0, 3) != sem_key(0, 0, 4) {
+        return 3
+    }
+    # The range membership: 1.2.9 in ^1.2.3, 1.2.2 and 2.0.0 out.
+    if !in_caret(1, 2, 3, sem_key(1, 2, 9)) {
+        return 4
+    }
+    if in_caret(1, 2, 3, sem_key(1, 2, 2)) {
+        return 5
+    }
+    if in_caret(1, 2, 3, sem_key(2, 0, 0)) {
+        return 6
+    }
+    # The 0.x clamp: 0.2.9 in ^0.2.3, 0.3.0 out — one left digit
+    # changes the whole contract.
+    if !in_caret(0, 2, 3, sem_key(0, 2, 9)) {
+        return 7
+    }
+    if in_caret(0, 2, 3, sem_key(0, 3, 0)) {
+        return 8
+    }
+    # The 0.0.x clamp: only the exact patch floats.
+    if !in_caret(0, 0, 3, sem_key(0, 0, 3)) {
+        return 9
+    }
+    if in_caret(0, 0, 3, sem_key(0, 0, 4)) {
+        return 10
+    }
+    return 0
+}
+
+fn main() -> int uses IO {
+    println("stage 131: hls-pkg semver")
+    let mut r: int = test_grammar()
+    if r != 0 {
+        return 10 + r
+    }
+    r = test_precedence()
+    if r != 0 {
+        return 20 + r
+    }
+    r = test_prerelease()
+    if r != 0 {
+        return 30 + r
+    }
+    r = test_bump()
+    if r != 0 {
+        return 40 + r
+    }
+    r = test_caret()
+    if r != 0 {
+        return 50 + r
+    }
+    println("  semver laws OK: grammar, precedence, pre-release, "
+    + "bump, caret")
+    return 0
+}
