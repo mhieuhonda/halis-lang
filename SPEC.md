@@ -8371,3 +8371,197 @@ parity holds), the certification matrix, the fairness matrix, the
 deadlock and panic parity, the honesty gates, and the differential +
 corpus hygiene (stdout, trace and exit identical across backends for
 the whole fixture set).
+
+## 68. The backwards-compatibility suite (Stage 128 — v0.146.0-alpha)
+
+Stages 1–127 shipped 170 releases, each carrying an `tests/ok/`
+acceptance corpus that was green the day it was cut. Stage 128's
+question is the one every growing language eventually has to answer
+honestly: does a program that compiled and ran green on release vN
+still compile and run green TODAY? The answer is measured, not
+believed. `tools/hls-compat.py` replays every prior version's ok
+corpus against the current toolchain, diffs every failure against a
+ledger of sanctioned drifts, and — in its strongest leg — runs each
+sampled release's own interpreter beside today's to verify that the
+ledger's claims about history are true statements, not today's
+excuses.
+
+### 68.1. The census
+
+Release tags are `v<major>.<minor>[.<patch>][-suffix]`, sorted by
+version (9 < 10 < 100, never alphabetically); non-release tags are
+counted and named, never silently dropped. Each release's `tests/ok`
+corpus is extracted with `git archive` — no worktree checkout, no
+dirty tree — and every top-level `.hls` fixture (the suite_01
+convention; `modules/` holds imported siblings, not entries) runs
+through today's Stage-0 interpreter with stdin from `/dev/null` and a
+clean environment (no `HL_*` mode variables leak into a compat run).
+`std.`/`core.` imports resolve to the CURRENT repo (today's stdlib —
+the compat claim itself); relative imports resolve inside the
+extracted historical tree, so a fixture runs with the siblings it
+shipped with.
+
+The corpus is content-addressed: a fixture that never changed between
+two releases is ONE program, verified once. Its identity is its own
+content hash plus, when it has relative imports, the hash of its
+import closure (the closure paths are taken relative to the extracted
+tree, so the temp directory's name cannot leak into the identity; an
+import that escapes the tree falls back to the whole-tree manifest).
+170 releases collapse 24,591 file-instances into 326 unique programs —
+a dedup of 75x — and the whole history replays in under two minutes,
+which is what makes the suite per-commit runnable. The bar is the
+suite's own convention since v0.1.0: exit 0, or exit 101 for the
+expected-panic fixtures. Anything else is a failure, named with its
+first error line.
+
+### 68.2. The verdict lattice
+
+| verdict | meaning |
+|---|---|
+| COMPATIBLE | exit 0 on today's interpreter |
+| COMPATIBLE-PANIC | exit 101 — the expected-panic convention's green |
+| WAIVED | a failure the ledger names (a sanctioned break) |
+| REGRESSION | a failure the ledger does not name — the alarm |
+| RECONCILED | a ledgered break that runs green again — the waiver is stale |
+
+A failure the ledger does not name is the regression this stage
+exists to catch. The diff is two-way: a ledgered program that runs
+green again is RECONCILED (the entry must be trimmed), and an entry
+that matches no historical content is STALE. On a restricted
+`--tags` run, entries outside the sampled range are reported as NOTEs,
+not failures — the full run is the certificate, the restricted run a
+probe. `--update-ledger` drafts the current failing set for review;
+the tool never writes the ledger itself.
+
+One blind spot is documented rather than papered over: exit 101 is
+green by convention, so a program that ran to completion at its
+release and PANICS today is invisible to the census. That is what the
+time-travel leg exists to see (it found exactly one such case — the
+xxHash64 spec-conformance fix).
+
+### 68.3. The ledger
+
+`tests/compat_ledger.json` is the sanctioned-drift registry. Every
+entry names ONE exact historical program (file basename + content
+sha256-16), the sanctioned change responsible, and the release that
+migrated the in-tree fixture. Three kinds:
+
+- **break** — the program ran green under its own release; today's
+  toolchain fails it (or panics it). Five are registered: the
+  deep-scan-19 import-path traversal guard (`..` segments in import
+  paths are a local-file-inclusion vector), the Stage 83 inline-asm
+  register-width rule (32-bit register names on int operands were a
+  miscompilation, twice), the Stage 85 hex64 full-word rendering (16
+  digits, unsigned — boot protocols carry 64-bit values that arrive
+  as negatives), and the xxHash64 spec-conformance fix (the old
+  digests were wrong for every input class, verified against
+  libxxhash 0.8.3).
+- **resurrect** — the program was RED under its own release (a
+  toolchain bug) and runs green today. One is registered: the config
+  quoted-dot-key write-only bug, whose red was masked by the
+  101-is-green convention for ten releases.
+- **drift** — the program still exits 0 on both toolchains but its
+  OUTPUT changed. Three are registered: the Hieu-Louis-to-Halis data
+  rename (twice — two fixtures echo `examples/data.txt`) and
+  html_escape learning to escape the forward slash (the `</script>`
+  XSS vector). A drift entry pins BOTH stdout digests and the last
+  release that still produced the old one — any FURTHER drift of the
+  same program fails the witness.
+
+Break and resurrect entries may carry `old_red_from`: the tag from
+which the program's own interpreter already showed the drift-era
+verdict. For a break, that is the migration gap — the breaking change
+landed but the migrated fixture had not yet shipped (the import guard
+landed at v0.51.1; the migrated fixture shipped at v0.60.0; nine
+releases carried a corpus entry their own interpreter rejected). For
+a resurrect, it is the bug's landing (green before it, red from it;
+before that tag the waiver does not apply and the normal agreement
+classification takes over).
+
+### 68.4. The time-travel witness
+
+For each sampled tag the FULL tree at that tag is extracted and the
+tag's OWN interpreter runs its own corpus — its world, its stdlib,
+what vN actually shipped and tested. Beside it, today's interpreter
+runs the same programs in the census layout (today's stdlib); the
+census run for exactly that tag's import context is reused, so
+context-dependent programs compare like-for-like. Exit code and
+stdout must agree byte for byte, with exactly the sanctioned
+exceptions the ledger names — and the witnessing runs BOTH ways:
+
+- a break is verified to have really run green (exit 0) at its
+  release, and to really not run green today;
+- a resurrect is verified to have really been red at its release, and
+  to really run green today;
+- a drift is verified to carry exactly the two stdout digests the
+  entry pins, on the releases the entry says it drifted;
+- an `old_red_from` window is verified in both directions: green
+  before the tag, red-or-failed from it.
+
+A program that fails under its own release's interpreter is an
+OLD-BUG, reported honestly and excluded from the comparison (its own
+suite's 101-is-green convention may have masked it at the time). An
+unnamed resurrection — a red-at-release program that runs green today
+— is a problem to own, not a pass: the change of behaviour must be
+named in the ledger or investigated. An unnamed divergence is the
+alarm. The default sample is the two bookends (the oldest and the
+latest release — dynamic, so the sample stays honest as the history
+grows) plus one tag per sanctioned-drift family, so every waiver's
+history is witnessed every run; `--time-travel all` sweeps every
+release.
+
+The full-history sweep was run once to build the ledger: all 170
+release tags, 24,591 corpus instances — 24,329 agreements, 224
+break-witnesses, 10 resurrection-witnesses, 28 drift-witnesses, every
+instance accounted for, zero unexplained divergences, zero unnamed
+resurrections, zero old bugs.
+
+The historical runs are strictly sequential, on purpose. The corpus
+contains port-binding fixtures (a fixed listen port) and
+timing-sensitive handshakes (a client retrying ~500ms while a server
+thread races to listen); two interpreters racing for the port, or the
+same fixture slowed past its handshake budget by CPU contention, turn
+a green corpus into a spurious panic. A verifier must not have a mode
+that can falsify history.
+
+### 68.5. The native leg
+
+`--native` compiles every program whose interpreter leg was green
+with the house recipe (bin/hlc + gcc -O2 -lm -pthread; the
+freestanding recipe for `#![freestanding]` crates) and runs it:
+native (exit, stdout) must equal interpreter (exit, stdout) byte for
+byte. The differential suite's discipline extended across time — an
+old program must still produce the same result on BOTH of today's
+backends.
+
+### 68.6. What the tests prove
+
+`tests/ok/feat_stage128_compat.hls` is the suite's own canary — the
+verdict lattice, the two-way ledger law, the content-dedup law and
+the travel law as executable checks in the oldest stable core; it
+enters the corpus at this release and is expected green ever after.
+`examples/compat_demo.hls` runs the same arithmetic on a toy history
+of three releases. `make compat-acceptance` (8 sections) drives the
+real CLI, the real git history and the real ledger: the convention
+and its refusal matrix (a missing, corrupt or schema-mismatched
+ledger is exit 2), the census and the keying laws, the ledger
+discipline (every sha spot-checked against the git object it names),
+the certification (the full census replays green), the regression
+alarm (a probe commit tagged into real history is caught with its
+error line quoted and cleaned up; every direction of ledger drift
+fails the verdict), the time-travel witness (the hand-computed
+agreement matrix over six sampled releases), the native differential
+over historical programs, and the corpus hygiene. The gate can run
+in pieces (`--sections 1,2` or `HLS_COMPAT_GATE_SECTIONS`) for CI
+step timeouts — a subset run says which sections it ran, never a
+silent skip.
+
+The suite's honest limits: a program that panicked under BOTH its
+own release and today (a persistent red the 101-is-green convention
+masked in both eras) agrees by convention and is not flagged; the
+witness samples by default rather than sweeping (the sweep is a
+one-time audit whose output is the ledger, re-runnable at will with
+`--time-travel all`); and the census's compatibility claim is about
+the interpreter-facing language and stdlib — historical snapshots are
+not compared, because outputs may drift for sanctioned reasons, which
+is precisely what the drift ledger exists to name.

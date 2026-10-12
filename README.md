@@ -207,6 +207,19 @@ python3 tools/hls-det.py examples/det_demo.hls   # Stage 127: certify a
 make det-acceptance           # Stage 127 gate: the determinism battery
                                # (hand-computed policy traces, fairness,
                                # deadlock parity, the honesty gates)
+python3 tools/hls-compat.py    # Stage 128: replay EVERY prior
+                               # version's ok corpus against today's
+                               # toolchain (170 release tags,
+                               # content-addressed, 24,591 instances ->
+                               # 326 unique programs; the ledger of
+                               # sanctioned drifts; --time-travel runs
+                               # a release's own interpreter beside
+                               # today's; --native adds the backend
+                               # differential; --update-ledger drafts)
+make compat-acceptance        # Stage 128 gate: the compatibility battery
+                               # (the census laws, the ledger discipline,
+                               # the regression alarm, the time-travel
+                               # witness, the native differential)
 
 # 13. Stage 15-alpha: Safe C FFI (v0.13.0-alpha)
 python3 boot/boot.py examples/ffi_demo.hls           # call libc functions
