@@ -273,6 +273,13 @@ class Parser:
             # flag; the checker requires #[secrets(...)] on the same
             # fn so the claim names what it covers.
             "ct": False,
+            # Stage 130 (v0.148.0-alpha): #[deprecated] /
+            # #[deprecated("msg")] — the deprecation notice the linter
+            # (L013 deprecated-call) warns about at call sites. None =
+            # not deprecated, "" = deprecated without a message, a
+            # string = deprecated with that message. Pure metadata:
+            # neither compiler emits a byte for it.
+            "deprecated": None,
             # Stage 109 (v0.128.0-alpha): the FFI taint marking. Both
             # are ONLY valid inside extern blocks — parse_attributes
             # (the fn/let attribute parser) rejects them explicitly so
@@ -546,6 +553,32 @@ class Parser:
                                  "per-function — one #[ct] is all a fn "
                                  "carries)", t0)
                     self.cur_attrs["ct"] = True
+                elif attr_name == "deprecated":
+                    # Stage 130 (v0.148.0-alpha): #[deprecated] /
+                    # #[deprecated("use other_thing instead")]. Marks
+                    # the fn deprecated: the linter's L013 rule warns
+                    # at every call site that survives the checker,
+                    # quoting the message; the compilers treat the
+                    # attribute as pure metadata (zero codegen — a
+                    # deprecated fn runs exactly like any other). The
+                    # message must be a string LITERAL: it is read at
+                    # parse time, before any value could exist.
+                    if self.cur_attrs["deprecated"] is not None:
+                        self.err("deprecated attribute appears more than "
+                                 "once on one function (a fn carries "
+                                 "exactly one deprecation notice)", t0)
+                    if self.at_sym("("):
+                        self.next()
+                        mt = self.peek()
+                        if mt["k"] != "str":
+                            self.err("deprecated expects a string literal "
+                                     "message but got %s" % self._desc(), mt)
+                        self.next()
+                        self.eat_sym(")")
+                        self.cur_attrs["deprecated"] = \
+                            mt["v"].decode("utf-8", "replace")
+                    else:
+                        self.cur_attrs["deprecated"] = ""
                 elif attr_name == "taint_source" or attr_name == "taint_sink":
                     # Stage 109 (v0.128.0-alpha): the FFI taint marking
                     # lives INSIDE extern blocks only — the boundary is
@@ -573,8 +606,9 @@ class Parser:
                              "inline(never), hot, cold, no_red_zone, "
                              "irq_handler, stack_size(N), tail_call, "
                              "panic_handler, section(\"NAME\"), align(N), "
-                             "secrets(NAMES), ct, and — inside extern "
-                             "blocks only — taint_source, taint_sink(ARGS))"
+                             "secrets(NAMES), ct, deprecated, and — inside "
+                             "extern blocks only — taint_source, "
+                             "taint_sink(ARGS))"
                              % attr_name, t0)
                 if self.at_sym(","):
                     self.next()
@@ -1159,7 +1193,8 @@ class Parser:
                           "hot": False, "cold": False,
                           "tail_call": False, "panic_handler": False,
                           "section": "", "align": -1,
-                          "secrets": [], "ct": False},
+                          "secrets": [], "ct": False,
+                          "deprecated": None},
                 # Stage 109 (v0.128.0-alpha): the FFI taint marking.
                 "taint_source": self.cur_attrs["taint_source"],
                 "taint_sinks": list(self.cur_attrs["taint_sinks"]),

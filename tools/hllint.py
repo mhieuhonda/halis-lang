@@ -35,6 +35,27 @@ Rules:
                               whole body every iteration — a large body
                               belongs in a helper the loop tail-calls,
                               not in the loop itself).
+  L013  deprecated-call       A call reaches a function the authors
+                              marked `#[deprecated]` or
+                              `#[deprecated("why")]` (Stage 130). The
+                              compilers treat the attribute as pure
+                              metadata — zero codegen, zero runtime
+                              cost — so this rule is the alarm: it
+                              quotes the deprecation message at every
+                              call site that survives the checker,
+                              across the whole merged crate (same-file
+                              fns, impl methods, imported modules).
+                              Three honesty rules: a call INSIDE a
+                              deprecated fn is silent (the caller is
+                              deprecated too); a METHOD name warns only
+                              when no non-deprecated method of the same
+                              short name exists (no receiver-type
+                              analysis means the ambiguous case stays
+                              silent rather than lying); a fn passed as
+                              a spawn / stream-combinator target warns
+                              through the same channel L002 uses.
+                              Not fixable: choosing the replacement is
+                              a design decision.
 
 Stage 118 (v0.137.0-alpha) — autofix mode. Eight of the twelve rules
 have a mechanical, semantics-preserving fix:
@@ -59,10 +80,13 @@ have a mechanical, semantics-preserving fix:
   L011  inline-always-large   delete the `#[inline(always)]` attribute
   L012  tail-call-large       delete the `#[tail_call]` attribute
 
-The remaining four need a human: L003 (deleting a field breaks
+The remaining five need a human: L003 (deleting a field breaks
 constructors and layout), L005 (choosing how to handle the error is a
 design decision), L008 (refactoring a long function is a design
-decision), L009 (never fires — the checker rejects shadowing).
+decision), L009 (never fires — the checker rejects shadowing), and
+L013 (choosing the replacement for a deprecated call is a design
+decision — the deprecation message names the intent, the call site
+names the context, and only the author has both).
 
 Usage:
   hllint FILE.hls              # print warnings to stdout, exit 0
@@ -126,6 +150,14 @@ RULES = {
     # should live in a helper that the small tail loop calls, not in
     # the loop itself. 30 statements keeps the hot path reviewable.
     "L012": ("tail-call-large",       "warning"),
+    # Stage 130 (v0.148.0-alpha): deprecated-call — warn at every call
+    # site that reaches a function the authors marked #[deprecated]
+    # (or #[deprecated("why")]), quoting the message. The compilers
+    # treat the attribute as pure metadata (a deprecated fn runs
+    # exactly like any other — deprecation is documentation, not
+    # behaviour); the linter is the alarm. Not fixable: choosing the
+    # replacement call is a design decision, exactly like L005/L008.
+    "L013": ("deprecated-call",       "warning"),
 }
 
 # Stage 118 (v0.137.0-alpha): the rules with a mechanical fix. Everything
@@ -298,7 +330,8 @@ def all_exprs_in_stmts(stmts):
 # ---------------------------------------------------------------------------
 
 class Linter:
-    def __init__(self, program, only_rules=None, path=None, source=None):
+    def __init__(self, program, only_rules=None, path=None, source=None,
+                 crate=None):
         self.program = program
         self.warnings = []
         self.only_rules = only_rules or set(RULES.keys())
@@ -309,6 +342,15 @@ class Linter:
         # possibly-stale file on disk.
         self.path = path
         self.source = source
+        # Stage 130: the UNFILTERED crate-merged program (None when the
+        # lint view fell back to a single-file parse). `self.program`
+        # is the ENTRY FILE's declarations only — the lint view's
+        # contract — but a deprecation registry must span the whole
+        # crate: a function deprecated in an imported module is exactly
+        # the case the warning exists for. L013 reads the registry from
+        # `self.crate` and reports call sites from `self.program`, so a
+        # warning still only ever names the file being linted.
+        self.crate = crate
         # Stage 118: rules that have a mechanical fix also emit a fix
         # HINT — a structured description of the edit (kind + the AST
         # nodes / byte spans involved). The fixer consumes hints, never
@@ -875,6 +917,127 @@ class Linter:
                                 "fname": fname, "short": fname.split(".")[-1],
                                 "line": fn.get("line", 0)})
 
+    def _rule_l013(self):
+        """Stage 130 (v0.148.0-alpha): deprecated-call — warn at every
+        call site that reaches a function marked #[deprecated] or
+        #[deprecated("why")].
+
+        The registry comes from the CRATE-MERGED program (via
+        self.crate), so a deprecation in an imported module is exactly
+        the case the rule catches; the call sites come from the entry
+        file's own fns (the lint view's contract — a warning names the
+        file being linted). The compilers treat #[deprecated] as pure
+        metadata — the warning is this rule's job and nothing else's.
+
+        Three honesty rules:
+        - a call site INSIDE a deprecated function is silent (the
+          caller is deprecated too — an old wrapper calling an older
+          primitive is normal during a migration, not a hazard to
+          report ten times over);
+        - a METHOD name warns only when no non-deprecated method of
+          the same short name exists anywhere in the crate (two
+          structs may both define `scale`; without a receiver-type
+          analysis the ambiguous case stays silent rather than lying);
+        - a function passed as a spawn/stream-combinator target warns
+          through the same spawn_fn / fn-name-argument channel L002
+          uses, so a deprecated worker cannot hide behind `spawn`.
+
+        Not fixable (no entry in FIXABLE_RULES): choosing the
+        replacement call is a design decision."""
+        registry = self.crate if self.crate is not None else self.program
+        dep_fns = {}       # plain fn name -> deprecation message
+        dep_methods = {}   # method short name -> message
+        plain_method_names = set()  # every method short name in the crate
+        deprecated_fn_keys = set()  # fn dict keys that ARE deprecated
+        for key, fn in registry["fns"].items():
+            attrs = fn.get("attrs") or {}
+            msg = attrs.get("deprecated")
+            if msg is None:
+                if fn.get("struct"):
+                    plain_method_names.add(fn["name"])
+                continue
+            deprecated_fn_keys.add(key)
+            if fn.get("struct"):
+                dep_methods[fn["name"]] = msg
+            else:
+                dep_fns[fn["name"]] = msg
+        if not deprecated_fn_keys:
+            return
+        # The ambiguous-method guard: a method name whose short form
+        # also exists as a NON-deprecated method somewhere in the
+        # crate stays silent (the receiver might be the live one).
+        dep_methods = {n: m for n, m in dep_methods.items()
+                       if n not in plain_method_names}
+        dep_names = dict(dep_fns)
+        dep_names.update(dep_methods)
+        if not dep_names:
+            return
+
+        reported = set()
+
+        def _warn_site(node, name, via):
+            line = node.get("line", 0)
+            mark = (line, name, via)
+            if mark in reported:
+                return
+            reported.add(mark)
+            msg = dep_names[name]
+            if msg:
+                self._warn("L013", line,
+                           "%s to deprecated %s'%s': %s"
+                           % (via, "method " if via == "call"
+                              and name in dep_methods else "",
+                              name, msg))
+            else:
+                self._warn("L013", line,
+                           "%s to deprecated %s'%s' (no deprecation "
+                           "message given)"
+                           % (via, "method " if via == "call"
+                              and name in dep_methods else "",
+                              name))
+
+        def _visit(node, via="call"):
+            if not isinstance(node, dict):
+                return
+            k = node.get("k")
+            if k in ("call", "method", "fieldcall"):
+                nm = node.get("name", "")
+                if nm in dep_names:
+                    _warn_site(node, nm, "call")
+                # The spawn family carries its fn TARGET in spawn_fn
+                # once the checker has run (it rewrote the args);
+                # the stream combinators keep the fn-name argument.
+                sf = node.get("spawn_fn")
+                if sf and sf in dep_names:
+                    _warn_site(node, sf, "call")
+                if k == "call" and nm in ("spawn", "async_spawn",
+                                          "gen_spawn", "stream_map_int",
+                                          "stream_filter_int",
+                                          "stream_flat_map_int",
+                                          "stream_fold_int"):
+                    args = node.get("args") or []
+                    idx = 0 if nm in ("spawn", "async_spawn",
+                                      "gen_spawn") else (
+                        2 if nm == "stream_fold_int" else 1)
+                    if len(args) > idx \
+                            and isinstance(args[idx], dict) \
+                            and args[idx].get("k") == "ident" \
+                            and args[idx].get("name") in dep_names:
+                        _warn_site(node, args[idx]["name"], "call")
+
+        for key, fn in self.program["fns"].items():
+            if key in deprecated_fn_keys:
+                # Honesty rule 1: a deprecated fn's own body is silent.
+                continue
+            for e in all_exprs_in_stmts(fn["body"]):
+                walk_expr(e, _visit)
+        # Struct field DEFAULT expressions can call too (the L002
+        # deep-scan-5 law).
+        for sname, sdef in self.program["structs"].items():
+            for _fname, _ftype, dflt in sdef["fields"]:
+                if dflt is not None:
+                    walk_expr(dflt, _visit)
+
 
 def _stmts_end_in_return(stmts) -> bool:
     """True iff the last statement of `stmts` is a `return` (or an
@@ -1217,6 +1380,7 @@ class Fixer:
         entry = self._entry_keys(src)
         status = self._crate_status(src)
         program = None
+        crate = None
         if entry is not None and self.path:
             # The entry's bytes are the in-memory `src` (which may be
             # mid-fix), so the candidate is spliced in via a temp file
@@ -1224,6 +1388,10 @@ class Fixer:
             merged = self._merged_view(src)
             if merged is not None:
                 program = merged
+                # Stage 130: the unfiltered crate view for the L013
+                # deprecation registry (the filtered `program` below
+                # keeps the lint view's entry-file-only contract).
+                crate = merged
         if program is None:
             # No crate to load (library use, or the crate cannot load —
             # a missing module, a cross-module duplicate). Fall back to
@@ -1244,7 +1412,8 @@ class Fixer:
                        "imports": program.get("imports", []),
                        "externs": program.get("externs", []),
                        "crate_attrs": program.get("crate_attrs", [])}
-        linter = Linter(program, only_rules=self.only_rules, source=src)
+        linter = Linter(program, only_rules=self.only_rules, source=src,
+                        crate=crate)
         warnings = linter.run()
         return warnings, linter.fix_hints, status
 
@@ -1813,7 +1982,20 @@ def main():
     except HLError as ex:
         sys.stderr.write("error: %s\n" % ex)
         return 1
-    linter = Linter(program, only_rules=only, path=args.file)
+    # Stage 130: the crate-merged view for the L013 deprecation
+    # registry — a `#[deprecated]` in an imported module is exactly
+    # the case the rule exists for. The registry needs names and
+    # attrs only, so the load (no check) is enough; a crate that
+    # cannot load (a missing module, a cross-module duplicate) falls
+    # back to the same-file registry, honestly.
+    crate = None
+    if args.file and os.path.isfile(args.file):
+        try:
+            from boot.boot import load_program
+            crate = load_program(os.path.abspath(args.file))
+        except (HLError, SystemExit, OSError, ValueError):
+            crate = None
+    linter = Linter(program, only_rules=only, path=args.file, crate=crate)
     warnings = linter.run()
     if not warnings:
         print("%s: no warnings" % args.file)
