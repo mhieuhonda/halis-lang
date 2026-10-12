@@ -13,6 +13,117 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.149.0-alpha] — Stage 131: semantic-versioning enforcement in `hls-pkg`
+- Stage 131 makes a version a CONTRACT. Until now the manifest's
+  `version` was an opaque string — a package could publish "1.0",
+  "final" or "2", and a dependency could pin `tag = "v2.0.0"` while
+  believing it asked for 1.x — and the only version arithmetic in the
+  tree (`hls-migrate`'s release-tag grammar) never reached the package
+  manager. The roadmap's phrase is the scope: "semantic-versioning
+  enforcement in `hls-pkg`". The new `tools/hpkg_parts/hpkg_semver.py`
+  implements SemVer 2.0.0 spec-correct — strict grammar (leading zeros
+  refused in the core AND in numeric pre-release identifiers),
+  precedence exactly per spec section 11 (the canonical chain
+  1.0.0-alpha < 1.0.0-alpha.1 < 1.0.0-alpha.beta < 1.0.0-beta <
+  1.0.0-beta.2 < 1.0.0-beta.11 < 1.0.0-rc.1 < 1.0.0, numeric <
+  alphanumeric, longer identifier lists beat their prefixes, build
+  metadata ignored) — and every place a version enters the toolchain
+  now goes through its laws.
+- **The requirement dialect.** A dependency may declare
+  `version = "<req>"` in its source table (`hls-pkg add --version`).
+  The dialect: caret (the first NON-ZERO component pins — ^1.2.3 is
+  >=1.2.3 <2.0.0, ^0.2.3 clamps to 0.2.x, ^0.0.3 admits exactly the
+  patch), tilde (patch floats, minor does not), the five comparators
+  with FULL bounds (a partial after `>=` is refused BY NAME — whether
+  1.2.0 itself satisfies >=1.2 is exactly the ambiguity a package
+  manager must not guess), wildcards (`*`, `1.x`, `1.2.*`), bare
+  partials (1.2 means >=1.2.0 <1.3.0), hyphen ranges (the upper
+  partial floats: 1.2.3 - 2.0 is >=1.2.3 <2.1.0), and space/comma
+  conjunctions. `||` alternatives are refused by name — a requirement
+  is one conjunction, and a resolver that picks between alternatives
+  is a resolver that lies. Pre-releases are OPT-IN (npm's rule): a
+  pre-release version satisfies a requirement only when some
+  comparator carries a pre-release tag on the same (major, minor,
+  patch) tuple, so ^1.2.3 never pulls 1.3.0-beta by accident, `=1.2.3`
+  never admits 1.2.3-beta, and `*` admits nothing pre-release at all.
+- **The enforcement points.** `add --version` checks the grammar at
+  the keyboard, before it reaches the manifest. `lock` validates the
+  package's own version and every requirement BEFORE anything
+  resolves, then judges each pinned ref: a semver tag directly
+  (v1.4.0 green under ^1.4, v2.0.0 refused, a non-semver tag refused —
+  a requirement that cannot be CHECKED is a refusal, not a warning),
+  and a moving ref (branch/main/path) by the dependency's own
+  manifest version (a branch that carries no manifest has nothing to
+  check a requirement against — refusal, named). The lockfile records
+  the requirement beside the pin. `build` applies the same validation
+  before a single line compiles. `verify` re-checks every entry
+  against its recorded requirement AND against the manifest's CURRENT
+  requirement — an edit after the lock is drift, and drift is a
+  verification failure naming both texts; a lockfile entry with no
+  requirement under a demanding manifest (a lock predating this
+  stage) fails too; a tampered lockfile version fails the
+  satisfaction re-check that the content hash cannot make. `publish`
+  REQUIRES a version (the silent "0.0.0" fallback is gone — a
+  publish must name its version) and enforces the immutability law:
+  name@version is a contract with the content it was first published
+  with, an identical republish no-ops the LEDGER (it is not spammed;
+  CI stays idempotent) while still recording the op for the audit
+  trail (quoting the seq it matched), and different content under the
+  same version is a hard refusal naming both hashes — semver requires
+  a bump, not a rewrite. Build metadata does not change the identity
+  (spec section 10): 0.3.0+x IS 0.3.0.
+- **The laws as a CLI.** `hls-pkg semver check | cmp | bump | sat` —
+  the same grammar, precedence and satisfaction the manifest
+  enforcement uses, reachable from scripts and CI without a manifest.
+  Exit-code convention (matching hls-migrate): 2 is usage/convention,
+  1 is a refusal or a negative verdict, 0 is green. Every refusal
+  names the grammar or the offending token; none says bare "invalid".
+- **Two prerequisite fixes, earned by the gate.** The gate's happy
+  path (a real clone, a semver tag, a requirement, a pure dep, an
+  empty allowed set) could not go green until two pre-existing bugs
+  died. `resolve_dependency` checked `path` before `git`, so the
+  DOCUMENTED shape `{ git = "...", path = "src/math.hls",
+  tag = "v1.0.0" }` resolved as a REPO-ROOT path dep — the clone
+  never happened, the tag was never checked out, and no requirement
+  could ever see its pinned ref; a git source now takes the git
+  branch (the in-clone path semantics the docstring always claimed),
+  bare path deps are unchanged. And `extract_effects`' fail-closed
+  heuristic fired on ANY non-empty audit output — the audit trailer
+  always mentions effect names — so a dependency that audited CLEAN
+  and PURE was recorded as using the whole effect family, and the
+  documented init/add/lock workflow died in the effect wall; the
+  heuristic's real job is catching ZERO parsed rows (format drift),
+  which is what it now checks, and an unauditable dep still lands in
+  the full fail-closed set (the gate pins both sides). Isolation
+  support rode along: `HLS_PKG_TRANSPARENCY_LOG` and `HLS_PKG_CACHE`
+  override the ledger and the clone cache (opt-in; defaults
+  unchanged) — a gate that appended its publishes into the
+  developer's real ledger would both pollute it and depend on it.
+- `tests/ok/feat_stage131_semver.hls` pins the laws in the ok corpus
+  as a pure-HLS program: the no-leading-zero grammar (0 is legal,
+  01 is not — and 01 sorting as 1 is the accident the law refuses),
+  numeric core precedence (9 < 10 < 100, the string sort that ranks
+  "10" below "9" being the bug every changelog tool eventually
+  ships), the pre-release identifier lattice (numeric-first
+  encoding, alpha < alpha.1, beta.2 < beta.11, everything below its
+  own release), the bump resets (bumped component rises, everything
+  below zeroes, the pre-release drops), and the caret clamps
+  (^1.2.3 / ^0.2.3 / ^0.0.3). Green the day it is born; the
+  differential suite runs it on the interpreter AND natively, byte
+  for byte.
+- Acceptance (`make semver-acceptance`): 8 sections, 97 checks over
+  the REAL hls-pkg CLI, the REAL enforcement module (imported for the
+  unit laws), a REAL local git dep repo (two semver tags, a
+  non-semver tag, a manifest-less main branch) and an isolated
+  ledger/cache/audit-log: the CLI convention, the grammar and
+  precedence law, the requirement dialect with its refusal matrix,
+  the manifest enforcement (lock/build/add), the publish laws, the
+  verify drift law, the pure-dep correction (both sides), and the
+  corpus showcase (checker, interpreter, native differential,
+  fmt-canonical, lint-clean). The gate runs inside its own temp root
+  under the repo (path deps are confined to the repo root by design;
+  the gate honours that) and cleans up after itself.
+
 ## [v0.148.0-alpha] — Stage 130: deprecation mechanism (`@deprecated` attribute + lint)
 - Stage 130 lands the first language-level tool of the run toward the
   API freeze: `#[deprecated]` and `#[deprecated("why")]` on a function

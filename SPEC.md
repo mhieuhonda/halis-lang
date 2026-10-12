@@ -1318,11 +1318,25 @@ allowed set, the lock fails.
 ### 22.1. Commands
 
 - `hls-pkg init NAME` — create a new package skeleton.
-- `hls-pkg add NAME GIT PATH [--tag T | --branch B]` — add a git dep.
-- `hls-pkg lock` — resolve deps, compute SHA-256, write `hls-pkg.lock`.
+- `hls-pkg add NAME GIT PATH [--tag T | --branch B] [--version REQ]`
+  — add a git dep; `--version` records a semver requirement
+  (Stage 131, v0.149.0-alpha), grammar-checked before it reaches the
+  manifest.
+- `hls-pkg lock` — resolve deps, compute SHA-256, write
+  `hls-pkg.lock`; validates every version and requirement first, and
+  refuses a pinned ref that does not satisfy its requirement.
 - `hls-pkg audit` — print the total effect report of the dep tree.
-- `hls-pkg verify` — verify lockfile SHA-256 hashes still match.
-- `hls-pkg build [--entry main.hls]` — compile the package.
+- `hls-pkg verify` — verify lockfile SHA-256 hashes still match, the
+  recorded requirements still hold, and the manifest has not drifted
+  since the lock.
+- `hls-pkg build [--entry main.hls]` — compile the package (versions
+  and requirements validated first).
+- `hls-pkg semver check|cmp|bump|sat` — the semver laws as a CLI
+  (Stage 131). `check VERSION` exits 0 valid / 1 invalid (the failing
+  clause is named); `cmp A B` prints -1/0/1 by spec §11 precedence
+  (build metadata ignored); `bump major|minor|patch VERSION` prints
+  the bumped version (pre-release and build drop);
+  `sat VERSION REQ` exits 0 satisfied / 1 not / 2 malformed.
 
 ### 22.2. Manifest format (`hls-pkg.toml`)
 
@@ -1333,15 +1347,61 @@ version = "0.1.0"
 
 [dependencies]
 std.str = { git = "https://github.com/.../halis-lang.git", path = "std/str.hls" }
+mymath  = { git = "https://github.com/foo/bar.git", path = "src/math.hls",
+            tag = "v1.4.0", version = "^1.4" }
 
 [effects]
 allowed = []   # empty = pure library
 ```
 
+`[package].version` must be a valid semantic version
+(`MAJOR.MINOR.PATCH[-PRERELEASE][+BUILD]`, semver 2.0.0 — no leading
+zeros in the core or in numeric pre-release identifiers). `lock`,
+`build` and `publish` refuse a manifest whose own version does not
+parse; `publish` additionally requires one (there is no silent
+fallback).
+
+A dependency's `version` field is a REQUIREMENT (Stage 131). The
+dialect: caret `^1.2.3` (>=1.2.3 <2.0.0; the first non-zero component
+pins: `^0.2.3` -> <0.3.0, `^0.0.3` -> <0.0.4), tilde `~1.2.3`
+(>=1.2.3 <1.3.0), comparators `>= > <= < =` (a FULL bound is
+required — a partial after a comparator is refused by name),
+wildcards `*`, `1.x`, `1.2.*`, bare partials (`1.2` means
+>=1.2.0 <1.3.0), hyphen ranges `1.2.3 - 2.0` (>=1.2.3 <2.1.0), and
+space/comma separated conjunctions. `||` alternatives are refused.
+A pre-release version satisfies a requirement only when some
+comparator carries a pre-release tag on the same (major, minor,
+patch) tuple — `^1.2.3` never matches `1.3.0-beta`, and `*` matches
+nothing pre-release.
+
+`lock` enforces the requirement against the pinned ref: a semver tag
+directly (one optional leading `v` is stripped), a moving ref
+(branch/main/path) via the dependency's own manifest version. A
+requirement that cannot be checked (non-semver tag, manifest-less
+branch) is a refusal, not a warning.
+
+`publish` enforces the immutability law: a name@version already in
+the transparency log with DIFFERENT content is refused (semver
+requires a bump, not a rewrite); identical content republishes as a
+no-op (no second ledger row; the op is still recorded in the audit
+log). Build metadata does not change the identity — 1.2.3+a and
+1.2.3+b are one version.
+
 ### 22.3. Lockfile format (`hls-pkg.lock`, JSON)
 
-Records per-package: `name`, `source`, `sha256`, `effects`,
+Records per-package: `name`, `source`, `version` (the resolved tag /
+branch), `requirement` (the recorded semver requirement, when the
+dependency declares one), `sha256`, `effects`,
 `transitive_effects`, `resolved_path`.
+
+`hls-pkg verify` re-checks the requirement law: the lockfile's
+recorded requirement must equal the manifest's current one (drift is
+a failure naming both texts), and the resolved version must still
+satisfy it.
+
+The ledger and the clone cache honour `HLS_PKG_TRANSPARENCY_LOG` and
+`HLS_PKG_CACHE` overrides (Stage 131) — opt-in isolation for tests
+and parallel CI; the defaults are unchanged.
 
 ## 23. Developer tooling (Stage 14-alpha — v0.12.0-alpha)
 

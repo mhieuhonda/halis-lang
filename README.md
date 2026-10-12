@@ -240,6 +240,19 @@ make deprecated-acceptance    # Stage 130 gate: the deprecation battery
                                # (both front-ends refuse the bad forms,
                                # zero codegen, the lint honesty rules, the
                                # pinned corpus census)
+python3 tools/hls-pkg.py semver cmp 1.0.0-alpha 1.0.0   # Stage 131:
+                               # semantic-versioning enforcement —
+                               # spec-correct check/cmp/bump/sat, plus
+                               # `version = "^1.4"` requirements on
+                               # dependencies enforced by lock/verify,
+                               # and publish immutability (a version
+                               # already published with different
+                               # content is a refusal)
+make semver-acceptance        # Stage 131 gate: the semver battery
+                               # (grammar, precedence, the requirement
+                               # dialect, manifest enforcement over a
+                               # real git dep, publish immutability,
+                               # verify drift)
 
 # 13. Stage 15-alpha: Safe C FFI (v0.13.0-alpha)
 python3 boot/boot.py examples/ffi_demo.hls           # call libc functions
