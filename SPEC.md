@@ -8669,3 +8669,87 @@ named, MANUAL skips named), and the corpus hygiene. The gate can run
 in pieces (`--sections` or `HLS_MIGRATE_GATE_SECTIONS`) for CI step
 timeouts — a subset run says which sections it ran, never a silent
 skip.
+
+
+## 70. The deprecation mechanism (Stage 130 — v0.148.0-alpha)
+
+An API that cannot be retired cannot be frozen. Stage 130 adds the
+language's deprecation mechanism — `#[deprecated]` and
+`#[deprecated("why")]` on a function declaration — so the run toward
+the v1.0 API freeze has a way to mark the surfaces that will not
+survive it, and the users of those surfaces a machine-readable warning
+at the exact call sites that would break.
+
+### 70.1. The attribute
+
+The attribute takes two forms: bare (`#[deprecated]`, no message) and
+the message form (`#[deprecated("use fast_path(v) — the old form
+double-counts zero")]`). The message must be a string LITERAL: the
+notice is read at parse time, before any value could exist — the same
+argument the `#[section]` name makes. A function carries exactly one
+notice; two lists disagree about the reason, and the notice is the
+contract the linter quotes. Extern declarations refuse the attribute
+(the C declaration is the contract, not ours to deprecate), and the
+let-binding grammar refuses it by name (a let binding has no call
+sites to watch). The message's escapes decode with the lexer's own
+four-escape rules — the linter quotes what the source said.
+
+### 70.2. Pure metadata, both front-ends
+
+Both compilers parse the attribute and both treat it as pure
+metadata: the emitted C carries nothing for it, and a deprecated
+function runs exactly like any other on the interpreter and natively.
+Deprecation is documentation, not behaviour — a call to a deprecated
+function is not an error, which is what makes the mechanism usable
+mid-migration. The boot parser and the self-hosted parser carry the
+same forms and the same refusals; the differential suite runs the
+same three refusal fixtures (a non-literal message, a duplicated
+notice, a let-binding placement) through both and matches the core
+messages. The self-compile fixed point holds: the self-hosted
+compiler compiles itself with the attribute code in place.
+
+### 70.3. L013 — deprecated-call
+
+The linter is the alarm. `hllint`'s L013 rule warns at every call
+site that reaches a deprecated function, quoting the message (the
+bare form says "no deprecation message given" instead of inventing
+one). The registry spans the whole merged crate — a deprecation in an
+imported module is exactly the case the rule exists for — while the
+call sites come from the entry file's own functions: a warning names
+the file being linted, never the module's own. Three honesty rules:
+
+- a call site INSIDE a deprecated function is silent — the caller is
+  deprecated too, and a migration's own scaffolding must not drown in
+  its warnings;
+- a METHOD name warns only when no non-deprecated method of the same
+  short name exists anywhere in the crate — two structs may both
+  define `scale`, and without a receiver-type analysis the ambiguous
+  case stays silent rather than lying; the unambiguous case warns
+  with the `method` qualifier;
+- a function passed as a spawn / stream-combinator target warns
+  through the same channel L002 uses, so a deprecated worker cannot
+  hide behind `spawn(fn)`.
+
+The rule is not fixable: choosing the replacement call is a design
+decision — the deprecation message names the intent, the call site
+names the context, and only the author has both. `hllint --fix`
+leaves a deprecated-call file byte-identical. The formatter preserves
+both attribute forms byte for byte.
+
+### 70.4. What the tests prove
+
+`tests/ok/feat_stage130_deprecated.hls` (with its imported sibling
+`tests/ok/modules/depmod.hls`) pins the contract in the ok corpus:
+both forms, live replacements that agree with their deprecated twins,
+a deprecated wrapper whose own body stays silent, and an exact
+five-warning L013 census documented in the file itself. Three
+refusal fixtures in `tests/fail/` are rejected by both front-ends
+with the same core message. `examples/deprecated_demo.hls` runs the
+demo. `make deprecated-acceptance` (8 sections) is the gate: the
+convention and its refusals, the parse laws, the self-hosted parity
+(zero codegen, the fixed point), the same-file lint, the cross-module
+lint, the honesty gates, the differential (the fixture byte-identical
+across backends), and the corpus hygiene. The gate can run in pieces
+(`--sections` or `HLS_DEPRECATED_GATE_SECTIONS`) for CI step
+timeouts — a subset run says which sections it ran, never a silent
+skip.

@@ -231,6 +231,15 @@ make migrate-acceptance       # Stage 129 gate: the migration battery
                                # (the plan census over the real bed, the
                                # walk with backups and verify, the version
                                # gate, idempotence, the honesty rules)
+python3 tools/hllint.py        # Stage 130: L013 deprecated-call — a call
+    examples/deprecated_demo.hls  # to a fn marked #[deprecated("why")]
+                               # quotes the message at every call site,
+                               # across imports; the compilers treat the
+                               # attribute as pure metadata (zero codegen)
+make deprecated-acceptance    # Stage 130 gate: the deprecation battery
+                               # (both front-ends refuse the bad forms,
+                               # zero codegen, the lint honesty rules, the
+                               # pinned corpus census)
 
 # 13. Stage 15-alpha: Safe C FFI (v0.13.0-alpha)
 python3 boot/boot.py examples/ffi_demo.hls           # call libc functions

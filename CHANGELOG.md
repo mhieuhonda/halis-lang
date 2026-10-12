@@ -13,6 +13,89 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.148.0-alpha] — Stage 130: deprecation mechanism (`@deprecated` attribute + lint)
+- Stage 130 lands the first language-level tool of the run toward the
+  API freeze: `#[deprecated]` and `#[deprecated("why")]` on a function
+  declaration. The attribute is a PROMISE the language records and the
+  toolchain enforces only as far as it honestly can: both front-ends
+  parse it (the boot parser and the self-hosted parser carry the same
+  forms, the same string-literal rule and the same refusals — the
+  differential suite runs the same three refusal fixtures through
+  `boot --check` and `bin/hlc` and matches the core messages), the
+  compilers treat it as pure METADATA (the emitted C carries nothing
+  for it — a deprecated function runs exactly like any other, on both
+  backends), and the LINTER is the alarm: `hllint` grows L013
+  `deprecated-call`, which warns at every call site that reaches a
+  deprecated function and quotes the message. The roadmap's own
+  phrasing is the scope: "attribute + lint".
+- **The forms and the refusals.** The bare `#[deprecated]` carries no
+  message; `#[deprecated("use fast_path(v) — the old form
+  double-counts zero")]` carries one, and it must be a string LITERAL
+  (the notice is read at parse time, before any value could exist —
+  the same argument `#[section]` makes; `#[deprecated(42)]` is a
+  named parse error in both front-ends). A function carries exactly
+  ONE notice (two lists disagree about the reason; the notice is the
+  contract the linter quotes, and a contract cannot have two texts).
+  Extern declarations refuse it (the C declaration is the contract,
+  not ours to deprecate), and the let-binding grammar refuses it by
+  name (a let has no call sites to watch). The message's escapes
+  decode with the lexer's own four-escape rules — the linter quotes
+  what the source said, never a guess.
+- **L013 deprecated-call.** The registry spans the whole merged crate
+  — a deprecation in an IMPORTED module is exactly the case the
+  warning exists for (the lint view's entry-file-only contract still
+  holds: a warning names the file being linted, never the module's
+  own). Three honesty rules, each earned the hard way in review: a
+  call site INSIDE a deprecated function is silent (the caller is
+  deprecated too — an old wrapper calling an older primitive is
+  normal during a migration, not a hazard to report ten times over);
+  a METHOD name warns only when no non-deprecated method of the same
+  short name exists anywhere in the crate (two structs may both
+  define `scale`; without a receiver-type analysis the ambiguous case
+  stays silent rather than lying — the unambiguous case warns with
+  the `method` qualifier); and a function passed as a spawn /
+  stream-combinator target warns through the same channel L002 uses,
+  so a deprecated worker cannot hide behind `spawn(fn)`. The rule is
+  NOT fixable — choosing the replacement call is a design decision
+  (the deprecation message names the intent, the call site names the
+  context, and only the author has both) — so `hllint --fix` leaves a
+  deprecated-call file byte-identical and says so.
+- **Zero-cost by construction.** The attribute is documentation, not
+  behaviour: the emitted C contains no deprecation machinery (the
+  acceptance gate greps the compiled showcase and finds nothing but
+  the program's own message literal), the self-compile fixed point
+  holds (the self-hosted compiler compiles ITSELF with the attribute
+  code in place), and `hlfmt` preserves both forms byte for byte. A
+  deprecated call is not an error — the program runs green on the
+  interpreter and natively, byte-identically, which is what makes the
+  mechanism usable mid-migration.
+- `tests/ok/feat_stage130_deprecated.hls` (with its imported sibling
+  `tests/ok/modules/depmod.hls`) pins the contract in the ok corpus:
+  both attribute forms, live replacements that agree with their
+  deprecated twins, a deprecated wrapper whose own body stays silent,
+  and the exact five-warning L013 census documented at the bottom of
+  the file — three same-file sites and two cross-module ones. The
+  fixture is green the day it is born; its census is part of the
+  corpus from now on, so any change that adds or drops a warning
+  there must say so in the same commit. Three refusal fixtures join
+  `tests/fail/` (the non-literal message, the duplicated notice, the
+  let-binding placement), each rejected by BOTH front-ends with the
+  same core message. `examples/deprecated_demo.hls` runs the demo
+  (two warnings, one green program).
+- Acceptance (`make deprecated-acceptance`): 8 sections over BOTH
+  front-ends, the linter and the formatter — the convention and its
+  refusal matrix, the parse laws (imported: the AST forms, the
+  escape decoding, the refusals), the self-hosted parity (zero
+  codegen, the fixed point), the same-file lint (line precision, the
+  suppression rules, --rule/--strict), the cross-module lint (the
+  registry across imports, the method honesty rules), the honesty
+  gates (--fix neutrality, hlfmt preservation, the broken-crate
+  fallback), the differential (the fixture byte-identical across
+  backends, the pinned census), and the corpus hygiene. The gate can
+  run in pieces (`--sections 1,2` or `HLS_DEPRECATED_GATE_SECTIONS`)
+  for CI step timeouts — a subset run says which sections it ran,
+  never a silent skip.
+
 ## [v0.147.0-alpha] — Stage 129: migration tooling (`hls migrate`)
 - Stage 129 is the other half of the bargain Stage 128 struck. The
   compat suite measures compatibility — it replays every prior
