@@ -1,0 +1,350 @@
+# feat_stage129_migrate.hls — Stage 129 (v0.147.0-alpha): the
+# migration tool (`hls migrate`).
+#
+# What the differential suite pins HERE is the arithmetic the codemod
+# lives on — the same laws `tools/hls-migrate.py` applies when it walks
+# a v0.34-era tree to today:
+#
+#   python3 tools/hls-migrate.py <path> --from v0.34.0-alpha --to v1.0
+#
+#   hls-migrate: 4 rules fire (the two pre-v0.34 dialects are gated off)
+#   hls-migrate: N findings (X auto, Y manual)  — exit 1 until applied
+#
+# The program: the version-gate law (a rule fires when the source
+# dialect predates its breaking change — `since > --from`; the roadmap
+# phrase gates OFF exactly two of the six real rules), the migration
+# verdict lattice (CLEAN, AUTO, MANUAL, GATED), the re-rendering laws
+# the auto-edits produce (the hex64 full word — carried here as
+# `mig_hex64`, the reference rendering the hex64-word rule re-renders
+# every golden to, nibble for nibble the core.section definition — the
+# spec XXH64 digests, the html_escape forward-slash golden), and the
+# honesty law (a '..' import is MANUAL advice, never a rewrite).
+#
+# This file enters the corpus at this release — green the day it is
+# born, and already written in the dialect every rule migrates TO.
+
+import "std.hash"
+import "std.html"
+import "std.str"
+
+# ----------------------------------------------------------------------
+# The migration verdict lattice, as a value: what the tool reports per
+# finding, and what it means for the walk.
+# ----------------------------------------------------------------------
+enum Verdict {
+    Clean,
+    Auto,
+    Manual,
+    Gated
+}
+
+fn verdict_str(v: Verdict) -> str {
+    return match v {
+        Verdict.Clean => "CLEAN",
+        Verdict.Auto => "AUTO",
+        Verdict.Manual => "MANUAL",
+        Verdict.Gated => "GATED"
+    }
+}
+
+# The lattice is compared through its code (match-driven — the enum
+# form of eq), so the gate's decisions assert as int equality.
+fn verdict_code(v: Verdict) -> int {
+    return match v {
+        Verdict.Clean => 0,
+        Verdict.Auto => 1,
+        Verdict.Manual => 2,
+        Verdict.Gated => 3
+    }
+}
+
+# ----------------------------------------------------------------------
+# The version gate, as arithmetic: a release tag is (major, minor,
+# patch) and a rule fires when the source dialect --from predates the
+# rule's breaking change. The six real rules with their real since
+# versions, oldest first.
+# ----------------------------------------------------------------------
+fn version_key(major: int, minor: int, patch: int) -> int {
+    return(major * 100000 + minor * 1000 + patch) * 10
+}
+
+fn since_html_escape() -> int {
+    return version_key(0, 8, 0)
+}
+
+fn since_rename() -> int {
+    return version_key(0, 20, 0)
+}
+
+fn since_import_guard() -> int {
+    return version_key(0, 51, 1)
+}
+
+fn since_xxh64_spec() -> int {
+    return version_key(0, 82, 0)
+}
+
+fn since_asm_width() -> int {
+    return version_key(0, 102, 0)
+}
+
+fn since_hex64_word() -> int {
+    return version_key(0, 103, 0)
+}
+
+# The gate: AUTO (the rule fires — the source predates the change)
+# when since > --from; GATED (the source already carries it) otherwise.
+fn gate(from_key: int, since_key: int) -> Verdict {
+    if since_key > from_key {
+        return Verdict.Auto
+    }
+    return Verdict.Gated
+}
+
+fn test_gate() -> int uses IO {
+    let a: int = verdict_code(Verdict.Auto)
+    let g: int = verdict_code(Verdict.Gated)
+    # v0.1.0-alpha: the whole history is ahead of the source — all six
+    # rules fire.
+    let v0: int = version_key(0, 1, 0)
+    if verdict_code(gate(v0, since_html_escape())) != a {
+        return 1
+    }
+    if verdict_code(gate(v0, since_rename())) != a {
+        return 2
+    }
+    if verdict_code(gate(v0, since_import_guard())) != a {
+        return 3
+    }
+    if verdict_code(gate(v0, since_xxh64_spec())) != a {
+        return 4
+    }
+    if verdict_code(gate(v0, since_asm_width())) != a {
+        return 5
+    }
+    if verdict_code(gate(v0, since_hex64_word())) != a {
+        return 6
+    }
+    # The roadmap phrase: hls migrate v0.34 -> v1.0. The two pre-v0.34
+    # dialects are gated OFF; the four post-v0.34 rules fire.
+    let v34: int = version_key(0, 34, 0)
+    if verdict_code(gate(v34, since_html_escape())) != g {
+        return 7
+    }
+    if verdict_code(gate(v34, since_rename())) != g {
+        return 8
+    }
+    if verdict_code(gate(v34, since_import_guard())) != a {
+        return 9
+    }
+    if verdict_code(gate(v34, since_xxh64_spec())) != a {
+        return 10
+    }
+    if verdict_code(gate(v34, since_asm_width())) != a {
+        return 11
+    }
+    if verdict_code(gate(v34, since_hex64_word())) != a {
+        return 12
+    }
+    # A v0.101 dialect carries everything through xxh64-spec; both
+    # Stage 83/85 rules are still ahead of it, the spec fix is behind.
+    let v101: int = version_key(0, 101, 0)
+    if verdict_code(gate(v101, since_asm_width())) != a {
+        return 13
+    }
+    if verdict_code(gate(v101, since_hex64_word())) != a {
+        return 14
+    }
+    if verdict_code(gate(v101, since_xxh64_spec())) != g {
+        return 15
+    }
+    println("  gate OK: " + verdict_str(Verdict.Auto) + "/"
+    + verdict_str(Verdict.Gated) + " split at v0.34 = 4/2")
+    return 0
+}
+
+# ----------------------------------------------------------------------
+# The hex64 word law (Stage 85): the full 16-digit unsigned rendering
+# is the form the hex64-word rule re-renders every golden to. This is
+# the reference implementation the rule mirrors — nibble for nibble
+# the core.section definition (a signed int64 is rendered as its
+# 64-bit two's-complement pattern, computed nibble by nibble because
+# 2^64 does not fit an int64).
+# ----------------------------------------------------------------------
+fn hex_digit(d: int) -> str {
+    if d < 10 {
+        return chr(48 + d)
+    }
+    return chr(97 + d - 10)
+}
+
+fn mig_hex64(v: int) -> str {
+    let mut n: int = v
+    let mut ds: list[int] = []
+    let mut i: int = 0
+    while i < 16 {
+        ds.push(int_and(n, 15))
+        n = int_shr(n, 4)
+        i = i + 1
+    }
+    let mut out: str = "0x"
+    let mut k: int = 15
+    while k >= 0 {
+        out = out + hex_digit(ds.get(k))
+        k = k - 1
+    }
+    return out
+}
+
+fn test_hex64() -> int {
+    # "0x0" (the pre-Stage 85 minimal form) migrates to the full word:
+    if mig_hex64(0) != "0x0000000000000000" {
+        return 1
+    }
+    # "0xff" — the same digits, zero-padded to the word:
+    if mig_hex64(255) != "0x00000000000000ff" {
+        return 2
+    }
+    # "-0x1" — the pre-85 negative form — is the two's-complement word:
+    if mig_hex64(-1) != "0xffffffffffffffff" {
+        return 3
+    }
+    # Above 2^63 the int arrives negative; the word is still the word:
+    if mig_hex64(-9223372036854775807 - 1) != "0x8000000000000000" {
+        return 4
+    }
+    if mig_hex64(4611686018427387904) != "0x4000000000000000" {
+        return 5
+    }
+    # The reference agrees with the stdlib where they meet (the boot
+    # corpus pins hex64 itself; here the LAW is the value):
+    if mig_hex64(65535) != "0x000000000000ffff" {
+        return 6
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------
+# The XXH64 digest law (v0.82.0-alpha): the five libxxhash-0.8.3
+# vectors the std.hash corpus has pinned since the spec fix — the same
+# values the xxh64-spec rule recomputes a wrong pinned digest into.
+# The tool's own Python carries the identical algorithm; this fixture
+# pins the values it must produce.
+# ----------------------------------------------------------------------
+fn test_xxh64() -> int {
+    # XXH64("", 0) = 0xef46db3751d8e999
+    if xxhash_str("") != -1205034819632174695 {
+        return 1
+    }
+    # XXH64("a", 0) = 0xd24ec4f1a98c6e5b
+    if xxhash_str("a") != -3292477735350538661 {
+        return 2
+    }
+    # XXH64("hello", 0) — the vector the migration bed pins:
+    if xxhash_str("hello") != 2794345569481354659 {
+        return 3
+    }
+    # The accumulator + merge paths ("a" * 32, "a" * 64):
+    let s32: str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    if xxhash_str(s32) != -8831976466377237801 {
+        return 4
+    }
+    let s64: str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    if xxhash_str(s64) != -1379396020616355102 {
+        return 5
+    }
+    # A seeded digest differs from the unseeded one:
+    if xxhash_str("hello") == xxhash_str_seeded("hello", 42) {
+        return 6
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------
+# The html_escape golden law (v0.8.0-alpha): the forward slash is
+# escaped — the exact re-rendering the html-escape-slash rule applies
+# to a pre-slash golden like "</b>".
+# ----------------------------------------------------------------------
+fn test_html_escape() -> int {
+    if html_escape("</b>") != "&lt;&#x2F;b&gt;" {
+        return 1
+    }
+    if html_escape("<script>") != "&lt;script&gt;" {
+        return 2
+    }
+    if html_escape("a/b") != "a&#x2F;b" {
+        return 3
+    }
+    if html_escape("plain") != "plain" {
+        return 4
+    }
+    # The unescape round-trips (html_unescape decodes &#x2F; too):
+    if html_unescape(html_escape("</b>")) != "</b>" {
+        return 5
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------
+# The honesty law: the import guard's two verdicts. An absolute path
+# is AUTO (rewritten relative to the importer); a '..' segment is
+# MANUAL — reported with the reason, never rewritten, because
+# rewriting one would silently change what the program loads. As a
+# value: the guard's decision table.
+# ----------------------------------------------------------------------
+enum ImportForm {
+    RelativeDown,
+    Absolute,
+    UpTraversal
+}
+
+fn guard_verdict(form: ImportForm) -> Verdict {
+    return match form {
+        ImportForm.RelativeDown => Verdict.Clean,
+        ImportForm.Absolute => Verdict.Auto,
+        ImportForm.UpTraversal => Verdict.Manual
+    }
+}
+
+fn test_guard() -> int {
+    let c: int = verdict_code(Verdict.Clean)
+    let a: int = verdict_code(Verdict.Auto)
+    let m: int = verdict_code(Verdict.Manual)
+    if verdict_code(guard_verdict(ImportForm.RelativeDown)) != c {
+        return 1
+    }
+    if verdict_code(guard_verdict(ImportForm.Absolute)) != a {
+        return 2
+    }
+    if verdict_code(guard_verdict(ImportForm.UpTraversal)) != m {
+        return 3
+    }
+    return 0
+}
+
+fn main() -> int uses IO {
+    println("stage 129: hls migrate")
+    let mut r: int = test_gate()
+    if r != 0 {
+        return 10 + r
+    }
+    r = test_hex64()
+    if r != 0 {
+        return 20 + r
+    }
+    r = test_xxh64()
+    if r != 0 {
+        return 30 + r
+    }
+    r = test_html_escape()
+    if r != 0 {
+        return 40 + r
+    }
+    r = test_guard()
+    if r != 0 {
+        return 50 + r
+    }
+    println("  migrate laws OK: gate, hex64 word, XXH64 digests, "
+    + "html golden, guard verdicts")
+    return 0
+}
