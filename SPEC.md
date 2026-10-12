@@ -8813,3 +8813,145 @@ across backends), and the corpus hygiene. The gate can run in pieces
 (`--sections` or `HLS_DEPRECATED_GATE_SECTIONS`) for CI step
 timeouts — a subset run says which sections it ran, never a silent
 skip.
+
+## 71. The LTS branch policy — backport-only after v1.0 (Stage 132 — v0.150.0-alpha)
+
+After v1.0 the project maintains LTS release branches. An LTS
+branch that accepts whatever lands on it is not an LTS branch — it
+is main with a longer name. `tools/hls-lts.py` turns the policy
+into an executable contract with three laws, each enforced at the
+point where a change would enter the branch: **backport-only**,
+**patch-only**, and **fail-closed**.
+
+### 71.1. The declaration
+
+- `hls-lts init --tag v1.0.0 [--branch release/1.0]` declares the
+  branch. The base tag must exist in the repository, parse as
+  semver 2.0.0, and be a >= 1.0.0 RELEASE: a pre-1.0 base is
+  refused (the policy begins after v1.0), a pre-release base is
+  refused (an LTS is a release), a non-semver base is refused.
+- The declaration lands in `.hls-lts.json` at the repository root:
+  `policy` (currently `halis-lts-1`), `branch`, `base_tag`,
+  `base_sha` (the tagged commit), `created`. One declaration per
+  repository.
+- A missing branch is created AT the base commit. Re-init with the
+  same tag and branch is an idempotent no-op; a different tag or
+  branch is refused as the new policy decision it is — even when
+  the requested base tag does not exist at all.
+
+### 71.2. The classifier
+
+`hls-lts classify <commit>` names a commit's class with its
+reasons (`--json` for machines). Two gates, in order; the first to
+re-class wins:
+
+- **The message law.** The subject's `word: ` prefix decides, over
+  the project's own commit vocabulary:
+  - BUGFIX: `fix`, `bugfix`, `revert`, `hotfix`, `regression`;
+  - FEATURE: `feat`, `feature`, `add`, `stage`, `spec`, `stdlib`,
+    `perf`, `opt`, `refactor` (a perf rewrite can change semantics;
+    only provable repairs qualify for an LTS);
+  - CHORE: `chore`, `release`, `docs`, `doc`, `test`, `tests`,
+    `ci`, `meta`;
+  - anything else — no prefix, an unrecognized prefix, or a
+    colon-less `Stage N (...)` subject — is UNKNOWN.
+- **The diff gate.** A BUGFIX whose diff introduces public API
+  surface is a FEATURE in disguise: a new top-level `fn` in a
+  `std/` or `core/` module (Halis has no access modifier — every
+  top-level fn in a module is importable, so a new fn IS new API),
+  a new module file under `std/` or `core/`, or a `SPEC.md` edit (a
+  spec change is a language change). The gate is diff-aware: a fn
+  rewritten in place (-/+ pair of the same name) is not new
+  surface, and a `def` in `tools/*.py` is implementation detail
+  that never trips it.
+
+The classifier is fail-closed: UNKNOWN is a refusal class. "I
+didn't label it" is never a path onto the branch.
+
+### 71.3. The backport law
+
+`hls-lts backport <commit>` cherry-picks a commit onto the declared
+branch under the policy:
+
+- the upstream commit must classify BUGFIX — FEATURE, CHORE and
+  UNKNOWN upstreams are refused BY CLASS (a chore lands on the
+  branch directly, not through backport);
+- the pick carries the machine-readable provenance trailer
+  `Backported-from: <full sha>` appended to the message, beside
+  git's own `-x` "(cherry picked from commit ...)" line;
+- `--dry-run` predicts the outcome and touches nothing;
+- a dirty worktree (tracked-file modifications) is refused before
+  anything happens; the policy file itself is untracked dirt by
+  design and never blocks a pick;
+- a conflicted pick is refused and cleaned up (`cherry-pick
+  --abort`, then `--quit` for residual state); a duplicate pick
+  (already applied) is refused the same way;
+- every refusal leaves the branch byte-identical and returns the
+  worktree to the branch it started on.
+
+### 71.4. The tag law
+
+`hls-lts tag-patch [--tag vX.Y.Z]` cuts the next LTS release:
+
+- the tag is `vMAJOR.MINOR.PATCH` and nothing else: the leading
+  `v` is part of the name, the three components are digits without
+  leading zeros, and a pre-release or build suffix is a refusal (an
+  LTS release is a release);
+- the major.minor stays the base's forever — an LTS branch is
+  patch-only; minor and major bumps are features and are refused
+  by name;
+- the chain is gapless: patch exactly +1 over the last tag on the
+  branch (the base tag for the first release); an off-chain name is
+  refused with the expected one named;
+- the empty-release law: a release carries at least one commit
+  since the previous tag — a tag on the same commit as the last
+  release is noise, and a changelog of noise is how policy drift
+  starts;
+- `--dry-run` predicts; `--tag` explicit names are judged by the
+  same law as the auto name.
+
+### 71.5. The audit
+
+`hls-lts audit [--json]` walks every commit on the branch since the
+base and every tag reachable from it, and names every violation:
+
+- a commit with a `Backported-from:` trailer must name an upstream
+  commit that EXISTS in the repository and classifies BUGFIX — the
+  trailer is CHECKED, not trusted (a forged trailer backporting a
+  FEATURE is a violation; a ghost sha is a violation; git's `-x`
+  line is accepted as an equivalent provenance record);
+- a commit without a trailer must classify CHORE — a rogue direct
+  commit (FEATURE) or an unclassified one (UNKNOWN) is a violation,
+  named sha and subject;
+- a backport whose own diff resolves into new API surface is a
+  violation (conflict resolution is where features sneak in);
+- the tag law over the branch's release chain: same major.minor,
+  no pre-release or build suffix, gapless +1. A tag claiming a
+  release BEYOND the LTS line (a greater major or minor reachable
+  from the branch) is a violation wherever it was cut from; the
+  pre-1.0 history the branch forks from and non-semver tags are
+  outside the policy's scope.
+
+Exit codes: 0 ok, 1 policy refusal (the rule is named), 2 usage
+error. `status` prints the declaration, the tag chain and the audit
+state; `--json` on `status`, `classify` and `audit` carries the
+same facts for machines.
+
+### 71.6. What the tests prove
+
+`tests/ok/feat_stage132_lts.hls` pins the decision procedure in the
+ok corpus: the classifier table with its fail-closed default (a
+capital-S `Stage 131 (...)` subject is no prefix at all), the tag
+grammar (v-prefixed, no leading zeros, no pre-release, no build),
+the gapless +1 chain law (a gap and a duplicate patch both break
+it), the trailer law (one line, exactly 40 hex — longer, shorter or
+non-hex is not provenance), and the empty-release law. The
+acceptance gate `make lts-acceptance` (8 sections) drives the REAL
+CLI over REAL scratch git repositories: the convention, the init
+law, the classifier with its diff gate, the backport law (the green
+pick, the dry run, refusals by class with the branch byte-
+identical, the duplicate pick, the dirty worktree, the conflicted
+pick), the tag law, the audit law (including the forged-trailer and
+ghost-sha cases), the release train (init → backport → v1.0.1 →
+backport → v1.0.2 → audit green), and the corpus hygiene (checker,
+interpreter, native differential, fmt-canonical, lint-clean).

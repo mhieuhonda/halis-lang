@@ -13,6 +13,82 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.150.0-alpha] — Stage 132: LTS branch policy (`backport-only after v1.0`)
+- Stage 132 turns the roadmap's phrase into an executable policy.
+  After v1.0 the project maintains LTS release branches, and an LTS
+  branch that accepts whatever lands on it is not an LTS branch —
+  it is main with a longer name. The new `tools/hls-lts.py` gives
+  the branch a CONTRACT with three laws, each enforced at the point
+  where a change would enter it:
+  **backport-only** (a commit on the branch is either a cherry-pick
+  of a BUGFIX from the main line — recorded with the machine-
+  readable `Backported-from: <sha>` trailer beside git's own `-x`
+  provenance — or a chore: release bookkeeping that touches no
+  language surface), **patch-only** (the tag chain keeps the base's
+  major.minor forever and rises exactly +1 per release: no minor
+  bumps, no pre-release or build suffixes on an LTS tag, no gaps —
+  a lost release is precisely what an audit exists to catch), and
+  **fail-closed** (a commit the classifier cannot name is a
+  refusal, not a pass — the UNKNOWN class exists so that "I didn't
+  label it" is never a path onto the branch).
+- **The classifier.** Two gates, in order. The message law reads the
+  project's own commit vocabulary: fix/bugfix/revert/hotfix/
+  regression name a BUGFIX; feat/feature/add/stage/spec/stdlib/
+  perf/opt/refactor are FEATURE (a perf rewrite can change
+  semantics — only provable repairs qualify for an LTS); chore/
+  release/docs/doc/test/tests/ci/meta are CHORE; no recognized
+  prefix is UNKNOWN — and a capital-S "Stage 131 (...)" subject
+  with its colon after the parenthetical is no prefix at all. The
+  diff gate then re-classes a BUGFIX whose diff introduces public
+  surface: a new top-level fn in a std/ or core/ module (Halis has
+  no access modifier — a new fn IS new API), a new module file
+  there, or a SPEC.md edit (a spec change is a language change) is
+  a FEATURE in disguise and is refused with the reason named. A fn
+  edited in place (-/+ pair) is not new surface; a `def` in tools/
+  is implementation detail and never trips the gate.
+- **The commands.** `init --tag v1.0.0` declares the branch: the
+  base must exist, parse as semver and be a >= 1.0.0 RELEASE (a
+  pre-1.0 or pre-release base is refused — the policy begins after
+  v1.0, on a release); the declaration lands in `.hls-lts.json`
+  (branch, base tag, base sha, policy version), a missing branch is
+  created AT the base, re-init is an idempotent no-op and a
+  different base is refused as the policy decision it is. `classify`
+  names a commit's class with its reasons (`--json` for machines).
+  `backport` cherry-picks a BUGFIX under the policy — dry-run
+  predicts, refusals leave the branch byte-identical, a conflicted
+  pick is refused and cleaned up (`--abort` + `--quit`), a dirty
+  worktree is refused before anything happens, a duplicate pick is
+  refused. `tag-patch` cuts the next LTS tag — auto-named
+  vMAJOR.MINOR.(last+1), an explicit name judged by the same law —
+  and refuses an empty release (a tag on the same commit as the
+  last release is noise, and a changelog of noise is how policy
+  drift starts). `audit` walks every commit since the base and
+  every tag on the branch: a backport's trailer is CHECKED, not
+  trusted (the named upstream must exist here and classify BUGFIX;
+  a forged trailer backporting a FEATURE is a violation), a rogue
+  direct commit, an unclassified one, a tag gap and an out-of-line
+  tag are all violations named sha by sha. `status` prints the
+  declaration, the chain and the audit state.
+- The version laws reuse the Stage 131 semver module — one grammar
+  for the whole project, from the package manifest to the release
+  train. Exit codes 0 ok / 1 policy refusal / 2 usage error; every
+  refusal names the RULE, not just the fact.
+- **The gate.** `make lts-acceptance` runs eight sections over the
+  real CLI and real scratch git repositories — an LTS gate that did
+  not drive git would be a memo, not a policy: the convention, the
+  init law, the classifier with its diff gate, the backport law
+  (green pick, dry run, refusals by class, duplicate, dirty
+  worktree, conflict), the tag law, the audit law (including the
+  forged-trailer and ghost-sha cases), the release train (init →
+  backport → v1.0.1 → backport → v1.0.2 → audit green → status
+  shows the chain), and the corpus showcase.
+- `tests/ok/feat_stage132_lts.hls` pins the decision procedure in
+  pure HLS: the classifier table with its fail-closed default, the
+  tag grammar (v-prefixed, no leading zeros, no pre-release, no
+  build), the gapless +1 chain law, the trailer law (one line,
+  exactly 40 hex), and the empty-release law. Green on the
+  interpreter and natively, byte for byte.
+
 ## [v0.149.0-alpha] — Stage 131: semantic-versioning enforcement in `hls-pkg`
 - Stage 131 makes a version a CONTRACT. Until now the manifest's
   `version` was an opaque string — a package could publish "1.0",

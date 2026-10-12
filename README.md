@@ -253,6 +253,26 @@ make semver-acceptance        # Stage 131 gate: the semver battery
                                # dialect, manifest enforcement over a
                                # real git dep, publish immutability,
                                # verify drift)
+python3 tools/hls-lts.py classify HEAD   # Stage 132: the LTS branch
+                               # policy — backport-only after v1.0:
+                               # init declares the branch from a
+                               # >= 1.0.0 release tag, classify names
+                               # a commit's class (BUGFIX / FEATURE /
+                               # CHORE / UNKNOWN, fail-closed), backport
+                               # cherry-picks a BUGFIX with a
+                               # Backported-from: trailer and refuses
+                               # everything else, tag-patch cuts the
+                               # next patch release (no gaps, no
+                               # pre-releases, no empty releases),
+                               # audit judges the branch commit by
+                               # commit and tag by tag
+make lts-acceptance           # Stage 132 gate: the LTS battery
+                               # (the convention, the init law, the
+                               # classifier with its diff gate, the
+                               # backport law over real scratch git
+                               # repos, the tag law, the audit law,
+                               # the release train, the corpus
+                               # showcase)
 
 # 13. Stage 15-alpha: Safe C FFI (v0.13.0-alpha)
 python3 boot/boot.py examples/ffi_demo.hls           # call libc functions
