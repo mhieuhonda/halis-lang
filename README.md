@@ -291,6 +291,28 @@ make xdiff-acceptance         # Stage 133 gate: the differential
                                # ledger's negative space, the
                                # purity census, the llvm leg's
                                # labelling, the corpus showcase)
+python3 tools/hls-fuzzseed.py # Stage 134: fuzz corpus seeding from
+                               # real-world packages — REAL
+                               # functions harvested out of the
+                               # hls-pkg trees and the project's
+                               # own code, each completed into a
+                               # type-correct harness with corner-
+                               # valued parameters and a
+                               # deterministic projection; purity,
+                               # smoke, identity and budget gates;
+                               # a ranked, mutated, reproducible
+                               # corpus with a provenance manifest
+python3 tools/hls-fuzz.py --seed-corpus fuzz-corpus/seed
+                               # the fuzzer, seeded: the Stage 18
+                               # differential oracle runs over REAL
+                               # code shapes (mutation included)
+                               # instead of only grammar toys
+make fuzzseed-acceptance      # Stage 134 gate: the seeding battery
+                               # (the convention, the harvest law,
+                               # the harness law, the purity law,
+                               # the identity law, the census law,
+                               # the mutation law, the differential
+                               # + the fuzzer)
 
 # 13. Stage 15-alpha: Safe C FFI (v0.13.0-alpha)
 python3 boot/boot.py examples/ffi_demo.hls           # call libc functions

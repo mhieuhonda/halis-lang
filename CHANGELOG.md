@@ -13,6 +13,145 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.152.0-alpha] — Stage 134: Fuzz corpus seeding from real-world packages
+- The Stage 18 fuzzer generates its programs from a hand-written
+  grammar — small `main()`-only toys over ints, strings and control
+  flow — and every hour of fuzzing began from the same toy shapes.
+  Real code is nothing like that: it has structs, enums, matches,
+  method calls, multi-parameter functions with real shapes, and none
+  of it ever reached the differential oracle. The new
+  `tools/hls-fuzzseed.py` is the bridge: it harvests REAL functions
+  out of the real-world corpus — the packages the package manager has
+  downloaded (the `.hls-pkg-cache` and `.hls-pkg-deps` trees, laid
+  out exactly as `hls-pkg` lays them), plus the project's own std/,
+  core/, examples/, tests/ok/ and benchmarks/ — and turns each one
+  into a type-correct, runnable, deterministic HARNESS the fuzzer can
+  seed from.
+- **The harvest and the harness.** What is harvested is functions,
+  not files: each non-extern, non-method, non-main function is an
+  entry candidate, parsed by the REAL parser, and completed into a
+  program by two closures — the CALL closure (every non-extern
+  function and method the body transitively calls, enum variant
+  constructors included) and the TYPE closure (every struct and enum
+  the signatures, bodies and ALREADY-CLOSED TYPES' own shapes
+  mention — a struct field typed Rgb drags Rgb in), both pulled in as
+  raw source slices with brace-matching that honours strings and
+  comments. A synthesized `main()` declares every parameter with a
+  type-correct corner value from an explicit pool (0, 1, 2, 3, 5,
+  10, -1, -2 for ints; "", "a", "hello", unicode for strings; shape
+  pools for lists), calls the function, and prints a deterministic
+  PROJECTION of the result: int/float/bool via to_str, str directly,
+  lists elementwise, struct returns field-by-field when every
+  projected field is primitive, anything else a named constant
+  marker. Generic entries instantiate T to int at the CALL (the
+  definition text is never rewritten); a Stage 98 refinement is
+  satisfied by trying corner vectors until the checker accepts,
+  capped at eight, then refusing by name. The shape is fixed —
+  parameter lets, the call, the projection, `return 0` — so the
+  mutator and the fuzzer always know where the mutable inputs live.
+  Methods ride inside a synthesized one-method `impl` block (a
+  method sliced bare would be a plain fn; the impl block is what
+  makes the checker resolve the receiver call).
+- **The gate.** A seed enters the corpus only when it is worth
+  fuzzing and safe to compare. Purity: the harness text passes the
+  SAME deny table Stage 133's differential suite uses — crate modes,
+  world-effect imports, nondeterministic builtins — plus the seed-
+  specific rows the fuzzer needs (isatty, cwd probes, cpu-feature
+  probes, scheduler identities, the second clock family the Stage
+  133 table predates), each named; and no closure may DECLARE a
+  world effect (a declared world is refused as loudly as a used
+  one). Closure honesty: a body that calls an extern fn, an `asm!`
+  block, or a module-qualified function is excluded BY NAME —
+  externs are FFI, asm is not interpreter-runnable, and cross-module
+  calls would drag whole std modules into a single-file harness (the
+  honest Stage 134 boundary; the skip census reads like a map of the
+  ecosystem, naming the import each refusal would have needed).
+  Smoke: every candidate is run on the interpreter once, pooled
+  across a bounded thread pool — ok and panic are both fine (a panic
+  is a legitimate differential observable, matched class-for-class),
+  timeout is excluded by default (`--keep-timeouts` lifts it) — a
+  corpus seeded with hangs is a corpus of wasted fuzz time. Identity:
+  the digest is SHA-256 over the NORMALIZED source (comments and
+  whitespace stripped, quote-aware) — the same function reached
+  through two paths lands once, with BOTH provenances in the
+  manifest. Budget: a harness over `--max-lines` is a refusal naming
+  the budget.
+- **Ranking and mutation.** Every seed is scored by an explicit
+  FEATURE CENSUS — struct literals, matches, generics, method calls,
+  recursion, list/string operations, the weights a static table in
+  the tool — and the corpus is emitted in rank order under `--limit`
+  (the manifest records each seed's census, so a rank is always
+  auditable). The mutator turns an accepted seed into `--mutate`
+  typed mutants through eight lexical ops — int corner swap, operator
+  swap, string mutation, bool flip, list shape change, line drop,
+  line duplicate, and the harness-aware parameter corner re-pick —
+  every one applied OUTSIDE string literals and comments, and every
+  mutant re-parsed and re-checked through the real pipeline before
+  it enters the corpus; a drop is counted against its op in the
+  manifest. Mutant lineage (parent digest, op name) is recorded; a
+  mutant is a child, and the manifest says whose. The mutator's big
+  int corners (INT64_MIN/MAX, powers of two) are applied one mutant
+  at a time, where a timeout is one dropped mutant, not a dead
+  corpus.
+- **Determinism.** The walk is sorted, the RNG is seeded (default
+  134), name hashing is crc32 — never Python's per-process-randomized
+  hash — and no wall-clock enters the manifest unless `--stamp` says
+  so. The same tree always seeds the same corpus; a corpus you
+  cannot rebuild is a corpus you cannot audit. The five-phase
+  pipeline (parse+close+check → rank → pooled smoke → write → mutate
+  only the accepted) seeds the full 494-file tree — 5,868 functions
+  considered, 1,959 harnesses checker-verified — into a 200-seed
+  corpus with 166 surviving mutants in ~70 seconds.
+- **The fuzzer integration.** `hls-fuzz --seed-corpus DIR
+  [--seed-ratio R]` loads a seeded corpus off disk (every file
+  re-checked through the real pipeline — a stale or hand-edited
+  corpus must not poison the run; the rejected count is reported,
+  never swallowed) and draws an R fraction of its programs from it,
+  0..2 mutator ops applied, the SAME op set the seeder used (the
+  mutator is shared through an explicit module loader, one
+  definition, no drift). The counters report the two populations
+  separately (`N run (M gen, K seeded)`); every other Stage 18 law is
+  unchanged. The minimiser now locates its region BY NAME — the
+  main function's body, between the opening line and the final
+  `return 0` — so a seeded program's provenance header and closure
+  definitions survive minimisation intact.
+- **The gate.** `make fuzzseed-acceptance` (bin/hlc prereq) runs
+  eight sections over the real CLI, the real parser+checker, the
+  real native backend, the real fuzzer, and the fixture package
+  tests/fuzzseed_pkg — a REAL package in exactly the layout hls-pkg
+  writes, whose modules span the seedable surface (structs+methods,
+  enums+match, recursion, list/float params) AND the named refusal
+  surface (a Clock declaration, an Fs declaration, a std.str import,
+  custom struct/enum parameters, a parse error, a guaranteed hang, a
+  guaranteed panic, a comment-twin for the identity law): the
+  convention (exit codes, named refusals, --json, --stamp, and two
+  runs agreeing on the corpus), the harvest law (the cache layout
+  walked as hls-pkg writes it, provenance labels, the parse error as
+  a named skip), the harness law (every seed independently re-verified
+  through parse+check, the shape pinned, the synthesis refusal
+  named), the purity law (the declared-Clock refusal, the text-level
+  clock_ms row proven on its own, the isatty row, every seed
+  re-gated), the identity law (the twin's four functions merged into
+  single seeds carrying BOTH provenances), the census law (ranks
+  non-increasing, the method closure exact — scale_x_len's harness
+  carries Vec2 AND the scale method, no greedy leak into the scalar
+  seeds), the mutation law (every mutant re-verified, lineage valid,
+  drop keys within the op vocabulary, --keep-timeouts admitting the
+  hang with smoke=timeout and the default run refusing it by name),
+  and the differential (all 24 corpus programs byte-identical on
+  interp and native, crashy's panic landing as 101 on BOTH sides,
+  the seeded fuzzer green with the seeded counter above zero, and
+  --minimize returning a clean seed unchanged). The ok corpus gains
+  tests/ok/feat_stage134_fuzzseed.hls, which pins the decision
+  procedure in pure HLS: the normalization+digest identity, the
+  purity deny table and the effect-set law, the corner pool's edges
+  as legal values, the rank table's exact weights, and the
+  directional harness-shape law.
+- Exit codes 0 green / 1 empty / 2 usage; every refusal names the
+  rule. The report is a table for humans and `--json` for CI; the
+  manifest (provenance, census, smoke, lineage, the full skip
+  census) is the audit trail.
+
 ## [v0.151.0-alpha] — Stage 133: Cross-impl differential suite (3+ backends)
 - Stage 133 sits every implementation of the language down at one
   table and makes them show their work. The project ships FOUR

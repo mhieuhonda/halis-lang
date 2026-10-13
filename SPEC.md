@@ -9072,3 +9072,175 @@ moved states → MISMATCH), the purity census and --all's honesty,
 the llvm leg's labelling, and the corpus showcase followed by the
 full --core run green with every verdict class present and three
 executing backends participated.
+
+## 73. Fuzz corpus seeding from real-world packages (Stage 134 — v0.152.0-alpha)
+
+The Stage 18 fuzzer wrote its own inputs: a hand-written grammar of
+small `main()`-only toys. Real code never reached the differential
+oracle, because the generator cannot emit structs, enums, matches,
+method calls or multi-parameter functions. `tools/hls-fuzzseed.py`
+closes that gap: it harvests real functions out of the real-world
+corpus — the packages the package manager has downloaded
+(`.hls-pkg-cache/` and `.hls-pkg-deps/`, in exactly the layout
+`hls-pkg` writes: `<cache>/<dep-name>/<repo-hash>/...`), plus the
+project's own std/, core/, examples/, tests/ok/ and benchmarks/ —
+and completes each into a self-contained, type-correct, deterministic
+HARNESS. Every function a human wrote for a human purpose becomes a
+fuzzable program; every hour of fuzzing starts from real shapes.
+
+### 73.1. The harness
+
+What is harvested is functions, not files. Each non-extern, non-
+method, non-`main` function of a parsed file is an entry candidate.
+An entry alone is not a program: the seeder closes it with two
+closures. The CALL closure pulls in every non-extern function and
+method the body transitively calls (enum variant constructors
+included — `Shape.Circle(r)` is a constructor, not a module call,
+because `Shape` resolves as a type in the file; `xs.get(i)` is a
+receiver call, because `xs` is a local — the classifier reads the
+fn's params, lets, for-variables, assignment roots and match
+bindings before it judges a root). The TYPE closure pulls in every
+struct and enum the signatures, the bodies, and the ALREADY-CLOSED
+types' own shapes mention — a struct field typed `Rgb`, or an enum
+variant payload typed `Rgb`, drags `Rgb` in, because the harness
+must be able to SPELL every type it constructs. Both closures are
+sliced from the ORIGINAL source with a brace matcher that honours
+strings, escapes and `#` comments; attribute lines above a
+definition are dropped (a seed is a semantic skeleton, not a byte
+copy), and every method rides inside a synthesized one-method `impl`
+block — a method sliced bare would be a plain fn, and the impl block
+is what makes the checker resolve the receiver call.
+
+The synthesized `main()` fixes the shape the whole stage speaks:
+one corner-valued `let` per parameter (ints from {0, 1, 2, 3, 5,
+10, -1, -2}; strings from the literal pool including "" and unicode;
+lists from the shape pools; a bare generic T instantiates to int at
+the call — the definition text is never rewritten), THEN the call,
+THEN the projection of the result (int/float/bool via to_str, str
+directly, lists elementwise, struct returns field-by-field when
+every projected field is primitive, anything else a named constant
+marker), THEN `return 0` — with `uses IO`. A Stage 98 refinement on
+a parameter is satisfied by trying full corner vectors until the
+checker accepts (eight attempts), then refusing by name: the
+checker is the only judge of what the pool may feed a predicate.
+Custom struct and enum parameters have no synthesizable literal and
+are refused by name — value construction is knowledge the signature
+does not carry.
+
+### 73.2. The gate
+
+A seed enters the corpus only when it is worth fuzzing and safe to
+compare. PURITY: the harness text passes the deny table Stage 133's
+differential suite uses — crate modes, world-effect imports,
+nondeterministic builtins — plus the seed-specific rows the fuzzer
+needs (isatty, cwd probes, cpu-feature probes, scheduler identities,
+the second clock family the Stage 133 table predates), every row
+named in the refusal; and no closure may DECLARE a world effect — a
+declared world is refused as loudly as a used one. CLOSURE HONESTY:
+a body that calls an extern fn, an `asm!` block, or a
+module-qualified function is excluded BY NAME — externs are FFI,
+asm is not interpreter-runnable, and a cross-module call would drag
+whole std modules into a single-file harness (the honest Stage 134
+boundary; where the callee's prefix agrees with one of the file's
+own imports, the refusal names that import, so the skip census reads
+like a map of the ecosystem). SMOKE: every candidate runs on the
+interpreter once, on a bounded thread pool — ok and panic are both
+kept (a panic is a legitimate differential observable, matched
+class-for-class by the native side), timeout is excluded by default
+and `--keep-timeouts` lifts the exclusion by name — a corpus seeded
+with hangs is a corpus of wasted fuzz time. IDENTITY: the digest is
+SHA-256 over the normalized source (comments and whitespace runs
+stripped, quote-aware, string contents preserved) — the same
+function reached through two paths lands once, with BOTH provenances
+recorded; the digest is the function, not the file. BUDGET: a
+closure over `--max-lines` (default 120) is a refusal naming the
+budget.
+
+### 73.3. Rank, mutation, determinism
+
+The rank is an explicit FEATURE CENSUS over the normalized seed —
+struct literals, matches, generics, method calls, recursion,
+list/string operations, with static weights chosen so a struct-and-
+match seed outranks an int-only toy — recorded per seed in the
+manifest, so a rank is always auditable; the corpus is emitted in
+rank order under `--limit`, and the pipeline smokes only the
+overprovisioned shortlist (rank ×3) before the cut. The mutator
+turns an ACCEPTED seed into `--mutate` mutants through eight lexical
+ops — int corner swap, operator swap, string mutation, bool flip,
+list shape change, line drop, line duplicate, and the harness-aware
+parameter corner re-pick — every op applied outside string literals
+and comments (a masked scan), every mutant re-parsed and re-checked
+through the real pipeline before it enters the corpus, every drop
+counted against its op. Mutant lineage (parent digest, op name) is
+in the manifest. The mutator's big corners (INT64_MIN/MAX, powers
+of two, the 10^9+7 modulus) apply one mutant at a time, where a
+timeout costs one dropped mutant, not a dead corpus. Determinism is
+a law: the walk is sorted, the RNG is seeded (default 134), name
+hashing is crc32 — never Python's per-process-randomized hash — and
+no wall-clock enters the manifest unless `--stamp` says so. The
+same tree always seeds the same corpus; a corpus you cannot rebuild
+is a corpus you cannot audit. The pipeline runs in five phases
+(parse+close+check, rank, pooled smoke, write, mutate only the
+accepted) and seeds the full 494-file tree — 5,868 functions
+considered, 1,959 harnesses checker-verified — into a 200-seed
+corpus with 166 surviving mutants in about seventy seconds.
+
+### 73.4. The fuzzer integration
+
+`hls-fuzz --seed-corpus DIR [--seed-ratio R]` loads the corpus off
+disk — every file re-checked through the real pipeline (a stale or
+hand-edited corpus must not poison the run; the rejected count is
+reported, never swallowed) — and draws an R fraction (default 0.5)
+of its programs from it, 0..2 mutator ops applied, the SAME op set
+the seeder used: the mutator is shared through an explicit module
+loader, one definition, no drift. The counters report the two
+populations separately (`N run (M gen, K seeded)`); every other
+Stage 18 law is unchanged — byte comparison, minimization, corpus
+output. The minimizer now locates its region BY NAME: the main
+function's body, between the opening line and the final `return 0`,
+so a seeded program's provenance header and closure definitions
+survive minimization intact.
+
+### 73.5. The gate
+
+`make fuzzseed-acceptance` (bin/hlc prerequisite) runs eight
+sections over the real CLI, the real parser+checker, the real
+native backend, the real fuzzer, and the fixture package
+tests/fuzzseed_pkg — a real package in exactly the layout hls-pkg
+writes, whose modules span the seedable surface (structs+methods,
+enums+match, recursion, list and float parameters) AND the named
+refusal surface (a Clock declaration, an Fs declaration, a std.str
+import, custom struct and enum parameters, a parse error, a
+guaranteed hang, a guaranteed panic, a comment-twin for the
+identity law). The sections: the convention (exit codes 0/1/2, the
+usage and missing-source refusals named, --json machine-parseable,
+the stamp law, and two runs agreeing on the corpus); the harvest
+law (the cache layout walked as hls-pkg writes it, provenance
+labels, the parse error a named skip with the parser's own words);
+the harness law (every emitted seed independently re-verified
+through parse+check, the shape pinned including params-before-call,
+the synthesis refusals named); the purity law (the declared-Clock
+refusal, the text-level clock_ms row proven on its own, the Fs
+declaration refusal, the import boundary named, the isatty row
+live, every seed re-gated through the tool's own verdict fn); the
+identity law (the twin's functions merged into single seeds
+carrying both provenances); the census law (ranks non-increasing,
+the method closure exact — scale_x_len's harness carries the Vec2
+definition AND the scale method body, and no greedy leak reaches
+the scalar seeds); the mutation law (every surviving mutant
+re-verified, lineage valid and parent-resolvable, drop keys within
+the op vocabulary, --keep-timeouts admitting the hang with
+smoke=timeout while the default run refuses it by name); and the
+differential — every corpus program byte-identical on interpreter
+and native, the guaranteed panic landing as 101 on BOTH sides, the
+seeded fuzzer green with the seeded counter above zero at ratio
+1.0 and moving at both populations at 0.5, and --minimize returning
+a clean seed unchanged. tests/ok/feat_stage134_fuzzseed.hls pins
+the decision procedure in pure HLS: the normalization+digest
+identity (three spacings, one function, one seed; a one-character
+content difference is a different seed), the purity deny table and
+the effect-set law (one world letter is enough to refuse; unknown
+rows deny by default), the corner pool's edges as legal values
+(INT64_MIN/MAX compare, halve, and increment in range), the rank
+table's exact weights, and the directional harness-shape law (a
+harness whose call precedes its parameter lets is malformed).
