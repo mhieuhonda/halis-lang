@@ -1,0 +1,454 @@
+# feat_stage134_fuzzseed.hls — Stage 134 (v0.152.0-alpha): fuzz
+# corpus seeding from real-world packages.
+#
+# What this fixture pins is the DECISION PROCEDURE the seeder runs —
+# the same laws `tools/hls-fuzzseed.py` applies when it turns real
+# package code into differential-ready fuzz inputs:
+#
+#   1. the identity  — a seed's digest is computed over the
+#      law             NORMALIZED source: comments and whitespace
+#                      runs are stripped, everything else survives
+#                      verbatim. The same function reached through
+#                      two paths (two packages, a re-format) is ONE
+#                      seed with TWO provenances — the digest is the
+#                      function, not the file;
+#   2. the purity    — a seed's output must be a function of its
+#      law             source. The deny table names the builtins
+#                      whose output is the world's (the wall clock,
+#                      the RNG, the filesystem, the environment, the
+#                      scheduler) and the effect-SET law refuses any
+#                      closure that DECLARES a world effect; only the
+#                      IO family's printing survives, because print
+#                      is deterministic given deterministic values;
+#   3. the corner    — the parameter initializer and the mutator draw
+#      pool law        from an explicit pool whose edges are the
+#                      language's own edges: zero, one, minus one,
+#                      INT64_MAX, INT64_MIN. The pool's big corners
+#                      are legal values: comparisons and division by
+#                      them stay in range (checked arithmetic panics
+#                      on anything else — a mutant that overflows is
+#                      a matched panic on both backends, never a
+#                      silent wrap);
+#   4. the rank      — a seed's rank is a weighted count of the
+#      law             language features its normalized source
+#                      exercises (structs, matches, method calls,
+#                      list and string operations, recursion), the
+#                      weights a static table. Ranks are auditable
+#                      and ORDERED: a struct-and-match seed outranks
+#                      an int-only toy;
+#   5. the harness   — the shape is fixed: one corner-valued let per
+#      shape law       parameter, THEN the call, THEN the projection,
+#                      THEN return 0 — so the mutator and the fuzzer
+#                      always know where the mutable inputs live.
+#
+# The program exits 0 when every law holds, 10+section*10+case
+# otherwise — the differential suite runs it on the interpreter AND
+# natively and requires byte-identical output.
+#
+# This file enters the corpus at this release — green the day it is
+# born, already written in the dialect the seeder speaks.
+
+# ----------------------------------------------------------------------
+# Verdict helpers: the fixture's own failure taxonomy.
+# ----------------------------------------------------------------------
+fn fail_case(section: int, case: int) -> int {
+    return 10 + section * 10 + case
+}
+
+# ----------------------------------------------------------------------
+# Section 1 — the identity law: normalization + digest.
+# ----------------------------------------------------------------------
+# The model source language: statements separated by '|', '#' opens a
+# comment that runs to the next '|'. The real seeder scans real files
+# (newlines and all, quote-aware); the LAW it applies is the one
+# modeled here: comments and whitespace runs vanish, content survives.
+# The model is honest about its own boundary — it strips whitespace
+# everywhere, string contents included, because the digest law's
+# merger of provenances is about COMMENT and LAYOUT noise, and the
+# quote-aware mechanics live in the tool and its gate.
+
+fn normalize(src: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    let mut in_comment: bool = false
+    while i < src.len() {
+        let c: str = src.slice(i, i + 1)
+        if in_comment {
+            if c == "|" {
+                in_comment = false
+            }
+        } else {
+            if c == "#" {
+                in_comment = true
+            } else {
+                if !(c == " ") {
+                    out = out + c
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn digest(s: str) -> int {
+    let mut h: int = 0
+    let mut i: int = 0
+    while i < s.len() {
+        h = (h * 31 + s.byte_at(i)) % 1000000007
+        i = i + 1
+    }
+    return h
+}
+
+fn same_fn_reached_twice() -> int {
+    # the same gcd body as it appears in two packages: the second
+    # copy re-commented and re-spaced
+    let from_pkg_a: str = "fn gcd(a,b)|let t=a%b|return t"
+    let from_pkg_b: str = "fn gcd( a, b ) | # euclid, again |  let t = a % b | return t"
+    let da: int = digest(normalize(from_pkg_a))
+    let db: int = digest(normalize(from_pkg_b))
+    if da != db {
+        return fail_case(1, 1)
+    }
+    # a DIFFERENT function normalizes differently — identity is not
+    # globbing
+    let other: str = "fn gcd2(a,b)|return a%b"
+    if digest(normalize(other)) == da {
+        return fail_case(1, 2)
+    }
+    # content survives: a body that differs in a character digests
+    # differently, no matter how identical the layout looks
+    let cousin: str = "fn gcd(a,b)|let t=a%b|return t+1"
+    if digest(normalize(cousin)) == da {
+        return fail_case(1, 3)
+    }
+    # layout-only differences NEVER change the digest — three
+    # spacings, one function, one seed
+    let spaced: str = "fn  gcd( a , b )|let t = a % b|return  t"
+    if digest(normalize(spaced)) != da {
+        return fail_case(1, 4)
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------
+# Section 2 — the purity law: the deny table + the effect-set law.
+# ----------------------------------------------------------------------
+# 1 = seedable (deterministic, host-stable), 0 = denied (the output
+# would be the world's, not the program's).
+
+fn deny_row(builtin: str) -> int {
+    if builtin == "print" {
+        return 1
+    }
+    if builtin == "println" {
+        return 1
+    }
+    if builtin == "clone" {
+        return 1
+    }
+    if builtin == "math_sqrt" {
+        return 1
+    }
+    if builtin == "len" {
+        return 1
+    }
+    if builtin == "clock_ms" {
+        return 0
+    }
+    if builtin == "rand_int" {
+        return 0
+    }
+    if builtin == "read_file" {
+        return 0
+    }
+    if builtin == "env_get" {
+        return 0
+    }
+    if builtin == "chan_new" {
+        return 0
+    }
+    if builtin == "sleep" {
+        return 0
+    }
+    return 0 - 1
+}
+
+fn effect_set_seedable(effects: str) -> bool {
+    # effects is a compact set spelling: one letter per effect —
+    # F=Fs, C=Clock, A=Args, N=Net, R=Rand, P=Proc, X=Conc. IO prints
+    # as nothing (it is the allowed family). Any world letter present
+    # makes the closure unseedable.
+    let mut i: int = 0
+    while i < effects.len() {
+        let c: str = effects.slice(i, i + 1)
+        if c == "F" || c == "C" || c == "A" || c == "N" || c == "R" {
+            return false
+        }
+        if c == "P" || c == "X" {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn purity_table() -> int {
+    # every deterministic builtin is seedable
+    if deny_row("print") != 1 || deny_row("println") != 1 {
+        return fail_case(2, 1)
+    }
+    if deny_row("clone") != 1 || deny_row("math_sqrt") != 1 {
+        return fail_case(2, 2)
+    }
+    # every world-bound builtin is denied
+    if deny_row("clock_ms") != 0 || deny_row("rand_int") != 0 {
+        return fail_case(2, 3)
+    }
+    if deny_row("read_file") != 0 || deny_row("env_get") != 0 {
+        return fail_case(2, 4)
+    }
+    if deny_row("chan_new") != 0 || deny_row("sleep") != 0 {
+        return fail_case(2, 5)
+    }
+    # an unknown row denies by default — the table is closed
+    if deny_row("mystery_fn") != 0 - 1 {
+        return fail_case(2, 6)
+    }
+    # the effect-set law: an empty set (or IO-only) is seedable
+    if !effect_set_seedable("") {
+        return fail_case(2, 7)
+    }
+    # one world letter is enough to refuse
+    if effect_set_seedable("F") || effect_set_seedable("C") {
+        return fail_case(2, 8)
+    }
+    if effect_set_seedable("N") || effect_set_seedable("R") {
+        return fail_case(2, 9)
+    }
+    if effect_set_seedable("A") || effect_set_seedable("P") {
+        return fail_case(2, 10)
+    }
+    if effect_set_seedable("X") {
+        return fail_case(2, 11)
+    }
+    # a mixed set refuses too — the law is over the whole closure
+    if effect_set_seedable("CF") {
+        return fail_case(2, 12)
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------
+# Section 3 — the corner pool law: the pool's edges are legal values.
+# ----------------------------------------------------------------------
+fn corner_pool() -> int {
+    let max_i: int = 9223372036854775807
+    let min_i: int = 0 - 9223372036854775807 - 1
+    # the extremes compare as themselves
+    if !(max_i > 0) || !(min_i < 0) {
+        return fail_case(3, 1)
+    }
+    if !(min_i < max_i) {
+        return fail_case(3, 2)
+    }
+    # arithmetic that stays in range on the pool's edges
+    if max_i / 2 * 2 > max_i {
+        return fail_case(3, 3)
+    }
+    if !(min_i + 1 > min_i) {
+        return fail_case(3, 4)
+    }
+    # the small corners are the everyday pool
+    if !(0 < 1 && 1 < 10 && 10 < max_i) {
+        return fail_case(3, 5)
+    }
+    # division by a corner is defined unless the divisor is zero —
+    # and zero is IN the pool, which is the point: the mutator
+    # reaches the panic path lawfully (a matched 101 on both
+    # backends, never a silent value)
+    if !(5 / 1 == 5 && 5 / 10 == 0) {
+        return fail_case(3, 6)
+    }
+    # minus one flips sign in range
+    if !(0 - 1 < 0 && 0 - (0 - 1) == 1) {
+        return fail_case(3, 7)
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------
+# Section 4 — the rank law: static weights, ordered output.
+# ----------------------------------------------------------------------
+fn weight_of(feature: str) -> int {
+    if feature == "struct_lit" {
+        return 3
+    }
+    if feature == "enum_match" {
+        return 3
+    }
+    if feature == "generic_fn" {
+        return 3
+    }
+    if feature == "method_call" {
+        return 2
+    }
+    if feature == "recursion" {
+        return 2
+    }
+    if feature == "list_op" {
+        return 1
+    }
+    if feature == "str_op" {
+        return 1
+    }
+    if feature == "while_loop" {
+        return 1
+    }
+    return 0
+}
+
+fn score_of(features: str) -> int {
+    # features: a compact census spelling "name:count;name:count"
+    let mut total: int = 0
+    let mut i: int = 0
+    while i < features.len() {
+        let mut name: str = ""
+        let mut count: int = 0
+        let mut phase: int = 0
+        while i < features.len() {
+            let c: str = features.slice(i, i + 1)
+            if c == ";" {
+                i = i + 1
+                break
+            }
+            if c == ":" {
+                phase = 1
+                i = i + 1
+                continue
+            }
+            if phase == 0 {
+                name = name + c
+            } else {
+                # the census counts are digits by construction;
+                # byte_at gives the char's own numeric value
+                count = count * 10 + (c.byte_at(0) - 48)
+            }
+            i = i + 1
+        }
+        total = total + weight_of(name) * count
+    }
+    return total
+}
+
+fn rank_law() -> int {
+    # a struct-driven seed outranks a method-only seed, which
+    # outranks a scalar toy
+    let rich: int = score_of("struct_lit:2;method_call:3")
+    let mid: int = score_of("method_call:2")
+    let plain: int = score_of("while_loop:1;list_op:1")
+    if !(rich > mid) {
+        return fail_case(4, 1)
+    }
+    if !(mid > plain) {
+        return fail_case(4, 2)
+    }
+    # the weights are what the manifest records — the law checks the
+    # exact table, not a monotone approximation
+    if weight_of("struct_lit") != 3 || weight_of("enum_match") != 3 {
+        return fail_case(4, 3)
+    }
+    if weight_of("method_call") != 2 || weight_of("recursion") != 2 {
+        return fail_case(4, 4)
+    }
+    if weight_of("list_op") != 1 || weight_of("str_op") != 1 {
+        return fail_case(4, 5)
+    }
+    # the census multiplies weight by recorded hits
+    if score_of("while_loop:3") != 3 {
+        return fail_case(4, 6)
+    }
+    # an unknown feature weighs nothing — the census is closed
+    if score_of("mystery:5") != 0 {
+        return fail_case(4, 7)
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------
+# Section 5 — the harness shape law: params, then the call.
+# ----------------------------------------------------------------------
+fn find_from(s: str, needle: str, start: int) -> int {
+    let mut i: int = start
+    let n: int = needle.len()
+    while i + n <= s.len() {
+        if s.slice(i, i + n) == needle {
+            return i
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn shape_law() -> int {
+    # the model harness: two params, the call, the projection. The
+    # law: every parameter let appears BEFORE the call index, and the
+    # projection AFTER it — the mutator's contract about where the
+    # mutable inputs live.
+    let harness: str = "let a=1|let b=2|call(a,b)|print(r)|return 0"
+    let call_at: int = find_from(harness, "call(", 0)
+    if call_at < 0 {
+        return fail_case(5, 1)
+    }
+    let la: int = find_from(harness, "let a=", 0)
+    let lb: int = find_from(harness, "let b=", 0)
+    if la < 0 || lb < 0 {
+        return fail_case(5, 2)
+    }
+    if !(la < call_at && lb < call_at) {
+        return fail_case(5, 3)
+    }
+    let proj: int = find_from(harness, "print(", call_at)
+    if proj < 0 || proj < call_at {
+        return fail_case(5, 4)
+    }
+    # and return 0 closes it
+    let tail: int = harness.len() - 8
+    if harness.slice(tail, tail + 8) != "return 0" {
+        return fail_case(5, 5)
+    }
+    # a harness whose call comes FIRST is malformed — the law is
+    # directional, not merely presentational
+    let broken: str = "call(a,b)|let a=1|let b=2|return 0"
+    let bc: int = find_from(broken, "call(", 0)
+    let bla: int = find_from(broken, "let a=", 0)
+    if bc < 0 || bla < 0 || !(bc < bla) {
+        return fail_case(5, 6)
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------
+fn main() -> int uses IO {
+    let s1: int = same_fn_reached_twice()
+    print("identity=")
+    println(s1.to_str())
+    let s2: int = purity_table()
+    print("purity=")
+    println(s2.to_str())
+    let s3: int = corner_pool()
+    print("corners=")
+    println(s3.to_str())
+    let s4: int = rank_law()
+    print("rank=")
+    println(s4.to_str())
+    let s5: int = shape_law()
+    print("shape=")
+    println(s5.to_str())
+    if s1 + s2 + s3 + s4 + s5 != 0 {
+        return 1
+    }
+    println("feat_stage134_fuzzseed: all laws hold")
+    return 0
+}
