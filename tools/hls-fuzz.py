@@ -16,13 +16,23 @@ case to fuzz-corpus/.
 Acceptance criterion (Stage 18): the fuzzer runs for 1 hour without
 finding any semantic discrepancy between the two implementations.
 
+Stage 134: `--seed-corpus DIR` points the fuzzer at a corpus seeded
+from real-world packages (tools/hls-fuzzseed.py). A `--seed-ratio`
+fraction of the programs then comes from the corpus — mutation
+included, via the same op set the seeder used — instead of the
+toy grammar, so the differential oracle sees real code shapes. The
+counters report the two populations separately; every other law is
+unchanged (byte comparison, minimisation, corpus output).
+
 Usage:
   python3 tools/hls-fuzz.py --time 3600            # 1-hour smoke
   python3 tools/hls-fuzz.py --time 600             # 10-minute smoke
   python3 tools/hls-fuzz.py --seed 42 --n 1000     # deterministic
+  python3 tools/hls-fuzz.py --seed-corpus fuzz-corpus/seed --time 600
   python3 tools/hls-fuzz.py --minimize case.hls    # minimize a case
 """
 import argparse
+import importlib.util
 import os
 import random
 import shutil
@@ -37,6 +47,16 @@ sys.path.insert(0, REPO_ROOT)
 from boot.boot import load_program          # noqa: E402
 from boot.checker import check              # noqa: E402
 from boot.lexer import HLError              # noqa: E402
+
+# Stage 134: the seeder's mutator is shared, not duplicated. The tool
+# file carries a dash, so the import goes through an explicit spec —
+# one loader, the same ops both sides of the corpus boundary.
+_FUZZSEED_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "hls-fuzzseed.py")
+_spec = importlib.util.spec_from_file_location("hls_fuzzseed",
+                                               _FUZZSEED_PATH)
+hls_fuzzseed = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(hls_fuzzseed)
 
 
 # ---------------------------------------------------------------------------
@@ -270,19 +290,34 @@ def differential_one(src, hlc_native, tmpdir, rng_seed):
 def minimize(src, hlc_native, tmpdir, rng_seed):
     """Delta-debug: try removing one statement at a time from the
     program while preserving the divergence. Returns the minimised
-    source. Best-effort — does not guarantee a global minimum."""
+    source. Best-effort — does not guarantee a global minimum.
+
+    Stage 134: the region under minimisation is the MAIN function's
+    body, located by name rather than assumed to be the whole file —
+    seeded programs carry a provenance header and closure definitions
+    above `fn main`, and those lines are part of the case."""
     lines = src.split("\n")
-    # The first line is `fn main()...` and the last two are `return 0`
-    # and `}`. We only minimise the body lines (indices 1..len-2).
-    body_start = 1
-    body_end = len(lines) - 2
-    if body_end <= body_start:
+    mi = None
+    for i, l in enumerate(lines):
+        if l.startswith("fn main"):
+            mi = i
+            break
+    if mi is None:
         return src
-    # Reconstruct with a sub-range of body lines.
+    # the tail is `return 0` + `}` (the harness contract); the body
+    # under minimisation is what sits between the opening line and it
+    ri = None
+    for i in range(len(lines) - 1, mi, -1):
+        if lines[i].strip() == "return 0":
+            ri = i
+            break
+    if ri is None or ri - mi < 2:
+        return src
+
     def try_subset(subset_lines):
-        new_src = (lines[0] + "\n"
+        new_src = ("\n".join(lines[:mi + 1]) + "\n"
                    + "\n".join(subset_lines) + "\n"
-                   + "\n".join(lines[body_end:]))
+                   + "\n".join(lines[ri:]))
         prog_path = os.path.join(tmpdir, "prog_min.hls")
         with open(prog_path, "w") as f:
             f.write(new_src)
@@ -298,7 +333,8 @@ def minimize(src, hlc_native, tmpdir, rng_seed):
         if i_out != n_out or i_rc != n_rc:
             return new_src  # still diverges — keep this subset
         return None
-    body = lines[body_start:body_end]
+
+    body = lines[mi + 1:ri]
     changed = True
     while changed and len(body) > 1:
         changed = False
@@ -317,6 +353,57 @@ def minimize(src, hlc_native, tmpdir, rng_seed):
 # Main fuzz loop
 # ---------------------------------------------------------------------------
 
+def load_seed_corpus(corpus_dir, cap=4000):
+    """Stage 134: read a seeded corpus off disk. Every file is
+    re-checked through the real pipeline — a stale or hand-edited
+    corpus must not poison the run — and the rejected count is
+    reported, never swallowed. Returns (sources, rejected)."""
+    sources = []
+    rejected = 0
+    if not os.path.isdir(corpus_dir):
+        return sources, rejected
+    paths = []
+    for dirpath, _dirs, files in os.walk(corpus_dir):
+        for fn in sorted(files):
+            if fn.endswith(".hls"):
+                paths.append(os.path.join(dirpath, fn))
+    for p in sorted(paths)[:cap]:
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                src = f.read()
+        except OSError:
+            rejected += 1
+            continue
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".hls",
+                                          delete=False)
+        try:
+            tmp.write(src)
+            tmp.close()
+            program = load_program(tmp.name)
+            check(program)
+            sources.append(src)
+        except Exception:
+            rejected += 1
+        finally:
+            os.unlink(tmp.name)
+    return sources, rejected
+
+
+def seeded_program(sources, rng):
+    """One corpus program, 0..2 mutator ops applied (30% none, 50%
+    one, 20% two) — the same ops the seeder used, the checker no
+    longer watching (the corpus files are known-good; a mutant that
+    breaks is caught by differential_one's own check gate)."""
+    src = rng.choice(sources)
+    r = rng.random()
+    n_ops = 0 if r < 0.30 else (1 if r < 0.80 else 2)
+    for _ in range(n_ops):
+        msrc, _op = hls_fuzzseed.mutate_source(src, rng)
+        if msrc is not None:
+            src = msrc
+    return src
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog="hls-fuzz",
@@ -330,6 +417,12 @@ def main():
                     help="max number of programs (default: unlimited)")
     ap.add_argument("--corpus", default=os.path.join(REPO_ROOT, "fuzz-corpus"),
                     help="directory to save minimised divergent cases")
+    ap.add_argument("--seed-corpus", default=None,
+                    help="Stage 134: corpus directory seeded from "
+                         "real-world packages (tools/hls-fuzzseed.py)")
+    ap.add_argument("--seed-ratio", type=float, default=0.5,
+                    help="fraction of programs drawn from the seed "
+                         "corpus when --seed-corpus is given")
     ap.add_argument("--minimize", default=None,
                     help="minimize an existing .hls case file and exit")
     ap.add_argument("--quiet", action="store_true")
@@ -358,9 +451,24 @@ def main():
     corpus_dir = args.corpus
     os.makedirs(corpus_dir, exist_ok=True)
 
+    # Stage 134: the seeded corpus, validated up front
+    seed_sources = []
+    seed_rejected = 0
+    if args.seed_corpus:
+        seed_sources, seed_rejected = load_seed_corpus(args.seed_corpus)
+        if not args.quiet:
+            print("== seed corpus: %d programs loaded, %d rejected =="
+                  % (len(seed_sources), seed_rejected))
+        if not (0.0 <= args.seed_ratio <= 1.0):
+            print("hls-fuzz: --seed-ratio must be within [0, 1]",
+                  file=sys.stderr)
+            return 2
+
     tmpdir = tempfile.mkdtemp(prefix="hlsfuzz-")
     try:
         n_run = 0
+        n_gen = 0
+        n_seeded = 0
         n_diverge = 0
         n_skip = 0
         deadline = time.time() + args.time
@@ -368,8 +476,13 @@ def main():
         while time.time() < deadline:
             if args.n is not None and n_run >= args.n:
                 break
-            gen = Gen(rng)
-            src = gen.gen_program()
+            if seed_sources and rng.random() < args.seed_ratio:
+                src = seeded_program(seed_sources, rng)
+                n_seeded += 1
+            else:
+                gen = Gen(rng)
+                src = gen.gen_program()
+                n_gen += 1
             n_run += 1
             try:
                 ok = differential_one(src, None, tmpdir, rng_seed)
@@ -398,12 +511,14 @@ def main():
                         print("   | " + line)
             if time.time() >= next_report:
                 rate = n_run / max(1.0, time.time() - (deadline - args.time))
-                print("  [%ds] %d run, %d skip, %d diverge (%.1f prog/s)" % (
-                    int(time.time() - (deadline - args.time)),
-                    n_run, n_skip, n_diverge, rate))
+                print("  [%ds] %d run (%d gen, %d seeded), %d skip, "
+                      "%d diverge (%.1f prog/s)" % (
+                          int(time.time() - (deadline - args.time)),
+                          n_run, n_gen, n_seeded, n_skip, n_diverge, rate))
                 next_report = time.time() + 5.0
-        print("\n== hls-fuzz done: %d run, %d skip, %d diverge ==" % (
-            n_run, n_skip, n_diverge))
+        print("\n== hls-fuzz done: %d run (%d gen, %d seeded), %d skip, "
+              "%d diverge ==" % (n_run, n_gen, n_seeded, n_skip,
+                                  n_diverge))
         return 0 if n_diverge == 0 else 1
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
