@@ -273,6 +273,24 @@ make lts-acceptance           # Stage 132 gate: the LTS battery
                                # repos, the tag law, the audit law,
                                # the release train, the corpus
                                # showcase)
+python3 tools/hls-xdiff.py     # Stage 133: the cross-impl
+                               # differential table — the SAME
+                               # program through the interpreter,
+                               # the native C build, the wasm
+                               # backend and (statically) the LLVM
+                               # emitter; bytes + halt classes
+                               # compared on a shared channel, the
+                               # ledger keeping the six real
+                               # findings of the first sweep loud;
+                               # --discover is the purity census,
+                               # --core the fast battery
+make xdiff-acceptance         # Stage 133 gate: the differential
+                               # battery (the convention, the
+                               # channel vectors, the three-backend
+                               # byte match, the halt law, the
+                               # ledger's negative space, the
+                               # purity census, the llvm leg's
+                               # labelling, the corpus showcase)
 
 # 13. Stage 15-alpha: Safe C FFI (v0.13.0-alpha)
 python3 boot/boot.py examples/ffi_demo.hls           # call libc functions

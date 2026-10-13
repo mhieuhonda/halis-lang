@@ -13,6 +13,117 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.151.0-alpha] — Stage 133: Cross-impl differential suite (3+ backends)
+- Stage 133 sits every implementation of the language down at one
+  table and makes them show their work. The project ships FOUR
+  implementations — the Stage-0 interpreter (boot/), the self-hosted
+  C backend (hlc → C → gcc), the WebAssembly backend (hlwasm) and
+  the LLVM IR emitter — and until now their agreement was only ever
+  checked pairwise, piecemeal, in different suites: the interpreter
+  met the native build in run_tests.sh, the wasm backend met
+  hello.hls in the backend suite, the LLVM IR met a structural
+  validator. Nobody ever ran the SAME program on all of them and
+  compared. The new `tools/hls-xdiff.py` is that table: four
+  registered backends, three executing (interp, native, wasm) plus
+  the LLVM leg as an honestly-labelled static participant
+  ("validated, not executed" — the report says so in those words).
+- **The oracle.** Two channels are compared across every pair of
+  executing legs: stdout BYTES and exit code. Backends may differ in
+  REPRESENTATION — printf renders 0.75 as "0.750000" and nan as
+  "-nan" where the wasm glue's JS Number renders "0.75" and "NaN" —
+  so the channel canonicalizer maps both sides onto one numeric
+  form: round to the printf channel's six decimals, shortest
+  round-trip repr, exponent forms normalized, ±nan folded, the sign
+  of zero dropped, and the verdict records `normalized` instead of
+  `exact` whenever raw bytes differed. The channel is a NARROW
+  license and the suite enforces the limits: short forms ("1.5"),
+  version strings ("1.10") and integers ("9007199254740993") are
+  never rewritten, so a divergence there is real and stays real.
+  Exit codes compare as CLASSES when a backend halts: hosted panic
+  is 101, the wasm alpha halts every panic/abort/exit(N) through one
+  `unreachable` trap that propagates no code — uniform 101 with a
+  wasm trap is `panic-equal`, uniform hosted N with a trap is
+  `halt-gap` (named, with the code pair), a halt on one side and a
+  clean run on the other is `divergence` — the loudest alarm the
+  suite owns. stderr is recorded but never compared: panic WORDING
+  is backend-owned; that a halt happened, and that the bytes before
+  it agree, is what the oracle owns.
+- **The verdict lattice.** exact | normalized | panic-equal |
+  halt-gap | unpaired (one executing leg) | skipped (the wasm
+  alpha's named subset refusals are skips, never errors) |
+  divergence | error. SKIP legs are absent by design and never
+  poison a verdict; ERROR legs cap it: a backend that TRIED and
+  failed (an invalid module, a timeout) has not agreed to anything,
+  so the program is an `error` even when the remaining pair agrees —
+  `exact` must mean every backend that could run the program ran it
+  and agreed. The run is green when no divergence or error is
+  unexplained, at least two executing backends participated, and
+  `--strict` demotes normalized/halt-gap for auditing the
+  byte-exact frontier.
+- **The ledger — and six real findings on the first sweep.** The
+  first sweep over the full purity-gated corpus (167 programs × 4
+  legs) found six real cross-implementation divergences, each now
+  named in tests/xdiff/ledger.json with its diagnosis: two wasm
+  emitter bugs that produce modules Node refuses to compile
+  (nested-generic calls emit an i64 constant where the signature
+  says i32; tail-call lowering loses the return value on the
+  stack); one documented unimplemented builtin (str.to_float is a
+  bare `unreachable` in the wasm alpha); one wrong f64 comparison
+  at the 2^63 corner (d = 9.223372036854776e18 > 1e17 is true on
+  interp and native, false on wasm — a value divergence the printed
+  bytes alone never show); and two missing soundness checks (the
+  runtime refinement guard and the byte_at bounds check are not
+  emitted on wasm: the interp panics 101 where wasm runs on and
+  prints output the other backends never print — feat_stage98_
+  refine_panic's own "unreachable" marker line is the proof). The
+  ledger is two-way, like Stage 128's: an entry whose divergence
+  still matches is SANCTIONED (green, diagnosis quoted back); a
+  program that compares clean again is STALE (trim it); an entry
+  whose per-backend states moved is a MISMATCH (re-diagnose, never
+  auto-pass); an unledgered divergence is the regression alarm.
+  `--update-ledger` drafts entries; the tool never writes the file.
+- **The purity gate.** A program is comparable only when its output
+  is a function of its source: crate modes (#![freestanding] and
+  friends) have no hosted main; time/env/net/fs/thread/process
+  imports and the nondeterministic builtins make output a function
+  of the WORLD. The gate denies by table, names its reason for
+  every exclusion in the report and the `--discover` census, and
+  `--all` lifts it for auditing. The gated corpus is 167 programs;
+  the full default sweep runs it through all four legs in ~95 s.
+- **The fixtures.** tests/xdiff/ carries seven fixtures written FOR
+  the table, in the wasm alpha's supported subset: integer corners
+  (division truncation across signs, the mod-sign rule, INT64_MIN/
+  MAX, 3^37), the float channel (every rendering pair the two
+  renderers actually disagree on, including inf/nan and the 2^63
+  magnitude), UTF-8 strings (two-byte é, three-byte ￥, 400-byte
+  concatenation), control flow and recursion, a div-by-zero panic,
+  a checked-overflow panic, and a deliberate exit(7) — one fixture
+  per verdict class. The ok corpus gains
+  tests/ok/feat_stage133_xdiff.hls, which pins the decision
+  procedure in pure HLS: the channel-suspicion law (six decimals is
+  printf's shape, three-plus is a real fraction, seven-plus integer
+  digits is channel noise — and a short form is NEVER rewritten),
+  the halt-class table, the ledger judgment table including the
+  fail-closed unledgered alarm, and the purity deny table.
+- **The gate.** `make xdiff-acceptance` (bin/hlc prereq) runs eight
+  sections over the real CLI and real backends: the convention
+  (0/1/2, refusals name the rule, the reference-leg law — interp
+  cannot be dropped while native runs), the normalizer's 17 vectors
+  in process, the three-backend byte match (interp == native ==
+  wasm on the RAW digest for the integers fixture; raw digests
+  DIFFER and canonical digests AGREE for the float fixture — the
+  channel did real work), the halt law with an unledgered trap
+  ringing exit 1, the ledger law including the missing-entry
+  regression, the bogus-entry STALE ring and the moved-states
+  MISMATCH ring, the purity census with --all's honesty, the llvm
+  static leg's labelling, and the corpus showcase (checker,
+  interpreter, native byte-identical, fmt-canonical, lint-clean)
+  plus the full --core run green with every verdict class present
+  and three executing backends participated. `make xdiff` is the
+  fast core (40 programs, every verdict class, ~a minute).
+- Exit codes 0 green / 1 not green / 2 usage; every refusal names
+  the rule. The report is a table for humans and `--json` for CI.
+
 ## [v0.150.0-alpha] — Stage 132: LTS branch policy (`backport-only after v1.0`)
 - Stage 132 turns the roadmap's phrase into an executable policy.
   After v1.0 the project maintains LTS release branches, and an LTS

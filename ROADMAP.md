@@ -203,7 +203,7 @@ remains green.
 | 130 | Deprecation mechanism (`@deprecated` attribute + lint) | ✅ | (done in v0.148.0-alpha) |
 | 131 | Semantic-versioning enforcement in `hls-pkg` | ✅ | (done in v0.149.0-alpha) |
 | 132 | LTS branch policy (backport-only after v1.0) | ✅ | (done in v0.150.0-alpha) |
-| 133 | Cross-impl differential suite (3+ backends) | ⬜ | 6 weeks |
+| 133 | Cross-impl differential suite (3+ backends) | ✅ | (done in v0.151.0-alpha) |
 | 134 | Fuzz corpus seeding from real-world packages | ⬜ | 4 weeks |
 | 135 | Bug-bounty-eligible soundness guarantees documented | ⬜ | 3 weeks |
 | 136 | Performance regression dashboard (per-commit) | ⬜ | 5 weeks |

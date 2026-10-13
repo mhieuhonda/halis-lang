@@ -8955,3 +8955,120 @@ pick), the tag law, the audit law (including the forged-trailer and
 ghost-sha cases), the release train (init → backport → v1.0.1 →
 backport → v1.0.2 → audit green), and the corpus hygiene (checker,
 interpreter, native differential, fmt-canonical, lint-clean).
+
+## 72. The cross-implementation differential suite (Stage 133 — v0.151.0-alpha)
+
+The language ships four implementations of itself — the Stage-0
+interpreter, the self-hosted C backend, the WebAssembly backend and
+the LLVM IR emitter — and their agreement is now a measured fact
+instead of an assumption. `tools/hls-xdiff.py` runs the SAME program
+through every backend and compares the observable behaviour: stdout
+bytes and exit codes. Three backends execute (interp, native, wasm);
+the llvm leg is a static participant — it emits IR and structurally
+validates it, and every report labels it "static — validated, not
+executed" in those words. An implementation that cannot run a
+program is not silently absent: the wasm alpha names its subset
+refusals and the suite reports them as skips with the refusal
+quoted; a backend that TRIES and fails (an invalid module, a
+timeout) has not agreed to anything, so an error leg caps the
+verdict — `exact` must mean every backend that could run the
+program ran it and agreed.
+
+### 72.1. The channel
+
+Backends may render one and the same double differently: printf says
+"0.750000" and "-nan"; the wasm glue's JS Number says "0.75" and
+"NaN". The oracle therefore compares both sides on a shared
+canonical form — round to the printf channel's six decimal places,
+shortest round-trip representation, exponent forms normalized,
+±nan folded to nan, the sign of zero dropped — and records the
+verdict as `normalized` instead of `exact` whenever raw bytes
+differed. The channel is a narrow license, and the suite enforces
+the limits as loudly as the license: short decimal forms ("1.5"),
+version strings ("1.10") and integers ("9007199254740993") are
+never rewritten — a divergence between those is real. The
+suspicion rule is syntactic: six decimals is printf's own shape,
+three or more is a real fraction, seven or more integer digits
+crosses the magnitude where JS abbreviates; anything else passes
+through untouched.
+
+### 72.2. The halt classes
+
+Exit codes compare exactly when backends agree; when they halt,
+they compare as CLASSES. The interpreter and the native build panic
+with 101 and honour exit(N); the wasm alpha halts every panic,
+abort and exit(N) through one `unreachable` trap — the HALT is
+propagated, the CODE is not (its emitter's documented alpha
+convention: a visible halt beats a silent wrong answer). Uniform
+101 with a wasm trap is `panic-equal`; a uniform hosted code N with
+a trap is `halt-gap`, named with the code pair; a halt on one side
+against a clean run on the other is a `divergence` — the loudest
+alarm the suite owns, because the implementations disagree about
+whether the program halts at all. stderr is recorded but never
+compared: panic wording is backend-owned; that a halt happened,
+and that the bytes before it agree, is what the oracle owns.
+
+### 72.3. The ledger
+
+A divergence the suite discovers is a finding, and findings are
+owned, not swept. tests/xdiff/ledger.json names each sanctioned
+divergence with the culprit backend, the per-backend state
+signature observed at diagnosis, and a diagnosis that says what is
+actually wrong. The judgment is two-way: a divergence whose entry
+matches is SANCTIONED (the run stays green and quotes the
+diagnosis); a ledgered program that compares clean again is STALE
+(the entry must be trimmed — the good news must not outlive its
+cause); an entry whose observed states no longer match is a
+MISMATCH (the divergence moved — re-diagnose, never auto-pass); a
+divergence with no entry is the regression alarm. `--update-ledger`
+drafts entries from a live run; the tool never writes the ledger.
+
+The first sweep found six real divergences, all wasm-side: two
+emitter bugs that produce invalid modules (nested-generic calls
+emit an i64 constant where the callee signature says i32; the
+tail-call lowering loses the return value on the stack), the
+documented-unimplemented str.to_float (a bare `unreachable`), a
+wrong f64 comparison at the 2^63 corner (a value divergence the
+printed bytes alone never show), and two missing soundness checks
+— the runtime refinement guard and the byte_at bounds check are
+not emitted, so a program the interpreter panics on runs on and
+prints output the other backends never print. The ledger keeps
+every one of them loud until it is fixed; healing one is the
+STALE ring telling you to trim the entry.
+
+### 72.4. The purity gate
+
+A program is comparable only when its output is a function of its
+source. Crate modes (#![freestanding], #![no_std], ...) have no
+hosted main; imports of time/env/process/net/fs/thread and friends,
+and the clock/rand/filesystem/network/scheduler builtins, make the
+output a function of the world. The gate denies by table, names
+its reason for every exclusion, and `--all` lifts it for auditing —
+an impure program then earns whatever its legs earn, usually an
+honest timeout error. `--discover` prints the census without
+running a leg.
+
+### 72.5. What the tests prove
+
+`tests/ok/feat_stage133_xdiff.hls` pins the decision procedure in
+the ok corpus: the channel-suspicion law and the pair-verdict
+table (raw-equal is exact; same-double-different-bytes through a
+channel token is normalized; everything else is divergence — with
+"1.10" vs "1.1" pinned as divergence), the halt-class table (nine
+rows, including the 0-vs-trap alarm and the trap-free uniform-101
+panic class), the ledger judgment table including the fail-closed
+unledgered alarm, and the purity deny table with its fail-closed
+default for unknown modules. tests/xdiff/ carries seven fixtures
+written for the table, one per verdict class. The acceptance gate
+`make xdiff-acceptance` (8 sections, bin/hlc prerequisite) drives
+the real CLI over the real backends: the convention (0/1/2, every
+refusal names the rule, the reference-leg law), the channel's 17
+vectors in process, the three-backend byte match proven by raw
+digest equality (and by raw digest INEQUALITY plus canonical
+equality for the float fixture — the channel did real work), the
+halt law with an unledgered trap ringing exit 1, the ledger's
+negative space (missing entry → regression, bogus entry → STALE,
+moved states → MISMATCH), the purity census and --all's honesty,
+the llvm leg's labelling, and the corpus showcase followed by the
+full --core run green with every verdict class present and three
+executing backends participated.
