@@ -13,6 +13,84 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.153.0-alpha] — Stage 135: Bug-bounty-eligible soundness guarantees documented
+- SECURITY.md has carried the security model in prose since
+  v0.30.0-alpha, and prose rots: nothing fails when the code it
+  describes changes. The new `tools/hls-guarantee.py` turns the
+  model into a LEDGER — fifteen machine-readable soundness
+  guarantees (G-MEM-01 through G-CORPUS-01), each with live
+  ANCHORS (enforcement points grepped in the tree at run time, line
+  numbers recorded), PROBES (real programs re-run through the real
+  checker and interpreter at verify time, refusal messages and
+  panic exits pinned), and a CONTRACT (what a bounty-eligible
+  violation looks like, what a report must ship, what is honestly
+  out of scope). The document is only ever allowed to claim what
+  the current tree still demonstrates.
+- **The ledger.** Seven critical rows open the table (ownership,
+  the refcounted no-free runtime, static typing, checked
+  arithmetic, the effects fixpoint, taint sinks, data-race
+  freedom), six high rows follow (match exhaustiveness, capability
+  tokens, the sandbox gate, the constant-time verifier, FFI
+  fencing, bootstrap determinism), two medium rows close it (name
+  resolution, corpus agreement). 27 anchors span
+  boot/checking/*.py, boot/boot.py, boot/ffi_taint.py,
+  boot/interp_parts/rt_num.py, src/hlc/{codegen,runtime}.hls, the
+  Makefile, the differential suite and SECURITY.md itself (the
+  reporting channel is an anchor — it cannot silently move). 30
+  probes re-run per verify: 27 checker refusals through
+  `boot.py --check` (every message substring pinned) and 3 runtime
+  panics through the interpreter (divzero, bounds, overflow — exit
+  101 pinned), including the sandbox probe, which passes extra CLI
+  args (`--sandbox`) because the sandbox gate, not the type
+  checker, is what refuses it. A verify pass is 15/15 green in
+  under four seconds.
+- **Anti-rot is the law.** An anchor that no longer resolves Voids
+  its guarantee and the tool exits 1 naming the row; a probe that
+  the checker suddenly ACCEPTS is a violation; a probe file that
+  disappears is a named error, not a silent pass; a report is
+  never written from a violated ledger. `report --out
+  SOUNDNESS.md` regenerates the bug-bounty scope document from the
+  ledger — deterministic (sorted walks, no wall-clock without
+  --stamp, the tree sha and the sha256 ledger digest embedded), so
+  two regenerations at one tree are byte-identical and any
+  hand-edit is a diff. The document carries the eligibility
+  contract, the severity vocabulary with ranks, per-guarantee
+  sections with live anchor line numbers and probe verdicts, the
+  seven-entry honest out-of-scope register (taint_unwrap,
+  mis-declared externs, native stack depth, the proof fragment,
+  sub-source-level side channels, kernel escapes, sanctioned
+  xdiff rows), and the reproduction contract (ledger id + accepted
+  reproducer + toolchain + observed-vs-expected).
+- **The gate.** `make guarantee-acceptance` (bin/hlc prereq) runs
+  eight sections over the real CLI, the real checker, the real
+  interpreter and the real native backend: the convention (exit
+  codes, refusals naming the rule), the ledger law (15 rows, ids
+  shaped G-<FAM>-NN, families and severities from the closed
+  vocabulary, the mapping pinned row by row, exactly the two meta
+  rows probe-free), the anchor law (27 anchors resolved with line
+  numbers; a tampered tree whose checker lost "use of moved value"
+  voids G-MEM-01 by name), the probe law (30/30 green, refusal and
+  panic messages recorded; a deleted probe named; a weakened
+  shadowing refusal caught by its pinned message), the drift law
+  (one tampered tree carrying an anchor drift AND a probe drift is
+  refused naming both rows; the report refuses the violated
+  ledger and writes nothing), the report law (byte-identical
+  regeneration, every id in the document, the tree sha equal to
+  git rev-parse HEAD, --stamp changing only the Generated line),
+  the bounty law (the advisory channel and the 90-day window
+  anchored live from SECURITY.md, severity ranks 0/1/2, every row
+  contracted, the critical rows opening the table), and the corpus
+  showcase: tests/ok/feat_stage135_guarantee.hls pins the decision
+  procedure in pure HLS — the closed severity vocabulary, the
+  G-<FAM>-NN id grammar, the fail-closed void law, the probe
+  verdict law, the sorted-walk determinism law, the
+  seven-critical-rows count law — hlfmt-canonical, hllint-clean,
+  byte-identical on the interpreter and natively.
+- Exit codes 0 verified / 1 named violation / 2 usage; every
+  refusal names the rule, not just the fact. `make guarantee` is
+  the fast re-demonstration pass for CI; `make guarantee-report`
+  regenerates SOUNDNESS.md when a release wants the document.
+
 ## [v0.152.0-alpha] — Stage 134: Fuzz corpus seeding from real-world packages
 - The Stage 18 fuzzer generates its programs from a hand-written
   grammar — small `main()`-only toys over ints, strings and control

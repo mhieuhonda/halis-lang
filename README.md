@@ -313,6 +313,26 @@ make fuzzseed-acceptance      # Stage 134 gate: the seeding battery
                                # the identity law, the census law,
                                # the mutation law, the differential
                                # + the fuzzer)
+python3 tools/hls-guarantee.py verify
+                               # Stage 135: re-demonstrate the
+                               # soundness guarantee ledger against
+                               # the live tree — 15 guarantees, 27
+                               # anchors grepped at their
+                               # enforcement points, 30 probes
+                               # re-run through the real
+                               # checker/interpreter (refusal
+                               # messages and panic exits pinned),
+                               # the SECURITY.md channel anchored
+python3 tools/hls-guarantee.py report --out SOUNDNESS.md
+                               # the bug-bounty scope document,
+                               # regenerated (never hand-edited):
+                               # deterministic, tree-sha-stamped,
+                               # byte-identical per tree
+make guarantee-acceptance      # Stage 135 gate: the ledger battery
+                               # (the convention, the ledger law,
+                               # the anchor law, the probe law, the
+                               # drift law, the report law, the
+                               # bounty law, the showcase)
 
 # 13. Stage 15-alpha: Safe C FFI (v0.13.0-alpha)
 python3 boot/boot.py examples/ffi_demo.hls           # call libc functions

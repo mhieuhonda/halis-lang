@@ -205,7 +205,7 @@ remains green.
 | 132 | LTS branch policy (backport-only after v1.0) | ✅ | (done in v0.150.0-alpha) |
 | 133 | Cross-impl differential suite (3+ backends) | ✅ | (done in v0.151.0-alpha) |
 | 134 | Fuzz corpus seeding from real-world packages | ✅ | (done in v0.152.0-alpha) |
-| 135 | Bug-bounty-eligible soundness guarantees documented | ⬜ | 3 weeks |
+| 135 | Bug-bounty-eligible soundness guarantees documented | ✅ | (done in v0.153.0-alpha) |
 | 136 | Performance regression dashboard (per-commit) | ⬜ | 5 weeks |
 | 137 | Memory regression dashboard (RSS over time) | ⬜ | 4 weeks |
 | 138 | Compile-time regression dashboard | ⬜ | 4 weeks |

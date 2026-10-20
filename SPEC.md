@@ -9244,3 +9244,105 @@ rows deny by default), the corner pool's edges as legal values
 (INT64_MIN/MAX compare, halve, and increment in range), the rank
 table's exact weights, and the directional harness-shape law (a
 harness whose call precedes its parameter lets is malformed).
+
+## 74. The soundness guarantee ledger (Stage 135 — v0.153.0-alpha)
+
+SECURITY.md states the security model in prose. Stage 135 makes the
+model AUDITABLE: `tools/hls-guarantee.py` carries the guarantee
+LEDGER — fifteen machine-readable rows, each a soundness guarantee
+the toolchain makes, each bound to the tree it is claimed against by
+three live parts.
+
+### 74.1. The row anatomy
+
+ANCHORS are (file, pattern) pairs — the enforcement points the
+guarantee rests on, grepped in the tree at verify time with the
+resolving line number recorded. An anchor that no longer resolves
+VOIDS its row: the tool exits 1 naming the guarantee, and no report
+is written. PROBES are real programs re-run through the real
+toolchain at verify time: a refusal probe must be rejected by
+`boot.py --check` with the pinned message substring (exit 1); a
+panic probe must halt the interpreter with exit 101 and the pinned
+panic line. A probe the checker suddenly ACCEPTS is a violation; a
+probe file that has disappeared is a named error, never a silent
+pass. The CONTRACT is the bounty mapping: what a violation of this
+row looks like, what a report must ship, and what is honestly out of
+scope.
+
+### 74.2. The table
+
+Seven critical rows open the ledger: G-MEM-01 (a moved or dropped
+binding is unusable on every control-flow path), G-MEM-02 (no manual
+free — the refcounted runtime releases exactly at scope exit),
+G-TYPE-01 (static typing, no implicit conversion), G-ARITH-01
+(overflow, division by zero and bounds are controlled panics, never
+UB), G-EFF-01 (no undeclared world effect reaches through the static
+call graph), G-TAINT-01 (a tainted value cannot reach a sink without
+a sanitizer), G-CONC-01 (owned values cross task boundaries only by
+clone or transfer; the Send rules close the rest). Six high rows
+follow: G-MATCH-01 (match exhaustiveness), G-CAP-01 (capabilities
+cannot be forged, cloned or taken outside a grant), G-SBX-01 (under
+`--sandbox`, extern blocks and Proc-reaching programs are refused
+and the file builtins are confined to DIR), G-CT-01 (a #[ct] claim
+is verified branch-free over its named secrets), G-FFI-01 (externs
+demand declared effects; taint crosses the boundary), G-DET-01 (the
+bootstrap is a fixed point). Two medium rows close it: G-SPEC-01
+(no shadowing, no unresolved names, no uninitialised bindings) and
+G-CORPUS-01 (interpreter and native agree byte-for-byte over the ok
+corpus, divergences sanctioned in the xdiff ledger). The two meta
+rows are exactly the rows with no probe — they demonstrate
+themselves through the suites that own them; every other row
+demonstrates itself in the verify pass, 30 probes in under four
+seconds.
+
+### 74.3. The report and the anti-rot law
+
+`hls-guarantee.py report --out SOUNDNESS.md` regenerates the
+bug-bounty scope document from the ledger — never hand-written,
+never written from a violated ledger. The render is deterministic:
+fixed row order (critical rows first, the definition order), no
+wall-clock unless `--stamp`, the tree sha from `git rev-parse HEAD`
+and the sha256 digest of the canonical ledger embedded in the
+header, live anchor line numbers in every section. Two
+regenerations at one tree are byte-identical; a hand-edit is a diff
+against the digest. The document carries the eligibility contract
+(name one ledger row, ship a reproducer the toolchain ACCEPTS,
+demonstrate the row's violation at the boundary the row claims), the
+severity vocabulary with ranks (critical 0, high 1, medium 2), the
+seven-entry honest out-of-scope register (taint_unwrap as a user
+decision, mis-declared externs, native stack depth, the proof
+engine's fragment, sub-source-level side channels, kernel escapes
+under the sandbox, sanctioned xdiff rows), the reporting channel
+quoted live from SECURITY.md — itself an anchored file, so the
+channel cannot silently move — and the reproduction contract.
+
+### 74.4. The gate
+
+`make guarantee-acceptance` (bin/hlc prerequisite) runs eight
+sections over the real CLI, the real checker, the real interpreter
+and the real native backend: the convention (0 verified / 1 named
+violation / 2 usage; refusals name the rule); the ledger law (15
+rows, ids shaped G-<FAM>-NN and unique, families and severities from
+the closed vocabulary, the severity/family mapping pinned row by
+row, claim/violation/repro/scope on every row); the anchor law (27
+anchors resolved with line numbers; a tampered tree whose checker
+lost "use of moved value" voids G-MEM-01 by name); the probe law
+(30/30 green, refusal and panic messages recorded; a deleted probe
+file named; a weakened shadowing refusal caught by its pinned
+message); the drift law (one tampered tree carrying an anchor drift
+AND a probe drift is refused naming both rows; the report refuses
+the violated ledger and writes nothing); the report law
+(byte-identical regeneration, every id in the document, the tree sha
+equal to HEAD, --stamp changing only the Generated line); the bounty
+law (the advisory channel and the 90-day window anchored live, the
+severity table, every row contracted, the critical rows opening the
+table); and the corpus showcase — tests/ok/feat_stage135_guarantee.hls
+pins the decision procedure in pure HLS (the closed severity
+vocabulary, the id grammar, the fail-closed void law, the probe
+verdict law, the sorted-walk determinism law, the
+seven-critical-rows count law), hlfmt-canonical, hllint-clean,
+byte-identical on the interpreter and natively.
+
+Exit codes: 0 verified, 1 a named violation (fail-closed), 2 usage
+error. `make guarantee` is the fast re-demonstration pass;
+`make guarantee-report` regenerates the document.
