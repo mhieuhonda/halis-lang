@@ -334,6 +334,36 @@ make guarantee-acceptance      # Stage 135 gate: the ledger battery
                                # drift law, the report law, the
                                # bounty law, the showcase)
 
+python3 tools/hls-perf.py record
+                               # Stage 136: file one measurement of
+                               # the tracked suite
+                               # (benchmarks/regression_watch.hls)
+                               # pinned to the current clean commit
+                               # — hls-bench measures, the ledger
+                               # remembers
+python3 tools/hls-perf.py gate
+                               # the CI leg: classify the newest
+                               # record against the prior record of
+                               # the same instrument (Welch +
+                               # seeded bootstrap, 5% band) — any
+                               # unsanctioned regressed or vanished
+                               # bench exits 1, named
+python3 tools/hls-perf.py sanction bench --reason "..."
+                               # a written excuse with an author —
+                               # sanctioned regressions are loud but
+                               # green
+python3 tools/hls-perf.py dashboard --out PERFORMANCE.md
+                               # the dashboard, regenerated (never
+                               # hand-edited): sorted verdicts,
+                               # per-bench trend sparklines, the
+                               # sanctions register, byte-identical
+                               # per ledger
+make perf-acceptance           # Stage 136 gate: the dashboard battery
+                               # (the convention, the record law,
+                               # the floor law, the classification
+                               # law, the gate law, the determinism
+                               # law, the ledger law, the showcase)
+
 # 13. Stage 15-alpha: Safe C FFI (v0.13.0-alpha)
 python3 boot/boot.py examples/ffi_demo.hls           # call libc functions
 python3 tools/hlbindgen.py /usr/include/stdlib.h      # generate extern block from C header

@@ -9346,3 +9346,74 @@ byte-identical on the interpreter and natively.
 Exit codes: 0 verified, 1 a named violation (fail-closed), 2 usage
 error. `make guarantee` is the fast re-demonstration pass;
 `make guarantee-report` regenerates the document.
+
+## 75. The per-commit performance ledger (Stage 136 — v0.154.0-alpha)
+
+Stage 124 built the instrument (`hls-bench`); Stage 136 adds the
+memory. `tools/hls-perf.py` is a LEDGER over commits: every `record`
+is one measurement of the tracked suite
+(`benchmarks/regression_watch.hls` — five deterministic,
+allocation-shaped benches over the interpreter's hot shapes: the
+arithmetic loop, string growth, heap-list churn, the byte-at-a-time
+FNV mix, enum match dispatch) pinned to one clean commit in the
+append-only ledger (`.hlperf/history.jsonl`, JSONL, one self-contained
+object per line). A record that does not pin a commit is a rumour: the
+tool reads `git rev-parse HEAD`, refuses a work tree with tracked
+modifications (`--allow-dirty` to override, `--commit SHA` for the CI
+import path), and stores the backend, the sha256 suite digest, the
+measurement plan, the env fingerprint and every raw sample.
+
+### 75.1. The laws
+
+THE RECORD LAW — the ledger is append-only (a record never rewrites a
+line; the bytes before are always a byte prefix of the bytes after);
+`--from-report` imports an `hls-bench --json` report instead of
+measuring (the CI path: one machine measures, another files it). THE
+FLOOR LAW — a bench with fewer than two samples, non-positive
+estimates, or a median without its raw samples is refused AT RECORD
+TIME ("a median no sample supports is not a measurement"); a FAILED
+bench fails the whole record (a dashboard built over half a suite is a
+lie); a corrupt or type-unknown ledger line is a named error naming
+the line, never a silent skip. THE INSTRUMENT LAW — comparisons happen
+only within the same backend and the same byte-identical suite digest;
+interpreter and native timings are different instruments, and a
+changed suite is re-baselined, not compared. THE CLASSIFICATION LAW —
+exactly Stage 124's: Welch p < 0.05 for significance, the
+seeded-bootstrap CI of the median change against the noise band
+(default 5%), the statistics IMPORTED from hls-bench itself so the
+runner's numbers and the ledger's verdicts cannot drift; the six-way
+vocabulary is no-change / within-noise / improved / regressed / new /
+vanished, and a bench that disappears fails BY NAME (silently losing a
+bench would hide regressions). THE GATE LAW — one unsanctioned
+regressed or vanished bench exits 1 naming it; a SANCTION is a written
+excuse with an author and a reason (a sanction without a reason is
+refused; an unknown bench is refused naming the known ones); sanctioned
+rows are loud but green. THE DETERMINISM LAW — the dashboard is a pure
+render of the ledger bytes: sorted walks, the sha256 ledger digest
+embedded, per-bench trend sparklines over 8 bands with integer
+half-up math (a constant series renders the mid band — a wall of
+max-height blocks would read as a regression that is not there), no
+wall-clock unless `--stamp` (and then only the Generated line), so two
+renders of one ledger are byte-identical and a hand-edited dashboard
+is a diff.
+
+### 75.2. The gate
+
+`make perf` records at the current commit; `make perf-gate` is the CI
+leg; `make perf-dashboard` regenerates PERFORMANCE.md;
+`make perf-acceptance` runs eight sections over the real CLI, the real
+runner, controlled ledgers and the negative space: the convention, the
+record law (real end-to-end measurement, append-only prefix check, the
+dirty-tree refusal on a throwaway clone), the floor law, the
+classification law (identical / +40% / -40% / significant-but-in-band
+pairs), the gate law (sanctions, baselines, ambiguity, instruments,
+suite changes, --threshold), the determinism law (byte-identical
+renders, the digest, the stamp, the sorted rows), the ledger law
+(corrupt lines, unknown types, missing pins) and the corpus showcase —
+tests/ok/feat_stage136_perf.hls pins the decision procedure in pure
+HLS (the class truth table with its boundary law, the gate boolean,
+the sanction-by-name law, the 40-hex pin grammar, the trend band law,
+the 5-bench/5-command/6-class count law), hlfmt-canonical,
+hllint-clean, byte-identical on the interpreter and natively.
+
+Exit codes: 0 verified, 1 a named violation, 2 usage error.

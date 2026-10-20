@@ -13,6 +13,102 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.154.0-alpha] — Stage 136: Performance regression dashboard (per-commit)
+- Stage 124 built the instrument — `hls-bench`, the criterion-style
+  runner with Welch tests and seeded bootstrap CIs — but an
+  instrument is not a memory: every run started from nothing, and a
+  regression had to be noticed by someone who remembered yesterday's
+  numbers. The new `tools/hls-perf.py` adds the memory: a LEDGER over
+  commits where every record is one measurement of the tracked suite
+  pinned to one clean commit, the gate classifies the newest record
+  against the prior record of the SAME instrument with exactly
+  Stage 124's law, and the dashboard renders the whole history
+  deterministically. `hls-bench` measures; `hls-perf` remembers and
+  judges — and the statistics are IMPORTED from `hls-bench` itself,
+  so the runner's numbers and the ledger's verdicts can never drift
+  apart.
+- **The ledger.** One append-only JSONL file (default
+  `.hlperf/history.jsonl`, gitignored — pass `--history` to point CI
+  at a committed one), one self-contained object per line. A record
+  carries the commit sha, the backend, the sha256 suite digest, the
+  measurement plan, the env fingerprint (python, cc, cpus), the
+  skipped benches, and every RAW sample — the distribution, not just
+  the median, because classification needs distributions. The
+  tracked suite `benchmarks/regression_watch.hls` covers the five
+  hot shapes a release can quietly regress: the arithmetic loop
+  (dispatch), string growth (concat + realloc), heap-list churn
+  (push/pop traffic), the byte-at-a-time FNV mix (the hash inner
+  loop every table leans on) and enum match dispatch — each sized
+  for timer resolution under the fixed-iter plan, each deterministic
+  and allocation-shaped, so a regression measured here is the
+  toolchain's regression, not the workload's mood. `record` reads
+  `git rev-parse HEAD` and REFUSES a work tree with tracked
+  modifications — a per-commit record that does not pin a clean
+  commit is a rumour, not a measurement (`--commit SHA` is the
+  explicit CI path; `--from-report` imports a machine report instead
+  of measuring: one machine measures, another files it).
+- **The laws.** The floor law bites at record time: a bench with
+  fewer than two samples, non-positive estimates, or a median
+  without its raw samples is refused ("a median no sample supports
+  is not a measurement"); a FAILED bench fails the whole record — a
+  dashboard built over half a suite is a lie. The instrument law:
+  comparisons happen only within the same backend and the same
+  byte-identical suite digest; interpreter and native timings are
+  different instruments, and a changed suite is re-baselined, not
+  compared. The classification law is Stage 124's verbatim — Welch
+  p < 0.05, the seeded bootstrap CI of the median change against the
+  noise band — extended with the rename law: a bench that appears is
+  new (reported, never failed), one that disappears is vanished and
+  fails BY NAME, because silently losing a bench would hide
+  regressions. The gate law: one unsanctioned regressed or vanished
+  bench exits 1 naming it; a SANCTION is a written excuse with an
+  author and a reason (`sanction bench_int_loop --reason "switched
+  to a correct algorithm; the constant factor was the price"`) — a
+  sanction without a reason is refused, an unknown bench is refused
+  naming the known ones, and sanctioned rows are loud but green. The
+  determinism law: the dashboard is a pure render of the ledger
+  bytes — sorted walks, the sha256 ledger digest embedded, per-bench
+  trend sparklines over 8 bands with integer half-up math (a
+  constant series renders the mid band: a wall of max-height blocks
+  would read as a regression that is not there), no wall-clock
+  unless --stamp (and then only the Generated line) — so two renders
+  of one ledger are byte-identical and a hand-edited dashboard is a
+  diff.
+- **The gate.** `make perf` records at the current commit;
+  `make perf-gate` is the CI leg; `make perf-dashboard` regenerates
+  PERFORMANCE.md; `make perf-acceptance` runs eight sections over the
+  real CLI, the real runner, controlled ledgers and the negative
+  space: the convention (exit codes 0/1/2, the empty-ledger
+  refusals), the record law (a real end-to-end measurement of the
+  tracked suite, the append-only prefix check — the bytes before are
+  always a byte prefix of the bytes after — the dirty-tree refusal
+  proven on a throwaway clone, the no-git refusal under
+  GIT_CEILING_DIRECTORIES), the floor law (one-sample, zero-sample,
+  non-positive, failed-bench, foreign-report refusals, each named),
+  the classification law (identical / +40% / -40% /
+  significant-but-in-band pairs classify no-change / regressed /
+  improved / within-noise, the rename pair yields new + vanished),
+  the gate law (sanctions flip the verdict loud-but-green, unknown
+  benches and reasonless sanctions are refused, --baseline resolves
+  a prefix and refuses an ambiguous one, cross-backend and
+  changed-suite comparisons are refused by name, --threshold moves
+  the band), the determinism law (byte-identical renders, the
+  embedded digest, --stamp moving only the Generated line, sorted
+  rows, the constant-trend mid band, the first-record n/a), the
+  ledger law (corrupt lines, unknown types, missing pins and
+  reasonless sanctions are named errors naming the line), and the
+  corpus showcase: tests/ok/feat_stage136_perf.hls pins the decision
+  procedure in pure HLS — the class truth table with its boundary
+  law (lo == noise does NOT clear the floor), the gate boolean, the
+  sanction-by-name law, the 40-hex pin grammar, the trend band law,
+  the 5-bench/5-command/6-class count law — hlfmt-canonical,
+  hllint-clean, byte-identical on the interpreter and natively. 76/76
+  green.
+- Exit codes 0 verified / 1 named violation / 2 usage; every refusal
+  names the rule, not just the fact. The ledger never guesses: a
+  corrupt line is a named error naming the line number, and the
+  append-only discipline means history is never rewritten under you.
+
 ## [v0.153.0-alpha] — Stage 135: Bug-bounty-eligible soundness guarantees documented
 - SECURITY.md has carried the security model in prose since
   v0.30.0-alpha, and prose rots: nothing fails when the code it

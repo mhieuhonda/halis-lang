@@ -206,7 +206,7 @@ remains green.
 | 133 | Cross-impl differential suite (3+ backends) | ✅ | (done in v0.151.0-alpha) |
 | 134 | Fuzz corpus seeding from real-world packages | ✅ | (done in v0.152.0-alpha) |
 | 135 | Bug-bounty-eligible soundness guarantees documented | ✅ | (done in v0.153.0-alpha) |
-| 136 | Performance regression dashboard (per-commit) | ⬜ | 5 weeks |
+| 136 | Performance regression dashboard (per-commit) | ✅ | (done in v0.154.0-alpha) |
 | 137 | Memory regression dashboard (RSS over time) | ⬜ | 4 weeks |
 | 138 | Compile-time regression dashboard | ⬜ | 4 weeks |
 | 139 | Binary-size regression dashboard | ⬜ | 3 weeks |
