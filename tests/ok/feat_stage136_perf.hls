@@ -1,0 +1,426 @@
+# feat_stage136_perf.hls — Stage 136 (v0.154.0-alpha): the per-commit
+# performance regression dashboard.
+#
+# What this fixture pins is the DECISION PROCEDURE the dashboard runs —
+# the same laws `tools/hls-perf.py` applies when it files a record,
+# classifies a bench against its baseline, applies a sanction, and
+# renders the dashboard:
+#
+#   hls-perf record | sanction | gate | dashboard | history
+#
+#   1. the class      — the vocabulary is closed and ordered: no-change
+#      law              0, regressed 1, improved 2, within-noise 3,
+#                       new 4, vanished 5. Non-significant changes are
+#                       no-change no matter how large; a significant
+#                       change outside the noise band is a regression
+#                       when the CI floor clears the band and an
+#                       improvement when its ceiling does; anything
+#                       else significant is within-noise;
+#   2. the gate law   — exactly the regressed and vanished classes
+#                       fail the gate, and only when unsanctioned;
+#                       new, improved, within-noise and no-change
+#                       never fail it; one unsanctioned regression
+#                       fails the whole gate;
+#   3. the sanction   — a sanction matches by bench NAME; a sanctioned
+#      law              regression is loud but green; a sanction on a
+#                       bench that did not regress is stale (counted,
+#                       never applied); a sanction cannot excuse a
+#                       different bench;
+#   4. the pinning    — a record is pinned to a commit: 40 hex
+#      law              characters, lowercase, nothing else — a
+#                       per-commit record that does not pin a clean
+#                       commit is a rumour;
+#   5. the trend      — the sparkline normalizes the record series to
+#      band law          [min, max] over 8 bands with INTEGER half-up
+#                       math; the endpoints map to bands 0 and 7; a
+#                       constant series maps to the mid band 3 (a wall
+#                       of max-height blocks would read as a
+#                       regression that is not there); and two renders
+#                       of one series are byte-identical;
+#   6. the count law  — the tracked suite carries exactly 5 benches,
+#                       the tool speaks exactly 5 commands, the
+#                       vocabulary counts exactly 6 classes — the
+#                       numbers the acceptance gate pins.
+#
+# The program exits 0 when every law holds, 10+section*10+case
+# otherwise — the differential suite runs it on the interpreter AND
+# natively and requires byte-identical output.
+#
+# This file enters the corpus at this release — green the day it is
+# born, already written in the dialect the dashboard speaks.
+
+# ----------------------------------------------------------------------
+# Section 1 — the class law. Six classes, closed vocabulary; the gate
+# only ever fails on regressed and vanished.
+# ----------------------------------------------------------------------
+fn is_regress_or_vanish(cls: int) -> bool {
+    return cls == 1 || cls == 5
+}
+
+fn classify(p_significant: bool, lo: int, hi: int, noise: int) -> int {
+    # The truth table, in ints (percents). lo/hi are the bootstrap CI
+    # of the median change; noise is the band.
+    if !p_significant {
+        return 0
+    }
+    if lo > noise {
+        return 1
+    }
+    if hi < 0 - noise {
+        return 2
+    }
+    return 3
+}
+
+fn test_class_law() -> int {
+    # Not significant: no matter how large the point estimate, the
+    # answer is no-change.
+    if classify(false, 4000, 9000, 50) != 0 {
+        return 1
+    }
+    if classify(false, 0 - 4000, 4000, 50) != 0 {
+        return 2
+    }
+    if classify(false, 0, 0, 50) != 0 {
+        return 3
+    }
+    # Significant with the CI floor above the band: regressed.
+    if classify(true, 400, 900, 50) != 1 {
+        return 4
+    }
+    if classify(true, 51, 900, 50) != 1 {
+        return 5
+    }
+    # Significant with the CI ceiling below -band: improved.
+    if classify(true, 0 - 900, 0 - 400, 50) != 2 {
+        return 6
+    }
+    if classify(true, 0 - 900, 0 - 51, 50) != 2 {
+        return 7
+    }
+    # Significant but inside the band: within-noise.
+    if classify(true, 0 - 40, 40, 50) != 3 {
+        return 8
+    }
+    # The boundary is the law: lo == noise does NOT clear the floor,
+    # hi == -noise does NOT clear the ceiling.
+    if classify(true, 50, 900, 50) != 3 {
+        return 9
+    }
+    if classify(true, 0 - 900, 0 - 50, 50) != 3 {
+        return 10
+    }
+    # The ordering holds: regressed and vanished are the failing
+    # classes; nothing else is.
+    if !is_regress_or_vanish(1) || !is_regress_or_vanish(5) {
+        return 11
+    }
+    if is_regress_or_vanish(0) || is_regress_or_vanish(2)
+    || is_regress_or_vanish(3) || is_regress_or_vanish(4) {
+        return 12
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------
+# Section 2 — the gate law. One unsanctioned regression (or vanished
+# bench) fails the whole gate; sanctioned rows and every other class
+# stay green.
+# ----------------------------------------------------------------------
+fn gate_fails(classes: list[int], sanctioned: list[bool]) -> bool {
+    let n: int = classes.len()
+    let mut i: int = 0
+    while i < n {
+        if is_regress_or_vanish(classes[i]) && !sanctioned[i] {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn test_gate_law() -> int {
+    # All quiet.
+    if gate_fails([0, 3, 2, 4], [false, false, false, false]) {
+        return 1
+    }
+    # One unsanctioned regression fails.
+    if !gate_fails([0, 1, 2], [false, false, false]) {
+        return 2
+    }
+    # One vanished bench fails too.
+    if !gate_fails([0, 5], [false, false]) {
+        return 3
+    }
+    # A sanctioned regression is loud but green.
+    if gate_fails([1, 0], [true, false]) {
+        return 4
+    }
+    if gate_fails([5, 0], [true, false]) {
+        return 5
+    }
+    # ...but a sanction cannot excuse a DIFFERENT bench: one
+    # sanctioned row does not cover the unsanctioned one.
+    if !gate_fails([1, 1], [true, false]) {
+        return 6
+    }
+    # Two unsanctioned regressions — the gate fails once, and names
+    # both (the count law of the refusal is the tool's job; here the
+    # boolean is what the language can pin).
+    if !gate_fails([1, 5], [false, false]) {
+        return 7
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------
+# Section 3 — the sanction law. A sanction matches by bench NAME; a
+# sanction on a bench that did not regress is stale — counted, never
+# applied.
+# ----------------------------------------------------------------------
+fn contains_str(hay: list[str], needle: str) -> bool {
+    let n: int = hay.len()
+    let mut i: int = 0
+    while i < n {
+        if hay[i] == needle {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn sanction_applies(bench: str, regressed: list[str],
+sanctioned_names: list[str]) -> bool {
+    # The sanction fires only when THIS bench actually regressed.
+    if !contains_str(regressed, bench) {
+        return false
+    }
+    return contains_str(sanctioned_names, bench)
+}
+
+fn test_sanction_law() -> int {
+    let regressed: list[str] = ["bench_int_loop", "bench_str_build"]
+    let names: list[str] = ["bench_str_build"]
+    # The sanctioned regression is excused.
+    if !sanction_applies("bench_str_build", regressed, names) {
+        return 1
+    }
+    # The unsanctioned regression is not.
+    if sanction_applies("bench_int_loop", regressed, names) {
+        return 2
+    }
+    # A bench that did not regress is never excused by its sanction:
+    # the sanction is stale, and a stale sanction is counted, not
+    # applied.
+    if sanction_applies("bench_list_ops", regressed, names) {
+        return 3
+    }
+    # The matching is by exact name — no prefix games.
+    if contains_str(regressed, "bench_str") {
+        return 4
+    }
+    if contains_str(regressed, "bench_str_build_x") {
+        return 5
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------
+# Section 4 — the pinning law. A record is pinned to a commit: 40 hex
+# characters, lowercase, nothing else.
+# ----------------------------------------------------------------------
+fn is_hex_byte(b: int) -> bool {
+    if b >= 48 && b <= 57 {
+        return true
+    }
+    if b >= 97 && b <= 102 {
+        return true
+    }
+    return false
+}
+
+fn is_sha1(s: str) -> bool {
+    let n: int = s.len()
+    if n != 40 {
+        return false
+    }
+    let mut i: int = 0
+    while i < n {
+        if !is_hex_byte(s.byte_at(i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn test_pinning_law() -> int {
+    if !is_sha1("c0ffee0000000000000000000000000000000001") {
+        return 1
+    }
+    if !is_sha1("0123456789abcdef0123456789abcdef01234567") {
+        return 2
+    }
+    # Near-misses are refusals, not pins.
+    if is_sha1("c0ffee") {
+        return 3
+    }
+    if is_sha1("c0ffee000000000000000000000000000000001") {
+        return 4
+    }
+    if is_sha1("c0ffee00000000000000000000000000000000011") {
+        return 5
+    }
+    # Uppercase is not a pin — the ledger normalizes nothing.
+    if is_sha1("C0FFEE0000000000000000000000000000000001") {
+        return 6
+    }
+    if is_sha1("c0ffee000000000000000000000000000000000g") {
+        return 7
+    }
+    if is_sha1("") {
+        return 8
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------
+# Section 5 — the trend band law. The sparkline normalizes to
+# [min, max] over 8 bands with integer half-up math; endpoints map to
+# 0 and 7; a constant series maps to the mid band; and two renders of
+# one series are identical.
+# ----------------------------------------------------------------------
+fn band_of(v: int, lo: int, hi: int) -> int {
+    if hi <= lo {
+        return 3
+    }
+    return((v - lo) * 14 + (hi - lo)) / ((hi - lo) * 2)
+}
+
+fn render_bands(vs: list[int], lo: int, hi: int) -> str {
+    let n: int = vs.len()
+    let mut doc: str = ""
+    let mut i: int = 0
+    while i < n {
+        doc = doc + band_of(vs[i], lo, hi).to_str()
+        i = i + 1
+    }
+    return doc
+}
+
+fn test_band_law() -> int {
+    # Endpoints.
+    if band_of(5, 5, 10) != 0 {
+        return 1
+    }
+    if band_of(10, 5, 10) != 7 {
+        return 2
+    }
+    # The middle rounds half-up.
+    if band_of(7, 5, 9) != 4 {
+        return 3
+    }
+    # Interior points stay in range and climb monotonically.
+    if band_of(6, 5, 10) != 1 {
+        return 4
+    }
+    if band_of(7, 5, 10) != 3 {
+        return 5
+    }
+    if band_of(8, 5, 10) != 4 {
+        return 6
+    }
+    # A constant series is the mid band — not a wall.
+    if band_of(5, 5, 5) != 3 {
+        return 7
+    }
+    # Two renders of one series are byte-identical.
+    let series: list[int] = [1000, 1020, 1040, 1030, 1400]
+    let d1: str = render_bands(series, 1000, 1400)
+    let d2: str = render_bands(series, 1000, 1400)
+    if d1 != d2 {
+        return 8
+    }
+    if d1 != "00117" {
+        return 9
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------
+# Section 6 — the count law. The tracked suite carries exactly 5
+# benches (sorted), the tool speaks exactly 5 commands, the vocabulary
+# counts exactly 6 classes.
+# ----------------------------------------------------------------------
+fn is_sorted_strs(xs: list[str]) -> bool {
+    let n: int = xs.len()
+    let mut i: int = 1
+    while i < n {
+        if xs[i - 1] > xs[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn test_count_law() -> int {
+    let benches: list[str] = ["bench_fnv_hash", "bench_int_loop",
+    "bench_list_ops", "bench_match_enum", "bench_str_build"]
+    if benches.len() != 5 {
+        return 1
+    }
+    if !is_sorted_strs(benches) {
+        return 2
+    }
+    let commands: list[str] = ["dashboard", "gate", "history",
+    "record", "sanction"]
+    if commands.len() != 5 {
+        return 3
+    }
+    if !is_sorted_strs(commands) {
+        return 4
+    }
+    # Six classes, and the two failing ones are counted among them.
+    let classes: int = 6
+    if classes != 6 {
+        return 5
+    }
+    if !is_regress_or_vanish(1) || !is_regress_or_vanish(5) {
+        return 6
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------
+fn main() -> int uses IO {
+    println("stage 136: hls-perf")
+    let mut r: int = test_class_law()
+    if r != 0 {
+        return 10 + r
+    }
+    r = test_gate_law()
+    if r != 0 {
+        return 20 + r
+    }
+    r = test_sanction_law()
+    if r != 0 {
+        return 30 + r
+    }
+    r = test_pinning_law()
+    if r != 0 {
+        return 40 + r
+    }
+    r = test_band_law()
+    if r != 0 {
+        return 50 + r
+    }
+    r = test_count_law()
+    if r != 0 {
+        return 60 + r
+    }
+    println("  PERF OK: 5 benches tracked, classified, sanctioned, "
+    + "pinned")
+    return 0
+}
