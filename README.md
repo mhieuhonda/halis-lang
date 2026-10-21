@@ -364,6 +364,47 @@ make perf-acceptance           # Stage 136 gate: the dashboard battery
                                # law, the gate law, the determinism
                                # law, the ledger law, the showcase)
 
+python3 tools/hls-mem.py record
+                               # Stage 137: file one measurement of
+                               # the tracked memory suite
+                               # (benchmarks/rss_watch/ — the floor,
+                               # string growth, heap churn, boxed
+                               # objects) pinned to the current clean
+                               # commit — every workload must certify
+                               # STABLE under hls-rss before it can
+                               # be filed (a canary that leaks is a
+                               # bug, not a record)
+python3 tools/hls-mem.py gate
+                               # the CI leg: classify the newest
+                               # record against the prior record of
+                               # the same instrument (same suite
+                               # digest AND page size) — the metric
+                               # is the marker median (the resident
+                               # set at the cycle markers, measured
+                               # with the layout pinned by setarch
+                               # -R), significance is the seeded
+                               # bootstrap CI of the median change
+                               # excluding zero (the page law), the
+                               # band floored at 16 pages; any
+                               # unsanctioned regressed or vanished
+                               # workload exits 1, named
+python3 tools/hls-mem.py sanction node_box --reason "..."
+                               # a written excuse with an author —
+                               # sanctioned regressions are loud but
+                               # green
+python3 tools/hls-mem.py dashboard --out MEMORY.md
+                               # the dashboard, regenerated (never
+                               # hand-edited): verdicts, the
+                               # resident-set-at-markers trend (RSS
+                               # over time, literally), the slope
+                               # watch, the sanctions register,
+                               # byte-identical per ledger
+make memdash-acceptance        # Stage 137 gate: the memory battery
+                               # (the convention, the record law,
+                               # the floor law, the classification
+                               # law, the gate law, the determinism
+                               # law, the ledger law, the showcase)
+
 # 13. Stage 15-alpha: Safe C FFI (v0.13.0-alpha)
 python3 boot/boot.py examples/ffi_demo.hls           # call libc functions
 python3 tools/hlbindgen.py /usr/include/stdlib.h      # generate extern block from C header

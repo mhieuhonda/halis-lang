@@ -13,6 +13,162 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.155.0-alpha] — Stage 137: Memory regression dashboard (RSS over time)
+- Stage 125 built the instrument — `hls-rss`, the two-instrument
+  RSS verifier that samples `/proc/<pid>/statm` against the cycle
+  markers, fits a Theil-Sen slope and counts the malloc balance
+  through the link-time interposer — but an instrument is not a
+  history: it certifies ONE workload at ONE moment, and "the runtime
+  got heavier" is a sentence about commit-to-commit drift that no
+  single run can pronounce. Stage 136 gave TIME its ledger; this
+  release gives MEMORY its own. The new `tools/hls-mem.py` is a
+  LEDGER over commits: every record is one measurement of the
+  tracked canary suite pinned to one clean commit, the gate
+  classifies the newest record against the prior record of the same
+  instrument, and the dashboard renders the whole history
+  deterministically. `hls-rss` measures; `hls-mem` remembers and
+  judges — and the page size, the quantile estimator and the median
+  are IMPORTED from hls-rss itself, so the instrument's pages and
+  the ledger's verdicts can never drift apart.
+- **The tracked suite.** `benchmarks/rss_watch/` — four
+  deterministic, allocation-shaped canaries, one per memory shape a
+  language release can quietly regress: `startup_floor.hls` (the
+  resident-set floor — the runtime image, stdio, stack; a growth
+  here means the RUNTIME got heavier, not the program),
+  `node_box.hls` (4096 boxed structs per cycle — the per-object
+  overhead layout every record, message and AST node is built
+  from), `list_churn.hls` (a 65536-element push/pop list plus an
+  8-key map per cycle — the allocator-bin traffic a real service
+  hammers) and `str_grow.hls` (1024 strings per cycle, each grown
+  to 4 KiB by the doubling ladder — the realloc shape every string
+  builder walks). Every workload follows the Stage 125 convention
+  (argv[1] cycle count, `__HLRSS_CYCLE__` markers, deterministic,
+  no clock), every cycle is a millisecond or more of native work
+  (the sampler and the marker reader must both keep pace, or the
+  marker-aligned readings drift into neighboring phases), and each
+  workload holds its working set LIVE AT THE CYCLE MARKER and tears
+  it down after — the marker state dominates every growth transient,
+  so the workload's footprint is a property of the CODE, not of
+  which microsecond the sampler fired in. The suite digest covers
+  workload NAMES AND BYTES — a renamed or edited canary
+  re-baselines, exactly as an edited bench suite does. `record` runs
+  the REAL hls-rss over every workload `--samples` times each
+  (default 5), stores the marker-median distribution, the end RSS,
+  the warmup-end RSS and the slope CIs per workload, and reads
+  `git rev-parse HEAD` — REFUSING a work tree with tracked
+  modifications (`--commit SHA` is the explicit CI path;
+  `--from-bundle` imports the machine bundle instead of measuring,
+  and the bundle may carry the measuring machine's env fingerprint —
+  when it does it wins: the record describes the machine that
+  measured, not the machine that files).
+- **The laws.** THE MEASUREMENT LAW: the instrument runs under
+  `setarch -R` whenever the platform provides it —
+  ADDR_NO_RANDOMIZE, inherited through exec into the compiled
+  workload, pins the address-space layout so the resident set
+  reflects the code, not the loader's dice (with the layout pinned,
+  the tracked suite's readings are byte-stable run over run; the env
+  fingerprint records the mode, aslr fixed/random). And the metric
+  is the MARKER MEDIAN — the median resident set over the measured
+  phase's cycle markers — not a sampled maximum: a max is a lottery
+  over transient spikes (the runtime's background threads touch
+  stack pages that recede, and the kernel's VmHWM remembers them
+  forever; neither is the workload's footprint), while the marker
+  median is the steady level the workload actually stands on —
+  which for this suite IS the peak, by the hold-at-marker design.
+  THE FLOOR LAW bites at record time: every run of every workload
+  must certify STABLE under hls-rss before it can enter the ledger
+  — a canary that leaks (or cannot certify) is a bug, not a record
+  ("file a bug, not a record"), a workload with fewer than two
+  samples is refused ("a median no sample supports is not a
+  measurement"), and a record without its page size is refused — a
+  record without its unit is not a record; the floor law holds on
+  read too (a hand-edited ledger line carrying a leaky verdict is a
+  named error naming the line). THE CLASSIFICATION LAW is the page
+  law: the marker-median samples are INTEGER PAGES and, with the
+  layout pinned, the distribution is often degenerate (every run of
+  one binary lands on the same pages; Welch's t-test returns p=1
+  when both variances are zero and would call a deterministic
+  thirty-page growth "no change"), so significance here is the
+  SEEDED BOOTSTRAP CI ITSELF: a change is significant when no
+  resample of the two distributions can bring the medians together
+  (the CI excludes zero), and the noise band is floored in PAGES —
+  `max(--threshold percent of baseline, --floor pages, default 16)`
+  — because a percent of a small footprint is a fraction of the
+  page RSS moves in. The six-way vocabulary is no-change /
+  within-noise / improved / regressed / new / vanished, and a
+  workload that disappears fails BY NAME — silently losing a canary
+  would hide the leak it was watching for. THE UNIT LAW: a page is
+  a unit; comparisons happen only within one byte-identical suite
+  digest AND one page size — a baseline measured in 8192-byte pages
+  is a different instrument from a record in 4096-byte pages,
+  refused by name exactly as interpreter timings are. THE GATE LAW:
+  one unsanctioned regressed or vanished workload exits 1 naming
+  it; a SANCTION is a written excuse with an author and a reason
+  (`sanction node_box --reason "the allocator now pre-sizes its
+  bins; the constant was the price"`) — a sanction without a reason
+  is refused, an unknown workload is refused naming the known ones,
+  and sanctioned rows are loud but green. THE DETERMINISM LAW: the
+  dashboard is a pure render of the ledger bytes — sorted walks,
+  the sha256 ledger digest embedded, no wall-clock unless --stamp
+  (and then only the Generated line) — so two renders of one ledger
+  are byte-identical and a hand-edited dashboard is a diff.
+- **The dashboard.** `MEMORY.md` is "RSS over time" made literal:
+  the verdict table (base marker RSS, now, the change in pages AND
+  percent, the band, the CI, the class), the
+  resident-set-at-markers trend with sparklines across the recorded
+  commits, the slope watch (pages per 1000 cycles against hls-rss's
+  own 0.25 page/cycle leak threshold — the floor law's other half,
+  trended so a slow creep cannot hide behind a green gate) and the
+  sanctions register. Sparklines normalise to [min, max] over 8
+  bands with integer half-up math, a constant series renders the
+  mid band (a wall of max-height blocks would read as a regression
+  that is not there), and the exact band function is pinned by the
+  ok corpus fixture so tool and fixture cannot drift.
+- **The gate.** `make mem` records at the current commit; `make
+  mem-gate` is the CI leg; `make mem-dashboard` regenerates
+  MEMORY.md; `make memdash-acceptance` runs eight sections over
+  the real CLI, the real instrument, the real tracked suite and
+  the negative space: the convention (exit codes 0/1/2, the
+  empty-ledger refusals), the record law (a real end-to-end
+  measurement of the tracked suite through the real hls-rss —
+  every workload certifying STABLE — the append-only prefix check,
+  the suite digest over names and bytes, the --json bundle
+  round-trip, the no-git refusal under GIT_CEILING_DIRECTORIES,
+  the bad-sha refusal, the dirty-tree refusal proven on a
+  throwaway clone), the floor law (leak and inconclusive runs, one
+  sample, zero runs, foreign bundles, foreign reports, traceless
+  reports, slopeless reports, unitless envs — each refusal
+  named), the classification law (identical / zero-variance +40% /
+  zero-variance in-band / zero-variance -40% / with-variance pairs
+  classify no-change / regressed / within-noise / improved /
+  regressed — the zero-variance pair is the page law's whole
+  point — and the rename pair yields new + vanished), the gate law
+  (sanctions flip the verdict loud-but-green, unknown workloads
+  and reasonless sanctions are refused, --baseline resolves a
+  prefix and refuses unknown, ambiguous and self baselines, the
+  cross-page-size refusals by default AND by name, the
+  changed-suite refusal, --threshold and --floor moving the band),
+  the determinism law (byte-identical renders, the embedded
+  digest, --stamp moving only the Generated line, sorted rows, the
+  trend table and the slope watch, the constant-trend mid band,
+  the first-record n/a), the ledger law (corrupt lines, unknown
+  types, missing pins, missing digests, missing page sizes, leaky
+  records and reasonless sanctions are named errors naming the
+  line), and the corpus showcase:
+  tests/ok/feat_stage137_mem.hls pins the decision procedure in
+  pure HLS — the class truth table with its boundary law (lo ==
+  band does NOT clear the floor), the CI-excludes-zero
+  significance law, the band floor law, the zero-variance page
+  law, the gate and sanction-by-name laws, the 40-hex pin grammar,
+  the unit law, the trend band law and the 4-workload/5-command/
+  6-class count law — hlfmt-canonical, hllint-clean,
+  byte-identical on the interpreter and natively. 94/94 green.
+- Exit codes 0 verified / 1 named violation / 2 usage; every
+  refusal names the rule, not just the fact. The ledger never
+  guesses: a corrupt line is a named error naming the line number,
+  and the append-only discipline means history is never rewritten
+  under you.
+
 ## [v0.154.0-alpha] — Stage 136: Performance regression dashboard (per-commit)
 - Stage 124 built the instrument — `hls-bench`, the criterion-style
   runner with Welch tests and seeded bootstrap CIs — but an
