@@ -1,0 +1,318 @@
+# ============================================================================
+# benchmarks/ctime_watch/check_effects.hls — Stage 138: the compile-time
+# suite, workload 4 of 5 — THE EFFECT CHECKER.
+# ----------------------------------------------------------------------------
+# This one is the EFFECT GRAPH: every function carries an effect
+# clause (or none), the call graph is deep and wide, and the checker
+# must propagate and verify the effect set of every frame — plus the
+# contract checker (`requires` clauses checked at every call site)
+# and the ? operator's enum-flow analysis. The pure half of the file
+# must stay pure (the checker proves it); the impure half declares
+# what it touches. No runtime work: the program's output is one line.
+# ============================================================================
+
+enum Load {
+    Ok(int),
+    Err(str)
+}
+
+enum Phase {
+    Idle,
+    Running,
+    Blocked(int),
+    Done(int, str)
+}
+
+# ----------------------------------------------------------------------
+# Section A — the pure core: contract-heavy arithmetic the checker
+# must verify at every call site. Every requires is a proof the
+# checker walks, and every call below satisfies it.
+# ----------------------------------------------------------------------
+
+fn pure_add(a: int, b: int) -> int
+    requires a >= 0
+    requires b >= 0
+{
+    return (a + b) % 1000003
+}
+
+fn pure_sub(a: int, b: int) -> int
+    requires a >= b
+{
+    return a - b
+}
+
+fn pure_div(a: int, b: int) -> int
+    requires b > 0
+{
+    return a / b
+}
+
+fn pure_clamp(n: int, lo: int, hi: int) -> int
+    requires lo <= hi
+    requires n >= lo
+    requires n <= hi
+{
+    return n
+}
+
+fn pure_mid(lo: int, hi: int) -> int
+    requires lo <= hi
+    requires lo >= 0
+    requires hi < 1000003
+{
+    return pure_div(pure_add(lo, hi - lo), 2)
+}
+
+fn pure_pow2(n: int) -> int
+    requires n >= 0
+    requires n <= 20
+{
+    let mut r: int = 1
+    let mut i: int = 0
+    while i < n {
+        r = r * 2
+        i = i + 1
+    }
+    return r
+}
+
+fn pure_hash_step(h: int, b: int) -> int
+    requires h >= 0
+    requires b >= 0
+    requires b <= 255
+{
+    return (h * 31 + b) % 1000003
+}
+
+fn pure_hash(s: str) -> int
+    requires s.len() > 0
+{
+    let mut h: int = 7
+    let mut i: int = 0
+    while i < s.len() {
+        h = pure_hash_step(h, s.byte_at(i))
+        i = i + 1
+    }
+    return h
+}
+
+fn pure_stride(a: int) -> int
+    requires a > 0
+{
+    let mut r: int = 0
+    let mut i: int = 0
+    while i < 24 {
+        r = (r + pure_mul(i, a)) % 1000003
+        i = i + 1
+    }
+    return r
+}
+
+fn pure_mul(a: int, b: int) -> int
+    requires a >= 0
+    requires b >= 0
+    requires a < 4096
+    requires b < 4096
+{
+    return (a * b) % 1000003
+}
+
+# ----------------------------------------------------------------------
+# Section B — the qmark lattice: every function returns Ok/Err and
+# propagates through ?, so the checker walks the enum flow and the
+# effect of a panic-free path at every frame.
+# ----------------------------------------------------------------------
+
+fn load_lookup(i: int) -> Load
+    requires i >= 0
+    requires i < 64
+{
+    if i % 17 == 13 {
+        return Load.Err("unlucky slot " + i.to_str())
+    }
+    return Load.Ok((i * 97 + 31) % 1000003)
+}
+
+fn load_chain_2(i: int) -> Load {
+    load_lookup(i)?
+    return Load.Ok(1)
+}
+
+fn load_chain_3(i: int) -> Load {
+    load_chain_2(i)?
+    load_lookup(i + 1)?
+    return Load.Ok(2)
+}
+
+fn load_chain_4(i: int) -> Load {
+    load_chain_3(i)?
+    load_lookup(i + 2)?
+    load_chain_2(i + 3)?
+    return Load.Ok(3)
+}
+
+fn load_chain_5(i: int) -> Load {
+    load_chain_4(i)?
+    load_chain_3(i + 4)?
+    load_chain_4(i + 5)?
+    return Load.Ok(4)
+}
+
+fn load_total(i: int) -> int {
+    let mut sum: int = 0
+    let mut k: int = 0
+    while k < 8 {
+        let r: Load = load_chain_5(i + k)
+        let d: int = match r {
+            Load.Ok(v) => v,
+            Load.Err(_) => 1
+        }
+        sum = (sum + d) % 1000003
+        k = k + 1
+    }
+    return sum
+}
+
+fn load_or_dflt(r: Load, dflt: int) -> int {
+    return match r {
+        Load.Ok(v) => v,
+        Load.Err(_) => dflt
+    }
+}
+
+# ----------------------------------------------------------------------
+# Section C — the phase machine: enum construction, nested matching,
+# and pure transitions the exhaustiveness checker must close.
+# ----------------------------------------------------------------------
+
+fn phase_next(p: Phase, tick: int) -> Phase {
+    return match p {
+        Phase.Idle => Phase.Running,
+        Phase.Running => Phase.Blocked(tick % 100),
+        Phase.Blocked(n) => Phase.Done(n, "after " + n.to_str()),
+        Phase.Done(n, why) => Phase.Done(n + 1, why + "!")
+    }
+}
+
+fn phase_label(p: Phase) -> str {
+    return match p {
+        Phase.Idle => "idle",
+        Phase.Running => "running",
+        Phase.Blocked(n) => "blocked:" + n.to_str(),
+        Phase.Done(n, why) => "done:" + n.to_str() + "/" + why
+    }
+}
+
+fn phase_run(ticks: int) -> int {
+    let mut p: Phase = Phase.Idle
+    let mut hashed: int = 0
+    let mut i: int = 0
+    while i < ticks {
+        p = phase_next(p, i)
+        hashed = pure_hash(phase_label(p) + ".")
+        i = i + 1
+    }
+    return hashed % 1000003
+}
+
+# ----------------------------------------------------------------------
+# Section D — the effect propagation lattice: deep call chains whose
+# leaves touch IO, so the checker computes the transitive effect of
+# every frame above them. The pure helper calls below must pass pure.
+# ----------------------------------------------------------------------
+
+fn io_leaf(v: int) -> int uses IO {
+    if v % 41 == 0 {
+        println("leaf: " + v.to_str())
+    }
+    return (v + 1) % 1000003
+}
+
+fn io_mid_1(v: int) -> int uses IO {
+    return io_leaf(v) + io_leaf(v + 1)
+}
+
+fn io_mid_2(v: int) -> int uses IO {
+    return io_mid_1(v) + io_leaf(v * 2)
+}
+
+fn io_mid_3(v: int) -> int uses IO {
+    return io_mid_2(v) + io_mid_1(v + 3) + io_leaf(v - 1)
+}
+
+fn io_top(v: int) -> int uses IO {
+    return io_mid_3(v) + io_mid_2(v + 5) + io_mid_1(v + 9) + io_leaf(v + 13)
+}
+
+fn io_report(v: int) -> int uses IO {
+    let t: int = io_top(v)
+    println("report: " + t.to_str())
+    return t
+}
+
+# ----------------------------------------------------------------------
+# Section E — the mixed lattice: pure analysis driving the impure
+# report; every pure result crossing into an IO frame is a proof
+# the effect checker re-walks.
+# ----------------------------------------------------------------------
+
+fn mixed_analyze(depth: int) -> int {
+    let mut acc: int = 0
+    let mut d: int = 0
+    while d < depth {
+        acc = (acc + pure_stride(d + 1)) % 1000003
+        acc = (acc + pure_hash("depth:" + d.to_str())) % 1000003
+        acc = pure_clamp(acc, 0, 1000002)
+        acc = (acc + pure_pow2(d % 12)) % 1000003
+        d = d + 1
+    }
+    return acc
+}
+
+fn mixed_verify(v: int) -> int
+    requires v >= 0
+    requires v < 1000003
+{
+    let a: int = pure_add(v, pure_sub(1000002, v))
+    let b: int = pure_mid(v, a % 1000003)
+    let c: int = load_or_dflt(load_chain_5(v % 64), 0)
+    return (a + b + c) % 1000003
+}
+
+fn mixed_run(rounds: int) -> int uses IO {
+    let mut total: int = 0
+    let mut i: int = 0
+    while i < rounds {
+        let a: int = mixed_analyze(i % 9 + 1)
+        let b: int = mixed_verify(a)
+        total = (total + a + b) % 1000003
+        if i == 0 {
+            total = total + io_report(b) % 1000003
+        }
+        i = i + 1
+    }
+    return total
+}
+
+# ----------------------------------------------------------------------
+# The driver.
+# ----------------------------------------------------------------------
+
+fn main() -> int uses IO {
+    let mut total: int = 0
+    total = total + pure_add(3, 5)
+    total = total + pure_pow2(10)
+    total = total + pure_hash("effects")
+    total = total + pure_stride(7)
+    total = total + load_total(2)
+    total = total + phase_run(9)
+    total = total + mixed_analyze(5)
+    total = total + mixed_verify(total % 1000)
+    total = total + mixed_run(4)
+    if total < 0 {
+        panic("impossible: every term is masked non-negative")
+    }
+    println("check_effects: " + total.to_str())
+    return total % 256
+}
