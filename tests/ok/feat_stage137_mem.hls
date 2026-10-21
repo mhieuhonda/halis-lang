@@ -1,0 +1,600 @@
+# feat_stage137_mem.hls — Stage 137 (v0.155.0-alpha): the memory
+# regression dashboard (RSS over time).
+#
+# What this fixture pins is the DECISION PROCEDURE the dashboard runs —
+# the same laws `tools/hls-mem.py` applies when it files a record,
+# classifies a workload against its baseline, applies a sanction, and
+# renders the dashboard:
+#
+#   hls-mem record | sanction | gate | dashboard | history
+#
+#   1. the class      — the vocabulary is closed and ordered: no-change
+#      law              0, regressed 1, improved 2, within-noise 3,
+#                       new 4, vanished 5. Significance is an INPUT
+#                       here (it is the CI-excludes-zero law, pinned in
+#                       its own section below); a significant change
+#                       outside the band is a regression when the CI
+#                       floor clears the band and an improvement when
+#                       its ceiling does; anything else significant is
+#                       within-noise; a non-significant change is
+#                       no-change no matter how large;
+#   2. the            — the page law: RSS is integer pages and the
+#      significance     run-to-run distribution is often degenerate
+#      law              (zero variance), so a change is significant
+#                       exactly when the bootstrap CI of the median
+#                       change EXCLUDES ZERO — when no resample can
+#                       bring the medians together; a t-test would
+#                       answer p=1 on degenerate samples and call a
+#                       deterministic growth no-change;
+#   3. the band       — the noise band is floored in PAGES: it is
+#      floor law         max(floor, percent of baseline), because a
+#                       percent of a small footprint is a fraction of
+#                       the page RSS moves in;
+#   4. the page       — the zero-variance pipeline: deterministic
+#      law              identical workloads classify no-change; a
+#                       deterministic growth beyond the band is
+#                       regressed, a deterministic shrink improved, a
+#                       deterministic shift inside the band
+#                       within-noise — the case Welch cannot see;
+#   5. the gate law   — exactly the regressed and vanished classes
+#                       fail the gate, and only when unsanctioned; a
+#                       sanction matches by workload NAME, and a
+#                       sanction on a workload that did not regress is
+#                       stale (counted, never applied);
+#   6. the pinning    — a record is pinned to a commit: 40 hex
+#      and unit law     characters, lowercase, nothing else; and a
+#                       comparison happens only within ONE page size —
+#                       a page is the unit RSS moves in, and a baseline
+#                       in different pages is a different instrument;
+#   7. the trend      — the sparkline normalizes the record series to
+#      band law          [min, max] over 8 bands with INTEGER half-up
+#                       math; the endpoints map to bands 0 and 7; a
+#                       constant series maps to the mid band 3; two
+#                       renders of one series are byte-identical;
+#   8. the count law  — the tracked suite carries exactly 4 workloads,
+#                       the tool speaks exactly 5 commands, the
+#                       vocabulary counts exactly 6 classes — the
+#                       numbers the acceptance gate pins.
+#
+# The program exits 0 when every law holds, 10+section*10+case
+# otherwise — the differential suite runs it on the interpreter AND
+# natively and requires byte-identical output.
+#
+# This file enters the corpus at this release — green the day it is
+# born, already written in the dialect the dashboard speaks.
+
+# ----------------------------------------------------------------------
+# Section 1 — the class law. Six classes, closed vocabulary; the gate
+# only ever fails on regressed and vanished.
+# ----------------------------------------------------------------------
+fn is_regress_or_vanish(cls: int) -> bool {
+    return cls == 1 || cls == 5
+}
+
+fn classify(sig: bool, lo: int, hi: int, band: int) -> int {
+    # The truth table, in ints. lo/hi are the bootstrap CI of the
+    # median change, in PAGES; band is the floored noise band.
+    if !sig {
+        return 0
+    }
+    if lo > band {
+        return 1
+    }
+    if hi < 0 - band {
+        return 2
+    }
+    return 3
+}
+
+fn test_class_law() -> int {
+    # Not significant: no matter how large the point estimate, the
+    # answer is no-change.
+    if classify(false, 80, 80, 16) != 0 {
+        return 1
+    }
+    if classify(false, 0 - 80, 80, 16) != 0 {
+        return 2
+    }
+    # Significant with the CI floor above the band: regressed.
+    if classify(true, 40, 80, 16) != 1 {
+        return 3
+    }
+    if classify(true, 17, 80, 16) != 1 {
+        return 4
+    }
+    # Significant with the CI ceiling below -band: improved.
+    if classify(true, 0 - 80, 0 - 40, 16) != 2 {
+        return 5
+    }
+    if classify(true, 0 - 80, 0 - 17, 16) != 2 {
+        return 6
+    }
+    # Significant but inside the band: within-noise.
+    if classify(true, 0 - 10, 10, 16) != 3 {
+        return 7
+    }
+    # The boundary is the law: lo == band does NOT clear the floor,
+    # hi == -band does NOT clear the ceiling.
+    if classify(true, 16, 80, 16) != 3 {
+        return 8
+    }
+    if classify(true, 0 - 80, 0 - 16, 16) != 3 {
+        return 9
+    }
+    # The ordering holds: regressed and vanished are the failing
+    # classes; nothing else is.
+    if !is_regress_or_vanish(1) || !is_regress_or_vanish(5) {
+        return 10
+    }
+    if is_regress_or_vanish(0) || is_regress_or_vanish(2)
+    || is_regress_or_vanish(3) || is_regress_or_vanish(4) {
+        return 11
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------
+# Section 2 — the significance law. A change is significant exactly
+# when the CI excludes zero: no resample can bring the medians
+# together. The endpoints: lo == 0 and hi == 0 include zero — not
+# significant.
+# ----------------------------------------------------------------------
+fn significant(lo: int, hi: int) -> bool {
+    return lo > 0 || hi < 0
+}
+
+fn test_significance_law() -> int {
+    # Identical distributions: the CI is the point zero.
+    if significant(0, 0) {
+        return 1
+    }
+    # A CI that straddles zero cannot separate the medians.
+    if significant(0 - 5, 5) {
+        return 2
+    }
+    if significant(0 - 5, 0) {
+        return 3
+    }
+    if significant(0, 5) {
+        return 4
+    }
+    # A CI entirely above zero: significant, upward.
+    if !significant(10, 10) {
+        return 5
+    }
+    if !significant(3, 9) {
+        return 6
+    }
+    # A CI entirely below zero: significant, downward.
+    if !significant(0 - 9, 0 - 3) {
+        return 7
+    }
+    if !significant(0 - 10, 0 - 10) {
+        return 8
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------
+# Section 3 — the band floor law. The noise band is
+# max(floor pages, percent of baseline) — the page floor keeps tiny
+# footprints honest.
+# ----------------------------------------------------------------------
+fn band_of(base: int, floor: int, pct: int) -> int {
+    let p: int = (base * pct) / 100
+    if p > floor {
+        return p
+    }
+    return floor
+}
+
+fn test_band_floor_law() -> int {
+    # Five percent of 200 is 10 — under the 16-page floor.
+    if band_of(200, 16, 5) != 16 {
+        return 1
+    }
+    # Five percent of 1000 is 50 — above the floor.
+    if band_of(1000, 16, 5) != 50 {
+        return 2
+    }
+    if band_of(400, 16, 5) != 20 {
+        return 3
+    }
+    # The floor moves the band when the percent cannot.
+    if band_of(100, 16, 5) != 16 {
+        return 4
+    }
+    if band_of(200, 8, 5) != 10 {
+        return 5
+    }
+    # An exact tie keeps the floor (max, never the percent alone).
+    if band_of(320, 16, 5) != 16 {
+        return 6
+    }
+    if band_of(640, 16, 5) != 32 {
+        return 7
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------
+# Section 4 — the page law. The zero-variance pipeline: deterministic
+# workloads (every run lands on the same pages) classify by the CI
+# point itself — the case a variance-hungry t-test cannot see.
+# ----------------------------------------------------------------------
+fn classify_det(cur: int, base: int, floor: int, pct: int) -> int {
+    # With zero variance on both sides the bootstrap CI is the point
+    # (cur - base, cur - base): significance is d != 0.
+    let d: int = cur - base
+    let sig: bool = d != 0
+    let band: int = band_of(base, floor, pct)
+    if !sig {
+        return 0
+    }
+    if d > band {
+        return 1
+    }
+    if d < 0 - band {
+        return 2
+    }
+    return 3
+}
+
+fn test_page_law() -> int {
+    # Deterministic identical: no-change.
+    if classify_det(200, 200, 16, 5) != 0 {
+        return 1
+    }
+    # A deterministic +10 (inside the 16-page band): within-noise.
+    if classify_det(210, 200, 16, 5) != 3 {
+        return 2
+    }
+    # A deterministic +40: regressed — THE case the page law exists
+    # for (zero variance both sides, a t-test answers p=1).
+    if classify_det(240, 200, 16, 5) != 1 {
+        return 3
+    }
+    # A deterministic -40: improved.
+    if classify_det(160, 200, 16, 5) != 2 {
+        return 4
+    }
+    # The boundary: exactly the band is within-noise, both ways.
+    if classify_det(216, 200, 16, 5) != 3 {
+        return 5
+    }
+    if classify_det(184, 200, 16, 5) != 3 {
+        return 6
+    }
+    # A bigger baseline widens the band: +12 of 1000 is inside 50.
+    if classify_det(1012, 1000, 16, 5) != 3 {
+        return 7
+    }
+    # The floor and the percent together set the band: with floor 4
+    # and 2 percent of 200 (also 4), +10 now clears the band.
+    if classify_det(210, 200, 4, 2) != 1 {
+        return 8
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------
+# Section 5 — the gate and sanction laws. One unsanctioned regression
+# (or vanished workload) fails the whole gate; a sanction matches by
+# workload NAME, and only on a row that actually regressed.
+# ----------------------------------------------------------------------
+fn gate_fails(classes: list[int], sanctioned: list[bool]) -> bool {
+    let n: int = classes.len()
+    let mut i: int = 0
+    while i < n {
+        if is_regress_or_vanish(classes[i]) && !sanctioned[i] {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn contains_str(hay: list[str], needle: str) -> bool {
+    let n: int = hay.len()
+    let mut i: int = 0
+    while i < n {
+        if hay[i] == needle {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn sanction_applies(workload: str, regressed: list[str],
+sanctioned_names: list[str]) -> bool {
+    # The sanction fires only when THIS workload actually regressed.
+    if !contains_str(regressed, workload) {
+        return false
+    }
+    return contains_str(sanctioned_names, workload)
+}
+
+fn test_gate_law() -> int {
+    # All quiet.
+    if gate_fails([0, 3, 2, 4], [false, false, false, false]) {
+        return 1
+    }
+    # One unsanctioned regression fails.
+    if !gate_fails([0, 1, 2], [false, false, false]) {
+        return 2
+    }
+    # One vanished workload fails too — silently losing a canary
+    # would hide the leak it was watching for.
+    if !gate_fails([0, 5], [false, false]) {
+        return 3
+    }
+    # A sanctioned regression is loud but green.
+    if gate_fails([1, 0], [true, false]) {
+        return 4
+    }
+    if gate_fails([5, 0], [true, false]) {
+        return 5
+    }
+    # ...but a sanction cannot excuse a DIFFERENT workload.
+    if !gate_fails([1, 1], [true, false]) {
+        return 6
+    }
+    # The sanction-by-name law with the tracked suite's own names.
+    let regressed: list[str] = ["node_box", "str_grow"]
+    let names: list[str] = ["str_grow"]
+    if !sanction_applies("str_grow", regressed, names) {
+        return 7
+    }
+    if sanction_applies("node_box", regressed, names) {
+        return 8
+    }
+    # A workload that did not regress is never excused: the sanction
+    # is stale, and a stale sanction is counted, not applied.
+    if sanction_applies("list_churn", regressed, names) {
+        return 9
+    }
+    # The matching is by exact name — no prefix games.
+    if contains_str(regressed, "str") {
+        return 10
+    }
+    if contains_str(regressed, "str_grow_x") {
+        return 11
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------
+# Section 6 — the pinning law and the unit law. A record is pinned to
+# a commit: 40 hex characters, lowercase, nothing else. And a
+# comparison happens only within one page size and one suite digest.
+# ----------------------------------------------------------------------
+fn is_hex_byte(b: int) -> bool {
+    if b >= 48 && b <= 57 {
+        return true
+    }
+    if b >= 97 && b <= 102 {
+        return true
+    }
+    return false
+}
+
+fn is_sha1(s: str) -> bool {
+    let n: int = s.len()
+    if n != 40 {
+        return false
+    }
+    let mut i: int = 0
+    while i < n {
+        if !is_hex_byte(s.byte_at(i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn same_page_unit(a: int, b: int) -> bool {
+    # A page is a unit: 4096-byte pages and 8192-byte pages are
+    # different instruments, never compared.
+    return a == b
+}
+
+fn comparable(digest_a: str, digest_b: str, pages_a: int,
+pages_b: int) -> bool {
+    if !same_page_unit(pages_a, pages_b) {
+        return false
+    }
+    return digest_a == digest_b
+}
+
+fn test_pinning_and_unit_law() -> int {
+    if !is_sha1("c0ffee0000000000000000000000000000000001") {
+        return 1
+    }
+    # Near-misses are refusals, not pins.
+    if is_sha1("c0ffee") {
+        return 2
+    }
+    if is_sha1("c0ffee000000000000000000000000000000001") {
+        return 3
+    }
+    if is_sha1("c0ffee00000000000000000000000000000000011") {
+        return 4
+    }
+    if is_sha1("C0FFEE0000000000000000000000000000000001") {
+        return 5
+    }
+    if is_sha1("") {
+        return 6
+    }
+    # The unit law: one page size, one suite digest.
+    if !same_page_unit(4096, 4096) {
+        return 7
+    }
+    if same_page_unit(4096, 8192) {
+        return 8
+    }
+    if !comparable("abc", "abc", 4096, 4096) {
+        return 9
+    }
+    if comparable("abc", "abd", 4096, 4096) {
+        return 10
+    }
+    if comparable("abc", "abc", 4096, 8192) {
+        return 11
+    }
+    # A third page size is still one unit when both sides share it.
+    if !comparable("abc", "abc", 65536, 65536) {
+        return 12
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------
+# Section 7 — the trend band law. The sparkline normalizes to
+# [min, max] over 8 bands with integer half-up math; endpoints map to
+# 0 and 7; a constant series maps to the mid band; and two renders of
+# one series are identical.
+# ----------------------------------------------------------------------
+fn trend_band_of(v: int, lo: int, hi: int) -> int {
+    if hi <= lo {
+        return 3
+    }
+    return((v - lo) * 14 + (hi - lo)) / ((hi - lo) * 2)
+}
+
+fn render_bands(vs: list[int], lo: int, hi: int) -> str {
+    let n: int = vs.len()
+    let mut doc: str = ""
+    let mut i: int = 0
+    while i < n {
+        doc = doc + trend_band_of(vs[i], lo, hi).to_str()
+        i = i + 1
+    }
+    return doc
+}
+
+fn test_trend_band_law() -> int {
+    # Endpoints.
+    if trend_band_of(5, 5, 10) != 0 {
+        return 1
+    }
+    if trend_band_of(10, 5, 10) != 7 {
+        return 2
+    }
+    # The middle rounds half-up.
+    if trend_band_of(7, 5, 9) != 4 {
+        return 3
+    }
+    # Interior points stay in range and climb monotonically.
+    if trend_band_of(6, 5, 10) != 1 {
+        return 4
+    }
+    if trend_band_of(7, 5, 10) != 3 {
+        return 5
+    }
+    if trend_band_of(8, 5, 10) != 4 {
+        return 6
+    }
+    # A constant series is the mid band — not a wall.
+    if trend_band_of(5, 5, 5) != 3 {
+        return 7
+    }
+    # Two renders of one series are byte-identical.
+    let series: list[int] = [275, 279, 283, 281, 331]
+    let d1: str = render_bands(series, 275, 331)
+    let d2: str = render_bands(series, 275, 331)
+    if d1 != d2 {
+        return 8
+    }
+    if d1 != "01117" {
+        return 9
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------
+# Section 8 — the count law. The tracked suite carries exactly 4
+# workloads (sorted), the tool speaks exactly 5 commands, the
+# vocabulary counts exactly 6 classes.
+# ----------------------------------------------------------------------
+fn is_sorted_strs(xs: list[str]) -> bool {
+    let n: int = xs.len()
+    let mut i: int = 1
+    while i < n {
+        if xs[i - 1] > xs[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn test_count_law() -> int {
+    let workloads: list[str] = ["list_churn", "node_box",
+    "startup_floor", "str_grow"]
+    if workloads.len() != 4 {
+        return 1
+    }
+    if !is_sorted_strs(workloads) {
+        return 2
+    }
+    let commands: list[str] = ["dashboard", "gate", "history",
+    "record", "sanction"]
+    if commands.len() != 5 {
+        return 3
+    }
+    if !is_sorted_strs(commands) {
+        return 4
+    }
+    # Six classes, and the two failing ones are counted among them.
+    let classes: int = 6
+    if classes != 6 {
+        return 5
+    }
+    if !is_regress_or_vanish(1) || !is_regress_or_vanish(5) {
+        return 6
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------
+fn main() -> int uses IO {
+    println("stage 137: hls-mem")
+    let mut r: int = test_class_law()
+    if r != 0 {
+        return 10 + r
+    }
+    r = test_significance_law()
+    if r != 0 {
+        return 20 + r
+    }
+    r = test_band_floor_law()
+    if r != 0 {
+        return 30 + r
+    }
+    r = test_page_law()
+    if r != 0 {
+        return 40 + r
+    }
+    r = test_gate_law()
+    if r != 0 {
+        return 50 + r
+    }
+    r = test_pinning_and_unit_law()
+    if r != 0 {
+        return 60 + r
+    }
+    r = test_trend_band_law()
+    if r != 0 {
+        return 70 + r
+    }
+    r = test_count_law()
+    if r != 0 {
+        return 80 + r
+    }
+    println("  MEM OK: 4 workloads tracked, floored, classified, "
+    + "pinned")
+    return 0
+}

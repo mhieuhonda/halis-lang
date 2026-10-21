@@ -31,7 +31,7 @@ else
   HL_CURL_DEFS :=
 endif
 
-.PHONY: all stage0 bootstrap bootstrap-nolibc xbootstrap-acceptance refine-acceptance test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full infer infer-smt model prove-acceptance invariant-acceptance cvc5 cvc5-acceptance shapes shapes-smt shapes-acceptance sidechannel sidechannel-acceptance ct ct-acceptance supply supply-pkg supply-acceptance sbom sbom-pkg sbom-release sbom-acceptance repro repro-pkg repro-release repro-verify repro-acceptance sign-keygen sign sign-verify sign-release sign-verify-release sign-selftest sign-acceptance tlog-verify tlog tlog-gossip tlog-witness tlog-witness-verify tlog-prove tlog-prove-verify tlog-selftest tlog-acceptance reverify reverify-json reverify-lto reverify-report reverify-selftest reverify-acceptance ffi-taint ffi-taint-acceptance sandbox sandbox-run sandbox-emit sandbox-release sandbox-verify-release sandbox-selftest sandbox-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve serve-acceptance wasm-pack wasm-pack-check wasm-pack-pack wasm-pack-acceptance aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance tui-acceptance color-acceptance progress-acceptance log-acceptance http-server-acceptance websocket-acceptance cookie-acceptance session-acceptance csrf-acceptance template-acceptance sse-acceptance graphql-acceptance openapi-acceptance jsffi-acceptance dom-acceptance freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance stackguard-acceptance asmreg-acceptance link-acceptance boot-acceptance idt-acceptance mmio-acceptance port-acceptance dma-acceptance atomics-acceptance irqsafe-acceptance triple triple-x86_64-acceptance triple-aarch64-acceptance triple-riscv64-acceptance debuginfo-acceptance cap cap-acceptance test-linker auditlog-list auditlog-show auditlog-verify auditlog-sign auditlog-verify-sign auditlog-selftest auditlog-acceptance lsp-def-acceptance lsp-hints-acceptance lsp-refactor-acceptance fmt-comments-acceptance fmt-config-acceptance lint-fix-acceptance snapshot-acceptance cases-acceptance dap-acceptance repl-acceptance bench-acceptance rss-acceptance rt-acceptance det-acceptance compat-acceptance migrate-acceptance deprecated-acceptance semver-acceptance lts-acceptance xdiff xdiff-acceptance fuzzseed fuzzseed-acceptance guarantee guarantee-report guarantee-acceptance perf perf-gate perf-dashboard perf-acceptance
+.PHONY: all stage0 bootstrap bootstrap-nolibc xbootstrap-acceptance refine-acceptance test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full infer infer-smt model prove-acceptance invariant-acceptance cvc5 cvc5-acceptance shapes shapes-smt shapes-acceptance sidechannel sidechannel-acceptance ct ct-acceptance supply supply-pkg supply-acceptance sbom sbom-pkg sbom-release sbom-acceptance repro repro-pkg repro-release repro-verify repro-acceptance sign-keygen sign sign-verify sign-release sign-verify-release sign-selftest sign-acceptance tlog-verify tlog tlog-gossip tlog-witness tlog-witness-verify tlog-prove tlog-prove-verify tlog-selftest tlog-acceptance reverify reverify-json reverify-lto reverify-report reverify-selftest reverify-acceptance ffi-taint ffi-taint-acceptance sandbox sandbox-run sandbox-emit sandbox-release sandbox-verify-release sandbox-selftest sandbox-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve serve-acceptance wasm-pack wasm-pack-check wasm-pack-pack wasm-pack-acceptance aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance tui-acceptance color-acceptance progress-acceptance log-acceptance http-server-acceptance websocket-acceptance cookie-acceptance session-acceptance csrf-acceptance template-acceptance sse-acceptance graphql-acceptance openapi-acceptance jsffi-acceptance dom-acceptance freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance stackguard-acceptance asmreg-acceptance link-acceptance boot-acceptance idt-acceptance mmio-acceptance port-acceptance dma-acceptance atomics-acceptance irqsafe-acceptance triple triple-x86_64-acceptance triple-aarch64-acceptance triple-riscv64-acceptance debuginfo-acceptance cap cap-acceptance test-linker auditlog-list auditlog-show auditlog-verify auditlog-sign auditlog-verify-sign auditlog-selftest auditlog-acceptance lsp-def-acceptance lsp-hints-acceptance lsp-refactor-acceptance fmt-comments-acceptance fmt-config-acceptance lint-fix-acceptance snapshot-acceptance cases-acceptance dap-acceptance repl-acceptance bench-acceptance rss-acceptance rt-acceptance det-acceptance compat-acceptance migrate-acceptance deprecated-acceptance semver-acceptance lts-acceptance xdiff xdiff-acceptance fuzzseed fuzzseed-acceptance guarantee guarantee-report guarantee-acceptance perf perf-gate perf-dashboard perf-acceptance mem mem-gate mem-dashboard memdash-acceptance
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -519,6 +519,42 @@ perf-acceptance: bin/hlc
 	@echo "[Stage 136 acceptance] running tests/perf_acceptance.py..."
 	@$(PYTHON) tests/perf_acceptance.py
 	@echo "ACCEPTANCE OK: Stage 136 -- performance regression dashboard (per-commit)"
+
+# Stage 137 (v0.155.0-alpha): the memory regression dashboard, RSS
+# over time. hls-rss (Stage 125) measures one workload once; hls-mem
+# remembers and judges: every record is one measurement of the
+# tracked suite (benchmarks/rss_watch/ — four deterministic,
+# allocation-shaped canaries: the resident-set floor, string growth,
+# heap churn, boxed objects) pinned to one clean commit in the
+# append-only .hlmem/history.jsonl ledger, where every workload must
+# certify STABLE before it can be filed (the floor law — a canary
+# that leaks is a bug, not a record). The gate classifies the newest
+# record against the prior record of the same instrument (same suite
+# digest AND same page size — a page is a unit) with the page law:
+# the metric is the marker median (the resident set at the cycle
+# markers, measured under setarch -R with the layout pinned);
+# significance is the seeded bootstrap CI of the median change
+# excluding zero (RSS is integer pages, often zero variance — a
+# t-test would call a deterministic growth no-change), and the
+# noise band is floored at 16 pages. `make mem` records at the
+# current commit; `make mem-gate` is the CI leg; `make mem-dashboard`
+# regenerates MEMORY.md; `make memdash-acceptance` is the gate:
+# eight sections over the real CLI, the real instrument, controlled
+# ledgers and the negative space (floor refusals, unit mismatches,
+# corrupt lines, the dirty-tree refusal on a throwaway clone).
+mem:
+	@$(PYTHON) tools/hls-mem.py record
+
+mem-gate:
+	@$(PYTHON) tools/hls-mem.py gate
+
+mem-dashboard:
+	@$(PYTHON) tools/hls-mem.py dashboard --out MEMORY.md
+
+memdash-acceptance: bin/hlc
+	@echo "[Stage 137 acceptance] running tests/memdash_acceptance.py..."
+	@$(PYTHON) tests/memdash_acceptance.py
+	@echo "ACCEPTANCE OK: Stage 137 -- memory regression dashboard (RSS over time)"
 
 # Stage 130 (v0.148.0-alpha): the deprecation gate. Eight sections
 # over BOTH real front-ends, the real linter and the real formatter:
