@@ -208,7 +208,7 @@ remains green.
 | 135 | Bug-bounty-eligible soundness guarantees documented | ✅ | (done in v0.153.0-alpha) |
 | 136 | Performance regression dashboard (per-commit) | ✅ | (done in v0.154.0-alpha) |
 | 137 | Memory regression dashboard (RSS over time) | ✅ | (done in v0.155.0-alpha) |
-| 138 | Compile-time regression dashboard | ⬜ | 4 weeks |
+| 138 | Compile-time regression dashboard | ✅ | (done in v0.156.0-alpha) |
 | 139 | Binary-size regression dashboard | ⬜ | 3 weeks |
 | 140 | Independent security audit (third-party, paid) | ⬜ | 8 weeks |
 

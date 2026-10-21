@@ -405,6 +405,48 @@ make memdash-acceptance        # Stage 137 gate: the memory battery
                                # law, the gate law, the determinism
                                # law, the ledger law, the showcase)
 
+python3 tools/hls-ctime.py record
+                               # Stage 138: file one measurement of
+                               # the tracked compile suite
+                               # (benchmarks/ctime_watch/ — the
+                               # token stream, the parse tree, the
+                               # type checker, the effect graph,
+                               # the code generator) pinned to the
+                               # current clean commit — the
+                               # instrument is the compiler itself
+                               # (stage0, the bootstrap chain, by
+                               # default; --instrument native for
+                               # bin/hlc), and every record pins the
+                               # compiler's own identity: the source
+                               # digest and the binary digest, so a
+                               # stale bin/hlc is refused at record
+                               # time
+python3 tools/hls-ctime.py gate
+                               # the CI leg: classify the newest
+                               # record against the prior record of
+                               # the same instrument (Welch + seeded
+                               # bootstrap, 10% band) — any
+                               # unsanctioned regressed or vanished
+                               # workload exits 1, named
+python3 tools/hls-ctime.py sanction check_generic --reason "..."
+                               # a written excuse with an author —
+                               # sanctioned regressions are loud but
+                               # green
+python3 tools/hls-ctime.py dashboard --out COMPILETIME.md
+                               # the dashboard, regenerated (never
+                               # hand-edited): sorted verdicts,
+                               # per-workload compile-time trends,
+                               # both compiler digests, the
+                               # sanctions register, byte-identical
+                               # per ledger
+make ctime-acceptance          # Stage 138 gate: the compile-time
+                               # battery (the convention, the record
+                               # law, the floor law — including the
+                               # stale-binary refusal — the
+                               # classification law, the gate law,
+                               # the determinism law, the ledger
+                               # law, the showcase)
+
 # 13. Stage 15-alpha: Safe C FFI (v0.13.0-alpha)
 python3 boot/boot.py examples/ffi_demo.hls           # call libc functions
 python3 tools/hlbindgen.py /usr/include/stdlib.h      # generate extern block from C header

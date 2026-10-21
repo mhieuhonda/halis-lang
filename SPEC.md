@@ -9535,3 +9535,130 @@ and judges — the page size, the quantile estimator and the median
 are imported from hls-rss itself, and the bootstrap width is
 hls-bench's `_BOOTSTRAP_B` (2000), the same width every dashboard in
 this tree uses.
+
+
+
+## 77. The compile-time ledger (Stage 138 — v0.156.0-alpha)
+
+Stage 124 built the runtime instrument; Stage 136 gave runtime its
+ledger; Stage 137 gave memory its own; Stage 138 gives the
+COMPILER's own wall time its ledger — the axis a language release
+can regress that no program benchmark sees: the tool gets slower to
+feed. `tools/hls-ctime.py` is a LEDGER over commits: every `record`
+is one measurement of the tracked compile suite
+(`benchmarks/ctime_watch/` — five deterministic, compile-shaped
+workloads over the front-end phases a release can quietly slow
+down: the token stream `lex_dense`, the parse tree `parse_deep`,
+the monomorphisation table `check_generic`, the effect graph
+`check_effects`, the C emitter `gen_data`; the suite is import-free
+by construction, and the digest covers workload names and bytes)
+pinned to one clean commit in the append-only ledger
+(`.hlctime/history.jsonl`, JSONL, one self-contained object per
+line). A record that does not pin a commit is a rumour: the tool
+reads `git rev-parse HEAD`, refuses a work tree with tracked
+modifications (`--allow-dirty` to override, `--commit SHA` for the
+CI import path), and stores the instrument, the sha256 suite
+digest, the measurement plan, the env fingerprint and every raw
+compile time.
+
+### 77.1. The laws
+
+THE INSTRUMENT LAW — the instrument is the compiler, and Halis
+ships two of them, so they are two instruments, never compared:
+`stage0` (the bootstrap chain: `boot/boot.py` running
+`src/hlc.hls` over the workload, emitting C that is thrown away)
+and `native` (`bin/hlc`, the self-hosted compiler). Both time the
+same quantity — one full HLS-to-C compile, wall time, milliseconds
+— through different machines; the gate refuses a comparison across
+them by default and by explicit `--baseline`, exactly as interpreter
+and native timings are different instruments in the perf ledger.
+THE PINNING LAW, doubled: every record pins the compiler's own
+identity alongside the commit — the sha256 over the compiler
+source (`src/hlc.hls` + every `src/hlc/*.hls`, names and bytes)
+and the sha256 of the compiler BINARY actually timed (`bin/hlc`
+for native, an untracked build artifact whose bytes the record
+must vouch for itself since the clean-tree check cannot;
+`boot/boot.py` for stage0). THE STALE-BINARY LAW bites at record
+time, the floor specific to compile time: a native record whose
+compiler binary was already filed against a DIFFERENT compiler
+source is refused — the same bin/hlc bytes cannot be the build of
+two different compiler sources, so the binary was not rebuilt for
+the commit it claims to measure ("run `make bootstrap`, then
+record"); a doc-only commit leaves the source digest unchanged,
+so its identical binary is expected, not stale, and a fresh binary
+under a changed source is a rebuild, filed. THE RECORD LAW — the
+ledger is append-only (a record never rewrites a line; the bytes
+before are always a byte prefix of the bytes after);
+`--from-report` imports a machine report instead of measuring (the
+CI path: one machine measures, another files it — and the report
+must carry all three digests itself, because the machine that
+measured is the machine that can pin what it measured; a report
+whose suite digest does not match the local suite is refused).
+THE FLOOR LAW bites at record time and on read: a workload with
+fewer than two samples is refused ("a median no sample supports is
+not a measurement"), non-positive compile times are refused, a
+workload whose compile fails is a named refusal ("file a bug, not a
+record" — a dashboard built over half a suite is a lie), and a
+hand-edited ledger line missing its commit pin or any of its three
+digests is a named error naming the line, never a silent skip.
+THE CLASSIFICATION LAW — exactly Stage 124's: Welch p < 0.05 for
+significance, the seeded-bootstrap CI of the median change against
+the noise band (default 10%, honest about wall time on a shared
+machine; `--threshold` moves it), the statistics IMPORTED from
+hls-bench itself so the runner's numbers and every ledger's
+verdicts cannot drift; the six-way vocabulary is no-change /
+within-noise / improved / regressed / new / vanished, and a
+workload that disappears fails BY NAME (silently losing a workload
+would hide the very regression it was watching for). THE GATE LAW —
+one unsanctioned regressed or vanished workload exits 1 naming it;
+a SANCTION is a written excuse with an author and a reason (a
+sanction without a reason is refused; an unknown workload is
+refused naming the known ones); sanctioned rows are loud but
+green. THE DETERMINISM LAW — the dashboard is a pure render of the
+ledger bytes: sorted walks, the sha256 ledger digest embedded, both
+compiler digests pinned at the head (which source, which binary,
+which instrument — the audit trail of the machine that measured),
+per-workload trend sparklines over 8 bands with integer half-up
+math (a constant series renders the mid band — a wall of
+max-height blocks would read as a regression that is not there),
+no wall-clock unless `--stamp` (and then only the Generated line),
+so two renders of one ledger are byte-identical and a hand-edited
+dashboard is a diff.
+
+### 77.2. The gate
+
+`make ctime` records at the current commit through the stage0
+chain (`--instrument native` for bin/hlc, which must be freshly
+built — the stale-binary law is the guard); `make ctime-gate` is
+the CI leg; `make ctime-dashboard` regenerates COMPILETIME.md;
+`make ctime-acceptance` runs eight sections over the real CLI,
+both real compilers, the real tracked suite and the negative
+space: the convention, the record law (real end-to-end
+measurements through BOTH instruments, the append-only prefix
+check, the no-git refusal, the bad-sha refusal, the dirty-tree
+refusal on a throwaway clone), the floor law (sample floors,
+failed compiles, foreign and digest-less reports, the
+suite-mismatch refusal, and the stale-binary trio: refused /
+doc-only-expected / fresh-filed), the classification law
+(identical / +40% / in-band / -40% pairs and the rename pair),
+the gate law (sanctions, baselines, ambiguity, instruments, suite
+changes, --threshold), the determinism law (byte-identical
+renders, the digest, the stamp, the sorted rows, the
+constant-trend mid band, the first-record n/a), the ledger law
+(corrupt lines, unknown types, missing pins, missing digests,
+reasonless sanctions) and the corpus showcase —
+tests/ok/feat_stage138_ctime.hls pins the decision procedure in
+pure HLS (the class truth table with its boundary law, the gate
+boolean, the sanction-by-name law, the 40-hex pin and 64-hex
+digest grammars, the stale-binary law, the instrument law, the
+trend band law, the 5-workload/5-command/6-class count law),
+hlfmt-canonical, hllint-clean, byte-identical on the interpreter
+and natively.
+
+Exit codes: 0 verified, 1 a named violation (gate failure, dirty
+tree, stale compiler binary, instrument mismatch), 2 usage error.
+Layering: `hls-bench` measures programs; `hls-perf` remembers
+program time; `hls-mem` remembers program memory; `hls-ctime`
+remembers the time of the compiler itself — and the Welch test and
+the seeded bootstrap are imported from hls-bench, the same law
+every dashboard in this tree speaks.
