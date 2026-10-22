@@ -37,6 +37,7 @@ Seven sections:
   7. the tools        — hlfmt stable, hllint clean on the new sources
 """
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -55,6 +56,13 @@ HLC = "bin/hlc"
 
 PASS = 0
 FAIL = 0
+# The gate's own scratch namespace: any leftover _gate_s109_* dir is
+# litter from a gate run that died before its cleanup — removed here
+# so a crashed run never poisons the next one's clean-worktree probe.
+for _stale in os.listdir(os.path.join(ROOT, "tests")):
+    if _stale.startswith("_gate_s109_"):
+        shutil.rmtree(os.path.join(ROOT, "tests", _stale),
+                      ignore_errors=True)
 TMP = tempfile.mkdtemp(prefix="_gate_s109_", dir=os.path.join(ROOT, "tests"))
 
 
@@ -467,6 +475,7 @@ expect(all(rc == 0 for rc in lints),
        "hllint: no findings on the demo or the ok-test")
 
 # ---------------------------------------------------------------------------
+shutil.rmtree(TMP, ignore_errors=True)
 print("")
 print("Stage 109 acceptance: %d passed, %d failed" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)
