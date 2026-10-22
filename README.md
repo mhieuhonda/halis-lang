@@ -447,6 +447,49 @@ make ctime-acceptance          # Stage 138 gate: the compile-time
                                # the determinism law, the ledger
                                # law, the showcase)
 
+python3 tools/hls-size.py record
+                               # Stage 139: file one size measurement
+                               # of the tracked suite
+                               # (benchmarks/size_watch/ — the runtime
+                               # floor, the string surface, the
+                               # per-function machinery, the
+                               # type-driven struct emission, the
+                               # match dispatch) pinned to the
+                               # current clean commit, every workload
+                               # weighed on five axes (emitted C,
+                               # binary, text/data/bss) — plus
+                               # hlc_self, the compiler's own girth,
+                               # on the native instrument. The axis
+                               # has no noise: byte-exact law, no
+                               # samples, no statistics, no noise
+                               # band — one byte of growth is a
+                               # regression it names
+python3 tools/hls-size.py gate
+                               # the CI leg: classify the newest
+                               # record against the prior record of
+                               # the same instrument, byte-identical
+                               # suite, same machine (cc/arch/recipe
+                               # are part of every record's
+                               # fingerprint) — any unsanctioned
+                               # regressed or vanished workload
+                               # exits 1, named
+python3 tools/hls-size.py sanction hlc_self --reason "..."
+                               # a written excuse with an author —
+                               # sanctioned growth is loud but green
+python3 tools/hls-size.py dashboard --out BINARYSIZE.md
+                               # the dashboard, regenerated (never
+                               # hand-edited): per-axis verdicts, the
+                               # bin_bytes trends, both compiler
+                               # digests, the sanctions register,
+                               # byte-identical per ledger
+make size-acceptance          # Stage 139 gate: the binary-size
+                               # battery (the convention, the record
+                               # law — the stage0 axes must equal
+                               # the native axes byte for byte — the
+                               # floor law, the classification law,
+                               # the gate law, the determinism law,
+                               # the ledger law, the showcase)
+
 # 13. Stage 15-alpha: Safe C FFI (v0.13.0-alpha)
 python3 boot/boot.py examples/ffi_demo.hls           # call libc functions
 python3 tools/hlbindgen.py /usr/include/stdlib.h      # generate extern block from C header

@@ -13,6 +13,112 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.157.0-alpha] — Stage 139: Binary-size regression dashboard (per-commit)
+- Stage 136 gave RUNTIME its ledger (`hls-perf`); Stage 137 gave
+  MEMORY its own (`hls-mem`); Stage 138 gave the COMPILER's wall
+  time its own (`hls-ctime`); this release gives the BYTES theirs —
+  the axis a language release regresses that no timing sees: the
+  tool gets fatter to ship, and every program it ships gets fatter
+  with it. The new `tools/hls-size.py` is a LEDGER over commits:
+  every record is one size measurement of the tracked suite pinned
+  to one clean commit, the gate classifies the newest record
+  against the prior record of the same instrument, and the
+  dashboard renders the whole history deterministically. The
+  layering is now complete on every axis a release can regress:
+  `hls-bench` measures programs, `hls-perf` remembers program
+  time, `hls-mem` remembers program memory, `hls-ctime` remembers
+  the time of the compiler itself, `hls-size` remembers the bytes
+  of the compiler's own output — program and tool both.
+- **The axis with no noise.** Binary size is the axis with NO
+  NOISE: the emitted C is byte-exact by the bootstrap invariant
+  (the chain proves it on every record — see below), the link
+  recipe is the Makefile's own fixed `cc -O2 -lm -pthread`, and
+  the same toolchain on the same architecture always produces the
+  same bytes. So hls-size keeps NO samples, runs NO statistics
+  and hides behind NO noise band — one byte of growth is a
+  regression the gate must name. What Stage 124's Welch law is to
+  hls-perf and hls-ctime, the integer byte compare is to hls-size
+  — and it is the whole law: `cur > base` regresses, `cur == base`
+  holds, `cur < base` improves.
+- **The five axes.** Every workload is measured on FIVE axes:
+  `c_bytes` (the emitted C — the emitter's girth), `bin_bytes`
+  (the linked native binary — what the user ships), and the
+  `size(1)` breakdown `text_bytes` / `data_bytes` / `bss_bytes` —
+  where the growth actually landed, at a resolution a file size
+  cannot give. A workload's class is the WORST of its axes: any
+  axis growing regresses the workload; a workload improves only
+  when every axis shrank-or-held and at least one strictly shrank;
+  everything else is no-change. The section axes may be
+  legitimately zero (a program with no bss is a THIN program, not
+  a broken one), but a zero emission or a zero binary is a named
+  refusal — an empty artifact is a bug, not a size.
+- **The tracked suite.** `benchmarks/size_watch/` — five
+  deterministic, size-shaped workloads, one per emission axis a
+  release can quietly fatten: `startup_floor` (the runtime floor
+  every binary stands on — a growth here means the RUNTIME got
+  heavier, not the program), `str_table` (the string surface),
+  `fn_grid` (sixteen small functions behind one dispatch — the
+  per-function call machinery), `struct_grid` (struct literals,
+  nesting and a list of structs — the type-driven emission),
+  `match_matrix` (twelve-variant dispatch — the match machinery).
+  Each prints one checksum line to prove the emission is alive;
+  the suites are compiled and linked, never benchmarked.
+- **The instruments, and the compiler's own girth.** The
+  instrument is the compiler (`stage0`, the bootstrap chain;
+  `native`, `bin/hlc` — two instruments, never compared), and for
+  the emitted bytes both must agree BYTE FOR BYTE: the bootstrap
+  invariant makes the stage0 and native records of the same commit
+  identical on every axis of the five shared workloads, which the
+  acceptance gate proves on every run. The native record carries
+  one more workload the stage0 record cannot: `hlc_self` — the
+  compiler's OWN girth (the size of `bin/hlc.c`, `bin/hlc` and
+  its sections), the row that answers "how fat is the tool this
+  commit".
+- **The pinning laws.** Every record pins the commit (a clean tree
+  or an explicit `--commit`; a dirty tree is a refusal), the
+  compiler's identity twice (the sha256 of the compiler source
+  and of the binary measured through — the stale-binary law bites
+  at record time, exactly as in the compile-time ledger: the same
+  bin/hlc bytes cannot be the build of two different compiler
+  sources), AND the machine the bytes were made on: the cc version
+  line, the architecture and the link recipe. THE MACHINE LAW —
+  sizes from two toolchains are two different languages of the
+  same program, and the gate refuses to translate between them.
+- **The gate, the sanctions, the dashboard.** The gate classifies
+  the newest record against the prior record of the same
+  instrument, byte-identical suite, same machine: no-change /
+  improved / regressed, plus new and vanished on either side of a
+  rename. One unsanctioned regressed or vanished workload exits 1
+  naming it; a SANCTION is a written excuse with an author and a
+  reason, and sanctioned rows are loud but green. The dashboard
+  (BINARYSIZE.md) is a pure render of the ledger bytes: sorted
+  walks, the sha256 ledger digest embedded, per-workload
+  bin_bytes trend sparklines over 8 bands with integer half-up
+  math, no wall-clock unless `--stamp` — two renders of one
+  ledger are byte-identical, so a hand-edited dashboard is a diff.
+- **The acceptance gate.** `make size-acceptance` — eight
+  sections over the real CLI, both real instruments, the real
+  tracked suite and the negative space: the convention, the record
+  law (the hlc_self axes are weighed against the real bin/hlc on
+  disk; the stage0 axes must equal the native axes byte for
+  byte), the floor law (missing axes, zero and negative sizes,
+  foreign reports, the stale-binary law's three cases), the
+  classification law (identical, plus-one-byte, worst-axis-mixed,
+  one-strict-shrink, rename), the gate law (cross-instrument,
+  cross-machine and cross-suite refusals, the baseline laws, the
+  sanction laws), the determinism law, the ledger law and the
+  corpus showcase — tests/ok/feat_stage139_size.hls pins the
+  decision procedure in pure HLS (the byte class law, the
+  worst-axis law, the gate boolean, the sanction-by-name law, the
+  40-hex pin and 64-hex digest grammars, the machine law, the
+  stale-binary law, the trend band law, the 5-workload/5-axis/
+  5-command/5-class count law), byte-identical on the interpreter
+  and natively. 101 checks.
+- **Docs:** SPEC 78 (the laws), the README tour, the roadmap tick,
+  the extension bump. `make size` records through bin/hlc;
+  `make size-gate` is the CI leg; `make size-dashboard` regenerates
+  BINARYSIZE.md.
+
 ## [v0.156.0-alpha] — Stage 138: Compile-time regression dashboard (per-commit)
 - Stage 124 built the runtime instrument; Stage 136 gave RUNTIME its
   ledger (`hls-perf`); Stage 137 gave MEMORY its own (`hls-mem`);

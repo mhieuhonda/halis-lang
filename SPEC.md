@@ -9668,3 +9668,121 @@ program time; `hls-mem` remembers program memory; `hls-ctime`
 remembers the time of the compiler itself — and the Welch test and
 the seeded bootstrap are imported from hls-bench, the same law
 every dashboard in this tree speaks.
+
+## 78. The binary-size ledger (Stage 139 — v0.157.0-alpha)
+
+Stage 136 gave runtime its ledger; Stage 137 gave memory its own;
+Stage 138 gave the compiler's wall time its own; Stage 139 gives
+the BYTES their ledger — the axis a language release regresses
+that no timing sees: the tool gets fatter to ship, and every
+program it ships gets fatter with it. `tools/hls-size.py` is a
+LEDGER over commits: every `record` is one size measurement of
+the tracked suite (`benchmarks/size_watch/` — five deterministic,
+size-shaped workloads: the runtime floor `startup_floor`, the
+string surface `str_table`, the per-function machinery `fn_grid`,
+the type-driven struct emission `struct_grid`, the match dispatch
+`match_matrix`) pinned to one clean commit in the append-only
+ledger (`.hlsize/history.jsonl`, JSONL). A record that does not
+pin a commit is a rumour, exactly as in every other ledger in
+this tree.
+
+### 78.1. The axis with no noise, and the five axes
+
+Binary size is the axis with NO NOISE: the emitted C is byte-exact
+by the bootstrap invariant (and the ledger PROVES it — a stage0
+record and a native record of the same commit carry identical
+axes for every shared workload, which the acceptance gate checks
+byte for byte), the link recipe is the Makefile's own fixed
+`cc -O2 -lm -pthread`, and the same toolchain on the same
+architecture always makes the same bytes. So this ledger keeps
+NO samples, runs NO statistics and hides behind NO noise band:
+one byte of growth is a regression the gate must name. The
+classification law is the integer byte compare, per axis —
+`cur > base` regresses, `cur == base` holds, `cur < base`
+improves — and a workload's class is the WORST of its FIVE AXES:
+`c_bytes` (the emitted C — the emitter's girth), `bin_bytes` (the
+linked native binary — what the user ships), and the `size(1)`
+breakdown `text_bytes` / `data_bytes` / `bss_bytes` (where the
+growth actually landed, at a resolution a file size cannot give).
+Any axis growing regresses the workload; a workload improves only
+when every axis shrank-or-held and at least one strictly shrank.
+The section axes may be legitimately zero — a program with no bss
+is a THIN program, not a broken one — but a zero emission or a
+zero binary is a named refusal: an empty artifact is a bug, not a
+size.
+
+### 78.2. The instruments, and the compiler's own girth
+
+The instrument is the compiler, two of them, never compared:
+`stage0` (the bootstrap chain — `boot/boot.py` running
+`src/hlc.hls` over the workload) and `native` (`bin/hlc`, the
+self-hosted compiler). For the emitted bytes the two instruments
+must agree byte for byte — the bootstrap invariant is this
+ledger's own cross-check, run on every pair of records the
+acceptance gate files. The native record carries one workload the
+stage0 record cannot: `hlc_self`, the compiler's OWN girth — the
+`c_bytes` of `bin/hlc.c`, the `bin_bytes` and sections of
+`bin/hlc` — the row that answers "how fat is the tool this
+commit". A record with an `hlc_self` row on the stage0 instrument
+is refused.
+
+### 78.3. The machine law, the stale-binary law, the gate
+
+Every record pins the commit (clean tree or explicit `--commit`),
+the compiler's identity twice (the sha256 of the compiler source
+and of the binary measured through — the stale-binary law bites
+at record time exactly as in the compile-time ledger: the same
+bin/hlc bytes cannot be the build of two different compiler
+sources; a doc-only commit's identical binary is expected, not
+stale), AND the machine the bytes were made on: the cc version
+line, the architecture, the link recipe. THE MACHINE LAW — sizes
+from two toolchains are two different languages of the same
+program, and the gate refuses to translate between them; a
+changed cc, arch or recipe refuses the comparison and says which
+key moved. THE GATE LAW — the newest record classifies against
+the prior record of the same instrument and byte-identical suite:
+no-change / improved / regressed, plus new and vanished on either
+side of a rename; one unsanctioned regressed or vanished workload
+exits 1 naming it; a SANCTION is a written excuse with an author
+(sanctioned rows are loud but green); improvements are free,
+always. THE DETERMINISM LAW — the dashboard (BINARYSIZE.md) is a
+pure render of the ledger bytes: sorted walks, the sha256 ledger
+digest embedded, both compiler digests and the machine pinned at
+the head, per-workload bin_bytes trend sparklines over 8 bands
+with integer half-up math (a constant series renders the mid
+band), no wall-clock unless `--stamp` — two renders of one ledger
+are byte-identical, so a hand-edited dashboard is a diff.
+
+### 78.4. The gate commands and the acceptance battery
+
+`make size` records at the current commit through bin/hlc (the
+default instrument; `--instrument stage0` for the bootstrap
+chain); `make size-gate` is the CI leg; `make size-dashboard`
+regenerates BINARYSIZE.md; `make size-acceptance` runs eight
+sections over the real CLI, both real instruments, the real
+tracked suite and the negative space: the convention, the record
+law (the hlc_self axes weighed against the real bin/hlc on disk;
+the stage0 axes equal to the native axes byte for byte), the
+floor law (missing axes, zero and negative sizes, foreign
+reports, missing digests, the stale-binary three cases), the
+classification law (identical, plus-one-byte, worst-axis-mixed,
+one-strict-shrink, rename), the gate law (cross-instrument,
+cross-machine, cross-suite refusals; the baseline laws; the
+sanction laws), the determinism law, the ledger law and the
+corpus showcase — tests/ok/feat_stage139_size.hls pins the
+decision procedure in pure HLS (the byte class law, the
+worst-axis law, the gate boolean, the sanction-by-name law, the
+40-hex pin and 64-hex digest grammars, the machine law, the
+stale-binary law, the trend band law, the count law),
+hlfmt-canonical, hllint-clean, byte-identical on the interpreter
+and natively.
+
+Exit codes: 0 verified, 1 a named violation (gate failure, dirty
+tree, stale compiler binary, instrument mismatch, machine
+mismatch), 2 usage error. Layering: `hls-bench` measures
+programs; `hls-perf` remembers program time; `hls-mem` remembers
+program memory; `hls-ctime` remembers the time of the compiler
+itself; `hls-size` remembers the bytes of the compiler's own
+output — program and tool both. Where the perf and compile-time
+ledgers speak Welch's law, this one speaks the byte compare, the
+one law a deterministic axis deserves.

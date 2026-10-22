@@ -209,7 +209,7 @@ remains green.
 | 136 | Performance regression dashboard (per-commit) | ✅ | (done in v0.154.0-alpha) |
 | 137 | Memory regression dashboard (RSS over time) | ✅ | (done in v0.155.0-alpha) |
 | 138 | Compile-time regression dashboard | ✅ | (done in v0.156.0-alpha) |
-| 139 | Binary-size regression dashboard | ⬜ | 3 weeks |
+| 139 | Binary-size regression dashboard | ✅ | (done in v0.157.0-alpha) |
 | 140 | Independent security audit (third-party, paid) | ⬜ | 8 weeks |
 
 ### Phase X — Final stabilisation & v1.0 (Stages 141–150)
