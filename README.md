@@ -570,6 +570,54 @@ make auditkit-acceptance      # Stage 140 gate: the audit battery
                                # law, the finding law, the triage
                                # law, the report law, the showcase)
 
+python3 tools/hls-freeze.py status
+                               # Stage 141: the quick verdict — the
+                               # live surface vs the freeze
+                               # (IDENTICAL, or the drift named at
+                               # its dotted paths)
+python3 tools/hls-freeze.py verify [--quiet] [--json]
+                               # the anti-rot pass, per commit: the
+                               # document must agree with ITSELF
+                               # (the digest matches the surface it
+                               # carries) and with the WORLD (the
+                               # live surface matches the frozen
+                               # one); REMOVED / ADDED / CHANGED,
+                               # each at its dotted path —
+                               # post-freeze additions are drift
+                               # too: the API is locked, not merely
+                               # backwards-compatible
+python3 tools/hls-freeze.py amend \
+       --reason "std.hex grows a helper for the v0.160 formatter" \
+       --by mhieuhonda
+                               # the ONLY legal mutation: refuses
+                               # without a written reason, refuses
+                               # a no-op (noise is how real
+                               # amendments stop being read),
+                               # rewrites the freeze to the live
+                               # surface and appends ONE
+                               # hash-chained record carrying who,
+                               # why, the commit, the delta and
+                               # both digests — the family's ONE
+                               # arithmetic since Stage 13; commit
+                               # the document and its chain
+                               # together
+python3 tools/hls-freeze.py report --out API.md
+                               # the frozen API document,
+                               # deterministic per freeze (the
+                               # digest embedded, the syntax
+                               # surface, the per-module census,
+                               # the amendment history) — and
+                               # never rendered from a drifted
+                               # tree: verify runs first, a
+                               # report from drift is fiction
+make freeze-acceptance        # Stage 141 gate: the freeze battery
+                               # (the convention, the syntax law,
+                               # the census law — the gate's own
+                               # independent re-derivation —, the
+                               # removal law, the mutation law,
+                               # the addition law, the amend law,
+                               # the report law, the showcase)
+
 # 13. Stage 15-alpha: Safe C FFI (v0.13.0-alpha)
 python3 boot/boot.py examples/ffi_demo.hls           # call libc functions
 python3 tools/hlbindgen.py /usr/include/stdlib.h      # generate extern block from C header

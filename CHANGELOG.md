@@ -13,6 +13,135 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.159.0-alpha] — Stage 141: API freeze (syntax + stdlib locked)
+- Phase X opens — the final stabilisation toward v1.0. Every phase
+  before this one added capability; Phase X spends it on
+  promises. Stage 141 is the first and loudest: the language's
+  WHOLE public surface is frozen — the syntax (keywords, the
+  reserved identifiers, the token alphabet, the effect vocabulary,
+  the crate and function attributes, the builtin functions, the
+  builtin method roster) and the stdlib (every public fn with its
+  exact signature, every struct with its fields, every enum with
+  its variant payloads, every import edge of every module under
+  `std/` and `core/`) — into `tests/api_freeze.json`,
+  content-addressed by the sha256 of its own canonical surface,
+  and COMMITTED, because a freeze that does not travel with the
+  repository freezes nothing. The new `tools/hls-freeze.py`
+  enforces the contract with five commands: `snapshot` (once),
+  `verify`, `amend`, `report`, `status`.
+- **The surface is derived LIVE from the real front-ends, never
+  from prose.** The keywords, reserved identifiers and tokens are
+  read out of the boot lexer's tables; the crate attributes and
+  the effect vocabulary out of the parser's; the builtin
+  functions are the checker's own `BUILTIN_FNS` table, imported,
+  not copied; the primitive method tables (str/int/float/bool)
+  are the checker's own dispatch tables; the container and
+  concurrency methods (list, map, Chan, Task) are DEMONSTRATED,
+  not asserted — every method in the probe roster is accepted by
+  the real checker at derive time and every junk name is refused,
+  so a checker whose method table moved breaks the probes loudly
+  instead of freezing a lie; the attribute vocabulary is read out
+  of the parser's own census (a junk attribute, refused, its
+  known-list captured verbatim); and the self-hosted front-end
+  must agree — the keyword chain in `src/hlc/types.hls` is
+  grepped live and must equal the boot set, because a language
+  whose two front-ends disagree about what a keyword IS has no
+  surface to freeze. Every module under `std/` and `core/` is
+  parsed with the real parser; line numbers are deliberately NOT
+  part of the surface — the freeze pins the CONTRACT, not the
+  bytes: a comment move is not an API event, a signature move is.
+- **The frozen census as shipped: 25 keywords, 2 reserved
+  identifiers, 27 tokens, 9 effects, 5 crate attributes, 16
+  function attributes, 130 builtin functions, 35 builtin methods
+  over 8 receivers, and 98 stdlib modules carrying 3402 fns, 185
+  structs, 36 enums and 211 import edges.** The digest is the
+  sha256 of the canonical JSON (sorted keys, compact separators,
+  no wall-clock, no paths, no machine specifics); every verify
+  recomputes it two ways — the document must agree with ITSELF
+  (the digest matches the surface it carries) and with the WORLD
+  (the live surface matches the frozen one). Either agreement
+  failing is a named refusal.
+- **The drift classification is closed and path-addressed:**
+  REMOVED (in the freeze, gone from the tree), ADDED (in the
+  tree, absent from the freeze) and CHANGED (present in both,
+  different), each named at its dotted path —
+  `stdlib.std.hex.fns.hex_byte.ret` — because a drift you cannot
+  point at is a drift you cannot review. Post-freeze ADDITIONS
+  are drift too: the API is LOCKED, not merely
+  backwards-compatible — v1.0 cannot be promised while the
+  surface grows unrecorded. A keyword deleted from ONE front-end
+  is refused outright (the agreement law fires before any
+  comparison); deleted from BOTH, it is named syntax drift.
+- **The amendment is the only legal mutation, and it is a ledger
+  entry, not an edit.** `amend --reason "..." --by NAME` refuses
+  to run without a written reason (an unnamed change to a frozen
+  API is how freezes die), refuses a whitespace-only reason,
+  refuses to run when the live surface already equals the frozen
+  one (a no-op amendment is noise, and noise is how real
+  amendments stop being read), computes the exact delta, rewrites
+  the frozen document to the live surface, and appends ONE
+  hash-chained record to `tests/api_freeze_amendments.jsonl`
+  carrying who, why, the commit, the delta and both digests. The
+  chain is the family's ONE arithmetic (imported from
+  hltlog_parts since Stage 13): sha256(prev_hash +
+  canonical-json(entry minus chain_hash)), genesis from 64 zeros,
+  every reader replaying from the start and naming the broken
+  line — a tampered record breaks the replay at its line. The
+  document and its history travel together: commit both or
+  neither.
+- **The report never renders from a drifted tree.** `report
+  --out API.md` runs verify first and refuses — a document that
+  describes a surface the tree no longer has is not
+  documentation, it is fiction. The render is deterministic per
+  freeze: sorted walks, no wall-clock unless `--stamp` (and then
+  only the Generated line), the digest embedded, the syntax
+  surface, the per-module census and the amendment history — two
+  renders of one freeze are byte-identical, so a hand-edit is a
+  diff. Exit codes: 0 the contract held, 1 a named refusal or a
+  detected drift (fail-closed), 2 usage error or a broken probe
+  (the tool refuses to freeze a surface it could not
+  demonstrate); every refusal names the rule, not just the fact.
+- **The acceptance gate.** `make freeze-acceptance` — eight
+  sections over the real freeze, the real front-ends (imported
+  and probed directly — the gate never trusts the tool's own
+  reader where it can re-derive) and the negative space: the
+  convention (the digest self-consistency through the gate's own
+  canonicaliser, the genesis chain, the committed-files law), the
+  syntax law (boot tables imported and compared, the self-hosted
+  chain grepped and equated, the live attribute census, the
+  method probes demonstrated and the junk names refused), the
+  census law (the gate walks std/ and core/ itself and rebuilds
+  the whole stdlib surface with its own record builder — 98
+  modules, row for row, canonically equal), the removal law (a
+  deleted fn named at its path; the one-front-end keyword removal
+  refused; the both-front-ends removal named), the mutation law
+  (parameter, return, effect, variant, field, deprecation — each
+  named), the addition law (a new fn and a grown builtin table
+  are drift; a comment-only edit is NOT — the contrast is the
+  law), the amend law (the refusals, the real amendment with its
+  chain_hash recomputed through the imported `chain_of`, the
+  post-amend green, the tampered record named at its line) and
+  the report law (two renders byte-identical, the digest
+  embedded, the drifted tree refused) — and the corpus showcase,
+  tests/ok/feat_stage141_apifreeze.hls, which pins the decision
+  procedure in pure HLS: the drift vocabulary (total over
+  (frozen?, live?, differs?)), the amendment law, the digest
+  grammar (64 lowercase hex, determinism, avalanche, self-
+  agreement), the chain law (genesis, no holes, prev binding,
+  replay names the break), the count law (25/2/8+19/9/5/16 and
+  the 8 receivers × 35 methods), the method rosters per receiver,
+  the contract-not-bytes law and the state machine (snapshot
+  once, verify green on zero drift only, amend absorbs and
+  returns to green, report never renders from drift) —
+  hlfmt-canonical, hllint-clean, byte-identical on the
+  interpreter and natively. 103 checks.
+- **Docs:** SPEC 80 (the laws), the README tour, the roadmap
+  tick, the extension bump. `make freeze` prints the quick
+  verdict; `make freeze-verify` is the per-commit anti-rot pass;
+  `make freeze-report` renders the frozen API document; the
+  surface moves only through `tools/hls-freeze.py amend --reason
+  --by` — a ledger entry with the exact delta, never an edit.
+
 ## [v0.158.0-alpha] — Stage 140: Independent security audit (third-party, paid)
 - Phase IX closes. Stage 135 documented the soundness guarantees
   and re-demonstrates them at verify time; Stage 140 is the other

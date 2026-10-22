@@ -216,7 +216,7 @@ remains green.
 
 | # | Stage | Status | Estimated effort |
 |---|-------|:------:|:----------------:|
-| 141 | API freeze — syntax + stdlib locked | ⬜ | 4 weeks |
+| 141 | API freeze — syntax + stdlib locked | ✅ | (done in v0.159.0-alpha) |
 | 142 | Pure-HLS bootstrap (remove `boot/` Python seed) | ⬜ | 8 weeks |
 | 143 | Bit-for-bit reproducible bootstrap chain | ⬜ | 4 weeks |
 | 144 | Independent third-party security audit (final) | ⬜ | 6 weeks |

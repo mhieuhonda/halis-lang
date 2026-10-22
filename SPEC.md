@@ -9917,3 +9917,147 @@ severities, 3 verdicts, 6 states, 2 repro modes, 2 outcomes, 4
 entry kinds) and the honesty law (both outcomes recorded, the
 drift named) — hlfmt-canonical, hllint-clean, byte-identical on
 the interpreter and natively. 102 checks.
+
+## 80. The API freeze (Stage 141 — v0.159.0-alpha)
+
+Roadmap Stage 141 is one phrase: "API freeze — syntax + stdlib
+locked". Phase X opens with the loudest promise in the roadmap,
+and the roadmap's own discipline applies: a promise about the
+future is prose, and prose rots — nothing failed when a keyword
+appeared or a signature moved. This stage turns the promise into
+a FROZEN DOCUMENT — `tests/api_freeze.json`, committed to the
+tree, content-addressed by the sha256 of its own canonical
+surface — and a kit, `tools/hls-freeze.py`, with five commands
+(`snapshot` once, `verify`, `amend`, `report`, `status`) that
+refuses to let the surface and the document disagree.
+
+### 80.1. The surface is derived live, from the real front-ends
+
+The SYNTAX section of the freeze is read out of the tables the
+checker actually tests membership against, never out of prose:
+the keywords, the reserved identifiers and the token alphabet
+from the boot lexer (`KEYWORDS`, `RESERVED_IDENTIFIERS`,
+`TWO_CHAR`, `ONE_CHAR`); the crate attributes and the nine-effect
+vocabulary from the parser (`CRATE_ATTRS`, `KNOWN_EFFECTS`); the
+builtin functions from the checker's own `BUILTIN_FNS` table,
+imported, not copied; the primitive method tables (str, int,
+float, bool) from the checker's own dispatch tables. The
+container and concurrency methods (list, map, Chan, Task — whose
+dispatch lives inline in the checker) are DEMONSTRATED, not
+asserted: every method in the probe roster is a real program
+accepted by the real checker at derive time, and a junk name per
+receiver is refused — a checker whose method table moved breaks
+the probes loudly and the tool refuses to freeze (fail-closed,
+never a guessed surface). The FUNCTION-attribute vocabulary is
+read out of the parser's own census: a junk attribute is refused
+with the `known: ...` enumeration, and the enumeration is frozen
+verbatim beside its cleaned name list — the parser's own words.
+And the self-hosted front-end must agree: the keyword chain in
+`src/hlc/types.hls` (`is_keyword`) is grepped live and must equal
+the boot lexer's set — a language whose two front-ends disagree
+about what a keyword IS has no surface to freeze, and a keyword
+deleted from ONE front-end is refused outright, before any
+comparison.
+
+### 80.2. The stdlib census, the contract not the bytes
+
+The STDLIB section is every public item of every module under
+`std/` and `core/`, parsed with the real parser: every fn with
+its exact signature (parameter names, types, mutability; return
+type; generic parameters; the computed effect set; purity;
+extern-ness; the deprecation notice; the FFI taint marking; and
+the rendered `requires`/`ensures` contracts), every struct with
+its fields (types and defaultedness), every enum with its variant
+payloads, and every import edge. Method-keyed fns freeze under
+their `Struct.method` keys. LINE NUMBERS ARE DELIBERATELY NOT
+PART OF THE SURFACE — the freeze pins the CONTRACT, not the
+bytes: a comment move, a blank line, a reformatted header move no
+row and an honest verify stays green; a parameter type, a return
+type, an effect clause, a variant, a field or a deprecation is a
+named event. The frozen census as shipped: 25 keywords, 2
+reserved identifiers, 27 tokens (8 two-char + 19 one-char), 9
+effects, 5 crate attributes, 16 function attributes, 130 builtin
+functions, 35 builtin methods over 8 receivers (str 12, int 3,
+float 3, bool 1, list 5, map 5, chan 5, task 1), and 98 modules
+carrying 3402 fns, 185 structs, 36 enums and 211 import edges.
+
+### 80.3. The digest, the drift, the law of additions
+
+The digest is the sha256 of the canonical JSON of the surface
+(sorted keys, compact separators, ensure-ASCII, no wall-clock, no
+paths, no machine specifics). Every verify recomputes it TWO
+ways: the document must agree with ITSELF (the digest matches the
+surface it carries — a hand-edited document is named at its
+self-disagreement) and with the WORLD (the live surface matches
+the frozen one). The drift classification is closed — REMOVED (in
+the freeze, gone from the tree), ADDED (in the tree, absent from
+the freeze), CHANGED (present in both, different) — and
+path-addressed (`stdlib.std.hex.fns.hex_byte.ret`): a drift you
+cannot point at is a drift you cannot review. POST-FREEZE
+ADDITIONS ARE DRIFT TOO: the API is locked, not merely
+backwards-compatible — v1.0 cannot be promised while the surface
+grows unrecorded. A grown builtin table, a new stdlib fn, a new
+attribute in the parser's census — all named.
+
+### 80.4. The amendment is a ledger entry, not an edit
+
+The only legal mutation is `amend --reason "..." --by NAME`. It
+refuses to run without a written reason (an unnamed change to a
+frozen API is how freezes die), refuses a whitespace-only
+reason, and refuses to run when the live surface already equals
+the frozen one — a no-op amendment is noise, and noise is how
+real amendments stop being read. A real amendment computes the
+exact delta, rewrites the frozen document to the live surface,
+and appends ONE record to `tests/api_freeze_amendments.jsonl` —
+seq, kind, by, reason, commit, delta (the removed/added/changed
+paths), from_digest, to_digest — chained with the family's ONE
+arithmetic, imported from hltlog_parts since Stage 13:
+sha256(prev_hash + canonical-json(entry minus chain_hash)),
+genesis from 64 zeros, seqs 1..n with no hole, every reader
+replaying from the start and naming the broken line. The chain
+travels WITH the document — commit both or neither; a chain
+without its freeze is a corrupted state no snapshot may paper
+over.
+
+### 80.5. The report never renders from drift, the battery
+
+`report --out API.md` runs the whole verify first and refuses on
+any drift — a document that describes a surface the tree no
+longer has is not documentation, it is fiction. The render is
+deterministic per freeze: sorted walks, no wall-clock unless
+`--stamp` (and then only the Generated line), the digest
+embedded — two renders of one freeze are byte-identical, so a
+hand-edit is a diff. Exit codes: 0 the contract held, 1 a named
+refusal or a detected drift (fail-closed), 2 usage error or a
+broken probe; every refusal names the rule, not just the fact.
+The acceptance battery (`make freeze-acceptance`) runs eight
+sections over the real freeze, the real front-ends (imported and
+probed directly — the gate never trusts the tool's own reader
+where it can re-derive) and the negative space: the convention
+(the digest self-consistency through the gate's own
+canonicaliser, the genesis chain, the committed-files law), the
+syntax law (the boot tables imported and compared, the
+self-hosted chain grepped and equated, the live attribute
+census, the method probes demonstrated), the census law (the
+gate walks std/ and core/ itself and rebuilds the whole stdlib
+surface with its own record builder — canonically equal, row for
+row), the removal law, the mutation law (parameter, return,
+effect, variant, field, deprecation — each named at its path),
+the addition law (with its contrast: a comment-only edit is NOT
+drift), the amend law (the refusals; the real amendment with its
+chain_hash recomputed through the imported `chain_of`; the
+tampered record named at its line) and the report law (two
+renders byte-identical, the drifted tree refused) — and the
+corpus showcase, tests/ok/feat_stage141_apifreeze.hls, which
+pins the decision procedure in pure HLS: the drift vocabulary
+(total over (frozen?, live?, differs?)), the amendment law, the
+digest grammar (64 lowercase hex, determinism, avalanche,
+self-agreement), the chain law (genesis, no holes, prev
+binding, replay names the break), the count law (25 keywords, 2
+reserved, 8+19 tokens, 9 effects, 5 crate attributes, 16
+function attributes, 8 receivers, 35 methods), the method
+rosters per receiver, the contract-not-bytes law and the state
+machine (snapshot once, verify green on zero drift only, amend
+absorbs and returns to green, report never renders from drift)
+— hlfmt-canonical, hllint-clean, byte-identical on the
+interpreter and natively. 103 checks.
