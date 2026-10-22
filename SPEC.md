@@ -9786,3 +9786,134 @@ itself; `hls-size` remembers the bytes of the compiler's own
 output — program and tool both. Where the perf and compile-time
 ledgers speak Welch's law, this one speaks the byte compare, the
 one law a deterministic axis deserves.
+
+## 79. The third-party audit kit (Stage 140 — v0.158.0-alpha)
+
+Roadmap Stage 140 is one phrase: "Independent security audit
+(third-party, paid)". A promise about the future is prose, and
+prose rots — so Phase IX closes by turning the promise into a
+LEDGER, exactly as Stage 135 turned the guarantees into one. The
+new `tools/hls-auditkit.py` runs the whole engagement as a
+hash-chained, append-only record (`.hlaudit/engagement.jsonl`,
+machine-local like every ledger in this tree) where every fact of
+the audit is an entry somebody signed, and the lifecycle is seven
+commands: `engage`, `brief`, `evidence`, `file`, `triage`,
+`report`, `status`. The chain arithmetic is the family's ONE
+definition (imported from hltlog_parts since Stage 13, the same
+sha256(prev + canonical-json(entry minus chain_hash)) every
+chained ledger in the tree speaks): every reader verifies the
+whole chain first and names the broken line — a tampered ledger
+is evidence, not a document, and nothing renders or appends from
+it.
+
+### 79.1. The scope is live, the drift is named
+
+The audit scope is the Stage 135 guarantee ledger, imported at
+run time and read, never copied: the brief can only scope what
+the CURRENT tree still demonstrates, and a guarantee removed from
+the ledger is removed from the audit the same day. The engagement
+records the scope digest (sha256 over the ledger's canonical
+JSON) it was signed against; every later evidence pass records
+the digest it actually ran; and when they disagree the report
+names the fact — "the last pass that ran a different scope did so
+at `sha256:...`" — a scope that moved under the auditors is a
+fact, never a silence. The reporting channel is anchored in
+SECURITY.md (the same two anchors the guarantee ledger pins) and
+checked at render time: a tree that lost the anchor refuses to
+brief until it is re-anchored. THE BRIEF (the RFP) is a
+deterministic render of the live scope — the census table, the
+method (re-derive the anchors, re-run the probes, attempt the
+violation contracts, bounty-style), the findings protocol, the
+commercial terms — and it is the only command that may run before
+a ledger exists, because solicitation precedes contract: on an
+empty world it renders OPEN SOLICITATION.
+
+### 79.2. The independence law
+
+WHO ran a pass is recorded on the entry, and the label follows
+the roster, never the runner's mood: a pass by a roster member is
+INDEPENDENT (role auditor), anyone else's is SELF-ASSESSED (role
+project) — and the report refuses to call a self-run pass
+independent. Independence is a fact the ledger names, not a fact
+it manufactures. The law is symmetric on both sides of the table:
+FINDINGS ARE THE AUDITORS' TO FILE (the project cannot author
+one), THE TRIAGE IS THE PROJECT'S TO GIVE (an auditor cannot
+respond to one), and the signer of the contract cannot be on
+their own roster — independence starts at the signature. An empty
+roster is refused (an audit with no auditors is a monologue); a
+window that ends before it starts is refused at the signature,
+not discovered at the invoice; and a second engagement is refused
+outright (a contract is not a draft — a new engagement is a new
+ledger). THE PAID PART is a term of the contract, not a vibe: the
+fee basis is recorded verbatim at engage time and the kit refuses
+an engagement without one — a gratis review is not an
+independent audit; it has no deliverable schedule, no remedy when
+the deliverable is late, and no obligation to file what it found.
+
+### 79.3. The findings protocol, the triage
+
+A finding names ONE guarantee row from the scope (the `against`
+law; a foreign row is refused naming the known ones — a finding
+against nothing in the scope is out of the protocol by
+definition), carries a severity from the closed FIVE-word audit
+vocabulary — critical/high/medium/low/info, ranked 0..4, wider
+than the bounty's three because auditors also file hardening
+notes — and carries a REPRODUCER: a path that exists in the tree
+or inline text, never both, never neither. A finding that cannot
+be reproduced is an opinion, and opinions are not findings; a
+reproducer that points at nothing is a rumor. Ids are sequential
+(AF-001, AF-002, ...). THE TRIAGE is one verdict
+(accepted/disputed/out-of-scope), one reason, one response per
+finding — a second is refused: the record is the response, not a
+negotiation. A triage without a reason is refused (the sanction
+law, on the other side of the table). An ACCEPTED finding carries
+its remediation commit at triage time — 40 hex naming a commit
+that EXISTS (a well-formed sha that names nothing is refused: a
+remediation that exists nowhere is a promise, not a commit; an
+acceptance without its remediation is a wish, not a fix).
+Disputed and out-of-scope carry no fix at all — the pairing is
+strict and closed: a disputed finding with a fix is a
+contradiction.
+
+### 79.4. Fail-closed, fail-recorded, the state, the battery
+
+An evidence pass re-runs the whole scope through the real checker
+(the hls-guarantee engine, imported; the same counts) and exits 1
+naming its refusals — and the transcript is still written, with
+`outcome: failed` and the refusals verbatim: a failed pass is a
+record, not a shame. THE STATE is derived from the census on
+every render, never stored — vacant -> open -> underway ->
+reported -> responded -> remediated. Responded requires every
+finding triaged; remediated requires every acceptance to carry
+its fix; and a finding-free audit honestly stays underway,
+because the ledger cannot know the auditors rested — the report
+is the deliverable either way. Both documents are deterministic
+per input: sorted walks, no wall-clock unless `--stamp` (and then
+only the Generated line), the ledger digest (the sha256 of the
+raw bytes) embedded — two renders of one ledger are
+byte-identical, so a hand-edited report is a diff. Exit codes: 0
+the command's contract held, 1 a named refusal or a failed pass
+(fail-closed), 2 usage error; every refusal names the rule, not
+just the fact. The acceptance battery (`make
+auditkit-acceptance`) runs eight sections over the real CLI, the
+real scope, the real checker and the negative space — the
+convention, the engagement law (the chain re-derived by the gate
+itself through the family's imported arithmetic, not through the
+tool's own reader), the brief law (open solicitation vs engaged,
+the census equal to the live ledger row for row, the anchored
+channel, the 14-row tree that briefs 14 rows), the evidence law
+(INDEPENDENT vs SELF-ASSESSED, the counts equal to the guarantee
+engine's, the FAILED pass recorded while the chain stays green,
+the drift recorded as a fact), the finding law, the triage law,
+the report law (the digest, the determinism, the banners, the
+broken chain named at its line — an edited entry, a reordered
+entry — with nothing rendering or appending from it) — and the
+corpus showcase, tests/ok/feat_stage140_auditkit.hls, which pins
+the decision procedure in pure HLS: the severity ranks, the
+verdict pairing, the reproducer xor, the independence labels, the
+state machine, the chain grammars (GENESIS the 64 zeros, the
+40-hex fix), the count law (7 commands, 15 guarantees, 5
+severities, 3 verdicts, 6 states, 2 repro modes, 2 outcomes, 4
+entry kinds) and the honesty law (both outcomes recorded, the
+drift named) — hlfmt-canonical, hllint-clean, byte-identical on
+the interpreter and natively. 102 checks.

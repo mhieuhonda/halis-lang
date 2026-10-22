@@ -191,7 +191,7 @@ remains green.
 | 123 | `hls-repl` — interactive REPL with :type/:effects/:audit | ✅ | (done in v0.141.0-alpha) |
 | 124 | `hls-bench` — criterion-style micro-benchmark runner | ✅ | (done in v0.142.0-alpha) |
 
-### Phase IX — Performance, runtime & stability (Stages 125–140)
+### Phase IX — Performance, runtime & stability (Stages 125–140, complete)
 
 | # | Stage | Status | Estimated effort |
 |---|-------|:------:|:----------------:|
@@ -210,7 +210,7 @@ remains green.
 | 137 | Memory regression dashboard (RSS over time) | ✅ | (done in v0.155.0-alpha) |
 | 138 | Compile-time regression dashboard | ✅ | (done in v0.156.0-alpha) |
 | 139 | Binary-size regression dashboard | ✅ | (done in v0.157.0-alpha) |
-| 140 | Independent security audit (third-party, paid) | ⬜ | 8 weeks |
+| 140 | Independent security audit (third-party, paid) | ✅ | (done in v0.158.0-alpha) |
 
 ### Phase X — Final stabilisation & v1.0 (Stages 141–150)
 

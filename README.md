@@ -490,6 +490,86 @@ make size-acceptance          # Stage 139 gate: the binary-size
                                # the gate law, the determinism law,
                                # the ledger law, the showcase)
 
+python3 tools/hls-auditkit.py engage \
+       --firm "..." --auditor "A" --auditor "B" \
+       --window "2026-11-02/2026-12-24" --basis "..." \
+       --by mhieuhonda
+                               # Stage 140: sign the contract. One
+                               # engagement per ledger, ever; the
+                               # roster, the window (two ISO dates,
+                               # a window that ends before it starts
+                               # is refused at the signature), the
+                               # fee basis (recorded verbatim — a
+                               # gratis review is not an
+                               # independent audit), the signer —
+                               # who is never on their own roster
+python3 tools/hls-auditkit.py brief --out AUDITBRIEF.md
+                               # the RFP, derived LIVE from the
+                               # Stage 135 guarantee ledger: the
+                               # census (the 15 rows, their anchors
+                               # and probes), the method (re-derive
+                               # the anchors, re-run the probes,
+                               # attempt the violation contracts,
+                               # bounty-style), the findings
+                               # protocol, the commercial terms.
+                               # The only command that may run
+                               # before a ledger exists —
+                               # solicitation precedes contract
+                               # (OPEN SOLICITATION)
+python3 tools/hls-auditkit.py evidence --by "Dana Fischer"
+                               # the pass: re-runs the whole scope
+                               # through the real checker and
+                               # appends one chained transcript
+                               # naming WHO ran it. The label
+                               # follows the roster: a roster
+                               # member's pass is INDEPENDENT,
+                               # anyone else's is SELF-ASSESSED —
+                               # the report refuses to call a
+                               # self-run pass independent. A
+                               # failed pass exits 1 naming its
+                               # refusals and is still recorded:
+                               # a failed pass is a record, not a
+                               # shame
+python3 tools/hls-auditkit.py file \
+       --against G-TAINT-01 --severity high \
+       --title "..." --repro-path repro.hls \
+       --by "Dana Fischer"
+                               # the auditors' instrument: a finding
+                               # names one row from the scope, a
+                               # severity from the closed five-word
+                               # vocabulary, and a REPRODUCER (a
+                               # path that exists or inline text,
+                               # never both, never neither — a
+                               # finding that cannot be reproduced
+                               # is an opinion). Findings are the
+                               # auditors' to file; the project
+                               # cannot author one
+python3 tools/hls-auditkit.py triage AF-001 \
+       --verdict accepted --reason "..." \
+       --fix <40-hex> --by mhieuhonda
+                               # the project's response: one verdict,
+                               # one reason (the sanction law, on
+                               # the other side of the table), and
+                               # for an acceptance the remediation
+                               # commit itself — 40 hex naming a
+                               # commit that EXISTS. One response
+                               # per finding; an auditor cannot
+                               # triage one
+python3 tools/hls-auditkit.py report --out AUDITREPORT.md
+                               # the deliverable, rendered from the
+                               # chained ledger: the engagement, the
+                               # drift line (the scope that moved
+                               # under the auditors is named, never
+                               # hidden), every pass with its
+                               # independence label, the findings,
+                               # the triage, the derived state —
+                               # byte-identical per ledger
+make auditkit-acceptance      # Stage 140 gate: the audit battery
+                               # (the convention, the engagement
+                               # law, the brief law, the evidence
+                               # law, the finding law, the triage
+                               # law, the report law, the showcase)
+
 # 13. Stage 15-alpha: Safe C FFI (v0.13.0-alpha)
 python3 boot/boot.py examples/ffi_demo.hls           # call libc functions
 python3 tools/hlbindgen.py /usr/include/stdlib.h      # generate extern block from C header

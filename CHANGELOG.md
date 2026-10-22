@@ -13,6 +13,122 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.158.0-alpha] — Stage 140: Independent security audit (third-party, paid)
+- Phase IX closes. Stage 135 documented the soundness guarantees
+  and re-demonstrates them at verify time; Stage 140 is the other
+  half of the promise: the same guarantees get looked at by
+  someone whose paycheck does not depend on them being true. The
+  new `tools/hls-auditkit.py` runs the WHOLE ENGAGEMENT as a
+  chained ledger (`.hlaudit/engagement.jsonl`, machine-local like
+  every ledger in this tree): one hash-chained, append-only
+  record per engagement — the family's ONE arithmetic, imported
+  from hltlog_parts since Stage 13, every reader verifies the
+  whole chain first and names the broken line — where every fact
+  of the audit is an entry somebody signed. Seven commands, one
+  lifecycle: `engage`, `brief`, `evidence`, `file`, `triage`,
+  `report`, `status`.
+- **The scope is derived LIVE, never copied.** The audit scope is
+  the Stage 135 guarantee ledger, imported at run time: the brief
+  can only scope what the CURRENT tree still demonstrates, and a
+  guarantee removed from the ledger is removed from the audit the
+  same day. The engagement records the scope digest it was signed
+  against; every later pass records the digest it actually ran;
+  and the report NAMES the drift when they disagree ("the last
+  pass that ran a different scope did so at ...") — a scope that
+  moved under the auditors is a fact, never a silence. The
+  reporting channel is anchored in SECURITY.md and checked at
+  render time: a tree that lost the anchor refuses to brief.
+- **THE INDEPENDENCE LAW is the stage's whole point.** WHO ran a
+  pass is recorded on the entry, and the label follows the
+  roster, never the runner's mood: a pass by a roster member is
+  INDEPENDENT, anyone else's is SELF-ASSESSED, and the report
+  refuses to call a self-run pass independent — independence is a
+  fact the ledger names, not a fact it manufactures. The law is
+  symmetric on both sides of the table: findings are the
+  AUDITORS' to file (the project cannot author one), the triage
+  is the PROJECT'S to give (an auditor cannot respond to one),
+  and the signer of the contract cannot be on their own roster —
+  independence starts at the signature. An empty roster is
+  refused (an audit with no auditors is a monologue), and so is a
+  window that ends before it starts — refused at the signature,
+  not discovered at the invoice.
+- **The paid part is a term of the contract, not a vibe.** The
+  fee basis is recorded verbatim at engage time and the kit
+  refuses an engagement without one: a gratis review is not an
+  independent audit — it has no deliverable schedule, no remedy
+  when the deliverable is late, and no obligation to file what it
+  found. The brief (the RFP) carries the standing commercial
+  terms — fixed fee against the scope census, half at engagement,
+  half on delivery of the report — and it is the only command
+  that may run before a ledger exists, because solicitation
+  precedes contract: on an empty world it renders OPEN
+  SOLICITATION.
+- **The findings protocol.** A finding names ONE guarantee row
+  from the scope (the `against` law; a foreign row is refused
+  naming the known ones), carries a severity from the closed
+  FIVE-word audit vocabulary (critical/high/medium/low/info —
+  wider than the bounty's three, because auditors also file
+  hardening notes), and carries a REPRODUCER: a path that exists
+  in the tree or inline text, never both, never neither — a
+  finding that cannot be reproduced is an opinion, and opinions
+  are not findings; a reproducer that points at nothing is a
+  rumor. Ids are sequential (AF-001, AF-002, ...).
+- **The triage.** One verdict (accepted/disputed/out-of-scope),
+  one response per finding — a second is refused: the record is
+  the response, not a negotiation. A triage without a reason is
+  refused (the sanction law, on the other side of the table).
+  An ACCEPTED finding carries its remediation commit at triage
+  time — 40 hex naming a commit that EXISTS (a well-formed sha
+  that names nothing is refused: a remediation that exists
+  nowhere is a promise, not a commit; an acceptance without its
+  remediation is a wish, not a fix). Disputed and out-of-scope
+  carry no fix at all — the pairing is strict and closed.
+- **Fail-closed AND fail-recorded.** An evidence pass re-runs the
+  whole scope through the real checker (the hls-guarantee engine,
+  imported, the same counts) and exits 1 naming its refusals —
+  and the transcript is still written: a failed pass is a record,
+  not a shame. THE STATE is derived from the census on every
+  render, never stored — vacant -> open -> underway -> reported
+  -> responded -> remediated; responded requires every finding
+  triaged, remediated requires every acceptance to carry its fix,
+  and a finding-free audit honestly stays underway (the ledger
+  cannot know the auditors rested; the report is the deliverable
+  either way). Both documents are deterministic per input: no
+  wall-clock unless `--stamp` (and then only the Generated line),
+  the ledger digest (sha256 of the raw bytes) embedded — two
+  renders of one ledger are byte-identical, and a hand-edited
+  report is a diff.
+- **The acceptance gate.** `make auditkit-acceptance` — eight
+  sections over the real CLI, the real scope, the real checker
+  and the negative space: the convention, the engagement law (the
+  chain re-derived by the gate itself, through the family's
+  imported arithmetic, not through the tool's own reader; the
+  dirty window; the self-signed roster; the monologue), the brief
+  law (open solicitation vs engaged, the census equal to the live
+  ledger row for row, the anchored channel, the 14-row tree that
+  briefs 14 rows), the evidence law (INDEPENDENT vs SELF-ASSESSED,
+  the counts equal to the guarantee engine's, the FAILED pass
+  recorded with its refusals while the chain stays green, the
+  drift recorded as a fact), the finding law (off-roster
+  filings, the closed vocabulary, the reproducer laws), the
+  triage law (the reason, the pairing, the fix that must name a
+  real commit, the one-response law) and the report law (the
+  digest, the determinism, the banners, the broken chain named at
+  its line — edited, reordered — with nothing rendering or
+  appending from it) — and the corpus showcase:
+  tests/ok/feat_stage140_auditkit.hls pins the decision procedure
+  in pure HLS (the severity ranks, the verdict pairing, the
+  reproducer xor, the independence labels, the state machine, the
+  chain grammars, the count law, the honesty law),
+  hlfmt-canonical, hllint-clean, byte-identical on the
+  interpreter and natively. 102 checks.
+- **Docs:** SPEC 79 (the laws), the README tour, the roadmap tick,
+  the extension bump. `make auditkit-brief` renders the RFP;
+  `make auditkit-evidence` files a pass through the project's own
+  identity (honestly labelled SELF-ASSESSED); `make
+  auditkit-report` renders the deliverable from the chained
+  ledger.
+
 ## [v0.157.0-alpha] — Stage 139: Binary-size regression dashboard (per-commit)
 - Stage 136 gave RUNTIME its ledger (`hls-perf`); Stage 137 gave
   MEMORY its own (`hls-mem`); Stage 138 gave the COMPILER's wall
