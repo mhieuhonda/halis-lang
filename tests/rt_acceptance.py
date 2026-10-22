@@ -23,11 +23,13 @@ prints):
                        re-derivation rule (a report whose totals
                        disagree with its lines is refused whole)
 
-  3. the runtime     — the emitted C carries the weak instrument hooks,
-     wiring           the arm call in main and the marker scan — and a
+  3. the runtime     — the emitted C carries the weak instrument
+     wiring           hooks as weak fallback DEFINITIONS (the plain
+                       `cc prog.c` link must hold on Mach-O too), the
+                       arm call in main and the marker scan — and a
                        --no-libc emission carries none of them; a
                        program run WITHOUT the instrument is unaffected
-                       by its own markers (the mode costs one GOT test
+                       by its own markers (the mode costs one flag test
                        when it is not armed)
 
   4. the steady      — the steady workload certifies RT BOUNDED; the
@@ -294,9 +296,11 @@ if NATIVE:
     r = run([HLC, hello, c_path])
     check(r.returncode == 0, "the hosted probe compiles")
     src = open(c_path).read()
-    check("extern void hlrt_cycle_mark" in src
-          and "__attribute__((weak))" in src,
-          "the emitted C declares the weak instrument hooks")
+    check("__attribute__((weak)) int hlrt_cycle_hooked = 0;" in src
+          and "__attribute__((weak)) void hlrt_cycle_mark" in src
+          and "extern void hlrt_cycle_mark" not in src,
+          "the emitted C defines the weak instrument hooks as fallbacks "
+          "(no weak references: Mach-O links the plain build)")
     check("hl_srt_init();" in src,
           "main arms the mode before any user code")
     check('__HLRT_CYCLE__ ' in src and "hl_srt_on_mark" in src,
@@ -331,7 +335,7 @@ if NATIVE:
                        stdin=subprocess.DEVNULL, timeout=120)
     check(p.stdout == "hello\n" and p.returncode == 0,
           "an uninstrumented binary ignores its own markers and the "
-          "report switch (mode not armed, one GOT test)")
+          "report switch (mode not armed, one flag test)")
     check("HLRT_REPORT_BEGIN" not in p.stderr,
           "no ledger without the instrument (the runtime never rolls)")
 else:

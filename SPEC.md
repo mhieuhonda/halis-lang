@@ -8107,7 +8107,13 @@ any user code) and recognises markers where they are BORN: a
 fifteen-byte prefix comparison inside `hl_println`. Arming requires
 the hls-rt instrument to be linked — the instrument's entry points
 (`hlrt_cycle_mark` / `hlrt_cycle_allocs` / `hlrt_cycle_bytes`) are
-WEAK symbols — and at least one budget axis or the report switch:
+weakly DEFINED in the emitted runtime and overridden strongly when
+the instrument is linked (weak *references* would be a Mach-O link
+error; the fallbacks keep the plain `cc prog.c -lm -pthread` link
+green on every platform), and presence is told by the same trade:
+`hlrt_cycle_hooked` is 0 in the fallback and 1 in the instrument,
+so `hl_srt_init` sees the instrument before it touches the
+environment — and at least one budget axis or the report switch:
 
 | Env var | Meaning |
 |---------|---------|
@@ -8131,7 +8137,7 @@ miss like any other fault, with the message `core.rt`'s
     soft real-time violation: cycle 7 took 1500000 ns (deadline 1000000 ns)
 
 A program built without the instrument returns from `hl_srt_init`
-before ONE getenv — the mode costs one GOT test per process and a
+before ONE getenv — the mode costs one flag test per process and a
 fifteen-byte comparison per println is never reached. A `--no-libc` or
 `#![freestanding]` emission carries none of the mode at all (the
 no-libc prelude's honest "not available", kept for a hosted-only

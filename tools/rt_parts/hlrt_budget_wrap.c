@@ -338,10 +338,15 @@ void __wrap_free(void* p) {
     __real_free(p);
 }
 
-/* The runtime's Stage 126 hooks (declared weak there). Marking closes
- * the open cycle: snapshot, ledger append, reset. The clock is stamped
+/* The runtime's Stage 126 hooks — the runtime emits WEAK DEFINITIONS of
+ * these (weak *references* are a Mach-O link error, and the toolchain
+ * promises the plain `cc prog.c -lm -pthread` link works everywhere),
+ * so this file overrides them STRONGLY just by defining them; the
+ * same is true of the flag the runtime arms on. Marking closes the
+ * open cycle: snapshot, ledger append, reset. The clock is stamped
  * BEFORE the roll so the recorded window is the cycle the program
  * actually ran, not the cost of bookkeeping it. */
+int hlrt_cycle_hooked = 1;
 void hlrt_cycle_mark(long long idx) {
     struct timespec now;
     long long nanos = 0;
