@@ -846,15 +846,17 @@ def render_report(path, entries, head, log_sha256, stamp=None):
                  % (engagement["basis"], engagement["by"]))
         L.append("- Scope at engagement: `sha256:%s`"
                  % engagement["scope_sha256"])
-        newest = passes[-1] if passes else None
-        if newest is not None \
-                and newest["scope_sha256"] != engagement["scope_sha256"]:
+        moved = [e for e in passes
+                 if e["scope_sha256"] != engagement["scope_sha256"]]
+        if moved:
+            last = moved[-1]
             L.append("- Scope drift: **MOVED** — engaged at "
-                     "`sha256:%s`, the latest pass ran `sha256:%s`:"
+                     "`sha256:%s`, and the last pass that ran a "
+                     "different scope did so at `sha256:%s`:"
                      % (engagement["scope_sha256"][:24],
-                        newest["scope_sha256"][:24]))
-            L.append("  the scope moved after the engagement; every")
-            L.append("  pass below names the scope it actually ran.")
+                        last["scope_sha256"][:24]))
+            L.append("  the scope moved under the auditors; every")
+            L.append("  pass above names the scope it actually ran.")
         else:
             L.append("- Scope drift: none on record")
     else:
