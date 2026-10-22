@@ -31,7 +31,7 @@ else
   HL_CURL_DEFS :=
 endif
 
-.PHONY: all stage0 bootstrap bootstrap-nolibc xbootstrap-acceptance refine-acceptance test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full infer infer-smt model prove-acceptance invariant-acceptance cvc5 cvc5-acceptance shapes shapes-smt shapes-acceptance sidechannel sidechannel-acceptance ct ct-acceptance supply supply-pkg supply-acceptance sbom sbom-pkg sbom-release sbom-acceptance repro repro-pkg repro-release repro-verify repro-acceptance sign-keygen sign sign-verify sign-release sign-verify-release sign-selftest sign-acceptance tlog-verify tlog tlog-gossip tlog-witness tlog-witness-verify tlog-prove tlog-prove-verify tlog-selftest tlog-acceptance reverify reverify-json reverify-lto reverify-report reverify-selftest reverify-acceptance ffi-taint ffi-taint-acceptance sandbox sandbox-run sandbox-emit sandbox-release sandbox-verify-release sandbox-selftest sandbox-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve serve-acceptance wasm-pack wasm-pack-check wasm-pack-pack wasm-pack-acceptance aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance tui-acceptance color-acceptance progress-acceptance log-acceptance http-server-acceptance websocket-acceptance cookie-acceptance session-acceptance csrf-acceptance template-acceptance sse-acceptance graphql-acceptance openapi-acceptance jsffi-acceptance dom-acceptance freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance stackguard-acceptance asmreg-acceptance link-acceptance boot-acceptance idt-acceptance mmio-acceptance port-acceptance dma-acceptance atomics-acceptance irqsafe-acceptance triple triple-x86_64-acceptance triple-aarch64-acceptance triple-riscv64-acceptance debuginfo-acceptance cap cap-acceptance test-linker auditlog-list auditlog-show auditlog-verify auditlog-sign auditlog-verify-sign auditlog-selftest auditlog-acceptance lsp-def-acceptance lsp-hints-acceptance lsp-refactor-acceptance fmt-comments-acceptance fmt-config-acceptance lint-fix-acceptance snapshot-acceptance cases-acceptance dap-acceptance repl-acceptance bench-acceptance rss-acceptance rt-acceptance det-acceptance compat-acceptance migrate-acceptance deprecated-acceptance semver-acceptance lts-acceptance xdiff xdiff-acceptance fuzzseed fuzzseed-acceptance guarantee guarantee-report guarantee-acceptance perf perf-gate perf-dashboard perf-acceptance mem mem-gate mem-dashboard memdash-acceptance ctime ctime-gate ctime-dashboard ctime-acceptance size size-gate size-dashboard size-acceptance auditkit-brief auditkit-evidence auditkit-report auditkit-acceptance
+.PHONY: all stage0 bootstrap bootstrap-nolibc xbootstrap-acceptance refine-acceptance test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full infer infer-smt model prove-acceptance invariant-acceptance cvc5 cvc5-acceptance shapes shapes-smt shapes-acceptance sidechannel sidechannel-acceptance ct ct-acceptance supply supply-pkg supply-acceptance sbom sbom-pkg sbom-release sbom-acceptance repro repro-pkg repro-release repro-verify repro-acceptance sign-keygen sign sign-verify sign-release sign-verify-release sign-selftest sign-acceptance tlog-verify tlog tlog-gossip tlog-witness tlog-witness-verify tlog-prove tlog-prove-verify tlog-selftest tlog-acceptance reverify reverify-json reverify-lto reverify-report reverify-selftest reverify-acceptance ffi-taint ffi-taint-acceptance sandbox sandbox-run sandbox-emit sandbox-release sandbox-verify-release sandbox-selftest sandbox-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve serve-acceptance wasm-pack wasm-pack-check wasm-pack-pack wasm-pack-acceptance aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance tui-acceptance color-acceptance progress-acceptance log-acceptance http-server-acceptance websocket-acceptance cookie-acceptance session-acceptance csrf-acceptance template-acceptance sse-acceptance graphql-acceptance openapi-acceptance jsffi-acceptance dom-acceptance freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance stackguard-acceptance asmreg-acceptance link-acceptance boot-acceptance idt-acceptance mmio-acceptance port-acceptance dma-acceptance atomics-acceptance irqsafe-acceptance triple triple-x86_64-acceptance triple-aarch64-acceptance triple-riscv64-acceptance debuginfo-acceptance cap cap-acceptance test-linker auditlog-list auditlog-show auditlog-verify auditlog-sign auditlog-verify-sign auditlog-selftest auditlog-acceptance lsp-def-acceptance lsp-hints-acceptance lsp-refactor-acceptance fmt-comments-acceptance fmt-config-acceptance lint-fix-acceptance snapshot-acceptance cases-acceptance dap-acceptance repl-acceptance bench-acceptance rss-acceptance rt-acceptance det-acceptance compat-acceptance migrate-acceptance deprecated-acceptance semver-acceptance lts-acceptance xdiff xdiff-acceptance fuzzseed fuzzseed-acceptance guarantee guarantee-report guarantee-acceptance perf perf-gate perf-dashboard perf-acceptance mem mem-gate mem-dashboard memdash-acceptance ctime ctime-gate ctime-dashboard ctime-acceptance size size-gate size-dashboard size-acceptance auditkit-brief auditkit-evidence auditkit-report auditkit-acceptance freeze freeze-verify freeze-report freeze-acceptance
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -684,6 +684,50 @@ auditkit-acceptance: bin/hlc
 	@echo "[Stage 140 acceptance] running tests/auditkit_acceptance.py..."
 	@$(PYTHON) tests/auditkit_acceptance.py
 	@echo "ACCEPTANCE OK: Stage 140 -- independent security audit (third-party, paid)"
+
+
+# Stage 141 (v0.159.0-alpha): the API freeze — syntax + stdlib locked.
+# tools/hls-freeze.py derives the language's WHOLE public surface LIVE
+# from the real front-ends (the boot lexer/parser tables, the checker's
+# own builtin tables, the self-hosted keyword chain grepped from
+# src/hlc/types.hls, the attribute vocabulary read out of the parser's
+# own census, the container/concurrency methods demonstrated through
+# the real checker, every std//core/ module parsed) and freezes it
+# content-addressed into tests/api_freeze.json — committed, because
+# the frozen API is exactly the part that travels with the tree.
+# `make freeze` prints the quick verdict; `make freeze-verify` is the
+# anti-rot pass: the live surface must equal the frozen one (REMOVED /
+# ADDED / CHANGED, each named at its dotted path — post-freeze
+# additions are drift too: the API is locked, not merely
+# backwards-compatible), the digest must agree with the document's own
+# surface, and the amendment chain (tests/api_freeze_amendments.jsonl,
+# the family's one arithmetic since Stage 13) must replay clean.
+# The surface moves ONLY through `tools/hls-freeze.py amend --reason
+# --by` — a ledger entry with the exact delta, not an edit.
+# `make freeze-report` renders the frozen API document (API.md,
+# deterministic per freeze, never rendered from a drifted tree);
+# `make freeze-acceptance` is the gate: eight sections over the real
+# freeze and the negative space (an independent re-derivation of the
+# whole stdlib census by the gate's own parser walk; the two-front-end
+# keyword agreement; removal/mutation/addition drifts named at their
+# paths; the amend law through the family's imported arithmetic; the
+# tampered chain and the hand-edited document both named; the report's
+# determinism and its verify-first refusal; and the corpus showcase —
+# the decision procedure pinned in pure HLS, byte-identical on the
+# interpreter and natively).
+freeze:
+	@$(PYTHON) tools/hls-freeze.py status
+
+freeze-verify:
+	@$(PYTHON) tools/hls-freeze.py verify
+
+freeze-report:
+	@$(PYTHON) tools/hls-freeze.py report --out API.md
+
+freeze-acceptance: bin/hlc
+	@echo "[Stage 141 acceptance] running tests/freeze_acceptance.py..."
+	@$(PYTHON) tests/freeze_acceptance.py
+	@echo "ACCEPTANCE OK: Stage 141 -- API freeze (syntax + stdlib locked)"
 
 
 # Stage 130 (v0.148.0-alpha): the deprecation gate. Eight sections
