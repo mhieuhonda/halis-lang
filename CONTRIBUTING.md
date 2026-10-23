@@ -28,15 +28,37 @@ We **never** rewrite history on `main` or on `feature/community-extensions`.
 Every commit must build (`make bootstrap`) and pass the full test suite
 (`make test`).
 
+### CI/CD architecture
+
+Four workflows live under `.github/workflows/`:
+
+| Workflow     | Trigger                                   | What it does |
+|--------------|-------------------------------------------|--------------|
+| `ci.yml`     | push, pull_request, `v*-alpha` tags       | The main gate (see branch protection above). Docs-only changes skip the heavy jobs. |
+| `release.yml`| `v*-alpha` tags, manual dispatch          | 6-platform native `hlc` builds + SHA256SUMS + GitHub Release. |
+| `nightly.yml`| daily 18:17 UTC                           | Full sequential battery, 30-min fuzz, cvc5/z3, cross-triples, size/mem/freeze gates; auto-issues on failure. |
+| `codeql.yml` | pushes to main, weekly                    | CodeQL (security-extended) over Python + the workflows. |
+
+Every third-party action is pinned to an exact commit SHA (checked by
+Dependabot, one grouped weekly PR). `bin/` is cached in CI keyed on the
+content hash of `boot/**` + `src/**`, so unchanged sources never pay the
+Stage-0 bootstrap twice.
+
 ### Branch protection (enforced on `main`)
 
 The `main` branch is protected. The rules in effect:
 
 - **Pull requests are required** for all non-admin pushers. Direct
   pushes to `main` are limited to the repo owner (admin).
-- **CI must pass** on every PR: the full 2×2 matrix of Python
-  3.8/3.11 × gcc/clang runs `make test`, `make bootstrap`, and the
-  example programs. All four cells must pass before a PR can merge.
+- **CI must pass** on every PR: the aggregate `CI gate` check.
+  Behind it run the lint job (actionlint, shellcheck at error
+  severity, Python byte-compile, hllint over compiler/stdlib/core,
+  spec-check), `make bootstrap` with the byte-identical
+  self-compilation diff plus the no-libc cross-bootstrap ladder, the
+  eight differential suites in parallel, a Python 3.8/3.13 × gcc/clang
+  grid with the pure-interpreter battery, macOS and Windows smokes,
+  and the tooling job (hltest, seeded fuzz, LSP smoke). All of them
+  must pass before a PR can merge.
 - **Linear history** is enforced — no merge commits. Rebase your PR
   before merging.
 - **No force-push, no branch deletion** on `main`.

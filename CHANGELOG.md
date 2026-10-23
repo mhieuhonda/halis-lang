@@ -13,6 +13,37 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.160.0-alpha] — CI/CD: the full GitHub Actions pipeline
+- `ci.yml` — the main gate for every push and pull request: actionlint
+  (pinned binary, checksum-verified) + shellcheck at error severity +
+  Python byte-compile + hllint over the compiler/stdlib/core sources +
+  spec-check; `make bootstrap` with the byte-identical self-compilation
+  diff and the no-libc cross-bootstrap ladder (bin/ cached on the exact
+  hash of boot/** + src/**); the 8 differential suites run in PARALLEL
+  through `tests/run_one_suite.sh`; a Python 3.8/3.13 × gcc/clang grid
+  with the pure-interpreter battery; macOS arm64 and Windows MinGW
+  smoke jobs; hltest + a seeded differential fuzz + LSP smoke; and one
+  aggregate `CI gate` check for branch protection. Docs-only changes
+  skip every heavy job via path filtering.
+- `nightly.yml` — the deep battery that is too slow for per-push CI:
+  the full sequential `make test`, a 30-minute fuzz run, SMT proving
+  through cvc5 + z3, the aarch64/riscv64 cross-triple gates (QEMU boots
+  where the emulator is present), the size/memory/api-freeze gates,
+  a JUnit + benchmarks artifact set, and advisory perf/constant-time
+  gates. Failures auto-open one deduplicated issue per day labelled
+  `nightly-failure` with the run link.
+- `codeql.yml` — CodeQL static security analysis (security-extended)
+  over the Python bootstrap + tooling and over the Actions workflows
+  themselves, weekly plus on pushes to main.
+- `release.yml` — every action pinned to its exact commit SHA and the
+  `sha256sum` invocation hardened (`-- *`), no behavioural change to
+  the 6-platform build.
+- `dependabot.yml` — weekly grouped bumps of the pinned actions.
+- `.github/actionlint.yaml` — the two newer hosted-runner labels
+  (`macos-15-intel`, `windows-11-arm`) registered for actionlint.
+- The tag-vs-CHANGELOG gate: pushing a `v*-alpha` tag whose version is
+  missing from CHANGELOG.md fails the lint job before release builds.
+
 ## [v0.159.0-alpha] — Stage 141: API freeze (syntax + stdlib locked)
 - Phase X opens — the final stabilisation toward v1.0. Every phase
   before this one added capability; Phase X spends it on
