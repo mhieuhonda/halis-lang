@@ -16,9 +16,10 @@ make test         # full suite: interpreter, native, differential,
                  # bootstrap determinism, LLVM IR, memory-stress, fmt, lint
 ```
 
-Requirements: gcc or clang. Python 3.8+ is optional (the Stage-0
-interpreter for the differential suites, `make stage0`, and the
-snapshot kit's tools).
+Requirements: gcc or clang. Python 3.8+ is optional and lab-only
+(the interpreter under `tools/hlinterp/` drives the differential
+suites and the Python tools; the seed itself left the tree in
+v0.164.0-alpha — nothing on any build or snapshot path reads it).
 
 ## Branch model
 
@@ -64,14 +65,13 @@ will both refuse a hand edit, naming the rule that fired.
   A comment-only edit regenerates the manifest only; a semantic edit
   re-derives the C at the fixed point. `make snapshot-prove` runs the
   freestanding lineage (the no-libc compiler deriving the same
-  bytes); `bin/hls-snap prove --seed` adds the Python oracle's
-  lineage; `make bootstrap-seed` runs the historic four-step
-  ladder. `make snapshot-chain` re-runs the whole bootstrap as two
+  bytes — the second lineage, and since v0.164.0-alpha the only
+  one: the seed left the tree, and the retired `--seed` flag refuses
+  by name). `make snapshot-chain` re-runs the whole bootstrap as two
   independent ignitions and byte-compares every hop — run it before
   tagging a release (`CC2=clang` for the cross-compiler form). Since
   Stage 143 the kit itself is Halis — `tools/hls-snap.hls`, compiled
-  by `bin/hlc` — so none of these steps needs Python unless you
-  invoke the seed.
+  by `bin/hlc` — so none of these steps needs Python.
 
 ### Branch protection (enforced on `main`)
 
@@ -83,9 +83,9 @@ The `main` branch is protected. The rules in effect:
   Behind it run the lint job (actionlint, shellcheck at error
   severity, Python byte-compile, hllint over compiler/stdlib/core,
   spec-check), `make bootstrap` with the byte-identical
-  self-compilation diff plus the no-libc cross-bootstrap ladder, the
-  eight differential suites in parallel, a Python 3.8/3.13 × gcc/clang
-  grid with the pure-interpreter battery, macOS and Windows smokes,
+  self-compilation diff plus the no-libc cross-bootstrap ladder and
+  the chain proof, the eight differential suites in parallel, the
+  gcc/clang cc grid over the pure chain, macOS and Windows smokes,
   and the tooling job (hltest, seeded fuzz, LSP smoke). All of them
   must pass before a PR can merge.
 - **Linear history** is enforced — no merge commits. Rebase your PR

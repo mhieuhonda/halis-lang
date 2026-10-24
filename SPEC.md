@@ -2792,7 +2792,7 @@ the emitted assembly uses <= 256 bytes of stack.
 
 The acceptance gate (`make stack-acceptance`) verifies:
 
-1. The HLS file parses with all three attributes (via `boot/boot.py`
+1. The HLS file parses with all three attributes (via `tools/hlinterp/boot.py`
    and via the native `bin/hlc`).
 2. The C source contains `__attribute__((interrupt))` on the
    `handle_irq` and `handle_irq_minimal` functions.
@@ -9571,7 +9571,7 @@ compile time.
 
 THE INSTRUMENT LAW — the instrument is the compiler, and Halis
 ships two of them, so they are two instruments, never compared:
-`stage0` (the bootstrap chain: `boot/boot.py` running
+`stage0` (the bootstrap chain: `tools/hlinterp/boot.py` running
 `src/hlc.hls` over the workload, emitting C that is thrown away)
 and `native` (`bin/hlc`, the self-hosted compiler). Both time the
 same quantity — one full HLS-to-C compile, wall time, milliseconds
@@ -9584,7 +9584,7 @@ source (`src/hlc.hls` + every `src/hlc/*.hls`, names and bytes)
 and the sha256 of the compiler BINARY actually timed (`bin/hlc`
 for native, an untracked build artifact whose bytes the record
 must vouch for itself since the clean-tree check cannot;
-`boot/boot.py` for stage0). THE STALE-BINARY LAW bites at record
+`tools/hlinterp/boot.py` for stage0). THE STALE-BINARY LAW bites at record
 time, the floor specific to compile time: a native record whose
 compiler binary was already filed against a DIFFERENT compiler
 source is refused — the same bin/hlc bytes cannot be the build of
@@ -9714,7 +9714,7 @@ size.
 ### 78.2. The instruments, and the compiler's own girth
 
 The instrument is the compiler, two of them, never compared:
-`stage0` (the bootstrap chain — `boot/boot.py` running
+`stage0` (the bootstrap chain — `tools/hlinterp/boot.py` running
 `src/hlc.hls` over the workload) and `native` (`bin/hlc`, the
 self-hosted compiler). For the emitted bytes the two instruments
 must agree byte for byte — the bootstrap invariant is this
@@ -10067,7 +10067,7 @@ interpreter and natively. 103 checks.
 
 The self-hosting cycle always had a Python-shaped ignition key:
 every fresh checkout, every CI runner, every release build first
-paid the interpreter — `boot/boot.py` walking the compiler source
+paid the interpreter — `tools/hlinterp/boot.py` walking the compiler source
 statement by statement (~80 s) — before gcc ever saw a byte. The
 seed was honest, but it made the language whose compiler is
 written in itself depend on a different language to turn on, and
@@ -10084,12 +10084,12 @@ source (37,111 lines, 2,576,679 bytes at the v0.161.0-alpha cut)
 [3/3] cmp snapshot/hlc.c bin/hlc_regen.c      # the fixed-point law
 ```
 
-No Python anywhere in the chain. `boot/` is demoted from ignition
-to oracle: the interpreter still drives the differential suites,
-still re-derives the snapshot when the language grows new syntax
-(`bin/hls-snap regen --seed`), and still walks the maintenance
-ladder (`make bootstrap-seed`) — but nothing on the default build
-path reads it. A fresh clone plus any C compiler is the whole
+No Python anywhere in the chain. v0.164.0-alpha finished the
+sentence: `boot/` left the tree entirely — the snapshot is the only
+seed the repository carries. The interpreter the lab tooling still
+uses (differential suites, the Python tools' front-end) lives under
+`tools/hlinterp/` as plain tooling: no law, no target, no build
+path names it. A fresh clone plus any C compiler is the whole
 requirement list.
 
 Stage 143 (v0.162.0-alpha) closed the loop the bootstrap opened:
@@ -10128,26 +10128,24 @@ compilation), while any semantic change does. The build never
 cries wolf over a moved comment; it never stays quiet over a
 moved statement.
 
-### 81.2. The seed as the second lineage
+### 81.2. The second lineage — freestanding, and the only one
 
-`boot/` is not deleted; it is an oracle now. Since Stage 143 the
-default `make snapshot-prove` is the FREESTANDING lineage: the
-hosted compiler (built from the snapshot) emits its own source
-against the no-libc runtime, cc links it `-ffreestanding
--nostdlib`, and that compiler must derive the SAME bytes the
-snapshot carries — two chains over one source, no interpreter in
-either. `bin/hls-snap prove --seed` invokes the stronger oracle
-lineage, the Python interpreter deriving the same bytes — run it
-while `boot/` is in the tree; the nightly runs both. A snapshot
-no lineage can reproduce is a snapshot nobody wrote. Prove
-refuses to run from a drifted tree: a proof that a lineage
-matches a snapshot the manifest no longer describes is not a
-proof, it is a coincidence.
-
-The old four-step ladder survives verbatim as
-`make bootstrap-seed` — interpreter pass, native compile, native
-re-compile, byte-identical diff — and remains the maintainer's
-cross-check whenever the pure chain refuses.
+`make snapshot-prove` is the FREESTANDING lineage: the hosted
+compiler (built from the snapshot) emits its own source against
+the no-libc runtime, cc links it `-ffreestanding -nostdlib`, and
+that compiler must derive the SAME bytes the snapshot carries —
+two chains over one source, no interpreter in either. Since
+v0.164.0-alpha this is the only lineage the tree carries: the
+Python oracle that once formed the third left with the seed, and
+the retired `--seed` flag refuses BY NAME (a silent no-op would
+hide the retirement) — its strongest form survives in the git
+history that carried `boot/`. A snapshot no lineage can reproduce
+is a snapshot nobody wrote. Prove refuses to run from a drifted
+tree: a proof that a lineage matches a snapshot the manifest no
+longer describes is not a proof, it is a coincidence. The
+maintainer's cross-check when the pure chain refuses is the
+freestanding lineage plus `make snapshot-chain` — two compilers,
+two runtimes, one digest — never an interpreter.
 
 ### 81.3. The manifest
 
@@ -10177,35 +10175,38 @@ does not — the snapshot travels with the sources.
 
 `make snapshot-regen` is the ONLY legal mutation of the snapshot,
 and it is a fixed-point iteration, not an edit: build the current
-compiler (from the committed snapshot, or from the interpreter
-with `--seed` when the sources use syntax the current compiler
-cannot yet parse), let it emit, compile THAT, let it emit again,
-until the bytes stabilise — normally one round, refused after
-eight (a codegen change that keeps changing its own output is a
-bug, not a regen). The regen rewrites `snapshot/hlc.c` AND
-`snapshot/MANIFEST.json` together — they commit together or not
+compiler from the committed snapshot, let it emit, compile THAT,
+let it emit again, until the bytes stabilise — normally one round,
+refused after eight (a codegen change that keeps changing its own
+output is a bug, not a regen). The regen rewrites `snapshot/hlc.c`
+AND `snapshot/MANIFEST.json` together — they commit together or not
 at all — and REFUSES to run when the tree already matches its
 snapshot (a no-op regen is noise, and noise is how real regens
 stop being read). The two legal triggers are: a file in the
 import closure moved (full regen), or the release heading in
 CHANGELOG.md moved (a manifest-only refresh — the emitted C did
 not move). The native path refuses to run when the snapshot is
-missing: it is the seed it builds from.
+missing: the snapshot IS the seed now, and no interpreter can
+re-derive it — the refusal names the restore. (Sources the
+current compiler cannot yet parse have no interpreter shortcut
+anymore: land the syntax change in two steps — a release whose
+snapshot already parses it, then the change.)
 
 ### 81.5. Consequences for the build estate
 
-CI's per-push bootstrap job needs no Python (the manifest tool
-runs on the system interpreter — the tool is Python, the chain is
-not) and its cache is keyed on `hashFiles('snapshot/**',
-'src/**')`; the Python 3.8/3.13 × gcc/clang matrix runs the
-SEEDED ladder, which is exactly what that grid exists to prove;
-the macOS and Windows smokes and all six release builds compile
-the committed snapshot directly — no interpreter, no
-previous-release fetch, no network — and judge the fixed-point
-diff against the tree's own `snapshot/hlc.c`, never a cache
-artifact. The nightly deep battery runs `make snapshot-prove`
-(the freestanding lineage) plus `bin/hls-snap prove --seed` (the
-Python oracle) and the full acceptance gate.
+CI's per-push bootstrap job needs no Python and its cache is keyed
+on `hashFiles('snapshot/**', 'src/**')` (plus `std/**` and the kit
+since the kit went Halis); the gcc/clang cc grid runs the pure
+chain — bootstrap + `make snapshot-chain` + a smoke on both
+compilers — which is exactly what that grid exists to prove since
+the seeded ladder retired with the seed; the macOS and Windows
+smokes and all six release builds compile the committed snapshot
+directly — no interpreter, no previous-release fetch, no network —
+and judge the fixed-point diff against the tree's own
+`snapshot/hlc.c`, never a cache artifact. The nightly deep battery
+runs `make snapshot-chain CC2=clang` (the chain through two
+compilers), `make snapshot-prove` (the freestanding lineage) and
+the full acceptance gate.
 
 ### 81.6. Acceptance
 
@@ -10213,13 +10214,14 @@ Python oracle) and the full acceptance gate.
 37 checks: the no-python law (bootstrap AND the snapshot
 lifecycle green under a PATH that provably cannot resolve
 python3 or python, on a tree copy that does not even carry
-`boot/`); the fixed-point law (tampered snapshot and
+the interpreter); the fixed-point law (tampered snapshot and
 semantic drift both fail the build with the named refusal, a
 comment-only change does not — and the manifest names it); the
 regen law (drift re-derived at the fixed point, no-op refused,
 release-heading refresh manifest-only, missing-snapshot regen
-refused); the agreement law (the seed derives the committed
-snapshot byte for byte); the manifest law (digest disagreement
+refused); the agreement law (the freestanding compiler derives
+the committed snapshot byte for byte, and the retired --seed
+flag refuses by name); the manifest law (digest disagreement
 and hand edits named TAMPERED, missing snapshot named
 NO-SNAPSHOT); the independence smoke (the purely-bootstrapped
 compiler compiles and runs fibonacci with

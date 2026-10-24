@@ -13,6 +13,75 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.164.0-alpha] — Stage 142, finished: the Python seed leaves the tree
+- Stage 142's roadmap line was always "Pure-HLS bootstrap (remove
+  `boot/` Python seed)". v0.161.0-alpha moved the ignition — the
+  snapshot became the seed, `make bootstrap` went cc/hlc/cmp — but
+  the sentence was left half-spoken: the seed was "demoted, not
+  deleted", an oracle on the prove path, a ladder in the Makefile, a
+  directory the tree still carried. This release finishes the
+  sentence: **`boot/` is gone.** The snapshot is the only seed the
+  repository carries, and nothing — no law, no target, no build
+  path, no release artifact — can bootstrap the compiler any other
+  way.
+- **The interpreter survives as what it always was underneath the
+  seed role: the lab's front-end.** The same 8,364 lines of Python
+  (lexer, parser, checker, interpreter) moved, not died — from
+  `boot/` to **`tools/hlinterp/`**, where every other lab tool
+  lives. What the move kills is the ROLE: the differential suites
+  still run the interpreter as the second implementation, hlfmt /
+  hllint / hltest / the LSP still parse through it — but it is
+  tooling now, named as tooling, reachable from no lifecycle that
+  guards the snapshot. The seed was the role, not the bytes; the
+  role is retired with everything that named it.
+- **The kit's seed laws retired, by name.** `tools/hls-snap.hls` no
+  longer carries `--seed` / `--python`: `prove` is the freestanding
+  lineage — the no-libc compiler re-deriving the snapshot byte for
+  byte — and since this release the ONLY lineage the tree carries;
+  `regen`'s missing-snapshot refusal names the new truth (the
+  snapshot IS the seed: restore it from git history); sources the
+  current compiler cannot parse have no interpreter shortcut anymore
+  (the refusal says so, and says what to do instead). A retired flag
+  refuses LOUDLY — `bin/hls-snap prove --seed` exits 2 with the
+  retirement named — because a silent no-op would hide that the
+  oracle ever left.
+- **The Makefile lost its seed targets.** `make stage0` and `make
+  bootstrap-seed` are deleted — the ladder they walked no longer
+  exists. `make check`, `make audit` and `make opt-stats` went the
+  other way: they are self-hosted now, driving `bin/hlc` (checking
+  IS the compile pipeline's front half; `--audit` and `--opt-stats`
+  are the native compiler's own modes). `make emit-ir` / `emit-llvm`
+  stay on the interpreter, named as lab tooling — they were
+  inspection conveniences, never bootstrap paths.
+- **CI's python matrix became the cc grid.** The old matrix existed
+  to prove "any Python derives the compiler" through the seeded
+  ladder; with the seed gone that axis is meaningless, so the grid
+  now proves the axis the chain actually has: gcc AND clang each
+  build the snapshot's compiler, re-derive the fixed point, and run
+  the chain proof — the digest does not care which cc built it. The
+  cross-compiler form (round two through the other cc) runs in the
+  nightly and the acceptance gate. The lint job byte-compiles
+  `tools/ tests/` (the interpreter included, as tooling); the paths
+  filter and CodeQL comments follow the move; the nightly lost its
+  `prove --seed` leg and gained nothing it did not already have.
+- **The acceptance gate follows the truth.** Section 1's tree copy
+  proves the lifecycle runs without the interpreter present (the
+  copy never carried `tools/hlinterp/`, and now says so); section 4
+  pins the retirement (`prove --seed` refuses by name, exit 2);
+  section 8 demands the kit's source name no interpreter invocation
+  at all — not even a refused one. 9 sections, 37 checks, same
+  count, different world.
+- **The record:** ROADMAP Stage 142 now reads "ignition moved in
+  v0.161.0-alpha; the seed left the tree in v0.164.0-alpha" — both
+  halves true, both dated. SPEC §81 walks the new shape (the
+  freestanding lineage as the only lineage, the regen refusal that
+  names the restore, the cc grid). One comment in `src/hlc.hls`'
+  header (the stale "python3 boot/boot.py" chain sketch) moved to
+  the pure chain — a comment-only closure change, so the snapshot
+  did not move: the manifest refresh records the new closure digest
+  and this release heading, and `hlc_c_sha256` is unchanged. The VS
+  Code extension manifest moves to 0.164.0-alpha.
+
 ## [v0.163.0-alpha] — Stage 143: the bit-for-bit reproducible bootstrap chain (the record corrected)
 - The roadmap line for Stage 143 named the wrong promise. v0.162.0-alpha
   shipped the snapshot kit written in Halis — the enabling precondition,

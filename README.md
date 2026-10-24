@@ -94,12 +94,12 @@ Seven core guarantees of v0.35.0-alpha:
    compiler)                                                   ▼
                                               status · verify · regen · prove · chain
 
-  (the Python seed, boot/, is off both paths: it stays as the optional
-   oracle that cross-derives the snapshot — `bin/hls-snap prove
-   --seed` — and as the maintenance ladder — make bootstrap-seed.
-   Since Stage 143 the snapshot lifecycle itself is guarded by the
-   kit written in Halis: even `make snapshot-regen` needs no Python
-   unless the language grew syntax the current compiler can't read)
+  (the Python seed is GONE — v0.164.0-alpha removed boot/ from the
+   tree entirely: the snapshot is the only seed, the freestanding
+   compiler is the proof's second lineage, and no law, target or
+   build path names an interpreter. The Python interpreter the lab
+   tooling still uses lives under tools/hlinterp/ as plain tooling —
+   off both paths, unreachable from any lifecycle above)
 ```
 
 `make bootstrap` performs the fixed-point chain above — **no Python
@@ -131,14 +131,14 @@ classifies, verifies, regenerates and proves the snapshot,
 `tools/hls-snap.hls`, is written in Halis and compiled by `bin/hlc`
 itself), and since v0.163.0-alpha the chain is bit-for-bit
 reproducible on demand (`make snapshot-chain`, two independent
-ignitions, one digest). Python 3.8+ is OPTIONAL: only for the Stage-0
-interpreter (`make stage0`), the differential suites, and the seed
-oracle (`bin/hls-snap prove --seed`) when new syntax needs bootstrapping
-through the interpreter.
+ignitions, one digest). Python 3.8+ is OPTIONAL and lab-only: the
+interpreter under `tools/hlinterp/` drives the differential suites
+and the Python tooling (hlfmt, hllint, hltest, LSP) — nothing on
+any build, release or snapshot path reads it.
 
 ```bash
-# 1. Run directly via Stage-0 (interpreted — needs Python)
-python3 boot/boot.py examples/hello.hls
+# 1. Run directly through the lab interpreter (optional — needs Python)
+python3 tools/hlinterp/boot.py examples/hello.hls
 
 # 2. Build the native compiler — pure HLS, no Python in the chain
 make bootstrap
@@ -154,24 +154,24 @@ make run F=examples/primes.hls
 make test
 
 # 5. Try the fine-grained effects (v0.7.0-alpha)
-python3 boot/boot.py examples/effects_demo.hls arg1 arg2
+python3 tools/hlinterp/boot.py examples/effects_demo.hls arg1 arg2
 
 # 6. Audit the capability / effect tree of a program
 make audit F=examples/effects_demo.hls
 
 # 7. Run the new taint tracking demo (v0.7.0-alpha)
-python3 boot/boot.py examples/taint_demo.hls "first arg" "/api/users"
+python3 tools/hlinterp/boot.py examples/taint_demo.hls "first arg" "/api/users"
 
 # 8. Run the Stage 10-beta demo (read_file_tainted + extended audit, v0.8.0-alpha)
-python3 boot/boot.py examples/taint_beta_demo.hls examples/data.txt
+python3 tools/hlinterp/boot.py examples/taint_beta_demo.hls examples/data.txt
 
 # 9. Stage 11-alpha: print HLIR / optimiser stats (v0.9.0-alpha)
-python3 boot/boot.py --emit ir examples/optimize_demo.hls
-python3 boot/boot.py --opt-stats examples/optimize_demo.hls
+python3 tools/hlinterp/boot.py --emit ir examples/optimize_demo.hls
+python3 tools/hlinterp/boot.py --opt-stats examples/optimize_demo.hls
 
 # 10. Stage 12-alpha: print LLVM IR (v0.10.0-alpha)
-python3 boot/boot.py --emit llvm examples/llvm_demo.hls
-python3 boot/boot.py --emit llvm --target aarch64-linux examples/llvm_demo.hls
+python3 tools/hlinterp/boot.py --emit llvm examples/llvm_demo.hls
+python3 tools/hlinterp/boot.py --emit llvm --target aarch64-linux examples/llvm_demo.hls
 
 # 11. Stage 13-alpha: package manager (v0.11.0-alpha)
 python3 tools/hls-pkg.py init mypkg
@@ -650,7 +650,7 @@ make freeze-acceptance        # Stage 141 gate: the freeze battery
                                # the report law, the showcase)
 
 # 13. Stage 15-alpha: Safe C FFI (v0.13.0-alpha)
-python3 boot/boot.py examples/ffi_demo.hls           # call libc functions
+python3 tools/hlinterp/boot.py examples/ffi_demo.hls           # call libc functions
 python3 tools/hlbindgen.py /usr/include/stdlib.h      # generate extern block from C header
 
 # 14. Stage 19 (v0.35.0-alpha): profile-guided optimisation
@@ -668,15 +668,15 @@ make emit-lto-ir F=examples/hello.hls   # whole-program LTO'd LLVM IR (.ll/.bc)
 # 16. Stage 21 (v0.37.0-alpha): SIMD vectorisation
 make simd-acceptance                    # the Stage 21 acceptance gate (>= 2x on AVX2)
 bin/hlc --target-feature avx2 bench.hls out.c    # native intrinsics for std.simd
-python3 boot/boot.py examples/simd_demo.hls      # portable std.simd everywhere
+python3 tools/hlinterp/boot.py examples/simd_demo.hls      # portable std.simd everywhere
 
 # 17. Stage 30 (v0.47.0-alpha): boxed-vs-stack layout analysis
-python3 boot/boot.py examples/stack_layout_demo.hls   # run the demo
+python3 tools/hlinterp/boot.py examples/stack_layout_demo.hls   # run the demo
 make escape-acceptance    # the Stage 30 gate: fibonacci inner loop, zero heap objects
 make layout-report F=examples/stack_layout_demo.hls   # per-binding layout decisions
 
 # 18. Stage 31 (v0.48.0-alpha): verified tail-call optimisation
-python3 boot/boot.py examples/fibonacci.hls 1000000  # fib_tail(1M), zero Python recursion
+python3 tools/hlinterp/boot.py examples/fibonacci.hls 1000000  # fib_tail(1M), zero Python recursion
 make tail-acceptance      # the Stage 31 gate: fib_tail(1M) under ulimit -s 1024
 make tail-report F=examples/fibonacci.hls            # verified tail-call decisions
 ```
@@ -783,12 +783,14 @@ halis-lang/
 ├── snapshot/            # Stage 142: the committed C snapshot — the seed the
 │   ├── hlc.c            #   pure bootstrap compiles (hlc's own emission for
 │   └── MANIFEST.json    #   src/hlc.hls) + its content-addressed manifest
-├── boot/                # Stage-0: the seed demoted to oracle (pure Python):
-│   ├── lexer.py         #   differential suites, snapshot prove/regen --seed,
-│   ├── parser.py        #   and the maintenance ladder (make bootstrap-seed)
-│   ├── checker.py       #   facade → boot/checking/ (helpers + 8 Checker mixins)
-│   ├── interp.py        #   facade → boot/interp_parts/ (rt + 6 Interp mixins)
-│   └── boot.py          #   CLI
+├── tools/               # The lab: all Python tooling, including the
+│   ├── hlinterp/        #   interpreter (moved from boot/ in v0.164.0-alpha —
+│   │   ├── lexer.py     #   plain lab tooling now: differential suites and
+│   │   ├── parser.py    #   the front-end the tools share; no law, target or
+│   │   ├── checker.py   #   build path names it — facade → hlinterp/checking/
+│   │   ├── interp.py    #   facade → hlinterp/interp_parts/
+│   │   └── boot.py      #   CLI
+│   └── hls-snap.hls     #   the snapshot kit, in Halis
 ├── src/
 │   ├── hlc.hls          # ★ COMPILER written 100% in HLS — entry point that
 │   │                    #   imports the modules below (lexer → parser →
