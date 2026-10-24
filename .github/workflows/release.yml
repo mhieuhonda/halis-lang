@@ -3,8 +3,19 @@
 # ============================================================================
 #
 # Triggers
-#   * push of a tag matching `v*-alpha` (e.g. v0.125.0-alpha)
-#       -> full pipeline: 6 platform builds + SHA256SUMS + GitHub Release.
+#   * push of ANY version tag (`v*`) — the tag's SHAPE picks the
+#     channel (the law lives in the `channel` step below, once):
+#
+#       v0.162.0          -> STABLE     — a full GitHub Release,
+#                                       marked latest
+#       v0.162.0-alpha    -> PRE-RELEASE — suffixed tags are the
+#       v0.162.0-beta.1                pre-release channels: ANY
+#       v0.162.0-rc.1                   suffix (-alpha, -beta, -rc,
+#       v0.162.0-whatever               -nightly, ...), not one
+#                                       blessed word — a hyphen is
+#                                       a hyphen
+#     -> full pipeline: 6 platform builds + SHA256SUMS + the GitHub
+#        Release on the channel the tag named.
 #   * workflow_dispatch (manual run from the Actions tab / `gh workflow run`)
 #       -> the same 6 builds, artifacts only; NO release is created.
 #          Use this to exercise the pipeline without publishing anything.
@@ -26,8 +37,10 @@
 #      workflow artifact named `pkg-<platform>`.
 #
 # The final `release` job (tag builds only) collects the six archives,
-# writes SHA256SUMS over them, verifies it, and publishes a prerelease
-# GitHub Release for the tag with every archive + SHA256SUMS attached.
+# writes SHA256SUMS over them, verifies it, and publishes the GitHub
+# Release on the tag's channel — pre-release for ANY suffixed tag,
+# stable-and-latest for a bare version — with every archive +
+# SHA256SUMS attached.
 #
 # Cache
 #   `bin/` (the native compiler) is cached per platform, keyed on
@@ -49,13 +62,14 @@
 #     Linux only). Without it every binary behaves identically —
 #     net_tls_get panics with a clear message, everything else works.
 #
-# ── STAGE 142 (pure-HLS bootstrap, v0.161.0-alpha) ──────────────────────────
-# DONE: the Python seed is off the release build path. Every platform
-# compiles the committed C snapshot directly (gcc/clang -O2 snapshot/hlc.c)
-# and the fixed-point law re-derives it from src/hlc.hls — no interpreter,
-# no previous-release fetch, no network. The seed lives on as the oracle
-# that re-derives the snapshot when the language grows new syntax
-# (`make snapshot-regen --seed`) and in the differential suites.
+# ── STAGE 143 (the self-hosted release) ────────────────────────────────────
+# Since Stage 142 the release build path is pure HLS + cc: every
+# platform compiles the committed C snapshot and re-proves the fixed
+# point — no interpreter, no previous-release fetch, no network
+# beyond the checkout. Stage 143 closes the loop around the release
+# itself: the snapshot lifecycle guarding these binaries is guarded
+# by tools/hls-snap.hls — the kit written in Halis, built by the
+# compiler it guards.
 # ────────────────────────────────────────────────────────────────────────────
 
 name: Release
@@ -63,7 +77,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v*-alpha'
+      - 'v*'
   workflow_dispatch:
 
 permissions:
@@ -262,6 +276,39 @@ jobs:
       contents: write
 
     steps:
+      - name: Detect the release channel from the tag
+        id: channel
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          # THE CHANNEL LAW — one rule, every suffix: a hyphen after
+          # the version is a pre-release identifier, whatever word it
+          # carries (-alpha, -beta, -rc.1, -nightly, -build.42, ...).
+          # A bare version has no hyphen and no suffix: it is the
+          # stable channel, and it is the release users are pointed
+          # at (latest).
+          case "${tag}" in
+            *-*)
+              prerelease=true
+              make_latest=false
+              suffix="${tag#*-}"
+              channel="pre-release (-${suffix})"
+              ;;
+            *)
+              prerelease=false
+              make_latest=true
+              suffix=""
+              channel="stable (latest)"
+              ;;
+          esac
+          {
+            echo "prerelease=${prerelease}"
+            echo "make_latest=${make_latest}"
+            echo "suffix=${suffix}"
+            echo "channel=${channel}"
+          } >> "$GITHUB_OUTPUT"
+          echo "tag ${tag} -> ${channel}"
+
       - name: Collect all platform archives
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -283,11 +330,12 @@ jobs:
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           name: ${{ github.ref_name }}
-          prerelease: true
+          prerelease: ${{ steps.channel.outputs.prerelease == 'true' }}
+          make_latest: ${{ steps.channel.outputs.make_latest }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           body: |
-            Native **`hlc`** compiler binaries for `${{ github.ref_name }}`, built by the Stage-0 Python bootstrap (`boot/`) on GitHub-hosted runners.
+            Native **`hlc`** compiler binaries for `${{ github.ref_name }}` — **${{ steps.channel.outputs.channel }}**, built by the pure-HLS bootstrap (the committed C snapshot) on GitHub-hosted runners.
 
             **Assets** — each archive contains `hlc`, `LICENSE` and `README.md`:
 
@@ -307,6 +355,6 @@ jobs:
             sha256sum --check SHA256SUMS
             ```
 
-            **Bootstrap guarantee**: every binary re-compiled `src/hlc.hls` to the byte-identical `hlc.c` the Stage-0 seed produced (the `make bootstrap` determinism gate) and was smoke-tested on `examples/hello.hls` before packaging. Built without libcurl — `net_tls_get` panics with a clear message; all other net builtins work.
+            **Bootstrap guarantee**: every binary re-compiled `src/hlc.hls` to the byte-identical `hlc.c` the committed snapshot carries (the `make bootstrap` determinism gate, guarded since Stage 143 by the self-hosted snapshot kit) and was smoke-tested on `examples/hello.hls` before packaging. Built without libcurl — `net_tls_get` panics with a clear message; all other net builtins work.
           files: |
             dist/**
