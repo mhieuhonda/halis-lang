@@ -308,7 +308,7 @@ class Census(object):
 
 def run_interpreter(path, timeout_s):
     """One green-check run: (rc, stdout, first error line)."""
-    cmd = [sys.executable, os.path.join(REPO_ROOT, "boot", "boot.py"), path]
+    cmd = [sys.executable, os.path.join(REPO_ROOT, "tools", "hlinterp", "boot.py"), path]
     try:
         p = subprocess.run(cmd, stdin=subprocess.DEVNULL,
                            stdout=subprocess.PIPE,
@@ -443,12 +443,13 @@ def load_ledger(path):
 
 
 def _toolchain_fingerprint(tree_root):
-    """Content fingerprint of a release's own interpreter world (boot/,
-    std/, core/). Two releases with the same fingerprint run the same
-    file content identically — the sweep memoizes on this."""
+    """Content fingerprint of a release's own interpreter world (boot/
+    in old trees, tools/hlinterp/ in current ones, plus std/ and
+    core/). Two releases with the same fingerprint run the same file
+    content identically — the sweep memoizes on this."""
     h = hashlib.sha256()
     paths = []
-    for sub in ("boot", "std", "core"):
+    for sub in ("boot", "tools/hlinterp", "std", "core"):
         d = os.path.join(tree_root, sub)
         if not os.path.isdir(d):
             continue

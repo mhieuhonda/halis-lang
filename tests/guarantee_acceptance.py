@@ -7,7 +7,7 @@ Run with `make guarantee-acceptance` (or
 `python3 tests/guarantee_acceptance.py`).
 
 Eight sections over the REAL ledger CLI, the REAL checker
-(boot/boot.py --check), the REAL interpreter and (when bin/hlc
+(tools/hlinterp/boot.py --check), the REAL interpreter and (when bin/hlc
 exists) the REAL native compiler — a guarantees document that did
 not re-demonstrate its claims would be prose, not a ledger:
 
@@ -73,7 +73,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 
 GUAR = [sys.executable, os.path.join(ROOT, "tools", "hls-guarantee.py")]
-BOOT = [sys.executable, os.path.join(ROOT, "boot", "boot.py")]
+BOOT = [sys.executable, os.path.join(ROOT, "tools", "hlinterp", "boot.py")]
 FMT = [sys.executable, os.path.join(ROOT, "tools", "hlfmt.py")]
 LINT = [sys.executable, os.path.join(ROOT, "tools", "hllint.py")]
 HLC = os.path.join(ROOT, "bin", "hlc")
@@ -261,7 +261,7 @@ def _section_3():
     # The negative space: an enforcement point removed from a COPY of
     # the tree voids its guarantee, named.
     t1 = make_tampered_tree("anchor1")
-    ef = os.path.join(t1, "boot", "checking", "expr.py")
+    ef = os.path.join(t1, "tools", "hlinterp", "checking", "expr.py")
     with open(ef, encoding="utf-8") as fh:
         src = fh.read()
     with open(ef, "w", encoding="utf-8") as fh:
@@ -272,7 +272,7 @@ def _section_3():
           "a removed ownership anchor voids G-MEM-01, named")
 
     t2 = make_tampered_tree("anchor2")
-    bf = os.path.join(t2, "boot", "boot.py")
+    bf = os.path.join(t2, "tools", "hlinterp", "boot.py")
     with open(bf, encoding="utf-8") as fh:
         src = fh.read()
     with open(bf, "w", encoding="utf-8") as fh:
@@ -321,7 +321,7 @@ def _section_4():
     # making the tampered checker weaker — the accepts-side of the
     # same law the drift section proves on the anchor side.
     t2 = make_tampered_tree("probe2")
-    ef = os.path.join(t2, "boot", "checking", "stmt.py")
+    ef = os.path.join(t2, "tools", "hlinterp", "checking", "stmt.py")
     with open(ef, encoding="utf-8") as fh:
         src = fh.read()
     with open(ef, "w", encoding="utf-8") as fh:
@@ -341,7 +341,7 @@ def _section_5():
     print("Section 5 — the drift law")
 
     t = make_tampered_tree("drift")
-    ef = os.path.join(t, "boot", "checking", "expr.py")
+    ef = os.path.join(t, "tools", "hlinterp", "checking", "expr.py")
     with open(ef, encoding="utf-8") as fh:
         src = fh.read()
     with open(ef, "w", encoding="utf-8") as fh:

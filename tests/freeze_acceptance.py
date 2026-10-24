@@ -28,8 +28,8 @@ showcase:
   2. the syntax      — the gate re-derives the syntax surface from
      law             the live front-ends and requires the freeze to
                      carry exactly it: keywords/reserved/tokens
-                     from boot.lexer, crate attributes and the
-                     effect vocabulary from boot.parser, the
+                     from tools.hlinterp.lexer, crate attributes and the
+                     effect vocabulary from tools.hlinterp.parser, the
                      builtin functions from the checker's own
                      BUILTIN_FNS table, the primitive method tables
                      from the checker's own STR_M/INT_M/FLOAT_M/
@@ -48,8 +48,8 @@ showcase:
      law             every module with the real parser and rebuilds
                      the stdlib surface with its own record
                      builder, then requires the rebuilt census to
-                     equal the frozen one canonically — 98 modules,
-                     3402 fns, 185 structs, 36 enums, row for row,
+                     equal the frozen one canonically — 99 modules,
+                     3428 fns, 185 structs, 36 enums, row for row,
                      signature for signature. An independent
                      re-derivation, not a replay of the tool's
                      code path
@@ -119,12 +119,12 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 sys.path.insert(0, os.path.join(ROOT, "tools", "hltlog_parts"))
 
-from boot.lexer import (                     # noqa: E402
+from tools.hlinterp.lexer import (                     # noqa: E402
     KEYWORDS, RESERVED_IDENTIFIERS, TWO_CHAR, ONE_CHAR, tokenize, HLError,
 )
-from boot.parser import Parser, CRATE_ATTRS, KNOWN_EFFECTS   # noqa: E402
-from boot.checker import check as checker_check   # noqa: E402
-from boot.checking.helpers import (          # noqa: E402
+from tools.hlinterp.parser import Parser, CRATE_ATTRS, KNOWN_EFFECTS   # noqa: E402
+from tools.hlinterp.checker import check as checker_check   # noqa: E402
+from tools.hlinterp.checking.helpers import (          # noqa: E402
     BUILTIN_FNS, STR_M, INT_M, FLOAT_M, BOOL_M,
 )
 from hltlog_parts.hltlog_common import GENESIS, chain_of    # noqa: E402
@@ -132,7 +132,7 @@ from hltlog_parts.hltlog_common import GENESIS, chain_of    # noqa: E402
 FREEZE = os.path.join(ROOT, "tests", "api_freeze.json")
 CHAIN = os.path.join(ROOT, "tests", "api_freeze_amendments.jsonl")
 TOOL = [sys.executable, os.path.join(ROOT, "tools", "hls-freeze.py")]
-BOOT = [sys.executable, os.path.join(ROOT, "boot", "boot.py")]
+BOOT = [sys.executable, os.path.join(ROOT, "tools", "hlinterp", "boot.py")]
 FMT = [sys.executable, os.path.join(ROOT, "tools", "hlfmt.py")]
 LINT = [sys.executable, os.path.join(ROOT, "tools", "hllint.py")]
 HLC = os.path.join(ROOT, "bin", "hlc")
@@ -144,11 +144,12 @@ SHOWCASE_OUT = ("stage 141: api freeze\n"
                 "  freeze laws OK: drift vocabulary, amendment, digest,\n"
                 "  chain, count, method roster, contract, state machine\n")
 
-# The scratch tree: exactly what the tool reads — the boot front-end,
-# the tools (the tool itself + the chain arithmetic it imports), the
+# The scratch tree: exactly what the tool reads — the tools (the
+# freeze tool, the chain arithmetic it imports, and the interpreter
+# front-end under tools/hlinterp/),
 # stdlib families, the self-hosted keyword chain, and the freeze
 # documents. Drift laws run against disposable copies of THIS.
-SCRATCH_PARTS = ["boot", "tools", "std", "core",
+SCRATCH_PARTS = ["tools", "std", "core",
                  os.path.join("src", "hlc", "types.hls"),
                  os.path.join("tests", "api_freeze.json"),
                  os.path.join("tests", "api_freeze_amendments.jsonl")]
@@ -376,12 +377,19 @@ def _section_1():
     check(doc.get("digest") == want, "the digest is the sha256 of the "
           "canonical surface it carries (gate's own canonicaliser)")
 
-    # The chain: present, zero records (genesis), replaying clean.
+    # The chain: present, carrying the std.sha256 record (the amend
+    # v0.162.0-alpha should have written when the module landed; it
+    # was written in v0.164.0-alpha), replaying clean.
     check(os.path.isfile(CHAIN), "the amendment chain exists beside "
           "the freeze")
     records = [json.loads(l) for l in read(CHAIN).splitlines()
                if l.strip()]
-    check(records == [], "the chain is at genesis (no amendments yet)")
+    check(len(records) == 1, "the chain carries exactly one amendment "
+          "(the std.sha256 record)")
+    check(records and records[0].get("seq") == 1
+          and records[0].get("delta", {}).get("added")
+          == ["stdlib.std.sha256"],
+          "the record is seq 1, amending in stdlib.std.sha256")
 
     # The tools answer on the real tree.
     p = run(TOOL + ["status"])
@@ -548,11 +556,12 @@ def _section_3():
     structs = sum(len(m["structs"]) for m in frozen_std.values())
     enums = sum(len(m["enums"]) for m in frozen_std.values())
     edges = sum(len(m["imports"]) for m in frozen_std.values())
-    check(len(frozen_std) == 98, "98 modules are frozen")
-    check(fns == 3402, "3402 stdlib fns are frozen")
+    check(len(frozen_std) == 99, "99 modules are frozen (sha256 "
+          "amended in)")
+    check(fns == 3428, "3428 stdlib fns are frozen")
     check(structs == 185, "185 stdlib structs are frozen")
     check(enums == 36, "36 stdlib enums are frozen")
-    check(edges == 211, "211 import edges are frozen")
+    check(edges == 213, "213 import edges are frozen")
 
     # Row-level spot checks: the freeze is signatures, and the gate
     # reads three of them straight from the parser's own output.
@@ -596,7 +605,7 @@ def _section_4():
     check(p.returncode == 0, "the revert is green again")
 
     # (b) a keyword removed from BOTH front-ends is syntax drift.
-    boot_lexer = os.path.join(root, "boot", "lexer.py")
+    boot_lexer = os.path.join(root, "tools", "hlinterp", "lexer.py")
     types_hls = os.path.join(root, "src", "hlc", "types.hls")
     bl = read(boot_lexer)
     th = read(types_hls)
@@ -720,7 +729,7 @@ def _section_6():
 
     # (b) a new builtin: the checker's own table grew, so the
     # syntax section moves — the freeze reads the live tables.
-    helpers = os.path.join(root, "boot", "checking", "helpers.py")
+    helpers = os.path.join(root, "tools", "hlinterp", "checking", "helpers.py")
     hsrc = read(helpers)
     write(helpers, hsrc.replace(
         '"print", "println", "panic", "exit", "str", "int", "len", '
@@ -779,9 +788,10 @@ def _section_7():
           "a real amendment succeeds")
     records = [json.loads(l) for l in read(chain_p).splitlines()
                if l.strip()]
-    check(len(records) == 1, "exactly one record appended")
-    rec = records[0]
-    check(rec.get("seq") == 1, "the record is seq 1")
+    check(len(records) == 2, "exactly one record appended (the chain "
+          "carried the sha256 record already)")
+    rec = records[1]
+    check(rec.get("seq") == 2, "the record is seq 2")
     check(rec.get("kind") == "amend", "the record is an amendment")
     check(rec.get("by") == "mhieuhonda", "the record names its author")
     check("v0.160 formatter" in rec.get("reason", ""),
@@ -795,8 +805,8 @@ def _section_7():
     # (c) the chain, re-derived through the family's arithmetic —
     # the gate computes chain_of itself, it does not trust the
     # tool's writer.
-    check(rec.get("prev_hash") == GENESIS,
-          "entry one chains from 64 zeros")
+    check(rec.get("prev_hash") == records[0].get("chain_hash"),
+          "entry two chains from entry one's hash")
     want_hash = chain_of(rec["prev_hash"], rec)
     check(rec.get("chain_hash") == want_hash,
           "chain_hash recomputes through the imported chain_of")
@@ -826,12 +836,12 @@ def _section_7():
     tampered = dict(rec)
     tampered["reason"] = "a different story"
     tampered["chain_hash"] = "0" * 64
-    write(chain_p, canon(tampered) + "\n")
+    write(chain_p, canon(records[0]) + "\n" + canon(tampered) + "\n")
     p = run(TOOL + ["verify", "--root", root], cwd=root)
     check(p.returncode == 1 and "BROKEN" in p.stdout
-          and "record 1" in p.stdout,
+          and "record 2" in p.stdout,
           "a tampered record breaks the replay at its line")
-    write(chain_p, canon(rec) + "\n")
+    write(chain_p, canon(records[0]) + "\n" + canon(rec) + "\n")
     p = run(TOOL + ["verify", "--quiet", "--root", root], cwd=root)
     check(p.returncode == 0, "the restored chain replays clean")
 

@@ -71,7 +71,7 @@ _TOOLS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(_TOOLS)
 
 POLICY = "halis-guarantee-1"
-BOOT = os.path.join(ROOT, "boot", "boot.py")
+BOOT = os.path.join(ROOT, "tools", "hlinterp", "boot.py")
 SECURITY_MD = "SECURITY.md"
 
 FAMILIES = ("types", "memory", "arithmetic", "effects", "taint",
@@ -120,11 +120,11 @@ LEDGER = [
         "The checker carries a moved-flag per binding and refuses any "
         "later read, including through if/while/for arms, with a "
         "use-of-moved-value error naming the binding.",
-        "enforced_by": "boot/checking (the ownership checker) + the "
+        "enforced_by": "tools/hlinterp/checking (the ownership checker) + the "
                        "self-hosted checker in src/hlc.hls",
         "anchors": [
-            ("boot/checking/expr.py", "use of moved value"),
-            ("boot/checking/stmt.py", "use of moved value"),
+            ("tools/hlinterp/checking/expr.py", "use of moved value"),
+            ("tools/hlinterp/checking/stmt.py", "use of moved value"),
         ],
         "probes": [
             {"path": "tests/fail/fail_use_after_drop.hls",
@@ -190,10 +190,10 @@ LEDGER = [
         "coercion without an explicit conversion call, rejects "
         "mismatched assignments and non-bool conditions, and the lexer "
         "rejects integer literals beyond int64.",
-        "enforced_by": "boot/checking (type checker) + boot/lexer",
+        "enforced_by": "tools/hlinterp/checking (type checker) + tools/hlinterp/lexer",
         "anchors": [
-            ("boot/checking/expr.py", "type mismatch"),
-            ("boot/checking/expr.py", "integer literal too large"),
+            ("tools/hlinterp/checking/expr.py", "type mismatch"),
+            ("tools/hlinterp/checking/expr.py", "integer literal too large"),
         ],
         "probes": [
             {"path": "tests/fail/fail_implicit_cast.hls",
@@ -228,11 +228,11 @@ LEDGER = [
         "runtime mirrors the checks so native binaries panic with the "
         "same message and code; literals beyond int64 are refused at "
         "compile time.",
-        "enforced_by": "boot/interp_parts/rt_num.py + the emitted C "
+        "enforced_by": "tools/hlinterp/interp_parts/rt_num.py + the emitted C "
                        "runtime (HL_CHECK paths)",
         "anchors": [
-            ("boot/interp_parts/rt_num.py", "integer overflow"),
-            ("boot/interp_parts/rt_num.py", "division by zero"),
+            ("tools/hlinterp/interp_parts/rt_num.py", "integer overflow"),
+            ("tools/hlinterp/interp_parts/rt_num.py", "division by zero"),
         ],
         "probes": [
             {"path": "tests/ok/panic_divzero.hls",
@@ -268,11 +268,11 @@ LEDGER = [
         "compared against the declared uses clause; pure functions "
         "must transitively call nothing effectful, with the offending "
         "edge named in the error.",
-        "enforced_by": "boot/checking (effect fixpoint) + the audit "
+        "enforced_by": "tools/hlinterp/checking (effect fixpoint) + the audit "
                        "surface (hlc --audit)",
         "anchors": [
-            ("boot/checking/match_fx.py", "requires effect"),
-            ("boot/checking/match_fx.py", "missing: %s"),
+            ("tools/hlinterp/checking/match_fx.py", "requires effect"),
+            ("tools/hlinterp/checking/match_fx.py", "missing: %s"),
         ],
         "probes": [
             {"path": "tests/fail/fail_effect_io.hls",
@@ -305,11 +305,11 @@ LEDGER = [
         "argument; print/eprint/file/exit/net/proc sinks refuse at "
         "compile time naming the sanitizer options; extern boundaries "
         "declare their own sinks via #[taint_sink(...)].",
-        "enforced_by": "boot/checking/call.py (sink enforcement) + "
-                       "boot/ffi_taint.py (FFI boundary)",
+        "enforced_by": "tools/hlinterp/checking/call.py (sink enforcement) + "
+                       "tools/hlinterp/ffi_taint.py (FFI boundary)",
         "anchors": [
-            ("boot/checking/call.py", "taint-sink violation"),
-            ("boot/ffi_taint.py", "taint_sink"),
+            ("tools/hlinterp/checking/call.py", "taint-sink violation"),
+            ("tools/hlinterp/ffi_taint.py", "taint_sink"),
         ],
         "probes": [
             {"path": "tests/fail/fail_taint_print.hls",
@@ -346,11 +346,11 @@ LEDGER = [
         "spawn/chan.send/async_spawn/stream_send argument sharing is "
         "refused unless the value crosses as clone(x) or take(x); "
         "Task handles and Cap values are not Send and cannot cross.",
-        "enforced_by": "boot/checking/call.py (sharing + Send rules) "
+        "enforced_by": "tools/hlinterp/checking/call.py (sharing + Send rules) "
                        "+ the deterministic scheduler for testing",
         "anchors": [
-            ("boot/checking/call.py", "cannot share"),
-            ("boot/checking/call.py", "is not Send"),
+            ("tools/hlinterp/checking/call.py", "cannot share"),
+            ("tools/hlinterp/checking/call.py", "is not Send"),
         ],
         "probes": [
             {"path": "tests/fail/fail_spawn_shared.hls",
@@ -382,9 +382,9 @@ LEDGER = [
         "The checker enumerates the matched enum's variants and "
         "refuses non-exhaustive matches, wrong-enum matches and "
         "wrong-arity payloads.",
-        "enforced_by": "boot/checking/match_fx.py",
+        "enforced_by": "tools/hlinterp/checking/match_fx.py",
         "anchors": [
-            ("boot/checking/match_fx.py", "not exhaustive"),
+            ("tools/hlinterp/checking/match_fx.py", "not exhaustive"),
         ],
         "probes": [
             {"path": "tests/fail/fail_match_nonexhaustive.hls",
@@ -412,11 +412,11 @@ LEDGER = [
         "cap_take(\"E\") yields Cap[E] only inside main or a function "
         "declaring uses E; clone() refuses Cap types; unknown "
         "capability names are refused at the type level.",
-        "enforced_by": "boot/checking/call.py (cap enforcement) + the "
+        "enforced_by": "tools/hlinterp/checking/call.py (cap enforcement) + the "
                        "clone rules",
         "anchors": [
-            ("boot/checking/call.py", "unknown capability"),
-            ("boot/checking/call.py", "cap_take"),
+            ("tools/hlinterp/checking/call.py", "unknown capability"),
+            ("tools/hlinterp/checking/call.py", "cap_take"),
         ],
         "probes": [
             {"path": "tests/fail/fail_stage111_cap_missing_grant.hls",
@@ -451,11 +451,11 @@ LEDGER = [
         "runtime confines read_file, read_file_tainted, write_file "
         "and file_exists to DIR, in both the interpreter and native "
         "paths.",
-        "enforced_by": "boot/boot.py (sandbox gate) + the runtime path "
+        "enforced_by": "tools/hlinterp/boot.py (sandbox gate) + the runtime path "
                        "confinement",
         "anchors": [
-            ("boot/boot.py", "--sandbox is incompatible"),
-            ("boot/boot.py", "restrict filesystem builtins"),
+            ("tools/hlinterp/boot.py", "--sandbox is incompatible"),
+            ("tools/hlinterp/boot.py", "restrict filesystem builtins"),
         ],
         "probes": [
             {"path": "tests/guarantee_probes/sandbox_extern.hls",
@@ -486,10 +486,10 @@ LEDGER = [
         "The checker refuses #[ct] without #[secrets], unknown secret "
         "names, duplicate claims, and any branch or memory access "
         "that depends on a secret parameter.",
-        "enforced_by": "boot/checking/core.py (the ct verifier) + the "
+        "enforced_by": "tools/hlinterp/checking/core.py (the ct verifier) + the "
                        "Stage 101 side-channel pass",
         "anchors": [
-            ("boot/checking/core.py", "constant-time claim"),
+            ("tools/hlinterp/checking/core.py", "constant-time claim"),
         ],
         "probes": [
             {"path": "tests/fail/fail_stage102_ct_nosecrets.hls",
@@ -522,10 +522,10 @@ LEDGER = [
         "in the caller; #[taint_source]/#[taint_sink] attributes on "
         "externs are checked for arity and void-return honesty, and "
         "tainted args to extern sinks are refused.",
-        "enforced_by": "boot/checking/call.py + boot/ffi_taint.py",
+        "enforced_by": "tools/hlinterp/checking/call.py + tools/hlinterp/ffi_taint.py",
         "anchors": [
-            ("boot/ffi_taint.py", "taint_source"),
-            ("boot/checking/call.py", "taint-sink violation: extern"),
+            ("tools/hlinterp/ffi_taint.py", "taint_source"),
+            ("tools/hlinterp/checking/call.py", "taint-sink violation: extern"),
         ],
         "probes": [
             {"path": "tests/fail/fail_stage109_ffi_sink.hls",
@@ -559,10 +559,10 @@ LEDGER = [
         "The statement checker refuses shadowing, reassignment of "
         "immutable bindings, use of undefined names and duplicate "
         "definitions; there is no null and no uninitialised value.",
-        "enforced_by": "boot/checking/stmt.py + the name-resolution "
+        "enforced_by": "tools/hlinterp/checking/stmt.py + the name-resolution "
                        "pass",
         "anchors": [
-            ("boot/checking/stmt.py", "shadowing not allowed"),
+            ("tools/hlinterp/checking/stmt.py", "shadowing not allowed"),
         ],
         "probes": [
             {"path": "tests/fail/fail_shadow.hls",
@@ -590,13 +590,15 @@ LEDGER = [
         "guarantee above holds identically for the Stage-0 interpreter "
         "and the native compiler.",
         "mechanism":
-        "make bootstrap compiles hlc.hls twice (Stage-0 then native) "
-        "and diffs the two C emissions; the cross-bootstrap ladder "
-        "extends the law to the freestanding binary.",
-        "enforced_by": "Makefile (bootstrap target) + "
+        "make bootstrap compiles the snapshot's native hlc and diffs "
+        "its re-emission against the committed snapshot (the "
+        "fixed-point law, step 3); the cross-bootstrap ladder extends "
+        "the law to the freestanding binary, and `make snapshot-chain` "
+        "re-proves it as two independent ignitions.",
+        "enforced_by": "Makefile (bootstrap + snapshot-chain targets) + "
                        "tests/xbootstrap_acceptance.py",
         "anchors": [
-            ("Makefile", "Comparing two passes of code generation"),
+            ("Makefile", "fixed-point law: the derivation must equal the snapshot"),
             ("tests/xbootstrap_acceptance.py", "byte"),
         ],
         "probes": [],
