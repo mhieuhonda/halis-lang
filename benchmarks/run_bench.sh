@@ -17,13 +17,13 @@ trap 'rm -rf "$TMP"' EXIT INT TERM HUP
 
 run_interp() {
     local f="$1"
-    echo "  [interp]    $(python3 boot/boot.py "$f" 2>/dev/null)"
+    echo "  [interp]    $(python3 tools/hlinterp/boot.py "$f" 2>/dev/null)"
 }
 
 run_native_stage0() {
     local f="$1"
     local name=$(basename "$f" .hls)
-    if python3 boot/boot.py src/hlc.hls "$f" "$TMP/$name.c" >/dev/null 2>&1; then
+    if python3 tools/hlinterp/boot.py src/hlc.hls "$f" "$TMP/$name.c" >/dev/null 2>&1; then
         if gcc -O2 -o "$TMP/$name.bin" "$TMP/$name.c" -lm -pthread 2>/dev/null; then
             echo "  [native s0] $("$TMP/$name.bin" 2>/dev/null)"
         else
@@ -39,7 +39,7 @@ run_native_self() {
     local name=$(basename "$f" .hls)
     # Use the bootstrap chain to get a native hlc.
     if [ ! -x "$TMP/hlc_native" ]; then
-        python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_s1.c" >/dev/null 2>&1
+        python3 tools/hlinterp/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_s1.c" >/dev/null 2>&1
         gcc -O2 -o "$TMP/hlc_native" "$TMP/hlc_s1.c" -lm -pthread 2>/dev/null
     fi
     if "$TMP/hlc_native" "$f" "$TMP/$name.self.c" >/dev/null 2>&1; then

@@ -153,7 +153,7 @@ def extract_effects(file_path: str) -> Tuple[List[str], List[str]]:
     file in the SAME directory as the target (so relative imports work)
     that imports the library and provides a dummy main.
     """
-    boot_py = os.path.join(REPO_ROOT, "boot", "boot.py")
+    boot_py = os.path.join(REPO_ROOT, "tools", "hlinterp", "boot.py")
     if not os.path.isfile(boot_py):
         print("warning: cannot audit %s (boot.py not found) — recording "
               "the full effect set (fail closed)" % file_path, file=sys.stderr)

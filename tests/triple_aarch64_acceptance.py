@@ -92,7 +92,7 @@ def normalise(text):
 
 
 def boot_check_target(src, with_target=True):
-    cmd = ["python3", "boot/boot.py", "--check"]
+    cmd = ["python3", "tools/hlinterp/boot.py", "--check"]
     if with_target:
         cmd += ["--target", TRIPLE]
     cmd.append(src)
@@ -124,7 +124,7 @@ print("=== 1. the CLI surface ===")
 # ---------------------------------------------------------------------------
 h = run(["./bin/hlc", "--target", TRIPLE, "tests/bare/fail_bare_float_param.hls",
          os.path.join(TMP, "never.c")])
-b = run(["python3", "boot/boot.py", "--check", "--target", TRIPLE,
+b = run(["python3", "tools/hlinterp/boot.py", "--check", "--target", TRIPLE,
          "tests/bare/fail_bare_float_param.hls"])
 if h.returncode == 0 or b.returncode == 0:
     bad("CLI: the triple accepted a float crate")
@@ -201,7 +201,7 @@ fn main() -> int {
 ipath = os.path.join(TMP, "imply.hls")
 with open(ipath, "w") as fh:
     fh.write(IMPLY)
-b = run(["python3", "boot/boot.py", "--target", TRIPLE, "--audit", ipath])
+b = run(["python3", "tools/hlinterp/boot.py", "--target", TRIPLE, "--audit", ipath])
 h = run(["./bin/hlc", "--target", TRIPLE, "--audit", ipath])
 b_lines = [ln.strip() for ln in b.stdout.splitlines()
            if "Crate mode" in ln or "Target:" in ln]
@@ -362,7 +362,7 @@ else:
 
 # The interpreter's documented boundary: it CHECKS the demo but refuses
 # to EXECUTE its asm! — with the long-standing refusal message.
-ir = run(["python3", "boot/boot.py", DEMO], timeout=120)
+ir = run(["python3", "tools/hlinterp/boot.py", DEMO], timeout=120)
 if ir.returncode == 0:
     bad("tools: the interpreter executed asm! (it must refuse)")
 elif "asm! cannot be executed by the boot interpreter" not in \

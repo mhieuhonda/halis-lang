@@ -70,7 +70,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 sys.path.insert(0, ROOT)
 
-from boot.lexer import HLError  # noqa: E402  (kept for parity with 119)
+from tools.hlinterp.lexer import HLError  # noqa: E402  (kept for parity with 119)
 import tools.hltest as hltest  # noqa: E402
 from tools.hltest import (  # noqa: E402
     load_store,
@@ -85,7 +85,7 @@ FAIL = 0
 TMP = tempfile.mkdtemp(prefix="_gate_s120_", dir=os.path.join(ROOT, "tests"))
 
 HLTEST = [sys.executable, "tools/hltest.py"]
-BOOT = [sys.executable, "boot/boot.py"]
+BOOT = [sys.executable, "tools/hlinterp/boot.py"]
 HLC = os.path.join(ROOT, "bin", "hlc")
 HLC_BIN = HLC if os.path.isfile(HLC) else None
 

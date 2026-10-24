@@ -215,17 +215,17 @@ examples:
 		   examples/heap_demo.hls examples/conn_machine.hls \
 		   examples/bits_demo.hls \
 		   examples/set_demo.hls; do \
-		 echo "--- $$f"; $(PYTHON) boot/boot.py $$f || exit 1; \
+		 echo "--- $$f"; $(PYTHON) tools/hlinterp/boot.py $$f || exit 1; \
 	done
 	@echo "--- examples/secure_demo.hls (deliberately panics on overflow)"
-	@rc=0; $(PYTHON) boot/boot.py examples/secure_demo.hls || rc=$$?; \
+	@rc=0; $(PYTHON) tools/hlinterp/boot.py examples/secure_demo.hls || rc=$$?; \
 	if [ "$$rc" != "0" ] && [ "$$rc" != "101" ]; then \
 	    echo "secure_demo.hls failed with unexpected exit code $$rc"; exit 1; \
 	fi
 	@# wordcount needs a data-file argument
-	@echo "--- examples/wordcount.hls"; $(PYTHON) boot/boot.py examples/wordcount.hls examples/data.txt
+	@echo "--- examples/wordcount.hls"; $(PYTHON) tools/hlinterp/boot.py examples/wordcount.hls examples/data.txt
 	@# taint_beta_demo.hls needs a data-file argument
-	@echo "--- examples/taint_beta_demo.hls"; $(PYTHON) boot/boot.py examples/taint_beta_demo.hls examples/data.txt
+	@echo "--- examples/taint_beta_demo.hls"; $(PYTHON) tools/hlinterp/boot.py examples/taint_beta_demo.hls examples/data.txt
 
 
 # Stage 104 (v0.123.0-alpha): hls-sbom, the CycloneDX + SPDX bill of

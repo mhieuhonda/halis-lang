@@ -164,9 +164,9 @@ import traceback
 from urllib.parse import quote, unquote, urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from boot.lexer import tokenize, HLError  # noqa: E402
-from boot.parser import Parser  # noqa: E402
-from boot.checker import check  # noqa: E402
+from tools.hlinterp.lexer import tokenize, HLError  # noqa: E402
+from tools.hlinterp.parser import Parser  # noqa: E402
+from tools.hlinterp.checker import check  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

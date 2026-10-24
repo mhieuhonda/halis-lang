@@ -58,7 +58,7 @@ check.failed = 0  # type: ignore[attr-defined]
 
 
 def boot(*args: str, cwd: str | None = None):
-    return subprocess.run([PY, os.path.join(REPO_ROOT, "boot", "boot.py")]
+    return subprocess.run([PY, os.path.join(REPO_ROOT, "tools", "hlinterp", "boot.py")]
                           + list(args), capture_output=True, text=True,
                           cwd=cwd or REPO_ROOT, timeout=300)
 
@@ -76,8 +76,8 @@ def write_tmp(suffix: str, src: str) -> str:
 
 def test_parse() -> None:
     section("1. Crate-attribute parsing (position/duplicates/unknown)")
-    from boot.lexer import tokenize
-    from boot.parser import Parser
+    from tools.hlinterp.lexer import tokenize
+    from tools.hlinterp.parser import Parser
 
     def parse(src: str):
         return Parser(tokenize(src.encode())).parse_program()
@@ -166,8 +166,8 @@ def test_scope() -> None:
           r.returncode == 1 and "only allowed in the entry file" in out,
           out.strip()[:100])
 
-    from boot.boot import load_program as _load_program
-    from boot.checker import check as checkmod
+    from tools.hlinterp.boot import load_program as _load_program
+    from tools.hlinterp.checker import check as checkmod
     for src, want in [("#![freestanding]\nfn main() -> int { return 0 }\n",
                        (True, True)),
                       ("#![no_std]\nfn main() -> int { return 0 }\n",

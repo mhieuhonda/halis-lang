@@ -56,13 +56,13 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from boot.lexer import tokenize, HLError            # noqa: E402
-from boot.parser import Parser                      # noqa: E402
-from boot.checker import check                      # noqa: E402
-from boot.interp import (                           # noqa: E402
+from tools.hlinterp.lexer import tokenize, HLError            # noqa: E402
+from tools.hlinterp.parser import Parser                      # noqa: E402
+from tools.hlinterp.checker import check                      # noqa: E402
+from tools.hlinterp.interp import (                           # noqa: E402
     Interp, HLPanic, ReturnSig, BreakSig, ContinueSig,
 )
-from boot.boot import load_program, print_audit     # noqa: E402
+from tools.hlinterp.boot import load_program, print_audit     # noqa: E402
 
 TOOL_VERSION = "0.141.0-alpha"
 

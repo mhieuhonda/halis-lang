@@ -3,8 +3,8 @@
 # (split for maintainability; sourced by tests/run_tests.sh in order).
 
 echo "=== 4. Differential test for examples (with data file) ==="
-python3 boot/boot.py examples/wordcount.hls examples/data.txt > "$TMP/wc_interp.txt" 2>/dev/null
-python3 boot/boot.py src/hlc.hls examples/wordcount.hls "$TMP/wc.c" >/dev/null 2>&1
+python3 tools/hlinterp/boot.py examples/wordcount.hls examples/data.txt > "$TMP/wc_interp.txt" 2>/dev/null
+python3 tools/hlinterp/boot.py src/hlc.hls examples/wordcount.hls "$TMP/wc.c" >/dev/null 2>&1
 gcc -O2 -o "$TMP/wc.bin" "$TMP/wc.c" -lm -pthread 2>/dev/null
 "$TMP/wc.bin" examples/data.txt > "$TMP/wc_nat.txt" 2>/dev/null
 if diff -q "$TMP/wc_interp.txt" "$TMP/wc_nat.txt" >/dev/null 2>&1; then
@@ -21,7 +21,7 @@ echo "=== 4a. Stage 16: NATIVE hlc compiles every ok program ==="
 # hide until feat_clone_deep crashed it. From now on, the native
 # compiler must compile (and, where possible, run) EVERY ok program.
 if [ ! -x "$TMP/hlc1" ]; then
-    python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
+    python3 tools/hlinterp/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
     gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
 fi
 nat_ok=0
@@ -67,10 +67,10 @@ for f in tests/ok/feat_contract_*.hls tests/ok/feat_proof_elide.hls \
     [ -f "$f" ] || continue
     name=$(basename "$f" .hls)
     if [ ! -x "$TMP/hlc1" ]; then
-        python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
+        python3 tools/hlinterp/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
         gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
     fi
-    interp_out=$(timeout 60 python3 boot/boot.py "$f" </dev/null 2>/dev/null); interp_rc=$?
+    interp_out=$(timeout 60 python3 tools/hlinterp/boot.py "$f" </dev/null 2>/dev/null); interp_rc=$?
     if "$TMP/hlc1" --fast "$f" "$TMP/$name.fast.c" >/dev/null 2>&1 \
             && gcc -O2 -o "$TMP/$name.fast.bin" "$TMP/$name.fast.c" -lm -pthread 2>/dev/null; then
         fast_out=$(timeout 60 "$TMP/$name.fast.bin" </dev/null 2>/dev/null); fast_rc=$?
@@ -461,10 +461,10 @@ for f in tests/ok/feat_stage111_*.hls; do
     [ -f "$f" ] || continue
     name=$(basename "$f" .hls)
     if [ ! -x "$TMP/hlc1" ]; then
-        python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
+        python3 tools/hlinterp/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
         gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
     fi
-    interp_out=$(timeout 60 python3 boot/boot.py "$f" </dev/null 2>/dev/null); interp_rc=$?
+    interp_out=$(timeout 60 python3 tools/hlinterp/boot.py "$f" </dev/null 2>/dev/null); interp_rc=$?
     if "$TMP/hlc1" "$f" "$TMP/$name.c" >/dev/null 2>&1 \
             && gcc -O2 -o "$TMP/$name.bin" "$TMP/$name.c" -lm -pthread 2>/dev/null; then
         nat_out=$(timeout 60 "$TMP/$name.bin" </dev/null 2>/dev/null); nat_rc=$?
@@ -494,7 +494,7 @@ cap_fails=0
 for f in tests/fail/fail_stage111_*.hls; do
     [ -f "$f" ] || continue
     if [ ! -x "$TMP/hlc1" ]; then
-        python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
+        python3 tools/hlinterp/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
         gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
     fi
     if "$TMP/hlc1" "$f" "$TMP/cap_fail.c" >/dev/null 2>&1; then
@@ -514,10 +514,10 @@ for f in tests/ok/feat_stage98_*.hls; do
     [ -f "$f" ] || continue
     name=$(basename "$f" .hls)
     if [ ! -x "$TMP/hlc1" ]; then
-        python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
+        python3 tools/hlinterp/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
         gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
     fi
-    interp_out=$(timeout 60 python3 boot/boot.py "$f" </dev/null 2>/dev/null); interp_rc=$?
+    interp_out=$(timeout 60 python3 tools/hlinterp/boot.py "$f" </dev/null 2>/dev/null); interp_rc=$?
     if "$TMP/hlc1" "$f" "$TMP/$name.c" >/dev/null 2>&1 \
             && gcc -O2 -o "$TMP/$name.bin" "$TMP/$name.c" -lm -pthread 2>/dev/null; then
         nat_out=$(timeout 60 "$TMP/$name.bin" </dev/null 2>/dev/null); nat_rc=$?
@@ -574,7 +574,7 @@ fn main() -> int uses Args {
     return risky(n)
 }
 RTSEOF
-rt_out=$(python3 boot/boot.py --contracts "$TMP/rt_contract.hls" </dev/null 2>&1 >/dev/null); rt_rc=$?
+rt_out=$(python3 tools/hlinterp/boot.py --contracts "$TMP/rt_contract.hls" </dev/null 2>&1 >/dev/null); rt_rc=$?
 if [ $rt_rc -eq 101 ] && echo "$rt_out" | grep -q "contract violation: requires"; then
     ok "--contracts runtime requires violation panics cleanly (101)"
 else
@@ -596,9 +596,9 @@ fn main() -> int uses IO {
     return 0
 }
 ENSEOF
-ens_interp=$(python3 boot/boot.py --contracts "$TMP/rt_ens.hls" </dev/null 2>&1); ens_irc=$?
+ens_interp=$(python3 tools/hlinterp/boot.py --contracts "$TMP/rt_ens.hls" </dev/null 2>&1); ens_irc=$?
 if [ ! -x "$TMP/hlc1" ]; then
-    python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
+    python3 tools/hlinterp/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
     gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
 fi
 if "$TMP/hlc1" --contracts "$TMP/rt_ens.hls" "$TMP/rt_ens.c" >/dev/null 2>&1 \

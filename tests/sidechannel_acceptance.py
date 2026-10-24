@@ -37,9 +37,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 sys.path.insert(0, ROOT)
 
-from boot.boot import load_program            # noqa: E402
-from boot.checker import check                # noqa: E402
-from boot.proof import analyze_sidechannel    # noqa: E402
+from tools.hlinterp.boot import load_program            # noqa: E402
+from tools.hlinterp.checker import check                # noqa: E402
+from tools.hlinterp.proof import analyze_sidechannel    # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -496,7 +496,7 @@ else:
 print("=== 5. the demo ===")
 # ---------------------------------------------------------------------------
 
-interp = run([sys.executable, "boot/boot.py", DEMO])
+interp = run([sys.executable, "tools/hlinterp/boot.py", DEMO])
 if interp.returncode == 0:
     ok("the demo runs on the interpreter (rc=0)")
 else:
@@ -549,7 +549,7 @@ def audit_secrets_block(cmd):
     return block
 
 
-b_block = audit_secrets_block(["python3", "boot/boot.py", "--audit",
+b_block = audit_secrets_block(["python3", "tools/hlinterp/boot.py", "--audit",
                                DEMO])
 h_block = audit_secrets_block([BIN, "--audit", DEMO])
 if b_block and b_block == h_block:
@@ -577,7 +577,7 @@ def normalise(text):
 
 for stem, needle, why in FAIL_PROGRAMS:
     src = "tests/fail/%s.hls" % stem
-    b = run(["python3", "boot/boot.py", "--check", src])
+    b = run(["python3", "tools/hlinterp/boot.py", "--check", src])
     h = run([BIN, src, os.path.join(TMP, stem + ".c")])
     if b.returncode == 0:
         bad("%s: boot accepted the malformed marking (%s)" % (stem, why))

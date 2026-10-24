@@ -145,7 +145,7 @@ def normalise(text):
 # ---------------------------------------------------------------------------
 print("=== 1. crate attributes + guards ===")
 # ---------------------------------------------------------------------------
-for label, cmd in (("boot", ["python3", "boot/boot.py", "--audit", KERNEL]),
+for label, cmd in (("boot", ["python3", "tools/hlinterp/boot.py", "--audit", KERNEL]),
                    ("hlc", ["./bin/hlc", "--audit", KERNEL])):
     r = run(cmd)
     if r.returncode == 0 and "Boot header: limine" in r.stdout:
@@ -159,7 +159,7 @@ for name, needle, desc in FAIL_PROGRAMS:
     if not os.path.exists(path):
         bad("boot: %s missing" % path)
         continue
-    rb = run(["python3", "boot/boot.py", "--check", path])
+    rb = run(["python3", "tools/hlinterp/boot.py", "--check", path])
     if rb.returncode != 1:
         bad("boot: %s not rejected by boot" % name)
         continue
@@ -185,7 +185,7 @@ with open(dep, "w", encoding="utf-8") as fh:
 entry = os.path.join(TMP, "bootentry.hls")
 with open(entry, "w", encoding="utf-8") as fh:
     fh.write('import "./bootdep.hls"\n\nfn main() -> int {\n    return helper()\n}\n')
-r = run(["python3", "boot/boot.py", "--check", entry])
+r = run(["python3", "tools/hlinterp/boot.py", "--check", entry])
 if r.returncode == 1 and "only allowed in the entry file" in (r.stdout + r.stderr):
     ok("boot: #![boot_header] is entry-file-only")
 else:
@@ -377,7 +377,7 @@ probe = os.path.join(TMP, "unplaced.hls")
 with open(probe, "w", encoding="utf-8") as fh:
     fh.write('#![freestanding]\n#![link_script("no_boot.ld")]\n'
              '#![boot_header(multiboot2)]\n\nfn main() -> int {\n    return 0\n}\n')
-rb = run(["python3", "boot/boot.py", "--check", probe])
+rb = run(["python3", "tools/hlinterp/boot.py", "--check", probe])
 rh = run(["./bin/hlc", "--audit", probe])
 if rb.returncode == 1 and "does not place" in (rb.stdout + rb.stderr) \
         and rh.returncode != 0 and "does not place" in (rh.stdout + rh.stderr):
@@ -574,7 +574,7 @@ for name, body, want, desc in PROBES:
     path = os.path.join(TMP, "probe_%s.hls" % name)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(body)
-    r = run(["python3", "boot/boot.py", path])
+    r = run(["python3", "tools/hlinterp/boot.py", path])
     if r.returncode != want:
         bad("boot: probe %s (interp) exit=%d want=%d — %s"
             % (name, r.returncode, want, (r.stdout + r.stderr).strip()[:100]))
@@ -593,11 +593,11 @@ for name, needle, desc in PANIC_PROGRAMS:
     if not os.path.exists(path):
         bad("boot: %s missing" % path)
         continue
-    r = run(["python3", "boot/boot.py", "--check", path])
+    r = run(["python3", "tools/hlinterp/boot.py", "--check", path])
     if r.returncode != 0:
         bad("boot: %s must be ACCEPTED by the checker" % name)
         continue
-    r = run(["python3", "boot/boot.py", path])
+    r = run(["python3", "tools/hlinterp/boot.py", path])
     if r.returncode == 101 and needle in (r.stdout + r.stderr):
         ok("boot: %s panics at run time (%s)" % (name, desc))
     else:
@@ -611,7 +611,7 @@ for name, needle, desc in PANIC_PROGRAMS:
 # ---------------------------------------------------------------------------
 print("=== 7. the demos + tools ===")
 # ---------------------------------------------------------------------------
-r = run(["python3", "boot/boot.py", OK_TEST])
+r = run(["python3", "tools/hlinterp/boot.py", OK_TEST])
 if r.returncode == 0:
     ok("boot: the ok-test is clean on the interpreter")
 else:
@@ -639,7 +639,7 @@ else:
     bad("boot: the ok-test did not compile as freestanding")
 
 # boot_demo: identical output on the interpreter and natively.
-ri = run(["python3", "boot/boot.py", DEMO])
+ri = run(["python3", "tools/hlinterp/boot.py", DEMO])
 code, out = hlc_run(DEMO)
 if ri.returncode == 0 and code == 0 and "DEMO OK" in out:
     ok("boot: boot_demo runs on both, DEMO OK")
@@ -680,7 +680,7 @@ for label, cmd, want in (
         bad("boot: %s: %s" % (label, (r.stdout + r.stderr).strip()[:140]))
 
 # --audit parity on the lines this stage adds.
-for label, cmd in (("boot", ["python3", "boot/boot.py", "--audit", KERNEL]),
+for label, cmd in (("boot", ["python3", "tools/hlinterp/boot.py", "--audit", KERNEL]),
                    ("hlc", ["./bin/hlc", "--audit", KERNEL])):
     r = run(cmd)
     text = r.stdout + r.stderr

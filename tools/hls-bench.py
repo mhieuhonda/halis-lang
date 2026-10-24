@@ -122,11 +122,11 @@ import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from boot.boot import load_program           # noqa: E402
-from boot.checker import check               # noqa: E402
-from boot.interp import Interp, HLPanic      # noqa: E402
-from boot.lexer import tokenize, HLError     # noqa: E402
-from boot.parser import Parser               # noqa: E402
+from tools.hlinterp.boot import load_program           # noqa: E402
+from tools.hlinterp.checker import check               # noqa: E402
+from tools.hlinterp.interp import Interp, HLPanic      # noqa: E402
+from tools.hlinterp.lexer import tokenize, HLError     # noqa: E402
+from tools.hlinterp.parser import Parser               # noqa: E402
 
 TOOL_VERSION = "0.142.0-alpha"
 

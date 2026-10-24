@@ -62,7 +62,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 SBX = [sys.executable, os.path.join(ROOT, "tools", "hls-sandbox.py")]
 PKG = [sys.executable, os.path.join(ROOT, "tools", "hls-pkg.py")]
-BOOT = [sys.executable, os.path.join(ROOT, "boot", "boot.py")]
+BOOT = [sys.executable, os.path.join(ROOT, "tools", "hlinterp", "boot.py")]
 HLC = os.path.join(ROOT, "src", "hlc.hls")
 DEMO = "examples/sandbox_demo.hls"
 PKG_DEMO = "examples/pkg_sandbox_demo"
@@ -132,7 +132,7 @@ expect("hls_audit._walk_import_graph" in _src
        and "hls_audit._fn_keys_per_module" in _src,
        "the derivation walks with hls-audit's own helpers (no re-walk)")
 
-from boot.checking.helpers import BUILTIN_EFFECTS            # noqa: E402
+from tools.hlinterp.checking.helpers import BUILTIN_EFFECTS            # noqa: E402
 _fs = {b for b, e in BUILTIN_EFFECTS.items() if e == {"Fs"}}
 expect(set(P.FS_READ_BUILTINS) | set(P.FS_WRITE_BUILTINS) <= _fs,
        "the fs census is the Fs family of the one builtin->effect table")

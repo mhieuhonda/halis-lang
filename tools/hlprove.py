@@ -109,11 +109,11 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from boot.boot import load_program            # noqa: E402
-from boot.checker import check                # noqa: E402
-from boot.lexer import HLError                # noqa: E402
-from boot import proof as _proof             # noqa: E402
-from boot import ffi_taint as _ffi           # noqa: E402
+from tools.hlinterp.boot import load_program            # noqa: E402
+from tools.hlinterp.checker import check                # noqa: E402
+from tools.hlinterp.lexer import HLError                # noqa: E402
+from tools.hlinterp import proof as _proof             # noqa: E402
+from tools.hlinterp import ffi_taint as _ffi           # noqa: E402
 
 
 def proof_report(program, checker):

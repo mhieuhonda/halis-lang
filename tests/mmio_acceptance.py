@@ -405,11 +405,11 @@ for name, needle, desc in PANIC_PROGRAMS:
     if not os.path.exists(path):
         bad("mmio: %s missing" % path)
         continue
-    r = run(["python3", "boot/boot.py", "--check", path])
+    r = run(["python3", "tools/hlinterp/boot.py", "--check", path])
     if r.returncode != 0:
         bad("mmio: %s must be ACCEPTED by the checker" % name)
         continue
-    r = run(["python3", "boot/boot.py", path])
+    r = run(["python3", "tools/hlinterp/boot.py", path])
     if r.returncode == 101 and needle in (r.stdout + r.stderr):
         ok("mmio: %s panics at run time (%s)" % (name, desc))
     else:
@@ -425,7 +425,7 @@ print("=== 6. behaviour probes ===")
 # ---------------------------------------------------------------------------
 for name, body, want, desc in PROBES:
     path = write("probe_%s.hls" % name, body)
-    r = run(["python3", "boot/boot.py", path])
+    r = run(["python3", "tools/hlinterp/boot.py", path])
     if r.returncode != want:
         bad("mmio: probe %s (interp) exit=%d want=%d — %s"
             % (name, r.returncode, want, (r.stdout + r.stderr).strip()[:100]))
@@ -446,7 +446,7 @@ for name, body, want, desc in PROBES:
 # ---------------------------------------------------------------------------
 print("=== 7. the demo + tools ===")
 # ---------------------------------------------------------------------------
-r = run(["python3", "boot/boot.py", OK_TEST])
+r = run(["python3", "tools/hlinterp/boot.py", OK_TEST])
 if r.returncode == 0:
     ok("mmio: the ok-test is clean on the interpreter")
 else:

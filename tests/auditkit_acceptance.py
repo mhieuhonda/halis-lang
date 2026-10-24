@@ -7,7 +7,7 @@ Run with `make auditkit-acceptance` (or
 
 Eight sections over the REAL hls-auditkit CLI, the REAL scope
 (the Stage 135 guarantee ledger, live), the REAL checker
-(boot/boot.py through the imported guarantee engine) and the real
+(tools/hlinterp/boot.py through the imported guarantee engine) and the real
 git surface — an audit kit that did not run the instruments it
 judges with would be a mock, not a gate:
 
@@ -92,7 +92,7 @@ from hltlog_parts.hltlog_common import GENESIS, chain_of  # noqa: E402
 
 KIT = [sys.executable, "tools/hls-auditkit.py"]
 GUAR = [sys.executable, "tools/hls-guarantee.py"]
-BOOT = [sys.executable, "boot/boot.py"]
+BOOT = [sys.executable, "tools/hlinterp/boot.py"]
 FMT = [sys.executable, "tools/hlfmt.py"]
 LINT = [sys.executable, "tools/hllint.py"]
 HLC = os.path.join(ROOT, "bin", "hlc")
@@ -445,7 +445,7 @@ def _section_4():
     # fail-recorded. The tampered tree drops the G-MEM-01 anchor
     # (the ownership checker's refusal message).
     broken = full_tree("broken")
-    expr = os.path.join(broken, "boot", "checking", "expr.py")
+    expr = os.path.join(broken, "tools", "hlinterp", "checking", "expr.py")
     with open(expr, encoding="utf-8") as fh:
         src = fh.read()
     with open(expr, "w", encoding="utf-8") as fh:

@@ -69,7 +69,7 @@ check.failed = 0  # type: ignore[attr-defined]
 
 
 def boot(*args: str, cwd: str | None = None):
-    return subprocess.run([PY, os.path.join(REPO_ROOT, "boot", "boot.py")]
+    return subprocess.run([PY, os.path.join(REPO_ROOT, "tools", "hlinterp", "boot.py")]
                           + list(args), capture_output=True, text=True,
                           cwd=cwd or REPO_ROOT, timeout=600)
 
@@ -87,7 +87,7 @@ def write_tmp(suffix: str, src: str) -> str:
 
 def test_resolution() -> None:
     section("1. core.asm import resolution (+ traversal guards)")
-    from boot.boot import _resolve_import
+    from tools.hlinterp.boot import _resolve_import
     entry = os.path.join(tempfile.mkdtemp(prefix="hls_asmreg_"), "e.hls")
     with open(entry, "w", encoding="utf-8", newline="\n") as f:
         f.write("fn main() -> int { return 0 }\n")
@@ -116,8 +116,8 @@ def test_resolution() -> None:
 
 def test_parse() -> None:
     section("2. core.asm parses standalone (enum + fns, zero imports)")
-    from boot.lexer import tokenize
-    from boot.parser import Parser
+    from tools.hlinterp.lexer import tokenize
+    from tools.hlinterp.parser import Parser
     with open(ASM, "rb") as f:
         prog = Parser(tokenize(f.read())).parse_program()
     check("core/asm.hls parses",

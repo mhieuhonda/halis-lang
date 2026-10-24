@@ -90,7 +90,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 TOOL_VERSION = "0.147.0-alpha"
 
-BOOT = os.path.join(REPO_ROOT, "boot", "boot.py")
+BOOT = os.path.join(REPO_ROOT, "tools", "hlinterp", "boot.py")
 
 # Release tags: v<major>.<minor>[.<patch>][-suffix] — the same grammar
 # the Stage 128 census uses, so the two tools agree on what a version IS.

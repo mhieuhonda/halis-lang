@@ -58,7 +58,7 @@ one strict shrink improves it, everything else is no-change.
 The instrument is the compiler, and Halis ships two of them, so they
 are two INSTRUMENTS, never compared:
 
-  stage0  python3 boot/boot.py src/hlc.hls <workload> <out.c>
+  stage0  python3 tools/hlinterp/boot.py src/hlc.hls <workload> <out.c>
   native  bin/hlc <workload> <out.c>
 
 For the emitted bytes both instruments must agree byte-for-byte (the
@@ -166,7 +166,7 @@ COMPILE_RECIPE = "%s %s -o out out.c %s" % (
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HLC_SOURCE_ENTRY = os.path.join("src", "hlc.hls")
 HLC_SOURCE_DIR = os.path.join("src", "hlc")
-BOOT_DRIVER = os.path.join("boot", "boot.py")
+BOOT_DRIVER = os.path.join("tools", "hlinterp", "boot.py")
 NATIVE_COMPILER = os.path.join("bin", "hlc")
 SCRATCH = os.path.join(".hlsize-out")
 
@@ -312,7 +312,7 @@ def compiler_binary_digest(root, instrument):
     """sha256 of the compiler BINARY actually measured through —
     bin/hlc for the native instrument (an untracked build artifact,
     so the record pins its bytes itself: the clean-tree check cannot
-    vouch for it), boot/boot.py for stage0 (the driver the chain
+    vouch for it), tools/hlinterp/boot.py for stage0 (the driver the chain
     runs through)."""
     path = os.path.join(root, NATIVE_COMPILER if instrument == "native"
                         else BOOT_DRIVER)
@@ -1248,7 +1248,7 @@ def render_dashboard(entries, history_path, limit, stamp=None):
       "axis grows; it improves only when every axis shrank-or-held "
       "and at least one strictly shrank.")
     a("- The instrument is the compiler. `stage0` is the bootstrap "
-      "chain (boot/boot.py running src/hlc.hls); `native` is "
+      "chain (tools/hlinterp/boot.py running src/hlc.hls); `native` is "
       "bin/hlc — and the native record alone carries `hlc_self`, the "
       "compiler's own girth. Instruments are never compared to each "
       "other, and neither are machines: cc, arch and recipe are part "

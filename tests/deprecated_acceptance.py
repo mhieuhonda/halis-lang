@@ -72,7 +72,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 sys.path.insert(0, ROOT)
 
-BOOT = [sys.executable, "boot/boot.py"]
+BOOT = [sys.executable, "tools/hlinterp/boot.py"]
 HLC = os.path.join(ROOT, "bin", "hlc")
 CC = os.environ.get("CC", "gcc")
 LINT = [sys.executable, "tools/hllint.py"]
@@ -162,8 +162,8 @@ def _section_1():
 # ===========================================================================
 def _section_2():
     print("Section 2 — the parse laws (the boot AST)")
-    from boot.lexer import tokenize
-    from boot.parser import Parser
+    from tools.hlinterp.lexer import tokenize
+    from tools.hlinterp.parser import Parser
 
     def parse(text):
         return Parser(tokenize(text.encode("utf-8"))).parse_program()

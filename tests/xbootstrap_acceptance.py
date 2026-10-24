@@ -245,7 +245,7 @@ WORLD = """fn main() -> int uses IO, Proc {
 """
 wpath = os.path.join(TMP, "world.hls")
 open(wpath, "w").write(WORLD.replace("TMPDIR_OUT", os.path.join(TMP, "world_out.txt")))
-interp = run(["python3", "boot/boot.py", wpath], stdin=subprocess.DEVNULL, timeout=120)
+interp = run(["python3", "tools/hlinterp/boot.py", wpath], stdin=subprocess.DEVNULL, timeout=120)
 w_c = os.path.join(TMP, "world.c")
 w_exe = os.path.join(TMP, "world")
 r = emit(wpath, w_c, ["--no-libc"])

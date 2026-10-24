@@ -116,9 +116,9 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from boot.lexer import tokenize, HLError  # noqa: E402
-from boot.parser import Parser  # noqa: E402
-from boot.checker import check  # noqa: E402
+from tools.hlinterp.lexer import tokenize, HLError  # noqa: E402
+from tools.hlinterp.parser import Parser  # noqa: E402
+from tools.hlinterp.checker import check  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -1328,7 +1328,7 @@ class Fixer:
         imports resolve identically; it is always deleted."""
         if not self.path:
             return None  # library use: no crate to load
-        from boot.boot import load_program
+        from tools.hlinterp.boot import load_program
         tmp_path = None
         try:
             d = os.path.dirname(os.path.abspath(self.path)) or "."
@@ -1376,7 +1376,7 @@ class Fixer:
         the imports. When the crate cannot be loaded (a missing module,
         say), the view falls back to the single-file parse with a
         plain single-file check."""
-        from boot.boot import load_program  # noqa: F401 (used via views)
+        from tools.hlinterp.boot import load_program  # noqa: F401 (used via views)
         entry = self._entry_keys(src)
         status = self._crate_status(src)
         program = None
@@ -1423,7 +1423,7 @@ class Fixer:
         loaded (the caller falls back to the single-file view)."""
         if not self.path:
             return None
-        from boot.boot import load_program
+        from tools.hlinterp.boot import load_program
         tmp_path = None
         try:
             d = os.path.dirname(os.path.abspath(self.path)) or "."
@@ -1991,7 +1991,7 @@ def main():
     crate = None
     if args.file and os.path.isfile(args.file):
         try:
-            from boot.boot import load_program
+            from tools.hlinterp.boot import load_program
             crate = load_program(os.path.abspath(args.file))
         except (HLError, SystemExit, OSError, ValueError):
             crate = None

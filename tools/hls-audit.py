@@ -74,11 +74,11 @@ from hpkg_manifest import parse_manifest                    # noqa: E402
 from hpkg_deps import resolve_dependency                    # noqa: E402
 from hpkg_util import sha256_file                           # noqa: E402
 
-from boot.boot import load_program, _resolve_import         # noqa: E402
-from boot.checker import check                              # noqa: E402
-from boot.lexer import tokenize                              # noqa: E402
-from boot.parser import Parser                              # noqa: E402
-from boot.checking.helpers import BUILTIN_EFFECTS           # noqa: E402
+from tools.hlinterp.boot import load_program, _resolve_import         # noqa: E402
+from tools.hlinterp.checker import check                              # noqa: E402
+from tools.hlinterp.lexer import tokenize                              # noqa: E402
+from tools.hlinterp.parser import Parser                              # noqa: E402
+from tools.hlinterp.checking.helpers import BUILTIN_EFFECTS           # noqa: E402
 
 ALL_EFFECTS = sorted(["IO", "Fs", "Clock", "Args", "Exit",
                       "Net", "Rand", "Proc", "Conc"])

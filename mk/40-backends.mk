@@ -130,7 +130,7 @@ wasm-acceptance:
 	@echo "[Stage 23 acceptance] running the wasm in Node.js..."
 	@$(PYTHON) tools/hlwasm.py examples/hello.hls $(BIN)/hello_wasm2 --run >$(BIN)/wasm_run.out 2>&1; \
 	rc=$$?; if [ $$rc -ne 0 ]; then echo "FAIL: wasm run failed (rc=$$rc)"; cat $(BIN)/wasm_run.out; exit 1; fi
-	@python3 boot/boot.py examples/hello.hls </dev/null 2>/dev/null >$(BIN)/interp_out.txt
+	@python3 tools/hlinterp/boot.py examples/hello.hls </dev/null 2>/dev/null >$(BIN)/interp_out.txt
 	@# Deep-scan-13 fix: also filter the 'wasm-opt: N -> M bytes' info
 	@# line (stderr, merged by 2>&1) — it polluted the output comparison
 	@# whenever the in-tree optimizer was active (CI red on main).

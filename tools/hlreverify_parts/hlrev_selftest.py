@@ -9,8 +9,8 @@ gate re-runs them.
 """
 from __future__ import annotations
 
-from boot import proof as bp
-from boot.proof import Interval, TOP
+from tools.hlinterp import proof as bp
+from tools.hlinterp.proof import Interval, TOP
 
 from . import hlrev_common as com
 from . import hlrev_collect as coll

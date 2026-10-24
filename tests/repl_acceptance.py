@@ -65,7 +65,7 @@ os.chdir(ROOT)
 sys.path.insert(0, ROOT)
 
 REPL = [sys.executable, "tools/hls-repl.py"]
-BOOT = [sys.executable, "boot/boot.py"]
+BOOT = [sys.executable, "tools/hlinterp/boot.py"]
 HLC = os.path.join(ROOT, "bin", "hlc")
 HLC_BIN = HLC if os.path.isfile(HLC) else None
 

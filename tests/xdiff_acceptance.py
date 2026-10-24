@@ -393,12 +393,12 @@ p = subprocess.run([sys.executable, os.path.join(REPO, "tools", "hllint.py"),
 check(p.returncode == 0 and b"no warnings" in p.stdout,
       "the fixture is hllint-clean", p.stdout.decode()[:200])
 
-p = subprocess.run([sys.executable, os.path.join(REPO, "boot", "boot.py"),
+p = subprocess.run([sys.executable, os.path.join(REPO, "tools", "hlinterp", "boot.py"),
                     "--check", OK_F], capture_output=True, cwd=REPO)
 check(p.returncode == 0, "the fixture boots through the real checker",
       p.stderr.decode()[:200])
 
-p = subprocess.run([sys.executable, os.path.join(REPO, "boot", "boot.py"),
+p = subprocess.run([sys.executable, os.path.join(REPO, "tools", "hlinterp", "boot.py"),
                     OK_F], capture_output=True, cwd=REPO)
 interp_out = p.stdout
 check(p.returncode == 0 and b"cross-impl suite OK" in interp_out,

@@ -58,7 +58,7 @@ check.failed = 0  # type: ignore[attr-defined]
 
 
 def boot(*args: str, cwd: str | None = None):
-    return subprocess.run([PY, os.path.join(REPO_ROOT, "boot", "boot.py")]
+    return subprocess.run([PY, os.path.join(REPO_ROOT, "tools", "hlinterp", "boot.py")]
                           + list(args), capture_output=True, text=True,
                           cwd=cwd or REPO_ROOT, timeout=300)
 
@@ -76,7 +76,7 @@ def write_tmp(suffix: str, src: str) -> str:
 
 def test_resolution() -> None:
     section("1. core. import resolution (+ traversal guards)")
-    from boot.boot import _resolve_import
+    from tools.hlinterp.boot import _resolve_import
     entry = os.path.join(tempfile.mkdtemp(prefix="hls_ns_"), "e.hls")
     with open(entry, "w", encoding="utf-8", newline="\n") as f:
         f.write("fn main() -> int { return 0 }\n")
@@ -102,8 +102,8 @@ def test_resolution() -> None:
 
 def test_parse() -> None:
     section("2. Core modules parse standalone")
-    from boot.lexer import tokenize
-    from boot.parser import Parser
+    from tools.hlinterp.lexer import tokenize
+    from tools.hlinterp.parser import Parser
     for mod in CORE:
         path = os.path.join(REPO_ROOT, "core", mod + ".hls")
         with open(path, "rb") as f:
@@ -284,8 +284,8 @@ def test_fmt_modes() -> None:
                    cwd=REPO_ROOT, timeout=120)
         check("hlfmt clean: %s" % os.path.basename(f),
               "NOT formatted" not in (r.stdout or ""))
-    from boot.boot import load_program as _load_program
-    from boot.checker import check as checkmod
+    from tools.hlinterp.boot import load_program as _load_program
+    from tools.hlinterp.checker import check as checkmod
     d = tempfile.mkdtemp(prefix="hls_ns_modes_")
     p = os.path.join(d, "m.hls")
     with open(p, "w", encoding="utf-8", newline="\n") as f:

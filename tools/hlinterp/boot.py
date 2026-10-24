@@ -7,7 +7,7 @@ This is the SEED used to bootstrap the self-hosting cycle of Halis:
   3. From there on, the native compilation cycle is self-sustaining.
 
 Usage:
-  python3 boot/boot.py [--check | --audit] <file.hls> [program args...]
+  python3 tools/hlinterp/boot.py [--check | --audit] <file.hls> [program args...]
 
 Flags:
   --check    type-check + effects-check only, no execution.
@@ -34,18 +34,19 @@ import os
 import sys
 import threading
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from boot.lexer import tokenize, HLError          # noqa: E402
-from boot.parser import Parser                     # noqa: E402
-from boot.checker import check                     # noqa: E402
-from boot.checking.helpers import (                # noqa: E402
+from tools.hlinterp.lexer import tokenize, HLError          # noqa: E402
+from tools.hlinterp.parser import Parser                     # noqa: E402
+from tools.hlinterp.checker import check                     # noqa: E402
+from tools.hlinterp.checking.helpers import (                # noqa: E402
     BARE_METAL_TRIPLES, bare_metal_triple,
 )
-from boot.interp import Interp                     # noqa: E402
+from tools.hlinterp.interp import Interp                     # noqa: E402
 
-# Repository root = parent of the `boot/` directory.
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Repository root = parent of the tools/hlinterp/ directory (the
+# interpreter moved there from boot/ in v0.164.0-alpha).
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def _resolve_import(import_path, importing_file):
@@ -405,7 +406,7 @@ def run_cli():
             # `feat` becomes one of "avx2", "sse4.2", "neon", "rvv", or
             # "" (no fast path — the portable pure-HLS implementation
             # runs).
-            from boot.interp import _cpu_supports
+            from tools.hlinterp.interp import _cpu_supports
             if _cpu_supports("avx2"):
                 feat = "avx2"
             elif _cpu_supports("sse4.2"):
@@ -541,7 +542,7 @@ def run_cli():
             return 2
     # Stage 21: install the target feature for has_feature() parity.
     if target_feature is not None:
-        from boot.interp import _set_target_feature
+        from tools.hlinterp.interp import _set_target_feature
         _set_target_feature(target_feature)
         program["target_feature"] = target_feature
     if audit_only:
@@ -569,13 +570,13 @@ def run_cli():
     # as HLS_SANDBOX_ROOT so any subprocess (e.g. a sandboxed native
     # binary the program might spawn via proc_exec) inherits the gate.
     if sandbox_dir is not None:
-        from boot.interp import _set_sandbox_root
+        from tools.hlinterp.interp import _set_sandbox_root
         _set_sandbox_root(sandbox_dir)
         # Canonicalise to absolute (matches _set_sandbox_root's realpath).
         sb_canonical = os.path.realpath(sandbox_dir)
         os.environ["HLS_SANDBOX_ROOT"] = sb_canonical
     else:
-        from boot.interp import _set_sandbox_root
+        from tools.hlinterp.interp import _set_sandbox_root
         _set_sandbox_root(None)
         os.environ.pop("HLS_SANDBOX_ROOT", None)
     interp = Interp(program, prog_args, sys.stdout.buffer, contracts=contracts,

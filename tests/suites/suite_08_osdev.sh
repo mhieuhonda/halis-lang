@@ -9,7 +9,7 @@ echo "=== 14. Stage 77: #![freestanding] mode (no libc, no OS calls) ==="
 # arena, trap panics, `_start` entry with raw-syscall exit).
 FS_F=tests/ok/feat_freestanding_basic.hls
 # (a) the freestanding ok-test checks + runs on the interpreter (exit 0).
-fs_interp_out=$(python3 boot/boot.py "$FS_F" </dev/null 2>/dev/null); fs_interp_code=$?
+fs_interp_out=$(python3 tools/hlinterp/boot.py "$FS_F" </dev/null 2>/dev/null); fs_interp_code=$?
 if [ "$fs_interp_code" -eq 0 ]; then
     ok "freestanding: feat_freestanding_basic runs on the interpreter (exit 0)"
 else
@@ -19,7 +19,7 @@ fi
 #     mode-specific message.
 for ff in tests/fail/fail_freestanding_*.hls; do
     fs_name=$(basename "$ff" .hls)
-    fs_err=$(python3 boot/boot.py --check "$ff" 2>&1 >/dev/null); fs_rc=$?
+    fs_err=$(python3 tools/hlinterp/boot.py --check "$ff" 2>&1 >/dev/null); fs_rc=$?
     # Deep-scan-28 fix: fail_freestanding_late_attr exercises the
     # crate-attribute POSITION rule — its message ("crate-level
     # attribute must appear before any item") does not mention
@@ -37,7 +37,7 @@ for ff in tests/fail/fail_freestanding_*.hls; do
     fi
 done
 # (c) the self-hosted compiler emits the freestanding TU shape.
-if python3 boot/boot.py src/hlc.hls "$FS_F" "$TMP/fs_basic.c" >/dev/null 2>&1; then
+if python3 tools/hlinterp/boot.py src/hlc.hls "$FS_F" "$TMP/fs_basic.c" >/dev/null 2>&1; then
     if grep -q "void _start(void)" "$TMP/fs_basic.c" \
         && ! grep -qE "int main\s*\(" "$TMP/fs_basic.c" \
         && grep -q "__builtin_trap" "$TMP/fs_basic.c" \
@@ -88,7 +88,7 @@ echo "=== 15. Stage 78: #![no_std] + core modules ==="
 # libc is kept (entry `main`).
 NS_F=tests/ok/feat_nostd_core.hls
 # (a) the no_std ok-test checks + runs on the interpreter (exit 0).
-ns_interp_out=$(python3 boot/boot.py "$NS_F" </dev/null 2>/dev/null); ns_interp_code=$?
+ns_interp_out=$(python3 tools/hlinterp/boot.py "$NS_F" </dev/null 2>/dev/null); ns_interp_code=$?
 if [ "$ns_interp_code" -eq 0 ]; then
     ok "nostd: feat_nostd_core runs on the interpreter (exit 0)"
 else
@@ -105,7 +105,7 @@ done
 # (c) every Stage 78 fail program is rejected with a mode message.
 for ff in tests/fail/fail_nostd_*.hls; do
     ns_name=$(basename "$ff" .hls)
-    ns_err=$(python3 boot/boot.py --check "$ff" 2>&1 >/dev/null); ns_rc=$?
+    ns_err=$(python3 tools/hlinterp/boot.py --check "$ff" 2>&1 >/dev/null); ns_rc=$?
     if [ "$ns_rc" -eq 1 ] && echo "$ns_err" | grep -q "no_std"; then
         ok "nostd: $ns_name rejected ($ns_err)"
     else
@@ -132,7 +132,7 @@ echo "=== 16. Stage 79: core.alloc — pluggable allocator protocol ==="
 # `no_std`-clean; the same module is importable from `#![freestanding]`.
 ALLOC_F=tests/ok/feat_stage79_alloc.hls
 # (a) the alloc ok-test checks + runs on the interpreter (exit 0).
-alloc_interp_out=$(python3 boot/boot.py "$ALLOC_F" </dev/null 2>/dev/null); alloc_interp_code=$?
+alloc_interp_out=$(python3 tools/hlinterp/boot.py "$ALLOC_F" </dev/null 2>/dev/null); alloc_interp_code=$?
 if [ "$alloc_interp_code" -eq 0 ]; then
     ok "alloc: feat_stage79_alloc runs on the interpreter (exit 0)"
 else
@@ -145,7 +145,7 @@ else
     bad "alloc: core/alloc.hls missing"
 fi
 # (c) the demo runs end-to-end on the interpreter (exit 0).
-alloc_demo_code=$(python3 boot/boot.py examples/alloc_demo.hls </dev/null 2>/dev/null; echo $?)
+alloc_demo_code=$(python3 tools/hlinterp/boot.py examples/alloc_demo.hls </dev/null 2>/dev/null; echo $?)
 if [ "$alloc_demo_code" -eq 0 ]; then
     ok "alloc: examples/alloc_demo.hls runs on the interpreter (exit 0)"
 else
@@ -160,7 +160,7 @@ src = open(sys.argv[1], encoding='utf-8').read()
 src = src.replace('\n#![no_std]\n', '\n#![freestanding]\n', 1)
 open(sys.argv[2], 'w', encoding='utf-8', newline='\n').write(src)
 PY
-if python3 boot/boot.py src/hlc.hls "$alloc_fs_src" "$TMP/alloc_fs.c" >/dev/null 2>&1 \
+if python3 tools/hlinterp/boot.py src/hlc.hls "$alloc_fs_src" "$TMP/alloc_fs.c" >/dev/null 2>&1 \
         && gcc -O2 -ffreestanding -nostdlib -ffunction-sections \
                -fno-stack-protector -Wl,--gc-sections \
                -o "$TMP/alloc_fs.bin" "$TMP/alloc_fs.c" 2>"$TMP/alloc_fs.gcc"; then
@@ -198,7 +198,7 @@ echo "=== 17. Stage 80: core.mem — physical-page allocator + page tables ==="
 # the same module is importable from `#![freestanding]`.
 MEM_F=tests/ok/feat_stage80_mem.hls
 # (a) the mem ok-test checks + runs on the interpreter (exit 0).
-mem_interp_out=$(python3 boot/boot.py "$MEM_F" </dev/null 2>/dev/null); mem_interp_code=$?
+mem_interp_out=$(python3 tools/hlinterp/boot.py "$MEM_F" </dev/null 2>/dev/null); mem_interp_code=$?
 if [ "$mem_interp_code" -eq 0 ]; then
     ok "mem: feat_stage80_mem runs on the interpreter (exit 0)"
 else
@@ -211,7 +211,7 @@ else
     bad "mem: core/mem.hls missing"
 fi
 # (c) the demo runs end-to-end on the interpreter (exit 0).
-mem_demo_code=$(python3 boot/boot.py examples/mem_demo.hls </dev/null 2>/dev/null; echo $?)
+mem_demo_code=$(python3 tools/hlinterp/boot.py examples/mem_demo.hls </dev/null 2>/dev/null; echo $?)
 if [ "$mem_demo_code" -eq 0 ]; then
     ok "mem: examples/mem_demo.hls runs on the interpreter (exit 0)"
 else
@@ -226,7 +226,7 @@ src = open(sys.argv[1], encoding='utf-8').read()
 src = src.replace('\n#![no_std]\n', '\n#![freestanding]\n', 1)
 open(sys.argv[2], 'w', encoding='utf-8', newline='\n').write(src)
 PY
-if python3 boot/boot.py src/hlc.hls "$mem_fs_src" "$TMP/mem_fs.c" >/dev/null 2>&1 \
+if python3 tools/hlinterp/boot.py src/hlc.hls "$mem_fs_src" "$TMP/mem_fs.c" >/dev/null 2>&1 \
         && gcc -O2 -ffreestanding -nostdlib -ffunction-sections \
                -fno-stack-protector -Wl,--gc-sections \
                -o "$TMP/mem_fs.bin" "$TMP/mem_fs.c" 2>"$TMP/mem_fs.gcc"; then
@@ -263,7 +263,7 @@ echo "=== 18. Stage 81: core.panic + #[panic_handler] ==="
 PANIC_F=tests/ok/feat_stage81_panic.hls
 # (a) the panic ok-test checks + runs on the interpreter (exit 0 —
 #     the effect-free handler is wired but never fires here).
-panic_interp_out=$(python3 boot/boot.py "$PANIC_F" </dev/null 2>/dev/null); panic_interp_code=$?
+panic_interp_out=$(python3 tools/hlinterp/boot.py "$PANIC_F" </dev/null 2>/dev/null); panic_interp_code=$?
 if [ "$panic_interp_code" -eq 0 ]; then
     ok "panic: feat_stage81_panic runs on the interpreter (exit 0)"
 else
@@ -276,8 +276,8 @@ else
     bad "panic: core/panic.hls missing"
 fi
 # (c) the hosted demo panics with the handler marker first (exit 101).
-panic_demo_out=$(python3 boot/boot.py examples/panic_demo.hls </dev/null 2>/dev/null); panic_demo_code=$?
-panic_demo_err=$(python3 boot/boot.py examples/panic_demo.hls </dev/null 2>&1 >/dev/null)
+panic_demo_out=$(python3 tools/hlinterp/boot.py examples/panic_demo.hls </dev/null 2>/dev/null); panic_demo_code=$?
+panic_demo_err=$(python3 tools/hlinterp/boot.py examples/panic_demo.hls </dev/null 2>&1 >/dev/null)
 if [ "$panic_demo_code" -eq 101 ] && echo "$panic_demo_out" | grep -q "kernel panic: demo fault"; then
     ok "panic: examples/panic_demo.hls handler fires, exit 101"
 else
@@ -297,7 +297,7 @@ src = open(sys.argv[1], encoding='utf-8').read()
 src = src.replace('\n#![no_std]\n', '\n#![freestanding]\n', 1)
 open(sys.argv[2], 'w', encoding='utf-8', newline='\n').write(src)
 PY
-if python3 boot/boot.py src/hlc.hls "$panic_fs_src" "$TMP/panic_fs.c" >/dev/null 2>&1 \
+if python3 tools/hlinterp/boot.py src/hlc.hls "$panic_fs_src" "$TMP/panic_fs.c" >/dev/null 2>&1 \
         && gcc -O2 -ffreestanding -nostdlib -ffunction-sections \
                -fno-stack-protector -Wl,--gc-sections \
                -o "$TMP/panic_fs.bin" "$TMP/panic_fs.c" 2>"$TMP/panic_fs.gcc"; then
@@ -333,7 +333,7 @@ echo "=== 19. Stage 82: deterministic stack size + guard pages ==="
 # and the runtime pins task stacks (1 MiB + 4-KiB guard page).
 STK_F=tests/ok/feat_stage82_stack.hls
 # (a) the stack ok-test checks + runs on the interpreter (exit 0).
-stk_interp_out=$(python3 boot/boot.py "$STK_F" </dev/null 2>/dev/null); stk_interp_code=$?
+stk_interp_out=$(python3 tools/hlinterp/boot.py "$STK_F" </dev/null 2>/dev/null); stk_interp_code=$?
 if [ "$stk_interp_code" -eq 0 ]; then
     ok "stack: feat_stage82_stack runs on the interpreter (exit 0)"
 else
@@ -351,20 +351,20 @@ for ff in tests/fail/fail_stack_budget_exceeded.hls \
           tests/fail/fail_stack_budget_recursion.hls \
           tests/fail/fail_stack_size_fn.hls; do
     stk_name=$(basename "$ff" .hls)
-    stk_err=$(python3 boot/boot.py --check "$ff" 2>&1 >/dev/null); stk_rc=$?
+    stk_err=$(python3 tools/hlinterp/boot.py --check "$ff" 2>&1 >/dev/null); stk_rc=$?
     if [ "$stk_rc" -eq 1 ] && echo "$stk_err" | grep -qE "stack_size|bounded recursion"; then
         ok "stack: $stk_name rejected by boot ($stk_err)"
     else
         bad "stack: $stk_name not rejected with a stack message (rc=$stk_rc)"
     fi
-    if python3 boot/boot.py src/hlc.hls "$ff" "$TMP/stk_fail.c" >/dev/null 2>&1; then
+    if python3 tools/hlinterp/boot.py src/hlc.hls "$ff" "$TMP/stk_fail.c" >/dev/null 2>&1; then
         bad "stack: $stk_name accepted by the self-hosted checker"
     else
         ok "stack: $stk_name rejected by hlc too (parity)"
     fi
 done
 # (d) the hosted demo hits the guard (exit 101, handler marker first).
-stk_demo_out=$(python3 boot/boot.py examples/stack_guard_demo.hls </dev/null 2>/dev/null); stk_demo_code=$?
+stk_demo_out=$(python3 tools/hlinterp/boot.py examples/stack_guard_demo.hls </dev/null 2>/dev/null); stk_demo_code=$?
 if [ "$stk_demo_code" -eq 101 ] && echo "$stk_demo_out" | grep -q "kernel panic: stack overflow"; then
     ok "stack: examples/stack_guard_demo.hls hits the guard, exit 101"
 else
@@ -395,7 +395,7 @@ ASM_F=tests/ok/feat_stage83_asmreg.hls
 # (a) the asmreg ok-test checks + runs on the interpreter (exit 0; it
 #     exercises the core.asm model and only DECLARES the asm! blocks).
 asm_interp_code=0
-python3 boot/boot.py "$ASM_F" </dev/null >/dev/null 2>&1 || asm_interp_code=$?
+python3 tools/hlinterp/boot.py "$ASM_F" </dev/null >/dev/null 2>&1 || asm_interp_code=$?
 if [ "$asm_interp_code" -eq 0 ]; then
     ok "asmreg: feat_stage83_asmreg runs on the interpreter (exit 0)"
 else
@@ -411,13 +411,13 @@ fi
 #     Stage 83 message, and the self-hosted checker agrees.
 for ff in tests/fail/fail_asmreg_*.hls; do
     asm_name=$(basename "$ff" .hls)
-    asm_err=$(python3 boot/boot.py --check "$ff" 2>&1 >/dev/null); asm_rc=$?
+    asm_err=$(python3 tools/hlinterp/boot.py --check "$ff" 2>&1 >/dev/null); asm_rc=$?
     if [ "$asm_rc" -eq 1 ] && echo "$asm_err" | grep -q "asm!"; then
         ok "asmreg: $asm_name rejected by boot ($asm_err)"
     else
         bad "asmreg: $asm_name not rejected with an asm! message (rc=$asm_rc)"
     fi
-    if python3 boot/boot.py src/hlc.hls "$ff" "$TMP/asm83_fail.c" >/dev/null 2>&1; then
+    if python3 tools/hlinterp/boot.py src/hlc.hls "$ff" "$TMP/asm83_fail.c" >/dev/null 2>&1; then
         bad "asmreg: $asm_name accepted by the self-hosted checker"
     else
         ok "asmreg: $asm_name rejected by hlc too (parity)"
@@ -456,7 +456,7 @@ fi
 #     core.asm module and the declared asm! blocks carry no libc).
 if [ -x "$TMP/hlc1" ]; then
     sed 's/^#!\[no_std\]$/#![freestanding]/' "$ASM_F" > "$TMP/asm83_fs.hls"
-    if python3 boot/boot.py src/hlc.hls "$TMP/asm83_fs.hls" "$TMP/asm83_fs.c" >/dev/null 2>&1 \
+    if python3 tools/hlinterp/boot.py src/hlc.hls "$TMP/asm83_fs.hls" "$TMP/asm83_fs.c" >/dev/null 2>&1 \
         && grep -q "void _start(void)" "$TMP/asm83_fs.c"; then
         if gcc -O2 -ffreestanding -nostdlib -ffunction-sections \
                 -fno-stack-protector -Wl,--gc-sections \
@@ -496,7 +496,7 @@ echo "=== 21. Stage 84: linker script + custom sections ==="
 # are the suite-level spot checks.
 SEC_F=tests/ok/feat_stage84_section.hls
 # (a) the no_std ok-test is clean on the interpreter.
-sec_interp=$(python3 boot/boot.py "$SEC_F" </dev/null 2>/dev/null); sec_code=$?
+sec_interp=$(python3 tools/hlinterp/boot.py "$SEC_F" </dev/null 2>/dev/null); sec_code=$?
 if [ "$sec_code" -eq 0 ]; then
     ok "link: feat_stage84_section runs on the interpreter (exit 0)"
 else
@@ -512,7 +512,7 @@ fi
 #     own diagnostic.
 for sf in tests/fail/fail_stage84_*.hls; do
     sec_name=$(basename "$sf" .hls)
-    sec_err=$(python3 boot/boot.py --check "$sf" 2>&1 >/dev/null); sec_rc=$?
+    sec_err=$(python3 tools/hlinterp/boot.py --check "$sf" 2>&1 >/dev/null); sec_rc=$?
     if [ "$sec_rc" -ne 1 ]; then
         bad "link: $sec_name not rejected by boot"
         continue
@@ -602,7 +602,7 @@ echo "=== 22. Stage 85: Multiboot2 + Limine boot protocol headers ==="
 # check proves the linker script KEEPs it. The gate is the authority;
 # these are the suite-level spot checks.
 BOOT_F=tests/ok/feat_stage85_boot.hls
-boot_interp=$(python3 boot/boot.py "$BOOT_F" </dev/null 2>/dev/null); boot_code=$?
+boot_interp=$(python3 tools/hlinterp/boot.py "$BOOT_F" </dev/null 2>/dev/null); boot_code=$?
 if [ "$boot_code" -eq 0 ]; then
     ok "boot: feat_stage85_boot runs on the interpreter (exit 0)"
 else
@@ -617,7 +617,7 @@ fi
 # SAME message.
 for bf in tests/fail/fail_stage85_*.hls; do
     boot_name=$(basename "$bf" .hls)
-    boot_err=$(python3 boot/boot.py --check "$bf" 2>&1 >/dev/null); boot_rc=$?
+    boot_err=$(python3 tools/hlinterp/boot.py --check "$bf" 2>&1 >/dev/null); boot_rc=$?
     if [ "$boot_rc" -ne 1 ]; then
         bad "boot: $boot_name not rejected by boot"
         continue
@@ -642,8 +642,8 @@ done
 # a bad mode without panicking on firmware bytes).
 for bp in tests/ok/panic_stage85_*.hls; do
     bp_name=$(basename "$bp" .hls)
-    if python3 boot/boot.py --check "$bp" >/dev/null 2>&1; then
-        bp_out=$(python3 boot/boot.py "$bp" 2>&1 >/dev/null); bp_code=$?
+    if python3 tools/hlinterp/boot.py --check "$bp" >/dev/null 2>&1; then
+        bp_out=$(python3 tools/hlinterp/boot.py "$bp" 2>&1 >/dev/null); bp_code=$?
         if [ "$bp_code" -eq 101 ] && [ -n "$bp_out" ]; then
             ok "boot: $bp_name accepted, panics at run time"
         else
@@ -702,7 +702,7 @@ echo "=== 23. Stage 86: core.interrupt — IDT/GDT declaration syntax ==="
 # plus the binding table a kernel installs. The gate is the authority;
 # these are the suite-level spot checks.
 IDT_F=tests/ok/feat_stage86_interrupt.hls
-idt_interp=$(python3 boot/boot.py "$IDT_F" </dev/null 2>/dev/null); idt_code=$?
+idt_interp=$(python3 tools/hlinterp/boot.py "$IDT_F" </dev/null 2>/dev/null); idt_code=$?
 if [ "$idt_code" -eq 0 ]; then
     ok "idt: feat_stage86_interrupt runs on the interpreter (exit 0)"
 else
@@ -715,7 +715,7 @@ else
 fi
 for if_ in tests/fail/fail_stage86_*.hls; do
     idt_name=$(basename "$if_" .hls)
-    idt_err=$(python3 boot/boot.py --check "$if_" 2>&1 >/dev/null); idt_rc=$?
+    idt_err=$(python3 tools/hlinterp/boot.py --check "$if_" 2>&1 >/dev/null); idt_rc=$?
     if [ "$idt_rc" -ne 1 ]; then
         bad "idt: $idt_name not rejected by boot"
         continue
@@ -805,7 +805,7 @@ echo "=== 24. Stage 87: core.mmio — memory-mapped I/O ==="
 # Halis function 8 bytes off the SysV alignment, so GCC's `movaps`
 # initialisers faulted). The gate is the authority.
 MM_F=tests/ok/feat_stage87_mmio.hls
-mm_interp=$(python3 boot/boot.py "$MM_F" </dev/null 2>/dev/null); mm_code=$?
+mm_interp=$(python3 tools/hlinterp/boot.py "$MM_F" </dev/null 2>/dev/null); mm_code=$?
 if [ "$mm_code" -eq 0 ]; then
     ok "mmio: feat_stage87_mmio runs on the interpreter (exit 0)"
 else
@@ -878,8 +878,8 @@ rm -f "$TMP/mmvol.hls" "$TMP/mmvolfs.hls"
 # The checked constructors are accepted by the checker and panic at run.
 for mp in tests/ok/panic_stage87_*.hls; do
     mp_name=$(basename "$mp" .hls)
-    if python3 boot/boot.py --check "$mp" >/dev/null 2>&1; then
-        mp_out=$(python3 boot/boot.py "$mp" 2>&1 >/dev/null); mp_code=$?
+    if python3 tools/hlinterp/boot.py --check "$mp" >/dev/null 2>&1; then
+        mp_out=$(python3 tools/hlinterp/boot.py "$mp" 2>&1 >/dev/null); mp_code=$?
         if [ "$mp_code" -eq 101 ] && [ -n "$mp_out" ]; then
             ok "mmio: $mp_name accepted, panics at run time"
         else
@@ -920,7 +920,7 @@ echo "=== 25. Stage 88: core.port — x86 I/O ports ==="
 # instructions and its main touches none of them; the gate
 # disassembly-checks the real ones. The gate is the authority.
 PORT_F=tests/ok/feat_stage88_port.hls
-port_interp=$(python3 boot/boot.py "$PORT_F" </dev/null 2>/dev/null); port_code=$?
+port_interp=$(python3 tools/hlinterp/boot.py "$PORT_F" </dev/null 2>/dev/null); port_code=$?
 if [ "$port_code" -eq 0 ]; then
     ok "port: feat_stage88_port runs on the interpreter (exit 0)"
 else
@@ -970,7 +970,7 @@ echo "=== 26. Stage 89: DMA-safe buffer types ==="
 # and must not MOVE — and neither failure is a fault, which is why the
 # requirements are values. The gate is the authority.
 DMA_F=tests/ok/feat_stage89_dma.hls
-dma_interp=$(python3 boot/boot.py "$DMA_F" </dev/null 2>/dev/null); dma_code=$?
+dma_interp=$(python3 tools/hlinterp/boot.py "$DMA_F" </dev/null 2>/dev/null); dma_code=$?
 if [ "$dma_code" -eq 0 ]; then
     ok "dma: feat_stage89_dma runs on the interpreter (exit 0)"
 else
@@ -1009,7 +1009,7 @@ echo "=== 27. Stage 90: core.sync.nolock — lock-free primitives ==="
 # and hazard pointers, as a MODEL so the retry and reclaim rules are
 # testable without threads. The gate is the authority.
 AT_F=tests/ok/feat_stage90_atomics.hls
-at_interp=$(python3 boot/boot.py "$AT_F" </dev/null 2>/dev/null); at_code=$?
+at_interp=$(python3 tools/hlinterp/boot.py "$AT_F" </dev/null 2>/dev/null); at_code=$?
 if [ "$at_code" -eq 0 ]; then
     ok "atomics: feat_stage90_atomics runs on the interpreter (exit 0)"
 else
@@ -1056,7 +1056,7 @@ echo "=== 28. Stage 91: verified interrupt-safety (no alloc in IRQ context) ==="
 # BOTH front-ends); the ok-test pins the accepted world on all three
 # paths; --audit publishes the per-handler proof lines.
 IRQ_F=tests/ok/feat_stage91_irqsafe.hls
-irq_interp=$(python3 boot/boot.py "$IRQ_F" </dev/null 2>/dev/null); irq_code=$?
+irq_interp=$(python3 tools/hlinterp/boot.py "$IRQ_F" </dev/null 2>/dev/null); irq_code=$?
 if [ "$irq_code" -eq 0 ]; then
     ok "irqsafe: feat_stage91_irqsafe runs on the interpreter (exit 0)"
 else
@@ -1067,7 +1067,7 @@ fi
 #     matching the Stage 86 parity protocol.
 for ff in tests/fail/fail_stage91_*.hls; do
     irq_name=$(basename "$ff" .hls)
-    irq_err=$(python3 boot/boot.py --check "$ff" 2>&1 >/dev/null); irq_rc=$?
+    irq_err=$(python3 tools/hlinterp/boot.py --check "$ff" 2>&1 >/dev/null); irq_rc=$?
     irq_hlc=$(./bin/hlc --audit "$ff" 2>&1 >/dev/null); irq_hrc=$?
     irq_norm_b=$(echo "$irq_err" | sed -E 's/^[a-z ]*error: //; s/ \(line [0-9]+\)$//' | head -1)
     irq_norm_h=$(echo "$irq_hlc" | sed -E 's/^panic: //; s/^[a-z ]*error: //; s/ \(line [0-9]+\)$//' | head -1)
@@ -1136,7 +1136,7 @@ echo "=== 30. Stage 93: target x86_64-unknown-none (bare-metal triple) ==="
 # integer-only discipline and the freestanding implication live in the
 # checker, the image placement in targets/x86_64-unknown-none.ld.
 # (a) the demo probe runs on the interpreter (exit 42).
-python3 boot/boot.py examples/bare_x86_64.hls </dev/null >/dev/null 2>&1
+python3 tools/hlinterp/boot.py examples/bare_x86_64.hls </dev/null >/dev/null 2>&1
 if [ $? -eq 42 ]; then
     ok "triple93: bare_x86_64 probe computes 42 on the interpreter"
 else
@@ -1145,7 +1145,7 @@ fi
 # (b) a float literal is refused under --target by BOTH front-ends with
 #     the same words, and stays legal WITHOUT the flag.
 bm_f=tests/bare/fail_bare_float_literal.hls
-bm_b=$(python3 boot/boot.py --check --target x86_64-unknown-none "$bm_f" 2>&1 >/dev/null)
+bm_b=$(python3 tools/hlinterp/boot.py --check --target x86_64-unknown-none "$bm_f" 2>&1 >/dev/null)
 bm_b_rc=$?
 bm_h=$(./bin/hlc --target x86_64-unknown-none "$bm_f" "$TMP/bm93.c" 2>&1 >/dev/null)
 bm_h_rc=$?
@@ -1157,7 +1157,7 @@ if [ "$bm_b_rc" -ne 0 ] && [ "$bm_h_rc" -ne 0 ] \
 else
     bad "triple93: float-literal probe parity (boot rc=$bm_b_rc, hlc rc=$bm_h_rc)"
 fi
-if python3 boot/boot.py --check "$bm_f" >/dev/null 2>&1; then
+if python3 tools/hlinterp/boot.py --check "$bm_f" >/dev/null 2>&1; then
     ok "triple93: the probe is a legal hosted crate without --target"
 else
     bad "triple93: the probe is rejected without --target (not conditional)"

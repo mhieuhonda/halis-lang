@@ -182,7 +182,7 @@ def run_interp(file_path, argv, timeout_s):
     env = dict(os.environ)
     env["HL_DET_SCHED"] = "1"
     env["HL_DET_TRACE"] = "1"
-    cmd = [sys.executable, os.path.join(REPO_ROOT, "boot", "boot.py"),
+    cmd = [sys.executable, os.path.join(REPO_ROOT, "tools", "hlinterp", "boot.py"),
            "--det", file_path] + argv
     try:
         p = subprocess.run(cmd, stdin=subprocess.DEVNULL,

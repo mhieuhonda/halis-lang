@@ -404,10 +404,10 @@ expect(src_root["modules"][0]["surface"] ==
 print("=== 7. the demos ===")
 # ---------------------------------------------------------------------------
 
-p1 = run([sys.executable, "boot/boot.py", DEMO])
+p1 = run([sys.executable, "tools/hlinterp/boot.py", DEMO])
 expect(p1.returncode == 0 and "surface: IO declared here" in p1.stdout,
        "the demo runs (interpreter)")
-p2 = run([sys.executable, "boot/boot.py", OK_TEST])
+p2 = run([sys.executable, "tools/hlinterp/boot.py", OK_TEST])
 expect(p2.returncode == 0 and "checks passed: 4" in p2.stdout,
        "the ok-test runs (interpreter)")
 

@@ -5,7 +5,7 @@
 echo "=== 1. Stage-0: valid programs ==="
 for f in tests/ok/*.hls; do
     name=$(basename "$f" .hls)
-    out=$(python3 boot/boot.py "$f" </dev/null 2>/dev/null); code=$?
+    out=$(python3 tools/hlinterp/boot.py "$f" </dev/null 2>/dev/null); code=$?
     if [ $code -eq 0 ] || [ $code -eq 101 ]; then
         snap="tests/snapshots/$name.txt"
         if [ -f "$snap" ] && [ "$out" != "$(cat "$snap")" ]; then
@@ -21,7 +21,7 @@ done
 echo "=== 2. Stage-0: programs EXPECTED TO FAIL ==="
 for f in tests/fail/*.hls; do
     name=$(basename "$f" .hls)
-    err=$(python3 boot/boot.py --check "$f" 2>&1 >/dev/null); code=$?
+    err=$(python3 tools/hlinterp/boot.py --check "$f" 2>&1 >/dev/null); code=$?
     if [ $code -eq 1 ]; then
         ok "$name -> $err"
     else
@@ -51,8 +51,8 @@ for f in tests/ok/*.hls; do
     # read_line() don't hang waiting for input. The interpreter reads
     # EOF (returns empty tainted[str]); the native binary does the same
     # — the differential test still compares apples to apples.
-    interp_out=$(python3 boot/boot.py "$f" </dev/null 2>/dev/null); interp_code=$?
-    if ! python3 boot/boot.py src/hlc.hls "$f" "$TMP/$name.c" >/dev/null 2>&1; then
+    interp_out=$(python3 tools/hlinterp/boot.py "$f" </dev/null 2>/dev/null); interp_code=$?
+    if ! python3 tools/hlinterp/boot.py src/hlc.hls "$f" "$TMP/$name.c" >/dev/null 2>&1; then
         bad "$name (hlc compile failed)"
         continue
     fi
@@ -88,7 +88,7 @@ echo "=== 3b. Stage 8-beta memory-stress (native RSS must stay flat) ==="
 # increase RSS. The stress binary churns ~500k allocations of every heap
 # shape; under the old arena model it would exhaust a 256 MB address
 # space, with refcounting it completes with delta == 0 pages.
-if python3 boot/boot.py src/hlc.hls tests/memcheck/stress_leak.hls "$TMP/stress.c" >/dev/null 2>&1 \
+if python3 tools/hlinterp/boot.py src/hlc.hls tests/memcheck/stress_leak.hls "$TMP/stress.c" >/dev/null 2>&1 \
     && gcc -O2 -o "$TMP/stress" "$TMP/stress.c" -lm -pthread 2>/dev/null; then
     stress_out=$(bash -c "ulimit -v 262144; \"$TMP/stress\"" 2>/dev/null); stress_rc=$?
     if [ $stress_rc -eq 0 ]; then

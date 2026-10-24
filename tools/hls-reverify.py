@@ -75,9 +75,9 @@ class CliError(Exception):
 def _load_and_check(path):
     """The ONE authoritative pipeline: load_program + check — the same
     fixpoint every tool in this repository runs first."""
-    from boot.boot import load_program
-    from boot.checker import check
-    from boot.lexer import HLError
+    from tools.hlinterp.boot import load_program
+    from tools.hlinterp.checker import check
+    from tools.hlinterp.lexer import HLError
     try:
         program = load_program(path)
     except HLError as ex:
@@ -95,7 +95,7 @@ def _build_modules(program, lto):
     """IR0 (pre-optimisation) and IR1 (optimised, fast=True)."""
     from ir import build_module
     from ir.optimize import optimize
-    from boot.lexer import HLError
+    from tools.hlinterp.lexer import HLError
     try:
         mod0 = build_module(program)
         mod1 = build_module(program)

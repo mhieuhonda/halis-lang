@@ -95,7 +95,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 
 TOOL = [sys.executable, "tools/hls-migrate.py"]
-BOOT = [sys.executable, "boot/boot.py"]
+BOOT = [sys.executable, "tools/hlinterp/boot.py"]
 FMT = [sys.executable, "tools/hlfmt.py"]
 LINT = [sys.executable, "tools/hllint.py"]
 HLC = os.path.join(ROOT, "bin", "hlc")

@@ -136,7 +136,7 @@ with open(probe, "w", encoding="utf-8") as fh:
     )
 # `--check` / compile-to-C only: this probe is about the PARSE, and
 # running it would exit with main's return value.
-for label, cmd in (("boot", ["python3", "boot/boot.py", "--check", probe]),
+for label, cmd in (("boot", ["python3", "tools/hlinterp/boot.py", "--check", probe]),
                    ("hlc", ["./bin/hlc", probe, os.path.join(TMP, "probe.c")])):
     r = run(cmd)
     if r.returncode == 0:
@@ -153,7 +153,7 @@ with open(dep, "w", encoding="utf-8") as fh:
 entry = os.path.join(TMP, "entry_dep.hls")
 with open(entry, "w", encoding="utf-8") as fh:
     fh.write('import "./dep.hls"\n\nfn main() -> int {\n    return helper()\n}\n')
-r = run(["python3", "boot/boot.py", "--check", entry])
+r = run(["python3", "tools/hlinterp/boot.py", "--check", entry])
 if r.returncode == 1 and "only allowed in the entry file" in (r.stdout + r.stderr):
     ok("link: #![link_script] is entry-file-only")
 else:
@@ -161,7 +161,7 @@ else:
         % (r.stdout + r.stderr).strip()[:120])
 
 # A missing linker script is an error, not a warning.
-r = run(["python3", "boot/boot.py", "--check", "tests/fail/fail_stage84_link_script_missing.hls"])
+r = run(["python3", "tools/hlinterp/boot.py", "--check", "tests/fail/fail_stage84_link_script_missing.hls"])
 if r.returncode == 1 and "cannot read the linker script" in (r.stdout + r.stderr):
     ok("link: a missing linker script is rejected by name")
 else:
@@ -202,7 +202,7 @@ for fn in ("section_check", "section_check_why", "section_align_ok",
 # ---------------------------------------------------------------------------
 print("=== 3. Stage-0 enforcement ===")
 # ---------------------------------------------------------------------------
-r = run(["python3", "boot/boot.py", OK_TEST])
+r = run(["python3", "tools/hlinterp/boot.py", OK_TEST])
 if r.returncode == 0:
     ok("link: ok-test clean on the interpreter")
 else:
@@ -214,7 +214,7 @@ if code == 0 and "DEMO OK" in out:
 else:
     bad("link: section_demo exit=%s (%s)" % (code, out.strip()[:120]))
 
-r = run(["python3", "boot/boot.py", DEMO])
+r = run(["python3", "tools/hlinterp/boot.py", DEMO])
 if r.returncode == 0 and "DEMO OK" in r.stdout:
     ok("link: section_demo runs on the interpreter, DEMO OK")
 else:
@@ -225,7 +225,7 @@ for name, needle, desc in FAIL_PROGRAMS:
     if not os.path.exists(path):
         bad("link: %s missing" % path)
         continue
-    rb = run(["python3", "boot/boot.py", "--check", path])
+    rb = run(["python3", "tools/hlinterp/boot.py", "--check", path])
     if rb.returncode != 1:
         bad("link: %s not rejected by boot" % name)
         continue
@@ -380,7 +380,7 @@ for name, body, want, desc in PROBES:
     path = os.path.join(TMP, "probe_%s.hls" % name)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(body)
-    r = run(["python3", "boot/boot.py", path])
+    r = run(["python3", "tools/hlinterp/boot.py", path])
     if r.returncode != want:
         bad("link: probe %s (interp) exit=%d want=%d — %s"
             % (name, r.returncode, want, (r.stdout + r.stderr).strip()[:100]))
@@ -556,7 +556,7 @@ else:
 # ---------------------------------------------------------------------------
 print("=== 7. --audit ===")
 # ---------------------------------------------------------------------------
-for label, cmd in (("boot", ["python3", "boot/boot.py", "--audit", good]),
+for label, cmd in (("boot", ["python3", "tools/hlinterp/boot.py", "--audit", good]),
                    ("hlc", ["./bin/hlc", "--audit", good])):
     r = run(cmd)
     text = r.stdout + r.stderr

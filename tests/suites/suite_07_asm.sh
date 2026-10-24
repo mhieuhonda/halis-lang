@@ -12,7 +12,7 @@ echo "=== 18. Stage 27: inline assembly (asm!) ==="
 # be parsed + type-checked by boot.
 
 # (a) boot parses feat_stage27_asm.hls (smoke test).
-if python3 boot/boot.py tests/ok/feat_stage27_asm.hls >"$TMP/s27_boot.out" 2>&1; then
+if python3 tools/hlinterp/boot.py tests/ok/feat_stage27_asm.hls >"$TMP/s27_boot.out" 2>&1; then
     if grep -q "ACCEPTANCE OK" "$TMP/s27_boot.out"; then
         ok "asm: feat_stage27_asm.hls runs on the boot interpreter (no asm executed)"
     else
@@ -25,7 +25,7 @@ else
 fi
 
 # (b) the asm! syntax parses via boot's --check mode.
-if python3 boot/boot.py --check tests/ok/feat_stage27_asm.hls >"$TMP/s27_check.out" 2>&1; then
+if python3 tools/hlinterp/boot.py --check tests/ok/feat_stage27_asm.hls >"$TMP/s27_check.out" 2>&1; then
     if grep -q "OK: types and effects valid" "$TMP/s27_check.out"; then
         ok "asm: boot --check accepts the asm! syntax (types + effects valid)"
     else
@@ -103,7 +103,7 @@ fn main() -> int uses IO {
     return 0
 }
 HLS_EOF
-if python3 boot/boot.py "$TMP/s27_run.hls" >"$TMP/s27_run.out" 2>&1; then
+if python3 tools/hlinterp/boot.py "$TMP/s27_run.hls" >"$TMP/s27_run.out" 2>&1; then
     bad "asm: interpreter should have raised an error on asm! execution"
     cat "$TMP/s27_run.out"
 else
@@ -125,7 +125,7 @@ fn main() -> int uses IO {
     return 0
 }
 HLS_EOF
-if python3 boot/boot.py --check "$TMP/s27_bad_oob.hls" >"$TMP/s27_bad_oob.out" 2>&1; then
+if python3 tools/hlinterp/boot.py --check "$TMP/s27_bad_oob.hls" >"$TMP/s27_bad_oob.out" 2>&1; then
     bad "asm: checker did not reject out-of-range {5} template placeholder"
 else
     if grep -q "out of range" "$TMP/s27_bad_oob.out"; then
@@ -145,7 +145,7 @@ fn main() -> int uses IO {
     return 0
 }
 HLS_EOF
-if python3 boot/boot.py --check "$TMP/s27_bad_pure.hls" >"$TMP/s27_bad_pure.out" 2>&1; then
+if python3 tools/hlinterp/boot.py --check "$TMP/s27_bad_pure.hls" >"$TMP/s27_bad_pure.out" 2>&1; then
     bad "asm: checker did not reject options(pure) with no outputs"
 else
     if grep -q "pure" "$TMP/s27_bad_pure.out"; then
@@ -166,7 +166,7 @@ fn main() -> int uses IO {
     return 0
 }
 HLS_EOF
-if python3 boot/boot.py --check "$TMP/s27_bad_noret.hls" >"$TMP/s27_bad_noret.out" 2>&1; then
+if python3 tools/hlinterp/boot.py --check "$TMP/s27_bad_noret.hls" >"$TMP/s27_bad_noret.out" 2>&1; then
     bad "asm: checker did not reject options(noreturn) with outputs"
 else
     if grep -q "noreturn" "$TMP/s27_bad_noret.out"; then
@@ -187,7 +187,7 @@ fn main() -> int uses IO {
     return 0
 }
 HLS_EOF
-if python3 boot/boot.py --check "$TMP/s27_bad_immut.hls" >"$TMP/s27_bad_immut.out" 2>&1; then
+if python3 tools/hlinterp/boot.py --check "$TMP/s27_bad_immut.hls" >"$TMP/s27_bad_immut.out" 2>&1; then
     bad "asm: checker did not reject out(reg) on immutable x"
 else
     if grep -q "mut" "$TMP/s27_bad_immut.out"; then
@@ -213,7 +213,7 @@ fi
 
 # (p) bootstrap is deterministic with the asm! additions (the
 #     self-hosted compiler must remain deterministic).
-if python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_asm1.c" >/dev/null 2>&1     && python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_asm2.c" >/dev/null 2>&1; then
+if python3 tools/hlinterp/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_asm1.c" >/dev/null 2>&1     && python3 tools/hlinterp/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_asm2.c" >/dev/null 2>&1; then
     if diff -q "$TMP/hlc_asm1.c" "$TMP/hlc_asm2.c" >/dev/null; then
         ok "asm: bootstrap deterministic with asm! changes"
     else
@@ -252,7 +252,7 @@ fi
 # ======================================================================
 
 # (r) checker rejects an unknown string-form constraint (`"exa"`).
-if python3 boot/boot.py --check tests/fail/fail_asm_bad_constraint_str.hls >"$TMP/s27_r.out" 2>&1; then
+if python3 tools/hlinterp/boot.py --check tests/fail/fail_asm_bad_constraint_str.hls >"$TMP/s27_r.out" 2>&1; then
     bad "asm: checker accepted unknown string-form constraint 'exa'"
 else
     if grep -q "not a recognised x86-64 register name" "$TMP/s27_r.out"; then
@@ -276,7 +276,7 @@ else
 fi
 
 # (s) checker rejects duplicate options (`options(nomem, nomem)`).
-if python3 boot/boot.py --check tests/fail/fail_asm_dup_option.hls >"$TMP/s27_s.out" 2>&1; then
+if python3 tools/hlinterp/boot.py --check tests/fail/fail_asm_dup_option.hls >"$TMP/s27_s.out" 2>&1; then
     bad "asm: checker accepted duplicate option 'nomem'"
 else
     if grep -q "appears more than once" "$TMP/s27_s.out"; then
@@ -300,7 +300,7 @@ else
 fi
 
 # (t) checker rejects pure + noreturn (contradictory).
-if python3 boot/boot.py --check tests/fail/fail_asm_pure_noreturn.hls >"$TMP/s27_t.out" 2>&1; then
+if python3 tools/hlinterp/boot.py --check tests/fail/fail_asm_pure_noreturn.hls >"$TMP/s27_t.out" 2>&1; then
     bad "asm: checker accepted contradictory pure + noreturn"
 else
     if grep -q "pure.*noreturn.*contradictory\|noreturn.*pure.*contradictory\|contradictory" "$TMP/s27_t.out"; then
@@ -312,7 +312,7 @@ else
 fi
 
 # (u) checker rejects pure without nomem.
-if python3 boot/boot.py --check tests/fail/fail_asm_pure_without_nomem.hls >"$TMP/s27_u.out" 2>&1; then
+if python3 tools/hlinterp/boot.py --check tests/fail/fail_asm_pure_without_nomem.hls >"$TMP/s27_u.out" 2>&1; then
     bad "asm: checker accepted pure without nomem"
 else
     if grep -q "requires.*nomem" "$TMP/s27_u.out"; then
@@ -324,7 +324,7 @@ else
 fi
 
 # (v) checker rejects imm constraint on out/inout/late_out.
-if python3 boot/boot.py --check tests/fail/fail_asm_imm_out.hls >"$TMP/s27_v.out" 2>&1; then
+if python3 tools/hlinterp/boot.py --check tests/fail/fail_asm_imm_out.hls >"$TMP/s27_v.out" 2>&1; then
     bad "asm: checker accepted imm on out direction"
 else
     if grep -q "imm.*cannot be used" "$TMP/s27_v.out"; then
@@ -336,7 +336,7 @@ else
 fi
 
 # (w) checker rejects direction-prefix/constraint mismatch (`in("=r") x`).
-if python3 boot/boot.py --check tests/fail/fail_asm_in_prefix_constraint.hls >"$TMP/s27_w.out" 2>&1; then
+if python3 tools/hlinterp/boot.py --check tests/fail/fail_asm_in_prefix_constraint.hls >"$TMP/s27_w.out" 2>&1; then
     bad "asm: checker accepted in(\"=r\") x (direction-prefix mismatch)"
 else
     if grep -q "direction prefix" "$TMP/s27_w.out"; then
@@ -349,7 +349,7 @@ fi
 
 # (x) the deep-scan-17 positive regression test compiles + runs cleanly
 #     on the boot interpreter and produces the expected output.
-if python3 boot/boot.py tests/ok/feat_stage27_perfection.hls >"$TMP/s27_x.out" 2>&1; then
+if python3 tools/hlinterp/boot.py tests/ok/feat_stage27_perfection.hls >"$TMP/s27_x.out" 2>&1; then
     if grep -q "deep-scan-17 hardening does not break valid asm!" "$TMP/s27_x.out"; then
         ok "asm: feat_stage27_perfection.hls runs on the boot interpreter"
     else
@@ -389,7 +389,7 @@ else
 fi
 
 # (y) boot --check accepts feat_stage27_perfection.hls (types + effects valid).
-if python3 boot/boot.py --check tests/ok/feat_stage27_perfection.hls >"$TMP/s27_y.out" 2>&1; then
+if python3 tools/hlinterp/boot.py --check tests/ok/feat_stage27_perfection.hls >"$TMP/s27_y.out" 2>&1; then
     if grep -q "OK: types and effects valid" "$TMP/s27_y.out"; then
         ok "asm: boot --check accepts feat_stage27_perfection.hls"
     else
@@ -405,7 +405,7 @@ fi
 #     additions (the new HLS code in src/hlc.hls must self-compile
 #     deterministically — both boot and self-hosted compilers must
 #     agree on the new check_asm logic).
-if python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_ds17_1.c" >/dev/null 2>&1     && python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_ds17_2.c" >/dev/null 2>&1; then
+if python3 tools/hlinterp/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_ds17_1.c" >/dev/null 2>&1     && python3 tools/hlinterp/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_ds17_2.c" >/dev/null 2>&1; then
     if diff -q "$TMP/hlc_ds17_1.c" "$TMP/hlc_ds17_2.c" >/dev/null; then
         ok "asm: bootstrap deterministic with deep-scan-17 checker additions"
     else
@@ -427,7 +427,7 @@ fi
 # ======================================================================
 
 # (aa) checker rejects in(imm) on a RUNTIME expression.
-if python3 boot/boot.py --check tests/fail/fail_asm_imm_runtime.hls >"$TMP/s27_aa.out" 2>&1; then
+if python3 tools/hlinterp/boot.py --check tests/fail/fail_asm_imm_runtime.hls >"$TMP/s27_aa.out" 2>&1; then
     bad "asm: checker accepted in(imm) on runtime expr"
 else
     if grep -q "requires a compile-time constant" "$TMP/s27_aa.out"; then
@@ -440,7 +440,7 @@ fi
 
 # (bb) the deep-scan-18 positive regression test (feat_stage27_perfection2.hls)
 #      runs on the boot interpreter and produces expected output.
-if python3 boot/boot.py tests/ok/feat_stage27_perfection2.hls >"$TMP/s27_bb.out" 2>&1; then
+if python3 tools/hlinterp/boot.py tests/ok/feat_stage27_perfection2.hls >"$TMP/s27_bb.out" 2>&1; then
     if grep -q "deep-scan-18 hardening does not break valid programs" "$TMP/s27_bb.out"; then
         ok "asm: feat_stage27_perfection2.hls runs on the boot interpreter"
     else
@@ -486,7 +486,7 @@ fn main() -> int uses IO {
     return check_sqrt()
 }
 HLS_EOF
-if python3 boot/boot.py "$TMP/s27_bd.hls" >"$TMP/s27_bd.out" 2>&1; then
+if python3 tools/hlinterp/boot.py "$TMP/s27_bd.hls" >"$TMP/s27_bd.out" 2>&1; then
     if grep -q "deep-scan-18: math_sqrt finite-path unchanged" "$TMP/s27_bd.out"; then
         ok "asm: math_sqrt finite-path unchanged (BUG-05 fix is sound)"
     else
@@ -516,7 +516,7 @@ fn main() -> int uses IO {
     return 1
 }
 HLS_EOF
-if python3 boot/boot.py "$TMP/s27_be.hls" >"$TMP/s27_be.out" 2>&1; then
+if python3 tools/hlinterp/boot.py "$TMP/s27_be.hls" >"$TMP/s27_be.out" 2>&1; then
     if grep -q "const_eval normal path unchanged" "$TMP/s27_be.out"; then
         ok "asm: proof const_eval normal-path unchanged (BUG-02 fix is sound)"
     else
@@ -548,7 +548,7 @@ fn main() -> int uses IO {
     return 1
 }
 HLS_EOF
-if python3 boot/boot.py "$TMP/s27_bf.hls" >"$TMP/s27_bf.out" 2>&1; then
+if python3 tools/hlinterp/boot.py "$TMP/s27_bf.hls" >"$TMP/s27_bf.out" 2>&1; then
     if grep -q "non-cyclic clone unchanged" "$TMP/s27_bf.out"; then
         ok "asm: non-cyclic clone unchanged (BUG-03 fix is sound)"
     else
@@ -586,7 +586,7 @@ fn main() -> int uses IO {
     return 1
 }
 HLS_EOF
-if python3 boot/boot.py "$TMP/s27_bg.hls" >"$TMP/s27_bg.out" 2>&1; then
+if python3 tools/hlinterp/boot.py "$TMP/s27_bg.hls" >"$TMP/s27_bg.out" 2>&1; then
     if grep -q "struct-default effect propagation unchanged" "$TMP/s27_bg.out"; then
         ok "asm: struct-default effect propagation unchanged (BUG-04 fix is sound)"
     else
@@ -603,7 +603,7 @@ fi
 #      box_fn_for/gen_unbox, BUG-06 fix in check_bin/check_method/
 #      check_qmark, BUG-07 fix in parse_placeholder_int — must
 #      self-compile deterministically).
-if python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_ds18_1.c" >/dev/null 2>&1     && python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_ds18_2.c" >/dev/null 2>&1; then
+if python3 tools/hlinterp/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_ds18_1.c" >/dev/null 2>&1     && python3 tools/hlinterp/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_ds18_2.c" >/dev/null 2>&1; then
     if diff -q "$TMP/hlc_ds18_1.c" "$TMP/hlc_ds18_2.c" >/dev/null; then
         ok "asm: bootstrap deterministic with deep-scan-18 codegen additions"
     else

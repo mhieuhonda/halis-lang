@@ -31,7 +31,7 @@ benchmark sees: the tool gets slower to feed.
 The instrument is the compiler itself, and Halis ships two of them,
 so they are two INSTRUMENTS, never compared:
 
-  stage0  python3 boot/boot.py src/hlc.hls <workload> <out.c>
+  stage0  python3 tools/hlinterp/boot.py src/hlc.hls <workload> <out.c>
          (the bootstrap chain — the front door every contributor's
          `make` walks through)
   native  bin/hlc <workload> <out.c>
@@ -57,7 +57,7 @@ hls-ctime is a LEDGER over commits:
      the compiler source (src/hlc.hls + src/hlc/*.hls — the bytes
      of the thing being timed) and the sha256 of the compiler
      BINARY actually timed (bin/hlc on the native instrument;
-     boot/boot.py on stage0) — and the STALE-BINARY LAW bites at
+     tools/hlinterp/boot.py on stage0) — and the STALE-BINARY LAW bites at
      record time: a native record whose compiler digest was already
      filed against a DIFFERENT source digest is refused, because
      bin/hlc was not rebuilt for the commit it claims to measure
@@ -140,7 +140,7 @@ INSTRUMENTS = ("stage0", "native")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HLC_SOURCE_ENTRY = os.path.join("src", "hlc.hls")
 HLC_SOURCE_DIR = os.path.join("src", "hlc")
-BOOT_DRIVER = os.path.join("boot", "boot.py")
+BOOT_DRIVER = os.path.join("tools", "hlinterp", "boot.py")
 NATIVE_COMPILER = os.path.join("bin", "hlc")
 
 # The statistics are hls-bench's statistics — imported, not
@@ -272,7 +272,7 @@ def compiler_binary_digest(root, instrument):
     """sha256 of the compiler BINARY actually timed — bin/hlc for the
     native instrument (an untracked build artifact, so the record
     pins its bytes itself: the clean-tree check cannot vouch for it),
-    boot/boot.py for stage0 (the driver the chain runs through; the
+    tools/hlinterp/boot.py for stage0 (the driver the chain runs through; the
     interpreter's word is the Python fingerprint in the env)."""
     path = os.path.join(root, NATIVE_COMPILER if instrument == "native"
                         else BOOT_DRIVER)
@@ -1079,7 +1079,7 @@ def render_dashboard(entries, history_path, limit, stamp=None):
       "is append-only and this document is a pure render of it (the "
       "sha256 above pins the bytes).")
     a("- The instrument is the compiler itself. `stage0` is the "
-      "bootstrap chain (boot/boot.py running src/hlc.hls); `native` "
+      "bootstrap chain (tools/hlinterp/boot.py running src/hlc.hls); `native` "
       "is bin/hlc. They time the same quantity through different "
       "machines and are never compared to each other.")
     a("- Every record pins the compiler's identity: the sha256 of the "

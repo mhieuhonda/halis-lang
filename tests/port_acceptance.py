@@ -308,7 +308,7 @@ else:
 # ---------------------------------------------------------------------------
 print("=== 5. the model ===")
 # ---------------------------------------------------------------------------
-r = run(["python3", "boot/boot.py", OK_TEST])
+r = run(["python3", "tools/hlinterp/boot.py", OK_TEST])
 if r.returncode == 0:
     ok("port: the ok-test is clean on the interpreter")
 else:
@@ -345,7 +345,7 @@ print("=== 6. behaviour probes ===")
 # ---------------------------------------------------------------------------
 for name, body, want, desc in PROBES:
     path = write("probe_%s.hls" % name, body)
-    r = run(["python3", "boot/boot.py", path])
+    r = run(["python3", "tools/hlinterp/boot.py", path])
     if r.returncode != want:
         bad("port: probe %s (interp) exit=%d want=%d — %s"
             % (name, r.returncode, want, (r.stdout + r.stderr).strip()[:100]))

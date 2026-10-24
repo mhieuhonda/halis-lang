@@ -278,7 +278,7 @@ else:
 # ---------------------------------------------------------------------------
 print("=== 2. the memory orders ===")
 # ---------------------------------------------------------------------------
-r = run(["python3", "boot/boot.py", write("orders.hls", PROBES[0][1])])
+r = run(["python3", "tools/hlinterp/boot.py", write("orders.hls", PROBES[0][1])])
 if r.returncode == 0:
     ok("atomics: the four orders and their two bits agree with the spec")
 else:
@@ -289,7 +289,7 @@ print("=== 3. the model ===")
 # ---------------------------------------------------------------------------
 for name, body, want, desc in PROBES[1:]:
     path = write("probe_%s.hls" % name, body)
-    r = run(["python3", "boot/boot.py", path])
+    r = run(["python3", "tools/hlinterp/boot.py", path])
     if r.returncode != want:
         bad("atomics: probe %s (interp) exit=%d want=%d — %s"
             % (name, r.returncode, want, (r.stdout + r.stderr).strip()[:100]))
@@ -382,7 +382,7 @@ else:
 # ---------------------------------------------------------------------------
 print("=== 5. the ok-test ===")
 # ---------------------------------------------------------------------------
-r = run(["python3", "boot/boot.py", OK_TEST])
+r = run(["python3", "tools/hlinterp/boot.py", OK_TEST])
 if r.returncode == 0:
     ok("atomics: the ok-test is clean on the interpreter")
 else:

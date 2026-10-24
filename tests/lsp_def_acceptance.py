@@ -58,7 +58,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 LSP = os.path.join(ROOT, "tools", "hls-lsp.py")
 SMOKE = os.path.join(ROOT, "tools", "lsp_smoke.py")
 OK_TEST = os.path.join(ROOT, "tests", "ok", "feat_stage113_lsp_resolve.hls")
-BOOT = [sys.executable, os.path.join(ROOT, "boot", "boot.py")]
+BOOT = [sys.executable, os.path.join(ROOT, "tools", "hlinterp", "boot.py")]
 
 PASS = 0
 FAIL = 0

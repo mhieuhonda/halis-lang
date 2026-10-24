@@ -139,11 +139,11 @@ from concurrent.futures import ThreadPoolExecutor
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 
-from boot.lexer import HLError                       # noqa: E402
-from boot.parser import parse                        # noqa: E402
-from boot.checker import check                       # noqa: E402
-from boot.checking.helpers import BUILTIN_FNS        # noqa: E402
-from boot.boot import load_program                   # noqa: E402
+from tools.hlinterp.lexer import HLError                       # noqa: E402
+from tools.hlinterp.parser import parse                        # noqa: E402
+from tools.hlinterp.checker import check                       # noqa: E402
+from tools.hlinterp.checking.helpers import BUILTIN_FNS        # noqa: E402
+from tools.hlinterp.boot import load_program                   # noqa: E402
 
 TOOL_VERSION = "hls-fuzzseed 1 (Stage 134, v0.152.0-alpha)"
 
@@ -881,7 +881,7 @@ def smoke_run(path, timeout_s):
     """'ok' | 'panic:<first line>' | 'timeout' | 'error:<first line>'."""
     try:
         p = subprocess.run(
-            [sys.executable, os.path.join(REPO_ROOT, "boot/boot.py"), path],
+            [sys.executable, os.path.join(REPO_ROOT, "tools/hlinterp/boot.py"), path],
             capture_output=True, timeout=timeout_s, input=b"",
             cwd=REPO_ROOT)
     except subprocess.TimeoutExpired:

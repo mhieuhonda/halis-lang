@@ -1163,11 +1163,11 @@ def _load_frontends(root):
     in."""
     if root not in sys.path:
         sys.path.insert(0, root)
-    from boot.lexer import (KEYWORDS, RESERVED_IDENTIFIERS, TWO_CHAR,
+    from tools.hlinterp.lexer import (KEYWORDS, RESERVED_IDENTIFIERS, TWO_CHAR,
                             ONE_CHAR, tokenize, HLError)
-    from boot.parser import Parser, CRATE_ATTRS, KNOWN_EFFECTS
-    from boot.checker import check
-    from boot.checking.helpers import (BUILTIN_FNS, STR_M, INT_M,
+    from tools.hlinterp.parser import Parser, CRATE_ATTRS, KNOWN_EFFECTS
+    from tools.hlinterp.checker import check
+    from tools.hlinterp.checking.helpers import (BUILTIN_FNS, STR_M, INT_M,
                                        FLOAT_M, BOOL_M)
     globals().update({
         "KEYWORDS": KEYWORDS, "RESERVED_IDENTIFIERS": RESERVED_IDENTIFIERS,

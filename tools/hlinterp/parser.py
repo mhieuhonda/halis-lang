@@ -248,7 +248,7 @@ class Parser:
     # Stage 28+29 (v0.45.0-alpha): attribute parser state. The boot
     # interpreter does NOT honour these attributes (they only affect C
     # codegen in the self-hosted compiler), but it MUST parse them so
-    # that running `boot/boot.py file_with_attrs.hls` does not error.
+    # that running `tools/hlinterp/boot.py file_with_attrs.hls` does not error.
     # parse_attributes populates these; parse_fn reads them and stores
     # them on the fn dict (the checker / interp ignore them).
     def reset_cur_attrs(self):

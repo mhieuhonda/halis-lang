@@ -489,10 +489,10 @@ else:
 print("=== 8. the demos ===")
 # ---------------------------------------------------------------------------
 
-p1 = run([sys.executable, "boot/boot.py", DEMO], env=os.environ)
+p1 = run([sys.executable, "tools/hlinterp/boot.py", DEMO], env=os.environ)
 expect(p1.returncode == 0 and "hashed, chained, signed" in p1.stdout,
        "the demo runs (interpreter)")
-p2 = run([sys.executable, "boot/boot.py", OK_TEST], env=os.environ)
+p2 = run([sys.executable, "tools/hlinterp/boot.py", OK_TEST], env=os.environ)
 expect(p2.returncode == 0 and "checks passed" in p2.stdout,
        "the ok-test runs (interpreter)")
 

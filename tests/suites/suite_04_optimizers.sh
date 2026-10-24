@@ -13,11 +13,11 @@ echo "=== 8. Stage 20: LTO across crates (inlining + DCE) ==="
 #       functions),
 #   (d) --emit lto produces a whole-program LTO'd LLVM IR module.
 if [ ! -x "$TMP/hlc1" ]; then
-    python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
+    python3 tools/hlinterp/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
     gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
 fi
 LTO_F=tests/ok/feat_stage20_lto.hls
-lto_interp=$(python3 boot/boot.py "$LTO_F" </dev/null 2>/dev/null)
+lto_interp=$(python3 tools/hlinterp/boot.py "$LTO_F" </dev/null 2>/dev/null)
 if "$TMP/hlc1" --lto "$LTO_F" "$TMP/l20.c" >/dev/null 2>&1 \
         && gcc -O2 -o "$TMP/l20_bin" "$TMP/l20.c" -lm -pthread 2>/dev/null \
         && "$TMP/hlc1" "$LTO_F" "$TMP/l20p.c" >/dev/null 2>&1 \
@@ -48,9 +48,9 @@ else
 fi
 # (d) --emit lto: whole-program LTO'd LLVM IR (DCE'd — fewer defines
 # than the non-LTO emission).
-python3 boot/boot.py --emit lto "$LTO_F" > "$TMP/l20.ll" 2>"$TMP/l20.rep"
+python3 tools/hlinterp/boot.py --emit lto "$LTO_F" > "$TMP/l20.ll" 2>"$TMP/l20.rep"
 defs_lto=$(grep -c "^define" "$TMP/l20.ll" || true)
-python3 boot/boot.py --emit llvm "$LTO_F" > "$TMP/l20p.ll" 2>/dev/null
+python3 tools/hlinterp/boot.py --emit llvm "$LTO_F" > "$TMP/l20p.ll" 2>/dev/null
 defs_plain=$(grep -c "^define" "$TMP/l20p.ll" || true)
 if [ "$defs_lto" -gt 0 ] && [ "$defs_lto" -lt "$defs_plain" ]; then
     ok "lto: --emit lto IR has $defs_lto defines (non-LTO: $defs_plain — DCE applied)"
@@ -60,7 +60,7 @@ fi
 # The && short-circuit regression (found by the LTO work): the native
 # build must not eagerly evaluate the right operand of &&/||.
 SC_F=tests/ok/feat_shortcircuit_slice.hls
-sc_interp=$(python3 boot/boot.py "$SC_F" </dev/null 2>/dev/null); sc_rc=$?
+sc_interp=$(python3 tools/hlinterp/boot.py "$SC_F" </dev/null 2>/dev/null); sc_rc=$?
 if "$TMP/hlc1" "$SC_F" "$TMP/sc.c" >/dev/null 2>&1 \
         && gcc -O2 -o "$TMP/sc_bin" "$TMP/sc.c" -lm -pthread 2>/dev/null; then
     sc_nat=$("$TMP/sc_bin" </dev/null 2>/dev/null); sc_nrc=$?
@@ -76,7 +76,7 @@ fi
 # Stage 20 perfection (v0.39.0-alpha): --lto-stats, --lto-threshold,
 # and generic instantiation dedup verification.
 DEDUP_F=tests/ok/feat_stage20_lto_dedup.hls
-dedup_interp=$(python3 boot/boot.py "$DEDUP_F" </dev/null 2>/dev/null)
+dedup_interp=$(python3 tools/hlinterp/boot.py "$DEDUP_F" </dev/null 2>/dev/null)
 # (a) --lto-stats prints a structured summary; the dedup program
 #     must show 1 generic struct instantiation (Pair[int, int]) and
 #     2 generic fn instantiations (pair_first[int,int], pair_second[int,int]).
@@ -138,7 +138,7 @@ else
     bad "lto-threshold: out-of-range value (0) not rejected"
 fi
 # (f) boot.py accepts the new flags silently (no effect on interpreter).
-boot_out=$(python3 boot/boot.py --lto-stats --lto-threshold 30 "$DEDUP_F" 2>/dev/null)
+boot_out=$(python3 tools/hlinterp/boot.py --lto-stats --lto-threshold 30 "$DEDUP_F" 2>/dev/null)
 if [ "$boot_out" == "$dedup_interp" ]; then
     ok "lto-flags: boot.py accepts --lto-stats / --lto-threshold (interpreter unaffected)"
 else
@@ -153,10 +153,10 @@ echo "=== 9. Stage 21: SIMD vectorisation (std.simd + target features) ==="
 #     interpreter driven with the same flag (fast path == portable
 #     semantics). x86-64 hosts only (the intrinsics); others skip.
 SIMD_F=tests/ok/feat_stage21_simd.hls
-simd_interp_flag=$(python3 boot/boot.py --target-feature avx2 "$SIMD_F" </dev/null 2>/dev/null)
+simd_interp_flag=$(python3 tools/hlinterp/boot.py --target-feature avx2 "$SIMD_F" </dev/null 2>/dev/null)
 if uname -m | grep -qE "x86_64|i386|i686"; then
     if [ ! -x "$TMP/hlc1" ]; then
-        python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
+        python3 tools/hlinterp/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
         gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
     fi
     if "$TMP/hlc1" --target-feature avx2 "$SIMD_F" "$TMP/s21a.c" >/dev/null 2>&1 \
@@ -205,13 +205,13 @@ fn main() -> int uses IO {
 }
 FCEOF
 if [ ! -x "$TMP/hlc1" ]; then
-    python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
+    python3 tools/hlinterp/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
     gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
 fi
 if "$TMP/hlc1" --target-feature avx2 "$TMP/feat_check.hls" "$TMP/fc.c" >/dev/null 2>&1 \
         && gcc -O2 -o "$TMP/fc_bin" "$TMP/fc.c" -lm -pthread 2>/dev/null; then
     fc_out=$("$TMP/fc_bin" 2>/dev/null)
-    fc_interp=$(python3 boot/boot.py --target-feature avx2 "$TMP/feat_check.hls" 2>/dev/null)
+    fc_interp=$(python3 tools/hlinterp/boot.py --target-feature avx2 "$TMP/feat_check.hls" 2>/dev/null)
     if [ "$fc_out" == "flag-on" ] && [ "$fc_interp" == "flag-on" ]; then
         ok "simd: has_feature const-folds (native and interpreter agree)"
     else
@@ -223,7 +223,7 @@ fi
 # (c) the SIMD acceptance benchmark (timing-gated: >= 2x on AVX2 hosts;
 #     correctness-gated everywhere the checksums must match).
 if [ ! -x "$TMP/hlc1" ]; then
-    python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
+    python3 tools/hlinterp/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
     gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
 fi
 if "$TMP/hlc1" --target-feature avx2 benchmarks/simd_bench.hls "$TMP/s21b.c" >/dev/null 2>&1 \
@@ -261,9 +261,9 @@ fi
 #      in every implementation (sections 1/3 already run them
 #      differentially: both sides must panic with exit 101).
 FUSED_F=tests/ok/feat_stage31_simd_fused.hls
-fused_interp=$(python3 boot/boot.py "$FUSED_F" </dev/null 2>/dev/null); fused_irc=$?
+fused_interp=$(python3 tools/hlinterp/boot.py "$FUSED_F" </dev/null 2>/dev/null); fused_irc=$?
 if [ ! -x "$TMP/hlc1" ]; then
-    python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
+    python3 tools/hlinterp/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
     gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
 fi
 fused_modes="avx2 sse4.2"
@@ -397,7 +397,7 @@ fi
 # (d) the new reduce_min/reduce_max ops are covered by the differential
 #     suite (sections 1/3) since feat_stage21_simd.hls calls them; here
 #     we verify the values are correct (mixed-sign lanes).
-simd_interp_v2=$(python3 boot/boot.py "$SIMD_F" </dev/null 2>/dev/null)
+simd_interp_v2=$(python3 tools/hlinterp/boot.py "$SIMD_F" </dev/null 2>/dev/null)
 if echo "$simd_interp_v2" | grep -q "^reduce_min: -5$" \
         && echo "$simd_interp_v2" | grep -q "^reduce_max: 7$"; then
     ok "simd: reduce_min/reduce_max correct on mixed-sign lanes (-5, 7)"
@@ -409,7 +409,7 @@ fi
 #     Both the interpreter and the native build must resolve "native"
 #     to the SAME concrete feature, so has_feature() const-folds
 #     identically on both sides.
-simd_interp_native=$(python3 boot/boot.py --target-feature native "$SIMD_F" </dev/null 2>/dev/null)
+simd_interp_native=$(python3 tools/hlinterp/boot.py --target-feature native "$SIMD_F" </dev/null 2>/dev/null)
 if "$TMP/hlc1" --target-feature native "$SIMD_F" "$TMP/s21n.c" >/dev/null 2>&1 \
         && gcc -O2 -o "$TMP/s21n_bin" "$TMP/s21n.c" -lm -pthread 2>/dev/null; then
     s21n_out=$("$TMP/s21n_bin" 2>/dev/null)

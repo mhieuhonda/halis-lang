@@ -9,13 +9,13 @@
 # string operation on chr(27); no live input, no random clock). The
 # differential test compares interpreter and native output byte-for-byte.
 tui-acceptance: bin/hlc
-	@$(PYTHON) boot/boot.py examples/tui_demo.hls > /tmp/tui_demo_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py examples/tui_demo.hls > /tmp/tui_demo_interp.txt 2>&1
 	@bin/hlc examples/tui_demo.hls /tmp/tui_demo.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/tui_demo /tmp/tui_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/tui_demo > /tmp/tui_demo_nat.txt 2>&1
 	@diff -q /tmp/tui_demo_interp.txt /tmp/tui_demo_nat.txt >/dev/null 2>&1 \
 		|| (echo "FAIL: tui_demo differential mismatch" && false)
-	@$(PYTHON) boot/boot.py tests/ok/feat_stage54_tui.hls > /tmp/s54_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py tests/ok/feat_stage54_tui.hls > /tmp/s54_interp.txt 2>&1
 	@bin/hlc tests/ok/feat_stage54_tui.hls /tmp/s54.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s54 /tmp/s54.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/s54 > /tmp/s54_nat.txt 2>&1
@@ -54,13 +54,13 @@ tui-acceptance: bin/hlc
 # affect the differential comparison because the live env is identical
 # between interpreter and native for the same process).
 color-acceptance: bin/hlc
-	@$(PYTHON) boot/boot.py examples/color_demo.hls > /tmp/color_demo_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py examples/color_demo.hls > /tmp/color_demo_interp.txt 2>&1
 	@bin/hlc examples/color_demo.hls /tmp/color_demo.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/color_demo /tmp/color_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/color_demo > /tmp/color_demo_nat.txt 2>&1
 	@diff -q /tmp/color_demo_interp.txt /tmp/color_demo_nat.txt >/dev/null 2>&1 \
 		|| (echo "FAIL: color_demo differential mismatch" && false)
-	@$(PYTHON) boot/boot.py tests/ok/feat_stage55_color.hls > /tmp/s55_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py tests/ok/feat_stage55_color.hls > /tmp/s55_interp.txt 2>&1
 	@bin/hlc tests/ok/feat_stage55_color.hls /tmp/s55.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s55 /tmp/s55.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/s55 > /tmp/s55_nat.txt 2>&1
@@ -109,13 +109,13 @@ color-acceptance: bin/hlc
 # capture interleaves byte-identically). The differential tests compare
 # interpreter vs native output byte-for-byte.
 progress-acceptance: bin/hlc
-	@$(PYTHON) boot/boot.py examples/progress_demo.hls > /tmp/progress_demo_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py examples/progress_demo.hls > /tmp/progress_demo_interp.txt 2>&1
 	@bin/hlc examples/progress_demo.hls /tmp/progress_demo.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/progress_demo /tmp/progress_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/progress_demo > /tmp/progress_demo_nat.txt 2>&1
 	@diff -q /tmp/progress_demo_interp.txt /tmp/progress_demo_nat.txt >/dev/null 2>&1 \
 		|| (echo "FAIL: progress_demo differential mismatch" && false)
-	@$(PYTHON) boot/boot.py tests/ok/feat_stage56_progress.hls > /tmp/s56_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py tests/ok/feat_stage56_progress.hls > /tmp/s56_interp.txt 2>&1
 	@bin/hlc tests/ok/feat_stage56_progress.hls /tmp/s56.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s56 /tmp/s56.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/s56 > /tmp/s56_nat.txt 2>&1
@@ -160,14 +160,14 @@ progress-acceptance: bin/hlc
 # the acceptance). This is the same discipline Stage 49 applied to
 # the live wall clock.
 log-acceptance: bin/hlc
-	@$(PYTHON) boot/boot.py examples/log_demo.hls > /tmp/log_demo_interp.txt 2>/dev/null
+	@$(PYTHON) tools/hlinterp/boot.py examples/log_demo.hls > /tmp/log_demo_interp.txt 2>/dev/null
 	@bin/hlc examples/log_demo.hls /tmp/log_demo.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/log_demo /tmp/log_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/log_demo > /tmp/log_demo_nat.txt 2>/dev/null
 	@diff -q /tmp/log_demo_interp.txt /tmp/log_demo_nat.txt >/dev/null 2>&1 \
 		|| (echo "FAIL: log_demo differential mismatch (stdout)" && false)
 	@/tmp/log_demo >/dev/null 2>&1 || (echo "FAIL: log_demo live smoke" && false)
-	@$(PYTHON) boot/boot.py tests/ok/feat_stage57_log.hls > /tmp/s57_interp.txt 2>/dev/null
+	@$(PYTHON) tools/hlinterp/boot.py tests/ok/feat_stage57_log.hls > /tmp/s57_interp.txt 2>/dev/null
 	@bin/hlc tests/ok/feat_stage57_log.hls /tmp/s57.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s57 /tmp/s57.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/s57 > /tmp/s57_nat.txt 2>/dev/null
@@ -211,13 +211,13 @@ log-acceptance: bin/hlc
 # by the test's stdout comparison).
 
 man-acceptance: bin/hlc
-	@$(PYTHON) boot/boot.py examples/man_demo.hls > /tmp/man_demo_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py examples/man_demo.hls > /tmp/man_demo_interp.txt 2>&1
 	@bin/hlc examples/man_demo.hls /tmp/man_demo.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/man_demo /tmp/man_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/man_demo > /tmp/man_demo_nat.txt 2>&1
 	@diff -q /tmp/man_demo_interp.txt /tmp/man_demo_nat.txt >/dev/null 2>&1 \
 		|| (echo "FAIL: man_demo differential mismatch" && false)
-	@$(PYTHON) boot/boot.py tests/ok/feat_stage62_man.hls > /tmp/s62_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py tests/ok/feat_stage62_man.hls > /tmp/s62_interp.txt 2>&1
 	@bin/hlc tests/ok/feat_stage62_man.hls /tmp/s62.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s62 /tmp/s62.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/s62 > /tmp/s62_nat.txt 2>&1
@@ -264,13 +264,13 @@ man-acceptance: bin/hlc
 # the dispatcher itself is pure (no IO, no Net).
 
 http-router-acceptance: bin/hlc
-	@$(PYTHON) boot/boot.py examples/http_router_demo.hls > /tmp/http_router_demo_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py examples/http_router_demo.hls > /tmp/http_router_demo_interp.txt 2>&1
 	@bin/hlc examples/http_router_demo.hls /tmp/http_router_demo.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/http_router_demo /tmp/http_router_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/http_router_demo > /tmp/http_router_demo_nat.txt 2>&1
 	@diff -q /tmp/http_router_demo_interp.txt /tmp/http_router_demo_nat.txt >/dev/null 2>&1 \
 		|| (echo "FAIL: http_router_demo differential mismatch" && false)
-	@$(PYTHON) boot/boot.py tests/ok/feat_stage63_http_router.hls > /tmp/s63_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py tests/ok/feat_stage63_http_router.hls > /tmp/s63_interp.txt 2>&1
 	@bin/hlc tests/ok/feat_stage63_http_router.hls /tmp/s63.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s63 /tmp/s63.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/s63 > /tmp/s63_nat.txt 2>&1
@@ -306,13 +306,13 @@ http-router-acceptance: bin/hlc
 # ============================================================================
 
 config-acceptance: bin/hlc
-	@$(PYTHON) boot/boot.py examples/config_demo.hls > /tmp/config_demo_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py examples/config_demo.hls > /tmp/config_demo_interp.txt 2>&1
 	@bin/hlc examples/config_demo.hls /tmp/config_demo.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/config_demo /tmp/config_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/config_demo > /tmp/config_demo_nat.txt 2>&1
 	@diff -q /tmp/config_demo_interp.txt /tmp/config_demo_nat.txt >/dev/null 2>&1 \
 		|| (echo "FAIL: config_demo differential mismatch" && false)
-	@$(PYTHON) boot/boot.py tests/ok/feat_stage58_config.hls > /tmp/s58_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py tests/ok/feat_stage58_config.hls > /tmp/s58_interp.txt 2>&1
 	@bin/hlc tests/ok/feat_stage58_config.hls /tmp/s58.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s58 /tmp/s58.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/s58 > /tmp/s58_nat.txt 2>&1
@@ -346,13 +346,13 @@ config-acceptance: bin/hlc
 # ============================================================================
 
 complete-acceptance: bin/hlc
-	@$(PYTHON) boot/boot.py examples/complete_demo.hls > /tmp/complete_demo_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py examples/complete_demo.hls > /tmp/complete_demo_interp.txt 2>&1
 	@bin/hlc examples/complete_demo.hls /tmp/complete_demo.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/complete_demo /tmp/complete_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/complete_demo > /tmp/complete_demo_nat.txt 2>&1
 	@diff -q /tmp/complete_demo_interp.txt /tmp/complete_demo_nat.txt >/dev/null 2>&1 \
 		|| (echo "FAIL: complete_demo differential mismatch" && false)
-	@$(PYTHON) boot/boot.py tests/ok/feat_stage59_complete.hls > /tmp/s59_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py tests/ok/feat_stage59_complete.hls > /tmp/s59_interp.txt 2>&1
 	@bin/hlc tests/ok/feat_stage59_complete.hls /tmp/s59.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s59 /tmp/s59.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/s59 > /tmp/s59_nat.txt 2>&1
@@ -385,13 +385,13 @@ complete-acceptance: bin/hlc
 # ============================================================================
 
 hlscli-acceptance: bin/hlc
-	@$(PYTHON) boot/boot.py examples/hlscli_demo.hls > /tmp/hlscli_demo_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py examples/hlscli_demo.hls > /tmp/hlscli_demo_interp.txt 2>&1
 	@bin/hlc examples/hlscli_demo.hls /tmp/hlscli_demo.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/hlscli_demo /tmp/hlscli_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/hlscli_demo > /tmp/hlscli_demo_nat.txt 2>&1
 	@diff -q /tmp/hlscli_demo_interp.txt /tmp/hlscli_demo_nat.txt >/dev/null 2>&1 \
 		|| (echo "FAIL: hlscli_demo differential mismatch" && false)
-	@$(PYTHON) boot/boot.py tests/ok/feat_stage60_hlscli.hls > /tmp/s60_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py tests/ok/feat_stage60_hlscli.hls > /tmp/s60_interp.txt 2>&1
 	@bin/hlc tests/ok/feat_stage60_hlscli.hls /tmp/s60.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s60 /tmp/s60.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/s60 > /tmp/s60_nat.txt 2>&1
@@ -426,13 +426,13 @@ hlscli-acceptance: bin/hlc
 # ============================================================================
 
 hlsdoc-acceptance: bin/hlc
-	@$(PYTHON) boot/boot.py examples/hlsdoc_demo.hls > /tmp/hlsdoc_demo_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py examples/hlsdoc_demo.hls > /tmp/hlsdoc_demo_interp.txt 2>&1
 	@bin/hlc examples/hlsdoc_demo.hls /tmp/hlsdoc_demo.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/hlsdoc_demo /tmp/hlsdoc_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/hlsdoc_demo > /tmp/hlsdoc_demo_nat.txt 2>&1
 	@diff -q /tmp/hlsdoc_demo_interp.txt /tmp/hlsdoc_demo_nat.txt >/dev/null 2>&1 \
 		|| (echo "FAIL: hlsdoc_demo differential mismatch" && false)
-	@$(PYTHON) boot/boot.py tests/ok/feat_stage61_hlsdoc.hls > /tmp/s61_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py tests/ok/feat_stage61_hlsdoc.hls > /tmp/s61_interp.txt 2>&1
 	@bin/hlc tests/ok/feat_stage61_hlsdoc.hls /tmp/s61.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s61 /tmp/s61.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/s61 > /tmp/s61_nat.txt 2>&1
@@ -485,13 +485,13 @@ hlsdoc-acceptance: bin/hlc
 # deterministic, no actual port bind).
 
 http-server-acceptance: bin/hlc
-	@$(PYTHON) boot/boot.py examples/http_server_demo.hls > /tmp/http_server_demo_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py examples/http_server_demo.hls > /tmp/http_server_demo_interp.txt 2>&1
 	@bin/hlc examples/http_server_demo.hls /tmp/http_server_demo.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/http_server_demo /tmp/http_server_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/http_server_demo > /tmp/http_server_demo_nat.txt 2>&1
 	@diff -q /tmp/http_server_demo_interp.txt /tmp/http_server_demo_nat.txt >/dev/null 2>&1 \
 		|| (echo "FAIL: http_server_demo differential mismatch" && false)
-	@$(PYTHON) boot/boot.py tests/ok/feat_stage64_http_server.hls > /tmp/s64_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py tests/ok/feat_stage64_http_server.hls > /tmp/s64_interp.txt 2>&1
 	@bin/hlc tests/ok/feat_stage64_http_server.hls /tmp/s64.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s64 /tmp/s64.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/s64 > /tmp/s64_nat.txt 2>&1
@@ -558,13 +558,13 @@ http-server-acceptance: bin/hlc
 # all deterministic, no actual network).
 
 websocket-acceptance: bin/hlc
-	@$(PYTHON) boot/boot.py examples/websocket_demo.hls > /tmp/ws_demo_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py examples/websocket_demo.hls > /tmp/ws_demo_interp.txt 2>&1
 	@bin/hlc examples/websocket_demo.hls /tmp/ws_demo.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/ws_demo /tmp/ws_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/ws_demo > /tmp/ws_demo_nat.txt 2>&1
 	@diff -q /tmp/ws_demo_interp.txt /tmp/ws_demo_nat.txt >/dev/null 2>&1 \
 		|| (echo "FAIL: websocket_demo differential mismatch" && false)
-	@$(PYTHON) boot/boot.py tests/ok/feat_stage65_websocket.hls > /tmp/s65_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py tests/ok/feat_stage65_websocket.hls > /tmp/s65_interp.txt 2>&1
 	@bin/hlc tests/ok/feat_stage65_websocket.hls /tmp/s65.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s65 /tmp/s65.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/s65 > /tmp/s65_nat.txt 2>&1
@@ -636,13 +636,13 @@ websocket-acceptance: bin/hlc
 # deterministic, no actual I/O).
 
 cookie-acceptance: bin/hlc
-	@$(PYTHON) boot/boot.py examples/cookie_demo.hls > /tmp/cookie_demo_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py examples/cookie_demo.hls > /tmp/cookie_demo_interp.txt 2>&1
 	@bin/hlc examples/cookie_demo.hls /tmp/cookie_demo.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/cookie_demo /tmp/cookie_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/cookie_demo > /tmp/cookie_demo_nat.txt 2>&1
 	@diff -q /tmp/cookie_demo_interp.txt /tmp/cookie_demo_nat.txt >/dev/null 2>&1 \
 		|| (echo "FAIL: cookie_demo differential mismatch" && false)
-	@$(PYTHON) boot/boot.py tests/ok/feat_stage66_cookie.hls > /tmp/s66_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py tests/ok/feat_stage66_cookie.hls > /tmp/s66_interp.txt 2>&1
 	@bin/hlc tests/ok/feat_stage66_cookie.hls /tmp/s66.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s66 /tmp/s66.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/s66 > /tmp/s66_nat.txt 2>&1
@@ -715,7 +715,7 @@ cookie-acceptance: bin/hlc
 session-acceptance: bin/hlc
 	@mkdir -p /tmp/hls_session_demo
 	@rm -f /tmp/hls_session_demo/*.sess 2>/dev/null || true
-	@$(PYTHON) boot/boot.py examples/session_demo.hls > /tmp/session_demo_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py examples/session_demo.hls > /tmp/session_demo_interp.txt 2>&1
 	@bin/hlc examples/session_demo.hls /tmp/session_demo.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/session_demo /tmp/session_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@rm -f /tmp/hls_session_demo/*.sess 2>/dev/null || true
@@ -724,7 +724,7 @@ session-acceptance: bin/hlc
 		|| (echo "FAIL: session_demo differential mismatch" && false)
 	@mkdir -p /tmp/hls_session_test
 	@rm -f /tmp/hls_session_test/*.sess 2>/dev/null || true
-	@$(PYTHON) boot/boot.py tests/ok/feat_stage67_session.hls > /tmp/s67_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py tests/ok/feat_stage67_session.hls > /tmp/s67_interp.txt 2>&1
 	@bin/hlc tests/ok/feat_stage67_session.hls /tmp/s67.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s67 /tmp/s67.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@rm -f /tmp/hls_session_test/*.sess 2>/dev/null || true
@@ -784,13 +784,13 @@ session-acceptance: bin/hlc
 # identical output on both the demo and the acceptance test.
 
 csrf-acceptance: bin/hlc
-	@$(PYTHON) boot/boot.py examples/csrf_demo.hls > /tmp/csrf_demo_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py examples/csrf_demo.hls > /tmp/csrf_demo_interp.txt 2>&1
 	@bin/hlc examples/csrf_demo.hls /tmp/csrf_demo.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/csrf_demo /tmp/csrf_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/csrf_demo > /tmp/csrf_demo_nat.txt 2>&1
 	@diff -q /tmp/csrf_demo_interp.txt /tmp/csrf_demo_nat.txt >/dev/null 2>&1 \
 		|| (echo "FAIL: csrf_demo differential mismatch" && false)
-	@$(PYTHON) boot/boot.py tests/ok/feat_stage68_csrf.hls > /tmp/s68_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py tests/ok/feat_stage68_csrf.hls > /tmp/s68_interp.txt 2>&1
 	@bin/hlc tests/ok/feat_stage68_csrf.hls /tmp/s68.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s68 /tmp/s68.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/s68 > /tmp/s68_nat.txt 2>&1
@@ -846,13 +846,13 @@ csrf-acceptance: bin/hlc
 # identical output on both the demo and the acceptance test.
 
 template-acceptance: bin/hlc
-	@$(PYTHON) boot/boot.py examples/template_demo.hls > /tmp/tmpl_demo_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py examples/template_demo.hls > /tmp/tmpl_demo_interp.txt 2>&1
 	@bin/hlc examples/template_demo.hls /tmp/tmpl_demo.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/tmpl_demo /tmp/tmpl_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/tmpl_demo > /tmp/tmpl_demo_nat.txt 2>&1
 	@diff -q /tmp/tmpl_demo_interp.txt /tmp/tmpl_demo_nat.txt >/dev/null 2>&1 \
 		|| (echo "FAIL: template_demo differential mismatch" && false)
-	@$(PYTHON) boot/boot.py tests/ok/feat_stage69_template.hls > /tmp/s69_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py tests/ok/feat_stage69_template.hls > /tmp/s69_interp.txt 2>&1
 	@bin/hlc tests/ok/feat_stage69_template.hls /tmp/s69.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s69 /tmp/s69.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/s69 > /tmp/s69_nat.txt 2>&1
@@ -909,13 +909,13 @@ template-acceptance: bin/hlc
 # byte-identical output on both the demo and the acceptance test.
 
 sse-acceptance: bin/hlc
-	@$(PYTHON) boot/boot.py examples/sse_demo.hls > /tmp/sse_demo_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py examples/sse_demo.hls > /tmp/sse_demo_interp.txt 2>&1
 	@bin/hlc examples/sse_demo.hls /tmp/sse_demo.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/sse_demo /tmp/sse_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/sse_demo > /tmp/sse_demo_nat.txt 2>&1
 	@diff -q /tmp/sse_demo_interp.txt /tmp/sse_demo_nat.txt >/dev/null 2>&1 \
 		|| (echo "FAIL: sse_demo differential mismatch" && false)
-	@$(PYTHON) boot/boot.py tests/ok/feat_stage70_sse.hls > /tmp/s70_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py tests/ok/feat_stage70_sse.hls > /tmp/s70_interp.txt 2>&1
 	@bin/hlc tests/ok/feat_stage70_sse.hls /tmp/s70.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s70 /tmp/s70.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/s70 > /tmp/s70_nat.txt 2>&1
@@ -960,13 +960,13 @@ sse-acceptance: bin/hlc
 # GraphQL pipeline (SDL parse -> query parse -> validate -> variables
 # -> trampoline execute -> render) is deterministic.
 graphql-acceptance: bin/hlc
-	@$(PYTHON) boot/boot.py examples/graphql_demo.hls > /tmp/gql_demo_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py examples/graphql_demo.hls > /tmp/gql_demo_interp.txt 2>&1
 	@bin/hlc examples/graphql_demo.hls /tmp/gql_demo.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/gql_demo /tmp/gql_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/gql_demo > /tmp/gql_demo_nat.txt 2>&1
 	@diff -q /tmp/gql_demo_interp.txt /tmp/gql_demo_nat.txt >/dev/null 2>&1 \
 		|| (echo "FAIL: graphql_demo differential mismatch" && false)
-	@$(PYTHON) boot/boot.py tests/ok/feat_stage71_graphql.hls > /tmp/s71_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py tests/ok/feat_stage71_graphql.hls > /tmp/s71_interp.txt 2>&1
 	@bin/hlc tests/ok/feat_stage71_graphql.hls /tmp/s71.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s71 /tmp/s71.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/s71 > /tmp/s71_nat.txt 2>&1
@@ -1010,13 +1010,13 @@ graphql-acceptance: bin/hlc
 # OpenAPI pipeline (schema builders -> router bridge -> validate ->
 # render -> serve) is deterministic.
 openapi-acceptance: bin/hlc
-	@$(PYTHON) boot/boot.py examples/openapi_demo.hls > /tmp/oa_demo_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py examples/openapi_demo.hls > /tmp/oa_demo_interp.txt 2>&1
 	@bin/hlc examples/openapi_demo.hls /tmp/oa_demo.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/oa_demo /tmp/oa_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/oa_demo > /tmp/oa_demo_nat.txt 2>&1
 	@diff -q /tmp/oa_demo_interp.txt /tmp/oa_demo_nat.txt >/dev/null 2>&1 \
 		|| (echo "FAIL: openapi_demo differential mismatch" && false)
-	@$(PYTHON) boot/boot.py tests/ok/feat_stage72_openapi.hls > /tmp/s72_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py tests/ok/feat_stage72_openapi.hls > /tmp/s72_interp.txt 2>&1
 	@bin/hlc tests/ok/feat_stage72_openapi.hls /tmp/s72.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s72 /tmp/s72.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/s72 > /tmp/s72_nat.txt 2>&1
@@ -1111,13 +1111,13 @@ jsffi-acceptance:
 # (DomNode enum + builders + immutable mutators + serialiser + HTTP
 # integration) is deterministic.
 dom-acceptance: bin/hlc
-	@$(PYTHON) boot/boot.py examples/dom_demo.hls > /tmp/dom_demo_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py examples/dom_demo.hls > /tmp/dom_demo_interp.txt 2>&1
 	@bin/hlc examples/dom_demo.hls /tmp/dom_demo.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/dom_demo /tmp/dom_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/dom_demo > /tmp/dom_demo_nat.txt 2>&1
 	@diff -q /tmp/dom_demo_interp.txt /tmp/dom_demo_nat.txt >/dev/null 2>&1 \
 		|| (echo "FAIL: dom_demo differential mismatch" && false)
-	@$(PYTHON) boot/boot.py tests/ok/feat_stage74_dom.hls > /tmp/s74_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py tests/ok/feat_stage74_dom.hls > /tmp/s74_interp.txt 2>&1
 	@bin/hlc tests/ok/feat_stage74_dom.hls /tmp/s74.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s74 /tmp/s74.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/s74 > /tmp/s74_nat.txt 2>&1

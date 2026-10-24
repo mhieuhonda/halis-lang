@@ -444,7 +444,7 @@ if not os.path.exists(HLC):
     bad("bin/hlc missing — run make bootstrap first")
 else:
     interp_out = subprocess.run(
-        [sys.executable, "boot/boot.py", CORPUS],
+        [sys.executable, "tools/hlinterp/boot.py", CORPUS],
         capture_output=True, text=True).stdout
     c_path = os.path.join(TMP, "s117_orig.c")
     bin_path = os.path.join(TMP, "s117_orig")
@@ -473,7 +473,7 @@ else:
     with open(alt_path, "wb") as fh:
         fh.write(alt_bytes)
     interp_alt = subprocess.run(
-        [sys.executable, "boot/boot.py", alt_path],
+        [sys.executable, "tools/hlinterp/boot.py", alt_path],
         capture_output=True, text=True).stdout
     c_path2 = os.path.join(TMP, "s117_alt.c")
     bin_path2 = os.path.join(TMP, "s117_alt_bin")

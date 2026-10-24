@@ -64,15 +64,15 @@ import subprocess
 import sys
 from typing import Dict, List, Optional, Set, Tuple
 
-# Resolve HLError whether we are imported from boot.py (sys.path has the
+# Resolve HLError whether we are imported from tools.hlinterp.py (sys.path has the
 # repo root) or run directly from the tools/ directory.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
-    from boot.lexer import HLError  # type: ignore
+    from tools.hlinterp.lexer import HLError  # type: ignore
 except ImportError:  # pragma: no cover
     if _REPO_ROOT not in sys.path:
         sys.path.insert(0, _REPO_ROOT)
-    from boot.lexer import HLError  # type: ignore
+    from tools.hlinterp.lexer import HLError  # type: ignore
 
 
 # ============================================================================

@@ -237,7 +237,7 @@ escape-acceptance:
 	  echo "  valgrind: not installed here — the malloc interposer gate above is the equivalent (and stronger: exact counts)"; \
 	fi
 	@# Determinism: the interpreter and the native binary agree.
-	@python3 boot/boot.py examples/fibonacci.hls >$(BIN)/fib30_interp.out 2>&1 || true
+	@python3 tools/hlinterp/boot.py examples/fibonacci.hls >$(BIN)/fib30_interp.out 2>&1 || true
 	@$(BIN)/fib30 >$(BIN)/fib30_native.out 2>&1 || true
 	@if diff -q $(BIN)/fib30_interp.out $(BIN)/fib30_native.out >/dev/null; then \
 	  echo "  interpreter and native outputs are byte-identical (layout is unobservable): OK"; \
@@ -329,7 +329,7 @@ tail-acceptance:
 	  echo "FAIL: fib_tail(1_000_000) blew the 1 MB stack — the transform is not constant-stack"; exit 1; \
 	fi
 	@# (d) the interpreter trampoline at full depth (zero Python recursion).
-	@python3 boot/boot.py examples/fibonacci.hls 1000000 >$(BIN)/fib31_interp.out 2>&1 \
+	@python3 tools/hlinterp/boot.py examples/fibonacci.hls 1000000 >$(BIN)/fib31_interp.out 2>&1 \
 	  || (echo "FAIL: interpreter fib_tail(1_000_000) run failed (RecursionError?)"; cat $(BIN)/fib31_interp.out; exit 1)
 	@echo "  interpreter fib_tail(1_000_000) runs with zero Python recursion: OK"
 	@# (e) differential: byte-identical outputs at the acceptance depth.

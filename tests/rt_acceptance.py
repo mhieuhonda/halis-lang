@@ -83,7 +83,7 @@ os.chdir(ROOT)
 sys.path.insert(0, ROOT)
 
 RT = [sys.executable, "tools/hls-rt.py"]
-BOOT = [sys.executable, "boot/boot.py"]
+BOOT = [sys.executable, "tools/hlinterp/boot.py"]
 HLC = os.path.join(ROOT, "bin", "hlc")
 CC = os.environ.get("CC", "gcc")
 NATIVE = os.path.isfile(HLC) and shutil.which(CC) is not None

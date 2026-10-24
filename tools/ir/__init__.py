@@ -44,12 +44,12 @@ import sys
 # Resolve HLError whether we are imported via `boot.py` (sys.path contains
 # the repo root) or run from anywhere.
 try:
-    from boot.lexer import HLError  # type: ignore
+    from tools.hlinterp.lexer import HLError  # type: ignore
 except ImportError:  # pragma: no cover
     _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if _REPO_ROOT not in sys.path:
         sys.path.insert(0, _REPO_ROOT)
-    from boot.lexer import HLError  # type: ignore
+    from tools.hlinterp.lexer import HLError  # type: ignore
 
 
 def _unsupported_ir(what: str, node):

@@ -91,7 +91,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 
 MEM = [sys.executable, os.path.join(ROOT, "tools", "hls-mem.py")]
-BOOT = [sys.executable, os.path.join(ROOT, "boot", "boot.py")]
+BOOT = [sys.executable, os.path.join(ROOT, "tools", "hlinterp", "boot.py")]
 FMT = [sys.executable, os.path.join(ROOT, "tools", "hlfmt.py")]
 LINT = [sys.executable, os.path.join(ROOT, "tools", "hllint.py")]
 HLC = os.path.join(ROOT, "bin", "hlc")

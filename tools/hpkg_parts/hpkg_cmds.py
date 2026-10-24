@@ -577,7 +577,7 @@ def cmd_build(args):
     if not os.path.isfile(entry):
         print("error: entry file not found: %s" % entry, file=sys.stderr)
         return 1
-    boot_py = os.path.join(REPO_ROOT, "boot", "boot.py")
+    boot_py = os.path.join(REPO_ROOT, "tools", "hlinterp", "boot.py")
     print("Building %s..." % entry)
     lock_path = os.path.join(os.getcwd(), "hls-pkg.lock")
     env = os.environ.copy()

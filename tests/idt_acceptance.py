@@ -135,7 +135,7 @@ if r.returncode == 0:
     ok("idt: #[irq_handler(N)] compiles")
 else:
     bad("idt: #[irq_handler(N)] rejected: %s" % (r.stdout + r.stderr)[:120])
-r = run(["python3", "boot/boot.py", "--check", decl])
+r = run(["python3", "tools/hlinterp/boot.py", "--check", decl])
 if r.returncode == 0:
     ok("idt: #[irq_handler(N)] accepted by Stage-0 too")
 else:
@@ -273,7 +273,7 @@ for name, needle, desc in FAIL_PROGRAMS:
     if not os.path.exists(path):
         bad("idt: %s missing" % path)
         continue
-    rb = run(["python3", "boot/boot.py", "--check", path])
+    rb = run(["python3", "tools/hlinterp/boot.py", "--check", path])
     if rb.returncode != 1:
         bad("idt: %s not rejected by boot" % name)
         continue
@@ -446,7 +446,7 @@ for name, body, want, desc in PROBES:
     path = os.path.join(TMP, "probe_%s.hls" % name)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(body)
-    r = run(["python3", "boot/boot.py", path])
+    r = run(["python3", "tools/hlinterp/boot.py", path])
     if r.returncode != want:
         bad("idt: probe %s (interp) exit=%d want=%d — %s"
             % (name, r.returncode, want, (r.stdout + r.stderr).strip()[:100]))
@@ -461,7 +461,7 @@ for name, body, want, desc in PROBES:
 # ---------------------------------------------------------------------------
 print("=== 7. the demos + tools ===")
 # ---------------------------------------------------------------------------
-r = run(["python3", "boot/boot.py", OK_TEST])
+r = run(["python3", "tools/hlinterp/boot.py", OK_TEST])
 if r.returncode == 0:
     ok("idt: the ok-test is clean on the interpreter")
 else:
@@ -488,7 +488,7 @@ if run(["./bin/hlc", fs_ok, fs_c]).returncode == 0:
 else:
     bad("idt: the ok-test did not compile as freestanding")
 
-ri = run(["python3", "boot/boot.py", DEMO])
+ri = run(["python3", "tools/hlinterp/boot.py", DEMO])
 code, out = hlc_run(DEMO)
 if ri.returncode == 0 and code == 0 and "DEMO OK" in out:
     ok("idt: interrupt_demo runs on both, DEMO OK")

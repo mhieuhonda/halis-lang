@@ -17,7 +17,7 @@ bad()  { FAIL=$((FAIL+1)); echo "  [FAIL] $1"; }
 # guard — so the dependent checks don't spuriously fail with
 # "command not found".
 if [ ! -x "$TMP/hlc1" ]; then
-    python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
+    python3 tools/hlinterp/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
     gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
 fi
 

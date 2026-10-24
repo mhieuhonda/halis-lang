@@ -33,8 +33,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 sys.path.insert(0, ROOT)
 
-from boot.boot import load_program            # noqa: E402
-from boot.checker import check                # noqa: E402
+from tools.hlinterp.boot import load_program            # noqa: E402
+from tools.hlinterp.checker import check                # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -75,7 +75,7 @@ def check_deny(name, src, expect):
     """boot's checker must reject the source with the expected message."""
     path = write(name, src)
     proc = subprocess.run(
-        [sys.executable, "boot/boot.py", "--check", path],
+        [sys.executable, "tools/hlinterp/boot.py", "--check", path],
         capture_output=True, text=True)
     err = proc.stderr + proc.stdout
     if proc.returncode == 1 and expect in err:
@@ -102,7 +102,7 @@ def check_deny_hlc(name, src, expect):
 
 def compile_native(src, out_c, hlc=None, flags=None):
     if hlc is None:
-        cmd = [sys.executable, "boot/boot.py", src, out_c]
+        cmd = [sys.executable, "tools/hlinterp/boot.py", src, out_c]
     else:
         cmd = [hlc] + (flags or []) + [src, out_c]
     proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -117,7 +117,7 @@ def run_binary(binary, timeout=120):
 
 def run_interp(src):
     proc = subprocess.run(
-        [sys.executable, "boot/boot.py", src],
+        [sys.executable, "tools/hlinterp/boot.py", src],
         capture_output=True, text=True, timeout=180)
     return proc.stdout, proc.returncode
 
@@ -293,7 +293,7 @@ for src in OK_TESTS + [DEMO]:
 print("=== 7. the audit: the Capability tokens section, word-for-word ===")
 audit_src = write("cap_audit.hls", open(DEMO).read())
 boot_audit = subprocess.run(
-    [sys.executable, "boot/boot.py", "--audit", audit_src],
+    [sys.executable, "tools/hlinterp/boot.py", "--audit", audit_src],
     capture_output=True, text=True)
 boot_rows = [ln.strip() for ln in boot_audit.stdout.splitlines()
              if "Capability tokens" in ln or ln.strip().startswith("main:")

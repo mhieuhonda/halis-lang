@@ -19,8 +19,8 @@ unit, so cross-crate LTO operates at the whole-program level:
      deduped counts) so builds are auditable.
 
 Usage (via boot.py):
-    python3 boot/boot.py --emit lto file.hls          # LTO'd LLVM IR text
-    python3 boot/boot.py --opt-stats --lto file.hls   # LTO'd HLIR stats
+    python3 tools/hlinterp/boot.py --emit lto file.hls          # LTO'd LLVM IR text
+    python3 tools/hlinterp/boot.py --opt-stats --lto file.hls   # LTO'd HLIR stats
 """
 from __future__ import annotations
 

@@ -17,7 +17,7 @@ a gate:
      named errors, never silent renders
 
   2. the record law  — `record` runs the REAL stage0 chain
-     (boot/boot.py running src/hlc.hls) over the REAL tracked suite
+     (tools/hlinterp/boot.py running src/hlc.hls) over the REAL tracked suite
      and appends exactly one entry pinned to `git rev-parse HEAD`
      (instrument, suite digest, compiler SOURCE digest, compiler
      BINARY digest, plan, env fingerprint, 5 workloads with >= 2
@@ -90,7 +90,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 
 CTIME = [sys.executable, os.path.join(ROOT, "tools", "hls-ctime.py")]
-BOOT = [sys.executable, os.path.join(ROOT, "boot", "boot.py")]
+BOOT = [sys.executable, os.path.join(ROOT, "tools", "hlinterp", "boot.py")]
 FMT = [sys.executable, os.path.join(ROOT, "tools", "hlfmt.py")]
 LINT = [sys.executable, os.path.join(ROOT, "tools", "hllint.py")]
 HLC = os.path.join(ROOT, "bin", "hlc")
@@ -278,7 +278,7 @@ def _section_2():
     check(r["source_digest"] == _live_source_digest(),
           "the compiler source digest pins the compiler being timed")
     boot_digest = hashlib.sha256(
-        open(os.path.join(ROOT, "boot", "boot.py"), "rb").read()
+        open(os.path.join(ROOT, "tools", "hlinterp", "boot.py"), "rb").read()
     ).hexdigest()
     check(r["compiler_digest"] == boot_digest,
           "the stage0 compiler digest is the sha256 of the driver "

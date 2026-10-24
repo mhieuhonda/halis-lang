@@ -46,7 +46,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 sys.path.insert(0, ROOT)
 
-BOOT = [sys.executable, "boot/boot.py"]
+BOOT = [sys.executable, "tools/hlinterp/boot.py"]
 PROVE = [sys.executable, "tools/hlprove.py"]
 FMT = [sys.executable, "tools/hlfmt.py"]
 LINT = [sys.executable, "tools/hllint.py"]

@@ -95,7 +95,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 
 SIZE = [sys.executable, "tools/hls-size.py"]
-BOOT = [sys.executable, "boot/boot.py"]
+BOOT = [sys.executable, "tools/hlinterp/boot.py"]
 FMT = [sys.executable, "tools/hlfmt.py"]
 LINT = [sys.executable, "tools/hllint.py"]
 HLC = os.path.join(ROOT, "bin", "hlc")
@@ -332,7 +332,7 @@ def _section_2():
           "the stage0 record carries the 5 workloads and NO hlc_self "
           "(the bootstrap chain has no built compiler to weigh)")
     boot_digest = hashlib.sha256(
-        open(os.path.join(ROOT, "boot", "boot.py"), "rb").read()
+        open(os.path.join(ROOT, "tools", "hlinterp", "boot.py"), "rb").read()
     ).hexdigest()
     check(rs["compiler_digest"] == boot_digest,
           "the stage0 record pins the sha256 of the driver it ran "

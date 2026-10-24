@@ -35,9 +35,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 sys.path.insert(0, ROOT)
 
-from boot.boot import load_program            # noqa: E402
-from boot.checker import check                # noqa: E402
-from boot import proof as _proof              # noqa: E402
+from tools.hlinterp.boot import load_program            # noqa: E402
+from tools.hlinterp.checker import check                # noqa: E402
+from tools.hlinterp import proof as _proof              # noqa: E402
 from tools.hlprove import make_decider        # noqa: E402
 
 PASS = 0
@@ -435,7 +435,7 @@ else:
 # ---------------------------------------------------------------------------
 print("=== 5. the demo ===")
 # ---------------------------------------------------------------------------
-interp = run([sys.executable, "boot/boot.py", DEMO])
+interp = run([sys.executable, "tools/hlinterp/boot.py", DEMO])
 if interp.returncode == 0:
     ok("the demo runs on the interpreter (rc=0)")
 else:

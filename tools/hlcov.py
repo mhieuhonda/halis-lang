@@ -30,10 +30,10 @@ import sys
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 
-from boot.boot import load_program            # noqa: E402
-from boot.checker import check                # noqa: E402
-from boot.interp import Interp, HLPanic       # noqa: E402
-from boot.lexer import HLError                # noqa: E402
+from tools.hlinterp.boot import load_program            # noqa: E402
+from tools.hlinterp.checker import check                # noqa: E402
+from tools.hlinterp.interp import Interp, HLPanic       # noqa: E402
+from tools.hlinterp.lexer import HLError                # noqa: E402
 
 
 # ---------------------------------------------------------------------------

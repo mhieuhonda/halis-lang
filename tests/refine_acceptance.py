@@ -33,8 +33,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 sys.path.insert(0, ROOT)
 
-from boot.boot import load_program            # noqa: E402
-from boot.checker import check                # noqa: E402
+from tools.hlinterp.boot import load_program            # noqa: E402
+from tools.hlinterp.checker import check                # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -61,7 +61,7 @@ def check_deny(name, src, expect):
     with open(path, "w") as f:
         f.write(src)
     proc = subprocess.run(
-        [sys.executable, "boot/boot.py", "--check", path],
+        [sys.executable, "tools/hlinterp/boot.py", "--check", path],
         capture_output=True, text=True)
     err = proc.stderr + proc.stdout
     if proc.returncode == 1 and expect in err:
@@ -84,7 +84,7 @@ def run_native(binary):
 
 def run_interp(src):
     proc = subprocess.run(
-        [sys.executable, "boot/boot.py", src],
+        [sys.executable, "tools/hlinterp/boot.py", src],
         capture_output=True, text=True, timeout=120)
     return proc.stdout, proc.returncode
 
@@ -175,7 +175,7 @@ print("=== 3. the guards: every runtime boundary emits its check ===")
 ok_src = "tests/ok/feat_stage98_refine.hls"
 nat_c = os.path.join(TMP, "refine.c")
 hlc = os.path.join(TMP, "hlc_gate")
-subprocess.run([sys.executable, "boot/boot.py", "src/hlc.hls", "src/hlc.hls",
+subprocess.run([sys.executable, "tools/hlinterp/boot.py", "src/hlc.hls", "src/hlc.hls",
                 nat_c], capture_output=True)
 subprocess.run(["gcc", "-O2", "-o", hlc, nat_c, "-lm", "-pthread"],
                capture_output=True)

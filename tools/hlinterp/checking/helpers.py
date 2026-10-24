@@ -35,7 +35,7 @@ def taint_inner(t):
     return t
 
 
-# Backwards-compatible aliases (used by boot/boot.py and tools/).
+# Backwards-compatible aliases (used by tools/hlinterp/boot.py and tools/).
 # BUG-SC-12 (for real this time): the old duplicate definitions that used to
 # live further down in this file (which shadowed these aliases at import
 # time) have been removed — `is_tainted_type`/`list_taint_inner` now resolve

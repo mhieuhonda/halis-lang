@@ -31,8 +31,8 @@ FILES=($(ls tests/ok/*.hls | sed -n "$((START+1)),$((START+COUNT))p"))
 echo "chunk: ${#FILES[@]} files ($START .. $((START+COUNT-1)))"
 for f in "${FILES[@]}"; do
     name=$(basename "$f" .hls)
-    interp_out=$(python3 boot/boot.py "$f" </dev/null 2>/dev/null); interp_code=$?
-    if ! python3 boot/boot.py src/hlc.hls "$f" "$TMP/$name.c" >/dev/null 2>&1; then
+    interp_out=$(python3 tools/hlinterp/boot.py "$f" </dev/null 2>/dev/null); interp_code=$?
+    if ! python3 tools/hlinterp/boot.py src/hlc.hls "$f" "$TMP/$name.c" >/dev/null 2>&1; then
         bad "$name (hlc compile failed)"
         continue
     fi

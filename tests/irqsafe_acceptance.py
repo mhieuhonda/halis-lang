@@ -92,7 +92,7 @@ def normalise(text):
 
 
 def boot_check(src):
-    r = run(["python3", "boot/boot.py", "--check", src])
+    r = run(["python3", "tools/hlinterp/boot.py", "--check", src])
     text = (r.stdout + r.stderr).strip()
     return r.returncode, text
 
@@ -218,8 +218,8 @@ else:
 # ---------------------------------------------------------------------------
 print("=== 3. the audit lines ===")
 # ---------------------------------------------------------------------------
-brc, _ = run(["python3", "boot/boot.py", "--audit", DEMO]), None
-b_audit = run(["python3", "boot/boot.py", "--audit", DEMO])
+brc, _ = run(["python3", "tools/hlinterp/boot.py", "--audit", DEMO]), None
+b_audit = run(["python3", "tools/hlinterp/boot.py", "--audit", DEMO])
 h_audit = run(["./bin/hlc", "--audit", DEMO])
 b_out = b_audit.stdout
 h_out = h_audit.stdout
@@ -248,7 +248,7 @@ else:
 # ---------------------------------------------------------------------------
 print("=== 4. the ok-test on all three paths ===")
 # ---------------------------------------------------------------------------
-interp = run(["python3", "boot/boot.py", OK_TEST], timeout=300)
+interp = run(["python3", "tools/hlinterp/boot.py", OK_TEST], timeout=300)
 if interp.returncode == 0:
     ok("irqsafe: feat_stage91_irqsafe runs on the interpreter (exit 0)")
 else:
@@ -403,7 +403,7 @@ else:
 # ---------------------------------------------------------------------------
 print("=== 6. the demo ===")
 # ---------------------------------------------------------------------------
-d_interp = run(["python3", "boot/boot.py", DEMO], timeout=300)
+d_interp = run(["python3", "tools/hlinterp/boot.py", DEMO], timeout=300)
 rc, out = native_run(DEMO)
 if d_interp.returncode == 0 and rc == 0 and out == d_interp.stdout:
     ok("irqsafe_demo: identical output on the interpreter and natively")

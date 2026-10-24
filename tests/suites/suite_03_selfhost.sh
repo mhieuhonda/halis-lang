@@ -4,7 +4,7 @@
 
 echo "=== 5. BOOTSTRAP: hlc self-compiles (fixed-point) ==="
 echo "  [5.1] Stage-0 runs hlc.hls to compile hlc.hls itself..."
-if python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_s1.c" >/dev/null 2>&1; then
+if python3 tools/hlinterp/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_s1.c" >/dev/null 2>&1; then
     ok "hlc.hls self-compiles via Stage-0"
 else
     bad "hlc.hls self-compiles via Stage-0"
@@ -33,7 +33,7 @@ interp=""
 "$TMP/hlc1" examples/fibonacci.hls "$TMP/fib.c" >/dev/null 2>&1 \
     && gcc -O2 -o "$TMP/fib" "$TMP/fib.c" -lm 2>/dev/null \
     && nat=$("$TMP/fib" 2>/dev/null) \
-    && interp=$(python3 boot/boot.py examples/fibonacci.hls 2>/dev/null)
+    && interp=$(python3 tools/hlinterp/boot.py examples/fibonacci.hls 2>/dev/null)
 if [ -n "$nat" ] && [ -n "$interp" ] && [ "$nat" == "$interp" ]; then
     ok "native hlc compiles + runs fibonacci correctly"
 else
@@ -76,7 +76,7 @@ echo "=== 7. Stage 19: profile-guided optimisation (PGO) ==="
 #       never meaning).
 #   (c) the profile/counter machinery must not appear in unflagged C.
 if [ ! -x "$TMP/hlc1" ]; then
-    python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
+    python3 tools/hlinterp/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
     gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
 fi
 PGO_F=tests/ok/feat_stage19_pgo.hls
@@ -142,8 +142,8 @@ fn main() -> int uses IO {
     return 0
 }
 JEOF
-j_interp=$(python3 boot/boot.py "$TMP/join_check.hls" 2>/dev/null)
-if python3 boot/boot.py src/hlc.hls "$TMP/join_check.hls" "$TMP/join_check.c" >/dev/null 2>&1 \
+j_interp=$(python3 tools/hlinterp/boot.py "$TMP/join_check.hls" 2>/dev/null)
+if python3 tools/hlinterp/boot.py src/hlc.hls "$TMP/join_check.hls" "$TMP/join_check.c" >/dev/null 2>&1 \
         && gcc -O2 -o "$TMP/join_check_bin" "$TMP/join_check.c" -lm -pthread 2>/dev/null; then
     j_nat=$("$TMP/join_check_bin" 2>/dev/null)
     if [ "$j_interp" == "$j_nat" ] && echo "$j_nat" | grep -q "big join len = 23889"; then

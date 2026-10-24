@@ -70,7 +70,7 @@ sys.path.insert(0, ROOT)
 ADAPTER = os.path.join(ROOT, "tools", "hls-dap.py")
 CORPUS = os.path.join(ROOT, "tests", "ok", "feat_stage121_dap.hls")
 EXT = os.path.join(ROOT, "editors", "vscode", "halis")
-BOOT = [sys.executable, os.path.join(ROOT, "boot", "boot.py")]
+BOOT = [sys.executable, os.path.join(ROOT, "tools", "hlinterp", "boot.py")]
 PY = sys.executable
 
 PASS = 0

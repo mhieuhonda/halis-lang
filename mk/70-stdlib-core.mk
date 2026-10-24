@@ -45,13 +45,13 @@ stage32-acceptance: bench-stdlib spec-check
 # Stage 33 (v0.52.0-alpha): async/await zero-runtime futures
 # ============================================================================
 async-acceptance: bin/hlc
-	@$(PYTHON) boot/boot.py examples/async_demo.hls > /tmp/async_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py examples/async_demo.hls > /tmp/async_interp.txt 2>&1
 	@bin/hlc examples/async_demo.hls /tmp/async_demo.c 2>/dev/null
 	@gcc -O2 -o /tmp/async_demo /tmp/async_demo.c -lm -pthread 2>/dev/null
 	@/tmp/async_demo > /tmp/async_nat.txt 2>&1
 	@diff -q /tmp/async_interp.txt /tmp/async_nat.txt >/dev/null 2>&1 \
 		|| (echo "FAIL: async_demo differential mismatch" && false)
-	@$(PYTHON) boot/boot.py tests/ok/feat_stage33_async.hls > /tmp/s33_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py tests/ok/feat_stage33_async.hls > /tmp/s33_interp.txt 2>&1
 	@bin/hlc tests/ok/feat_stage33_async.hls /tmp/s33.c 2>/dev/null
 	@gcc -O2 -o /tmp/s33 /tmp/s33.c -lm -pthread 2>/dev/null
 	@/tmp/s33 > /tmp/s33_nat.txt 2>&1
@@ -68,13 +68,13 @@ async-acceptance: bin/hlc
 # Stage 34 (v0.53.0-alpha): async stream combinators (channels x generators)
 # ============================================================================
 stream-acceptance: bin/hlc
-	@$(PYTHON) boot/boot.py examples/stream_demo.hls > /tmp/stream_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py examples/stream_demo.hls > /tmp/stream_interp.txt 2>&1
 	@bin/hlc examples/stream_demo.hls /tmp/stream_demo.c 2>/dev/null
 	@gcc -O2 -o /tmp/stream_demo /tmp/stream_demo.c -lm -pthread 2>/dev/null
 	@/tmp/stream_demo > /tmp/stream_nat.txt 2>&1
 	@diff -q /tmp/stream_interp.txt /tmp/stream_nat.txt >/dev/null 2>&1 \
 		|| (echo "FAIL: stream_demo differential mismatch" && false)
-	@$(PYTHON) boot/boot.py tests/ok/feat_stage34_stream.hls > /tmp/s34_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py tests/ok/feat_stage34_stream.hls > /tmp/s34_interp.txt 2>&1
 	@bin/hlc tests/ok/feat_stage34_stream.hls /tmp/s34.c 2>/dev/null
 	@gcc -O2 -o /tmp/s34 /tmp/s34.c -lm -pthread 2>/dev/null
 	@/tmp/s34 > /tmp/s34_nat.txt 2>&1
@@ -92,13 +92,13 @@ stream-acceptance: bin/hlc
 # Stage 35 (v0.54.0-alpha): std.io -- buffered I/O traits + Cursor + Chain
 # ============================================================================
 io-acceptance: bin/hlc
-	@$(PYTHON) boot/boot.py examples/io_demo.hls > /tmp/io_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py examples/io_demo.hls > /tmp/io_interp.txt 2>&1
 	@bin/hlc examples/io_demo.hls /tmp/io_demo.c 2>/dev/null
 	@gcc -O2 -o /tmp/io_demo /tmp/io_demo.c -lm -pthread 2>/dev/null
 	@/tmp/io_demo > /tmp/io_nat.txt 2>&1
 	@diff -q /tmp/io_interp.txt /tmp/io_nat.txt >/dev/null 2>&1 \
 		|| (echo "FAIL: io_demo differential mismatch" && false)
-	@$(PYTHON) boot/boot.py tests/ok/feat_stage35_io.hls > /tmp/s35_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py tests/ok/feat_stage35_io.hls > /tmp/s35_interp.txt 2>&1
 	@bin/hlc tests/ok/feat_stage35_io.hls /tmp/s35.c 2>/dev/null
 	@gcc -O2 -o /tmp/s35 /tmp/s35.c -lm -pthread 2>/dev/null
 	@/tmp/s35 > /tmp/s35_nat.txt 2>&1
@@ -120,13 +120,13 @@ io-acceptance: bin/hlc
 # Stage 36 (v0.55.0-alpha): std.fs -- path abstraction + dir walk + metadata
 # ============================================================================
 fs-acceptance: bin/hlc
-	@$(PYTHON) boot/boot.py examples/fs_demo.hls > /tmp/fs_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py examples/fs_demo.hls > /tmp/fs_interp.txt 2>&1
 	@bin/hlc examples/fs_demo.hls /tmp/fs_demo.c 2>/dev/null
 	@gcc -O2 -o /tmp/fs_demo /tmp/fs_demo.c -lm -pthread 2>/dev/null
 	@/tmp/fs_demo > /tmp/fs_nat.txt 2>&1
 	@diff -q /tmp/fs_interp.txt /tmp/fs_nat.txt >/dev/null 2>&1 \
 		|| (echo "FAIL: fs_demo differential mismatch" && false)
-	@$(PYTHON) boot/boot.py tests/ok/feat_stage36_fs.hls > /tmp/s36_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py tests/ok/feat_stage36_fs.hls > /tmp/s36_interp.txt 2>&1
 	@bin/hlc tests/ok/feat_stage36_fs.hls /tmp/s36.c 2>/dev/null
 	@gcc -O2 -o /tmp/s36 /tmp/s36.c -lm -pthread 2>/dev/null
 	@/tmp/s36 > /tmp/s36_nat.txt 2>&1
@@ -149,13 +149,13 @@ fs-acceptance: bin/hlc
 # Stage 37 (v0.56.0-alpha): std.net -- TCP/UDP sockets, DNS, TLS via libcurl
 # ============================================================================
 net-acceptance: bin/hlc
-	@$(PYTHON) boot/boot.py examples/net_demo.hls > /tmp/net_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py examples/net_demo.hls > /tmp/net_interp.txt 2>&1
 	@bin/hlc examples/net_demo.hls /tmp/net_demo.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/net_demo /tmp/net_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/net_demo > /tmp/net_nat.txt 2>&1
 	@diff -q /tmp/net_interp.txt /tmp/net_nat.txt >/dev/null 2>&1 \
 		|| (echo "FAIL: net_demo differential mismatch" && false)
-	@$(PYTHON) boot/boot.py tests/ok/feat_stage37_net.hls > /tmp/s37_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py tests/ok/feat_stage37_net.hls > /tmp/s37_interp.txt 2>&1
 	@bin/hlc tests/ok/feat_stage37_net.hls /tmp/s37.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s37 /tmp/s37.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/s37 > /tmp/s37_nat.txt 2>&1
@@ -179,13 +179,13 @@ net-acceptance: bin/hlc
 # Stage 38 (v0.57.0-alpha): std.http -- HTTP/1.1 server + client (RFC 7230)
 # ============================================================================
 http-acceptance: bin/hlc
-	@$(PYTHON) boot/boot.py examples/http_demo.hls > /tmp/http_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py examples/http_demo.hls > /tmp/http_interp.txt 2>&1
 	@bin/hlc examples/http_demo.hls /tmp/http_demo.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/http_demo /tmp/http_demo.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/http_demo > /tmp/http_nat.txt 2>&1
 	@diff -q /tmp/http_interp.txt /tmp/http_nat.txt >/dev/null 2>&1 \
 		|| (echo "FAIL: http_demo differential mismatch" && false)
-	@$(PYTHON) boot/boot.py tests/ok/feat_stage38_http.hls > /tmp/s38_interp.txt 2>&1
+	@$(PYTHON) tools/hlinterp/boot.py tests/ok/feat_stage38_http.hls > /tmp/s38_interp.txt 2>&1
 	@bin/hlc tests/ok/feat_stage38_http.hls /tmp/s38.c 2>/dev/null
 	@gcc -O2 $(HL_CURL_DEFS) $(LIBCURL_CFLAGS) -o /tmp/s38 /tmp/s38.c -lm -pthread $(LIBCURL_LIBS) 2>/dev/null
 	@/tmp/s38 > /tmp/s38_nat.txt 2>&1

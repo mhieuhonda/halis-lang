@@ -10,7 +10,7 @@ echo "=== 10. Stage 22: cross-compilation targets (Linux/macOS/Windows/FreeBSD) 
 # the C source is still written (so it can be copied to a target
 # machine and compiled there).
 CROSS_F=tests/ok/feat_stage22_cross.hls
-cross_interp=$(python3 boot/boot.py "$CROSS_F" </dev/null 2>/dev/null)
+cross_interp=$(python3 tools/hlinterp/boot.py "$CROSS_F" </dev/null 2>/dev/null)
 # (a) the feat_stage22_cross program is differentially covered by
 #     sections 1/3 (it lives in tests/ok); here we verify the
 #     expected platform-independent output.
@@ -51,7 +51,7 @@ fi
 #     host compiler). The binary must run and produce the same output
 #     as the interpreter.
 if [ ! -x "$TMP/hlc1" ]; then
-    python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
+    python3 tools/hlinterp/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
     gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
 fi
 if python3 tools/hlcross.py "$CROSS_F" "$TMP/cross_host" --target "$host_triple" \
@@ -210,7 +210,7 @@ fi
 # (d) running the wasm in Node.js produces the same output as the interpreter.
 #     (Only runs if node is available; skipped gracefully otherwise.)
 if command -v node >/dev/null 2>&1; then
-    interp_out=$(python3 boot/boot.py "$WASM_F" </dev/null 2>/dev/null)
+    interp_out=$(python3 tools/hlinterp/boot.py "$WASM_F" </dev/null 2>/dev/null)
     if python3 tools/hlwasm.py "$WASM_F" "$TMP/hello_wasm2" --run >"$TMP/wasm_run.out" 2>&1; then
         # Deep-scan-13 fix: also filter the 'wasm-opt: N -> M bytes' info
         # line — it goes to stderr (merged by 2>&1) and is printed ONLY
@@ -250,7 +250,7 @@ fn main() -> int uses IO {
     return r
 }
 HLS_EOF
-if python3 boot/boot.py --check "$TMP/test_jsffi.hls" >/dev/null 2>&1; then
+if python3 tools/hlinterp/boot.py --check "$TMP/test_jsffi.hls" >/dev/null 2>&1; then
     ok "wasm: extern \"js\" block accepted by the parser/checker"
 else
     bad "wasm: extern \"js\" block rejected"
@@ -325,7 +325,7 @@ fi
 
 # (b) the optimized wasm still runs correctly (output matches interpreter).
 if command -v node >/dev/null 2>&1; then
-    interp_out=$(python3 boot/boot.py examples/hello.hls </dev/null 2>/dev/null)
+    interp_out=$(python3 tools/hlinterp/boot.py examples/hello.hls </dev/null 2>/dev/null)
     if python3 tools/hlwasm.py examples/hello.hls "$TMP/hello_wasm24_run" --wasm-opt auto >"$TMP/wasm24_run.log" 2>&1; then
         # Run the wasm in node to get the actual runtime output.
         wasm_out=$(node -e "
@@ -608,7 +608,7 @@ echo "=== 13. Stage 25: AArch64 backend tuning (NEON + PAC + BTI) ==="
 # aarch64-linux-gnu targets and applies PAC/BTI security flags.
 
 # (a) --target-feature neon emits NEON intrinsics in the C source.
-if python3 boot/boot.py src/hlc.hls examples/simd_demo.hls "$TMP/simd_neon.c" --target-feature neon >/dev/null 2>&1; then
+if python3 tools/hlinterp/boot.py src/hlc.hls examples/simd_demo.hls "$TMP/simd_neon.c" --target-feature neon >/dev/null 2>&1; then
     neon_count=$(grep -c "vaddq_s32\|vsubq_s32\|vmulq_s32\|vminq_s32\|vmaxq_s32" "$TMP/simd_neon.c" 2>/dev/null || echo 0)
     if [ "$neon_count" -gt 0 ]; then
         ok "aarch64: --target-feature neon emits NEON intrinsics ($neon_count sites)"
@@ -708,8 +708,8 @@ fi
 
 # (k) bootstrap still works after the src/hlc.hls NEON changes
 #     (the self-hosted compiler must remain deterministic).
-if python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_neon.c" >/dev/null 2>&1 \
-    && python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_neon2.c" --target-feature neon >/dev/null 2>&1; then
+if python3 tools/hlinterp/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_neon.c" >/dev/null 2>&1 \
+    && python3 tools/hlinterp/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_neon2.c" --target-feature neon >/dev/null 2>&1; then
     # The two outputs must be byte-identical when --target-feature is
     # not used by hlc.hls itself (which it isn't — hlc.hls doesn't use
     # std.simd).

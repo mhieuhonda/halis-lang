@@ -286,11 +286,11 @@ print("=== 2. the constructors are checked ===")
 # ---------------------------------------------------------------------------
 for desc, body, needle in PANIC_PROGRAMS:
     path = write("panic_%d.hls" % PANIC_PROGRAMS.index((desc, body, needle)), body)
-    r = run(["python3", "boot/boot.py", "--check", path])
+    r = run(["python3", "tools/hlinterp/boot.py", "--check", path])
     if r.returncode != 0:
         bad("dma: %s must be ACCEPTED by the checker" % desc)
         continue
-    r = run(["python3", "boot/boot.py", path])
+    r = run(["python3", "tools/hlinterp/boot.py", path])
     if r.returncode == 101 and needle in (r.stdout + r.stderr):
         ok("dma: %s panics at run time" % desc)
     else:
@@ -302,7 +302,7 @@ print("=== 3. the model ===")
 # ---------------------------------------------------------------------------
 for name, body, want, desc in PROBES:
     path = write("probe_%s.hls" % name, body)
-    r = run(["python3", "boot/boot.py", path])
+    r = run(["python3", "tools/hlinterp/boot.py", path])
     if r.returncode != want:
         bad("dma: probe %s (interp) exit=%d want=%d — %s"
             % (name, r.returncode, want, (r.stdout + r.stderr).strip()[:100]))
@@ -323,7 +323,7 @@ for name, body, want, desc in PROBES:
 # ---------------------------------------------------------------------------
 print("=== 4. the ok-test ===")
 # ---------------------------------------------------------------------------
-r = run(["python3", "boot/boot.py", OK_TEST])
+r = run(["python3", "tools/hlinterp/boot.py", OK_TEST])
 if r.returncode == 0:
     ok("dma: the ok-test is clean on the interpreter")
 else:
@@ -365,7 +365,7 @@ print("=== 6. the properties a driver relies on ===")
 # ---------------------------------------------------------------------------
 for i, (desc, body) in enumerate(PROPS):
     path = write("prop_%d.hls" % (i + 1), body)
-    r = run(["python3", "boot/boot.py", path])
+    r = run(["python3", "tools/hlinterp/boot.py", path])
     if r.returncode != 0:
         bad("dma: property %r not held" % desc)
         continue

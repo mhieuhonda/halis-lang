@@ -5,7 +5,7 @@ The fuzzer generates small random HLS programs (a tiny grammar tuned to
 exercise the surface that matters: arithmetic, control flow, lists,
 strings, structs, enums, contracts), compiles each program TWO ways:
 
-  (1) Interpreter:  python3 boot/boot.py prog.hls
+  (1) Interpreter:  python3 tools/hlinterp/boot.py prog.hls
   (2) Native:       hlc.hls (via Stage-0) -> C -> gcc -> run
 
 and compares stdout+exit-code byte-for-byte. Any divergence is a
@@ -44,9 +44,9 @@ import time
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 
-from boot.boot import load_program          # noqa: E402
-from boot.checker import check              # noqa: E402
-from boot.lexer import HLError              # noqa: E402
+from tools.hlinterp.boot import load_program          # noqa: E402
+from tools.hlinterp.checker import check              # noqa: E402
+from tools.hlinterp.lexer import HLError              # noqa: E402
 
 # Stage 134: the seeder's mutator is shared, not duplicated. The tool
 # file carries a dash, so the import goes through an explicit spec —
@@ -225,7 +225,7 @@ def run_interp(prog_path, timeout=10):
     """Run the program via Stage-0 interpreter. Returns (stdout bytes, rc)."""
     try:
         p = subprocess.run(
-            [sys.executable, os.path.join(REPO_ROOT, "boot/boot.py"),
+            [sys.executable, os.path.join(REPO_ROOT, "tools/hlinterp/boot.py"),
              prog_path],
             capture_output=True, timeout=timeout, input=b"",
             cwd=REPO_ROOT)
@@ -240,7 +240,7 @@ def run_native(prog_path, hlc_native, tmpdir, timeout=10):
     out_bin = os.path.join(tmpdir, "out.bin")
     # Step 1: hlc.hls (via Stage-0) compiles prog.hls -> out.c
     p1 = subprocess.run(
-        [sys.executable, os.path.join(REPO_ROOT, "boot/boot.py"),
+        [sys.executable, os.path.join(REPO_ROOT, "tools/hlinterp/boot.py"),
          os.path.join(REPO_ROOT, "src/hlc.hls"), prog_path, out_c],
         capture_output=True, timeout=timeout, cwd=REPO_ROOT)
     if p1.returncode != 0:

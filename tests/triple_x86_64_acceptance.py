@@ -106,7 +106,7 @@ def normalise(text):
 
 
 def boot_check_target(src, with_target=True):
-    cmd = ["python3", "boot/boot.py", "--check"]
+    cmd = ["python3", "tools/hlinterp/boot.py", "--check"]
     if with_target:
         cmd += ["--target", TRIPLE]
     cmd.append(src)
@@ -144,7 +144,7 @@ print("=== 1. the CLI surface: the triples and the refused combinations ===")
 BAD_TRIPLE_MSG = ("unknown bare-metal target 'armv7-unknown-none' "
                   "(expected x86_64-unknown-none | aarch64-unknown-none | "
                   "riscv64-unknown-none)")
-b = run(["python3", "boot/boot.py", "--check", "--target",
+b = run(["python3", "tools/hlinterp/boot.py", "--check", "--target",
          "armv7-unknown-none", DEMO])
 h = run(["./bin/hlc", "--target", "armv7-unknown-none", DEMO,
          os.path.join(TMP, "never.c")])
@@ -166,7 +166,7 @@ else:
 FEAT_MSG = ("--target-feature is not available on target %s "
             "(bare-metal targets are integer-only: SIMD intrinsics use "
             "floating-point registers)" % TRIPLE)
-b = run(["python3", "boot/boot.py", "--check", "--target", TRIPLE,
+b = run(["python3", "tools/hlinterp/boot.py", "--check", "--target", TRIPLE,
          "--target-feature", "neon", DEMO])
 h = run(["./bin/hlc", "--target", TRIPLE, "--target-feature", "neon",
          DEMO, os.path.join(TMP, "never.c")])
@@ -261,7 +261,7 @@ fn main() -> int {
 ipath = os.path.join(TMP, "imply.hls")
 with open(ipath, "w") as fh:
     fh.write(IMPLY)
-b = run(["python3", "boot/boot.py", "--target", TRIPLE, "--audit", ipath])
+b = run(["python3", "tools/hlinterp/boot.py", "--target", TRIPLE, "--audit", ipath])
 h = run(["./bin/hlc", "--target", TRIPLE, "--audit", ipath])
 b_lines = [ln.strip() for ln in b.stdout.splitlines()
            if "Crate mode" in ln or "Target:" in ln]

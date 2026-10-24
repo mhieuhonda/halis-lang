@@ -443,7 +443,7 @@ def cmd_selftest(args):
 
 def selftest():
     from sandbox_parts import sbx_policy as P
-    from boot.checking.helpers import BUILTIN_EFFECTS
+    from tools.hlinterp.checking.helpers import BUILTIN_EFFECTS
 
     total = [0, 0]
 

@@ -26,10 +26,10 @@ same program and made them show their work. This tool is that table.
 
 The backends (four registered, three executing):
 
-  interp  boot/boot.py <file>                    the reference implementation
+  interp  tools/hlinterp/boot.py <file>                    the reference implementation
   native  bin/hlc <file> <c> + gcc -O2 + run     the shipped compiler
   wasm    tools/hlwasm.py <file> + node          the wasm32 backend
-  llvm    boot/boot.py --emit llvm + ll_validate STATIC — structural validation
+  llvm    tools/hlinterp/boot.py --emit llvm + ll_validate STATIC — structural validation
           (+ llvm-as when installed); the llvm leg never executes here,
           it participates in the report as a validated static leg and
           the report says so, in those words.
@@ -127,7 +127,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BOOT = os.path.join(REPO, "boot", "boot.py")
+BOOT = os.path.join(REPO, "tools", "hlinterp", "boot.py")
 HLWASM = os.path.join(REPO, "tools", "hlwasm.py")
 LL_VALIDATE = os.path.join(REPO, "tools", "ll_validate.py")
 HLC = os.path.join(REPO, "bin", "hlc")

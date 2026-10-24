@@ -434,7 +434,7 @@ else:
     else:
         ok("no-libc: --debug --symbols work on the Stage 92 mode")
 
-brc = run(["python3", "boot/boot.py", "--check", DEMO])
+brc = run(["python3", "tools/hlinterp/boot.py", "--check", DEMO])
 if brc.returncode != 0:
     bad("front-end: boot.py --check rejects the demo: %s"
         % (brc.stdout + brc.stderr).strip()[:200])

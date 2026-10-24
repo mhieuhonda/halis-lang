@@ -77,10 +77,10 @@ import xml.sax.saxutils as saxutils
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from boot.boot import load_program           # noqa: E402
-from boot.checker import check               # noqa: E402
-from boot.interp import Interp, HLPanic      # noqa: E402
-from boot.lexer import HLError               # noqa: E402
+from tools.hlinterp.boot import load_program           # noqa: E402
+from tools.hlinterp.checker import check               # noqa: E402
+from tools.hlinterp.interp import Interp, HLPanic      # noqa: E402
+from tools.hlinterp.lexer import HLError               # noqa: E402
 
 # Reserved panic prefix used by std.test.mark_skip — hltest recognises
 # this and reports the test as SKIP instead of FAIL.
@@ -338,7 +338,7 @@ def _table_row_type(ret):
     module-qualified names, future syntax)."""
     if not isinstance(ret, str) or "[" not in ret:
         return None
-    from boot.checking.helpers import type_base, type_args  # noqa: E402
+    from tools.hlinterp.checking.helpers import type_base, type_args  # noqa: E402
     if type_base(ret) != "list":
         return None
     args = type_args(ret)
@@ -409,8 +409,8 @@ def list_tests_in_file(filepath):
     are merged in by load_program)."""
     with open(filepath, "rb") as f:
         src = f.read()
-    from boot.lexer import tokenize              # noqa: E402
-    from boot.parser import Parser               # noqa: E402
+    from tools.hlinterp.lexer import tokenize              # noqa: E402
+    from tools.hlinterp.parser import Parser               # noqa: E402
     toks = tokenize(src)
     prog = Parser(toks).parse_program()
     tests = [name for name in prog["fns"].keys() if name.startswith("test_")]

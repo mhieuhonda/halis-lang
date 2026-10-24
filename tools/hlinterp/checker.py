@@ -2,7 +2,7 @@
 
 Facade: the implementation lives in the boot/checking/ package
 (split for maintainability). All public names are re-exported so
-that `from boot.checker import check` (and every helper) keeps
+that `from tools.hlinterp.checker import check` (and every helper) keeps
 working."""
 from .checking.helpers import *  # noqa: F401,F403
 from .lexer import HLError  # noqa: F401

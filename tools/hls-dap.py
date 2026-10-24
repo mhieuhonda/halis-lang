@@ -60,13 +60,13 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from boot.boot import load_program, _resolve_import     # noqa: E402
-from boot.checker import check                          # noqa: E402
-from boot.interp import Interp, HLPanic                 # noqa: E402
-from boot.lexer import tokenize, HLError                # noqa: E402
-from boot.parser import Parser                          # noqa: E402
-from boot.interp_parts.exec import InterpExec           # noqa: E402
-from boot.interp_parts.core import InterpCore           # noqa: E402
+from tools.hlinterp.boot import load_program, _resolve_import     # noqa: E402
+from tools.hlinterp.checker import check                          # noqa: E402
+from tools.hlinterp.interp import Interp, HLPanic                 # noqa: E402
+from tools.hlinterp.lexer import tokenize, HLError                # noqa: E402
+from tools.hlinterp.parser import Parser                          # noqa: E402
+from tools.hlinterp.interp_parts.exec import InterpExec           # noqa: E402
+from tools.hlinterp.interp_parts.core import InterpCore           # noqa: E402
 
 DAP_VERSION = "1.64.0"
 TOOL_VERSION = "0.140.0-alpha"

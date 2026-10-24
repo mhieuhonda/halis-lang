@@ -8,7 +8,7 @@ echo "=== 14. Stage 28: stack-frame layout control (kernel code) ==="
 # signature. The kernel_irq_demo.hls example exercises all three.
 
 # (a) the example file parses with all three attributes (via boot).
-if python3 boot/boot.py examples/kernel_irq_demo.hls >/dev/null 2>&1; then
+if python3 tools/hlinterp/boot.py examples/kernel_irq_demo.hls >/dev/null 2>&1; then
     ok "stack: examples/kernel_irq_demo.hls parses via boot"
 else
     bad "stack: examples/kernel_irq_demo.hls failed to parse via boot"
@@ -16,7 +16,7 @@ fi
 
 # (b) hlc compiles it to a C source that contains __attribute__((interrupt)).
 if [ ! -x "$TMP/hlc1" ]; then
-    python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
+    python3 tools/hlinterp/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
     gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
 fi
 if "$TMP/hlc1" examples/kernel_irq_demo.hls "$TMP/kernel_irq.c" >/dev/null 2>&1; then
@@ -52,7 +52,7 @@ fn main() -> int {
     return too_big(10)
 }
 SEOF
-err=$(python3 boot/boot.py src/hlc.hls "$TMP/stack_fail.hls" "$TMP/stack_fail.c" 2>&1)
+err=$(python3 tools/hlinterp/boot.py src/hlc.hls "$TMP/stack_fail.hls" "$TMP/stack_fail.c" 2>&1)
 if echo "$err" | grep -q "#\[stack_size(8)\] violated"; then
     ok "stack: #[stack_size(8)] checker fires on too-large frame"
 else
@@ -70,7 +70,7 @@ fn main() -> int {
     return 0
 }
 IEOF
-err=$(python3 boot/boot.py src/hlc.hls "$TMP/irq_bad.hls" "$TMP/irq_bad.c" 2>&1)
+err=$(python3 tools/hlinterp/boot.py src/hlc.hls "$TMP/irq_bad.hls" "$TMP/irq_bad.c" 2>&1)
 if echo "$err" | grep -q "irq_handler.*void"; then
     ok "stack: #[irq_handler] rejects non-void return"
 else
@@ -91,7 +91,7 @@ else
 fi
 
 # (g) bootstrap still works after the src/hlc.hls Stage 28 changes.
-if python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_s28.c" >/dev/null 2>&1 \
+if python3 tools/hlinterp/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_s28.c" >/dev/null 2>&1 \
     && diff -q "$TMP/hlc_s28.c" "$TMP/hlc_nat.c" >/dev/null; then
     ok "stack: bootstrap deterministic with Stage 28 changes"
 else
@@ -105,7 +105,7 @@ echo "=== 15. Stage 29: inline / hot / cold attributes + --opt-stats ==="
 # inline(never). hllint warns (L011) on inline(always) > 50 statements.
 
 # (a) the example file parses with all four attributes (via boot).
-if python3 boot/boot.py examples/inline_attrs_demo.hls >/dev/null 2>&1; then
+if python3 tools/hlinterp/boot.py examples/inline_attrs_demo.hls >/dev/null 2>&1; then
     ok "inline: examples/inline_attrs_demo.hls parses via boot"
 else
     bad "inline: examples/inline_attrs_demo.hls failed to parse via boot"
@@ -113,7 +113,7 @@ fi
 
 # (b) hlc compiles it to a C source that contains the right C attributes.
 if [ ! -x "$TMP/hlc1" ]; then
-    python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
+    python3 tools/hlinterp/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
     gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
 fi
 if "$TMP/hlc1" examples/inline_attrs_demo.hls "$TMP/inline_attrs.c" >/dev/null 2>&1; then
@@ -233,7 +233,7 @@ fi
 
 # (i) bootstrap still works after the src/hlc.hls Stage 29 changes
 #     (the self-hosted compiler must remain deterministic).
-if python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_s29.c" >/dev/null 2>&1 \
+if python3 tools/hlinterp/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_s29.c" >/dev/null 2>&1 \
     && diff -q "$TMP/hlc_s29.c" "$TMP/hlc_nat.c" >/dev/null; then
     ok "inline: bootstrap deterministic with Stage 29 changes"
 else
@@ -248,7 +248,7 @@ echo "=== 16. Stage 30: boxed-vs-stack layout analysis (escape analysis) ==="
 # fibonacci zero-heap-objects acceptance.
 
 # (a) the demo example runs via the boot interpreter.
-if python3 boot/boot.py examples/stack_layout_demo.hls >"$TMP/s30_demo.out" 2>&1; then
+if python3 tools/hlinterp/boot.py examples/stack_layout_demo.hls >"$TMP/s30_demo.out" 2>&1; then
     ok "stage30: examples/stack_layout_demo.hls runs via boot"
 else
     bad "stage30: examples/stack_layout_demo.hls failed via boot"
@@ -258,7 +258,7 @@ fi
 # (b) the native hlc compiles it; the C source contains the typed frame
 #     arrays (the #[stack] + auto layouts) and the accessors.
 if [ ! -x "$TMP/hlc1" ]; then
-    python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
+    python3 tools/hlinterp/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
     gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
 fi
 if "$TMP/hlc1" examples/stack_layout_demo.hls "$TMP/s30_demo.c" >/dev/null 2>&1; then
@@ -339,7 +339,7 @@ fi
 #     reject every escape class.
 LEAKS=0
 for f in tests/fail/fail_stack_*.hls; do
-    if python3 boot/boot.py --check "$f" >/dev/null 2>&1; then
+    if python3 tools/hlinterp/boot.py --check "$f" >/dev/null 2>&1; then
         echo "  boot --check LEAK: $f"
         LEAKS=$((LEAKS + 1))
     fi
@@ -425,7 +425,7 @@ fi
 
 # (k) bootstrap still deterministic with the Stage 30 changes (the
 #     compiler's own print_opt_stats now uses #[stack] + auto layouts).
-if python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_s30.c" >/dev/null 2>&1 \
+if python3 tools/hlinterp/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_s30.c" >/dev/null 2>&1 \
     && diff -q "$TMP/hlc_s30.c" "$TMP/hlc_nat.c" >/dev/null; then
     ok "stage30: bootstrap deterministic with Stage 30 changes"
 else
@@ -436,7 +436,7 @@ echo ""
 echo "=== 17. Stage 31: verified tail calls (#[tail_call]) ==="
 
 # (a) the feature matrix runs via the interpreter (fast depths).
-if s31out=$(python3 boot/boot.py tests/ok/feat_stage31_tail.hls 2>&1); then
+if s31out=$(python3 tools/hlinterp/boot.py tests/ok/feat_stage31_tail.hls 2>&1); then
     if echo "$s31out" | grep -q "fib_tail(10000) = 271496360" \
         && echo "$s31out" | grep -q "collatz_steps(27) = 111" \
         && echo "$s31out" | grep -q "sum_tail(50000, 0) = 1250175003"; then
@@ -490,9 +490,9 @@ cat > "$TMP/s31_trampoline.py" <<'PYEOF31'
 import sys
 sys.path.insert(0, ".")
 sys.setrecursionlimit(200)  # a 100k tail depth must NOT need Python frames
-from boot.boot import load_program
-from boot.checker import check
-from boot.interp import Interp
+from tools.hlinterp.boot import load_program
+from tools.hlinterp.checker import check
+from tools.hlinterp.interp import Interp
 import io
 prog = load_program("tests/ok/feat_stage31_tail.hls")
 check(prog)
@@ -510,7 +510,7 @@ fi
 # (f) the verifier rejects every fail_tail_call_* program (boot + native).
 s31fail=0
 for f in tests/fail/fail_tail_call_*.hls; do
-    if ! python3 boot/boot.py --check "$f" >/dev/null 2>&1; then
+    if ! python3 tools/hlinterp/boot.py --check "$f" >/dev/null 2>&1; then
         s31fail=$((s31fail+1))
     else
         bad "stage31: $(basename $f) was NOT rejected by the boot checker"
@@ -578,7 +578,7 @@ echo "=== 16. Stage 26: RISC-V 64 backend (RVV + bare-metal) ==="
 # flags.
 
 # (a) --target-feature rvv emits RVV intrinsics in the C source.
-if python3 boot/boot.py src/hlc.hls examples/riscv_demo.hls "$TMP/riscv_rvv.c" --target-feature rvv >/dev/null 2>&1; then
+if python3 tools/hlinterp/boot.py src/hlc.hls examples/riscv_demo.hls "$TMP/riscv_rvv.c" --target-feature rvv >/dev/null 2>&1; then
     rvv_count=$(grep -c "__riscv_vadd_vv_i32m1\|__riscv_vsub_vv_i32m1\|__riscv_vmul_vv_i32m1\|__riscv_vmin_vv_i32m1\|__riscv_vmax_vv_i32m1" "$TMP/riscv_rvv.c" 2>/dev/null || echo 0)
     if [ "$rvv_count" -gt 0 ]; then
         ok "riscv: --target-feature rvv emits RVV intrinsics ($rvv_count sites)"
@@ -689,7 +689,7 @@ fi
 # (l) the feat_stage26_riscv.hls test runs cleanly via the boot interpreter
 #     (portable path) AND with --target-feature rvv (which sets
 #     has_feature("rvv") -> true).
-if python3 boot/boot.py tests/ok/feat_stage26_riscv.hls >"$TMP/s26_portable.out" 2>&1; then
+if python3 tools/hlinterp/boot.py tests/ok/feat_stage26_riscv.hls >"$TMP/s26_portable.out" 2>&1; then
     if grep -q "ACCEPTANCE OK" "$TMP/s26_portable.out"; then
         ok "riscv: feat_stage26_riscv.hls runs on portable path"
     else
@@ -700,7 +700,7 @@ else
     bad "riscv: feat_stage26_riscv.hls failed to run on portable path"
     tail -10 "$TMP/s26_portable.out"
 fi
-if python3 boot/boot.py --target-feature rvv tests/ok/feat_stage26_riscv.hls >"$TMP/s26_rvv.out" 2>&1; then
+if python3 tools/hlinterp/boot.py --target-feature rvv tests/ok/feat_stage26_riscv.hls >"$TMP/s26_rvv.out" 2>&1; then
     if grep -q 'has_feature("rvv"): true' "$TMP/s26_rvv.out" \
         && grep -q "ACCEPTANCE OK" "$TMP/s26_rvv.out"; then
         ok "riscv: feat_stage26_riscv.hls runs with --target-feature rvv (has_feature(rvv)=true)"
@@ -715,8 +715,8 @@ fi
 
 # (m) bootstrap still works after the src/hlc.hls RVV changes (the
 #     self-hosted compiler must remain deterministic).
-if python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_rvv.c" >/dev/null 2>&1 \
-    && python3 boot/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_rvv2.c" --target-feature rvv >/dev/null 2>&1; then
+if python3 tools/hlinterp/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_rvv.c" >/dev/null 2>&1 \
+    && python3 tools/hlinterp/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_rvv2.c" --target-feature rvv >/dev/null 2>&1; then
     # The two outputs must be byte-identical when --target-feature is
     # not used by hlc.hls itself (which it isn't — hlc.hls doesn't use
     # std.simd).

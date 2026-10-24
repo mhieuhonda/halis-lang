@@ -62,7 +62,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from boot.lexer import tokenize, HLError  # noqa: E402
+from tools.hlinterp.lexer import tokenize, HLError  # noqa: E402
 
 
 # Token categories (mirror boot/lexer.py).

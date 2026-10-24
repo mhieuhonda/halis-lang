@@ -73,7 +73,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 sys.path.insert(0, ROOT)
 
-from boot.lexer import HLError  # noqa: E402
+from tools.hlinterp.lexer import HLError  # noqa: E402
 import tools.hltest as hltest  # noqa: E402
 from tools.hltest import (  # noqa: E402
     parse_snapshot_records,
@@ -87,9 +87,9 @@ FAIL = 0
 TMP = tempfile.mkdtemp(prefix="_gate_s119_", dir=os.path.join(ROOT, "tests"))
 
 HLTEST = [sys.executable, "tools/hltest.py"]
-BOOT = [sys.executable, "boot/boot.py"]
+BOOT = [sys.executable, "tools/hlinterp/boot.py"]
 HLC = os.path.join(ROOT, "bin", "hlc")
-HLS_CHECK = [sys.executable, "boot/boot.py", "--check"]
+HLS_CHECK = [sys.executable, "tools/hlinterp/boot.py", "--check"]
 HLC_BIN = HLC if os.path.isfile(HLC) else None
 
 FIXTURE = os.path.join(ROOT, "tests", "ok", "feat_stage119_snapshot.hls")

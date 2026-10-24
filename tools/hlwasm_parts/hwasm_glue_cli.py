@@ -123,7 +123,7 @@ def compile_via_emscripten(input_hls: str, output_base: str,
     hlc = os.path.join(_REPO_ROOT, "bin", "hlc")
     if not os.path.isfile(hlc):
         # Try building via the bootstrap compiler.
-        boot_py = os.path.join(_REPO_ROOT, "boot", "boot.py")
+        boot_py = os.path.join(_REPO_ROOT, "tools", "hlinterp", "boot.py")
         if not os.path.isfile(boot_py):
             return None
         hlc = None  # will use boot.py directly
@@ -243,8 +243,8 @@ def compile_program(input_hls: str, output_base: str,
             "libc access).\n")
     # Load + check the program (mirrors boot.py's pipeline).
     sys.path.insert(0, _REPO_ROOT)
-    from boot.boot import load_program  # type: ignore
-    from boot.checker import check  # type: ignore
+    from tools.hlinterp.boot import load_program  # type: ignore
+    from tools.hlinterp.checker import check  # type: ignore
     program = load_program(input_hls)
     check(program)  # raises HLError on failure
     # Emit the wasm binary.

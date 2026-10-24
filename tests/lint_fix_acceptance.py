@@ -68,7 +68,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 sys.path.insert(0, ROOT)
 
-from boot.lexer import HLError  # noqa: E402
+from tools.hlinterp.lexer import HLError  # noqa: E402
 import tools.hllint as hllint  # noqa: E402
 from tools.hllint import Fixer  # noqa: E402
 
@@ -79,7 +79,7 @@ TMP = tempfile.mkdtemp(prefix="_gate_s118_", dir=os.path.join(ROOT, "tests"))
 HLC = os.path.join(ROOT, "bin", "hlc")
 HLLINT = [sys.executable, "tools/hllint.py"]
 HLFMT = [sys.executable, "tools/hlfmt.py"]
-BOOT = [sys.executable, "boot/boot.py"]
+BOOT = [sys.executable, "tools/hlinterp/boot.py"]
 
 
 def ok(msg):

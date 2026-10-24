@@ -89,10 +89,10 @@ import tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from boot.parser import parse                     # noqa: E402
-from boot.checker import check as hls_check       # noqa: E402
-from boot.boot import load_program                # noqa: E402
-from boot.lexer import HLError                    # noqa: E402
+from tools.hlinterp.parser import parse                     # noqa: E402
+from tools.hlinterp.checker import check as hls_check       # noqa: E402
+from tools.hlinterp.boot import load_program                # noqa: E402
+from tools.hlinterp.lexer import HLError                    # noqa: E402
 
 PKG_SRC = os.path.join(ROOT, "tests", "fuzzseed_pkg", "src")
 FZZ = os.path.join(ROOT, "tools", "hls-fuzzseed.py")
@@ -186,7 +186,7 @@ def interp_native(src_path, tmpdir):
 
 
 def interp_only(src_path):
-    p = run([sys.executable, os.path.join(ROOT, "boot", "boot.py"),
+    p = run([sys.executable, os.path.join(ROOT, "tools", "hlinterp", "boot.py"),
              src_path], cwd=ROOT, input="")
     return p.stdout, p.returncode
 

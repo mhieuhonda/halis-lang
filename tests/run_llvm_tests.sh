@@ -30,7 +30,7 @@ bad()  { FAIL=$((FAIL+1)); echo "  [FAIL] $1"; }
 echo "=== LLVM IR backend: emit + structural validation ==="
 for f in tests/llvm/*.hls; do
     name=$(basename "$f" .hls)
-    if ! python3 boot/boot.py --emit llvm "$f" > "$TMP/$name.ll" 2> "$TMP/$name.err"; then
+    if ! python3 tools/hlinterp/boot.py --emit llvm "$f" > "$TMP/$name.ll" 2> "$TMP/$name.err"; then
         bad "$name (emit failed: $(head -1 "$TMP/$name.err"))"
         continue
     fi
@@ -54,7 +54,7 @@ run_and_check() {
     local name="$1"; shift
     local expected="$1"; shift
     local actual
-    actual=$(python3 boot/boot.py "tests/llvm/$name.hls" 2>/dev/null)
+    actual=$(python3 tools/hlinterp/boot.py "tests/llvm/$name.hls" 2>/dev/null)
     if [ "$actual" == "$expected" ]; then
         ok "$name (interpreter snapshot)"
     else
@@ -73,7 +73,7 @@ echo "=== LLVM IR backend: unsupported constructs fail CLEANLY ==="
 # struct/enum/match/?/user-methods must raise a clear HLError, not emit
 # silently-broken IR.
 printf 'struct S { x: int }\nfn main() -> int { let s: S = S { x: 1 }\n return s.x }\n' > "$TMP/unsup.hls"
-python3 boot/boot.py --emit llvm "$TMP/unsup.hls" > /dev/null 2> "$TMP/unsup.err"
+python3 tools/hlinterp/boot.py --emit llvm "$TMP/unsup.hls" > /dev/null 2> "$TMP/unsup.err"
 rc=$?
 # NOTE: use plain grep (not rg) — GitHub runners do not ship ripgrep.
 if [ $rc -ne 0 ] && grep -q "not yet supported by --emit llvm" "$TMP/unsup.err" && ! grep -q "Traceback" "$TMP/unsup.err"; then

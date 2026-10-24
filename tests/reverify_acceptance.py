@@ -112,7 +112,7 @@ from hlreverify_parts import hlrev_common as com          # noqa: E402
 from hlreverify_parts import hlrev_collect as coll        # noqa: E402
 from hlreverify_parts import hlrev_ircheck as ircheck     # noqa: E402
 from hlreverify_parts import hlrev_replay as replay       # noqa: E402
-from boot import proof as bp                              # noqa: E402
+from tools.hlinterp import proof as bp                              # noqa: E402
 
 expect(ircheck.bp.iv_add is bp.iv_add and ircheck.bp.mul_fits is bp.mul_fits
        and ircheck.bp.excludes_zero is bp.excludes_zero
@@ -140,8 +140,8 @@ expect(p.returncode == 0 and "0 failed" in p.stdout,
 print("=== 2. the baseline ===")
 # ---------------------------------------------------------------------------
 
-from boot.boot import load_program  # noqa: E402
-from boot.checker import check      # noqa: E402
+from tools.hlinterp.boot import load_program  # noqa: E402
+from tools.hlinterp.checker import check      # noqa: E402
 
 
 def checked(path):
@@ -473,10 +473,10 @@ expect(refused == len(sample_fails),
 print("=== 7. the demos ===")
 # ---------------------------------------------------------------------------
 
-p = run([sys.executable, "boot/boot.py", DEMO])
+p = run([sys.executable, "tools/hlinterp/boot.py", DEMO])
 expect(p.returncode == 0 and "law proven" in p.stdout,
        "the demo runs in the interpreter")
-p2 = run([sys.executable, "boot/boot.py", OK_TEST])
+p2 = run([sys.executable, "tools/hlinterp/boot.py", OK_TEST])
 expect(p2.returncode == 0 and p2.stdout.startswith("stage108 reverify:"),
        "the ok-test runs in the interpreter")
 if p.returncode == 0 and p2.returncode == 0:
