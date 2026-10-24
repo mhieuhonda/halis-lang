@@ -10,16 +10,18 @@
 #          Use this to exercise the pipeline without publishing anything.
 #
 # Per-platform job (matrix of 6):
-#   1. Stage-0 bootstrap — the Python seed (boot/) interprets the HLS
-#      compiler source (src/hlc.hls) and makes it compile itself into
-#      bin/hlc.c                       (the `make bootstrap` step 1).
-#   2. Native compile of bin/hlc.c with the platform C toolchain
-#      (-O2 -lm -pthread, exactly as the Makefile does).
-#   3. Bootstrap-invariant re-check, run on EVERY build including cache
-#      hits: the native compiler must regenerate bin/hlc.c byte-identically
-#      (make bootstrap steps 3+4), and examples/hello.hls must compile and
-#      run end-to-end with the expected output.
-#   4. Package hlc + LICENSE + README.md into a per-platform archive
+#   1. Compile the committed C snapshot (Stage 142, v0.161.0-alpha):
+#      cc -O2 -o bin/hlc snapshot/hlc.c — NO Python on the build path;
+#      the snapshot is the compiler's own emission for src/hlc.hls,
+#      carried in the tree and content-addressed by
+#      snapshot/MANIFEST.json.
+#   2. Bootstrap-invariant re-check, run on EVERY build including cache
+#      hits: the native compiler must re-derive the snapshot byte for
+#      byte (the fixed-point law: bin/hlc compiles src/hlc.hls and the
+#      output is diffed against the COMMITTED snapshot/hlc.c), and
+#      examples/hello.hls must compile and run end-to-end with the
+#      expected output.
+#   3. Package hlc + LICENSE + README.md into a per-platform archive
 #      (.tar.gz on Linux/macOS, .zip on Windows) and upload it as a
 #      workflow artifact named `pkg-<platform>`.
 #
@@ -28,13 +30,13 @@
 # GitHub Release for the tag with every archive + SHA256SUMS attached.
 #
 # Cache
-#   `bin/` (hlc.c + the native compiler) is cached per platform, keyed on
-#   the exact content hash of boot/** + src/**. A hit proves these very
-#   sources were bootstrapped before, so steps 1+2 are skipped entirely:
-#   re-runs, retries and re-pushes of the same tag never pay the Python
-#   bootstrap again. No restore-keys are used on purpose — a stale
-#   compiler must never be reused for a release, and the verify step
-#   (step 3) always runs regardless of cache state.
+#   `bin/` (the native compiler) is cached per platform, keyed on
+#   the exact content hash of snapshot/**. A hit proves this very
+#   snapshot was compiled before, so the build step is skipped
+#   entirely: re-runs, retries and re-pushes of the same tag never
+#   pay the compile again. No restore-keys are used on purpose — a
+#   stale compiler must never be reused for a release, and the verify
+#   step (the fixed-point law) always runs regardless of cache state.
 #
 # Toolchain notes
 #   * All 6 jobs build NATIVELY on GitHub-hosted runners (public repo:
@@ -47,15 +49,13 @@
 #     Linux only). Without it every binary behaves identically —
 #     net_tls_get panics with a clear message, everything else works.
 #
-# ── STAGE 142 NOTE (pure-HLS bootstrap) ─────────────────────────────────────
-# When `boot/` (the Python seed) is removed, replace the two commands inside
-# the "Stage-0 bootstrap + native compile" step (marked STAGE 142 below):
-#     1. fetch the previous release's `hlc` for THIS platform (the hosted
-#        compiler can compile src/hlc.hls), then
-#     2. run `./hlc src/hlc.hls bin/hlc.c` instead of
-#        `python boot/boot.py src/hlc.hls src/hlc.hls bin/hlc.c`.
-# The cache key should then drop the boot/** pattern. Everything else —
-# verification, packaging, checksums, release — stays exactly as is.
+# ── STAGE 142 (pure-HLS bootstrap, v0.161.0-alpha) ──────────────────────────
+# DONE: the Python seed is off the release build path. Every platform
+# compiles the committed C snapshot directly (gcc/clang -O2 snapshot/hlc.c)
+# and the fixed-point law re-derives it from src/hlc.hls — no interpreter,
+# no previous-release fetch, no network. The seed lives on as the oracle
+# that re-derives the snapshot when the language grows new syntax
+# (`make snapshot-regen --seed`) and in the differential suites.
 # ────────────────────────────────────────────────────────────────────────────
 
 name: Release
@@ -106,7 +106,6 @@ jobs:
             msystem: MINGW64
             packages: >-
               mingw-w64-x86_64-gcc
-              mingw-w64-x86_64-python
               diffutils
               grep
           - name: windows-aarch64
@@ -115,7 +114,6 @@ jobs:
             msystem: CLANGARM64
             packages: >-
               mingw-w64-clang-aarch64-gcc
-              mingw-w64-clang-aarch64-python
               diffutils
               grep
 
@@ -130,13 +128,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # ---- Toolchains ------------------------------------------------------
-      - name: Setup Python 3.12
-        if: runner.os != 'Windows'
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: '3.12'
-
-      - name: Setup MSYS2 (MinGW gcc + python)
+      # Stage 142: no Python setup on any platform — the build compiles
+      # the committed C snapshot with the platform C toolchain alone.
+      - name: Setup MSYS2 (MinGW gcc)
         if: runner.os == 'Windows'
         uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2.33.0
         with:
@@ -146,44 +140,38 @@ jobs:
           install: ${{ matrix.packages }}
 
       # ---- Cache ------------------------------------------------------------
-      # bin/ holds the Stage-0 output (hlc.c) and the native compiler built
-      # from it. Keyed on the exact sources; no restore-keys (see header).
+      # bin/ holds the native compiler built from the committed C
+      # snapshot. Keyed on the snapshot's exact content; no restore-keys
+      # (see header).
       - name: Restore bootstrap cache
         id: bootcache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: bin
-          key: hlc-boot-${{ matrix.name }}-${{ hashFiles('boot/**', 'src/**') }}
+          key: hlc-snap-${{ matrix.name }}-${{ hashFiles('snapshot/**') }}
 
-      # ---- Build (STAGE 142: replace the bootstrap command below) ----------
-      - name: Stage-0 bootstrap + native compile (Linux/macOS)
+      # ---- Build (Stage 142: compile the committed C snapshot) --------------
+      - name: Compile the committed C snapshot (Linux/macOS)
         if: runner.os != 'Windows' && steps.bootcache.outputs.cache-hit != 'true'
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p bin
-          echo "python: $(command -v python) ($(python --version 2>&1))"
           echo "cc:     $(command -v ${{ matrix.cc }}) ($(${{ matrix.cc }} --version | head -1))"
-          # Stage-0: the Python seed interprets the HLS compiler and makes
-          # it compile itself into C (make bootstrap step 1).
-          python boot/boot.py src/hlc.hls src/hlc.hls bin/hlc.c
-          # Native compile of the emitted C (make bootstrap step 2).
-          ${{ matrix.cc }} -O2 -o bin/hlc bin/hlc.c -lm -pthread
+          # Stage 142: the snapshot IS the seed — the compiler's own
+          # emission for src/hlc.hls, committed to the tree.
+          ${{ matrix.cc }} -O2 -o bin/hlc snapshot/hlc.c -lm -pthread
 
-      - name: Stage-0 bootstrap + native compile (Windows)
+      - name: Compile the committed C snapshot (Windows)
         if: runner.os == 'Windows' && steps.bootcache.outputs.cache-hit != 'true'
         shell: msys2 {0}
         run: |
           set -euo pipefail
           mkdir -p bin
-          echo "python: $(command -v python) ($(python --version 2>&1))"
           echo "cc:     $(command -v ${{ matrix.cc }}) ($(${{ matrix.cc }} --version | head -1))"
-          # Stage-0: the Python seed interprets the HLS compiler and makes
-          # it compile itself into C (make bootstrap step 1).
-          python boot/boot.py src/hlc.hls src/hlc.hls bin/hlc.c
-          # Native compile of the emitted C (make bootstrap step 2). MinGW
-          # gcc auto-appends .exe to the output name.
-          ${{ matrix.cc }} -O2 -o bin/hlc bin/hlc.c -lm -pthread
+          # Stage 142: the snapshot IS the seed. MinGW gcc auto-appends
+          # .exe to the output name.
+          ${{ matrix.cc }} -O2 -o bin/hlc snapshot/hlc.c -lm -pthread
 
       # ---- Verify (always runs — cached or not) -----------------------------
       - name: Verify bootstrap invariant + smoke run (Linux/macOS)
@@ -192,10 +180,12 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p smoke
-          # (a) The compiler must regenerate its own C source byte-for-byte
-          #     — the exact gate `make bootstrap` steps 3+4 enforce.
+          # (a) The fixed-point law: the compiler built from the committed
+          #     snapshot must re-derive the snapshot byte for byte — the
+          #     exact gate `make bootstrap` enforces, judged against the
+          #     tree's own snapshot/hlc.c (not a cache artifact).
           ./bin/hlc src/hlc.hls smoke/hlc_selfcheck.c
-          diff -q bin/hlc.c smoke/hlc_selfcheck.c
+          diff -q snapshot/hlc.c smoke/hlc_selfcheck.c
           # (b) Compile a real program end-to-end and run it.
           ./bin/hlc examples/hello.hls smoke/hello.c
           ${{ matrix.cc }} -O2 -o smoke/hello smoke/hello.c -lm -pthread
@@ -210,12 +200,12 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p smoke
-          # (a) The compiler must regenerate its own C source byte-for-byte
-          #     — the exact gate `make bootstrap` steps 3+4 enforce.
+          # (a) The fixed-point law: judged against the tree's own
+          #     committed snapshot/hlc.c. MSYS2 bash resolves ./bin/hlc
+          #     to bin/hlc.exe automatically.
           ./bin/hlc src/hlc.hls smoke/hlc_selfcheck.c
-          diff -q bin/hlc.c smoke/hlc_selfcheck.c
-          # (b) Compile a real program end-to-end and run it. MSYS2 bash
-          #     resolves ./bin/hlc to bin/hlc.exe automatically.
+          diff -q snapshot/hlc.c smoke/hlc_selfcheck.c
+          # (b) Compile a real program end-to-end and run it.
           ./bin/hlc examples/hello.hls smoke/hello.c
           ${{ matrix.cc }} -O2 -o smoke/hello smoke/hello.c -lm -pthread
           out="$(./smoke/hello)"

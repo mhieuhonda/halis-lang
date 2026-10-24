@@ -9,12 +9,16 @@ how to submit changes.
 ```bash
 git clone https://github.com/mhieuhonda/halis-lang.git
 cd halis-lang
-make bootstrap    # builds the native compiler via the bootstrap chain
+make bootstrap    # pure-HLS: cc compiles the committed C snapshot,
+                 # hlc re-derives it, the fixed-point law must hold
+                 # (no Python in the chain — Stage 142)
 make test         # full suite: interpreter, native, differential,
                  # bootstrap determinism, LLVM IR, memory-stress, fmt, lint
 ```
 
-Requirements: Python 3.8+ (only for the Stage-0 seed), gcc or clang.
+Requirements: gcc or clang. Python 3.8+ is optional (the Stage-0
+interpreter for the differential suites, `make stage0`, and the
+snapshot kit's tools).
 
 ## Branch model
 
@@ -41,8 +45,26 @@ Four workflows live under `.github/workflows/`:
 
 Every third-party action is pinned to an exact commit SHA (checked by
 Dependabot, one grouped weekly PR). `bin/` is cached in CI keyed on the
-content hash of `boot/**` + `src/**`, so unchanged sources never pay the
-Stage-0 bootstrap twice.
+content hash of `snapshot/**` + `src/**`, so unchanged sources never pay
+the snapshot compile twice.
+
+### The committed C snapshot (Stage 142)
+
+`snapshot/hlc.c` — the compiler's own emission for `src/hlc.hls`,
+carried in the tree — is the seed the pure bootstrap compiles, and
+`snapshot/MANIFEST.json` records what it was cut from (the exact import
+closure, content-addressed). Two rules for contributors:
+
+- **Never edit either file by hand.** The fixed-point law
+  (`make bootstrap`) and the manifest laws (`make snapshot-verify`)
+will both refuse a hand edit, naming the rule that fired.
+- **If you changed anything under `src/hlc.hls` / `src/hlc/`, run
+  `make snapshot-regen` and commit `snapshot/hlc.c` +
+  `snapshot/MANIFEST.json` TOGETHER with your change** (or neither).
+  A comment-only edit regenerates the manifest only; a semantic edit
+  re-derives the C at the fixed point. `make snapshot-prove` shows the
+  Python seed deriving the same bytes; `make bootstrap-seed` runs the
+  historic four-step ladder.
 
 ### Branch protection (enforced on `main`)
 
@@ -81,9 +103,11 @@ you are the owner.
 4. **Run the full test suite**:
    ```bash
    make test
-   make bootstrap    # confirms deterministic self-compilation
+   make bootstrap    # confirms the pure-HLS fixed point
    ```
-   Both must succeed before you push.
+   Both must succeed before you push. If you touched the compiler
+   sources, also run `make snapshot-regen` (see the snapshot rules
+   above) and commit the moved snapshot with your change.
 5. **Commit with a clear message** (see "Commit messages" below).
 6. **Open a pull request** against the appropriate base branch. Reference
    the issue number in the PR description (`Closes #N`).
@@ -100,7 +124,12 @@ src/hlc/                 # Compiler modules: types, lexer, parser, checker,
                          # proof, check_expr, check_call, check_match,
                          # runtime, codegen, pgo, simd, lto, gen_expr,
                          # gen_stmt, gen_fn, main
-boot/                    # Stage-0 bootstrap seed (pure Python);
+snapshot/                # The committed C snapshot + manifest (Stage 142):
+                         # the seed the pure bootstrap compiles; mutate only
+                         # through make snapshot-regen, never by hand
+boot/                    # The seed demoted to oracle (pure Python):
+                         # differential suites, snapshot prove / regen --seed,
+                         # and the maintenance ladder make bootstrap-seed;
                          # checker.py/interp.py are facades over the
                          # boot/checking/ and boot/interp_parts/ packages
 std/                     # Standard library modules (pure HLS); large

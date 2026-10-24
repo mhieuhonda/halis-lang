@@ -82,37 +82,44 @@ Seven core guarantees of v0.35.0-alpha:
 ## Self-hosting — proof, not promise
 
 ```
-                    ┌────────────────────────────────────────────┐
-                    │                                            │
-  src/hlc.hls ──► boot/ (Stage-0, seed) ──► hlc.c (pass 1)       │
-  (compiler in         used ONLY ONCE to        │                │
-   HLS, ~3000 lines)   bootstrap the cycle      ▼                │
-                                           gcc -O2                │
-                                                │                  │
-                                                ▼                  │
-                                        bin/hlc  (native) ───────┤
-                                                │  recompiles self │
-                                                ▼                  │
-                                        hlc.c (pass 2)             │
-                                                │                  │
-                                 diff pass 1 vs pass 2 = 0 bytes ─┘
+  snapshot/hlc.c  ── cc -O2 ──►  bin/hlc (native)  ── compiles ──►  src/hlc.hls
+  (the compiler's      │                                            │
+   own emission,        │            │                                │
+   COMMITTED in the     │            ▼                                │
+   tree — Stage 142)    └──── hlc_regen.c ─── cmp snapshot = 0 bytes ──┘
+                              (the fixed-point law, every build)
+
+  (the Python seed, boot/, is off this path: it stays as the oracle
+   that re-derives the snapshot — make snapshot-prove — and as the
+   maintenance ladder — make bootstrap-seed)
 ```
 
-`make bootstrap` performs the entire chain above and confirms the
-**determinism** of the self-compilation process. From Stage 5 onwards, the
-language grows in itself.
+`make bootstrap` performs the chain above — **no Python anywhere in
+it**: the seed is the committed C snapshot, the compiler's own
+emission for `src/hlc.hls`, content-addressed by
+`snapshot/MANIFEST.json`. The build proves the **fixed-point law**
+every time it runs: the compiler built from the snapshot must
+re-derive the snapshot byte for byte. A stale or hand-edited snapshot
+fails the build loudly (`make snapshot-regen` is the only legal
+mutation, and it moves the snapshot and its manifest together). From
+Stage 5 onwards, the language grows in itself.
 
 ## Quick start
 
-Requirements: Python 3.8+ (only for the Stage-0 seed), gcc or clang.
+Requirements: gcc or clang. That is the whole list — the bootstrap is
+pure HLS since Stage 142 (v0.161.0-alpha). Python 3.8+ is OPTIONAL:
+only for the Stage-0 interpreter (`make stage0`), the differential
+suites, and re-deriving the snapshot when the language grows new
+syntax.
 
 ```bash
-# 1. Run directly via Stage-0 (interpreted)
+# 1. Run directly via Stage-0 (interpreted — needs Python)
 python3 boot/boot.py examples/hello.hls
 
-# 2. Build the native compiler via the bootstrap chain
+# 2. Build the native compiler — pure HLS, no Python in the chain
 make bootstrap
 #    → bin/hlc  (the HLS compiler written in HLS, compiled native)
+#      from the committed C snapshot in ~20 s
 
 # 3. Compile your program to a native binary
 make run F=examples/primes.hls
@@ -749,9 +756,12 @@ halis-lang/
 ├── SPEC.md              # Language constitution (full v0.30 spec)
 ├── ROADMAP.md           # 150-stage roadmap to v1.0
 ├── SECURITY.md          # Threat model & security policy
-├── boot/                # Stage-0: bootstrap seed (pure Python)
-│   ├── lexer.py         #   lexer
-│   ├── parser.py        #   syntax → AST
+├── snapshot/            # Stage 142: the committed C snapshot — the seed the
+│   ├── hlc.c            #   pure bootstrap compiles (hlc's own emission for
+│   └── MANIFEST.json    #   src/hlc.hls) + its content-addressed manifest
+├── boot/                # Stage-0: the seed demoted to oracle (pure Python):
+│   ├── lexer.py         #   differential suites, snapshot prove/regen --seed,
+│   ├── parser.py        #   and the maintenance ladder (make bootstrap-seed)
 │   ├── checker.py       #   facade → boot/checking/ (helpers + 8 Checker mixins)
 │   ├── interp.py        #   facade → boot/interp_parts/ (rt + 6 Interp mixins)
 │   └── boot.py          #   CLI

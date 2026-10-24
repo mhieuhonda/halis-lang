@@ -13,6 +13,125 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.161.0-alpha] — Stage 142: pure-HLS bootstrap (the Python seed leaves the build)
+- Phase X's second promise: the language whose compiler is written in
+  itself no longer needs a different language to turn itself on.
+  Until now every fresh checkout, every CI runner, every release
+  build first paid the interpreter — `boot/boot.py` walking the
+  29,000-line compiler source statement by statement, ~80 seconds of
+  Python before gcc ever saw a byte. The seed was honest, but it sat
+  on the build path of every artifact this tree shipped. This stage
+  moves the ignition: the repository now carries **`snapshot/hlc.c`**
+  — the C the compiler emits for its own source, 37,111 lines /
+  2,576,679 bytes, committed like any other file — and the default
+  build compiles THAT. `make bootstrap` is three commands —
+  `cc -O2 -o bin/hlc snapshot/hlc.c`, `bin/hlc src/hlc.hls
+  bin/hlc_regen.c`, `cmp snapshot/hlc.c bin/hlc_regen.c` — and not
+  one of them is Python. A fresh clone plus any C compiler is the
+  whole requirement list; the local bootstrap drops from ~101 s to
+  ~22 s and the CI release builds drop their Python setup steps and
+  MSYS2 python packages entirely.
+- **The fixed-point law is the trust anchor.** The snapshot is
+  derived, never written: the compiler built FROM `snapshot/hlc.c`
+  must re-emit `snapshot/hlc.c` byte-for-byte when it compiles
+  `src/hlc.hls`, and `make bootstrap` proves this on every build.
+  A hand-edited snapshot breaks the law loudly (the edited bytes
+  will not re-derive themselves); so does a compiler-source change
+  that was not followed by a regen — the failure names both
+  possibilities, because the law alone cannot tell a stale snapshot
+  from a tampered one; the manifest can. The old four-step ladder
+  survives verbatim as `make bootstrap-seed` — the maintenance path
+  a maintainer uses to cross-check a snapshot the pure chain
+  refuses, and the lineage the proof below pins.
+- **The seed is demoted, not deleted — from ignition to oracle.**
+  `boot/` stays in the tree: the interpreter still drives the
+  differential suites, and `make snapshot-prove` requires that it
+  derive the SAME bytes the snapshot carries. The committed C is
+  therefore the child of the HLS sources through TWO independent
+  lineages — the interpreter reading the sources, and the compiled
+  snapshot reading them — and a snapshot neither lineage can
+  reproduce is a snapshot nobody wrote. Prove refuses to run from a
+  drifted tree: a proof that the seed matches a snapshot the
+  manifest no longer describes is not a proof, it is a coincidence.
+- **`tools/hls-snap.py` — the snapshot kit**, in the house shape
+  (status | verify | regen | prove, every refusal naming its rule):
+  `status` classifies the tree in a closed four-state vocabulary —
+  FRESH, STALE-SOURCES (naming the file, REMOVED / ADDED / CHANGED),
+  TAMPERED (the bytes disagree with the digest the manifest
+  records), NO-SNAPSHOT — without compiling anything; `verify`
+  adds the manifest's own arithmetic (its closure digest is the
+  digest of the closure it carries) and, with `--deep`, the
+  fixed-point compile itself; `regen` is the ONLY legal mutation —
+  it iterates to the fixed point (a codegen change re-derives the
+  compiler, which re-emits its own source, until the bytes
+  stabilise — normally 1 round, refused after 8), rewrites the
+  snapshot AND the manifest together, and REFUSES a no-op (noise is
+  how real regens stop being read; the two legal triggers are a
+  closure file moving or the release heading moving — the latter
+  performs a manifest-only refresh, the emitted C did not move);
+  the native path refuses to run when the snapshot is missing (it
+  is the seed it builds from) and names the `--seed` fallback for
+  sources the current compiler cannot parse (new syntax).
+- **`snapshot/MANIFEST.json` records what the snapshot was cut
+  from:** the exact import closure of `src/hlc.hls` — 20 files,
+  each content-addressed — plus the closure digest, the snapshot's
+  own sha256, its line and byte counts, the release it ships in,
+  and the number of fixed-point rounds the regen took. No
+  wall-clock, no paths outside the tree, no machine specifics: two
+  regens of one state write byte-identical manifests. The manifest
+  is the fast path that names drift without compiling; the
+  fixed-point law is the slow path that proves it with a compiler.
+  A comment-only source change moves the closure but not the
+  emission — the build never cries wolf over a moved comment (the
+  gate pins this both ways), while `status` still names the file
+  so the manifest travels with the sources.
+- **The acceptance gate** — `make purebootstrap-acceptance`, 7
+  sections, 24 checks: the no-python law (bootstrap succeeds under
+  a PATH that provably cannot resolve python3 or python, on a tree
+  copy that does not even carry `boot/`); the fixed-point law (the
+  tampered snapshot and the semantic drift both fail the build with
+  the named refusal, the comment-only change does not); the regen
+  law (drift re-derived at the fixed point, no-op refused,
+  release-heading refresh manifest-only, missing-snapshot regen
+  refused); the agreement law (prove: two lineages, one result);
+  the manifest law (digest disagreement and hand edits named
+  TAMPERED, missing snapshot named NO-SNAPSHOT); the independence
+  smoke (the purely-bootstrapped compiler compiles and runs
+  fibonacci with interpreter-identical output); the provenance law
+  (the gate re-derives the closure with its OWN walker and demands
+  it equal the manifest's, the version pins the CHANGELOG head, no
+  absolute path leaks into the snapshot text). The corpus fixture
+  `tests/ok/feat_stage142_snapshot.hls` pins the decision procedure
+  in pure HLS: the purity of the
+  build chain, the closure walk, the canonical digest, the
+  semantic-not-textual emitter, one-round convergence, the
+  four-state classification, the no-op refusal with commit-both,
+  and the two-lineage agreement — byte-identical on the interpreter
+  and natively, hlfmt-canonical, hllint-clean.
+- **CI and release follow the demotion.** The per-push bootstrap
+  job runs the pure chain plus `make snapshot-verify` and no longer
+  sets up Python (the manifest tool runs on the runner's system
+  python3 — the tool is Python, the chain is not); its cache is
+  keyed on `hashFiles('snapshot/**', 'src/**')` and the paths
+  filter gained `snapshot/**`. The Python 3.8/3.13 × gcc/clang
+  matrix now runs `make bootstrap-seed` — every Python version
+  still proves it can derive the compiler, which is exactly what
+  that grid exists for. The macOS and Windows smokes build purely
+  (no Python setup, no MSYS2 python package). The nightly deep
+  battery gained the two Stage-142 gates — `make snapshot-prove`
+  and the full acceptance — and release.yml compiles the committed
+  snapshot on all six platforms with no interpreter, no
+  previous-release fetch, no network: the fixed-point diff is
+  judged against the tree's own `snapshot/hlc.c`, never a cache
+  artifact, and the build is now 15 seconds of cc on every
+  platform instead of 80 seconds of Python on every platform.
+- **What this buys Stage 143.** The bit-for-bit reproducible
+  bootstrap chain now has its anchor in-tree: a deterministic
+  emitter, a content-addressed snapshot, a manifest that names the
+  exact closure, and a fixed-point law that runs on every build —
+  the reproducibility proof is one pinned-toolchain
+  `gcc -o` away from being a chain of such snapshots.
+
 ## [v0.160.0-alpha] — CI/CD: the full GitHub Actions pipeline
 - `ci.yml` — the main gate for every push and pull request: actionlint
   (pinned binary, checksum-verified) + shellcheck at error severity +
