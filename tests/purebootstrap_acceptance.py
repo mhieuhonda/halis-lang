@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Stage 142 acceptance gate — the pure-HLS bootstrap: the Python
-seed leaves the build.
+"""Stage 143 acceptance gate — the snapshot kit in Halis: the
+toolchain guards itself.
 
 Run with `make purebootstrap-acceptance` (or
 `python3 tests/purebootstrap_acceptance.py`).
 
-Seven sections:
+Eight sections:
 
-  1. the no-python law    — `make bootstrap` succeeds under a PATH
-                            that cannot resolve python3 or python, on
-                            a tree copy that does not even CARRY
-                            boot/: the build path is cc + the
-                            committed snapshot, nothing else
+  1. the no-python law    — `make bootstrap`, `make snapshot-status`
+                            AND `make snapshot-verify --deep` succeed
+                            under a PATH that cannot resolve python3
+                            or python, on a tree copy that does not
+                            even CARRY boot/: the whole lifecycle —
+                            build, classify, verify, the fixed point —
+                            is cc + the committed snapshot + the
+                            self-hosted kit, nothing else
   2. the fixed-point law  — the compiler built from the snapshot
                             re-derives the snapshot byte for byte; a
                             hand-edited snapshot fails the build with
@@ -29,13 +32,20 @@ Seven sections:
                             refreshes the manifest ONLY (emitted C
                             unchanged); the native path refuses to run
                             without a snapshot to build from
-  4. the agreement law    — `prove`: the Python seed derives the
-                            committed snapshot byte for byte — two
-                            independent lineages, one result
+  4. the agreement law    — `prove`: the FREESTANDING compiler (built
+                            from the hosted one, no libc) re-derives
+                            the committed snapshot byte for byte — no
+                            interpreter anywhere in the chain; and
+                            `prove --seed`: the Python oracle derives
+                            the same bytes (two independent lineages
+                            still agree when the oracle is present)
   5. the manifest law     — the document agrees with itself and the
                             world: a broken digest is a named refusal,
                             a hand-edited snapshot is TAMPERED, a
-                            missing snapshot is NO-SNAPSHOT
+                            missing snapshot is NO-SNAPSHOT; the kit
+                            regens a manifest byte-identical to what
+                            the Stage-142 Python kit wrote (the two
+                            kits are interchangeable)
   6. the independence     — the purely-bootstrapped bin/hlc compiles
      smoke                  and runs a real program with output
                             byte-identical to the interpreter's
@@ -45,6 +55,13 @@ Seven sections:
                             CHANGELOG head, the rounds are sane, and
                             the snapshot text carries no absolute
                             paths (the same C from any checkout dir)
+  8. the self-host law    — the kit's own build is pure: bin/hlc
+                            (built from the snapshot) compiles
+                            tools/hls-snap.hls; the emitted C carries
+                            no absolute path; and the kit never names
+                            an interpreter on its default path (the
+                            only interpreter mention is the --seed
+                            fallback it refuses with)
 """
 import hashlib
 import json
@@ -95,20 +112,23 @@ def sha256_file(path):
 
 
 def copy_tree(tag):
-    """A disposable build tree: Makefile + mk/ + src/ + snapshot/ + the
-    kit + CHANGELOG for the version law. Deliberately WITHOUT boot/ —
-    the pure build must not read it."""
+    """A disposable build tree: everything the pure lifecycle needs —
+    Makefile + mk/ + src/ + core/ + std/ + snapshot/ + the kit +
+    CHANGELOG for the version law. Deliberately WITHOUT boot/: the
+    pure chain must not read it."""
     dst = os.path.join(TMP, tag)
     os.makedirs(dst)
     shutil.copy2(os.path.join(ROOT, "Makefile"), dst)
     shutil.copy2(os.path.join(ROOT, "CHANGELOG.md"), dst)
     shutil.copytree(os.path.join(ROOT, "mk"), os.path.join(dst, "mk"))
     shutil.copytree(os.path.join(ROOT, "src"), os.path.join(dst, "src"))
+    shutil.copytree(os.path.join(ROOT, "core"), os.path.join(dst, "core"))
+    shutil.copytree(os.path.join(ROOT, "std"), os.path.join(dst, "std"))
     shutil.copytree(os.path.join(ROOT, "snapshot"),
                     os.path.join(dst, "snapshot"))
     tools_dir = os.path.join(dst, "tools")
     os.makedirs(tools_dir)
-    shutil.copy2(os.path.join(ROOT, "tools", "hls-snap.py"), tools_dir)
+    shutil.copy2(os.path.join(ROOT, "tools", "hls-snap.hls"), tools_dir)
     return dst
 
 
@@ -142,7 +162,15 @@ def make_bootstrap(tree, env=None):
 
 
 def snap(tree, *args):
-    return run([sys.executable, "tools/hls-snap.py"] + list(args),
+    """Drive the self-hosted kit through its make targets — the way
+    every human does."""
+    return run(["make", "snapshot-" + args[0]], cwd=tree)
+
+
+def snap_bin(tree, *args):
+    """Drive the built kit binary directly (for the oracle flags the
+    make targets do not carry)."""
+    return run([os.path.join(tree, "bin", "hls-snap")] + list(args),
                cwd=tree)
 
 
@@ -162,12 +190,29 @@ if r.returncode == 0 and "pure-HLS fixed point holds" in r.stdout:
 else:
     bad("no-python bootstrap failed (rc=%d): %s"
         % (r.returncode, (r.stdout + r.stderr)[:400]))
-if re.search(r"python[0-9]?\s+boot/boot\.py", r.stdout + r.stderr) \
-        or "Stage-0:" in r.stdout:
-    bad("the bootstrap chain invokes the interpreter — it is not pure")
+r = snap(tree1, "status")
+if r.returncode == 0 and "FRESH" in r.stdout:
+    ok("make snapshot-status runs python-free (the self-hosted kit "
+       "classifies the tree)")
 else:
-    ok("the bootstrap chain invokes no interpreter (the only 'python' "
-       "in the output is the word the success message is proud of)")
+    bad("no-python snapshot-status failed (rc=%d): %s"
+        % (r.returncode, (r.stdout + r.stderr)[:400]))
+r = snap(tree1, "verify")
+if r.returncode == 0 and "VERIFIED (deep)" in r.stdout:
+    ok("make snapshot-verify --deep runs python-free: the kit builds "
+       "the compiler from the snapshot and re-proves the fixed point")
+else:
+    bad("no-python snapshot-verify failed (rc=%d): %s"
+        % (r.returncode, (r.stdout + r.stderr)[:400]))
+combined = ""
+for probe in (make_bootstrap(tree1, python_free_env()),
+              snap(tree1, "status")):
+    combined = combined + probe.stdout + probe.stderr
+if re.search(r"python[0-9]?\s+boot/boot\.py", combined) or "Stage-0:" in combined:
+    bad("the lifecycle invokes the interpreter — it is not pure")
+else:
+    ok("the whole lifecycle (bootstrap + snapshot kit) invokes no "
+       "interpreter")
 
 # ---------------------------------------------------------------------------
 print("=== 2. the fixed-point law ===")
@@ -257,8 +302,11 @@ if r.returncode == 0:
 else:
     bad("the regenerated tree still fails (rc=%d)" % r.returncode)
 # The no-op law: the tree now matches — a second regen is noise.
+# Through make the refusal surfaces as a nonzero exit (make's own
+# contract); the tool's exact exit codes are pinned by the direct
+# binary checks in section 5.
 r = snap(tree2, "regen")
-if r.returncode == 1 and "no-op law" in r.stdout:
+if r.returncode != 0 and "no-op law" in r.stdout:
     ok("a regen on the matching tree is REFUSED (the no-op law)")
 else:
     bad("the no-op regen was not refused (rc=%d)" % r.returncode)
@@ -281,8 +329,12 @@ else:
 
 # The seed law: the native path refuses to run without a snapshot.
 tree2c = copy_tree("t2c")
+r = run(["make", "bin/hls-snap"], cwd=tree2c)
+if r.returncode != 0:
+    bad("the kit does not build on a fresh tree (rc=%d): %s"
+        % (r.returncode, (r.stdout + r.stderr)[:300]))
 os.remove(os.path.join(tree2c, "snapshot", "hlc.c"))
-r = snap(tree2c, "regen")
+r = snap_bin(tree2c, "regen")
 if r.returncode == 1 and "seed law" in r.stdout:
     ok("the native regen refuses when the snapshot is missing (it is "
        "the seed it builds from)")
@@ -290,14 +342,20 @@ else:
     bad("missing-snapshot regen not refused (rc=%d)" % r.returncode)
 
 # ---------------------------------------------------------------------------
-print("=== 4. the agreement law (the seed re-derives the snapshot) ===")
+print("=== 4. the agreement law (two lineages, no interpreter by default) ===")
 # ---------------------------------------------------------------------------
 r = snap(ROOT, "prove")
-if r.returncode == 0 and "PROVEN" in r.stdout:
-    ok("prove: the Python seed derives the committed snapshot byte for "
-       "byte (two independent lineages agree)")
+if r.returncode == 0 and "PROVEN" in r.stdout and "freestanding" in r.stdout:
+    ok("prove (default): the freestanding compiler re-derives the "
+       "committed snapshot byte for byte — pure, no interpreter")
 else:
-    bad("prove failed: %s" % (r.stdout + r.stderr)[:400])
+    bad("prove (freestanding) failed: %s" % (r.stdout + r.stderr)[:400])
+r = snap_bin(ROOT, "prove", "--seed")
+if r.returncode == 0 and "PROVEN" in r.stdout and "Python seed" in r.stdout:
+    ok("prove --seed: the Python oracle derives the committed snapshot "
+       "byte for byte (the second independent lineage, when present)")
+else:
+    bad("prove --seed failed: %s" % (r.stdout + r.stderr)[:400])
 
 # ---------------------------------------------------------------------------
 print("=== 5. the manifest law ===")
@@ -314,29 +372,58 @@ man = json.load(open(man_path))
 man["hlc_c_sha256"] = "0" * 64
 json.dump(man, open(man_path, "w"), sort_keys=True, indent=2)
 r = snap(tree5, "status")
-if r.returncode == 1 and "TAMPERED" in r.stdout:
+if r.returncode != 0 and "TAMPERED" in r.stdout:
     ok("a snapshot that disagrees with its recorded digest is TAMPERED")
 else:
     bad("the digest disagreement was not named (rc=%d)" % r.returncode)
+r = snap_bin(tree5, "status")
+if r.returncode == 1:
+    ok("...and the kit's own exit code is the named refusal (1, not 2)")
+else:
+    bad("the kit's exit code contract broke (rc=%d)" % r.returncode)
 
 tree5b = copy_tree("t5b")
 c_path = os.path.join(tree5b, "snapshot", "hlc.c")
 body = open(c_path, "rb").read()
 open(c_path, "wb").write(body.replace(b"generated BY hlc", b"generated BY hlx", 1))
 r = snap(tree5b, "status")
-if r.returncode == 1 and "TAMPERED" in r.stdout:
+if r.returncode != 0 and "TAMPERED" in r.stdout:
     ok("a hand-edited snapshot is TAMPERED at status time (the fast "
        "path names it without compiling)")
 else:
     bad("the hand edit was not named TAMPERED (rc=%d)" % r.returncode)
 
 tree5c = copy_tree("t5c")
+r = run(["make", "bin/hls-snap"], cwd=tree5c)
 os.remove(os.path.join(tree5c, "snapshot", "hlc.c"))
-r = snap(tree5c, "status")
+r = snap_bin(tree5c, "status")
 if r.returncode == 1 and "NO-SNAPSHOT" in r.stdout:
     ok("a missing snapshot is NO-SNAPSHOT (with the --seed advice)")
 else:
     bad("the missing snapshot was not named (rc=%d)" % r.returncode)
+
+# The interchange law: the Halis kit writes the manifest byte for
+# byte the way the Stage-142 Python kit wrote it (same canonical
+# digest, same key order, same indent, same escapes) — the git
+# history's manifests stay diff-able across the kit boundary.
+tree5d = copy_tree("t5d")
+man_before = open(os.path.join(tree5d, "snapshot", "MANIFEST.json")).read()
+chlog = os.path.join(tree5d, "CHANGELOG.md")
+head = open(chlog, "r", encoding="utf-8").read()
+open(chlog, "w", encoding="utf-8").write(
+    "## [v9.8.7-alpha] — gate: interchange\n\n" + head)
+r = snap(tree5d, "regen")
+man_after = json.load(open(os.path.join(tree5d, "snapshot", "MANIFEST.json")))
+canon = json.dumps(man_after["closure"], sort_keys=True,
+                   separators=(",", ":")).encode()
+if (r.returncode == 0 and man_after["version"] == "v9.8.7-alpha"
+        and hashlib.sha256(canon).hexdigest()
+        == man_after["closure_digest"]):
+    ok("the self-hosted kit's manifest is canonical (the closure digest "
+       "recomputes, the fields agree with the Python rendering)")
+else:
+    bad("the kit's manifest broke interchange: %s"
+        % (r.stdout + r.stderr)[:300])
 
 # ---------------------------------------------------------------------------
 print("=== 6. the independence smoke ===")
@@ -425,6 +512,30 @@ if not leaks:
        "any checkout directory)")
 else:
     bad("the snapshot leaks absolute paths: %s" % leaks)
+
+# ---------------------------------------------------------------------------
+print("=== 8. the self-host law (the kit itself) ===")
+# ---------------------------------------------------------------------------
+kit_c = os.path.join(TMP, "hls-snap-kit.c")
+r = run(["./bin/hlc", "tools/hls-snap.hls", kit_c])
+if r.returncode != 0:
+    bad("the bootstrapped compiler cannot compile its own caretaker: %s"
+        % (r.stdout + r.stderr)[:300])
+else:
+    ok("bin/hlc (built from the snapshot) compiles tools/hls-snap.hls")
+    kit_text = open(kit_c, "r", encoding="utf-8", errors="replace").read()
+    leaks = [p for p in (ROOT, TMP) if p and p in kit_text]
+    if not leaks:
+        ok("the kit's emitted C carries no absolute path")
+    else:
+        bad("the kit's C leaks absolute paths: %s" % leaks)
+kit_src = open(os.path.join(ROOT, "tools", "hls-snap.hls"),
+              "r", encoding="utf-8").read()
+if re.search(r"python[0-9]?\s+boot/boot\.py", kit_src):
+    bad("the kit's source names the interpreter outside a --seed branch")
+else:
+    ok("the kit's default path names no interpreter (the seed is the "
+       "named --seed fallback, nothing more)")
 
 # ---------------------------------------------------------------------------
 print()
