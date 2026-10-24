@@ -1,11 +1,13 @@
 # ============================================================================
-# hls-snap.hls — Stage 143: the snapshot kit, in Halis.
+# hls-snap.hls — Stage 143: the snapshot kit, in Halis; the chain
+# law joined in v0.163.0-alpha.
 # ----------------------------------------------------------------------------
 # Usage:
 #   bin/hls-snap status  [--root PATH] [--json]
 #   bin/hls-snap verify  [--root PATH] [--deep] [--cc CC] [--json]
 #   bin/hls-snap regen   [--root PATH] [--seed] [--cc CC] [--python PYTHON]
 #   bin/hls-snap prove   [--root PATH] [--cc CC] [--seed] [--python PYTHON]
+#   bin/hls-snap chain   [--root PATH] [--cc CC] [--cc2 CC2]
 #
 # Stage 142 moved the ignition: the repository carries snapshot/hlc.c —
 # the C the compiler emits for its own source — and `make bootstrap` is
@@ -60,12 +62,27 @@
 #      proof that a lineage matches a snapshot the manifest no longer
 #      describes is not a proof, it is a coincidence.
 #
+#   6. the CHAIN law (v0.163.0-alpha, the record corrected: this is
+#      Stage 143's own promise — the bit-for-bit reproducible
+#      bootstrap chain) — `chain` re-runs the whole bootstrap TWICE,
+#      as two independent ignitions, and byte-compares every hop:
+#      each round's emission equals the snapshot (the fixed point)
+#      AND the previous round's emission (the repeatability the
+#      fixed point alone does not name). With --cc2 the second round
+#      builds through a DIFFERENT C compiler — the chain's tracked
+#      artifact is what the HLS compiler emits, not what cc links,
+#      so any conforming cc in slot one must land on the same bytes.
+#      The command closes with the CHAIN DIGEST — sha256 over the
+#      snapshot and every round's emission — the one number two
+#      machines, two checkouts and two compilers must agree on.
+#
 # Exit codes, the house contract: 0 the law held; 1 a named refusal
 # or detected drift (fail-closed); 2 usage error. Every refusal names
 # the rule that fired, not just the fact.
 #
 # Scratch files (regen rounds, the deep-verify compiler, the prove
-# chain) live under <root>/bin/ with the hls-snap- prefix — bin/ is
+# chain, the chain rounds) live under <root>/bin/ with the hls-snap-
+# prefix — bin/ is
 # the build's own regenerable directory, wiped by `make clean`, never
 # tree content. The kit deletes nothing: a killed regen leaves its
 # work files where the next verify can see them, and the worst a
@@ -208,7 +225,7 @@ fn refuse(rule: str, detail: str) -> void uses IO, Exit {
 
 fn usage_error(detail: str) -> void uses IO, Exit {
     println("hls-snap: usage error — " + detail)
-    println("usage: hls-snap status|verify|regen|prove [--root PATH] [...]")
+    println("usage: hls-snap status|verify|regen|prove|chain [--root PATH] [...]")
     exit(2)
 }
 
@@ -1357,6 +1374,105 @@ fn cmd_prove(root: str, cc: str, seed: bool, python: str) -> int uses Fs, IO, Pr
 }
 
 # ============================================================================
+# chain — the bit-for-bit law (v0.163.0-alpha, Stage 143's own promise).
+#
+#   bin/hls-snap chain [--root PATH] [--cc CC] [--cc2 CC2]
+#
+# The bootstrap chain, re-run and byte-compared hop for hop. Two
+# rounds, each one a full, independent ignition:
+#   1. cc compiles the committed snapshot into a fresh native hlc;
+#   2. that hlc re-emits src/hlc.hls;
+#   3. the emission must equal the snapshot byte for byte (the
+#      fixed-point law — the same law `make bootstrap` proves once);
+#   4. the emission must equal the PREVIOUS round's emission byte for
+#      byte (the repeatability law — the fixed point alone does not
+#      name this: a chain self-consistent once is deterministic, a
+#      chain self-consistent TWICE, from two separately-built
+#      compilers, is reproducible).
+# With --cc2 the second round builds through a SECOND C compiler: the
+# chain's tracked artifact is what the HLS compiler emits, not what
+# cc links, so any conforming cc in the first slot must land on the
+# same bytes. The command closes with the CHAIN DIGEST — sha256 over
+# the snapshot and every round's emission, in order — the one number
+# two machines, two checkouts and two compilers must agree on.
+# ============================================================================
+
+# chain_round(root, ccr, tag, prev_c, snap_path) — one full ignition:
+# cc builds the compiler FROM the snapshot, the compiler re-emits the
+# sources, the emission is byte-compared against the snapshot (the
+# fixed point) and against the previous round (the repeatability).
+# Returns the round's emission path.
+fn chain_round(root: str, ccr: str, tag: str, prev_c: str, snap_path: str) -> str uses Fs, Proc, IO, Exit {
+    let work_prefix: str = path_join2(root, "bin/hls-snap-chain")
+    let hlc_bin: str = work_prefix + "-" + tag + "-hlc"
+    cc_compile(root, ccr, snap_path, hlc_bin)
+    let out_c: str = work_prefix + "-" + tag + ".c"
+    if !hlc_emit(root, hlc_bin, out_c) {
+        refuse("the chain law",
+            "round " + tag + ": the compiler built from the snapshot could "
+            + "not re-compile " + snap_entry() + " (its diagnostics are above)")
+    }
+    if !same_files(out_c, snap_path) {
+        refuse("the fixed-point law",
+            "round " + tag + ": the derived compiler emits DIFFERENT bytes "
+            + "than the snapshot carries — the snapshot is stale or hand-"
+            + "edited; run `make bootstrap` for the named failure, then "
+            + "`make snapshot-regen`")
+    }
+    if prev_c != "" {
+        if !same_files(out_c, prev_c) {
+            refuse("the chain law",
+                "round " + tag + " derived bytes that differ from the "
+                + "previous round's — two independently-built compilers "
+                + "reading one source must emit one output; the chain is "
+                + "not bit-for-bit reproducible")
+        }
+    }
+    return out_c
+}
+
+fn cmd_chain(root: str, cc: str, cc2: str) -> int uses Fs, IO, Proc, Exit {
+    let cls: Classification = classify(root)
+    if cls.state != verdict_fresh() {
+        refuse("the drifted-tree law",
+            "chain never runs from a tree the manifest does not describe "
+            + "(state=" + cls.state + "); run `make snapshot-regen` first")
+    }
+    let snap_path: str = path_join2(root, snap_snapshot_c())
+    let manifest: JsonValue = json_parse(read_file(path_join2(root, snap_manifest())))
+    ensure_workdir(root)
+
+    let mut cc_round2: str = cc
+    if cc2 != "" {
+        cc_round2 = cc2
+    }
+    let r1: str = chain_round(root, cc, "1", "", snap_path)
+    let r2: str = chain_round(root, cc_round2, "2", r1, snap_path)
+
+    # The chain digest: sha256 over the snapshot and every round's
+    # emission, in round order — the number that must not move.
+    let chain_text: str = read_file(snap_path) + read_file(r1) + read_file(r2)
+    let digest: str = sha256_hex(chain_text)
+
+    println("snapshot: CHAIN PROVEN — 2 rounds, byte for byte identical ("
+        + manifest_get_str(manifest, "version") + ")")
+    println("  round 1: " + cc + " built the snapshot's compiler, which "
+        + "re-derived " + manifest_get_int(manifest, "hlc_c_lines").to_str()
+        + " lines")
+    if cc2 != "" {
+        println("  round 2: " + cc_round2 + " built it — a different cc in "
+            + "slot one, identical bytes")
+    } else {
+        println("  round 2: " + cc_round2 + " built it again, independently — "
+            + "identical bytes")
+    }
+    println("  chain digest: " + digest.slice(0, 16) + "... "
+        + "(snapshot + every round's emission)")
+    println("  two machines, two checkouts, two compilers — one digest")
+    return 0
+}
+
+# ============================================================================
 # CLI.
 # ============================================================================
 
@@ -1396,7 +1512,7 @@ fn env_or(name: str, default_value: str) -> str uses Proc {
 fn main() -> int uses IO, Fs, Proc, Args, Exit {
     let argv: list[str] = args()
     if argv.len() < 2 {
-        usage_error("no command; try status | verify | regen | prove")
+        usage_error("no command; try status | verify | regen | prove | chain")
     }
     let cmd: str = argv.get(1)
     let rest: list[str] = []
@@ -1411,6 +1527,7 @@ fn main() -> int uses IO, Fs, Proc, Args, Exit {
     let root: str = find_flag_value(rest, "--root", cwd_get())
     let cc: str = find_flag_value(rest, "--cc", env_or("CC", "gcc"))
     let python: str = find_flag_value(rest, "--python", env_or("HALS_PYTHON", "python3"))
+    let cc2: str = find_flag_value(rest, "--cc2", "")
     let want_json: bool = has_flag(rest, "--json")
     let deep: bool = has_flag(rest, "--deep")
     let seed: bool = has_flag(rest, "--seed")
@@ -1426,6 +1543,9 @@ fn main() -> int uses IO, Fs, Proc, Args, Exit {
     }
     if cmd == "prove" {
         return cmd_prove(root, cc, seed, python)
+    }
+    if cmd == "chain" {
+        return cmd_chain(root, cc, cc2)
     }
     usage_error("unknown command " + cmd)
     return 2
