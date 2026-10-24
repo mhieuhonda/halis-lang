@@ -1,0 +1,1436 @@
+# ============================================================================
+# hls-snap.hls — Stage 143: the snapshot kit, in Halis.
+# ----------------------------------------------------------------------------
+# Usage:
+#   bin/hls-snap status  [--root PATH] [--json]
+#   bin/hls-snap verify  [--root PATH] [--deep] [--cc CC] [--json]
+#   bin/hls-snap regen   [--root PATH] [--seed] [--cc CC] [--python PYTHON]
+#   bin/hls-snap prove   [--root PATH] [--cc CC] [--seed] [--python PYTHON]
+#
+# Stage 142 moved the ignition: the repository carries snapshot/hlc.c —
+# the C the compiler emits for its own source — and `make bootstrap` is
+# cc, hlc, cmp: no Python anywhere in the chain. But the kit that
+# GUARDS the bootstrap stayed Python: hls-snap.py was the one tool on
+# the self-hosting lifecycle (status / verify / regen / prove) written
+# in another language. This stage closes that loop — the toolchain now
+# guards itself:
+#
+#   cc -O2 -o bin/hlc snapshot/hlc.c          # the pure bootstrap
+#   bin/hlc tools/hls-snap.hls bin/hls-snap.c  # the compiler builds
+#   cc -O2 -o bin/hls-snap bin/hls-snap.c      #   its own caretaker
+#
+# The laws are the Stage-142 laws, verbatim — only the language of the
+# tool that enforces them moved:
+#
+#   1. the FIXED-POINT law — snapshot/hlc.c == the C a compiler built
+#      from snapshot/hlc.c emits for src/hlc.hls, byte for byte.
+#      `make bootstrap` proves it on every build; `verify --deep`
+#      re-proves it on demand;
+#
+#   2. the SEED law — the Python interpreter stays the oracle that
+#      re-derives the snapshot when the language grows new syntax
+#      (`regen --seed`, `prove --seed`), but nothing on the default
+#      path needs it: `prove` itself is now the FREESTANDING lineage —
+#      the no-libc compiler (built from the hosted one, -ffreestanding
+#      -nostdlib) must re-derive the snapshot byte for byte. Two
+#      compilers from the same sources, two runtimes, one result —
+#      and neither path names an interpreter;
+#
+#   3. the MANIFEST law — snapshot/MANIFEST.json records the import
+#      closure of src/hlc.hls (every file content-addressed by the
+#      sha256 this tool computes itself, through std.sha256), the
+#      closure digest over the canonical (sorted, compact) rendering,
+#      the snapshot's own sha256, line and byte counts, the release it
+#      ships in, and the fixed-point rounds. The document must agree
+#      with itself: its recorded digest is the digest of the closure
+#      it carries. The file is written exactly as the Stage-142 kit
+#      wrote it — keys sorted, two-space indent, ASCII escapes — so
+#      the two kits' regens are interchangeable byte for byte;
+#
+#   4. the REGEN law — the only legal mutation: it iterates to the
+#      fixed point (a codegen change re-derives the compiler, which
+#      re-emits its own source, until the bytes stabilise — normally
+#      1 round, refused after 8), rewrites the snapshot AND the
+#      manifest together, and REFUSES a no-op. A release-heading move
+#      alone refreshes the manifest ONLY. The native path refuses to
+#      run when the snapshot is missing (it is the seed it builds
+#      from) and names the --seed fallback;
+#
+#   5. the AGREEMENT law — prove never runs from a drifted tree: a
+#      proof that a lineage matches a snapshot the manifest no longer
+#      describes is not a proof, it is a coincidence.
+#
+# Exit codes, the house contract: 0 the law held; 1 a named refusal
+# or detected drift (fail-closed); 2 usage error. Every refusal names
+# the rule that fired, not just the fact.
+#
+# Scratch files (regen rounds, the deep-verify compiler, the prove
+# chain) live under <root>/bin/ with the hls-snap- prefix — bin/ is
+# the build's own regenerable directory, wiped by `make clean`, never
+# tree content. The kit deletes nothing: a killed regen leaves its
+# work files where the next verify can see them, and the worst a
+# stale work file can do is fail a byte comparison it was going to
+# run anyway.
+# ============================================================================
+
+import "std.str"
+import "std.json"
+import "std.sha256"
+import "std.process"
+
+# ============================================================================
+# Constants.
+# ============================================================================
+
+fn snap_entry() -> str {
+    return "src/hlc.hls"
+}
+
+fn snap_snapshot_c() -> str {
+    return "snapshot/hlc.c"
+}
+
+fn snap_manifest() -> str {
+    return "snapshot/MANIFEST.json"
+}
+
+fn snap_max_rounds() -> int {
+    return 8
+}
+
+fn snap_law_text() -> str {
+    return "snapshot/hlc.c == the C that a Halis compiler built from snapshot/hlc.c emits for src/hlc.hls, byte for byte — proved at every make bootstrap"
+}
+
+fn snap_provenance_text() -> str {
+    return "cut from the src/hlc.hls import closure by hlc itself (make snapshot-regen); the freestanding compiler re-derives the same bytes (make snapshot-prove)"
+}
+
+# Classification verdicts (closed vocabulary).
+
+fn verdict_fresh() -> str {
+    return "FRESH"
+}
+
+fn verdict_stale() -> str {
+    return "STALE-SOURCES"
+}
+
+fn verdict_tampered() -> str {
+    return "TAMPERED"
+}
+
+fn verdict_no_snapshot() -> str {
+    return "NO-SNAPSHOT"
+}
+
+fn verdict_no_manifest() -> str {
+    return "NO-MANIFEST"
+}
+
+# ============================================================================
+# Small string / path helpers.
+# ============================================================================
+
+# str_lt(a, b) — byte-lexicographic order. For the ASCII paths and hex
+# digests the manifest carries, this is exactly Python's sort_keys
+# order (code-point order on ASCII == byte order).
+fn str_lt(a: str, b: str) -> bool {
+    let mut n: int = a.len()
+    if b.len() < n {
+        n = b.len()
+    }
+    let mut i: int = 0
+    while i < n {
+        let ca: int = a.byte_at(i)
+        let cb: int = b.byte_at(i)
+        if ca != cb {
+            return ca < cb
+        }
+        i = i + 1
+    }
+    return a.len() < b.len()
+}
+
+# path_join2(base, rel) — base + "/" + rel, without doubling a slash
+# (the caller guarantees base carries no trailing slash).
+fn path_join2(base: str, rel: str) -> str {
+    if base == "" {
+        return rel
+    }
+    if base.byte_at(base.len() - 1) == 47 {
+        return base + rel
+    }
+    return base + "/" + rel
+}
+
+# path_dir(p) — everything before the last "/"; "." for a bare name.
+fn path_dir(p: str) -> str {
+    let mut i: int = p.len() - 1
+    while i >= 0 {
+        if p.byte_at(i) == 47 {
+            if i == 0 {
+                return "/"
+            }
+            return p.slice(0, i)
+        }
+        i = i - 1
+    }
+    return "."
+}
+
+# count_lines(text) — how Python's `for line in fh` counts: the number
+# of "\n" bytes, plus one when the text is non-empty and does not end
+# in a newline.
+fn count_lines(text: str) -> int {
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < text.len() {
+        if text.byte_at(i) == 10 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    if text.len() > 0 && text.byte_at(text.len() - 1) != 10 {
+        n = n + 1
+    }
+    return n
+}
+
+# ============================================================================
+# Refusals — every one names its rule.
+# ============================================================================
+
+fn refuse(rule: str, detail: str) -> void uses IO, Exit {
+    println("snapshot: REFUSED (" + rule + ") — " + detail)
+    exit(1)
+}
+
+fn usage_error(detail: str) -> void uses IO, Exit {
+    println("hls-snap: usage error — " + detail)
+    println("usage: hls-snap status|verify|regen|prove [--root PATH] [...]")
+    exit(2)
+}
+
+# ============================================================================
+# Digests — sha256 through std.sha256 (the module this stage adds).
+# ============================================================================
+
+fn sha256_file(path: str) -> str uses Fs {
+    return sha256_hex(read_file(path))
+}
+
+# same_bytes(path_a, path_b) — length first, then byte for byte.
+fn same_bytes(a: str, b: str) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    let mut i: int = 0
+    while i < a.len() {
+        if a.byte_at(i) != b.byte_at(i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn same_files(pa: str, pb: str) -> bool uses Fs {
+    return same_bytes(read_file(pa), read_file(pb))
+}
+
+# ============================================================================
+# JSON emission — the two renderings the kit writes.
+#
+# Both must be byte-identical to Python's json.dumps (sort_keys=True)
+# in the respective modes, because the manifest this tool writes has
+# to be interchangeable with the Stage-142 kit's: compact for the
+# closure digest (separators=(",",":")), indent=2 for the file. The
+# escape alphabet is json.dumps' default (ensure_ascii=True): the two
+# JSON quotes, backslash, the short control escapes, \u00XX for the
+# other control bytes, and \uXXXX for every byte past 0x7E (decoded
+# from UTF-8 first — the law text carries an em-dash, which Python
+# renders as \u2014).
+# ============================================================================
+
+# json_escape_str(s) — the escaped inner text of a JSON string.
+fn json_escape_str(s: str) -> str {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        if b == 34 {
+            out.push("\\\"")
+            i = i + 1
+            continue
+        }
+        if b == 92 {
+            out.push("\\\\")
+            i = i + 1
+            continue
+        }
+        if b == 10 {
+            out.push("\\n")
+            i = i + 1
+            continue
+        }
+        if b == 13 {
+            out.push("\\r")
+            i = i + 1
+            continue
+        }
+        if b == 9 {
+            out.push("\\t")
+            i = i + 1
+            continue
+        }
+        if b == 8 {
+            out.push("\\b")
+            i = i + 1
+            continue
+        }
+        if b == 12 {
+            out.push("\\f")
+            i = i + 1
+            continue
+        }
+        if b < 32 {
+            out.push("\\u00" + hex2(b))
+            i = i + 1
+            continue
+        }
+        if b <= 126 {
+            out.push(s.slice(i, i + 1))
+            i = i + 1
+            continue
+        }
+        # A multi-byte UTF-8 sequence: decode the code point, render
+        # \uXXXX (or the surrogate pair for planes past the BMP).
+        let cp: int = utf8_decode(s, i)
+        let width: int = utf8_width(s.byte_at(i))
+        if cp <= 65535 {
+            out.push("\\u" + hex4(cp))
+        } else {
+            let v: int = cp - 65536
+            let hi: int = 55296 + (v / 1024)
+            let lo: int = 56320 + (v % 1024)
+            out.push("\\u" + hex4(hi) + "\\u" + hex4(lo))
+        }
+        i = i + width
+    }
+    out.push("")
+    return str_join(out, "")
+}
+
+fn hex2(v: int) -> str {
+    let digits: str = "0123456789abcdef"
+    return digits.slice(v / 16, v / 16 + 1) + digits.slice(v % 16, v % 16 + 1)
+}
+
+fn hex4(v: int) -> str {
+    let digits: str = "0123456789abcdef"
+    let mut out: str = ""
+    let mut shift: int = 12
+    while shift >= 0 {
+        let nib: int = int_and(int_shr(v, shift), 15)
+        out = out + digits.slice(nib, nib + 1)
+        shift = shift - 4
+    }
+    return out
+}
+
+fn utf8_width(b: int) -> int {
+    if b >= 240 {
+        return 4
+    }
+    if b >= 224 {
+        return 3
+    }
+    if b >= 192 {
+        return 2
+    }
+    return 1
+}
+
+fn utf8_decode(s: str, i: int) -> int {
+    let b0: int = s.byte_at(i)
+    if b0 < 128 {
+        return b0
+    }
+    if b0 < 224 {
+        return (b0 - 192) * 64 + (s.byte_at(i + 1) - 128)
+    }
+    if b0 < 240 {
+        return (b0 - 224) * 4096 + (s.byte_at(i + 1) - 128) * 64 + (s.byte_at(i + 2) - 128)
+    }
+    return (b0 - 240) * 262144 + (s.byte_at(i + 1) - 128) * 4096 + (s.byte_at(i + 2) - 128) * 64 + (s.byte_at(i + 3) - 128)
+}
+
+# json_quote(s) — the escaped string with its quotes.
+fn json_quote(s: str) -> str {
+    return "\"" + json_escape_str(s) + "\""
+}
+
+# ============================================================================
+# StrMap — the sorted-map discipline the kit needs (the closure, the
+# drift, the manifest's own fields). Parallel lists, keys kept sorted
+# by construction: insert_sorted walks once, appends after.
+# ============================================================================
+
+struct StrMap {
+    keys: list[str],
+    vals: list[str]
+}
+
+fn strmap_new() -> StrMap {
+    let m: StrMap = StrMap {
+        keys: [],
+        vals: []
+    }
+    return m
+}
+
+fn strmap_set(m: StrMap, key: str, val: str) -> StrMap {
+    let keys: list[str] = []
+    let vals: list[str] = []
+    let mut i: int = 0
+    let mut placed: bool = false
+    while i < m.keys.len() {
+        let cur: str = m.keys.get(i)
+        if cur == key {
+            keys.push(key)
+            vals.push(val)
+            placed = true
+        } else {
+            if !placed && str_lt(key, cur) {
+                keys.push(key)
+                vals.push(val)
+                placed = true
+            }
+            keys.push(cur)
+            vals.push(m.vals.get(i))
+        }
+        i = i + 1
+    }
+    if !placed {
+        keys.push(key)
+        vals.push(val)
+    }
+    let out: StrMap = StrMap {
+        keys: keys,
+        vals: vals
+    }
+    return out
+}
+
+fn strmap_has(m: StrMap, key: str) -> bool {
+    let mut i: int = 0
+    while i < m.keys.len() {
+        if m.keys.get(i) == key {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn strmap_get(m: StrMap, key: str) -> str {
+    let mut i: int = 0
+    while i < m.keys.len() {
+        if m.keys.get(i) == key {
+            return m.vals.get(i)
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn strmap_len(m: StrMap) -> int {
+    return m.keys.len()
+}
+
+# ============================================================================
+# The canonical / pretty JSON renderings of a StrMap — the only JSON
+# this tool ever WRITES is a flat object of string values (the closure)
+# or the whole manifest (a fixed shape the tool itself builds).
+# ============================================================================
+
+# render_canonical(m) — Python's json.dumps(m, sort_keys=True,
+# separators=(",",":")) over a flat str->str object.
+fn render_canonical(m: StrMap) -> str {
+    let mut out: str = "{"
+    let mut i: int = 0
+    while i < m.keys.len() {
+        if i > 0 {
+            out = out + ","
+        }
+        out = out + json_quote(m.keys.get(i)) + ":" + json_quote(m.vals.get(i))
+        i = i + 1
+    }
+    return out + "}"
+}
+
+# ============================================================================
+# The import closure of the entry file — resolved the way the compiler
+# resolves it (src/hlc/main.hls resolve_import_path): "std.X" /
+# "core.X" anchor on the root, everything else on the importing
+# file's directory.
+# ============================================================================
+
+# parse_import(line) — the import path a line declares, or "" when the
+# line declares none. Matches ^\s*import\s+"([^"]+)" over the line.
+fn parse_import(line: str) -> str {
+    let mut i: int = 0
+    while i < line.len() && line.byte_at(i) <= 32 {
+        i = i + 1
+    }
+    if !line.slice(i, line.len()).starts_with("import") {
+        return ""
+    }
+    i = i + 6
+    if i >= line.len() || line.byte_at(i) <= 32 {
+        while i < line.len() && line.byte_at(i) <= 32 {
+            i = i + 1
+        }
+    } else {
+        return ""
+    }
+    if i >= line.len() || line.byte_at(i) != 34 {
+        return ""
+    }
+    i = i + 1
+    let start: int = i
+    while i < line.len() && line.byte_at(i) != 34 {
+        i = i + 1
+    }
+    if i >= line.len() {
+        return ""
+    }
+    return line.slice(start, i)
+}
+
+# resolve_import(imp, importing_file, root) — the absolute path of the
+# module imp names, or "" when it does not resolve.
+fn resolve_import(imp: str, importing_file: str, root: str) -> str uses Fs {
+    if imp.starts_with("std.") || imp.starts_with("core.") {
+        let mut family: str = "std"
+        let mut cut: int = 4
+        if imp.starts_with("core.") {
+            family = "core"
+            cut = 5
+        }
+        let rest: str = imp.slice(cut, imp.len())
+        let mut rel: str = ""
+        let mut i: int = 0
+        while i < rest.len() {
+            if rest.byte_at(i) == 46 {
+                rel = rel + "/"
+            } else {
+                rel = rel + rest.slice(i, i + 1)
+            }
+            i = i + 1
+        }
+        let candidate: str = path_join2(path_join2(root, family), rel + ".hls")
+        if file_exists(candidate) {
+            return candidate
+        }
+        return ""
+    }
+    let direct: str = path_join2(path_dir(importing_file), imp)
+    if file_exists(direct) {
+        return direct
+    }
+    return ""
+}
+
+# closure_map(root) — the transitive import closure of src/hlc.hls:
+# every file the compiler reads when it compiles itself, each
+# content-addressed by sha256. BFS from the entry; a file is seen
+# once; the result is keyed by root-relative path.
+fn closure_map(root: str) -> StrMap uses Fs, IO, Exit {
+    let entry: str = path_join2(root, snap_entry())
+    if !file_exists(entry) {
+        refuse("the entry law",
+            snap_entry() + " is missing under " + root
+            + " — nothing to close over")
+    }
+    let mut seen: StrMap = strmap_new()
+    let seen_paths: list[str] = []
+    let queue: list[str] = []
+    queue.push(entry)
+    let mut qi: int = 0
+    while qi < queue.len() {
+        let current: str = queue.get(qi)
+        qi = qi + 1
+        if strmap_has(seen, current) {
+            continue
+        }
+        if !file_exists(current) {
+            refuse("the closure law",
+                "imported file does not exist: " + current)
+        }
+        seen = strmap_set(seen, current, sha256_file(current))
+        seen_paths.push(current)
+        let text: str = read_file(current)
+        let lines: list[str] = text.split("\n")
+        let mut li: int = 0
+        while li < lines.len() {
+            let imp: str = parse_import(lines.get(li))
+            if imp != "" {
+                let resolved: str = resolve_import(imp, current, root)
+                if resolved == "" {
+                    refuse("the closure law",
+                        "unresolvable import \"" + imp + "\" in " + current)
+                }
+                if !strmap_has(seen, resolved) {
+                    queue.push(resolved)
+                }
+            }
+            li = li + 1
+        }
+    }
+    # Re-key by root-relative path (the manifest's vocabulary).
+    let mut out: StrMap = strmap_new()
+    let mut i: int = 0
+    while i < seen_paths.len() {
+        let p: str = seen_paths.get(i)
+        let rel: str = p.slice(root.len() + 1, p.len())
+        out = strmap_set(out, rel, strmap_get(seen, p))
+        i = i + 1
+    }
+    return out
+}
+
+fn canonical_digest(m: StrMap) -> str {
+    return sha256_hex(render_canonical(m))
+}
+
+# ============================================================================
+# The manifest — read (JSON), build (the nine fields), write (the exact
+# Stage-142 rendering: keys sorted, two-space indent, ASCII escapes,
+# one trailing newline).
+# ============================================================================
+
+fn manifest_exists(root: str) -> bool uses Fs {
+    return file_exists(path_join2(root, snap_manifest()))
+}
+
+# manifest_get_* — field readers over the parsed document.
+fn manifest_get_str(m: JsonValue, key: str) -> str {
+    let v: JsonValue = json_object_get(m, key)
+    if json_is_str(v) {
+        return json_str_value(v)
+    }
+    return ""
+}
+
+fn manifest_get_int(m: JsonValue, key: str) -> int {
+    let v: JsonValue = json_object_get(m, key)
+    if json_is_int(v) {
+        return json_int_value(v)
+    }
+    return 0 - 1
+}
+
+# manifest_closure(m) — the closure object as a StrMap.
+fn manifest_closure(m: JsonValue) -> StrMap {
+    let mut out: StrMap = strmap_new()
+    let clo: JsonValue = json_object_get(m, "closure")
+    if !json_is_object(clo) {
+        return out
+    }
+    let keys: list[str] = closure_keys_of(clo)
+    let mut i: int = 0
+    while i < keys.len() {
+        let k: str = keys.get(i)
+        out = strmap_set(out, k, json_str_value(json_object_get(clo, k)))
+        i = i + 1
+    }
+    return out
+}
+
+# closure_keys_of(obj) — the object's keys, sorted. json_object's
+# obj_keys carry FILE order; the manifest file is sorted, but a
+# hand-merged one might not be — and every digest the kit computes
+# is over the SET, so the keys are re-sorted here (push-only build).
+fn closure_keys_of(obj: JsonValue) -> list[str] {
+    let mut out: list[str] = []
+    let mut i: int = 0
+    while i < obj.obj_keys.len() {
+        let k: str = obj.obj_keys.get(i)
+        let mut j: int = 0
+        let mut placed: bool = false
+        while j < out.len() {
+            if str_lt(k, out.get(j)) {
+                # insert at j: keep everything before it, then k, then
+                # the rest — rebuilt push-only (no in-place insert).
+                let rebuilt: list[str] = []
+                let mut t: int = 0
+                while t < j {
+                    rebuilt.push(out.get(t))
+                    t = t + 1
+                }
+                rebuilt.push(k)
+                t = j
+                while t < out.len() {
+                    rebuilt.push(out.get(t))
+                    t = t + 1
+                }
+                out = rebuilt
+                placed = true
+                j = out.len()
+            } else {
+                j = j + 1
+            }
+        }
+        if !placed {
+            out.push(k)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# changelog_version(root) — the head "## [v...]" release heading.
+fn changelog_version(root: str) -> str uses Fs {
+    let path: str = path_join2(root, "CHANGELOG.md")
+    if !file_exists(path) {
+        return ""
+    }
+    let lines: list[str] = read_file(path).split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i)
+        if line.starts_with("## [v") {
+            let mut j: int = 5
+            while j < line.len() && line.byte_at(j) != 93 && line.byte_at(j) > 32 {
+                j = j + 1
+            }
+            if j > 5 && j < line.len() && line.byte_at(j) == 93 {
+                return line.slice(4, j)
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn require_changelog_version(root: str) -> str uses Fs, IO, Exit {
+    let v: str = changelog_version(root)
+    if v == "" {
+        refuse("the version law",
+            "CHANGELOG.md carries no '## [v...]' release heading — the "
+            + "manifest records the release the snapshot belongs to")
+    }
+    return v
+}
+
+# build_manifest(root, snapshot_text, rounds) — the nine fields, as a
+# JSON value shaped for the writer (object with sorted keys).
+fn build_manifest_value(root: str, snapshot_text: str, rounds: int) -> JsonValue uses Fs, IO, Exit {
+    let live: StrMap = closure_map(root)
+    let keys: list[str] = []
+    let vals: list[JsonValue] = []
+    # closure (sorted already — StrMap keeps keys sorted)
+    let clo_keys: list[str] = []
+    let clo_vals: list[JsonValue] = []
+    let mut i: int = 0
+    while i < strmap_len(live) {
+        clo_keys.push(live.keys.get(i))
+        clo_vals.push(json_str(live.vals.get(i)))
+        i = i + 1
+    }
+    keys.push("closure")
+    vals.push(json_object(clo_keys, clo_vals))
+    keys.push("closure_digest")
+    vals.push(json_str(canonical_digest(live)))
+    keys.push("hlc_c_bytes")
+    vals.push(json_int(snapshot_text.len()))
+    keys.push("hlc_c_lines")
+    vals.push(json_int(count_lines(snapshot_text)))
+    keys.push("hlc_c_sha256")
+    vals.push(json_str(sha256_hex(snapshot_text)))
+    keys.push("law")
+    vals.push(json_str(snap_law_text()))
+    keys.push("provenance")
+    vals.push(json_str(snap_provenance_text()))
+    keys.push("rounds")
+    vals.push(json_int(rounds))
+    keys.push("version")
+    vals.push(json_str(require_changelog_version(root)))
+    return json_object(keys, vals)
+}
+
+# json_render_pretty(v, indent) — the indent=2 rendering of a JsonValue.
+fn json_render_pretty(v: JsonValue, depth: int) -> str {
+    let pad: str = str_repeat("  ", depth)
+    let pad2: str = str_repeat("  ", depth + 1)
+    if json_is_str(v) {
+        return json_quote(json_str_value(v))
+    }
+    if json_is_int(v) {
+        return json_int_value(v).to_str()
+    }
+    if json_is_bool(v) {
+        if json_bool_value(v) {
+            return "true"
+        }
+        return "false"
+    }
+    if json_is_null(v) {
+        return "null"
+    }
+    if json_is_array(v) {
+        if v.arr.len() == 0 {
+            return "[]"
+        }
+        let mut out: str = "[\n"
+        let mut i: int = 0
+        while i < v.arr.len() {
+            out = out + pad2 + json_render_pretty(v.arr.get(i), depth + 1)
+            if i + 1 < v.arr.len() {
+                out = out + ","
+            }
+            out = out + "\n"
+            i = i + 1
+        }
+        return out + pad + "]"
+    }
+    if json_is_object(v) {
+        let okeys: list[str] = closure_keys_of(v)
+        if okeys.len() == 0 {
+            return "{}"
+        }
+        let mut out: str = "{\n"
+        let mut i: int = 0
+        while i < okeys.len() {
+            let k: str = okeys.get(i)
+            out = out + pad2 + json_quote(k) + ": "
+                + json_render_pretty(json_object_get(v, k), depth + 1)
+            if i + 1 < okeys.len() {
+                out = out + ","
+            }
+            out = out + "\n"
+            i = i + 1
+        }
+        return out + pad + "}"
+    }
+    if json_is_float(v) {
+        return "0.0"
+    }
+    return "null"
+}
+
+# write_manifest(root, value) — the pretty rendering + one newline.
+fn write_manifest(root: str, value: JsonValue) -> void uses Fs {
+    write_file(path_join2(root, snap_manifest()), json_render_pretty(value, 0) + "\n")
+}
+
+# ============================================================================
+# Classification — (state, drift) over the manifest's closure.
+# ============================================================================
+
+struct Drift {
+    removed: list[str],
+    added: list[str],
+    changed: list[str]
+}
+
+struct Classification {
+    state: str,
+    drift: Drift
+}
+
+fn drift_empty() -> Drift {
+    let d: Drift = Drift {
+        removed: [],
+        added: [],
+        changed: []
+    }
+    return d
+}
+
+# classify(root) — the closed vocabulary: NO-SNAPSHOT / NO-MANIFEST /
+# STALE-SOURCES (naming the files) / TAMPERED (bytes or arithmetic) /
+# FRESH. The walk is a merge over two sorted key lists.
+fn classify(root: str) -> Classification uses Fs, IO, Exit {
+    let snap_path: str = path_join2(root, snap_snapshot_c())
+    let nothing: Classification = Classification {
+        state: "",
+        drift: drift_empty()
+    }
+    if !file_exists(snap_path) {
+        nothing.state = verdict_no_snapshot()
+        return nothing
+    }
+    if !manifest_exists(root) {
+        nothing.state = verdict_no_manifest()
+        return nothing
+    }
+    let manifest: JsonValue = json_parse(read_file(path_join2(root, snap_manifest())))
+    if !json_is_object(manifest) {
+        refuse("the manifest law",
+            snap_manifest() + " does not parse as a JSON object")
+    }
+    let live: StrMap = closure_map(root)
+    let frozen: StrMap = manifest_closure(manifest)
+    let drift: Drift = Drift {
+        removed: [],
+        added: [],
+        changed: []
+    }
+    # merge-walk the sorted key lists: left-to-right diff of live vs
+    # frozen, in one pass.
+    let mut li: int = 0
+    let mut fi: int = 0
+    while li < strmap_len(live) || fi < strmap_len(frozen) {
+        if li >= strmap_len(live) {
+            drift.removed.push(frozen.keys.get(fi))
+            fi = fi + 1
+            continue
+        }
+        if fi >= strmap_len(frozen) {
+            drift.added.push(live.keys.get(li))
+            li = li + 1
+            continue
+        }
+        let lk: str = live.keys.get(li)
+        let fk: str = frozen.keys.get(fi)
+        if lk == fk {
+            if live.vals.get(li) != frozen.vals.get(fi) {
+                drift.changed.push(lk)
+            }
+            li = li + 1
+            fi = fi + 1
+            continue
+        }
+        if str_lt(lk, fk) {
+            drift.added.push(lk)
+            li = li + 1
+        } else {
+            drift.removed.push(fk)
+            fi = fi + 1
+        }
+    }
+    if drift.removed.len() > 0 || drift.added.len() > 0 || drift.changed.len() > 0 {
+        let out: Classification = Classification {
+            state: verdict_stale(),
+            drift: drift
+        }
+        return out
+    }
+    if sha256_file(snap_path) != manifest_get_str(manifest, "hlc_c_sha256") {
+        nothing.state = verdict_tampered()
+        return nothing
+    }
+    if canonical_digest(frozen) != manifest_get_str(manifest, "closure_digest") {
+        nothing.state = verdict_tampered()
+        return nothing
+    }
+    let out: Classification = Classification {
+        state: verdict_fresh(),
+        drift: drift_empty()
+    }
+    return out
+}
+
+# ============================================================================
+# Compilers — cc on a C file, the native hlc's own emission, the seed
+# interpreter (the optional oracle), the freestanding lineage.
+# ============================================================================
+
+# run_simple(program, args) — spawn, wait, inherit stdio (a failing cc
+# writes its own diagnostics straight to the tool's stderr, in full).
+fn run_simple(program: str, args: list[str]) -> bool uses Proc {
+    let c: Command = command_new(program)
+    let mut i: int = 0
+    let mut cmd: Command = c
+    while i < args.len() {
+        cmd = command_arg(cmd, args.get(i))
+        i = i + 1
+    }
+    let st: ExitStatus = command_status(cmd)
+    return exit_status_success(st)
+}
+
+# ensure_workdir(root) — the kit's scratch files live under <root>/bin,
+# the build's own regenerable directory (wiped by make clean, never
+# tree content). The language has no mkdir — the directory is created
+# by `make bootstrap` (bin/hlc is this tool's prerequisite anyway), so
+# a missing bin/ is named, not stumbled over by a failing ld.
+fn ensure_workdir(root: str) -> void uses Fs, IO, Exit {
+    if !fs_is_dir(path_join2(root, "bin")) {
+        refuse("the workspace law",
+            root + "/bin does not exist — the kit works inside the "
+            + "build directory the bootstrap owns; run `make bootstrap` "
+            + "first")
+    }
+}
+
+# cc_compile(root, cc, c_path, out_bin) — refuse naming the toolchain
+# law on failure.
+fn cc_compile(root: str, cc: str, c_path: str, out_bin: str) -> void uses Proc, IO, Exit {
+    let okc: bool = run_simple(cc, ["-O2", "-o", out_bin, c_path, "-lm", "-pthread"])
+    if !okc {
+        refuse("the toolchain law",
+            cc + " could not compile " + c_path + " (its diagnostics are above)")
+    }
+}
+
+# hlc_emit(root, hlc_bin, out_c) — bin/hlc compiles the entry into out_c.
+fn hlc_emit(root: str, hlc_bin: str, out_c: str) -> bool uses Proc {
+    return run_simple(hlc_bin, [path_join2(root, snap_entry()), out_c])
+}
+
+# seed_emit(root, python, out_c) — the Python oracle's derivation.
+fn seed_emit(root: str, python: str, out_c: str) -> bool uses Proc {
+    let entry: str = path_join2(root, snap_entry())
+    return run_simple(python, ["boot/boot.py", entry, entry, out_c])
+}
+
+# fs_compile(cc, c_path, out_bin) — the freestanding link.
+fn fs_compile(cc: str, c_path: str, out_bin: str) -> bool uses Proc {
+    return run_simple(cc, [
+        "-O2", "-ffreestanding", "-nostdlib", "-ffunction-sections",
+        "-fno-stack-protector", "-Wl,--gc-sections",
+        "-o", out_bin, c_path
+    ])
+}
+
+# ============================================================================
+# status — name the state, and the drift.
+# ============================================================================
+
+fn cmd_status(root: str, want_json: bool) -> int uses Fs, IO, Proc, Exit {
+    let cls: Classification = classify(root)
+    if want_json {
+        let keys: list[str] = ["drift", "state"]
+        let vals: list[JsonValue] = [drift_json(cls.drift), json_str(cls.state)]
+        println(json_stringify(json_object(keys, vals)))
+        if cls.state == verdict_fresh() {
+            return 0
+        }
+        return 1
+    }
+    if cls.state == verdict_fresh() {
+        let manifest: JsonValue = json_parse(read_file(path_join2(root, snap_manifest())))
+        println("snapshot: FRESH — the tree matches the snapshot ("
+            + manifest_get_str(manifest, "version") + ", "
+            + manifest_get_int(manifest, "hlc_c_lines").to_str() + " lines, rounds="
+            + manifest_get_int(manifest, "rounds").to_str() + ")")
+        return 0
+    }
+    if cls.state == verdict_no_snapshot() {
+        println("snapshot: NO-SNAPSHOT — snapshot/hlc.c is missing; "
+            + "re-cut it with a seeded regen (`bin/hls-snap regen --seed`, "
+            + "the Python interpreter re-derives the C from the HLS sources)")
+        return 1
+    }
+    if cls.state == verdict_no_manifest() {
+        println("snapshot: NO-MANIFEST — snapshot/hlc.c exists but "
+            + "snapshot/MANIFEST.json does not; run `make snapshot-regen`")
+        return 1
+    }
+    if cls.state == verdict_tampered() {
+        println("snapshot: TAMPERED — snapshot/hlc.c (or the manifest's own "
+            + "arithmetic) does not agree with snapshot/MANIFEST.json; a "
+            + "hand-edited snapshot is not a snapshot. Run "
+            + "`make snapshot-regen` to re-derive it from the sources")
+        return 1
+    }
+    println("snapshot: STALE-SOURCES — the sources moved after the snapshot was cut:")
+    print_drift(cls.drift)
+    println("run `make snapshot-regen` and commit snapshot/hlc.c together "
+        + "with snapshot/MANIFEST.json")
+    return 1
+}
+
+fn print_drift(drift: Drift) -> void uses IO {
+    let mut i: int = 0
+    while i < drift.removed.len() {
+        println("  REMOVED  " + drift.removed.get(i))
+        i = i + 1
+    }
+    i = 0
+    while i < drift.added.len() {
+        println("  ADDED    " + drift.added.get(i))
+        i = i + 1
+    }
+    i = 0
+    while i < drift.changed.len() {
+        println("  CHANGED  " + drift.changed.get(i))
+        i = i + 1
+    }
+}
+
+fn drift_json(drift: Drift) -> JsonValue {
+    let rvals: list[JsonValue] = []
+    let mut i: int = 0
+    while i < drift.removed.len() {
+        rvals.push(json_str(drift.removed.get(i)))
+        i = i + 1
+    }
+    let avals: list[JsonValue] = []
+    i = 0
+    while i < drift.added.len() {
+        avals.push(json_str(drift.added.get(i)))
+        i = i + 1
+    }
+    let cvals: list[JsonValue] = []
+    i = 0
+    while i < drift.changed.len() {
+        cvals.push(json_str(drift.changed.get(i)))
+        i = i + 1
+    }
+    return json_object(["ADDED", "CHANGED", "REMOVED"],
+        [json_array(avals), json_array(cvals), json_array(rvals)])
+}
+
+# ============================================================================
+# verify — the manifest laws; --deep adds the fixed point.
+# ============================================================================
+
+fn cmd_verify(root: str, cc: str, deep: bool, want_json: bool) -> int uses Fs, IO, Proc, Exit {
+    let cls: Classification = classify(root)
+    if cls.state != verdict_fresh() {
+        cmd_status(root, want_json)
+        refuse("the verify law",
+            "verify only passes on a FRESH snapshot (state=" + cls.state + ")")
+    }
+    let manifest: JsonValue = json_parse(read_file(path_join2(root, snap_manifest())))
+    let head: str = changelog_version(root)
+    if manifest_get_str(manifest, "version") != head {
+        refuse("the version law",
+            "the manifest records release "
+            + manifest_get_str(manifest, "version")
+            + " but CHANGELOG.md heads with " + head
+            + " — run `make snapshot-regen` so the manifest names the "
+            + "release the snapshot ships in")
+    }
+    if deep {
+        ensure_workdir(root)
+        let snap_path: str = path_join2(root, snap_snapshot_c())
+        let work_bin: str = path_join2(root, "bin/hls-snap-verify-hlc")
+        let out_c: str = path_join2(root, "bin/hls-snap-verify-regen.c")
+        cc_compile(root, cc, snap_path, work_bin)
+        if !hlc_emit(root, work_bin, out_c) {
+            refuse("the fixed-point law",
+                "the compiler built from the snapshot could not re-compile "
+                + snap_entry() + " (its diagnostics are above)")
+        }
+        if !same_files(out_c, snap_path) {
+            refuse("the fixed-point law",
+                "the compiler built from snapshot/hlc.c emits DIFFERENT "
+                + "bytes for src/hlc.hls than the snapshot carries — the "
+                + "snapshot is stale or hand-edited; run `make snapshot-regen`")
+        }
+        println("snapshot: VERIFIED (deep) — manifest agrees with itself and "
+            + "the world; the fixed point holds ("
+            + manifest_get_str(manifest, "version") + ")")
+        return 0
+    }
+    println("snapshot: VERIFIED (shallow) — manifest self-agreement and "
+        + "closure agreement hold (" + manifest_get_str(manifest, "version")
+        + "); the fixed point itself is `make bootstrap`'s law")
+    return 0
+}
+
+# ============================================================================
+# regen — the only legal mutation, iterating to the fixed point.
+# ============================================================================
+
+# regen_iteration(root, cc, first_c, work_prefix) — compile the
+# candidate, re-emit, compare; repeat until the bytes stabilise.
+# Returns the fixed-point C path; sets the rounds through the record.
+fn regen_iteration(root: str, cc: str, first_c: str, work_prefix: str, rounds: list[int]) -> str uses Fs, Proc, IO, Exit {
+    let mut current: str = first_c
+    let mut n: int = 1
+    while true {
+        let hlc_bin: str = work_prefix + "-hlc_r" + n.to_str()
+        cc_compile(root, cc, current, hlc_bin)
+        let nxt: str = work_prefix + "-regen_r" + n.to_str() + ".c"
+        if !hlc_emit(root, hlc_bin, nxt) {
+            refuse("the fixed-point law",
+                "round " + n.to_str() + ": the derived compiler could not "
+                + "re-compile " + snap_entry() + " (its diagnostics are above)")
+        }
+        if same_files(current, nxt) {
+            rounds.push(n)
+            return current
+        }
+        current = nxt
+        n = n + 1
+        if n > snap_max_rounds() {
+            refuse("the convergence law",
+                "the regeneration did not reach a fixed point within "
+                + snap_max_rounds().to_str() + " rounds — a codegen change "
+                + "that keeps changing its own output is a bug, not a regen")
+        }
+    }
+    return ""
+}
+
+fn cmd_regen(root: str, cc: str, seed: bool, python: str) -> int uses Fs, IO, Proc, Exit {
+    let cls: Classification = classify(root)
+    let snap_path: str = path_join2(root, snap_snapshot_c())
+    let version: str = require_changelog_version(root)
+    let work_prefix: str = path_join2(root, "bin/hls-snap-regen")
+    ensure_workdir(root)
+
+    if cls.state == verdict_fresh() && manifest_exists(root) {
+        let manifest: JsonValue = json_parse(read_file(path_join2(root, snap_manifest())))
+        if manifest_get_str(manifest, "version") == version {
+            refuse("the no-op law",
+                "the tree already matches the snapshot at release " + version
+                + "; a regeneration that changes nothing is noise, and "
+                + "noise is how real regens stop being read. The two "
+                + "legal triggers are: a source in the import closure "
+                + "moved, or the release heading in CHANGELOG.md did")
+        }
+        # Only the release heading moved: a manifest-only refresh.
+        let mut rounds: int = manifest_get_int(manifest, "rounds")
+        if rounds < 1 {
+            rounds = 1
+        }
+        let snapshot_text: str = read_file(snap_path)
+        write_manifest(root, build_manifest_value(root, snapshot_text, rounds))
+        println("snapshot: MANIFEST REFRESHED — emitted C unchanged; the "
+            + "manifest now records release " + version + " (was "
+            + manifest_get_str(manifest, "version") + ")")
+        println("commit snapshot/MANIFEST.json (snapshot/hlc.c did not move)")
+        return 0
+    }
+
+    if !file_exists(snap_path) && !seed {
+        refuse("the seed law",
+            "the native path builds its compiler FROM snapshot/hlc.c, "
+            + "which is missing — rerun with --seed (the Python "
+            + "interpreter re-derives the C from the HLS sources)")
+    }
+
+    let first_c: str = work_prefix + "-first.c"
+    let mut origin: str = ""
+    if seed {
+        if !seed_emit(root, python, first_c) {
+            refuse("the seed law",
+                "boot/boot.py could not compile " + snap_entry()
+                + " (its diagnostics are above)")
+        }
+        origin = "the Python seed (boot/boot.py pass 1)"
+    } else {
+        # The OLD snapshot's compiler must accept the NEW sources.
+        let cur_bin: str = work_prefix + "-hlc_cur"
+        cc_compile(root, cc, snap_path, cur_bin)
+        if !hlc_emit(root, cur_bin, first_c) {
+            refuse("the seed law",
+                "the current snapshot's compiler could not compile the new "
+                + "sources (new syntax?) — its diagnostics are above; "
+                + "rerun with --seed to derive through the Python interpreter")
+        }
+        origin = "the compiler built from the previous snapshot"
+    }
+
+    let rounds: list[int] = []
+    let fixed_c: str = regen_iteration(root, cc, first_c, work_prefix, rounds)
+    let n: int = rounds.get(0)
+
+    let mut moved: bool = true
+    if file_exists(snap_path) {
+        moved = !same_files(fixed_c, snap_path)
+    }
+
+    # Rewrite BOTH files — they travel together.
+    let fixed_text: str = read_file(fixed_c)
+    write_file(snap_path, fixed_text)
+    write_manifest(root, build_manifest_value(root, fixed_text, n))
+
+    println("snapshot: REGENERATED via " + origin)
+    if n == 1 {
+        println("  fixed point reached in 1 round")
+    } else {
+        println("  fixed point reached in " + n.to_str() + " rounds")
+    }
+    let new_manifest: JsonValue = json_parse(read_file(path_join2(root, snap_manifest())))
+    let live: StrMap = manifest_closure(new_manifest)
+    let mut lines_msg: str = "  snapshot/hlc.c: "
+        + manifest_get_int(new_manifest, "hlc_c_lines").to_str() + " lines, "
+        + manifest_get_int(new_manifest, "hlc_c_bytes").to_str() + " bytes"
+    if moved {
+        lines_msg = lines_msg + " (moved)"
+    } else {
+        lines_msg = lines_msg + " (emitted C unchanged — manifest refreshed for the moved sources)"
+    }
+    println(lines_msg)
+    println("  manifest: " + manifest_get_str(new_manifest, "version") + ", "
+        + strmap_len(live).to_str() + " closure files, digest "
+        + manifest_get_str(new_manifest, "closure_digest").slice(0, 16) + "...")
+    println("commit snapshot/hlc.c and snapshot/MANIFEST.json TOGETHER (or neither)")
+    return 0
+}
+
+# ============================================================================
+# prove — the second lineage.
+#
+#   default: the FREESTANDING lineage — the no-libc compiler, built
+#   from the hosted one, re-derives the snapshot byte for byte. No
+#   interpreter anywhere in the chain: this is the pure self-hosting
+#   world's own agreement proof.
+#
+#   --seed: the PYTHON lineage — the Stage-0 interpreter derives the
+#   same bytes (the oracle; requires boot/ and a python3 on PATH).
+# ============================================================================
+
+fn cmd_prove(root: str, cc: str, seed: bool, python: str) -> int uses Fs, IO, Proc, Exit {
+    let cls: Classification = classify(root)
+    if cls.state != verdict_fresh() {
+        refuse("the drifted-tree law",
+            "prove never runs from a tree the manifest does not describe "
+            + "(state=" + cls.state + "); run `make snapshot-regen` first")
+    }
+    let snap_path: str = path_join2(root, snap_snapshot_c())
+    let manifest: JsonValue = json_parse(read_file(path_join2(root, snap_manifest())))
+    let work_prefix: str = path_join2(root, "bin/hls-snap-prove")
+
+    if seed {
+        let pass1: str = work_prefix + "-seed.c"
+        if !seed_emit(root, python, pass1) {
+            refuse("the seed law",
+                "boot/boot.py could not compile " + snap_entry()
+                + " (its diagnostics are above)")
+        }
+        if !same_files(pass1, snap_path) {
+            refuse("the agreement law",
+                "the Python seed derives DIFFERENT bytes than the "
+                + "committed snapshot carries — the snapshot's second "
+                + "lineage is broken; rerun regen with --seed")
+        }
+        println("snapshot: PROVEN — the Python seed derives the committed "
+            + "snapshot byte for byte (" + manifest_get_int(manifest, "hlc_c_lines").to_str()
+            + " lines, sha256 "
+            + manifest_get_str(manifest, "hlc_c_sha256").slice(0, 16) + "...)")
+        println("  two independent lineages agree: the seed reading the "
+            + "sources, and the compiled snapshot reading them")
+        return 0
+    }
+
+    # The freestanding lineage, pure HLS end to end:
+    #   1. cc builds the hosted compiler from the committed snapshot;
+    #   2. the hosted compiler emits its own source against the no-libc
+    #      runtime (--no-libc);
+    #   3. cc links that freestanding (-ffreestanding -nostdlib);
+    #   4. the no-libc compiler must re-derive the committed snapshot.
+    let host_bin: str = work_prefix + "-host"
+    ensure_workdir(root)
+    cc_compile(root, cc, snap_path, host_bin)
+    let nolibc_c: str = work_prefix + "-nolibc.c"
+    if !run_simple(host_bin, ["--no-libc", path_join2(root, snap_entry()), nolibc_c]) {
+        refuse("the freestanding law",
+            "the hosted compiler could not emit its own no-libc source "
+            + "(its diagnostics are above)")
+    }
+    let fs_bin: str = work_prefix + "-fs"
+    if !fs_compile(cc, nolibc_c, fs_bin) {
+        refuse("the freestanding law",
+            cc + " could not link the freestanding compiler (its "
+            + "diagnostics are above)")
+    }
+    let fs_out: str = work_prefix + "-fs-emission.c"
+    if !run_simple(fs_bin, [path_join2(root, snap_entry()), fs_out]) {
+        refuse("the freestanding law",
+            "the freestanding compiler could not re-compile "
+            + snap_entry() + " (its diagnostics are above)")
+    }
+    if !same_files(fs_out, snap_path) {
+        refuse("the agreement law",
+            "the freestanding compiler emits DIFFERENT bytes than the "
+            + "committed snapshot carries — the two runtimes disagree "
+            + "on one source; run `make bootstrap-nolibc` for the full "
+            + "cross-check, then `make snapshot-regen` if the sources moved")
+    }
+    println("snapshot: PROVEN — the freestanding compiler re-derives the "
+        + "committed snapshot byte for byte ("
+        + manifest_get_int(manifest, "hlc_c_lines").to_str() + " lines, sha256 "
+        + manifest_get_str(manifest, "hlc_c_sha256").slice(0, 16) + "...)")
+    println("  the hosted chain and the no-libc chain read the same sources "
+        + "and agree — no interpreter anywhere in either")
+    return 0
+}
+
+# ============================================================================
+# CLI.
+# ============================================================================
+
+fn find_flag_value(argv: list[str], name: str, default_value: str) -> str {
+    let mut i: int = 0
+    while i < argv.len() {
+        if argv.get(i) == name {
+            if i + 1 < argv.len() {
+                return argv.get(i + 1)
+            }
+            return default_value
+        }
+        i = i + 1
+    }
+    return default_value
+}
+
+fn has_flag(argv: list[str], name: str) -> bool {
+    let mut i: int = 0
+    while i < argv.len() {
+        if argv.get(i) == name {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn env_or(name: str, default_value: str) -> str uses Proc {
+    let v: str = env_get(name)
+    if v == "" {
+        return default_value
+    }
+    return v
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let argv: list[str] = args()
+    if argv.len() < 2 {
+        usage_error("no command; try status | verify | regen | prove")
+    }
+    let cmd: str = argv.get(1)
+    let rest: list[str] = []
+    let mut i: int = 2
+    while i < argv.len() {
+        rest.push(argv.get(i))
+        i = i + 1
+    }
+
+    # --root defaults to the invoking directory: the make targets and
+    # the acceptance gates always run from the tree they mean.
+    let root: str = find_flag_value(rest, "--root", cwd_get())
+    let cc: str = find_flag_value(rest, "--cc", env_or("CC", "gcc"))
+    let python: str = find_flag_value(rest, "--python", env_or("HALS_PYTHON", "python3"))
+    let want_json: bool = has_flag(rest, "--json")
+    let deep: bool = has_flag(rest, "--deep")
+    let seed: bool = has_flag(rest, "--seed")
+
+    if cmd == "status" {
+        return cmd_status(root, want_json)
+    }
+    if cmd == "verify" {
+        return cmd_verify(root, cc, deep, want_json)
+    }
+    if cmd == "regen" {
+        return cmd_regen(root, cc, seed, python)
+    }
+    if cmd == "prove" {
+        return cmd_prove(root, cc, seed, python)
+    }
+    usage_error("unknown command " + cmd)
+    return 2
+}
+
+# ============================================================================
+# End of tools/hls-snap.hls
+# ============================================================================

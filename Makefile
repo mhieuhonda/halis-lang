@@ -83,19 +83,40 @@ bootstrap-seed:
 	@rm -f $(BIN)/hlc2.c
 	@echo "Native compiler: $(BIN)/hlc"
 
-# Stage 142 (v0.161.0-alpha): the snapshot kit (tools/hls-snap.py).
-# The ONLY legal way to mutate snapshot/hlc.c — never edit it by hand.
-snapshot-status:
-	@$(PYTHON) tools/hls-snap.py status
+# Stage 143 (v0.162.0-alpha): the snapshot kit, in Halis. The tool
+# that guards the bootstrap is itself built by it: hlc (compiled from
+# the committed snapshot) compiles tools/hls-snap.hls, cc links
+# bin/hls-snap — no Python anywhere on the lifecycle. The four
+# commands below are the ONLY legal way to mutate snapshot/hlc.c —
+# never edit it by hand. The kit's scratch files (bin/hls-snap-*)
+# live in the build directory and are wiped by `make clean`; direct
+# invocation for the oracle flags: `bin/hls-snap regen --seed`,
+# `bin/hls-snap prove --seed`.
+# The wiring is deliberately BOOTSTRAP-FREE: regen and status must
+# stay runnable on a drifted tree (where `make bootstrap` fails by
+# design — that failure IS the fixed-point law naming the drift),
+# so a missing bin/hlc is filled by one bare cc on the snapshot —
+# the kit's own commands do their own proving. Prerequisites are the
+# kit's sources only (tools/hls-snap.hls + std/), never $(SNAP): a
+# make-level refusal must not hide the tool's own named laws.
+$(BIN)/hls-snap: tools/hls-snap.hls $(wildcard std/*.hls)
+	@mkdir -p $(BIN)
+	@test -x $(BIN)/hlc || { echo "[snapkit] cc: a compiler from the committed snapshot (bootstrap-free)..."; $(CC) $(CFLAGS) -o $(BIN)/hlc $(SNAP) -lm -pthread; }
+	@echo "[snapkit] hlc compiles the snapshot kit (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hls-snap.hls $(BIN)/hls-snap.c
+	@$(CC) $(CFLAGS) -o $(BIN)/hls-snap $(BIN)/hls-snap.c -lm -pthread
 
-snapshot-verify:
-	@$(PYTHON) tools/hls-snap.py verify --deep
+snapshot-status: $(BIN)/hls-snap
+	@$(BIN)/hls-snap status
 
-snapshot-regen:
-	@$(PYTHON) tools/hls-snap.py regen
+snapshot-verify: $(BIN)/hls-snap
+	@$(BIN)/hls-snap verify --deep
 
-snapshot-prove:
-	@$(PYTHON) tools/hls-snap.py prove
+snapshot-regen: $(BIN)/hls-snap
+	@$(BIN)/hls-snap regen
+
+snapshot-prove: $(BIN)/hls-snap
+	@$(BIN)/hls-snap prove
 
 # File target for the native compiler: acceptance targets declared with
 # `bin/hlc` as a prerequisite stay buildable after `make clean` or on a
