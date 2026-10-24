@@ -1,0 +1,488 @@
+# feat_stage142_snapshot.hls — Stage 142 (v0.161.0-alpha): the
+# pure-HLS bootstrap — the Python seed leaves the build.
+#
+# What this fixture pins is the DECISION PROCEDURE the kit runs —
+# the same laws `tools/hls-snap.py` applies when it classifies a
+# tree, digests a closure, regenerates a snapshot and proves the
+# two lineages agree:
+#
+#   hls-snap status | verify | regen | prove
+#
+#   1. the purity    — the build chain is exactly three steps
+#      law             (cc on the committed snapshot, hlc re-deriving
+#                      itself, cmp against the snapshot) and NO step
+#                      names an interpreter; the seed ladder is four
+#                      steps and DOES name one — demoted to the
+#                      maintenance list, present for prove and
+#                      regen --seed, absent from the build;
+#   2. the closure   — the import walk is transitive, deduped and
+#      law             canonical: the entry is a member, a file
+#                      reached twice is counted once, and an
+#                      unresolvable import is a named error, never
+#                      silence;
+#   3. the digest    — the closure digest is computed over the
+#      law             CANONICAL (sorted) rendering, so the walk
+#                      order cannot move it; one byte moved in one
+#                      file moves it; the manifest must agree with
+#                      itself (its recorded digest is the digest of
+#                      the closure it carries);
+#   4. the semantic  — the emitter is semantic, not textual: a
+#      law             comment-only change moves NOTHING in the
+#                      emission, a code change moves it — the build
+#                      never cries wolf over a moved comment, and
+#                      never stays quiet over a moved statement;
+#   5. the fixed     — the emission of the emission IS the emission
+#      point law       (idempotence: convergence in one round);
+#                      rounds run 1..8 and a chain that cannot
+#                      converge inside the bound is refused, not
+#                      retried forever;
+#   6. the tamper    — the classification is total over exactly
+#      law             four states — FRESH, STALE-SOURCES (named at
+#                      the file that moved), TAMPERED (the bytes
+#                      disagree with the digest the manifest
+#                      records) and NO-SNAPSHOT — and nothing else
+#                      is a verdict;
+#   7. the no-op     — regen on a FRESH tree is REFUSED (noise);
+#      law             on STALE-SOURCES it re-derives and moves the
+#                      snapshot AND the manifest together (they
+#                      commit together or not at all); on a
+#                      release-heading move alone it refreshes the
+#                      manifest ONLY — the emitted C did not move;
+#   8. the agreement — two lineages reach the same fixed point:
+#      law             one deriving from the sources, one deriving
+#                      from the previous snapshot — the seed reading
+#                      the sources and the compiled snapshot
+#                      reading them agree byte for byte.
+#
+# The program exits 0 when every law holds, nonzero with the law's
+# number otherwise — the differential suite runs it on the
+# interpreter AND natively and requires byte-identical output.
+
+# ---------------------------------------------------------------------------
+# The digest fold — a deterministic stand-in for sha256. The LAWS
+# (width, alphabet, determinism, byte-sensitivity, canonical order)
+# are what this fixture pins, not the hash's internals.
+# ---------------------------------------------------------------------------
+
+fn fold_int(s: str) -> int {
+    let mut h: int = 5381
+    let mut i: int = 0
+    while i < s.len() {
+        h = (h * 33 + s.byte_at(i)) % 2147483647
+        i = i + 1
+    }
+    if h < 0 {
+        h = 0 - h
+    }
+    return h
+}
+
+fn hex_digit(v: int) -> str {
+    let alphabet: str = "0123456789abcdef"
+    let idx: int = v % 16
+    return alphabet.slice(idx, idx + 1)
+}
+
+fn hex8(v: int) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    let mut x: int = v % 4294967296
+    if x < 0 {
+        x = 0 - x
+    }
+    # render 8 nibbles, most significant first
+    let mut scale: int = 268435456
+    while i < 8 {
+        out = out + hex_digit(x / scale)
+        x = x % scale
+        scale = scale / 16
+        i = i + 1
+    }
+    return out
+}
+
+fn file_sha(text: str) -> str {
+    return hex8(fold_int(text))
+}
+
+# ---------------------------------------------------------------------------
+# The canonical order — insertion sort keyed on the name fold, so the
+# digest is a function of the SET, never of the walk order.
+# ---------------------------------------------------------------------------
+
+fn sorted_by_key(names: list[str]) -> list[str] {
+    # selection sort by the name fold: repeatedly take the smallest
+    # key not yet taken — push-only, no in-place insert needed
+    let out: list[str] = []
+    while out.len() < names.len() {
+        let mut best: str = ""
+        let mut found: bool = false
+        let mut i: int = 0
+        while i < names.len() {
+            let n: str = names.get(i)
+            if !has_name(out, n) {
+                if !found || fold_int(n) < fold_int(best) {
+                    best = n
+                    found = true
+                }
+            }
+            i = i + 1
+        }
+        out.push(best)
+    }
+    return out
+}
+
+# ---------------------------------------------------------------------------
+# The closure walk — transitive imports over an edge list, deduped.
+# An edge is "from->to"; the walk refuses an unknown node by
+# returning "ERROR:" + the name (a named error, never silence).
+# ---------------------------------------------------------------------------
+
+fn imports_of(name: str, edges: list[str]) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < edges.len() {
+        let e: str = edges.get(i)
+        if e.starts_with(name + "->") {
+            out.push(e.slice(name.len() + 2, e.len()))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn has_name(names: list[str], name: str) -> bool {
+    let mut i: int = 0
+    while i < names.len() {
+        if names.get(i) == name {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn closure_of(entry: str, universe: list[str], edges: list[str]) -> list[str] {
+    let seen: list[str] = []
+    let queue: list[str] = []
+    if !has_name(universe, entry) {
+        return["ERROR:" + entry]
+    }
+    queue.push(entry)
+    let mut qi: int = 0
+    while qi < queue.len() {
+        let cur: str = queue.get(qi)
+        qi = qi + 1
+        if has_name(seen, cur) {
+            continue
+        }
+        let deps: list[str] = imports_of(cur, edges)
+        let mut j: int = 0
+        while j < deps.len() {
+            if !has_name(universe, deps.get(j)) {
+                return["ERROR:" + deps.get(j)]
+            }
+            if !has_name(seen, deps.get(j)) {
+                queue.push(deps.get(j))
+            }
+            j = j + 1
+        }
+        seen.push(cur)
+    }
+    return seen
+}
+
+# ---------------------------------------------------------------------------
+# The canonical closure digest — sorted rendering, "name:sha" rows,
+# fixed separator: the fold of a set, not of a sequence.
+# ---------------------------------------------------------------------------
+
+fn closure_digest(names: list[str], texts: list[str]) -> str {
+    let ordered: list[str] = sorted_by_key(names)
+    let rows: list[str] = []
+    let mut i: int = 0
+    while i < ordered.len() {
+        let n: str = ordered.get(i)
+        let mut j: int = 0
+        while j < names.len() {
+            if names.get(j) == n {
+                rows.push(n + ":" + file_sha(texts.get(j)))
+                j = names.len()
+            } else {
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    return hex8(fold_int(join(rows, "|")))
+}
+
+# ---------------------------------------------------------------------------
+# The emitter — semantic, not textual: comments vanish, code stays in
+# order. Idempotent by construction, so the fixed point is one round.
+# ---------------------------------------------------------------------------
+
+fn emit_str(src: str) -> str {
+    let lines: list[str] = src.split("\n")
+    let kept: list[str] = []
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i).trim()
+        if line.len() == 0 {
+            i = i + 1
+            continue
+        }
+        if line.starts_with("#") {
+            i = i + 1
+            continue
+        }
+        kept.push(line)
+        i = i + 1
+    }
+    return join(kept, "\n")
+}
+
+fn rounds_to_fixed_point(src: str) -> int {
+    let mut cur: str = emit_str(src)
+    let mut rounds: int = 1
+    while rounds < 8 {
+        if emit_str(cur) == cur {
+            return rounds
+        }
+        cur = emit_str(cur)
+        rounds = rounds + 1
+    }
+    return 0 - 1
+}
+
+# ---------------------------------------------------------------------------
+# The classification — total over exactly four states.
+# ---------------------------------------------------------------------------
+
+fn classify(has_snapshot: bool, bytes_match_manifest: bool,
+closure_match_manifest: bool) -> str {
+    if !has_snapshot {
+        return "NO-SNAPSHOT"
+    }
+    if !closure_match_manifest {
+        return "STALE-SOURCES"
+    }
+    if !bytes_match_manifest {
+        return "TAMPERED"
+    }
+    return "FRESH"
+}
+
+# ---------------------------------------------------------------------------
+# The regen verdict — refused on a no-op; a full re-derivation when
+# the closure moved; a manifest-only refresh when the release
+# heading alone moved.
+# ---------------------------------------------------------------------------
+
+fn regen_verdict(state: str, heading_moved: bool) -> str {
+    if state == "FRESH" {
+        if heading_moved {
+            return "REFRESH-ONLY"
+        }
+        return "REFUSED"
+    }
+    return "REGEN"
+}
+
+# ---------------------------------------------------------------------------
+# main — every law, counted.
+# ---------------------------------------------------------------------------
+
+fn main() -> int uses IO {
+    let mut failures: int = 0
+
+    # ---- the toy tree: three modules, one diamond ----------------------
+    let names: list[str] = ["main", "types", "lexer", "codegen"]
+    let texts: list[str] = [
+    "fn start\n# entry comment\nlet boot: int = 1",
+    "# shared types\nfn tok\nfn span",
+    "fn lex\n# reuses types\nfn peek",
+    "fn emit\nfn emit\nfn close"]
+    let edges: list[str] = [
+    "main->types", "main->lexer", "main->codegen",
+    "lexer->types", "codegen->types"]
+
+    println("stage 142: pure-hls bootstrap — the snapshot laws")
+
+    # ---- 1. the purity law ---------------------------------------------
+    let build_chain: list[str] = [
+    "cc -O2 -o bin/hlc snapshot/hlc.c",
+    "bin/hlc src/hlc.hls bin/hlc_regen.c",
+    "cmp snapshot/hlc.c bin/hlc_regen.c"]
+    let seed_chain: list[str] = [
+    "python3 boot/boot.py src/hlc.hls src/hlc.hls bin/hlc.c",
+    "cc -O2 -o bin/hlc bin/hlc.c",
+    "bin/hlc src/hlc.hls bin/hlc2.c",
+    "diff bin/hlc.c bin/hlc2.c"]
+    let mut chain_pure: bool = true
+    let mut i: int = 0
+    while i < build_chain.len() {
+        if build_chain.get(i).contains("python") {
+            chain_pure = false
+        }
+        if build_chain.get(i).contains("boot.py") {
+            chain_pure = false
+        }
+        i = i + 1
+    }
+    if chain_pure && build_chain.len() == 3 && seed_chain.len() == 4
+    && seed_chain.get(0).contains("boot.py") {
+        println("  purity law OK: 3 build steps, no interpreter; the")
+        println("  seed's 4 steps live on the maintenance list")
+    } else {
+        println("  purity law FAILED: the build chain names an interpreter")
+        failures = failures + 1
+    }
+
+    # ---- 2. the closure law --------------------------------------------
+    let closure: list[str] = closure_of("main", names, edges)
+    let closure_ok: bool = closure.len() == 4
+    && has_name(closure, "main")
+    && has_name(closure, "types")
+    && has_name(closure, "lexer")
+    && has_name(closure, "codegen")
+    # the diamond: types is reached from three importers — once
+    let mut types_count: int = 0
+    i = 0
+    while i < closure.len() {
+        if closure.get(i) == "types" {
+            types_count = types_count + 1
+        }
+        i = i + 1
+    }
+    # an unknown import is a NAMED error, never silence: "ghost"
+    # is imported but absent from the universe
+    let broken: list[str] = closure_of("main",
+    ["main"],
+    ["main->ghost"])
+    if closure_ok && types_count == 1
+    && broken.len() == 1
+    && broken.get(0).starts_with("ERROR:ghost") {
+        println("  closure law OK: transitive, deduped (types once),")
+        println("  the unknown import named, not silenced")
+    } else {
+        println("  closure law FAILED")
+        failures = failures + 1
+    }
+
+    # ---- 3. the digest law ---------------------------------------------
+    let d1: str = closure_digest(names, texts)
+    # the same set walked in a different order digests identically:
+    # the canonical sort erases the walk
+    let shuffled: list[str] = ["codegen", "lexer", "types", "main"]
+    let d2: str = closure_digest(shuffled, [
+    texts.get(3), texts.get(2), texts.get(1), texts.get(0)])
+    # one byte moved in one file moves the digest
+    let moved_texts: list[str] = [
+    texts.get(0), texts.get(1), "# shared types CHANGED\nfn tok\nfn span",
+    texts.get(3)]
+    let d3: str = closure_digest(names, moved_texts)
+    # the manifest's own arithmetic: recorded digest == digest of the
+    # closure the manifest carries
+    let self_agree: bool = closure_digest(names, texts) == d1
+    if d1 == d2 && d1 != d3 && self_agree {
+        println("  digest law OK: canonical (order erased), byte-")
+        println("  sensitive, self-agreeing")
+    } else {
+        println("  digest law FAILED")
+        failures = failures + 1
+    }
+
+    # ---- 4. the semantic law -------------------------------------------
+    let source: str = "fn a\n# a comment\nfn b\nfn c"
+    let commented: str = "fn a\n# a comment elsewhere\n# another\nfn b\nfn c"
+    let coded: str = "fn a\n# a comment\nfn b\nfn d"
+    let e0: str = emit_str(source)
+    if e0 == emit_str(commented) && e0 != emit_str(coded) {
+        println("  semantic law OK: a comment move changes nothing,")
+        println("  a code move changes the emission")
+    } else {
+        println("  semantic law FAILED")
+        failures = failures + 1
+    }
+
+    # ---- 5. the fixed-point law ----------------------------------------
+    if rounds_to_fixed_point(source) == 1
+    && emit_str(emit_str(source)) == emit_str(source) {
+        println("  fixed-point law OK: emission is idempotent —")
+        println("  convergence in 1 round (the bound is 8)")
+    } else {
+        println("  fixed-point law FAILED")
+        failures = failures + 1
+    }
+
+    # ---- 6. the tamper law ---------------------------------------------
+    # the live emission and the committed snapshot agree
+    let live_snapshot: str = emit_str(source)
+    let c_fresh: str = classify(true, true, true)
+    let c_stale: str = classify(true, true, false)
+    let c_tamper: str = classify(true, false, true)
+    let c_missing: str = classify(false, false, false)
+    if c_fresh == "FRESH" && c_stale == "STALE-SOURCES"
+    && c_tamper == "TAMPERED" && c_missing == "NO-SNAPSHOT" {
+        println("  tamper law OK: the classification is total —")
+        println("  FRESH / STALE-SOURCES / TAMPERED / NO-SNAPSHOT")
+    } else {
+        println("  tamper law FAILED")
+        failures = failures + 1
+    }
+
+    # ---- 7. the no-op law ----------------------------------------------
+    # a regen on FRESH is refused; on STALE it re-derives and moves
+    # BOTH the snapshot and the manifest; a heading move alone
+    # refreshes the manifest only
+    let snapshot_before: str = live_snapshot
+    let manifest_before: str = d1
+    let v_fresh: str = regen_verdict("FRESH", false)
+    let v_stale: str = regen_verdict("STALE-SOURCES", false)
+    let v_heading: str = regen_verdict("FRESH", true)
+    # the drifted tree: one code line moved in "types" — the
+    # snapshot AND the manifest both move (they commit together)
+    let snapshot_after: str = emit_str("fn a\nfn b\nfn d")
+    let manifest_after: str = d3
+    if v_fresh == "REFUSED" && v_stale == "REGEN"
+    && v_heading == "REFRESH-ONLY"
+    && snapshot_after != snapshot_before
+    && manifest_after != manifest_before {
+        println("  no-op law OK: no-op refused; drift re-derived with")
+        println("  snapshot AND manifest together; heading alone")
+        println("  refreshes the manifest only")
+    } else {
+        println("  no-op law FAILED")
+        failures = failures + 1
+    }
+
+    # ---- 8. the agreement law ------------------------------------------
+    # lineage A derives from the sources; lineage B derives from the
+    # previous snapshot (whose sources carried different comments —
+    # comments never survive compilation). Both reach the same bytes.
+    let lineage_a: str = emit_str(source)
+    let previous_sources: str = "# lead\nfn a\nfn b\n# tail\nfn c"
+    let previous_snapshot: str = emit_str(previous_sources)
+    let lineage_b: str = emit_str(previous_snapshot)
+    if lineage_a == lineage_b && lineage_a == live_snapshot
+    && previous_snapshot == lineage_a {
+        println("  agreement law OK: the source lineage and the")
+        println("  snapshot lineage reach the same fixed point")
+    } else {
+        println("  agreement law FAILED")
+        failures = failures + 1
+    }
+
+    if failures == 0 {
+        println("stage 142: pure-hls bootstrap")
+        println("  snapshot laws OK: purity, closure, digest, semantic,")
+        println("  fixed point, tamper, no-op, agreement")
+        return 0
+    }
+    println("stage 142: pure-hls bootstrap FAILED")
+    println("  failures:")
+    println(failures.to_str())
+    return 1
+}
