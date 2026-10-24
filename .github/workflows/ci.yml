@@ -8,12 +8,19 @@
 #                 at error severity, Python byte-compile of boot/ tools/
 #                 tests/, hllint over the compiler + stdlib + core sources,
 #                 spec-check, and on tag pushes the tag-vs-CHANGELOG gate.
-#   bootstrap   — make bootstrap (Stage 142: cc compiles the committed
-#                 C snapshot -> native hlc re-derives itself -> the
-#                 fixed-point law against the snapshot; NO Python in the
-#                 chain), make snapshot-verify (the manifest laws), the
-#                 full no-libc cross-bootstrap ladder, then a smoke run.
-#                 bin/ is cached on the exact hash of snapshot/** + src/**.
+#                 Python here is LAB TOOLING (the linters run on the
+#                 sources) — the artifact path lives in `bootstrap`.
+#   bootstrap   — THE SELF-HOSTING GATE (Stage 143: no setup-python, no
+#                 Python on the job at all): make bootstrap (Stage 142:
+#                 cc compiles the committed C snapshot -> native hlc
+#                 re-derives itself -> the fixed-point law against the
+#                 snapshot), the self-hosted snapshot kit (bin/hlc compiles
+#                 tools/hls-snap.hls -> bin/hls-snap), make snapshot-verify
+#                 (the manifest laws, through the kit), the full no-libc
+#                 cross-bootstrap ladder, then a smoke run — and the
+#                 whole lifecycle re-proven under a PATH that provably
+#                 cannot resolve python3 or python. bin/ is cached on the
+#                 exact hash of snapshot/** + src/** + std/** + the kit.
 #   test        — the 8 differential suites from tests/run_tests.sh run in
 #                 PARALLEL via tests/run_one_suite.sh (suite_08 first builds
 #                 bin/hlc + bin/hlc-fs, which it consumes directly).
@@ -21,6 +28,8 @@
 #                 bootstrap ladder (make bootstrap-seed — the interpreter
 #                 derives the compiler, so every Python version proves it),
 #                 the pure-interpreter battery (suite_01) and a native smoke.
+#                 This is the ORACLE battery: it tests boot/ (the optional
+#                 Python seed), never the artifact path.
 #   smoke-macos — bootstrap + smoke on the Apple-silicon runner.
 #   smoke-win   — bootstrap + smoke under MSYS2 MinGW on windows-2025.
 #   tools       — hltest over the ok corpus, a seeded 2-minute differential
@@ -28,8 +37,9 @@
 #   gate        — one aggregate verdict for branch protection ("CI gate").
 #
 # Docs-only changes skip every heavy job and the run finishes in the
-# lint job. Tag pushes (`v*-alpha`) run the full battery; the release
-# build itself lives in release.yml.
+# lint job. Tag pushes (ANY v* tag — v0.161.0-alpha, v1.0.0-rc.1,
+# v1.0.0) run the full battery; the release itself lives in
+# release.yml, which turns the tag's suffix into the channel.
 # ============================================================================
 
 name: CI
@@ -43,7 +53,7 @@ on:
       - 'arena/**'
       - 'fix/**'
     tags:
-      - 'v*-alpha'
+      - 'v*'
   pull_request:
   workflow_dispatch:
 
@@ -155,12 +165,14 @@ jobs:
           echo "CHANGELOG entry for ${v} found"
 
   # -------------------------------------------------------------- bootstrap --
-  # Stage 142 (v0.161.0-alpha): the pure-HLS bootstrap — no Python in
-  # the bootstrap CHAIN. cc compiles the committed C snapshot, the
-  # native hlc re-derives itself from the HLS sources, and the
-  # fixed-point law must hold byte for byte. snapshot-verify (the
-  # manifest laws) runs on the runner's system python3 — the tool is
-  # Python, the chain is not.
+  # Stage 143: THE SELF-HOSTING GATE. No setup-python step, no Python
+  # requirement anywhere in the job: cc compiles the committed C
+  # snapshot, the native hlc re-derives itself, and the snapshot
+  # lifecycle (status / verify / the fixed point) runs through the
+  # self-hosted kit — bin/hlc compiles tools/hls-snap.hls. The last
+  # step re-proves the whole lifecycle under a PATH that provably
+  # cannot resolve python3 or python: the absence is demonstrated,
+  # not asserted.
   bootstrap:
     name: bootstrap & determinism (gcc)
     needs: changes
@@ -171,20 +183,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # bin/ is derived deterministically from snapshot/** + src/**; a
-      # hit proves these exact sources were bootstrapped before.
+      # bin/ is derived deterministically from snapshot/** + src/**
+      # (+ std/** and the kit since Stage 143 — a std change rebuilds
+      # the self-hosted tools); a hit proves these exact sources were
+      # bootstrapped before.
       - name: Restore bootstrap cache
         id: bootcache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: bin
-          key: hlc-ci-gcc-x64-${{ runner.os }}-${{ hashFiles('snapshot/**', 'src/**') }}
+          key: hlc-ci-gcc-x64-${{ runner.os }}-${{ hashFiles('snapshot/**', 'src/**', 'std/**', 'tools/hls-snap.hls') }}
 
       - name: Bootstrap (snapshot -> native hlc -> fixed-point law)
         if: steps.bootcache.outputs.cache-hit != 'true'
         run: make bootstrap
 
-      - name: Snapshot manifest laws (verify --deep)
+      - name: Self-hosted snapshot kit (hlc compiles hls-snap.hls)
+        run: make bin/hls-snap
+
+      - name: Snapshot manifest laws (verify --deep, through the kit)
         run: make snapshot-verify
 
       - name: Cross-bootstrap ladder (no-libc freestanding hlc)
@@ -192,6 +209,27 @@ jobs:
 
       - name: Smoke run (make run examples/hello.hls)
         run: make run F=examples/hello.hls
+
+      # The pure chain, demonstrated: bootstrap + status + verify
+      # (deep) under a PATH holding the C toolchain and coreutils —
+      # and provably no python3 / python anywhere on it.
+      - name: No-python proof (the lifecycle on a stripped PATH)
+        run: |
+          set -euo pipefail
+          nopy="$(mktemp -d)"
+          for tool in gcc cc make cmp diff mkdir cp rm cat sh bash ld as; do
+            ln -s "$(command -v "$tool")" "$nopy/$tool"
+          done
+          for probe in curl-config pkg-config; do
+            printf '#!/bin/sh\nexit 1\n' > "$nopy/$probe"
+            chmod +x "$nopy/$probe"
+          done
+          if PATH="$nopy" command -v python3 >/dev/null 2>&1 \
+             || PATH="$nopy" command -v python >/dev/null 2>&1; then
+            echo "::error::python3 or python resolves on the stripped PATH — the gate cannot prove the law"
+            exit 1
+          fi
+          env PATH="$nopy" TMPDIR="$(mktemp -d)" make bootstrap snapshot-status snapshot-verify
 
   # ------------------------------------------------------------ test matrix --
   test:
