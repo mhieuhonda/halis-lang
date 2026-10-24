@@ -1,0 +1,385 @@
+# ============================================================================
+# std/sha256.hls — Stage 143: SHA-256 hash (FIPS PUB 180-4 §6.2)
+# ----------------------------------------------------------------------------
+# Pure-HLS implementation of the SHA-256 Secure Hash Algorithm. The module
+# exists because the self-hosted snapshot kit (tools/hls-snap.hls) is
+# content-addressed by sha256 — the manifest's closure digests, the
+# snapshot's own digest — and the kit is written in Halis, so the digest
+# it computes must be computable by the language itself. std.sha1 (the
+# WebSocket handshake's fixed RFC 6455 requirement) stays as it was;
+# production keyed hashing remains std.crypto's SipHash / HMAC.
+#
+# NO new compiler builtins — the entire module is pure HLS layered on
+# std.bits, exactly like std.sha1 before it. Every intermediate value is
+# a 32-bit unsigned int carried as a non-negative int64 in [0, 2^32).
+# The widest intermediate is the round sum
+#   T1 = h + SIGMA1 + Ch + K + W
+# whose five addends are each < 2^32, so the sum is < 5 * 2^32 < 2^35 —
+# well within int64; we reduce modulo 2^32 after the addition by masking.
+#
+# API:
+#   sha256_hash(data: str) -> str
+#       The 32-byte SHA-256 digest of `data` as a Halis str (a byte
+#       string — see SPEC.md §3), each byte in 0..255.
+#
+#   sha256_hex(data: str) -> str
+#       The 64-character lowercase hex digest. FIPS 180-4 test vectors:
+#         sha256_hex("")   = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+#         sha256_hex("abc")= "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+#         sha256_hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")
+#                          = "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+#         sha256_hex("a" * 1_000_000)
+#                          = "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+#
+# Differential parity (interpreter == native):
+#   Every operation is pure integer + byte access — no I/O, no randomness,
+#   no float arithmetic. The interpreter and the native binary produce
+#   byte-identical digests (tests/ok/feat_sha256.hls pins the vectors on
+#   both paths).
+# ============================================================================
+
+import "std.bits"
+import "std.str"
+
+# ============================================================================
+# Constants — FIPS 180-4 §4.2.2 (round constants) + §5.3.2 (initial values).
+# ============================================================================
+
+# The initial hash values H0..H7: the first 32 bits of the fractional
+# parts of the square roots of the first 8 primes (2, 3, 5, 7, 11, 13,
+# 17, 19). Carried as decimal literals in [0, 2^32).
+
+fn sha256_h0() -> int {
+    return 1779033703              # 0x6A09E667
+}
+
+fn sha256_h1() -> int {
+    return 3144134277              # 0xBB67AE85
+}
+
+fn sha256_h2() -> int {
+    return 1013904242              # 0x3C6EF372
+}
+
+fn sha256_h3() -> int {
+    return 2773480762              # 0xA54FF53A
+}
+
+fn sha256_h4() -> int {
+    return 1359893119              # 0x510E527F
+}
+
+fn sha256_h5() -> int {
+    return 2600822924              # 0x9B05688C
+}
+
+fn sha256_h6() -> int {
+    return 528734635               # 0x1F83D9AB
+}
+
+fn sha256_h7() -> int {
+    return 1541459225              # 0x5BE0CD19
+}
+
+fn sha256_mask_32() -> int {
+    return 4294967295               # 2^32 - 1
+}
+
+# The 64 round constants K[0..63] — the first 32 bits of the fractional
+# parts of the cube roots of the first 64 primes (FIPS 180-4 §4.2.2).
+# Returned as a list built once per hash; the compression function reads
+# it by index, so the table is walked, never rebuilt per block.
+
+fn sha256_k() -> list[int] {
+    return [
+        1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993, 2453635748, 2870763221,
+        3624381080, 310598401, 607225278, 1426881987, 1925078388, 2162078206, 2614888103, 3248222580,
+        3835390401, 4022224774, 264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986,
+        2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711, 113926993, 338241895,
+        666307205, 773529912, 1294757372, 1396182291, 1695183700, 1986661051, 2177026350, 2456956037,
+        2730485921, 2820302411, 3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344,
+        430227734, 506948616, 659060556, 883997877, 958139571, 1322822218, 1537002063, 1747873779,
+        1955562222, 2024104815, 2227730452, 2361852424, 2428436474, 2756734187, 3204031479, 3329325298
+    ]
+}
+
+# ============================================================================
+# 32-bit primitives — rotate-right, modular add, complement.
+#
+# SHA-256 rotates RIGHT (SHA-1 rotates left); rotr(x, n) is implemented
+# as rotl(x, 32 - n) with the same masking discipline as std.sha1: the
+# shifted-left intermediate stays below 2^63, and every result is masked
+# down to exactly 32 bits.
+# ============================================================================
+
+# sha256_rotr(x, n) — right-rotate a 32-bit value by n bits (1..31).
+# Implements: ((x >> n) | (x << (32 - n))) & 0xFFFFFFFF.
+fn sha256_rotr(x: int, n: int) -> int {
+    if n < 0 || n >= 32 {
+        panic("sha256_rotr: rotation count must be in 1..31")
+    }
+    let left: int = int_shl(x, 32 - n)
+    let right: int = int_shr(x, n)
+    return int_and(int_or(left, right), sha256_mask_32())
+}
+
+# sha256_add32(a, b) — modular addition of two 32-bit unsigned values.
+# The sum is below 2^33; the mask reduces it modulo 2^32.
+fn sha256_add32(a: int, b: int) -> int {
+    return int_and(a + b, sha256_mask_32())
+}
+
+# sha256_not32(x) — bitwise NOT of a 32-bit value, masked back to 32
+# bits (same two's-complement note as std.sha1.sha1_not32).
+fn sha256_not32(x: int) -> int {
+    return int_and(int_not(x), sha256_mask_32())
+}
+
+# ============================================================================
+# The four composed rotations (FIPS 180-4 §4.1.2).
+#
+#   Sigma0(x) = rotr(x, 2) xor rotr(x, 13) xor rotr(x, 22)   (uppercase)
+#   Sigma1(x) = rotr(x, 6) xor rotr(x, 11) xor rotr(x, 25)
+#   sigma0(x) = rotr(x, 7) xor rotr(x, 18) xor shr(x, 3)      (lowercase)
+#   sigma1(x) = rotr(x, 17) xor rotr(x, 19) xor shr(x, 10)
+# ============================================================================
+
+fn sha256_sigma0_upper(x: int) -> int {
+    return int_xor(
+        int_xor(sha256_rotr(x, 2), sha256_rotr(x, 13)),
+        sha256_rotr(x, 22)
+    )
+}
+
+fn sha256_sigma1_upper(x: int) -> int {
+    return int_xor(
+        int_xor(sha256_rotr(x, 6), sha256_rotr(x, 11)),
+        sha256_rotr(x, 25)
+    )
+}
+
+fn sha256_sigma0_lower(x: int) -> int {
+    return int_xor(
+        int_xor(sha256_rotr(x, 7), sha256_rotr(x, 18)),
+        int_shr(x, 3)
+    )
+}
+
+fn sha256_sigma1_lower(x: int) -> int {
+    return int_xor(
+        int_xor(sha256_rotr(x, 17), sha256_rotr(x, 19)),
+        int_shr(x, 10)
+    )
+}
+
+# ============================================================================
+# The round functions (FIPS 180-4 §4.1.2) — identical in shape to SHA-1's
+# Ch, but with XOR instead of OR in Maj (the FIPS spelling; the two are
+# equivalent, and the explicit form is the auditable one).
+#
+#   Ch(x, y, z)  = (x AND y) XOR ((NOT x) AND z)
+#   Maj(x, y, z) = (x AND y) XOR (x AND z) XOR (y AND z)
+# ============================================================================
+
+fn sha256_ch(x: int, y: int, z: int) -> int {
+    return int_xor(
+        int_and(x, y),
+        int_and(sha256_not32(x), z)
+    )
+}
+
+fn sha256_maj(x: int, y: int, z: int) -> int {
+    return int_xor(
+        int_xor(int_and(x, y), int_and(x, z)),
+        int_and(y, z)
+    )
+}
+
+# ============================================================================
+# Message schedule — extend a 64-byte block into 64 32-bit words
+# (FIPS 180-4 §6.2.2):
+#   W[t] = M[t]                                     for t in 0..15
+#   W[t] = sigma1(W[t-2]) + W[t-7]
+#          + sigma0(W[t-15]) + W[t-16]              for t in 16..63
+# ============================================================================
+
+# sha256_block_word(block, t) — the t-th 32-bit big-endian word of the
+# 64-byte block (t in 0..15). Same assembly as std.sha1.
+fn sha256_block_word(block: str, t: int) -> int {
+    let off: int = t * 4
+    let b0: int = block.byte_at(off)
+    let b1: int = block.byte_at(off + 1)
+    let b2: int = block.byte_at(off + 2)
+    let b3: int = block.byte_at(off + 3)
+    return int_or(
+        int_or(int_shl(b0, 24), int_shl(b1, 16)),
+        int_or(int_shl(b2, 8), b3)
+    )
+}
+
+fn sha256_message_schedule(block: str) -> list[int] {
+    let w: list[int] = []
+    let mut t: int = 0
+    while t < 16 {
+        w.push(sha256_block_word(block, t))
+        t = t + 1
+    }
+    while t < 64 {
+        let w2: int = w.get(t - 2)
+        let w7: int = w.get(t - 7)
+        let w15: int = w.get(t - 15)
+        let w16: int = w.get(t - 16)
+        let x: int = sha256_add32(
+            sha256_add32(sha256_sigma1_lower(w2), w7),
+            sha256_add32(sha256_sigma0_lower(w15), w16)
+        )
+        w.push(x)
+        t = t + 1
+    }
+    return w
+}
+
+# ============================================================================
+# Compression function — one 64-byte block (FIPS 180-4 §6.2.2):
+#   a..h = H0..H7
+#   for t in 0..63:
+#     T1 = h + Sigma1(e) + Ch(e, f, g) + K[t] + W[t]
+#     T2 = Sigma0(a) + Maj(a, b, c)
+#     h = g; g = f; f = e; e = d + T1
+#     d = c; c = b; b = a; a = T1 + T2
+#   H0 = H0 + a; ...; H7 = H7 + h      (each mod 2^32)
+#
+# The state travels as a list[int] of length 8 — the sha1.hls convention.
+# ============================================================================
+
+fn sha256_compress_block(state: list[int], block: str, k: list[int]) -> list[int] {
+    let w: list[int] = sha256_message_schedule(block)
+    let mut a: int = state.get(0)
+    let mut b: int = state.get(1)
+    let mut c: int = state.get(2)
+    let mut d: int = state.get(3)
+    let mut e: int = state.get(4)
+    let mut f: int = state.get(5)
+    let mut g: int = state.get(6)
+    let mut h: int = state.get(7)
+    let mut t: int = 0
+    while t < 64 {
+        let t1: int = sha256_add32(
+            sha256_add32(
+                sha256_add32(h, sha256_sigma1_upper(e)),
+                sha256_add32(sha256_ch(e, f, g), k.get(t))
+            ),
+            w.get(t)
+        )
+        let t2: int = sha256_add32(
+            sha256_sigma0_upper(a),
+            sha256_maj(a, b, c)
+        )
+        h = g
+        g = f
+        f = e
+        e = sha256_add32(d, t1)
+        d = c
+        c = b
+        b = a
+        a = sha256_add32(t1, t2)
+        t = t + 1
+    }
+    let out: list[int] = []
+    out.push(sha256_add32(state.get(0), a))
+    out.push(sha256_add32(state.get(1), b))
+    out.push(sha256_add32(state.get(2), c))
+    out.push(sha256_add32(state.get(3), d))
+    out.push(sha256_add32(state.get(4), e))
+    out.push(sha256_add32(state.get(5), f))
+    out.push(sha256_add32(state.get(6), g))
+    out.push(sha256_add32(state.get(7), h))
+    return out
+}
+
+# ============================================================================
+# Padding — FIPS 180-4 §5.1.1, byte-identical scheme to SHA-1's: one 0x80
+# byte, zeros to congruence 56 mod 64, then the 8-byte big-endian bit
+# length. HLS int is int64, so the bit length of any str the runtime can
+# carry fits without the 2^64 high-word dance.
+# ============================================================================
+
+fn sha256_pad(data: str) -> str {
+    let orig_len_bytes: int = data.len()
+    let orig_len_bits: int = orig_len_bytes * 8
+    let after_0x80: int = orig_len_bytes + 1
+    let mod_after: int = after_0x80 - (after_0x80 / 64) * 64
+    let zeros: int = (56 - mod_after + 64) - ((56 - mod_after + 64) / 64) * 64
+    let mut out: str = data + chr(128)
+    let mut i: int = 0
+    while i < zeros {
+        out = out + chr(0)
+        i = i + 1
+    }
+    let b7: int = int_and(int_shr(orig_len_bits, 56), 255)
+    let b6: int = int_and(int_shr(orig_len_bits, 48), 255)
+    let b5: int = int_and(int_shr(orig_len_bits, 40), 255)
+    let b4: int = int_and(int_shr(orig_len_bits, 32), 255)
+    let b3: int = int_and(int_shr(orig_len_bits, 24), 255)
+    let b2: int = int_and(int_shr(orig_len_bits, 16), 255)
+    let b1: int = int_and(int_shr(orig_len_bits, 8), 255)
+    let b0: int = int_and(orig_len_bits, 255)
+    out = out + chr(b7) + chr(b6) + chr(b5) + chr(b4)
+    out = out + chr(b3) + chr(b2) + chr(b1) + chr(b0)
+    return out
+}
+
+# ============================================================================
+# Top-level hash — FIPS 180-4 §6.2: pad, seed the state with H0..H7,
+# compress every block, emit the state as 8 big-endian 4-byte words.
+# ============================================================================
+
+fn sha256_hash(data: str) -> str {
+    let padded: str = sha256_pad(data)
+    let k: list[int] = sha256_k()
+    let mut state: list[int] = [
+        sha256_h0(), sha256_h1(), sha256_h2(), sha256_h3(),
+        sha256_h4(), sha256_h5(), sha256_h6(), sha256_h7()
+    ]
+    let n_blocks: int = padded.len() / 64
+    let mut bi: int = 0
+    while bi < n_blocks {
+        let block: str = padded.slice(bi * 64, (bi + 1) * 64)
+        state = sha256_compress_block(state, block, k)
+        bi = bi + 1
+    }
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < 8 {
+        out = out + sha256_word_to_bytes(state.get(i))
+        i = i + 1
+    }
+    return out
+}
+
+fn sha256_word_to_bytes(w: int) -> str {
+    let b0: int = int_and(int_shr(w, 24), 255)
+    let b1: int = int_and(int_shr(w, 16), 255)
+    let b2: int = int_and(int_shr(w, 8), 255)
+    let b3: int = int_and(w, 255)
+    return chr(b0) + chr(b1) + chr(b2) + chr(b3)
+}
+
+# sha256_hex(data) — the 64-character lowercase hex digest.
+fn sha256_hex(data: str) -> str {
+    let digest: str = sha256_hash(data)
+    let digits: str = "0123456789abcdef"
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < digest.len() {
+        let b: int = digest.byte_at(i)
+        out.push(digits.slice(b / 16, b / 16 + 1))
+        out.push(digits.slice(b % 16, b % 16 + 1))
+        i = i + 1
+    }
+    return str_join(out, "")
+}
+
+# ============================================================================
+# End of std/sha256.hls
+# ============================================================================
