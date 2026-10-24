@@ -11,10 +11,11 @@ Nine sections:
                             AND `make snapshot-verify --deep` succeed
                             under a PATH that cannot resolve python3
                             or python, on a tree copy that does not
-                            even CARRY boot/: the whole lifecycle —
-                            build, classify, verify, the fixed point —
-                            is cc + the committed snapshot + the
-                            self-hosted kit, nothing else
+                            even CARRY the interpreter: the whole
+                            lifecycle — build, classify, verify, the
+                            fixed point — is cc + the committed
+                            snapshot + the self-hosted kit, nothing
+                            else
   2. the fixed-point law  — the compiler built from the snapshot
                             re-derives the snapshot byte for byte; a
                             hand-edited snapshot fails the build with
@@ -35,10 +36,12 @@ Nine sections:
   4. the agreement law    — `prove`: the FREESTANDING compiler (built
                             from the hosted one, no libc) re-derives
                             the committed snapshot byte for byte — no
-                            interpreter anywhere in the chain; and
-                            `prove --seed`: the Python oracle derives
-                            the same bytes (two independent lineages
-                            still agree when the oracle is present)
+                            interpreter anywhere in the chain, and
+                            since v0.164.0-alpha there is no other
+                            lineage to be: the seed that formed the
+                            oracle left the tree, and the retired
+                            --seed flag refuses BY NAME (a silent
+                            no-op would hide the retirement)
   5. the manifest law     — the document agrees with itself and the
                             world: a broken digest is a named refusal,
                             a hand-edited snapshot is TAMPERED, a
@@ -58,10 +61,11 @@ Nine sections:
   8. the self-host law    — the kit's own build is pure: bin/hlc
                             (built from the snapshot) compiles
                             tools/hls-snap.hls; the emitted C carries
-                            no absolute path; and the kit never names
-                            an interpreter on its default path (the
-                            only interpreter mention is the --seed
-                            fallback it refuses with)
+                            no absolute path; and the kit's source
+                            names no interpreter invocation at all —
+                            not even a refused one (the --seed flag
+                            refuses as a RETIRED flag, naming the
+                            retirement, not an interpreter)
   9. the chain law      — Stage 143's own promise: `make
                             snapshot-chain` re-runs the whole bootstrap
                             as TWO independent ignitions and byte-
@@ -127,8 +131,8 @@ def sha256_file(path):
 def copy_tree(tag):
     """A disposable build tree: everything the pure lifecycle needs —
     Makefile + mk/ + src/ + core/ + std/ + snapshot/ + the kit +
-    CHANGELOG for the version law. Deliberately WITHOUT boot/: the
-    pure chain must not read it."""
+    CHANGELOG for the version law. Deliberately WITHOUT the
+    interpreter (tools/hlinterp/): the pure chain must not read it."""
     dst = os.path.join(TMP, tag)
     os.makedirs(dst)
     shutil.copy2(os.path.join(ROOT, "Makefile"), dst)
@@ -181,8 +185,8 @@ def snap(tree, *args):
 
 
 def snap_bin(tree, *args):
-    """Drive the built kit binary directly (for the oracle flags the
-    make targets do not carry)."""
+    """Drive the built kit binary directly (for the flags the make
+    targets do not carry)."""
     return run([os.path.join(tree, "bin", "hls-snap")] + list(args),
                cwd=tree)
 
@@ -191,11 +195,11 @@ def snap_bin(tree, *args):
 print("=== 1. the no-python law ===")
 # ---------------------------------------------------------------------------
 tree1 = copy_tree("t1")
-if os.path.exists(os.path.join(tree1, "boot")):
-    bad("the build tree carries boot/ — the gate cannot prove the "
-        "build never reads it")
+if os.path.exists(os.path.join(tree1, "tools", "hlinterp")):
+    bad("the build tree carries the interpreter — the gate cannot "
+        "prove the build never reads it")
 else:
-    ok("the build tree carries no boot/ at all")
+    ok("the build tree carries no interpreter at all")
 r = make_bootstrap(tree1, python_free_env())
 if r.returncode == 0 and "pure-HLS fixed point holds" in r.stdout:
     ok("make bootstrap succeeds with no python3 and no python on PATH "
@@ -349,26 +353,32 @@ if r.returncode != 0:
 os.remove(os.path.join(tree2c, "snapshot", "hlc.c"))
 r = snap_bin(tree2c, "regen")
 if r.returncode == 1 and "seed law" in r.stdout:
-    ok("the native regen refuses when the snapshot is missing (it is "
-       "the seed it builds from)")
+    ok("the native regen refuses when the snapshot is missing (the "
+       "snapshot IS the seed now — the refusal names the restore)")
 else:
     bad("missing-snapshot regen not refused (rc=%d)" % r.returncode)
 
 # ---------------------------------------------------------------------------
-print("=== 4. the agreement law (two lineages, no interpreter by default) ===")
+print("=== 4. the agreement law (two runtimes, one source — no interpreter anywhere) ===")
 # ---------------------------------------------------------------------------
 r = snap(ROOT, "prove")
 if r.returncode == 0 and "PROVEN" in r.stdout and "freestanding" in r.stdout:
-    ok("prove (default): the freestanding compiler re-derives the "
-       "committed snapshot byte for byte — pure, no interpreter")
+    ok("prove: the freestanding compiler re-derives the committed "
+       "snapshot byte for byte — the second lineage, and the only "
+       "one the tree carries")
 else:
     bad("prove (freestanding) failed: %s" % (r.stdout + r.stderr)[:400])
+# The retired flag refuses BY NAME — a silent no-op would hide the
+# retirement (v0.164.0-alpha: the seed left, and with it the oracle
+# lineage the flag used to invoke).
 r = snap_bin(ROOT, "prove", "--seed")
-if r.returncode == 0 and "PROVEN" in r.stdout and "Python seed" in r.stdout:
-    ok("prove --seed: the Python oracle derives the committed snapshot "
-       "byte for byte (the second independent lineage, when present)")
+if (r.returncode == 2 and "retired" in r.stdout
+        and "v0.164.0-alpha" in r.stdout):
+    ok("prove --seed REFUSES with the retirement named (exit 2, usage "
+       "contract) — there is no oracle lineage anymore")
 else:
-    bad("prove --seed failed: %s" % (r.stdout + r.stderr)[:400])
+    bad("the retired --seed did not refuse by name (rc=%d): %s"
+        % (r.returncode, (r.stdout + r.stderr)[:300]))
 
 # ---------------------------------------------------------------------------
 print("=== 5. the manifest law ===")
@@ -411,7 +421,8 @@ r = run(["make", "bin/hls-snap"], cwd=tree5c)
 os.remove(os.path.join(tree5c, "snapshot", "hlc.c"))
 r = snap_bin(tree5c, "status")
 if r.returncode == 1 and "NO-SNAPSHOT" in r.stdout:
-    ok("a missing snapshot is NO-SNAPSHOT (with the --seed advice)")
+    ok("a missing snapshot is NO-SNAPSHOT (naming the restore-from-git "
+       "advice — there is no interpreter to re-derive it)")
 else:
     bad("the missing snapshot was not named (rc=%d)" % r.returncode)
 
@@ -451,7 +462,7 @@ else:
     r1 = run(["./bin/hlc", "examples/fibonacci.hls", fib_c])
     r2 = run(["gcc", "-O2", "-o", fib_bin, fib_c, "-lm", "-pthread"])
     nat = run([fib_bin])
-    interp = run([sys.executable, "boot/boot.py",
+    interp = run([sys.executable, "tools/hlinterp/boot.py",
                   "examples/fibonacci.hls"])
     if (r1.returncode == 0 and r2.returncode == 0
             and nat.stdout == interp.stdout
@@ -544,11 +555,11 @@ else:
         bad("the kit's C leaks absolute paths: %s" % leaks)
 kit_src = open(os.path.join(ROOT, "tools", "hls-snap.hls"),
               "r", encoding="utf-8").read()
-if re.search(r"python[0-9]?\s+boot/boot\.py", kit_src):
-    bad("the kit's source names the interpreter outside a --seed branch")
+if re.search(r"boot/boot\.py", kit_src):
+    bad("the kit's source still names an interpreter invocation")
 else:
-    ok("the kit's default path names no interpreter (the seed is the "
-       "named --seed fallback, nothing more)")
+    ok("the kit's source names no interpreter invocation at all — not "
+       "even a refused one (--seed refuses as a retired flag)")
 
 # ---------------------------------------------------------------------------
 print("=== 9. the chain law (bit for bit, twice over) ===")

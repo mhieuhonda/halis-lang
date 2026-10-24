@@ -32,15 +32,10 @@ else
   HL_CURL_DEFS :=
 endif
 
-.PHONY: all stage0 bootstrap bootstrap-seed bootstrap-nolibc xbootstrap-acceptance refine-acceptance test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full infer infer-smt model prove-acceptance invariant-acceptance cvc5 cvc5-acceptance shapes shapes-smt shapes-acceptance sidechannel sidechannel-acceptance ct ct-acceptance supply supply-pkg supply-acceptance sbom sbom-pkg sbom-release sbom-acceptance repro repro-pkg repro-release repro-verify repro-acceptance sign-keygen sign sign-verify sign-release sign-verify-release sign-selftest sign-acceptance tlog-verify tlog tlog-gossip tlog-witness tlog-witness-verify tlog-prove tlog-prove-verify tlog-selftest tlog-acceptance reverify reverify-json reverify-lto reverify-report reverify-selftest reverify-acceptance ffi-taint ffi-taint-acceptance sandbox sandbox-run sandbox-emit sandbox-release sandbox-verify-release sandbox-selftest sandbox-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve serve-acceptance wasm-pack wasm-pack-check wasm-pack-pack wasm-pack-acceptance aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance tui-acceptance color-acceptance progress-acceptance log-acceptance http-server-acceptance websocket-acceptance cookie-acceptance session-acceptance csrf-acceptance template-acceptance sse-acceptance graphql-acceptance openapi-acceptance jsffi-acceptance dom-acceptance freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance stackguard-acceptance asmreg-acceptance link-acceptance boot-acceptance idt-acceptance mmio-acceptance port-acceptance dma-acceptance atomics-acceptance irqsafe-acceptance triple triple-x86_64-acceptance triple-aarch64-acceptance triple-riscv64-acceptance debuginfo-acceptance cap cap-acceptance test-linker auditlog-list auditlog-show auditlog-verify auditlog-sign auditlog-verify-sign auditlog-selftest auditlog-acceptance lsp-def-acceptance lsp-hints-acceptance lsp-refactor-acceptance fmt-comments-acceptance fmt-config-acceptance lint-fix-acceptance snapshot-acceptance cases-acceptance dap-acceptance repl-acceptance bench-acceptance rss-acceptance rt-acceptance det-acceptance compat-acceptance migrate-acceptance deprecated-acceptance semver-acceptance lts-acceptance xdiff xdiff-acceptance fuzzseed fuzzseed-acceptance guarantee guarantee-report guarantee-acceptance perf perf-gate perf-dashboard perf-acceptance mem mem-gate mem-dashboard memdash-acceptance ctime ctime-gate ctime-dashboard ctime-acceptance size size-gate size-dashboard size-acceptance auditkit-brief auditkit-evidence auditkit-report auditkit-acceptance freeze freeze-verify freeze-report freeze-acceptance snapshot-status snapshot-verify snapshot-regen snapshot-prove snapshot-chain purebootstrap-acceptance
+.PHONY: all bootstrap bootstrap-nolibc xbootstrap-acceptance refine-acceptance test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full infer infer-smt model prove-acceptance invariant-acceptance cvc5 cvc5-acceptance shapes shapes-smt shapes-acceptance sidechannel sidechannel-acceptance ct ct-acceptance supply supply-pkg supply-acceptance sbom sbom-pkg sbom-release sbom-acceptance repro repro-pkg repro-release repro-verify repro-acceptance sign-keygen sign sign-verify sign-release sign-verify-release sign-selftest sign-acceptance tlog-verify tlog tlog-gossip tlog-witness tlog-witness-verify tlog-prove tlog-prove-verify tlog-selftest tlog-acceptance reverify reverify-json reverify-lto reverify-report reverify-selftest reverify-acceptance ffi-taint ffi-taint-acceptance sandbox sandbox-run sandbox-emit sandbox-release sandbox-verify-release sandbox-selftest sandbox-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve serve-acceptance wasm-pack wasm-pack-check wasm-pack-pack wasm-pack-acceptance aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance tui-acceptance color-acceptance progress-acceptance log-acceptance http-server-acceptance websocket-acceptance cookie-acceptance session-acceptance csrf-acceptance template-acceptance sse-acceptance graphql-acceptance openapi-acceptance jsffi-acceptance dom-acceptance freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance stackguard-acceptance asmreg-acceptance link-acceptance boot-acceptance idt-acceptance mmio-acceptance port-acceptance dma-acceptance atomics-acceptance irqsafe-acceptance triple triple-x86_64-acceptance triple-aarch64-acceptance triple-riscv64-acceptance debuginfo-acceptance cap cap-acceptance test-linker auditlog-list auditlog-show auditlog-verify auditlog-sign auditlog-verify-sign auditlog-selftest auditlog-acceptance lsp-def-acceptance lsp-hints-acceptance lsp-refactor-acceptance fmt-comments-acceptance fmt-config-acceptance lint-fix-acceptance snapshot-acceptance cases-acceptance dap-acceptance repl-acceptance bench-acceptance rss-acceptance rt-acceptance det-acceptance compat-acceptance migrate-acceptance deprecated-acceptance semver-acceptance lts-acceptance xdiff xdiff-acceptance fuzzseed fuzzseed-acceptance guarantee guarantee-report guarantee-acceptance perf perf-gate perf-dashboard perf-acceptance mem mem-gate mem-dashboard memdash-acceptance ctime ctime-gate ctime-dashboard ctime-acceptance size size-gate size-dashboard size-acceptance auditkit-brief auditkit-evidence auditkit-report auditkit-acceptance freeze freeze-verify freeze-report freeze-acceptance snapshot-status snapshot-verify snapshot-regen snapshot-prove snapshot-chain purebootstrap-acceptance
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
-
-# Run Stage-0 directly (interpret an HLS program via the bootstrap seed)
-stage0:
-	@test "x$(F)" != "x" || (echo "Usage: make stage0 F=examples/hello.hls" && false)
-	@$(PYTHON) boot/boot.py $(F)
 
 # PURE-HLS BOOTSTRAP (Stage 142, v0.161.0-alpha) — no Python anywhere
 # in the chain. The seed is the committed C snapshot: the compiler's
@@ -51,8 +46,9 @@ stage0:
 #   3. the fixed-point law: the derivation must equal the snapshot,
 #      byte for byte — a hand-edited snapshot, or a stale one (sources
 #      moved without `make snapshot-regen`), fails the build loudly.
-# The Python seed lives on in `make bootstrap-seed` (the maintenance
-# path) and in the differential suites; it is OFF the build path.
+# Since v0.164.0-alpha the seed is gone entirely: boot/ left the
+# tree, and the interpreter that remains is lab tooling under
+# tools/hlinterp/ — no law, no target, no build path names it.
 bootstrap:
 	@mkdir -p $(BIN)
 	@echo "[1/3] cc: compiling the committed C snapshot..."
@@ -60,27 +56,9 @@ bootstrap:
 	@echo "[2/3] native hlc re-derives itself from the HLS sources..."
 	@$(BIN)/hlc $(HLC) $(BIN)/hlc_regen.c
 	@echo "[3/3] fixed-point law: the derivation must equal the snapshot..."
-	@cmp $(SNAP) $(BIN)/hlc_regen.c || { echo "BOOTSTRAP FAILED: bin/hlc re-derived C that differs from snapshot/hlc.c —"; echo "  the snapshot is stale (src/hlc/** moved without a regen) or hand-edited."; echo "  Run 'make snapshot-regen' and commit snapshot/hlc.c + snapshot/MANIFEST.json together,"; echo "  or cross-check through the Python seed with 'make bootstrap-seed'."; rm -f $(BIN)/hlc_regen.c; exit 1; }
+	@cmp $(SNAP) $(BIN)/hlc_regen.c || { echo "BOOTSTRAP FAILED: bin/hlc re-derived C that differs from snapshot/hlc.c —"; echo "  the snapshot is stale (src/hlc/** moved without a regen) or hand-edited."; echo "  Run 'make snapshot-regen' and commit snapshot/hlc.c + snapshot/MANIFEST.json together,"; echo "  and cross-check the lineage with 'make snapshot-prove' (freestanding) and 'make snapshot-chain'."; rm -f $(BIN)/hlc_regen.c; exit 1; }
 	@rm -f $(BIN)/hlc_regen.c
 	@echo "BOOTSTRAP OK: pure-HLS fixed point holds (no Python in the chain)"
-	@echo "Native compiler: $(BIN)/hlc"
-
-# The Stage-142 maintenance path: the ORIGINAL Python-seeded ladder,
-# verbatim. The interpreter derives the first pass, gcc makes it
-# native, and the native compiler must agree byte for byte. This is
-# how a maintainer cross-checks a snapshot the pure chain refuses —
-# and the lineage `make snapshot-prove` pins to the snapshot.
-bootstrap-seed:
-	@mkdir -p $(BIN)
-	@echo "[1/4] Stage-0: hlc.hls self-compiles..."
-	@$(PYTHON) boot/boot.py $(HLC) $(HLC) $(BIN)/hlc.c
-	@echo "[2/4] gcc: compiling native hlc..."
-	@$(CC) $(CFLAGS) -o $(BIN)/hlc $(BIN)/hlc.c -lm -pthread
-	@echo "[3/4] native hlc re-compiles itself..."
-	@$(BIN)/hlc $(HLC) $(BIN)/hlc2.c
-	@echo "[4/4] Comparing two passes of code generation..."
-	@diff $(BIN)/hlc.c $(BIN)/hlc2.c && echo "SEED BOOTSTRAP OK: the interpreter and the native compiler agree byte for byte"
-	@rm -f $(BIN)/hlc2.c
 	@echo "Native compiler: $(BIN)/hlc"
 
 # Stage 143 (v0.162.0-alpha): the snapshot kit, in Halis; the chain
@@ -89,10 +67,9 @@ bootstrap-seed:
 # compiles tools/hls-snap.hls, cc links bin/hls-snap — no Python
 # anywhere on the lifecycle. The five commands below are the ONLY
 # legal way to touch snapshot/hlc.c (four to mutate it, one to prove
-# the chain it travels) — never edit it by hand. The kit's scratch files (bin/hls-snap-*)
-# live in the build directory and are wiped by `make clean`; direct
-# invocation for the oracle flags: `bin/hls-snap regen --seed`,
-# `bin/hls-snap prove --seed`.
+# the chain it travels) — never edit it by hand. The kit's scratch
+# files (bin/hls-snap-*) live in the build directory and are wiped by
+# `make clean`.
 # The wiring is deliberately BOOTSTRAP-FREE: regen and status must
 # stay runnable on a drifted tree (where `make bootstrap` fails by
 # design — that failure IS the fixed-point law naming the drift),
@@ -178,9 +155,13 @@ run:
 	@mkdir -p $(BIN)
 	@$(BIN)/hlc $(F) $(BIN)/hls_out.c && $(CC) $(CFLAGS) $(HL_CURL_DEFS) -o $(BIN)/hls_out $(BIN)/hls_out.c -lm -pthread $(LIBCURL_LIBS) && $(BIN)/hls_out
 
-# Only check types + effects (no execution)
+# Only check types + effects (no execution). Self-hosted since
+# v0.164.0-alpha: checking IS the compile pipeline's front half,
+# so the native compiler does it and the C file is a byproduct.
 check:
-	$(PYTHON) boot/boot.py --check $(F)
+	@test -x $(BIN)/hlc || $(MAKE) bootstrap
+	@mkdir -p $(BIN)
+	@$(BIN)/hlc $(F) $(BIN)/hls_check.c
 
 # Full test suite
 test:
@@ -191,20 +172,27 @@ bench:
 	@bash benchmarks/run_bench.sh
 
 # Print the capability / effect tree of every function in a program
+# (self-hosted: hlc --audit)
 audit:
-	@$(PYTHON) boot/boot.py --audit $(F)
+	@test -x $(BIN)/hlc || $(MAKE) bootstrap
+	@$(BIN)/hlc --audit $(F)
 
-# Stage 11 (v0.9.0-alpha): print the HLIR of a program
+# Stage 11 (v0.9.0-alpha): print the HLIR of a program. Lab
+# tooling: the interpreter's printer, off every build path.
 emit-ir:
-	@$(PYTHON) boot/boot.py --emit ir $(F)
+	@$(PYTHON) tools/hlinterp/boot.py --emit ir $(F)
 
-# Stage 12 (v0.10.0-alpha): print the LLVM IR of a program
+# Stage 12 (v0.10.0-alpha): print the LLVM IR of a program. Lab
+# tooling: the interpreter's printer, off every build path.
 emit-llvm:
-	@$(PYTHON) boot/boot.py --emit llvm $(F)
+	@$(PYTHON) tools/hlinterp/boot.py --emit llvm $(F)
 
 # Stage 11: run the optimiser and print per-pass statistics
+# (self-hosted: hlc --opt-stats)
 opt-stats:
-	@$(PYTHON) boot/boot.py --opt-stats $(F)
+	@test -x $(BIN)/hlc || $(MAKE) bootstrap
+	@mkdir -p $(BIN)
+	@$(BIN)/hlc --opt-stats $(F) $(BIN)/hls_stats.c
 
 # Stage 14 (v0.12.0-alpha): opinionated formatter
 fmt:
@@ -634,7 +622,7 @@ memdash-acceptance: bin/hlc
 # Stage 138 (v0.156.0-alpha): the compile-time regression dashboard.
 # The instrument is the compiler itself, and Halis ships two of
 # them, so they are two instruments, never compared: stage0 (the
-# bootstrap chain — boot/boot.py running src/hlc.hls) and native
+# bootstrap chain — tools/hlinterp/boot.py running src/hlc.hls) and native
 # (bin/hlc, the self-hosted compiler). Both time the same quantity —
 # one full HLS-to-C compile of every workload of the tracked suite
 # (benchmarks/ctime_watch/ — five deterministic, compile-shaped
