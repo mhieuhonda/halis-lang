@@ -92,7 +92,7 @@ Seven core guarantees of v0.35.0-alpha:
   bin/hlc  ── compiles ──►  tools/hls-snap.hls  ── cc ──►  bin/hls-snap
   (the snapshot's own              (the kit — Stage 143)         │
    compiler)                                                   ▼
-                                              status · verify · regen · prove
+                                              status · verify · regen · prove · chain
 
   (the Python seed, boot/, is off both paths: it stays as the optional
    oracle that cross-derives the snapshot — `bin/hls-snap prove
@@ -111,20 +111,29 @@ every time it runs: the compiler built from the snapshot must
 re-derive the snapshot byte for byte. A stale or hand-edited snapshot
 fails the build loudly (`make snapshot-regen` is the only legal
 mutation, and it moves the snapshot and its manifest together).
-From Stage 5 onwards, the language grows in itself — and since
-Stage 143, the toolchain that guards that growth is written in it
-too.
+Since v0.163.0-alpha the chain is also **reproducible on demand**:
+`make snapshot-chain` re-runs the whole bootstrap as two independent
+ignitions, byte-compares every hop (each round against the snapshot,
+round against round), and prints the chain digest — the one number
+two machines, two checkouts and two compilers must agree on
+(`CC2=clang` proves a different cc in slot one lands on the same
+bytes; the drifted tree is refused by name). From Stage 5 onwards,
+the language grows in itself — since Stage 143 the toolchain that
+guards that growth is written in it too, and the chain it grows on
+is bit-for-bit reproducible.
 
 ## Quick start
 
 Requirements: gcc or clang. That is the whole list — the bootstrap is
-pure HLS since Stage 142 (v0.161.0-alpha), and since Stage 143
-(v0.162.0-alpha) the whole snapshot lifecycle is too: the kit that
-classifies, verifies, regenerates and proves the snapshot
-(`tools/hls-snap.hls`) is written in Halis and compiled by `bin/hlc`
-itself. Python 3.8+ is OPTIONAL: only for the Stage-0 interpreter
-(`make stage0`), the differential suites, and the seed oracle
-(`bin/hls-snap prove --seed`) when new syntax needs bootstrapping
+pure HLS since Stage 142 (v0.161.0-alpha), since Stage 143
+(v0.162.0-alpha) the whole snapshot lifecycle is too (the kit that
+classifies, verifies, regenerates and proves the snapshot,
+`tools/hls-snap.hls`, is written in Halis and compiled by `bin/hlc`
+itself), and since v0.163.0-alpha the chain is bit-for-bit
+reproducible on demand (`make snapshot-chain`, two independent
+ignitions, one digest). Python 3.8+ is OPTIONAL: only for the Stage-0
+interpreter (`make stage0`), the differential suites, and the seed
+oracle (`bin/hls-snap prove --seed`) when new syntax needs bootstrapping
 through the interpreter.
 
 ```bash

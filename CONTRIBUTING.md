@@ -66,9 +66,12 @@ will both refuse a hand edit, naming the rule that fired.
   freestanding lineage (the no-libc compiler deriving the same
   bytes); `bin/hls-snap prove --seed` adds the Python oracle's
   lineage; `make bootstrap-seed` runs the historic four-step
-  ladder. Since Stage 143 the kit itself is Halis —
-  `tools/hls-snap.hls`, compiled by `bin/hlc` — so none of these
-  steps needs Python unless you invoke the seed.
+  ladder. `make snapshot-chain` re-runs the whole bootstrap as two
+  independent ignitions and byte-compares every hop — run it before
+  tagging a release (`CC2=clang` for the cross-compiler form). Since
+  Stage 143 the kit itself is Halis — `tools/hls-snap.hls`, compiled
+  by `bin/hlc` — so none of these steps needs Python unless you
+  invoke the seed.
 
 ### Branch protection (enforced on `main`)
 
@@ -107,9 +110,10 @@ you are the owner.
 4. **Run the full test suite**:
    ```bash
    make test
-   make bootstrap    # confirms the pure-HLS fixed point
+   make bootstrap        # confirms the pure-HLS fixed point
+   make snapshot-chain   # the chain, twice over, byte for byte
    ```
-   Both must succeed before you push. If you touched the compiler
+   All must succeed before you push. If you touched the compiler
    sources, also run `make snapshot-regen` (see the snapshot rules
    above) and commit the moved snapshot with your change.
 5. **Commit with a clear message** (see "Commit messages" below).

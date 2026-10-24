@@ -83,12 +83,13 @@ bootstrap-seed:
 	@rm -f $(BIN)/hlc2.c
 	@echo "Native compiler: $(BIN)/hlc"
 
-# Stage 143 (v0.162.0-alpha): the snapshot kit, in Halis. The tool
-# that guards the bootstrap is itself built by it: hlc (compiled from
-# the committed snapshot) compiles tools/hls-snap.hls, cc links
-# bin/hls-snap — no Python anywhere on the lifecycle. The four
-# commands below are the ONLY legal way to mutate snapshot/hlc.c —
-# never edit it by hand. The kit's scratch files (bin/hls-snap-*)
+# Stage 143 (v0.162.0-alpha): the snapshot kit, in Halis; the chain
+# law joined in v0.163.0-alpha. The tool that guards the bootstrap is
+# itself built by it: hlc (compiled from the committed snapshot)
+# compiles tools/hls-snap.hls, cc links bin/hls-snap — no Python
+# anywhere on the lifecycle. The five commands below are the ONLY
+# legal way to touch snapshot/hlc.c (four to mutate it, one to prove
+# the chain it travels) — never edit it by hand. The kit's scratch files (bin/hls-snap-*)
 # live in the build directory and are wiped by `make clean`; direct
 # invocation for the oracle flags: `bin/hls-snap regen --seed`,
 # `bin/hls-snap prove --seed`.

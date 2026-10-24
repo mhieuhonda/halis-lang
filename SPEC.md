@@ -10092,16 +10092,20 @@ ladder (`make bootstrap-seed`) — but nothing on the default build
 path reads it. A fresh clone plus any C compiler is the whole
 requirement list.
 
-Stage 143 (v0.162.0-alpha) closes the loop the bootstrap opened:
+Stage 143 (v0.162.0-alpha) closed the loop the bootstrap opened:
 the snapshot kit itself — the tool that classifies the tree,
 digests the closure, regenerates the snapshot and proves the
-lineages — is written in Halis (`tools/hls-snap.hls`). `bin/hlc`,
+lineages — was written in Halis (`tools/hls-snap.hls`). `bin/hlc`,
 built from the committed snapshot, compiles it; `cc` links
 `bin/hls-snap`; the make targets `snapshot-status` /
 `snapshot-verify` / `snapshot-regen` / `snapshot-prove` drive it.
 Every digest the manifest carries is computed by `std.sha256`, a
 pure-HLS FIPS 180-4 implementation — the language certifies
-itself with its own digest.
+itself with its own digest. That was the enabling precondition.
+v0.163.0-alpha corrected the record — the roadmap line had named
+the kit as the stage — and delivered the stage's own promise:
+the bit-for-bit reproducible bootstrap chain, §81.7 below, and
+its command `make snapshot-chain`.
 
 ### 81.1. The fixed-point law
 
@@ -10205,8 +10209,8 @@ Python oracle) and the full acceptance gate.
 
 ### 81.6. Acceptance
 
-`make purebootstrap-acceptance` — since Stage 143, 8 sections,
-32 checks: the no-python law (bootstrap AND the snapshot
+`make purebootstrap-acceptance` — since v0.163.0-alpha, 9 sections,
+37 checks: the no-python law (bootstrap AND the snapshot
 lifecycle green under a PATH that provably cannot resolve
 python3 or python, on a tree copy that does not even carry
 `boot/`); the fixed-point law (tampered snapshot and
@@ -10219,19 +10223,51 @@ snapshot byte for byte); the manifest law (digest disagreement
 and hand edits named TAMPERED, missing snapshot named
 NO-SNAPSHOT); the independence smoke (the purely-bootstrapped
 compiler compiles and runs fibonacci with
-interpreter-identical output); and the provenance law (the gate
+interpreter-identical output); the provenance law (the gate
 re-derives the closure with its own walker and demands it equal
 the manifest's, the version pins the CHANGELOG head, the rounds
 are sane, no absolute path leaks into the snapshot text — the
-same C from any checkout directory). The corpus fixture
-`tests/ok/feat_stage142_snapshot.hls` pins the decision procedure
-in pure HLS: the purity of the build chain, the closure walk, the
-canonical digest, the semantic-not-textual emitter, one-round
-convergence, the four-state classification, the no-op refusal
-with commit-both, and the two-lineage agreement — hlfmt-canonical,
-hllint-clean, byte-identical on the interpreter and natively.
+same C from any checkout directory); the self-host law (the
+kit's own build is pure and its emitted C carries no absolute
+path); and the chain law (§81.7: the command green on the real
+tree, two checkouts at different paths landing on one emission
+and one digest, the hostile-environment chain, the CC2 form, the
+drifted-tree refusal). The corpus fixtures
+`tests/ok/feat_stage142_snapshot.hls` and
+`tests/ok/feat_stage143_chain.hls` pin the two decision
+procedures in pure HLS — hlfmt-canonical, hllint-clean,
+byte-identical on the interpreter and natively; the chain
+fixture digests with the REAL `std.sha256`, and its path law
+carries the falsifiable negative (a leaky emitter that pasted
+the checkout path WOULD be caught).
 
-Stage 143 (the bit-for-bit reproducible bootstrap chain) builds
-directly on this anchor: a deterministic emitter, a
-content-addressed snapshot, a manifest that names the exact
-closure, and a fixed-point law that runs on every build.
+### 81.7. The chain law — the bit-for-bit reproducible bootstrap chain
+
+`make snapshot-chain` (Stage 143's own promise, v0.163.0-alpha)
+re-runs the whole bootstrap as TWO independent ignitions and
+byte-compares every hop. Each round: cc compiles the committed
+snapshot into a fresh native hlc; that hlc re-emits
+`src/hlc.hls`; the emission must equal the snapshot (the
+fixed-point law, which `make bootstrap` proves once) AND the
+previous round's emission (the repeatability the fixed point
+alone does not name: a chain self-consistent once is
+deterministic; a chain self-consistent twice, from two
+separately-built compilers, is reproducible). `CC2=clang` puts
+a different C compiler in round two's slot — the chain's
+tracked artifact is what the HLS compiler emits, not what cc
+links, so any conforming cc in slot one must land on the same
+bytes. The command closes with the CHAIN DIGEST — sha256 over
+the snapshot and every round's emission, in round order — the
+one number two machines, two checkouts and two compilers must
+agree on. The acceptance gate proves the digest does not move
+under two checkouts at different filesystem paths, nor under a
+hostile environment (TZ / LANG / LC_ALL / SOURCE_DATE_EPOCH
+poisoned, python-free PATH). Like `prove`, `chain` refuses a
+drifted tree: a chain run from a tree the manifest does not
+describe is not a proof, it is a coincidence.
+
+The anchor Stage 143 builds on is exactly this: a deterministic
+emitter, a content-addressed snapshot, a manifest that names
+the exact closure, and a fixed-point law that runs on every
+build — the chain law turns those ingredients into a number
+any two machines can agree on.

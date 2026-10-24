@@ -13,6 +13,72 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.163.0-alpha] — Stage 143: the bit-for-bit reproducible bootstrap chain (the record corrected)
+- The roadmap line for Stage 143 named the wrong promise. v0.162.0-alpha
+  shipped the snapshot kit written in Halis — the enabling precondition,
+  and it keeps its changelog entry — but the stage's own acceptance
+  was never the kit: SPEC.md §81 already closed on "Stage 143 (the
+  bit-for-bit reproducible bootstrap chain) builds directly on this
+  anchor", while the roadmap said "self-hosted toolchain". The record
+  is corrected here, and the promise itself is delivered: **the
+  bootstrap chain is bit-for-bit reproducible, and the tree proves it
+  on demand.**
+- **`bin/hls-snap chain` — the chain law, in the kit.** Two rounds,
+  each one a full, independent ignition: cc compiles the committed
+  snapshot into a fresh native hlc, that hlc re-emits `src/hlc.hls`,
+  and the emission must equal the snapshot byte for byte (the
+  fixed-point law, the same law `make bootstrap` proves once) AND the
+  previous round's emission byte for byte (the repeatability the
+  fixed point alone does not name: a chain self-consistent once is
+  deterministic; a chain self-consistent TWICE, from two
+  separately-built compilers, is reproducible). With `--cc2` the
+  second round builds through a second C compiler — the chain's
+  tracked artifact is what the HLS compiler emits, not what cc links,
+  so any conforming cc in slot one must land on the same bytes.
+  `make snapshot-chain` drives it (`CC2=clang` for the cross-compiler
+  form); like `prove`, it refuses a drifted tree — a chain run from a
+  tree the manifest does not describe is not a proof.
+- **What "bit for bit" means here, precisely.** The artifact the
+  chain tracks is `snapshot/hlc.c` — the C the HLS compiler emits —
+  not the binary cc links (build IDs and link timestamps are cc's
+  business, and the tree commits none of them). The command closes
+  with the CHAIN DIGEST, sha256 over the snapshot and every round's
+  emission: the one number two machines, two checkouts and two
+  compilers must agree on.
+- **The acceptance gate grew a ninth section** — 9 sections, 37
+  checks. The chain law runs the kit's command on the real tree, then
+  two full chains from two checkouts at different filesystem paths
+  (the round-1 emissions cmp'd, the digests matched against each
+  other and the manifest), the same chain again under a hostile
+  environment (TZ / LANG / LC_ALL / SOURCE_DATE_EPOCH poisoned, HOME
+  pointed nowhere, on the python-free PATH — the digest does not
+  move), the `CC2` cross-compiler form (clang where the machine has
+  it, cc otherwise; the truly-different compiler is CI's grid), and
+  the drifted-tree refusal with the law named.
+- **`tests/ok/feat_stage143_chain.hls`** pins the decision procedure
+  in pure HLS with REAL `std.sha256` — the module the manifest is
+  content-addressed by: the every-hop law (fixed point inside the
+  chain, round equal to round), the path law (two checkouts, same
+  bytes — with the falsifiable negative: a leaky emitter that pasted
+  the checkout path IS caught), the env law, the cc law, the digest
+  law (deterministic, byte-sensitive, over the whole chain and not
+  any single hop), and the refusal law — hlfmt-canonical,
+  hllint-clean, byte-identical on the interpreter and natively.
+- **CI: the bootstrap job ends with the chain proof.** `make
+  snapshot-chain` runs after the no-python proof; the job stays
+  Python-free end to end, and the chain it proves is the release
+  artifact's own lineage.
+- **The record itself.** ROADMAP Stage 143 is re-titled "Bit-for-bit
+  reproducible bootstrap chain"; the RC1 line drops its chain
+  parenthetical — RC1 inherits the chain, it does not build it. En
+  passant: the VS Code extension manifest moves to 0.163.0-alpha (the
+  v0.162 release forgot its bump and shipped 0.161.0-alpha).
+- **The snapshot did not move.** The chain command is a new leaf in
+  the kit, outside the compiler's import closure — `snapshot/hlc.c`
+  is byte-identical and the manifest carries a version-only refresh
+  (the documented release-heading trigger, performed by the kit
+  itself).
+
 ## [v0.162.0-alpha] — Stage 143: the snapshot kit in Halis (the toolchain guards itself)
 - Phase X's third promise: the language whose compiler is written in
   itself no longer borrows another language to prove it. Stage 142
