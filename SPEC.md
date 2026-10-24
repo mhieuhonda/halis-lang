@@ -10087,10 +10087,21 @@ source (37,111 lines, 2,576,679 bytes at the v0.161.0-alpha cut)
 No Python anywhere in the chain. `boot/` is demoted from ignition
 to oracle: the interpreter still drives the differential suites,
 still re-derives the snapshot when the language grows new syntax
-(`make snapshot-regen --seed`), and still walks the maintenance
+(`bin/hls-snap regen --seed`), and still walks the maintenance
 ladder (`make bootstrap-seed`) — but nothing on the default build
 path reads it. A fresh clone plus any C compiler is the whole
 requirement list.
+
+Stage 143 (v0.162.0-alpha) closes the loop the bootstrap opened:
+the snapshot kit itself — the tool that classifies the tree,
+digests the closure, regenerates the snapshot and proves the
+lineages — is written in Halis (`tools/hls-snap.hls`). `bin/hlc`,
+built from the committed snapshot, compiles it; `cc` links
+`bin/hls-snap`; the make targets `snapshot-status` /
+`snapshot-verify` / `snapshot-regen` / `snapshot-prove` drive it.
+Every digest the manifest carries is computed by `std.sha256`, a
+pure-HLS FIPS 180-4 implementation — the language certifies
+itself with its own digest.
 
 ### 81.1. The fixed-point law
 
@@ -10115,15 +10126,19 @@ moved statement.
 
 ### 81.2. The seed as the second lineage
 
-`boot/` is not deleted; it is an oracle now. `make snapshot-prove`
-requires that the Python interpreter derive the SAME bytes the
-snapshot carries — the committed C is thus the child of the HLS
-sources through two independent lineages: the interpreter reading
-the sources, and the compiled snapshot reading them. A snapshot
-neither lineage can reproduce is a snapshot nobody wrote. Prove
-refuses to run from a drifted tree: a proof that the seed matches
-a snapshot the manifest no longer describes is not a proof, it is
-a coincidence.
+`boot/` is not deleted; it is an oracle now. Since Stage 143 the
+default `make snapshot-prove` is the FREESTANDING lineage: the
+hosted compiler (built from the snapshot) emits its own source
+against the no-libc runtime, cc links it `-ffreestanding
+-nostdlib`, and that compiler must derive the SAME bytes the
+snapshot carries — two chains over one source, no interpreter in
+either. `bin/hls-snap prove --seed` invokes the stronger oracle
+lineage, the Python interpreter deriving the same bytes — run it
+while `boot/` is in the tree; the nightly runs both. A snapshot
+no lineage can reproduce is a snapshot nobody wrote. Prove
+refuses to run from a drifted tree: a proof that a lineage
+matches a snapshot the manifest no longer describes is not a
+proof, it is a coincidence.
 
 The old four-step ladder survives verbatim as
 `make bootstrap-seed` — interpreter pass, native compile, native
@@ -10184,15 +10199,17 @@ the macOS and Windows smokes and all six release builds compile
 the committed snapshot directly — no interpreter, no
 previous-release fetch, no network — and judge the fixed-point
 diff against the tree's own `snapshot/hlc.c`, never a cache
-artifact. The nightly deep battery runs `make snapshot-prove` and
-the full acceptance gate.
+artifact. The nightly deep battery runs `make snapshot-prove`
+(the freestanding lineage) plus `bin/hls-snap prove --seed` (the
+Python oracle) and the full acceptance gate.
 
 ### 81.6. Acceptance
 
-`make purebootstrap-acceptance` — 7 sections, 24 checks: the
-no-python law (bootstrap green under a PATH that provably cannot
-resolve python3 or python, on a tree copy that does not even
-carry `boot/`); the fixed-point law (tampered snapshot and
+`make purebootstrap-acceptance` — since Stage 143, 8 sections,
+32 checks: the no-python law (bootstrap AND the snapshot
+lifecycle green under a PATH that provably cannot resolve
+python3 or python, on a tree copy that does not even carry
+`boot/`); the fixed-point law (tampered snapshot and
 semantic drift both fail the build with the named refusal, a
 comment-only change does not — and the manifest names it); the
 regen law (drift re-derived at the fixed point, no-op refused,

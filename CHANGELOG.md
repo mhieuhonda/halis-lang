@@ -13,6 +13,90 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.162.0-alpha] — Stage 143: the snapshot kit in Halis (the toolchain guards itself)
+- Phase X's third promise: the language whose compiler is written in
+  itself no longer borrows another language to prove it. Stage 142
+  moved the ignition — the committed C snapshot is the seed, `make
+  bootstrap` is cc, hlc, cmp — but the kit that GUARDED that law
+  stayed Python: `tools/hls-snap.py` classified the tree, digested
+  the closure, regenerated the snapshot and proved the lineages,
+  660 lines of another language on the one path that certifies this
+  one. This stage closes the loop. **`tools/hls-snap.hls` is the
+  kit, written in Halis** — `bin/hlc` (built from the snapshot)
+  compiles it, `cc` links `bin/hls-snap`, and `make
+  snapshot-status | snapshot-verify | snapshot-regen |
+  snapshot-prove` drive it. The four commands, their laws, their
+  refusals and their exit codes are the Stage-142 contract
+  verbatim; only the language of the tool that enforces them
+  moved. The make wiring is deliberately **bootstrap-free** (a
+  missing `bin/hlc` is filled by one bare cc on the snapshot):
+  `regen` and `status` must stay runnable on a drifted tree, where
+  `make bootstrap` fails by design — that failure IS the
+  fixed-point law naming the drift, and a make-level refusal
+  before the kit runs would hide the tool's own named laws.
+- **std.sha256 — the digest the language certifies itself by.**
+  The manifest is content-addressed by SHA-256, and a kit written
+  in Halis must compute that digest in Halis. The new module is a
+  pure-HLS FIPS 180-4 implementation in the std.sha1 house shape —
+  the same Merkle-Damgård discipline, the same 32-bit-carrying
+  conventions, zero new compiler builtins — pinned by
+  `tests/ok/feat_sha256.hls` against the published vectors (empty,
+  "abc", the 448-bit and 896-bit messages) plus a 100,000-byte
+  long message cross-checked against an independent implementation,
+  on the interpreter AND natively, with byte-identical output.
+  A one-megabyte digest takes ~46 ms native; the interpreter needs
+  the shorter long-vector, and the fixture says so.
+- **prove, redefined for the pure world.** The old agreement law
+  needed the Python seed by construction: lineage two WAS the
+  interpreter. The kit's default `prove` is now the **freestanding
+  lineage** — the hosted compiler (built from the snapshot) emits
+  its own source against the no-libc runtime, cc links it
+  `-ffreestanding -nostdlib`, and that compiler must re-derive the
+  committed snapshot byte for byte. Two chains, one source, no
+  interpreter anywhere in either. The Python oracle survives as
+  `bin/hls-snap prove --seed` — the strongest form of the second
+  lineage, run when boot/ is present — and the nightly runs both.
+- **The acceptance gate grew a section.** `make
+  purebootstrap-acceptance` is now 8 sections, 32 checks: the
+  no-python law proves the WHOLE lifecycle (bootstrap + status +
+  verify --deep) under a PATH that cannot resolve python3 or
+  python, on a tree copy that does not carry boot/; the
+  self-host law (new) pins that the bootstrapped compiler compiles
+  the kit, that the emitted C carries no absolute path, and that
+  the kit's default path names no interpreter; the interchange
+  law (new) regens a manifest on a disposable tree and recomputes
+  the canonical closure digest — the Halis kit's output is
+  byte-for-byte the rendering the Python kit wrote (sorted keys,
+  two-space indent, ASCII escapes), so the git history's
+  manifests stay diff-able across the kit boundary.
+- **CI: the self-hosting gate is demonstrated, not asserted.** The
+  bootstrap job carries no setup-python at all, builds the kit,
+  verifies the manifest through it, and then re-runs the whole
+  lifecycle under a stripped PATH where `command -v python3` is
+  allowed to fail loudly. The Python that remains in CI is lab
+  tooling and oracle battery, named as such: the linters in the
+  lint job, the interpreter matrix over boot/, the differential
+  suites. The artifact path and the snapshot lifecycle require
+  none of it. Tag pushes now run the full battery for ANY `v*`
+  tag, not just `-alpha`.
+- **CD: the tag's shape picks the channel.** release.yml now
+  triggers on every version tag and applies one law, once: a
+  hyphen after the version is a pre-release identifier — `-alpha`,
+  `-beta`, `-rc.1`, `-nightly`, whatever word it carries — and any
+  suffixed tag publishes a PRE-RELEASE; a bare `v0.162.0` has no
+  suffix and publishes the STABLE release, marked latest. The
+  channel detection is a single case statement in the release
+  job, its outputs drive `prerelease` and `make_latest`
+  explicitly, and the release body names the channel it shipped
+  on. (Also fixed en passant: the release body still claimed the
+  binaries were "built by the Stage-0 Python bootstrap" — it has
+  not been true since v0.161.0-alpha.)
+- **The snapshot did not move.** Nothing in the compiler's import
+  closure changed this stage — the kit and std.sha256 are new
+  leaves outside it — so `snapshot/hlc.c` is byte-identical and
+  the manifest carries a version-only refresh (plus the
+  provenance line that now names the freestanding lineage).
+
 ## [v0.161.0-alpha] — Stage 142: pure-HLS bootstrap (the Python seed leaves the build)
 - Phase X's second promise: the language whose compiler is written in
   itself no longer needs a different language to turn itself on.

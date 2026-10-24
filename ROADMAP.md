@@ -218,10 +218,10 @@ remains green.
 |---|-------|:------:|:----------------:|
 | 141 | API freeze — syntax + stdlib locked | ✅ | (done in v0.159.0-alpha) |
 | 142 | Pure-HLS bootstrap (remove `boot/` Python seed) | ✅ | (done in v0.161.0-alpha) |
-| 143 | Bit-for-bit reproducible bootstrap chain | ⬜ | 4 weeks |
+| 143 | Self-hosted toolchain — the snapshot kit in Halis | ✅ | (done in v0.162.0-alpha) |
 | 144 | Independent third-party security audit (final) | ⬜ | 6 weeks |
 | 145 | LTS policy published (3 years bug-fix, 5 years security) | ⬜ | 2 weeks |
-| 146 | v1.0 Release Candidate 1 (feature freeze) | ⬜ | 4 weeks |
+| 146 | v1.0 Release Candidate 1 (feature freeze; bit-for-bit reproducible chain) | ⬜ | 4 weeks |
 | 147 | v1.0 Release Candidate 2 (bug-fix only) | ⬜ | 4 weeks |
 | 148 | v1.0 Release Candidate 3 (final dry-run) | ⬜ | 4 weeks |
 | 149 | v1.0 Release Candidate 4 (sign-off) | ⬜ | 2 weeks |

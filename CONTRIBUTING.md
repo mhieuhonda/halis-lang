@@ -62,9 +62,13 @@ will both refuse a hand edit, naming the rule that fired.
   `make snapshot-regen` and commit `snapshot/hlc.c` +
   `snapshot/MANIFEST.json` TOGETHER with your change** (or neither).
   A comment-only edit regenerates the manifest only; a semantic edit
-  re-derives the C at the fixed point. `make snapshot-prove` shows the
-  Python seed deriving the same bytes; `make bootstrap-seed` runs the
-  historic four-step ladder.
+  re-derives the C at the fixed point. `make snapshot-prove` runs the
+  freestanding lineage (the no-libc compiler deriving the same
+  bytes); `bin/hls-snap prove --seed` adds the Python oracle's
+  lineage; `make bootstrap-seed` runs the historic four-step
+  ladder. Since Stage 143 the kit itself is Halis —
+  `tools/hls-snap.hls`, compiled by `bin/hlc` — so none of these
+  steps needs Python unless you invoke the seed.
 
 ### Branch protection (enforced on `main`)
 

@@ -85,32 +85,47 @@ Seven core guarantees of v0.35.0-alpha:
   snapshot/hlc.c  ── cc -O2 ──►  bin/hlc (native)  ── compiles ──►  src/hlc.hls
   (the compiler's      │                                            │
    own emission,        │            │                                │
-   COMMITTED in the     │            ▼                                │
-   tree — Stage 142)    └──── hlc_regen.c ─── cmp snapshot = 0 bytes ──┘
+   COMMITTED in the     │            ▼                                ▼
+   tree — Stage 142)    └── hlc_regen.c ──── cmp snapshot = 0 bytes ──┘
                               (the fixed-point law, every build)
 
-  (the Python seed, boot/, is off this path: it stays as the oracle
-   that re-derives the snapshot — make snapshot-prove — and as the
-   maintenance ladder — make bootstrap-seed)
+  bin/hlc  ── compiles ──►  tools/hls-snap.hls  ── cc ──►  bin/hls-snap
+  (the snapshot's own              (the kit — Stage 143)         │
+   compiler)                                                   ▼
+                                              status · verify · regen · prove
+
+  (the Python seed, boot/, is off both paths: it stays as the optional
+   oracle that cross-derives the snapshot — `bin/hls-snap prove
+   --seed` — and as the maintenance ladder — make bootstrap-seed.
+   Since Stage 143 the snapshot lifecycle itself is guarded by the
+   kit written in Halis: even `make snapshot-regen` needs no Python
+   unless the language grew syntax the current compiler can't read)
 ```
 
-`make bootstrap` performs the chain above — **no Python anywhere in
-it**: the seed is the committed C snapshot, the compiler's own
-emission for `src/hlc.hls`, content-addressed by
-`snapshot/MANIFEST.json`. The build proves the **fixed-point law**
+`make bootstrap` performs the fixed-point chain above — **no Python
+anywhere in it**: the seed is the committed C snapshot, the compiler's
+own emission for `src/hlc.hls`, content-addressed by
+`snapshot/MANIFEST.json` (every digest in that manifest computed by
+`std.sha256`, in Halis). The build proves the **fixed-point law**
 every time it runs: the compiler built from the snapshot must
 re-derive the snapshot byte for byte. A stale or hand-edited snapshot
 fails the build loudly (`make snapshot-regen` is the only legal
-mutation, and it moves the snapshot and its manifest together). From
-Stage 5 onwards, the language grows in itself.
+mutation, and it moves the snapshot and its manifest together).
+From Stage 5 onwards, the language grows in itself — and since
+Stage 143, the toolchain that guards that growth is written in it
+too.
 
 ## Quick start
 
 Requirements: gcc or clang. That is the whole list — the bootstrap is
-pure HLS since Stage 142 (v0.161.0-alpha). Python 3.8+ is OPTIONAL:
-only for the Stage-0 interpreter (`make stage0`), the differential
-suites, and re-deriving the snapshot when the language grows new
-syntax.
+pure HLS since Stage 142 (v0.161.0-alpha), and since Stage 143
+(v0.162.0-alpha) the whole snapshot lifecycle is too: the kit that
+classifies, verifies, regenerates and proves the snapshot
+(`tools/hls-snap.hls`) is written in Halis and compiled by `bin/hlc`
+itself. Python 3.8+ is OPTIONAL: only for the Stage-0 interpreter
+(`make stage0`), the differential suites, and the seed oracle
+(`bin/hls-snap prove --seed`) when new syntax needs bootstrapping
+through the interpreter.
 
 ```bash
 # 1. Run directly via Stage-0 (interpreted — needs Python)
