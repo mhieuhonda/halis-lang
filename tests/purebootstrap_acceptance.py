@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Stage 143 acceptance gate — the snapshot kit in Halis: the
-toolchain guards itself.
+"""Stage 143 acceptance gate — the bit-for-bit reproducible bootstrap
+chain (the record corrected in v0.163.0-alpha).
 
 Run with `make purebootstrap-acceptance` (or
 `python3 tests/purebootstrap_acceptance.py`).
 
-Eight sections:
+Nine sections:
 
   1. the no-python law    — `make bootstrap`, `make snapshot-status`
                             AND `make snapshot-verify --deep` succeed
@@ -62,6 +62,19 @@ Eight sections:
                             an interpreter on its default path (the
                             only interpreter mention is the --seed
                             fallback it refuses with)
+  9. the chain law      — Stage 143's own promise: `make
+                            snapshot-chain` re-runs the whole bootstrap
+                            as TWO independent ignitions and byte-
+                            compares every hop (each round's emission
+                            equals the snapshot AND the previous
+                            round's); two checkouts at different
+                            filesystem paths land on the same emission
+                            and the same chain digest; a hostile
+                            environment (TZ / LANG / LC_ALL /
+                            SOURCE_DATE_EPOCH poisoned, python-free
+                            PATH) does not move it; the cross-compiler
+                            form (CC2) lands on the same digest; and
+                            chain, like prove, refuses a drifted tree
 """
 import hashlib
 import json
@@ -536,6 +549,93 @@ if re.search(r"python[0-9]?\s+boot/boot\.py", kit_src):
 else:
     ok("the kit's default path names no interpreter (the seed is the "
        "named --seed fallback, nothing more)")
+
+# ---------------------------------------------------------------------------
+print("=== 9. the chain law (bit for bit, twice over) ===")
+# ---------------------------------------------------------------------------
+CHAIN_DIGEST_RE = re.compile(r"chain digest: ([0-9a-f]{16})\.\.\.")
+
+def chain_digest_of(text):
+    m = CHAIN_DIGEST_RE.search(text)
+    return m.group(1) if m else None
+
+# 9a. The kit's own chain command on the REAL tree: two independent
+#     ignitions, every hop byte-compared, one digest.
+r = snap(ROOT, "chain")
+if (r.returncode == 0 and "CHAIN PROVEN" in r.stdout
+        and "2 rounds, byte for byte identical" in r.stdout
+        and chain_digest_of(r.stdout) is not None):
+    ok("make snapshot-chain: two independent ignitions, every hop "
+       "byte-compared, one chain digest")
+else:
+    bad("the chain command failed: %s" % (r.stdout + r.stderr)[:400])
+root_digest = chain_digest_of(r.stdout)
+
+# 9b. Path independence: two full chains from two checkouts at
+#     different filesystem paths. The emissions — not the binaries;
+#     cc is free to link differently — must be byte-identical, and
+#     the chain digest must not move.
+treeA = copy_tree("chainA")
+treeB = copy_tree("chainB")
+rA = snap(treeA, "chain")
+rB = snap(treeB, "chain")
+da, db = chain_digest_of(rA.stdout), chain_digest_of(rB.stdout)
+shaA = sha256_file(os.path.join(treeA, "bin", "hls-snap-chain-1.c"))
+shaB = sha256_file(os.path.join(treeB, "bin", "hls-snap-chain-1.c"))
+man = json.load(open(os.path.join(treeA, "snapshot", "MANIFEST.json")))
+if (rA.returncode == 0 and rB.returncode == 0
+        and da is not None and da == db
+        and shaA == shaB == man["hlc_c_sha256"]):
+    ok("two checkouts at different paths: identical round-1 emission "
+       "and identical chain digest")
+else:
+    bad("path independence broke: digests %s vs %s" % (da, db))
+
+# 9c. Environment hostility: TZ, LANG, LC_ALL and SOURCE_DATE_EPOCH
+#     poisoned, on the python-free PATH — the digest must not move.
+hostile_env = python_free_env()
+hostile_env.update({
+    "TZ": "Asia/Tokyo",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C",
+    "SOURCE_DATE_EPOCH": "1234567890",
+    "HOME": "/nonexistent",
+})
+rC = run(["make", "snapshot-chain"], cwd=treeB, env=hostile_env)
+dc = chain_digest_of(rC.stdout)
+if rC.returncode == 0 and dc is not None and dc == db:
+    ok("a hostile environment (TZ/LANG/LC_ALL/SOURCE_DATE_EPOCH, "
+       "python-free PATH) does not move the chain digest")
+else:
+    bad("the hostile-env chain failed or moved the digest: %s"
+        % (rC.stdout + rC.stderr)[:300])
+
+# 9d. The cross-compiler form: a second cc in round two's slot must
+#     land on the same digest. clang when the machine has it; cc
+#     otherwise (the flag path proven here, the truly-different
+#     compiler on CI's grid).
+cc2 = shutil.which("clang") or "cc"
+rD = run(["make", "snapshot-chain", "CC2=" + cc2], cwd=treeA)
+dd = chain_digest_of(rD.stdout)
+if (rD.returncode == 0 and dd is not None and dd == da
+        and "slot one" in rD.stdout):
+    ok("the cross-compiler form (CC2=%s) lands on the same digest" % cc2)
+else:
+    bad("the cross-compiler chain failed: %s" % (rD.stdout + rD.stderr)[:300])
+
+# 9e. The drifted-tree law: chain, like prove, refuses a drifted tree.
+types_hls = os.path.join(treeA, "src", "hlc", "types.hls")
+types_orig = open(types_hls, "r", encoding="utf-8").read()
+with open(types_hls, "w", encoding="utf-8") as fh:
+    fh.write(types_orig + "\n# gate: chain drift probe\n")
+r = snap(treeA, "chain")
+if r.returncode != 0 and "the drifted-tree law" in r.stdout:
+    ok("chain refuses a drifted tree with the law named (a chain run "
+       "from a tree the manifest does not describe is not a proof)")
+else:
+    bad("the drifted-tree chain was not refused (rc=%d)" % r.returncode)
+with open(types_hls, "w", encoding="utf-8") as fh:
+    fh.write(types_orig)
 
 # ---------------------------------------------------------------------------
 print()
