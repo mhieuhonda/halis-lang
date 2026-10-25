@@ -397,10 +397,11 @@ nostd:
 # end-to-end suite: core. resolution, standalone parsing, Stage-0
 # enforcement, core API behavior, the freestanding+core bridge,
 # self-hosted emission + parity, hlfmt stability, mode distinction.
-nostd-acceptance:
-	@echo "[Stage 78 acceptance] running tests/nostd_acceptance.py..."
-	@$(PYTHON) tests/nostd_acceptance.py
-	@echo "ACCEPTANCE OK: Stage 78 -- #![no_std] + core modules"
+# The gate itself is Halis (tests/acc/nostd_acceptance.hls, compiled
+# native by bin/hlc through the $(BIN)/acc-% pattern rule).
+nostd-acceptance: $(BIN)/acc-nostd
+	@echo "[Stage 78 acceptance] running tests/acc/nostd_acceptance.hls..."
+	@$(BIN)/acc-nostd
 
 # alloc-acceptance: the Stage 79 acceptance gate. Runs the 7-section
 # end-to-end suite for `core.alloc`: resolution + guards, standalone
@@ -409,9 +410,11 @@ nostd-acceptance:
 # bump+reset+OOM, alignment padding, pool LIFO recycle, double-free,
 # null sentinel, stats accounting), self-hosted emission + native
 # parity (incl. freestanding), hlfmt stability, and `--audit` purity.
-alloc-acceptance:
-	@echo "[Stage 79 acceptance] running tests/alloc_acceptance.py..."
-	@$(PYTHON) tests/alloc_acceptance.py
+# The gate itself is Halis (tests/acc/alloc_acceptance.hls, compiled
+# native by bin/hlc through the $(BIN)/acc-%% pattern rule).
+alloc-acceptance: $(BIN)/acc-alloc
+	@echo "[Stage 79 acceptance] running tests/acc/alloc_acceptance.hls..."
+	@$(BIN)/acc-alloc
 	@echo "ACCEPTANCE OK: Stage 79 -- core.alloc (pluggable allocator protocol)"
 
 # mem-acceptance: the Stage 80 acceptance gate. Runs the 8-section
@@ -423,9 +426,11 @@ alloc-acceptance:
 # atomicity under frame exhaustion, unmap + protect, huge map +
 # unmap), self-hosted emission + native parity (incl. freestanding),
 # hlfmt stability, and `--audit` purity.
-mem-acceptance:
-	@echo "[Stage 80 acceptance] running tests/mem_acceptance.py..."
-	@$(PYTHON) tests/mem_acceptance.py
+# The gate itself is Halis (tests/acc/mem_acceptance.hls, compiled
+# native by bin/hlc through the $(BIN)/acc-%% pattern rule).
+mem-acceptance: $(BIN)/acc-mem
+	@echo "[Stage 80 acceptance] running tests/acc/mem_acceptance.hls..."
+	@$(BIN)/acc-mem
 	@echo "ACCEPTANCE OK: Stage 80 -- core.mem (physical-page allocator + page tables)"
 
 # panic-acceptance: the Stage 81 acceptance gate. Runs the 7-section
@@ -439,9 +444,11 @@ mem-acceptance:
 # at 101, exit-wins at 42, ok-test at 0, freestanding -nostdlib at 0,
 # boot/hlc parity on fail programs), hlfmt stability, and `--audit`
 # purity.
-panic-acceptance:
-	@echo "[Stage 81 acceptance] running tests/panic_acceptance.py..."
-	@$(PYTHON) tests/panic_acceptance.py
+# The gate itself is Halis (tests/acc/panic_acceptance.hls, compiled
+# native by bin/hlc through the $(BIN)/acc-%% pattern rule).
+panic-acceptance: $(BIN)/acc-panic
+	@echo "[Stage 81 acceptance] running tests/acc/panic_acceptance.hls..."
+	@$(BIN)/acc-panic
 	@echo "ACCEPTANCE OK: Stage 81 -- core.panic + #[panic_handler]"
 
 # stackguard-acceptance: the Stage 82 acceptance gate. Runs the

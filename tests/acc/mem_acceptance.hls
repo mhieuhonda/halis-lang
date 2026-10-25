@@ -1,0 +1,619 @@
+# ============================================================================
+# tests/acc/mem_acceptance.hls — Stage 80 acceptance gate, in Halis
+# (the Halis twin of what was tests/mem_acceptance.py; same sections,
+# same assertions, same needles — the harness is tests/acc/harness.hls
+# and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make mem-acceptance` (which compiles this file to bin/acc-mem
+# and runs it from the repo root).
+#
+# The old battery reached into the lab interpreter's Python internals
+# (_resolve_import, tokenize/Parser) for its first two sections; the
+# gate asks the same questions through the front door — probe programs
+# the CLI must accept or reject, and source-shape greps.
+#
+#  1. core.mem import resolution (+ traversal guards)
+#  2. core.mem parses standalone + core-only imports
+#  3. Stage-0 enforcement (demo + ok-test pass in both modes)
+#  4. Behavior probes (interpreter, no_std mode): page geometry and
+#     canonical-address math, FrameAlloc first-fit/reuse/OOM, run +
+#     huge-frame alignment, PTE flag/NO_EXECUTE/address-field round
+#     trip, space_map with on-demand tables billed to the allocator,
+#     atomic out-of-frames failure, translate/unmap/protect, huge map
+#     + unmap
+#  5. Self-hosted emission (hlc) + native parity
+#  6. hlfmt stability over every Stage 80 file
+#  7. --audit: every mem function pure (no uses)
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.regex"
+
+# ----------------------------------------------------------------------------
+# The gate's data.
+# ----------------------------------------------------------------------------
+
+struct Probe {
+    label: str,
+    body: str
+}
+
+fn demo() -> str {
+    return "examples/mem_demo.hls"
+}
+
+fn ok_test() -> str {
+    return "tests/ok/feat_stage80_mem.hls"
+}
+
+fn core_mem() -> str {
+    return "core/mem.hls"
+}
+
+fn core_modules() -> list[str] {
+    return ["option", "result", "iter", "clone", "eq", "alloc", "mem"]
+}
+
+fn must_structs() -> list[str] {
+    return ["FrameAlloc", "PageTable", "AddressSpace"]
+}
+
+fn must_fns() -> list[str] {
+    return ["mem_error_msg", "mem_page_size", "mem_page_align_up",
+            "mem_page_count", "vaddr_pml4_index", "vaddr_pt_index",
+            "vaddr_is_canonical", "pte_new", "pte_address",
+            "pte_is_present", "pte_is_no_execute",
+            "frame_new", "frame_alloc_one", "frame_alloc_run",
+            "frame_alloc_huge", "frame_free", "frame_reserve",
+            "table_new", "table_set_entry",
+            "space_new", "space_map", "space_map_huge",
+            "space_translate", "space_unmap", "space_unmap_huge",
+            "space_protect", "space_leaf_entry",
+            "mem_identity_map", "mem_map_bytes"]
+}
+
+fn must_be_pure() -> list[str] {
+    return [
+        "mem_error_msg", "mem_page_size", "mem_huge_page_size",
+        "mem_pages_per_huge", "mem_is_page_aligned", "mem_is_huge_aligned",
+        "mem_page_align_up", "mem_page_count", "mem_pages_to_bytes",
+        "vaddr_pml4_index", "vaddr_pdpt_index", "vaddr_pd_index",
+        "vaddr_pt_index", "vaddr_page_offset", "vaddr_huge_offset",
+        "vaddr_is_canonical", "vaddr_is_huge_aligned",
+        "pte_flag_present", "pte_flag_writable", "pte_flag_user",
+        "pte_flag_no_execute", "pte_flags_known_mask", "pte_addr_limit",
+        "pte_new", "pte_address", "pte_flags", "pte_is_present",
+        "pte_is_writable", "pte_is_huge", "pte_is_no_execute",
+        "pte_set_flags", "pte_clear_flags",
+        "frame_new", "frame_alloc_one", "frame_alloc_run",
+        "frame_alloc_huge", "frame_free", "frame_reserve",
+        "frame_index_of", "frame_in_range", "frame_is_full",
+        "frame_used_count", "frame_free_count", "frame_peak",
+        "table_new", "table_entry", "table_set_entry",
+        "table_present_count", "space_new", "space_table_count",
+        "space_get_entry", "space_set_entry", "space_leaf_entry",
+        "space_translate", "space_is_mapped", "space_map",
+        "space_map_huge", "space_unmap", "space_unmap_huge",
+        "space_protect", "mem_identity_map", "mem_map_bytes",
+    ]
+}
+
+fn probes() -> list[Probe] {
+    return [
+        Probe {
+            label: "page geometry + canonical math",
+            body: "import \"core.mem\"\n" +
+                  "import \"core.result\"\n" +
+                  "fn main() -> int {\n" +
+                  "    if mem_page_size() != 4096 { return 1 }\n" +
+                  "    if mem_huge_page_size() != 2097152 { return 2 }\n" +
+                  "    if result_unwrap(mem_page_count(4097)) != 2 { return 3 }\n" +
+                  "    if !vaddr_is_canonical(-2147483648) { return 4 }\n" +
+                  "    if vaddr_is_canonical(140737488355328) { return 5 }\n" +
+                  "    if vaddr_pml4_index(-2147483648) != 511 { return 6 }\n" +
+                  "    if vaddr_pdpt_index(-2147483648) != 510 { return 7 }\n" +
+                  "    if vaddr_pd_index(2097152) != 1 { return 8 }\n" +
+                  "    if vaddr_page_offset(4096 + 291) != 291 { return 9 }\n" +
+                  "    if vaddr_huge_offset(2097152 + 12345) != 12345 { return 10 }\n" +
+                  "    return 0\n" +
+                  "}\n"
+        },
+        Probe {
+            label: "frame alloc/free/reuse/OOM",
+            body: "import \"core.mem\"\n" +
+                  "import \"core.result\"\n" +
+                  "fn main() -> int {\n" +
+                  "    let fa: FrameAlloc = result_unwrap(frame_new(1048576, 4))\n" +
+                  "    if result_unwrap(frame_alloc_one(fa)) != 1048576 { return 1 }\n" +
+                  "    if result_unwrap(frame_alloc_one(fa)) != 1052672 { return 2 }\n" +
+                  "    if frame_used_count(fa) != 2 { return 3 }\n" +
+                  "    if result_is_err(frame_free(fa, 1048576, 1)) { return 4 }\n" +
+                  "    # first-fit hands the freed frame out again\n" +
+                  "    if result_unwrap(frame_alloc_one(fa)) != 1048576 { return 5 }\n" +
+                  "    # freeing it once more is legal; a THIRD free is a double free\n" +
+                  "    if result_is_err(frame_free(fa, 1048576, 1)) { return 6 }\n" +
+                  "    if !result_is_err(frame_free(fa, 1048576, 1)) { return 7 }\n" +
+                  "    if mem_error_msg(result_unwrap_err(frame_free(fa, 1048576, 1))) != \"double free\" { return 8 }\n" +
+                  "    if !result_is_err(frame_free(fa, 1048577, 1)) { return 9 }\n" +
+                  "    if !result_is_err(frame_free(fa, 1114112, 1)) { return 10 }\n" +
+                  "    let mut guard: int = 0\n" +
+                  "    while !frame_is_full(fa) && guard < 10 {\n" +
+                  "        let _x: Result[int, MemError] = frame_alloc_one(fa)\n" +
+                  "        guard = guard + 1\n" +
+                  "    }\n" +
+                  "    if !frame_is_full(fa) || !result_is_err(frame_alloc_one(fa)) { return 11 }\n" +
+                  "    return 0\n" +
+                  "}\n"
+        },
+        Probe {
+            label: "frame runs + huge alignment",
+            body: "import \"core.mem\"\n" +
+                  "import \"core.result\"\n" +
+                  "fn main() -> int {\n" +
+                  "    let fa: FrameAlloc = result_unwrap(frame_new(1048576, 2048))\n" +
+                  "    let _r: Result[int, MemError] = frame_alloc_one(fa)\n" +
+                  "    if result_unwrap(frame_alloc_run(fa, 3)) != 1048576 + 4096 { return 1 }\n" +
+                  "    if !result_is_err(frame_alloc_run(fa, 0)) { return 2 }\n" +
+                  "    if result_unwrap(frame_alloc_huge(fa)) != 2097152 { return 3 }\n" +
+                  "    if result_unwrap(frame_alloc_huge(fa)) != 4194304 { return 4 }\n" +
+                  "    # 1 root alloc + 3 run frames + two huge runs of 512\n" +
+                  "    if frame_used_count(fa) != 1028 { return 5 }\n" +
+                  "    if result_is_err(frame_free(fa, 1048576, 1)) { return 6 }\n" +
+                  "    if result_is_err(frame_free(fa, 2097152, 512)) { return 7 }\n" +
+                  "    if result_unwrap(frame_alloc_huge(fa)) != 2097152 { return 8 }\n" +
+                  "    return 0\n" +
+                  "}\n"
+        },
+        Probe {
+            label: "PTE format + NX round trip",
+            body: "import \"core.mem\"\n" +
+                  "import \"core.result\"\n" +
+                  "fn main() -> int {\n" +
+                  "    let f: int = int_or(pte_flag_present(), int_or(pte_flag_writable(), pte_flag_no_execute()))\n" +
+                  "    let e: int = result_unwrap(pte_new(32768, f))\n" +
+                  "    if e >= 0 { return 1 }\n" +
+                  "    if pte_address(e) != 32768 { return 2 }\n" +
+                  "    if !pte_is_no_execute(e) || !pte_is_writable(e) || !pte_is_present(e) { return 3 }\n" +
+                  "    let e2: int = pte_clear_flags(e, pte_flag_no_execute())\n" +
+                  "    if pte_is_no_execute(e2) || pte_address(e2) != 32768 { return 4 }\n" +
+                  "    if !result_is_err(pte_new(4095, 0)) { return 5 }\n" +
+                  "    if !result_is_err(pte_new(4503599627370496, 0)) { return 6 }\n" +
+                  "    if !result_is_err(pte_new(0, 4096)) { return 7 }\n" +
+                  "    return 0\n" +
+                  "}\n"
+        },
+        Probe {
+            label: "space map + on-demand tables + translate",
+            body: "import \"core.mem\"\n" +
+                  "import \"core.result\"\n" +
+                  "fn main() -> int {\n" +
+                  "    let fa: FrameAlloc = result_unwrap(frame_new(1048576, 64))\n" +
+                  "    let root: int = result_unwrap(frame_alloc_one(fa))\n" +
+                  "    let sp: AddressSpace = result_unwrap(space_new(root))\n" +
+                  "    let mr: Result[int, MemError] = space_map(fa, sp, 2097152, 3145728, 2, pte_flag_writable())\n" +
+                  "    if result_is_err(mr) { return 1 }\n" +
+                  "    if space_table_count(sp) != 4 { return 2 }\n" +
+                  "    if frame_used_count(fa) != 4 { return 3 }\n" +
+                  "    if option_unwrap(space_translate(sp, 2097152 + 100)) != 3145828 { return 4 }\n" +
+                  "    if option_is_some(space_translate(sp, 2097152 + 8192)) { return 5 }\n" +
+                  "    if !result_is_err(space_map(fa, sp, 2097152, 3145728, 1, 0)) { return 6 }\n" +
+                  "    return 0\n" +
+                  "}\n"
+        },
+        Probe {
+            label: "map atomicity under frame exhaustion",
+            body: "import \"core.mem\"\n" +
+                  "import \"core.result\"\n" +
+                  "fn main() -> int {\n" +
+                  "    let fa: FrameAlloc = result_unwrap(frame_new(9437184, 2))\n" +
+                  "    let root: int = result_unwrap(frame_alloc_one(fa))\n" +
+                  "    let sp: AddressSpace = result_unwrap(space_new(root))\n" +
+                  "    let oom: Result[int, MemError] = space_map(fa, sp, 2097152, 3145728, 1, 0)\n" +
+                  "    if !result_is_err(oom) { return 1 }\n" +
+                  "    if mem_error_msg(result_unwrap_err(oom)) != \"out of frames\" { return 2 }\n" +
+                  "    if space_table_count(sp) != 1 { return 3 }\n" +
+                  "    if frame_used_count(fa) != 1 { return 4 }\n" +
+                  "    if space_maps(sp) != 0 { return 5 }\n" +
+                  "    return 0\n" +
+                  "}\n"
+        },
+        Probe {
+            label: "unmap + protect re-flag",
+            body: "import \"core.mem\"\n" +
+                  "import \"core.result\"\n" +
+                  "fn main() -> int {\n" +
+                  "    let fa: FrameAlloc = result_unwrap(frame_new(1048576, 64))\n" +
+                  "    let root: int = result_unwrap(frame_alloc_one(fa))\n" +
+                  "    let sp: AddressSpace = result_unwrap(space_new(root))\n" +
+                  "    let _m: Result[int, MemError] = space_map(fa, sp, 2097152, 3145728, 1, pte_flag_writable())\n" +
+                  "    if result_is_err(space_protect(sp, 2097152, 1, pte_flag_present())) { return 1 }\n" +
+                  "    let l: int = result_unwrap(space_leaf_entry(sp, 2097152))\n" +
+                  "    if pte_is_writable(l) || pte_address(l) != 3145728 { return 2 }\n" +
+                  "    if result_is_err(space_unmap(sp, 2097152, 1)) { return 3 }\n" +
+                  "    if option_is_some(space_translate(sp, 2097152)) { return 4 }\n" +
+                  "    if !result_is_err(space_unmap(sp, 2097152, 1)) { return 5 }\n" +
+                  "    if !result_is_err(space_protect(sp, 2097152, 1, pte_flag_present())) { return 6 }\n" +
+                  "    return 0\n" +
+                  "}\n"
+        },
+        Probe {
+            label: "huge map + huge unmap",
+            body: "import \"core.mem\"\n" +
+                  "import \"core.result\"\n" +
+                  "fn main() -> int {\n" +
+                  "    let fa: FrameAlloc = result_unwrap(frame_new(1048576, 2048))\n" +
+                  "    let root: int = result_unwrap(frame_alloc_one(fa))\n" +
+                  "    let sp: AddressSpace = result_unwrap(space_new(root))\n" +
+                  "    let hp: int = result_unwrap(frame_alloc_huge(fa))\n" +
+                  "    if hp != 2097152 { return 1 }\n" +
+                  "    let hv: int = -140737488355328\n" +
+                  "    let f: int = int_or(pte_flag_writable(), pte_flag_no_execute())\n" +
+                  "    if result_is_err(space_map_huge(fa, sp, hv, hp, 1, f)) { return 2 }\n" +
+                  "    if space_table_count(sp) != 3 { return 3 }\n" +
+                  "    if option_unwrap(space_translate(sp, hv + 12345)) != hp + 12345 { return 4 }\n" +
+                  "    if !pte_is_huge(result_unwrap(space_leaf_entry(sp, hv))) { return 5 }\n" +
+                  "    if !result_is_err(space_map(fa, sp, hv, 4096, 1, 0)) { return 6 }\n" +
+                  "    if !result_is_err(space_unmap(sp, hv, 1)) { return 7 }\n" +
+                  "    if result_is_err(space_unmap_huge(sp, hv, 1)) { return 8 }\n" +
+                  "    if option_is_some(space_translate(sp, hv)) { return 9 }\n" +
+                  "    if !result_is_err(space_unmap_huge(sp, hv, 1)) { return 10 }\n" +
+                  "    return 0\n" +
+                  "}\n"
+        },
+    ]
+}
+
+# ----------------------------------------------------------------------------
+# Shared legs.
+# ----------------------------------------------------------------------------
+
+fn decl_word(src: str, kw: str, name: str) -> bool {
+    let rr: Result[Regex, str] = regex_compile(kw + "\\s+" + name + "\\b")
+    if result_is_err(rr) {
+        return false
+    }
+    let re: Regex = result_unwrap(rr)
+    return regex_is_match(re, src)
+}
+
+fn import_paths(src: str) -> list[str] {
+    let out: list[str] = []
+    let lines: list[str] = src.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i).trim()
+        if line.starts_with("import ") {
+            let rest: str = line.slice(7, line.len()).trim()
+            if rest.starts_with("\"") {
+                let tail: str = rest.slice(1, rest.len())
+                let end: int = tail.find("\"")
+                if end > 0 {
+                    out.push(tail.slice(0, end))
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn swap_no_std(text: str) -> str {
+    let at: int = text.find("\n#![no_std]\n")
+    if at < 0 {
+        return text
+    }
+    return text.slice(0, at) + "\n#![freestanding]\n"
+        + text.slice(at + 12, text.len())
+}
+
+fn drop_no_std(text: str) -> str {
+    let at: int = text.find("#![no_std]\n")
+    if at < 0 {
+        return text
+    }
+    return text.slice(0, at) + text.slice(at + 11, text.len())
+}
+
+# ----------------------------------------------------------------------------
+# 1. core.mem resolution + traversal guards
+# ----------------------------------------------------------------------------
+fn sec1(acc: Acc) -> void uses IO, Fs, Proc {
+    section("1. core.mem import resolution (+ traversal guards)")
+    let p: str = write_src(acc, "res_mem.hls",
+        "import \"core.mem\"\n" +
+        "\n" +
+        "fn main() -> int {\n" +
+        "    return 0\n" +
+        "}\n")
+    let r: RunResult = boot_check(acc, p)
+    check(acc, "core.mem resolves", r.code == 0, clip(r.combined, 60))
+    let mods: list[str] = core_modules()
+    let mut i: int = 0
+    while i < mods.len() {
+        let m: str = mods.get(i)
+        let q: str = write_src(acc, "res_" + m + ".hls",
+            "import \"core." + m + "\"\n" +
+            "\n" +
+            "fn main() -> int {\n" +
+            "    return 0\n" +
+            "}\n")
+        let rq: RunResult = boot_check(acc, q)
+        check(acc, "core." + m + " still resolves", rq.code == 0, "")
+        i = i + 1
+    }
+    let s: str = write_src(acc, "res_std_str.hls",
+        "import \"std.str\"\n" +
+        "\n" +
+        "fn main() -> int {\n" +
+        "    return 0\n" +
+        "}\n")
+    let rs: RunResult = boot_check(acc, s)
+    check(acc, "std.str still resolves", rs.code == 0, "")
+    let evils: list[str] = ["core.../secret", "core./x", "core"]
+    let mut j: int = 0
+    while j < evils.len() {
+        let e: str = evils.get(j)
+        let q: str = write_src(acc, "guard_" + j.to_str() + ".hls",
+            "import \"" + e + "\"\n" +
+            "\n" +
+            "fn main() -> int {\n" +
+            "    return 0\n" +
+            "}\n")
+        let rq: RunResult = boot_check(acc, q)
+        check(acc, "guard '" + e + "'", rq.code != 0, clip(rq.combined, 70))
+        j = j + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 2. core.mem parses standalone + imports are core-only
+# ----------------------------------------------------------------------------
+fn sec2(acc: Acc) -> void uses IO {
+    section("2. core.mem parses standalone + core-only imports")
+    let src: str = read_or(core_mem(), "")
+    check(acc, "core/mem.hls parses", src.len() > 0 && top_kinds_pos(src), "shape ok")
+    let structs: list[str] = must_structs()
+    let mut all_structs: bool = true
+    let mut i: int = 0
+    while i < structs.len() {
+        if !decl_word(src, "struct", structs.get(i)) {
+            all_structs = false
+        }
+        i = i + 1
+    }
+    check(acc, "all three structs present", all_structs, "")
+    check(acc, "MemError enum present", decl_word(src, "enum", "MemError"), "")
+    let imps: list[str] = import_paths(src)
+    check(acc, "imports are core-only",
+        imps.len() == 2 && ((imps.get(0) == "core.option" && imps.get(1) == "core.result")
+            || (imps.get(0) == "core.result" && imps.get(1) == "core.option")),
+        str_join(imps, ", "))
+    let fns: list[str] = must_fns()
+    let mut missing: str = ""
+    let mut j: int = 0
+    while j < fns.len() {
+        if !decl_word(src, "fn", fns.get(j)) {
+            missing = missing + " " + fns.get(j)
+        }
+        j = j + 1
+    }
+    check(acc, "all reference functions present", missing == "", clip(missing, 90))
+    # Function count sane: at least 70 `fn ` lines at column 0.
+    let lines: list[str] = src.split("\n")
+    let mut fn_count: int = 0
+    let mut li: int = 0
+    while li < lines.len() {
+        if lines.get(li).starts_with("fn ") {
+            fn_count = fn_count + 1
+        }
+        li = li + 1
+    }
+    check(acc, "function count sane (>= 70)", fn_count >= 70, fn_count.to_str())
+}
+
+# top_kinds_pos(src) — the file declares at least one struct, one enum
+# and one fn at column 0.
+fn top_kinds_pos(src: str) -> bool {
+    let lines: list[str] = src.split("\n")
+    let mut has_s: bool = false
+    let mut has_e: bool = false
+    let mut has_f: bool = false
+    let mut i: int = 0
+    while i < lines.len() {
+        let l: str = lines.get(i)
+        if l.starts_with("struct ") {
+            has_s = true
+        }
+        if l.starts_with("enum ") {
+            has_e = true
+        }
+        if l.starts_with("fn ") {
+            has_f = true
+        }
+        i = i + 1
+    }
+    return has_s && has_e && has_f
+}
+
+# ----------------------------------------------------------------------------
+# 3. Stage-0 enforcement (no_std + freestanding)
+# ----------------------------------------------------------------------------
+fn sec3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("3. Stage-0 enforcement (demo + ok-test pass in both modes)")
+    let rd: RunResult = boot_check(acc, demo())
+    check(acc, "no_std demo checks", rd.code == 0, clip(rd.combined, 60))
+    let rt: RunResult = boot_check(acc, ok_test())
+    check(acc, "no_std ok-test checks", rt.code == 0, clip(rt.combined, 60))
+    let rd2: RunResult = boot(acc, [demo()])
+    check(acc, "no_std demo runs (exit 0)", rd2.code == 0, "rc=" + rd2.code.to_str())
+    let rt2: RunResult = boot(acc, [ok_test()])
+    check(acc, "no_std ok-test runs (exit 0)", rt2.code == 0, "rc=" + rt2.code.to_str())
+    let fs_src: str = swap_no_std(read_file(ok_test()))
+    let fs_p: str = write_src(acc, "ok_fs.hls", fs_src)
+    let rf: RunResult = boot_check(acc, fs_p)
+    check(acc, "freestanding ok-test checks", rf.code == 0, clip(rf.combined, 60))
+    let rf2: RunResult = boot(acc, [fs_p])
+    check(acc, "freestanding ok-test runs (exit 0)", rf2.code == 0,
+        "rc=" + rf2.code.to_str())
+    let bare_src: str = drop_no_std(read_file(ok_test()))
+    let bare_p: str = write_src(acc, "ok_bare.hls", bare_src)
+    let rb: RunResult = boot(acc, [bare_p])
+    check(acc, "hosted (no crate attr) ok-test runs (exit 0)", rb.code == 0,
+        "rc=" + rb.code.to_str())
+    let ra: RunResult = boot(acc, ["--audit", demo()])
+    check(acc, "--audit shows no_std", ra.code == 0 && ra.out.contains("#![no_std]"), "")
+    let p: str = write_src(acc, "extern_probe.hls",
+        "#![no_std]\nimport \"core.mem\"\n" +
+        "extern \"C\" {\n    fn malloc(n: int) -> int uses IO\n}\n" +
+        "fn main() -> int { return 0 }\n")
+    let r: RunResult = boot_check(acc, p)
+    check(acc, "no_std extern rejected",
+        r.code == 1 && r.combined.contains("not available in #![no_std]"),
+        clip(r.combined, 90))
+}
+
+# ----------------------------------------------------------------------------
+# 4. Targeted behavior probes (interpreter, no_std mode)
+# ----------------------------------------------------------------------------
+fn sec4(acc: Acc) -> void uses IO, Fs, Proc {
+    section("4. Behavior probes (interpreter, no_std mode)")
+    let ps: list[Probe] = probes()
+    let mut i: int = 0
+    while i < ps.len() {
+        let p: Probe = ps.get(i)
+        let path: str = write_src(acc, "probe_" + i.to_str() + ".hls",
+            "#![no_std]\n" + p.body)
+        let r: RunResult = boot(acc, [path])
+        check(acc, p.label, r.code == 0, "rc=" + r.code.to_str()
+            + " " + clip(r.combined, 80))
+        i = i + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 5. Self-hosted emission + parity
+# ----------------------------------------------------------------------------
+fn sec5(acc: Acc) -> void uses IO, Fs, Proc {
+    section("5. Self-hosted emission (hlc) + native parity")
+    let out: str = scratch(acc, "mem.c")
+    let r: RunResult = boot(acc, ["src/hlc.hls", demo(), out])
+    check(acc, "hlc emits no_std C", r.code == 0 && file_exists(out),
+        clip(r.combined, 100))
+    let src: str = read_or(out, "")
+    let mre: Result[Regex, str] = regex_compile("int main\\s*\\(")
+    let mut has_main: bool = false
+    if result_is_ok(mre) {
+        if regex_is_match(result_unwrap(mre), src) {
+            has_main = true
+        }
+    }
+    check(acc, "hosted main kept", has_main, "")
+    check(acc, "no _start entry", !src.contains("void _start"), "")
+    check(acc, "stdio kept", src.contains("#include <stdio.h>"), "")
+    check(acc, "no freestanding markers",
+        !src.contains("HL_FREESTANDING") && !src.contains("__builtin_trap"), "")
+    check(acc, "core.mem fns compiled",
+        src.contains("usf_frame_new") && src.contains("usf_frame_alloc_one")
+            && src.contains("usf_frame_alloc_huge") && src.contains("usf_frame_free")
+            && src.contains("usf_space_new") && src.contains("usf_space_map")
+            && src.contains("usf_space_map_huge") && src.contains("usf_space_translate")
+            && src.contains("usf_space_unmap") && src.contains("usf_space_protect")
+            && src.contains("usf_mem_identity_map") && src.contains("usf_mem_map_bytes"),
+        "")
+    let binp: str = scratch(acc, "mem.bin")
+    let g: RunResult = run_capture("gcc", ["-O2", "-o", binp, out, "-lm", "-pthread"])
+    if g.code == 0 {
+        let nat: RunResult = run_capture(binp, [])
+        check(acc, "native mem_demo exit 0", nat.code == 0,
+            "rc=" + nat.code.to_str())
+    } else {
+        check(acc, "native mem_demo links", false, "gcc failed")
+    }
+    let fs_src: str = swap_no_std(read_file(ok_test()))
+    let fs_p: str = write_src(acc, "ok_fs2.hls", fs_src)
+    let interp: RunResult = boot(acc, [fs_p])
+    let out2: str = scratch(acc, "fs.c")
+    let r2: RunResult = boot(acc, ["src/hlc.hls", fs_p, out2])
+    check(acc, "hlc emits freestanding C", r2.code == 0 && file_exists(out2),
+        clip(r2.combined, 100))
+    let bin2: str = scratch(acc, "fs.bin")
+    let g2: RunResult = run_capture("gcc", ["-O2", "-ffreestanding", "-nostdlib",
+        "-ffunction-sections", "-fno-stack-protector", "-Wl,--gc-sections",
+        "-o", bin2, out2])
+    if g2.code == 0 {
+        let nat2: RunResult = run_capture(bin2, [])
+        check(acc, "freestanding native == interpreter",
+            nat2.code == interp.code,
+            "interp=" + interp.code.to_str() + " nat=" + nat2.code.to_str())
+    } else {
+        check(acc, "freestanding binary links", false, "gcc failed")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 6. hlfmt stability
+# ----------------------------------------------------------------------------
+fn sec6(acc: Acc) -> void uses IO, Proc {
+    section("6. hlfmt stability over every Stage 80 file")
+    let files: list[str] = [core_mem(), demo(), ok_test()]
+    let mut i: int = 0
+    while i < files.len() {
+        let r: RunResult = run_capture("python3", ["tools/hlfmt.py", "-c", files.get(i)])
+        check(acc, "hlfmt clean: " + basename(files.get(i)),
+            !r.out.contains("NOT formatted"), clip(r.out, 80))
+        i = i + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 7. --audit shows every mem function pure
+# ----------------------------------------------------------------------------
+fn sec7(acc: Acc) -> void uses IO, Proc {
+    section("7. --audit: every mem function pure (no uses)")
+    let r: RunResult = boot(acc, ["--audit", demo()])
+    let out: str = r.out
+    check(acc, "audit ran", r.code == 0, "")
+    let must: list[str] = must_be_pure()
+    let mut missing: str = ""
+    let mut i: int = 0
+    while i < must.len() {
+        if !out.contains(must.get(i)) {
+            missing = missing + " " + must.get(i)
+        }
+        i = i + 1
+    }
+    check(acc, "all mem fns in audit output", missing == "", clip(missing, 90))
+    let lines: list[str] = out.split("\n")
+    let mut bad: str = ""
+    let mut li: int = 0
+    while li < lines.len() {
+        let s: str = lines.get(li).trim()
+        let mut fi: int = 0
+        while fi < must.len() {
+            if s.starts_with(must.get(fi) + " ") {
+                if !s.contains("(none - pure)") && !s.contains("(none)") {
+                    bad = bad + " " + s
+                }
+                break
+            }
+            fi = fi + 1
+        }
+        li = li + 1
+    }
+    check(acc, "all mem fns declared pure", bad == "", clip(bad, 90))
+    check(acc, "crate mode reported",
+        out.contains("Crate mode:") && out.contains("#![no_std]"), "")
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let acc: Acc = acc_new("mem")
+    sec1(acc)
+    sec2(acc)
+    sec3(acc)
+    sec4(acc)
+    sec5(acc)
+    sec6(acc)
+    sec7(acc)
+    return finish(acc, "Stage 80 -- core.mem (frame allocator + page tables)")
+}

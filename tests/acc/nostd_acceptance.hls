@@ -1,0 +1,389 @@
+# ============================================================================
+# tests/acc/nostd_acceptance.hls — Stage 78 acceptance gate, in Halis
+# (the Halis twin of what was tests/nostd_acceptance.py; same eight
+# sections, same assertions, same needles — the harness is
+# tests/acc/harness.hls and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make nostd-acceptance` (which compiles this file to
+# bin/acc-nostd and runs it from the repo root).
+#
+# The old battery reached into the lab interpreter's Python internals
+# (_resolve_import, tokenize/Parser, the checker's crate_mode_flags);
+# the gate asks the same questions through the front door — probe
+# programs the CLI must accept or reject, source-shape counts, and the
+# --audit crate-mode line — so the gate itself carries no Python beyond
+# the oracle legs every gate spawns by design.
+#
+#  1. core. import resolution (Stage-0): all five modules resolve;
+#     traversal guards (`core.../x`, absolute) hold
+#  2. Core modules parse standalone (shape: struct/enum/fn content,
+#     core.option imports nothing, core.iter imports only core.option)
+#  3. Stage-0 enforcement: the demo + ok-test check; std import, `uses`,
+#     and `extern` are rejected in `#![no_std]` mode
+#  4. Core API behavior on the interpreter (parse_int edges,
+#     iterator exhaustion, clone independence, order-insensitive map
+#     equality)
+#  5. Freestanding+core bridge: `#![freestanding]` importing
+#     `core.option` checks; `std`+`core` together conflict
+#  6. Self-hosted emission (hlc.hls through the interpreter): the
+#     no_std demo compiles to hosted C (main, stdio, core fns, no
+#     freestanding markers); parity rejection on the std-import fail
+#  7. hlfmt stability over every new Stage 77/78 file
+#  8. no_std is NOT freestanding (the --audit crate-mode line says so)
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.regex"
+
+# ----------------------------------------------------------------------------
+# The gate's data.
+# ----------------------------------------------------------------------------
+
+fn demo() -> str {
+    return "examples/nostd_demo.hls"
+}
+
+fn ok_test() -> str {
+    return "tests/ok/feat_nostd_core.hls"
+}
+
+fn core_modules() -> list[str] {
+    return ["option", "result", "iter", "clone", "eq"]
+}
+
+# ----------------------------------------------------------------------------
+# Shared legs.
+# ----------------------------------------------------------------------------
+
+fn import_paths(src: str) -> list[str] {
+    let out: list[str] = []
+    let lines: list[str] = src.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i).trim()
+        if line.starts_with("import ") {
+            let rest: str = line.slice(7, line.len()).trim()
+            if rest.starts_with("\"") {
+                let tail: str = rest.slice(1, rest.len())
+                let end: int = tail.find("\"")
+                if end > 0 {
+                    out.push(tail.slice(0, end))
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# top_kinds(src) — (structs, enums, fns) declared at column 0 (the old
+# battery's parse shape).
+fn top_structs(src: str) -> int {
+    let lines: list[str] = src.split("\n")
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).starts_with("struct ") {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn top_enums(src: str) -> int {
+    let lines: list[str] = src.split("\n")
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).starts_with("enum ") {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn top_fns(src: str) -> int {
+    let lines: list[str] = src.split("\n")
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).starts_with("fn ") {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+# ----------------------------------------------------------------------------
+# 1. core. resolution
+# ----------------------------------------------------------------------------
+fn sec1(acc: Acc) -> void uses IO, Fs, Proc {
+    section("1. core. import resolution (+ traversal guards)")
+    let mods: list[str] = core_modules()
+    let mut i: int = 0
+    while i < mods.len() {
+        let m: str = mods.get(i)
+        let p: str = write_src(acc, "res_" + m + ".hls",
+            "import \"core." + m + "\"\n" +
+            "\n" +
+            "fn main() -> int {\n" +
+            "    return 0\n" +
+            "}\n")
+        let r: RunResult = boot_check(acc, p)
+        check(acc, "core." + m + " resolves", r.code == 0, clip(r.combined, 60))
+        i = i + 1
+    }
+    let s: str = write_src(acc, "res_std_str.hls",
+        "import \"std.str\"\n" +
+        "\n" +
+        "fn main() -> int {\n" +
+        "    return 0\n" +
+        "}\n")
+    let rs: RunResult = boot_check(acc, s)
+    check(acc, "std.str still resolves", rs.code == 0, "")
+    let evils: list[str] = ["core.../secret", "core./x", "core"]
+    let mut j: int = 0
+    while j < evils.len() {
+        let e: str = evils.get(j)
+        let p: str = write_src(acc, "guard_" + j.to_str() + ".hls",
+            "import \"" + e + "\"\n" +
+            "\n" +
+            "fn main() -> int {\n" +
+            "    return 0\n" +
+            "}\n")
+        let r: RunResult = boot_check(acc, p)
+        check(acc, "guard '" + e + "'", r.code != 0, clip(r.combined, 70))
+        j = j + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 2. Core modules parse standalone
+# ----------------------------------------------------------------------------
+fn sec2(acc: Acc) -> void uses IO, Fs, Proc {
+    section("2. Core modules parse standalone")
+    let mods: list[str] = core_modules()
+    let mut i: int = 0
+    while i < mods.len() {
+        let m: str = mods.get(i)
+        let path: str = "core/" + m + ".hls"
+        let src: str = read_or(path, "")
+        let s: int = top_structs(src)
+        let e: int = top_enums(src)
+        let f: int = top_fns(src)
+        check(acc, "core/" + m + ".hls parses (s=" + s.to_str() + ",e="
+            + e.to_str() + ",f=" + f.to_str() + ")",
+            src.len() > 0 && (s + e + f) > 0, "")
+        i = i + 1
+    }
+    let opt_src: str = read_or("core/option.hls", "")
+    check(acc, "core.option has no imports", import_paths(opt_src).len() == 0, "")
+    let it_imps: list[str] = import_paths(read_or("core/iter.hls", ""))
+    check(acc, "core.iter imports only core.option",
+        it_imps.len() == 1 && it_imps.get(0) == "core.option",
+        str_join(it_imps, ", "))
+}
+
+# ----------------------------------------------------------------------------
+# 3. Stage-0 enforcement
+# ----------------------------------------------------------------------------
+fn sec3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("3. Stage-0 enforcement (demo OK, violations rejected)")
+    let rd: RunResult = boot_check(acc, demo())
+    check(acc, "nostd demo checks", rd.code == 0, clip(rd.combined, 60))
+    let rt: RunResult = boot_check(acc, ok_test())
+    check(acc, "nostd ok-test checks", rt.code == 0, clip(rt.combined, 60))
+    let rd2: RunResult = boot(acc, [demo()])
+    check(acc, "nostd demo runs (exit 0)", rd2.code == 0, "rc=" + rd2.code.to_str())
+    let rt2: RunResult = boot(acc, [ok_test()])
+    check(acc, "nostd ok-test runs (exit 0)", rt2.code == 0, "rc=" + rt2.code.to_str())
+    let fails: list[list[str]] = [
+        ["fail_nostd_std_import.hls", "std module"],
+        ["fail_nostd_uses.hls", "capabilities are unavailable"],
+    ]
+    let mut i: int = 0
+    while i < fails.len() {
+        let f: list[str] = fails.get(i)
+        let r: RunResult = boot_check(acc, "tests/fail/" + f.get(0))
+        check(acc, f.get(0) + " rejected",
+            r.code == 1 && r.combined.contains(f.get(1)), clip(r.combined, 90))
+        i = i + 1
+    }
+    let p: str = write_src(acc, "extern_probe.hls",
+        "#![no_std]\nextern \"C\" {\n" +
+        "    fn puts(s: str) -> int uses IO\n}\n" +
+        "fn main() -> int { return 0 }\n")
+    let r: RunResult = boot_check(acc, p)
+    check(acc, "no_std extern rejected",
+        r.code == 1 && r.combined.contains("not available in #![no_std]"),
+        clip(r.combined, 90))
+    let ra: RunResult = boot(acc, ["--audit", demo()])
+    check(acc, "--audit shows no_std",
+        ra.code == 0 && ra.out.contains("#![no_std]"), "")
+}
+
+# ----------------------------------------------------------------------------
+# 4. Core API behavior
+# ----------------------------------------------------------------------------
+fn sec4(acc: Acc) -> void uses IO, Fs, Proc {
+    section("4. Core API behavior (targeted probes)")
+    let parse_int_probe: str = write_src(acc, "probe_parse_int.hls",
+        "#![no_std]\nimport \"core.result\"\nfn main() -> int {\n" +
+        "    if result_unwrap(parse_int(\"-9223372036854775808\")) != -9223372036854775808 { return 1 }\n" +
+        "    if !result_is_err(parse_int(\"12a\")) { return 2 }\n" +
+        "    if !result_is_err(parse_int(\"--1\")) { return 3 }\n" +
+        "    if result_unwrap_or(parse_int(\"7\"), 0) != 7 { return 4 }\n" +
+        "    return 0\n}\n")
+    let r1: RunResult = boot(acc, [parse_int_probe])
+    check(acc, "parse_int edges", r1.code == 0, "rc=" + r1.code.to_str()
+        + " " + clip(r1.combined, 80))
+
+    let iter_probe: str = write_src(acc, "probe_iter.hls",
+        "#![no_std]\nimport \"core.iter\"\nfn main() -> int {\n" +
+        "    let xs: list[int] = [9]\n" +
+        "    let mut it: ListIter[int] = list_iter(xs)\n" +
+        "    if option_unwrap_or(iter_next(it), 0) != 9 { return 1 }\n" +
+        "    if iter_has_next(it) { return 2 }\n" +
+        "    if option_is_some(iter_next(it)) { return 3 }\n" +
+        "    if iter_remaining(it) != 0 { return 4 }\n" +
+        "    return 0\n}\n")
+    let r2: RunResult = boot(acc, [iter_probe])
+    check(acc, "iter exhaustion", r2.code == 0, "rc=" + r2.code.to_str()
+        + " " + clip(r2.combined, 80))
+
+    let clone_probe: str = write_src(acc, "probe_clone.hls",
+        "#![no_std]\nimport \"core.option\"\nimport \"core.clone\"\nfn main() -> int {\n" +
+        "    let a: list[int] = [1]\n" +
+        "    let b: list[int] = clone_list_of(a)\n" +
+        "    b.push(2)\n" +
+        "    if a.len() != 1 { return 1 }\n" +
+        "    return 0\n}\n")
+    let r3: RunResult = boot(acc, [clone_probe])
+    check(acc, "clone independence", r3.code == 0, "rc=" + r3.code.to_str()
+        + " " + clip(r3.combined, 80))
+
+    let eq_probe: str = write_src(acc, "probe_eq.hls",
+        "#![no_std]\nimport \"core.eq\"\nfn main() -> int {\n" +
+        "    let m1: map[str, int] = map_new()\n" +
+        "    m1.set(\"a\", 1)\n" +
+        "    let m2: map[str, int] = map_new()\n" +
+        "    m2.set(\"a\", 1)\n" +
+        "    if !eq_map_str_int(m1, m2) { return 1 }\n" +
+        "    m2.set(\"b\", 2)\n" +
+        "    if eq_map_str_int(m1, m2) { return 2 }\n" +
+        "    return 0\n}\n")
+    let r4: RunResult = boot(acc, [eq_probe])
+    check(acc, "map order-insensitive", r4.code == 0, "rc=" + r4.code.to_str()
+        + " " + clip(r4.combined, 80))
+}
+
+# ----------------------------------------------------------------------------
+# 5. Freestanding+core bridge + std/core duality
+# ----------------------------------------------------------------------------
+fn sec5(acc: Acc) -> void uses IO, Fs, Proc {
+    section("5. Freestanding+core bridge; std/core duality")
+    let p: str = write_src(acc, "fs_core.hls",
+        "#![freestanding]\nimport \"core.option\"\n" +
+        "fn main() -> int {\n" +
+        "    let o: Option[int] = Option.Some(3)\n" +
+        "    return option_unwrap_or(o, 0)\n}\n")
+    let r: RunResult = boot_check(acc, p)
+    check(acc, "freestanding + core.option checks", r.code == 0, "")
+    let r2: RunResult = boot(acc, [p])
+    check(acc, "freestanding + core.option runs (exit 3)", r2.code == 3,
+        "rc=" + r2.code.to_str())
+    let q: str = write_src(acc, "duality.hls",
+        "import \"std.option\"\nimport \"core.option\"\n" +
+        "fn main() -> int { return 0 }\n")
+    let r3: RunResult = boot_check(acc, q)
+    check(acc, "std+core duality conflict",
+        r3.code == 1 && r3.combined.contains("duplicate type name"),
+        clip(r3.combined, 90))
+}
+
+# ----------------------------------------------------------------------------
+# 6. Self-hosted emission + parity
+# ----------------------------------------------------------------------------
+fn sec6(acc: Acc) -> void uses IO, Fs, Proc {
+    section("6. Self-hosted emission (hosted no_std TU) + parity")
+    let out: str = scratch(acc, "nostd.c")
+    let r: RunResult = boot(acc, ["src/hlc.hls", demo(), out])
+    check(acc, "hlc emits no_std C", r.code == 0 && file_exists(out),
+        clip(r.combined, 100))
+    let src: str = read_or(out, "")
+    let mre: Result[Regex, str] = regex_compile("int main\\s*\\(")
+    let mut has_main: bool = false
+    if result_is_ok(mre) {
+        if regex_is_match(result_unwrap(mre), src) {
+            has_main = true
+        }
+    }
+    check(acc, "hosted main kept", has_main, "")
+    check(acc, "no _start entry", !src.contains("void _start"), "")
+    check(acc, "stdio kept", src.contains("#include <stdio.h>"), "")
+    check(acc, "no freestanding markers",
+        !src.contains("HL_FREESTANDING") && !src.contains("__builtin_trap"), "")
+    check(acc, "core fns compiled",
+        src.contains("usf_option_unwrap") && src.contains("usf_iter_sum_int")
+            && src.contains("usf_eq_map_str_int") && src.contains("usf_parse_int"), "")
+    let out2: str = scratch(acc, "f.c")
+    let r2: RunResult = boot(acc, ["src/hlc.hls",
+        "tests/fail/fail_nostd_std_import.hls", out2])
+    let low: str = str_to_lower_ascii(r2.combined)
+    check(acc, "hlc rejects no_std std-import",
+        r2.code != 0 && low.contains("no_std"), clip(r2.combined, 120))
+}
+
+# ----------------------------------------------------------------------------
+# 7. hlfmt stability + mode distinction
+# ----------------------------------------------------------------------------
+fn sec7(acc: Acc) -> void uses IO, Proc {
+    section("7. hlfmt stability; no_std is not freestanding")
+    let files: list[str] = [demo(), ok_test(),
+        "core/option.hls", "core/result.hls", "core/iter.hls",
+        "core/clone.hls", "core/eq.hls"]
+    let mut i: int = 0
+    while i < files.len() {
+        let r: RunResult = run_capture("python3", ["tools/hlfmt.py", "-c", files.get(i)])
+        check(acc, "hlfmt clean: " + basename(files.get(i)),
+            !r.out.contains("NOT formatted"), clip(r.out, 80))
+        i = i + 1
+    }
+    # The old battery read the checker's crate_mode_flags off the AST;
+    # the --audit crate-mode line publishes the same fact.
+    let p: str = write_src(acc, "m.hls", "#![no_std]\nfn main() -> int { return 0 }\n")
+    let r: RunResult = boot(acc, ["--audit", p])
+    let line: str = first_line_containing(r.out, "Crate mode:")
+    check(acc, "no_std flags exact (no_std, not freestanding)",
+        r.code == 0 && line.contains("#![no_std]") && !line.contains("freestanding"),
+        clip(line, 80))
+}
+
+# first_line_containing(text, needle) — "" when absent.
+fn first_line_containing(text: str, needle: str) -> str {
+    let lines: list[str] = text.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).contains(needle) {
+            return lines.get(i).trim()
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let acc: Acc = acc_new("nostd")
+    sec1(acc)
+    sec2(acc)
+    sec3(acc)
+    sec4(acc)
+    sec5(acc)
+    sec6(acc)
+    sec7(acc)
+    return finish(acc, "Stage 78 -- #![no_std] + core modules (Option/Result/Iterator/Clone/Eq)")
+}
