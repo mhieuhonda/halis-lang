@@ -10415,3 +10415,114 @@ Stage 145 (the LTS policy) and the RC series (146–149) follow
 from here, and the RCs inherit this stage's law: no candidate
 is cut while the gate is red, and the first thing the release
 process runs is `make finalaudit-gate`.
+
+## 83. The published LTS policy — 3 years bug-fix, 5 years security (Stage 145 — v0.166.0-alpha)
+
+Stage 132 (§71) made the branch policy executable: WHAT may land on
+an LTS line. This stage publishes the other half of the promise —
+WHEN. The roadmap's phrase is "3 years bug-fix, 5 years security",
+and a promise of that shape has to live in two places at once: a
+document a user can read without running anything, and a gate that
+refuses what the document forbids. One without the other is either
+prose or an undocumented refusal. `tools/hls-lts.py` and `LTS.md`
+are those two places, wired so they cannot drift apart.
+
+### 83.1. The publication
+
+- `LTS.md` sits at the repository root and is a RENDER, not a
+  maintained document: `hls-lts policy` derives it from the tool's
+  own constants (`BUGFIX_YEARS = 3`, `SECURITY_YEARS = 5`), so the
+  numbers on the page are the numbers the gates enforce — there is
+  no second source of truth to edit around.
+- The render is deterministic: no timestamps, no tree shas, two runs
+  byte-identical. `make lts-policy-verify` (`hls-lts policy
+  --check`) re-derives the committed copy and refuses drift, naming
+  the regenerate command; a tree without the document says it is
+  not published here.
+
+### 83.2. The line and the calendar
+
+- An LTS line is a major.minor. The window belongs to the LINE, not
+  to each patch: it is measured from the committer day of the base
+  release (`vMAJOR.MINOR.0`'s commit), and every patch on the line
+  lives inside the same window. A line born late does not get a late
+  window; a patch cut late does not extend one.
+- `base + N years` is an anniversary — the same month and day, with
+  February 29 clamped to the 28th when the target year is not a leap
+  year (a line born 2024-02-29 is bug-fixed through 2027-02-28). The
+  policy speaks in days: every date is a calendar day read from
+  git's committer timestamp.
+- The horizon day itself belongs to the phase it closes: the third
+  birthday is the last full-support day, the day after it is
+  security-only; the fifth birthday is the last supported day, the
+  day after it is end of life.
+
+### 83.3. The three phases and the marking
+
+- `active` (base → +3 years): any BUGFIX backport and chores land.
+  `security` (+3 → +5): SECURITY-marked BUGFIX backports and
+  chores land. `eol` (past +5): nothing lands — a dead line takes
+  nothing, not even bookkeeping.
+- A bug fix is a SECURITY fix when its message carries a
+  `Security: <reason>` line — the name case-insensitive, the value
+  non-empty, the first such line decides. Fail-closed: no trailer,
+  no security claim. The marking is a fact beside the class
+  (`hls-lts classify` reports both), never a key past the class law
+  — a marked FEATURE is still a FEATURE, and still refused.
+
+### 83.4. The enforcement
+
+- `hls-lts window [--tag vX.Y.Z] [--at DAY]` reads the window: the
+  base day, both horizons, the phase at a day, the days remaining.
+  `--at` pins the clock (default: today) so no gate depends on when
+  it runs; `--tag` judges any release tag without a declaration
+  (the tag must be a >= 1.0.0 release — the windows begin where the
+  policy does).
+- `backport` grows two gates: end of life refuses everything before
+  any other question; the security phase refuses a plain BUGFIX
+  with both horizons named. `--dry-run` reflects the phase.
+- `tag-patch` cuts no release past end of life, and in the security
+  phase requires at least one security backport since the previous
+  tag — a chore-only release is how a security line pretends to be
+  alive.
+- `audit` judges history by the day each commit landed: an
+  unmarked backport that arrived in the security window, any commit
+  past end of life, and any tag cut from a commit dated past end of
+  life are violations, named sha by sha. The base day git cannot
+  name is itself a violation — the audit refuses to judge history
+  it cannot date.
+- `status` prints the live window (the phase today, both horizons);
+  the declaration gains no fields and `halis-lts-1` keeps its name:
+  the window law is the same policy grown its second dimension,
+  derived live from the base tag every time.
+
+### 83.5. What the tests prove
+
+`make lts-policy-acceptance` (9 sections, 61 checks) drives the
+real CLI over scratch repositories whose birthdays are fabricated
+on command (GIT_COMMITTER_DATE) — a support window cannot wait
+three years to be tested: the convention (the `--at` grammar, both
+missing-policy remedies named, the publication live on the real
+tree), the calendar law (the February-29 clamp through both
+horizons, each boundary day on each side), the phase machine
+(`--json` exact, the same law through the declaration and through
+`--tag`), the marking law (the trailer grammar end to end), the
+backport window law (refusals with horizons, the marked landing,
+the dead line, the moved clock), the tag law, the audit law (the
+unmarked landing, the posthumous commit, the posthumous tag), and
+the publication law (determinism, the byte-identical committed
+copy, the refused drift). The corpus fixture
+`tests/ok/feat_stage145_ltspolicy.hls` pins the decision procedure
+in pure HLS — the leap-year grammar and anniversary arithmetic over
+Stage 131's date keys, the phase machine with its closed horizons,
+the marking grammar, the admission law per phase — hlfmt-canonical,
+hllint-clean, byte-identical on the interpreter and natively.
+Stage 132's own gate still passes untouched (`make
+lts-acceptance`, 106 checks): the second dimension was added
+without bending the first.
+
+The policy begins at v1.0 — a pre-1.0 LTS is a contradiction, and
+`window --tag` refuses a pre-1.0 tag by name. Until the first line
+is declared, LTS.md is the promise and the gates prove the
+enforcement on scratch lines with fabricated birthdays; the day
+`hls-lts init --tag v1.0.0` runs, the document becomes the clock.

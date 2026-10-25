@@ -1,5 +1,20 @@
 # Security policy — Halis (HLS)
 
+## Support windows (Stage 145 — v0.166.0-alpha)
+
+Every LTS line gets **3 years of bug-fix support** and **5 years of
+security support**, counted from the day its base release was cut.
+The last two years are security-only: after the third anniversary
+a plain bug fix is refused on the line, and after the fifth the
+line is dead and takes nothing. The full policy — the phases, the
+calendar, what makes a fix a security fix, what the tool refuses —
+is published in [LTS.md](LTS.md), rendered from the constants the
+`hls-lts` gates enforce and re-derived on every run
+(`make lts-policy-verify`). A security fix meant for backport
+carries a `Security: <reason>` trailer in its commit message; the
+audit judges every LTS line's history by the day each commit
+landed.
+
 ## Security model of the language (v0.30.0-alpha)
 
 Halis is designed so that **safety is the default state**. Four layers

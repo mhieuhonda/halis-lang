@@ -304,6 +304,36 @@ make lts-acceptance           # Stage 132 gate: the LTS battery
                                # repos, the tag law, the audit law,
                                # the release train, the corpus
                                # showcase)
+python3 tools/hls-lts.py window --tag v1.0.0 --at 2029-06-15
+                               # Stage 145: the published support
+                               # windows — 3 years bug-fix, 5 years
+                               # security, counted from the base
+                               # release's committer day: the phase
+                               # (active / security / eol) at any
+                               # day, anniversaries with the
+                               # February-29 clamp, the horizon day
+                               # belonging to the phase it closes;
+                               # a `Security: <reason>` trailer
+                               # marks a fix for the security-only
+                               # years; backport refuses plain fixes
+                               # there and everything on a dead
+                               # line, tag-patch cuts no release
+                               # past end of life, audit judges
+                               # history by the day it landed
+cat LTS.md                    # the policy on paper — a render from
+                               # the tool's own constants, not a
+                               # second truth to edit around
+make lts-policy-verify        # re-derive the committed LTS.md
+                               # (a hand-edited policy is visible
+                               # as a diff; drift is a refusal)
+make lts-policy-acceptance    # Stage 145 gate: the window battery
+                               # (the calendar law, the phase
+                               # machine, the marking law, the
+                               # backport/tag/audit window gates,
+                               # the publication law — over scratch
+                               # repos with fabricated birthdays,
+                               # because a support window cannot
+                               # wait three years to be tested)
 python3 tools/hls-xdiff.py     # Stage 133: the cross-impl
                                # differential table — the SAME
                                # program through the interpreter,
@@ -847,6 +877,9 @@ halis-lang/
 ├── SPEC.md              # Language constitution (full v0.30 spec)
 ├── ROADMAP.md           # 150-stage roadmap to v1.0
 ├── SECURITY.md          # Threat model & security policy
+├── LTS.md               # Stage 145: the published support policy (3y
+│                        #   bug-fix, 5y security) — rendered from the
+│                        #   hls-lts constants, verified every run
 ├── snapshot/            # Stage 142: the committed C snapshot — the seed the
 │   ├── hlc.c            #   pure bootstrap compiles (hlc's own emission for
 │   └── MANIFEST.json    #   src/hlc.hls) + its content-addressed manifest
