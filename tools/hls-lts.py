@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""hls-lts — the Stage 132 LTS branch policy (`backport-only after v1.0`).
+"""hls-lts — the Stage 132 LTS branch policy (`backport-only after v1.0`)
+and the Stage 145 support windows (`3 years bug-fix, 5 years security`).
 
 Usage:
   python3 tools/hls-lts.py init --tag v1.0.0 [--branch release/1.0] [--repo PATH]
   python3 tools/hls-lts.py status  [--repo PATH] [--json]
   python3 tools/hls-lts.py classify <commit> [--repo PATH] [--json]
   python3 tools/hls-lts.py backport <commit> [--branch release/1.0]
-                                     [--repo PATH] [--dry-run]
+                                     [--repo PATH] [--dry-run] [--at DATE]
   python3 tools/hls-lts.py tag-patch [--tag vX.Y.Z] [--branch release/1.0]
-                                     [--repo PATH] [--dry-run]
+                                     [--repo PATH] [--dry-run] [--at DATE]
   python3 tools/hls-lts.py audit    [--branch release/1.0] [--repo PATH] [--json]
+  python3 tools/hls-lts.py window   [--tag vX.Y.Z] [--at DATE]
+                                     [--repo PATH] [--json]
+  python3 tools/hls-lts.py policy   [--out PATH] [--repo PATH] [--check]
 
 The roadmap's phrase is the scope: "LTS branch policy (backport-only
 after v1.0)". Stage 132 turns that phrase into an executable policy.
@@ -58,6 +62,50 @@ Commands:
              is BUGFIX) or a chore; each tag must obey the version
              law. Exit 1 names every violation.
 
+Stage 145 publishes the second dimension of the same policy — the
+SUPPORT WINDOWS. The roadmap's phrase is the promise: "3 years
+bug-fix, 5 years security". A published promise a tool cannot read
+is prose; these commands make it arithmetic:
+
+  window     print the line's support window: the day the base
+             release was cut (the commit's committer day), the day
+             bug fixes stop (base + 3 years), the day everything
+             stops (base + 5 years), and the phase at a given day —
+             `active`, `security` or `eol`. `--at` pins the clock
+             (default: today); `--tag` judges any release tag
+             without a declaration.
+  policy     render the published policy document (LTS.md) from the
+             tool's own constants — deterministic, so two renders
+             are byte-identical and a hand-edited document is
+             visible as a diff. `--check` re-derives the committed
+             copy and refuses drift; `--out` regenerates it.
+
+The window laws, enforced where a change would enter the branch:
+
+  - the MARKING law: a bug fix is a SECURITY fix when its message
+    carries a `Security: <reason>` trailer (one line, non-empty
+    value — the first such line decides; fail-closed: no trailer,
+    no security claim). The class gates are unchanged — a marked
+    FEATURE is still a FEATURE, and still refused.
+  - the BACKPORT law: in the `active` phase any BUGFIX may land; in
+    the `security` phase only marked fixes may; in `eol` nothing
+    lands — a dead line takes nothing, not even chores.
+  - the RELEASE law: no tag is cut past end of life, and a release
+    cut in the security phase carries at least one marked backport
+    (a chore-only release is how a security line pretends to be
+    alive).
+  - the AUDIT law: history is judged the day it landed — a backport
+    that arrived in the security phase without the mark, or any
+    commit or tag past end of life, is a violation named sha by sha.
+
+The calendar speaks in anniversaries: base + N years is the same
+month and day, with February 29 clamped to the 28th when the target
+year is not a leap year, and the horizon day itself belongs to the
+phase it closes (support runs THROUGH the anniversary, not up to
+it). The declaration gains no fields and the policy version stays
+`halis-lts-1`: the window law is the same policy grown its second
+dimension, derived live from the base tag every time.
+
 Exit codes: 0 ok, 1 policy refusal (the rule is named on stdout/stderr),
 2 usage error. Every refusal names the RULE, not just the fact.
 
@@ -67,6 +115,7 @@ project, from the package manifest to the release train.
 """
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import re
@@ -86,6 +135,38 @@ DEFAULT_UPSTREAM = "main"
 
 TRAILER = "Backported-from"
 CHERRY_MARK = "(cherry picked from commit "
+
+# The Stage 145 support windows, in years. BUGFIX_YEARS is the full
+# window (any qualifying fix lands); SECURITY_YEARS is the total
+# horizon — the last two years of a five-year line are security-only.
+# These constants are the single source of truth: `policy` renders
+# the published document from them, and `make lts-policy-verify`
+# re-derives the committed copy against the same render.
+BUGFIX_YEARS = 3
+SECURITY_YEARS = 5
+
+# The security marking: a `Security: <reason>` line in the commit
+# message (name matched case-insensitively, like Backported-from).
+SECURITY_TRAILER = "Security"
+
+# The published document (rendered by `policy`, committed at the
+# repository root, verified by `policy --check`).
+POLICY_DOC = "LTS.md"
+
+PHASE_ACTIVE = "active"
+PHASE_SECURITY = "security"
+PHASE_EOL = "eol"
+
+PHASE_MEANING = {
+    PHASE_ACTIVE: "bug-fix and security backports land",
+    PHASE_SECURITY: "security backports only — plain fixes are refused",
+    PHASE_EOL: "end of life — nothing lands on a dead line",
+}
+
+# The --at grammar: a plain ISO day, YYYY-MM-DD. The policy speaks in
+# days; the clock it reads can be pinned, so the gates and CI never
+# depend on when they run.
+DAY_RE = re.compile(r"^([0-9]{4})-([0-9]{2})-([0-9]{2})$")
 
 # ---------------------------------------------------------------------------
 # The message law. The prefix table is the project's own commit
@@ -344,7 +425,10 @@ def _diff_gate(git: Git, sha: str, cls: str) -> Tuple[str, List[str]]:
 def classify_commit(git: Git, sha: str) -> Dict:
     """Classify one commit. The message law first; the diff gate may
     re-class a BUGFIX into a FEATURE. The default is UNKNOWN — the
-    fail-closed law."""
+    fail-closed law. The Stage 145 marking rides along as a fact,
+    not a class: `security` is true only when a `Security:` trailer
+    stands in the message, whatever the class — a marked FEATURE is
+    still a FEATURE, and still refused."""
     msg = git.message(sha)
     subject = msg.splitlines()[0] if msg.splitlines() else ""
     m = PREFIX_RE.match(subject)
@@ -362,18 +446,146 @@ def classify_commit(git: Git, sha: str) -> Dict:
     cls, extra = _diff_gate(git, sha, cls)
     reasons = ([reason] if not extra else [reason] + extra) \
         if cls != "UNKNOWN" else [reason]
+    mark = _security_mark(msg)
     return {
         "sha": git.rev_parse(sha) or sha,
         "subject": subject,
         "class": cls,
         "reason": reasons[0] if reasons else reason,
         "reasons": reasons,
+        "security": mark is not None,
+        "security_reason": mark,
     }
 
 
 def is_backport_commit(git: Git, sha: str) -> bool:
     return _trailer_sha(git.message(sha)) is not None \
         or CHERRY_MARK in git.message(sha)
+
+
+# ---------------------------------------------------------------------------
+# The Stage 145 window law — the calendar, the phases, the marking.
+# ---------------------------------------------------------------------------
+
+def _security_mark(message: str) -> Optional[str]:
+    """The marking law. A bug fix is a security fix when its message
+    carries a `Security: <reason>` line — the name matched case-
+    insensitively (git trailers are case-insensitive by convention),
+    the value stripped; the FIRST such line decides, and an empty
+    value is not a marking (fail-closed: no trailer, no claim)."""
+    for line in message.splitlines():
+        s = line.strip()
+        if s.lower().startswith(SECURITY_TRAILER.lower() + ":"):
+            val = s.split(":", 1)[1].strip()
+            return val if val else None
+    return None
+
+
+def _commit_day(iso: str) -> Optional[datetime.date]:
+    """The day a commit landed: the committer timestamp's date part
+    (git's %cI — the clock the project's landing laws already read)."""
+    if not iso:
+        return None
+    m = DAY_RE.match(iso.strip()[:10])
+    if not m:
+        return None
+    try:
+        return datetime.date(int(m.group(1)), int(m.group(2)),
+                             int(m.group(3)))
+    except ValueError:
+        return None
+
+
+def _parse_day(text: str) -> Optional[datetime.date]:
+    m = DAY_RE.match(text.strip() if text else "")
+    if not m:
+        return None
+    try:
+        return datetime.date(int(m.group(1)), int(m.group(2)),
+                              int(m.group(3)))
+    except ValueError:
+        return None
+
+
+def _days_in_month(year: int, month: int) -> int:
+    if month == 2:
+        leap = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+        return 29 if leap else 28
+    if month in (4, 6, 9, 11):
+        return 30
+    return 31
+
+
+def _add_years(day: datetime.date, years: int) -> datetime.date:
+    """The anniversary: same month and day, with February 29 clamped
+    to the 28th when the target year is not a leap year. A promise of
+    `3 years` speaks in anniversaries, not in 1095 fixed days."""
+    y = day.year + years
+    d = day.day
+    if day.month == 2 and d == 29 and _days_in_month(y, 2) < d:
+        d = 28
+    return datetime.date(y, day.month, d)
+
+
+def _window(base: datetime.date) -> Dict:
+    """The line's two horizons, from the day the base release was cut."""
+    return {
+        "bug_fix_until": _add_years(base, BUGFIX_YEARS),
+        "security_until": _add_years(base, SECURITY_YEARS),
+    }
+
+
+def _phase_at(base: datetime.date, at: datetime.date) -> str:
+    """The phase on a given day. The horizon day itself belongs to the
+    phase it closes: support runs THROUGH the anniversary, so the
+    third birthday is the last full-support day and the day after it
+    is security-only; the fifth birthday is the last supported day
+    and the day after it is end of life."""
+    w = _window(base)
+    if at <= w["bug_fix_until"]:
+        return PHASE_ACTIVE
+    if at <= w["security_until"]:
+        return PHASE_SECURITY
+    return PHASE_EOL
+
+
+def _line_base_day(git: Git, pol: Dict) -> Optional[datetime.date]:
+    """The day the declared line was born: the committer day of the
+    base tag's commit. Support is measured from the BASE release
+    (vMAJOR.MINOR.0's day), not from each patch — the window belongs
+    to the line, and every patch on it lives inside the same one."""
+    sha = pol.get("base_sha")
+    if not sha:
+        return None
+    return _commit_day(git.commit_time(sha))
+
+
+def _line_base_day_of_tag(git: Git, tag: str) -> Optional[datetime.date]:
+    sha = git.tag_sha(tag)
+    if not sha:
+        return None
+    return _commit_day(git.commit_time(sha))
+
+
+def _window_payload(base_day: datetime.date, at: datetime.date) -> Dict:
+    w = _window(base_day)
+    phase = _phase_at(base_day, at)
+    return {
+        "base_date": base_day.isoformat(),
+        "bug_fix_until": w["bug_fix_until"].isoformat(),
+        "security_until": w["security_until"].isoformat(),
+        "at": at.isoformat(),
+        "phase": phase,
+        "days_bugfix_left": (w["bug_fix_until"] - at).days,
+        "days_security_left": (w["security_until"] - at).days,
+    }
+
+
+def _resolve_at(args) -> Optional[datetime.date]:
+    """--at pins the clock the policy reads. Default: today."""
+    if not getattr(args, "at", None):
+        return datetime.date.today()
+    return _parse_day(args.at)
 
 
 # ---------------------------------------------------------------------------
@@ -491,16 +703,32 @@ def cmd_status(args) -> int:
     commits = git.commits(base_sha, branch)
     tags = [t for t in git.tags_on(branch) if semver.tag_version(t)]
     violations = audit_violations(git, pol)
+
+    # The Stage 145 window, live: where the line stands today.
+    base_day = _line_base_day(git, pol)
+    win = _window_payload(base_day, datetime.date.today()) \
+        if base_day is not None else None
+
     if args.json:
-        print(json.dumps({
+        data = {
             "policy": pol,
             "commits_since_base": len(commits),
             "tags": tags,
             "violations": violations,
-        }, indent=2))
+            "window": win,
+        }
+        print(json.dumps(data, indent=2))
     else:
         print("LTS policy %s — branch %s from %s (%s)"
               % (pol["policy"], branch, pol["base_tag"], base_sha[:12]))
+        if win is not None:
+            print("window: bug fixes until %s, security until %s — "
+                  "phase today: %s (%s)"
+                  % (win["bug_fix_until"], win["security_until"],
+                     win["phase"], PHASE_MEANING[win["phase"]]))
+        else:
+            print("window: the base commit's day cannot be read — the "
+                  "phase is unknown (fail-closed)")
         print("commits since base: %d" % len(commits))
         print("tags on branch: %s"
               % (", ".join(tags) if tags else "(none yet)"))
@@ -526,6 +754,11 @@ def cmd_classify(args) -> int:
         print("commit %s" % c["sha"])
         print("  subject: %s" % c["subject"])
         print("  class:   %s" % c["class"])
+        if c["security"]:
+            print("  security: marked — %s" % c["security_reason"])
+        else:
+            print("  security: unmarked — no 'Security: <reason>' trailer "
+                  "in the message (fail-closed)")
         for r in c["reasons"]:
             print("  - %s" % r)
     return 0
@@ -566,14 +799,44 @@ def cmd_backport(args) -> int:
                    "commit or stash them first (the tool refuses to "
                    "stomp work)", 1)
 
+    # The Stage 145 window gate, part one: the phase. A dead line
+    # takes nothing — not even a chore, not even a question about
+    # the commit's class; the refusal names the day the line died.
+    at = _resolve_at(args)
+    if at is None:
+        return die("backport: --at must be a plain ISO day, YYYY-MM-DD "
+                   "(the policy speaks in days)", 1)
+    base_day = _line_base_day(git, pol)
+    if base_day is None:
+        return die("backport: the base commit's day cannot be read from "
+                   "git — the window law refuses to guess (fail-closed)",
+                   1)
+    phase = _phase_at(base_day, at)
+    w = _window(base_day)
+    if phase == PHASE_EOL:
+        print("backport: REFUSED — the LTS line of %s reached end of "
+              "life on %s — nothing lands on a dead line (judged at %s)"
+              % (pol["base_tag"], w["security_until"].isoformat(),
+                 at.isoformat()))
+        return 1
+
     c = classify_commit(git, sha)
     if args.dry_run:
         print("backport: dry run")
         print("  upstream commit %s (%s)" % (sha[:12], c["subject"]))
         print("  class: %s — %s" % (c["class"], c["reason"]))
+        print("  window: %s (since %s, until %s; judged at %s)"
+              % (phase, w["bug_fix_until"].isoformat(),
+                 w["security_until"].isoformat(), at.isoformat()))
+        if c["security"]:
+            print("  security: marked — %s" % c["security_reason"])
         if c["class"] == "BUGFIX":
-            print("  would cherry-pick onto %s with a '%s: %s' trailer"
-                  % (branch, TRAILER, sha))
+            if phase == PHASE_SECURITY and not c["security"]:
+                print("  would refuse: the line is security-only and "
+                      "this fix carries no 'Security:' trailer")
+            else:
+                print("  would cherry-pick onto %s with a '%s: %s' "
+                      "trailer" % (branch, TRAILER, sha))
         else:
             print("  would refuse: only BUGFIX commits may be backported")
         return 0
@@ -584,6 +847,18 @@ def cmd_backport(args) -> int:
         print("  reason: %s" % c["reason"])
         for r in c["reasons"][1:]:
             print("  - %s" % r)
+        return 1
+
+    # The window gate, part two: the security-only phase takes only
+    # marked fixes. The class law said WHAT the commit is; the window
+    # law says whether the line still wants it.
+    if phase == PHASE_SECURITY and not c["security"]:
+        print("backport: REFUSED — the LTS line of %s is security-only "
+              "since %s (until %s, judged at %s): only fixes marked "
+              "'Security: <reason>' may land — this one carries no "
+              "Security trailer"
+              % (pol["base_tag"], w["bug_fix_until"].isoformat(),
+                 w["security_until"].isoformat(), at.isoformat()))
         return 1
 
     git.run("checkout", "-q", branch)
@@ -604,6 +879,15 @@ def cmd_backport(args) -> int:
         print("backport: applied %s onto %s as %s"
               % (sha[:12], branch, picked[:12]))
         print("  provenance: %s: %s" % (TRAILER, sha))
+        if phase == PHASE_SECURITY:
+            print("  window: security-only — the line takes security "
+                  "fixes until %s"
+                  % w["security_until"].isoformat())
+        else:
+            print("  window: %s — the line takes bug fixes until %s "
+                  "(security until %s)"
+                  % (phase, w["bug_fix_until"].isoformat(),
+                     w["security_until"].isoformat()))
         git.run("checkout", "-q", original)
         return 0
     except RuntimeError as exc:
@@ -644,6 +928,28 @@ def cmd_tag_patch(args) -> int:
         return die("tag-patch: branch '%s' is not the declared LTS branch "
                    "('%s')" % (branch, pol["branch"]))
     base = semver.tag_version(pol["base_tag"])
+
+    # The Stage 145 window gate: no release is cut from a dead line.
+    # Judged before anything else — the empty-release question does
+    # not even arise on a line that ended.
+    at = _resolve_at(args)
+    if at is None:
+        return die("tag-patch: --at must be a plain ISO day, YYYY-MM-DD "
+                   "(the policy speaks in days)", 1)
+    base_day = _line_base_day(git, pol)
+    if base_day is None:
+        return die("tag-patch: the base commit's day cannot be read from "
+                   "git — the window law refuses to guess (fail-closed)",
+                   1)
+    phase = _phase_at(base_day, at)
+    w = _window(base_day)
+    if phase == PHASE_EOL:
+        print("tag-patch: REFUSED — no release is cut from a dead line: "
+              "the LTS line of %s reached end of life on %s (judged at "
+              "%s)" % (pol["base_tag"],
+                       w["security_until"].isoformat(),
+                       at.isoformat()))
+        return 1
 
     # The last LTS tag on the branch: same major.minor, the highest
     # patch. The chain starts at the base tag itself.
@@ -696,6 +1002,28 @@ def cmd_tag_patch(args) -> int:
               "release is not a release (backport a fix first)"
               % last_tag)
         return 1
+
+    # The security-release law: a release cut in the security-only
+    # phase carries at least one marked backport since the previous
+    # tag. A chore-only release in that phase is how a security line
+    # pretends to be alive — the refusal names it as such.
+    if phase == PHASE_SECURITY:
+        marked = 0
+        for csha in git.commits(since_sha, branch):
+            t = _trailer_sha(git.message(csha))
+            if t is None:
+                continue
+            up = git.rev_parse(t)
+            if up is not None and classify_commit(git, up)["security"]:
+                marked += 1
+        if marked == 0:
+            print("tag-patch: REFUSED — a release in the security-only "
+                  "phase carries at least one security backport — since "
+                  "%s there is none (chore-only releases are how a "
+                  "security line pretends to be alive; judged at %s)"
+                  % (last_tag, at.isoformat()))
+            return 1
+
     if git.tag_exists(want):
         return die("tag-patch: tag '%s' already exists — the chain has "
                    "no duplicates" % want)
@@ -717,6 +1045,19 @@ def audit_violations(git: Git, pol: Dict) -> List[str]:
     violations: List[str] = []
     branch = pol["branch"]
     base_sha = pol["base_sha"]
+
+    # The Stage 145 window the history is judged against. Fail-closed:
+    # a base day git cannot name is itself a violation — the audit
+    # refuses to judge history it cannot date.
+    base_day = _line_base_day(git, pol)
+    if base_day is not None:
+        w = _window(base_day)
+    else:
+        w = None
+        violations.append(
+            "the base commit's day cannot be read — the window law "
+            "refuses to judge history it cannot date (fail-closed)")
+
     for sha in git.commits(base_sha, branch):
         msg = git.message(sha)
         subject = msg.splitlines()[0] if msg.splitlines() else ""
@@ -726,6 +1067,23 @@ def audit_violations(git: Git, pol: Dict) -> List[str]:
                           msg)
             if m and git.rev_parse(m.group(1)):
                 trailer = git.rev_parse(m.group(1))
+
+        # The window audit, part one: WHEN it landed. History is judged
+        # the day it happened — a commit past end of life is a commit
+        # on a dead line, whatever else it is.
+        landed = _commit_day(git.commit_time(sha))
+        past_eol = w is not None and landed is not None \
+            and landed > w["security_until"]
+        in_security = w is not None and landed is not None \
+            and w["bug_fix_until"] < landed <= w["security_until"]
+        if past_eol:
+            violations.append(
+                "%s '%s' landed on %s, past end of life (%s) — a dead "
+                "line takes nothing, not even bookkeeping"
+                % (sha[:12], subject[:60], landed.isoformat(),
+                   w["security_until"].isoformat()))
+            continue
+
         if trailer is None:
             c = classify_commit(git, sha)
             if c["class"] == "CHORE":
@@ -751,6 +1109,19 @@ def audit_violations(git: Git, pol: Dict) -> List[str]:
                 % (sha[:12], subject[:60], trailer[:12], c["class"],
                    c["reason"]))
             continue
+
+        # The window audit, part two: WHAT landed in the security-only
+        # phase — a plain fix that arrived after the bug-fix horizon
+        # is a violation even though the class law smiled on it.
+        if in_security and not c["security"]:
+            violations.append(
+                "%s '%s' landed in the security-only phase (on %s, after "
+                "%s) without a Security mark — plain fixes do not land "
+                "in that window"
+                % (sha[:12], subject[:60], landed.isoformat(),
+                   w["bug_fix_until"].isoformat()))
+            continue
+
         # The backport's own diff must not introduce surface either
         # (conflict resolution is where features sneak in).
         c2 = classify_commit(git, sha)
@@ -784,6 +1155,19 @@ def audit_violations(git: Git, pol: Dict) -> List[str]:
         law = _lts_tag_law(pol, v, t)
         if law is not None:
             violations.append("tag %s: %s" % (t, law))
+            continue
+
+        # The window audit, part three: a release cut past end of
+        # life. A release is cut from the commit it names; the commit's
+        # day is the release's day.
+        tday = _line_base_day_of_tag(git, t)
+        if w is not None and tday is not None \
+                and tday > w["security_until"]:
+            violations.append(
+                "tag %s is cut from a commit dated %s, past end of life "
+                "(%s) — no release from a dead line"
+                % (t, tday.isoformat(),
+                   w["security_until"].isoformat()))
             continue
         chain.append((v.patch, t))
     chain.sort()
@@ -824,6 +1208,227 @@ def cmd_audit(args) -> int:
     return 0
 
 
+def cmd_window(args) -> int:
+    repo = _require_repo(_repo_arg(args))
+    git = Git(repo)
+
+    at = _resolve_at(args)
+    if at is None:
+        return die("window: --at must be a plain ISO day, YYYY-MM-DD "
+                   "(the policy speaks in days)", 1)
+
+    # The line to judge: the declaration's, or any release tag named
+    # explicitly. Both roads meet at the same law: the tag must parse
+    # as semver and be a >= 1.0.0 release (the windows begin where
+    # the policy does).
+    if args.tag:
+        v = semver.tag_version(args.tag)
+        if v is None:
+            return die("window: tag '%s' is not a valid semantic version"
+                       % args.tag, 1)
+        if v.prerelease:
+            return die("window: tag '%s' carries a pre-release — the "
+                       "support windows are a release's promise" % args.tag,
+                       1)
+        if v.major < 1:
+            return die("window: tag '%s' is pre-1.0 — the policy begins "
+                       "after v1.0" % args.tag, 1)
+        if not git.tag_exists(args.tag):
+            return die("window: tag '%s' does not exist in the repository"
+                       % args.tag, 1)
+        base_day = _line_base_day_of_tag(git, args.tag)
+        label = args.tag
+    else:
+        pol = load_policy(git)
+        if pol is None:
+            return die("window: no LTS policy declared — name a tag with "
+                       "`window --tag v1.0.0`, or declare the line with "
+                       "`hls-lts init --tag v1.0.0`", 1)
+        base_day = _line_base_day(git, pol)
+        label = pol["base_tag"]
+
+    if base_day is None:
+        return die("window: the base commit's day cannot be read from "
+                   "git — the window law refuses to guess (fail-closed)",
+                   1)
+
+    win = _window_payload(base_day, at)
+    if args.json:
+        win["base_tag"] = label
+        print(json.dumps(win, indent=2))
+        return 0
+
+    print("LTS line of %s — base released %s" % (label, win["base_date"]))
+    print("  bug fixes until:  %s (through the anniversary day)"
+          % win["bug_fix_until"])
+    print("  security until:   %s (through the anniversary day)"
+          % win["security_until"])
+    print("  phase at %s: %s — %s"
+          % (win["at"], win["phase"], PHASE_MEANING[win["phase"]]))
+    if win["phase"] == PHASE_ACTIVE:
+        print("  full support days left: %d (then security-only until %s)"
+              % (win["days_bugfix_left"], win["security_until"]))
+    elif win["phase"] == PHASE_SECURITY:
+        print("  security-only days left: %d" % win["days_security_left"])
+    else:
+        print("  the line ended %s — %d days past end of life"
+              % (win["security_until"], -win["days_security_left"]))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# The published document (Stage 145). Rendered from the constants above,
+# deterministic per input: two renders are byte-identical, and a
+# hand-edited copy is visible as a diff.
+# ---------------------------------------------------------------------------
+
+def render_policy() -> str:
+    L: List[str] = []
+    a = L.append
+    a("# Long-term support policy — Halis (HLS)")
+    a("")
+    a("Generated from the live constants of `tools/hls-lts.py` —")
+    a("this document is rendered, not maintained. Do not hand-edit;")
+    a("regenerate it with `python3 tools/hls-lts.py policy --out")
+    a("LTS.md`. `make lts-policy-verify` re-derives the committed copy")
+    a("against the same render and refuses drift — the numbers below")
+    a("are the numbers the gates enforce, or the tree says no.")
+    a("")
+    a("## The promise")
+    a("")
+    a("Every LTS line this project opens gets **%d years of bug-fix"
+      % BUGFIX_YEARS)
+    a("support** and **%d years of security support**, counted from"
+      % SECURITY_YEARS)
+    a("the day its base release was cut. The last %d years of a %d-year"
+      % (SECURITY_YEARS - BUGFIX_YEARS, SECURITY_YEARS))
+    a("line are security-only: after the third anniversary a plain")
+    a("bug fix is refused on the line even when it is a perfectly good")
+    a("fix, and after the fifth the line is dead and takes nothing at")
+    a("all. A published promise a tool cannot read is prose; this one")
+    a("is arithmetic (`hls-lts window`), it is enforced where a change")
+    a("would enter the branch (`hls-lts backport`, `hls-lts")
+    a("tag-patch`), and it audits history after the fact (`hls-lts")
+    a("audit`).")
+    a("")
+    a("## The line, and the day it is measured from")
+    a("")
+    a("An LTS line is a major.minor — `1.0` is the line of `v1.0.0`,")
+    a("`v1.0.1`, `v1.0.2` and every patch after. The window belongs to")
+    a("the LINE, not to each patch: it is measured from the committer")
+    a("day of the base release (`vMAJOR.MINOR.0`'s commit), and every")
+    a("patch on the line lives inside the same window. A line born")
+    a("late does not get a late window; a patch cut late does not")
+    a("extend one. `hls-lts init --tag vX.Y.0` declares the line;")
+    a("`hls-lts window` reads it, with `--at` to pin the day the law")
+    a("is judged on (default: today) — the same law, on any day.")
+    a("")
+    a("## The three phases")
+    a("")
+    a("| phase | days | what may land on the line |")
+    a("|-------|------|----------------------------|")
+    a("| `active` | base → base +%d years | any BUGFIX backport and "
+      "chores |" % BUGFIX_YEARS)
+    a("| `security` | base +%d → +%d years | SECURITY-marked BUGFIX "
+      "backports and chores |" % (BUGFIX_YEARS, SECURITY_YEARS))
+    a("| `eol` | past base +%d years | nothing — a dead line takes "
+      "nothing |" % SECURITY_YEARS)
+    a("")
+    a("The horizon day itself belongs to the phase it closes: support")
+    a("runs THROUGH the anniversary, so the third birthday is the last")
+    a("full-support day and the day after it is security-only; the")
+    a("fifth birthday is the last supported day and the day after it")
+    a("is end of life.")
+    a("")
+    a("## The calendar law")
+    a("")
+    a("`base + N years` is the same month and day — an anniversary,")
+    a("not a fixed count of days. February 29 clamps to the 28th when")
+    a("the target year is not a leap year (a line born 2024-02-29 is")
+    a("bug-fixed through 2027-02-28). The policy speaks in days: every")
+    a("date is a calendar day, read from git's committer timestamp —")
+    a("the same clock the landing laws already read.")
+    a("")
+    a("## What makes a fix a security fix")
+    a("")
+    a("A `Security: <reason>` line in the commit message (a CVE id, a")
+    a("one-word severity, a sentence — anything non-empty). The name")
+    a("matches case-insensitively, the first such line decides, and an")
+    a("empty value is not a marking. Fail-closed, like everything in")
+    a("this policy: **no trailer, no security claim** — an unmarked")
+    a("fix is a plain fix, and a plain fix does not land on a")
+    a("security-only line. The trailer is a line of the message,")
+    a("wherever it stands; `hls-lts classify` reports the marking")
+    a("beside the class (a marked FEATURE is still a FEATURE, and")
+    a("still refused — the marking is a fact about a fix, not a key")
+    a("past the class law).")
+    a("")
+    a("## What the tool refuses")
+    a("")
+    a("- `backport` in the `security` phase: a plain BUGFIX is")
+    a("  refused with the phase and both horizons named; in `eol`,")
+    a("  everything is refused — the dead line takes no chores either.")
+    a("- `tag-patch` past end of life: no release is cut from a dead")
+    a("  line. In the `security` phase a release must carry at least")
+    a("  one security backport since the previous tag — a chore-only")
+    a("  release is how a security line pretends to be alive.")
+    a("- `audit`: history is judged the day it landed. A backport")
+    a("  that arrived in the security phase without the mark, any")
+    a("  commit past end of life, and any tag cut from a commit dated")
+    a("  past end of life are violations, named sha by sha.")
+    a("")
+    a("## Relationship to the branch policy")
+    a("")
+    a("This is the second dimension of the Stage 132 policy, not a new")
+    a("one. `halis-lts-1` keeps its name and its declaration; the")
+    a("window law derives from the base tag live on every run and")
+    a("adds no state. Stage 132 said WHAT may land on an LTS branch")
+    a("(backport-only, patch-only, fail-closed); this policy says")
+    a("WHEN — the same line, with a birthday and a death day.")
+    a("")
+    a("## When it begins")
+    a("")
+    a("The policy begins at v1.0 — a pre-1.0 LTS is a contradiction.")
+    a("Until the first LTS line is declared this document is the")
+    a("promise; the day `hls-lts init --tag v1.0.0` runs, it becomes")
+    a("the clock. The gates prove the law in the meantime on scratch")
+    a("lines with fabricated birthdays (`make lts-policy-acceptance`),")
+    a("so the enforcement is tested before it is ever needed.")
+    a("")
+    return "\n".join(L)
+
+
+def cmd_policy(args) -> int:
+    text = render_policy()
+    if args.check:
+        repo = _repo_arg(args)
+        path = os.path.join(repo, POLICY_DOC)
+        if not os.path.isfile(path):
+            return die("policy: %s is not published here — the policy "
+                       "document is missing (regenerate with "
+                       "`python3 tools/hls-lts.py policy --out %s`)"
+                       % (POLICY_DOC, POLICY_DOC), 1)
+        with open(path, "r", encoding="utf-8") as fh:
+            committed = fh.read()
+        if committed != text:
+            print("policy: REFUSED — the committed %s drifted from the "
+                  "tool's render — a hand-edited policy is visible as a "
+                  "diff (regenerate with `python3 tools/hls-lts.py "
+                  "policy --out %s`)" % (POLICY_DOC, POLICY_DOC))
+            return 1
+        print("policy: %s matches the render — the published promise "
+              "is the enforced one (%d years bug-fix, %d years security)"
+              % (POLICY_DOC, BUGFIX_YEARS, SECURITY_YEARS))
+        return 0
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        print("policy: rendered %s (%d lines)" % (args.out, len(text.splitlines())))
+        return 0
+    sys.stdout.write(text)
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -833,7 +1438,8 @@ def build_parser():
     ap = argparse.ArgumentParser(
         prog="hls-lts",
         description="LTS branch policy — backport-only after v1.0 "
-                    "(Stage 132)")
+                    "(Stage 132), support windows 3y bug-fix / 5y "
+                    "security (Stage 145)")
     sub = ap.add_subparsers(dest="cmd")
 
     p = sub.add_parser("init", help="declare the LTS branch from a "
@@ -861,6 +1467,8 @@ def build_parser():
     p.add_argument("--branch")
     p.add_argument("--repo")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--at", help="pin the day the window law is judged "
+                                 "on, YYYY-MM-DD (default: today)")
     p.set_defaults(fn=cmd_backport)
 
     p = sub.add_parser("tag-patch", help="cut the next LTS patch tag")
@@ -868,6 +1476,8 @@ def build_parser():
     p.add_argument("--branch")
     p.add_argument("--repo")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--at", help="pin the day the window law is judged "
+                                 "on, YYYY-MM-DD (default: today)")
     p.set_defaults(fn=cmd_tag_patch)
 
     p = sub.add_parser("audit", help="judge the branch against the "
@@ -876,6 +1486,24 @@ def build_parser():
     p.add_argument("--repo")
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_audit)
+
+    p = sub.add_parser("window", help="the line's support window and "
+                                     "phase (3y bug-fix, 5y security)")
+    p.add_argument("--tag", help="judge this release tag's line "
+                                 "(default: the declared line)")
+    p.add_argument("--at", help="pin the day the law is judged on, "
+                                 "YYYY-MM-DD (default: today)")
+    p.add_argument("--repo")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_window)
+
+    p = sub.add_parser("policy", help="render the published policy "
+                                     "document (LTS.md); --check verifies "
+                                     "the committed copy")
+    p.add_argument("--out", help="write the render to this path")
+    p.add_argument("--repo")
+    p.add_argument("--check", action="store_true")
+    p.set_defaults(fn=cmd_policy)
 
     return ap
 
