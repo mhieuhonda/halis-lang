@@ -1,0 +1,425 @@
+# ============================================================================
+# tests/acc/refine_acceptance.hls — Stage 98 acceptance gate, in Halis
+# (the Halis twin of what was tests/refine_acceptance.py; same seven
+# sections, same assertions, same needles — the harness is
+# tests/acc/harness.hls and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make refine-acceptance` (which compiles this file to
+# bin/acc-refine and runs it from the repo root).
+#
+# The old battery loaded programs in-process (load_program + check) for
+# its accept legs; the gate asks the same question through the front
+# door — `boot.py --check` exit 0. The gate-hlc ladder (the interpreter
+# compiling the compiler, gcc linking it, the gate then driving that
+# binary) is kept exactly as the battery built it.
+#
+#  1. the parser        — every lightweight position accepts `where`,
+#                         every non-lightweight position rejects it
+#  2. the checker       — predicate validation: bool-typed, `self`-only,
+#                         pure; constant violations are compile errors at
+#                         lets / args / returns / fields / defaults
+#  3. the guards        — the generated C guards every runtime boundary
+#                         (fn entry, return, let, assign, constructor)
+#  4. the proof         — proven sites are elided; the unprovable sites
+#                         keep their guards; `where self != 0` + a
+#                         bounded dividend elides the division check
+#                         under --fast
+#  5. the differential  — interpreter vs native (default AND --fast)
+#                         byte-identical, including the runtime-violation
+#                         panics (exit 101, nothing printed)
+#  6. the demo          — examples/refine_demo.hls agrees everywhere
+#  7. the tools         — hlfmt stable, hllint clean on the new sources
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+
+# ----------------------------------------------------------------------------
+# The gate's data.
+# ----------------------------------------------------------------------------
+
+fn demo() -> str {
+    return "examples/refine_demo.hls"
+}
+
+fn ok_src() -> str {
+    return "tests/ok/feat_stage98_refine.hls"
+}
+
+fn fast_src() -> str {
+    return "tests/ok/feat_stage98_refine_fast.hls"
+}
+
+fn diff_srcs() -> list[str] {
+    return [
+        "tests/ok/feat_stage98_refine.hls",
+        "tests/ok/feat_stage98_refine_fast.hls",
+        "tests/ok/feat_stage98_refine_panic.hls",
+        "tests/ok/feat_stage98_refine_sound.hls",
+    ]
+}
+
+# ----------------------------------------------------------------------------
+# Shared legs.
+# ----------------------------------------------------------------------------
+
+# count_of(text, sub) — non-overlapping occurrences of sub (Python's
+# str.count).
+fn count_of(text: str, sub: str) -> int {
+    let mut n: int = 0
+    let mut at: int = text.find(sub)
+    while at >= 0 {
+        n = n + 1
+        at = find_from(text, sub, at + sub.len())
+    }
+    return n
+}
+
+# find_from(text, sub, from) — the first occurrence at or after `from`.
+fn find_from(text: str, sub: str, from: int) -> int {
+    let mut i: int = from
+    while i + sub.len() <= text.len() {
+        if text.slice(i, i + sub.len()) == sub {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn check_accept(acc: Acc, name: str, src: str) -> void uses IO, Fs, Proc {
+    let path: str = write_src(acc, name, src)
+    let r: RunResult = boot_check(acc, path)
+    if r.code == 0 {
+        pass_msg(acc, name + " accepted")
+    } else {
+        fail_msg(acc, name + " rejected: " + clip(r.combined, 220))
+    }
+}
+
+fn check_deny(acc: Acc, name: str, src: str, expect: str) -> void uses IO, Fs, Proc {
+    let path: str = write_src(acc, name, src)
+    let r: RunResult = boot_check(acc, path)
+    if r.code == 1 && r.combined.contains(expect) {
+        pass_msg(acc, name + " rejected (" + expect + ")")
+    } else {
+        fail_msg(acc, name + ": rc=" + r.code.to_str() + " expected '" + expect
+            + "' in: " + clip(r.combined, 220))
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 1. the parser: lightweight positions accept, others reject
+# ----------------------------------------------------------------------------
+fn sec1(acc: Acc) -> void uses IO, Fs, Proc {
+    section("1. the parser: lightweight positions accept, others reject")
+    check_accept(acc, "good.hls",
+        "fn f(a: int where self > 0) -> int where self >= 0 {\n" +
+        "    let b: int where self >= 0 = a\n" +
+        "    return b\n" +
+        "}\n" +
+        "fn main() -> int { return f(1) }\n")
+    check_deny(acc, "pos_container.hls",
+        "fn s(xs: list[int where self > 0]) -> int { return 0 }\n" +
+        "fn main() -> int { return s([1]) }\n",
+        "container element types")
+    check_deny(acc, "pos_typearg.hls",
+        "struct B[T] { v: T }\n" +
+        "fn main() -> int { let b: B[int where self > 0] = B{ v: 1 } return 0 }\n",
+        "type arguments")
+    check_deny(acc, "pos_forvar.hls",
+        "fn main() -> int {\n" +
+        "    for x: int where self > 0 in [1, 2] { }\n" +
+        "    return 0\n}\n",
+        "loop variables")
+    check_deny(acc, "pos_extern.hls",
+        "extern \"C\" {\n    fn puts(s: str where self.len() > 0) -> int uses IO\n}\n" +
+        "fn main() -> int { return 0 }\n",
+        "extern declarations")
+    check_deny(acc, "pos_nonprim.hls",
+        "struct P { x: int }\n" +
+        "fn f(p: P where self.x > 0) -> int { return 0 }\n" +
+        "fn main() -> int { return f(P{ x: 1 }) }\n",
+        "only supported on primitive types")
+}
+
+# ----------------------------------------------------------------------------
+# 2. the checker: predicate validation + constant violations
+# ----------------------------------------------------------------------------
+fn sec2(acc: Acc) -> void uses IO, Fs, Proc {
+    section("2. the checker: predicate validation + constant violations")
+    check_deny(acc, "chk_scope.hls",
+        "fn f(x: int where self > y) -> int { return x }\n" +
+        "fn main() -> int { return f(1) }\n",
+        "may only reference 'self'")
+    check_deny(acc, "chk_pure.hls",
+        "fn g(x: int) -> int { return x }\n" +
+        "fn f(x: int where g(1) > 0) -> int { return x }\n" +
+        "fn main() -> int { return f(1) }\n",
+        "predicates must be pure")
+    check_deny(acc, "chk_bool.hls",
+        "fn f(x: int where self + 1) -> int { return x }\n" +
+        "fn main() -> int { return f(1) }\n",
+        "must be bool")
+    check_deny(acc, "chk_let.hls",
+        "fn main() -> int {\n" +
+        "    let x: int where self > 0 = 0 - 5\n" +
+        "    return 0\n}\n",
+        "value -5 does not satisfy")
+    check_deny(acc, "chk_arg.hls",
+        "fn h(x: int where self > 0) -> int { return x }\n" +
+        "fn main() -> int { return h(0) }\n",
+        "value 0 does not satisfy")
+    check_deny(acc, "chk_ret.hls",
+        "fn f() -> int where self >= 0 { return 0 - 1 }\n" +
+        "fn main() -> int { return f() }\n",
+        "value -1 does not satisfy")
+    check_deny(acc, "chk_field.hls",
+        "struct B { v: int where self >= 0 }\n" +
+        "fn main() -> int { let b: B = B{ v: 0 - 1 } return 0 }\n",
+        "field 'B.v'")
+    check_deny(acc, "chk_default.hls",
+        "struct B { v: int where self >= 0 = 0 - 1 }\n" +
+        "fn main() -> int { let b: B = B{ v: 1 } return 0 }\n",
+        "default of field 'B.v'")
+    check_deny(acc, "chk_assign.hls",
+        "fn main() -> int {\n" +
+        "    let mut x: int where self >= 0 = 1\n" +
+        "    x = 0 - 2\n" +
+        "    return 0\n}\n",
+        "value -2 does not satisfy")
+}
+
+# ----------------------------------------------------------------------------
+# 3. the guards: every runtime boundary emits its check
+# ----------------------------------------------------------------------------
+fn sec3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("3. the guards: every runtime boundary emits its check")
+    # The gate's own hlc: the interpreter compiles the compiler, gcc
+    # links it, exactly the ladder the battery built.
+    let nat_c: str = scratch(acc, "refine.c")
+    run_capture("python3", ["tools/hlinterp/boot.py", "src/hlc.hls", "src/hlc.hls", nat_c])
+    let hlc_gate: str = scratch(acc, "hlc_gate")
+    let g: RunResult = run_capture("gcc", ["-O2", "-o", hlc_gate, nat_c, "-lm", "-pthread"])
+    if g.code != 0 || !file_exists(hlc_gate) {
+        fail_msg(acc, "gate hlc build failed")
+        return
+    }
+    pass_msg(acc, "gate hlc built")
+    let out_c: str = scratch(acc, "refine_gen.c")
+    let comp: RunResult = run_capture(hlc_gate, [ok_src(), out_c])
+    if comp.code != 0 {
+        fail_msg(acc, "native compile of " + ok_src() + " failed")
+        return
+    }
+    let c: str = read_or(out_c, "")
+    let guards: int = count_of(c, "hl_die(\"refinement violation:")
+    if guards >= 7 {
+        pass_msg(acc, "runtime guards emitted (" + guards.to_str() + " sites)")
+    } else {
+        fail_msg(acc, "too few runtime guards emitted (" + guards.to_str() + ")")
+    }
+    if c.contains("parameter 'amt' of 'withdraw' must satisfy 'self > 0'") {
+        pass_msg(acc, "fn-entry guard present")
+    } else {
+        fail_msg(acc, "fn-entry guard missing")
+    }
+    if c.contains("field 'Account.balance' must satisfy 'self >= 0'")
+            && c.contains("usf_new_Account") {
+        pass_msg(acc, "constructor guard present")
+    } else {
+        fail_msg(acc, "constructor guard missing")
+    }
+    if c.contains("return ") && c.contains("refinement violation: return value of 'abs_diff'") {
+        pass_msg(acc, "return guard present")
+    } else {
+        fail_msg(acc, "return guard missing")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 4. the proof: proven sites elided, unproven kept
+# ----------------------------------------------------------------------------
+fn sec4(acc: Acc) -> void uses IO, Fs, Proc {
+    section("4. the proof: proven sites elided, unproven kept")
+    let hlc_gate: str = scratch(acc, "hlc_gate")
+    if !file_exists(hlc_gate) {
+        return
+    }
+    # Elisions are PROOF-based, not mode-based.
+    let fast_c: str = scratch(acc, "refine_fast.c")
+    let comp: RunResult = run_capture(hlc_gate, [fast_src(), fast_c])
+    if comp.code != 0 {
+        fail_msg(acc, "fast-source compile failed")
+        return
+    }
+    let fc: str = read_or(fast_c, "")
+    let proven: list[str] = ["a", "b", "c"]
+    let mut i: int = 0
+    while i < proven.len() {
+        let v: str = proven.get(i)
+        if !fc.contains("variable '" + v + "' must satisfy") {
+            pass_msg(acc, "proven let '" + v + "' guard elided")
+        } else {
+            fail_msg(acc, "proven let '" + v + "' guard NOT elided")
+        }
+        i = i + 1
+    }
+    let unproven: list[str] = ["d", "e"]
+    let mut j: int = 0
+    while j < unproven.len() {
+        let v: str = unproven.get(j)
+        if fc.contains("variable '" + v + "' must satisfy") {
+            pass_msg(acc, "unprovable let '" + v + "' guard kept")
+        } else {
+            fail_msg(acc, "unprovable let '" + v + "' guard wrongly elided")
+        }
+        j = j + 1
+    }
+    let fast2_c: str = scratch(acc, "refine_fast2.c")
+    let comp2: RunResult = run_capture(hlc_gate, ["--fast", ok_src(), fast2_c])
+    if comp2.code != 0 {
+        fail_msg(acc, "fast compile failed")
+        return
+    }
+    let n_def: int = count_of(read_or(scratch(acc, "refine_gen.c"), ""),
+        "hl_die(\"refinement violation:")
+    let n_fast: int = count_of(read_or(fast2_c, ""),
+        "hl_die(\"refinement violation:")
+    if n_def == n_fast {
+        pass_msg(acc, "guard count mode-independent (" + n_def.to_str()
+            + " == " + n_fast.to_str() + ")")
+    } else {
+        fail_msg(acc, "guard count differs by mode (" + n_def.to_str()
+            + " vs " + n_fast.to_str() + ")")
+    }
+    let demo_c: str = scratch(acc, "demo_fast.c")
+    let comp3: RunResult = run_capture(hlc_gate, ["--fast", demo(), demo_c])
+    if comp3.code != 0 {
+        fail_msg(acc, "demo fast compile failed")
+        return
+    }
+    let dc: str = read_or(demo_c, "")
+    if dc.contains("return (u_num / u_den);")
+            && dc.contains("refinement violation: parameter 'amount' of 'apply'") {
+        pass_msg(acc, "refinements compose into a proof (division elided, guards kept)")
+    } else {
+        fail_msg(acc, "demo proof/elision pattern wrong")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 5. the differential: interp vs native (default + fast)
+# ----------------------------------------------------------------------------
+fn sec5(acc: Acc) -> void uses IO, Fs, Proc {
+    section("5. the differential: interp vs native (default + fast)")
+    let hlc_gate: str = scratch(acc, "hlc_gate")
+    if !file_exists(hlc_gate) {
+        return
+    }
+    let srcs: list[str] = diff_srcs()
+    let mut i: int = 0
+    while i < srcs.len() {
+        let f: str = srcs.get(i)
+        let name: str = basename(f)
+        let interp: RunResult = boot(acc, [f])
+        let nc: str = scratch(acc, "d.c")
+        let comp: RunResult = run_capture(hlc_gate, [f, nc])
+        if comp.code != 0 {
+            fail_msg(acc, name + " native compile failed")
+            i = i + 1
+            continue
+        }
+        let nb: str = scratch(acc, "d.bin")
+        run_capture("gcc", ["-O2", "-o", nb, nc, "-lm", "-pthread"])
+        let nat: RunResult = run_capture(nb, [])
+        if interp.out == nat.out && interp.code == nat.code {
+            pass_msg(acc, name + ": interp == native (rc=" + interp.code.to_str() + ")")
+        } else {
+            fail_msg(acc, name + " diverges: interp=" + interp.code.to_str()
+                + " native=" + nat.code.to_str())
+        }
+        let fc2: str = scratch(acc, "d_fast.c")
+        let comp2: RunResult = run_capture(hlc_gate, ["--fast", f, fc2])
+        if comp2.code != 0 {
+            fail_msg(acc, name + " fast compile failed")
+            i = i + 1
+            continue
+        }
+        let fb: str = scratch(acc, "d_fast.bin")
+        run_capture("gcc", ["-O2", "-o", fb, fc2, "-lm", "-pthread"])
+        let fast: RunResult = run_capture(fb, [])
+        if interp.out == fast.out && interp.code == fast.code {
+            pass_msg(acc, name + ": interp == -O fast (rc=" + fast.code.to_str() + ")")
+        } else {
+            fail_msg(acc, name + " -O fast diverges: interp=" + interp.code.to_str()
+                + " fast=" + fast.code.to_str())
+        }
+        i = i + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 6. the demo
+# ----------------------------------------------------------------------------
+fn sec6(acc: Acc) -> void uses IO, Fs, Proc {
+    section("6. the demo")
+    let chk: RunResult = boot_check(acc, demo())
+    if chk.code == 0 {
+        pass_msg(acc, "refine_demo checks clean")
+    } else {
+        fail_msg(acc, "refine_demo rejected: " + clip(chk.combined, 160))
+    }
+    let hlc_gate: str = scratch(acc, "hlc_gate")
+    if !file_exists(hlc_gate) {
+        return
+    }
+    let interp: RunResult = boot(acc, [demo()])
+    let dc2: str = scratch(acc, "demo.c")
+    let comp: RunResult = run_capture(hlc_gate, [demo(), dc2])
+    if comp.code != 0 {
+        fail_msg(acc, "refine_demo native compile failed")
+        return
+    }
+    let db: str = scratch(acc, "demo.bin")
+    run_capture("gcc", ["-O2", "-o", db, dc2, "-lm", "-pthread"])
+    let nat: RunResult = run_capture(db, [])
+    if interp.out == nat.out && interp.code == nat.code
+            && nat.out.contains("gift:    main (545)") {
+        pass_msg(acc, "refine_demo: interp == native, output pinned")
+    } else {
+        fail_msg(acc, "refine_demo diverges or output drifted")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 7. the tools
+# ----------------------------------------------------------------------------
+fn sec7(acc: Acc) -> void uses IO, Proc {
+    section("7. the tools")
+    let fmt1: RunResult = run_capture("python3", ["tools/hlfmt.py", demo()])
+    let fmt2: RunResult = run_capture("python3", ["tools/hlfmt.py", demo()])
+    if fmt1.out == fmt2.out && fmt1.code == 0 {
+        pass_msg(acc, "hlfmt stable on the demo")
+    } else {
+        fail_msg(acc, "hlfmt unstable on the demo")
+    }
+    let lint: RunResult = run_capture("python3", ["tools/hllint.py", demo()])
+    if lint.code == 0 {
+        pass_msg(acc, "hllint clean on the demo")
+    } else {
+        fail_msg(acc, "hllint failed on the demo: " + clip(lint.combined, 160))
+    }
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let acc: Acc = acc_new("refine")
+    sec1(acc)
+    sec2(acc)
+    sec3(acc)
+    sec4(acc)
+    sec5(acc)
+    sec6(acc)
+    sec7(acc)
+    return finish(acc, "Stage 98 -- refinement types (lightweight, opt-in)")
+}

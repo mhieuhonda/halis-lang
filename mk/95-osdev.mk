@@ -42,9 +42,11 @@ $(LINKER_TEST_BIN): $(LINKER_TEST_OBJ) $(LINKER_SCRIPT)
 # ALSO pins the known GAP: a locked read-modify-write needs a memory
 # destination, and HLS's asm has no `"+m"` write constraint, so the
 # assembler refuses `lock addq` on an `inout(reg)` operand.
-atomics-acceptance:
-	@echo "[Stage 90 acceptance] running tests/atomics_acceptance.py..."
-	@$(PYTHON) tests/atomics_acceptance.py
+# The gate itself is Halis (tests/acc/atomics_acceptance.hls, compiled
+# native by bin/hlc through the $(BIN)/acc-% pattern rule).
+atomics-acceptance: $(BIN)/acc-atomics
+	@echo "[Stage 90 acceptance] running tests/acc/atomics_acceptance.hls..."
+	@$(BIN)/acc-atomics
 	@echo "ACCEPTANCE OK: Stage 90 -- core.sync.nolock (lock-free primitives)"
 
 # irqsafe-acceptance: the Stage 91 acceptance gate. Runs the 7-section
@@ -56,9 +58,11 @@ atomics-acceptance:
 # front-ends, the ok-test on the interpreter + native + -nostdlib, the
 # synthesized classification probes on both sides, the demo, and the
 # tools.
-irqsafe-acceptance:
-	@echo "[Stage 91 acceptance] running tests/irqsafe_acceptance.py..."
-	@$(PYTHON) tests/irqsafe_acceptance.py
+# The gate itself is Halis (tests/acc/irqsafe_acceptance.hls, compiled
+# native by bin/hlc through the $(BIN)/acc-% pattern rule).
+irqsafe-acceptance: $(BIN)/acc-irqsafe
+	@echo "[Stage 91 acceptance] running tests/acc/irqsafe_acceptance.hls..."
+	@$(BIN)/acc-irqsafe
 	@echo "ACCEPTANCE OK: Stage 91 -- verified interrupt-safety (no alloc in IRQ context)"
 
 # dma-acceptance: the Stage 89 acceptance gate. Runs the 6-section suite
@@ -68,9 +72,11 @@ irqsafe-acceptance:
 # over-large bounce transfer), five behaviour probes on the interpreter
 # and both native paths, the ok-test on all three, the demo, the tools,
 # and the six properties a driver actually relies on.
-dma-acceptance:
-	@echo "[Stage 89 acceptance] running tests/dma_acceptance.py..."
-	@$(PYTHON) tests/dma_acceptance.py
+# The gate itself is Halis (tests/acc/dma_acceptance.hls, compiled
+# native by bin/hlc through the $(BIN)/acc-% pattern rule).
+dma-acceptance: $(BIN)/acc-dma
+	@echo "[Stage 89 acceptance] running tests/acc/dma_acceptance.hls..."
+	@$(BIN)/acc-dma
 	@echo "ACCEPTANCE OK: Stage 89 -- DMA-safe buffer types (no GC moves, no virtual remap)"
 
 # port-acceptance: the Stage 88 acceptance gate. Runs the 7-section
@@ -82,9 +88,11 @@ dma-acceptance:
 # `out %al,(%dx)` / `in (%dx),%eax`, the demo running (its main touches
 # no port, because a port access is privileged), the model on all three
 # execution paths, five behaviour probes, and the tools.
-port-acceptance:
-	@echo "[Stage 88 acceptance] running tests/port_acceptance.py..."
-	@$(PYTHON) tests/port_acceptance.py
+# The gate itself is Halis (tests/acc/port_acceptance.hls, compiled
+# native by bin/hlc through the $(BIN)/acc-% pattern rule).
+port-acceptance: $(BIN)/acc-port
+	@echo "[Stage 88 acceptance] running tests/acc/port_acceptance.hls..."
+	@$(BIN)/acc-port
 	@echo "ACCEPTANCE OK: Stage 88 -- core.port (typesafe x86 I/O ports)"
 
 # mmio-acceptance: the Stage 87 acceptance gate. Runs the 7-section
@@ -96,9 +104,11 @@ port-acceptance:
 # (hosted AND -nostdlib) plus a stack-allocated list surviving the
 # freestanding entry's frame alignment, the four checked-constructor
 # panics, six behaviour probes on all three paths, and the tools.
-mmio-acceptance:
-	@echo "[Stage 87 acceptance] running tests/mmio_acceptance.py..."
-	@$(PYTHON) tests/mmio_acceptance.py
+# The gate itself is Halis (tests/acc/mmio_acceptance.hls, compiled
+# native by bin/hlc through the $(BIN)/acc-% pattern rule).
+mmio-acceptance: $(BIN)/acc-mmio
+	@echo "[Stage 87 acceptance] running tests/acc/mmio_acceptance.hls..."
+	@$(BIN)/acc-mmio
 	@echo "ACCEPTANCE OK: Stage 87 -- core.mmio (volatile memory-mapped I/O)"
 
 # idt-acceptance: the Stage 86 acceptance gate. Runs the 7-section suite
@@ -109,9 +119,11 @@ mmio-acceptance:
 # fact that the vector form does NOT use gcc's `interrupt` attribute
 # (gcc rejects SSE in an ISR, and a Halis body always uses it), the
 # boot/hlc diagnostic parity, eight behaviour probes, and the demos.
-idt-acceptance:
-	@echo "[Stage 86 acceptance] running tests/idt_acceptance.py..."
-	@$(PYTHON) tests/idt_acceptance.py
+# The gate itself is Halis (tests/acc/idt_acceptance.hls, compiled
+# native by bin/hlc through the $(BIN)/acc-% pattern rule).
+idt-acceptance: $(BIN)/acc-idt
+	@echo "[Stage 86 acceptance] running tests/acc/idt_acceptance.hls..."
+	@$(BIN)/acc-idt
 	@echo "ACCEPTANCE OK: Stage 86 -- core.interrupt (IDT/GDT declaration syntax)"
 
 # boot-acceptance: the Stage 85 acceptance gate. Runs the 7-section
@@ -461,8 +473,10 @@ stackguard-acceptance:
 # xmm, explicit clobber lists, -Werror link, DEMO OK, freestanding
 # -nostdlib at 0, boot/hlc parity on fail programs), hlfmt stability,
 # and `--audit` purity.
-asmreg-acceptance:
-	@echo "[Stage 83 acceptance] running tests/asmreg_acceptance.py..."
-	@$(PYTHON) tests/asmreg_acceptance.py
+# The gate itself is Halis (tests/acc/asmreg_acceptance.hls, compiled
+# native by bin/hlc through the $(BIN)/acc-% pattern rule).
+asmreg-acceptance: $(BIN)/acc-asmreg
+	@echo "[Stage 83 acceptance] running tests/acc/asmreg_acceptance.hls..."
+	@$(BIN)/acc-asmreg
 	@echo "ACCEPTANCE OK: Stage 83 -- inline-asm register constraints (clobber, input, output)"
 

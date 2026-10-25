@@ -1,0 +1,646 @@
+# ============================================================================
+# tests/acc/port_acceptance.hls — Stage 88 acceptance gate, in Halis
+# (the Halis twin of what was tests/port_acceptance.py; same seven
+# sections, same assertions, same needles — the harness is
+# tests/acc/harness.hls and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make port-acceptance` (which compiles this file to bin/acc-port
+# and runs it from the repo root).
+#
+#  1. the carrier rule         — a sub-64 register is accepted for an
+#                                `int` operand when the template's
+#                                instruction is that narrow, the two
+#                                widths one port instruction needs
+#                                (8-bit data, 16-bit port) each get
+#                                their own carrier, and a 64-bit
+#                                instruction on a narrow register is
+#                                still rejected
+#  2. core/port.hls            — the enum / surface, the `core.*`-only
+#                                import, no effects
+#  3. the PATTERN              — the demo's six port instructions
+#                                compile `-Werror` and LINK, and the
+#                                disassembly really is
+#                                `out %al,(%dx)` / `in (%dx),%eax`
+#  4. the demo                 — it runs, because `main` touches no
+#                                port: a port access is privileged
+#                                and an image run by a host faults on
+#                                the first one
+#  5. the model                — the port map, the widths each
+#                                architectural port actually uses, on
+#                                all three execution paths (ok-test)
+#  6. behaviour probes         — the width rules, the 16-bit port
+#                                bound, the EOI order, the PIT divisor
+#                                wrap, the PCI field widths
+#  7. the tools                — hlfmt and hllint
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.regex"
+
+# ----------------------------------------------------------------------------
+# The gate's data.
+# ----------------------------------------------------------------------------
+
+struct Probe {
+    name: str,
+    want: int,
+    desc: str,
+    body: str
+}
+
+struct ToolLeg {
+    label: str,
+    argv: list[str]
+}
+
+fn ok_test() -> str {
+    return "tests/ok/feat_stage88_port.hls"
+}
+
+fn demo() -> str {
+    return "examples/port_demo.hls"
+}
+
+fn core_port() -> str {
+    return "core/port.hls"
+}
+
+fn core_fns() -> list[str] {
+    return [
+        "port_number_bits", "port_max", "port_is_legal", "port_has_immediate",
+        "port_imm_ok", "port_width_name", "port_data_bits", "port_width_suffix",
+        "port_width_mask", "port_read", "port_write", "pic_cmd_port",
+        "pic_data_port", "pic_slave_cmd_port", "pic_slave_data_port", "pic_icw1",
+        "pic_icw4_8086", "pic_ocw2_eoi", "pic_ocw3_isr_read",
+        "pic_eoi_order_is_slave_first", "pit_channel0_port", "pit_command_port",
+        "pit_freq", "pit_divisor", "pit_reload_low", "pit_reload_high",
+        "speaker_gate_port", "debug_port", "debug_write_byte",
+        "pci_config_address_port", "pci_config_data_port", "pci_bus_bits",
+        "pci_device_bits", "pci_function_bits", "pci_register_bits",
+        "pci_config_address", "pci_field_fits", "pm1_status_port",
+        "pm1_status_write1_to_clear", "port_delay_cycles",
+        "port_access_cost_cycles",
+    ]
+}
+
+fn out8_hls() -> str {
+    return "fn out8(p: int, v: int) -> void {\n" +
+           "    asm!(\"outb {0}, {1}\", in(\"a\") v, in(\"dx\") p)\n" +
+           "    return\n}\n\nfn main() -> int { return 0 }\n"
+}
+
+fn in8_hls() -> str {
+    return "fn in8(p: int) -> int {\n" +
+           "    let mut v: int = 0\n" +
+           "    asm!(\"inb {1}, {0}\", out(\"al\") v, in(\"dx\") p)\n" +
+           "    return v\n}\n\nfn main() -> int { return 0 }\n"
+}
+
+fn wide_hls() -> str {
+    return "fn rd(a: int) -> int {\n" +
+           "    let mut v: int = 0\n" +
+           "    asm!(\"movq ({1}), {0}\", out(\"al\") v, in(\"cx\") a)\n" +
+           "    return v\n}\n\nfn main() -> int { return 0 }\n"
+}
+
+fn probes() -> list[Probe] {
+    return [
+        Probe {
+            name: "widths",
+            want: 0,
+            desc: "the width masks, the 16-bit port bound, and the imm8 form",
+            body: "import \"core.port\"\n" +
+                  "fn main() -> int {\n" +
+                  "    if port_number_bits() != 16 { return 1 }\n" +
+                  "    if port_max() != 65535 { return 2 }\n" +
+                  "    if port_width_mask(PortWidth.Byte) != 255 { return 3 }\n" +
+                  "    if port_width_suffix(PortWidth.Dword) != \"l\" { return 4 }\n" +
+                  "    # An 8-bit in puts the byte in AL and LEAVES the rest alone.\n" +
+                  "    if port_read(1311768467463791224, PortWidth.Dword) != 2596070008 { return 5 }\n" +
+                  "    if port_write(300, PortWidth.Byte) != 44 { return 6 }\n" +
+                  "    if !port_is_legal(0) || port_is_legal(65536) { return 7 }\n" +
+                  "    # The IMMEDIATE form is a different encoding and exists only below\n" +
+                  "    # 256.\n" +
+                  "    if port_has_immediate(256) || !port_imm_ok(248) { return 8 }\n" +
+                  "    return 0\n" +
+                  "}\n"
+        },
+        Probe {
+            name: "pic",
+            want: 0,
+            desc: "the PIC ports, the 8086 bit, and the EOI order",
+            body: "import \"core.port\"\n" +
+                  "fn main() -> int {\n" +
+                  "    if pic_cmd_port() != 32 || pic_data_port() != 33 { return 1 }\n" +
+                  "    if pic_slave_data_port() != 161 { return 2 }\n" +
+                  "    # ICW4's 8086 bit: a PIC left in 8085 mode does not deliver an\n" +
+                  "    # interrupt to a protected-mode kernel.\n" +
+                  "    if pic_icw1() != 17 || pic_icw4_8086() != 1 { return 3 }\n" +
+                  "    if pic_ocw2_eoi() != 32 { return 4 }\n" +
+                  "    # The SLAVE's EOI goes FIRST for IRQ 8..15.\n" +
+                  "    if !pic_eoi_order_is_slave_first(9) { return 5 }\n" +
+                  "    if pic_eoi_order_is_slave_first(7) { return 6 }\n" +
+                  "    return 0\n" +
+                  "}\n"
+        },
+        Probe {
+            name: "pit",
+            want: 0,
+            desc: "the PIT divisor, its 65536 wrap, and the low-byte-first order",
+            body: "import \"core.port\"\n" +
+                  "fn main() -> int {\n" +
+                  "    if pit_freq() != 1193182 { return 1 }\n" +
+                  "    if pit_divisor(100) != 11931 { return 2 }\n" +
+                  "    # A divisor of 0 means 65536: the counter is 16-bit and WRAPS.\n" +
+                  "    if pit_divisor(1) != 65536 { return 3 }\n" +
+                  "    if pit_divisor(1193182) != 1 { return 4 }\n" +
+                  "    # The two bytes go LOW FIRST. That is not a convention.\n" +
+                  "    let d: int = pit_divisor(100)\n" +
+                  "    if pit_reload_low(d) != 155 { return 5 }\n" +
+                  "    if pit_reload_high(d) != 46 { return 6 }\n" +
+                  "    if speaker_gate_port() != 97 { return 7 }\n" +
+                  "    return 0\n" +
+                  "}\n"
+        },
+        Probe {
+            name: "pci",
+            want: 0,
+            desc: "the PCI field widths, and why each field must be masked",
+            body: "import \"core.port\"\n" +
+                  "fn main() -> int {\n" +
+                  "    if pci_config_address_port() != 248 || pci_config_data_port() != 252 { return 1 }\n" +
+                  "    # Both ports are 32-bit, but the bus is 8 bits, the device 5, the\n" +
+                  "    # function 3 and the register 4.\n" +
+                  "    if pci_bus_bits() != 8 || pci_register_bits() != 4 { return 2 }\n" +
+                  "    if pci_device_bits() != 5 || pci_function_bits() != 3 { return 3 }\n" +
+                  "    let a: int = pci_config_address(0, 3, 0, 4)\n" +
+                  "    if a < 2147483648 { return 4 }\n" +
+                  "    # Each field has to be MASKED: a bare shift reads the enable bit.\n" +
+                  "    if int_and(int_shr(a, 11), 31) != 3 { return 5 }\n" +
+                  "    if int_and(int_shr(a, 2), 15) != 4 { return 6 }\n" +
+                  "    if pci_vendor_id_reg() != 0 || pci_bar0_reg() != 16 { return 7 }\n" +
+                  "    return 0\n" +
+                  "}\n"
+        },
+        Probe {
+            name: "acpi-delay",
+            want: 0,
+            desc: "the ACPI PM1 status rule and the I/O serialisation model",
+            body: "import \"core.port\"\n" +
+                  "fn main() -> int {\n" +
+                  "    if pm1_control_port() != 0 || pm1_status_port() != 4 { return 1 }\n" +
+                  "    # PM1 status is write-1-to-clear: writing ZERO clears nothing, which\n" +
+                  "    # is a hang waiting for a bit that has been acknowledged.\n" +
+                  "    if pm1_status_write1_to_clear() != true { return 2 }\n" +
+                  "    # The serialisation delay is a MODEL, so a test asserts the\n" +
+                  "    # arithmetic rather than a timing.\n" +
+                  "    if port_delay_cycles() != 400 { return 3 }\n" +
+                  "    if port_access_cost_cycles(PortWidth.Byte) != 408 { return 4 }\n" +
+                  "    if port_access_cost_cycles(PortWidth.Dword) != 432 { return 5 }\n" +
+                  "    return 0\n" +
+                  "}\n"
+        },
+    ]
+}
+
+# ----------------------------------------------------------------------------
+# Shared legs.
+# ----------------------------------------------------------------------------
+
+fn decl_word(src: str, kw: str, name: str) -> bool {
+    let rr: Result[Regex, str] = regex_compile(kw + "\\s+" + name + "\\b")
+    if result_is_err(rr) {
+        return false
+    }
+    let re: Regex = result_unwrap(rr)
+    return regex_is_match(re, src)
+}
+
+fn import_paths(src: str) -> list[str] {
+    let out: list[str] = []
+    let lines: list[str] = src.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i).trim()
+        if line.starts_with("import ") {
+            let rest: str = line.slice(7, line.len()).trim()
+            if rest.starts_with("\"") {
+                let tail: str = rest.slice(1, rest.len())
+                let end: int = tail.find("\"")
+                if end > 0 {
+                    out.push(tail.slice(0, end))
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn strip_no_std(text: str) -> str {
+    let lines: list[str] = text.split("\n")
+    let mut out: str = ""
+    let mut removed: bool = false
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i)
+        if !removed && line == "#![no_std]" {
+            removed = true
+            i = i + 1
+            continue
+        }
+        out = out + line + "\n"
+        i = i + 1
+    }
+    return out
+}
+
+# compile_to(acc, src, cname) — hlc to C, the result carries the exit
+# code + diagnostics.
+fn compile_to(acc: Acc, src: str, cname: str) -> RunResult uses Proc {
+    let c: str = scratch(acc, cname)
+    return run_capture(hlc_path(acc), [src, c])
+}
+
+# gcc_hosted(acc, exename, cpath) — gcc -O2 -Werror, -lm -pthread; the
+# result is the RUN of the produced binary (code -1 + the gcc text in
+# combined when the link failed).
+fn gcc_hosted(acc: Acc, exename: str, cpath: str) -> RunResult uses Proc {
+    let exe: str = scratch(acc, exename)
+    let g: RunResult = run_capture("gcc", ["-O2", "-Werror", "-o", exe, cpath, "-lm", "-pthread"])
+    if g.code != 0 {
+        let r: RunResult = RunResult {
+            code: -1, out: "", err: g.err, combined: g.combined, spawned: false
+        }
+        return r
+    }
+    let runr: RunResult = run_capture(exe, [])
+    runr.spawned = true
+    return runr
+}
+
+# gcc_fs(acc, exename, cpath) — the -nostdlib link twin.
+fn gcc_fs(acc: Acc, exename: str, cpath: str) -> RunResult uses Proc {
+    let exe: str = scratch(acc, exename)
+    let g: RunResult = run_capture("gcc", ["-O2", "-ffreestanding", "-nostdlib",
+        "-ffunction-sections", "-fno-stack-protector", "-Wl,--gc-sections", "-o", exe, cpath])
+    if g.code != 0 {
+        let r: RunResult = RunResult {
+            code: -1, out: "", err: g.err, combined: g.combined, spawned: false
+        }
+        return r
+    }
+    let runr: RunResult = run_capture(exe, [])
+    runr.spawned = true
+    return runr
+}
+
+# is_fun_label(line) — objdump's `^[0-9a-f]+ <` function header shape.
+fn is_fun_label(line: str) -> bool {
+    let lt: int = line.find(" <")
+    if lt <= 0 {
+        return false
+    }
+    let mut i: int = 0
+    while i < lt {
+        let c: int = line.byte_at(i)
+        let hex: bool = (c >= 48 && c <= 57) || (c >= 97 && c <= 102)
+        if !hex {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# main_touches_port(dis) — the usf_main body of an objdump -d listing,
+# scanned for a bare `out`/`in` mnemonic (the old battery's
+# re.search(r"\b(out|in)\s", main_dis)).
+fn main_touches_port(dis: str) -> bool {
+    let lines: list[str] = dis.split("\n")
+    let mut started: bool = false
+    let mut body: str = ""
+    let mut i: int = 0
+    while i < lines.len() {
+        let l: str = lines.get(i)
+        if !started {
+            if l.contains("<usf_main>:") {
+                started = true
+            }
+        } else {
+            if is_fun_label(l) {
+                break
+            }
+            body = body + l + "\n"
+        }
+        i = i + 1
+    }
+    let rr: Result[Regex, str] = regex_compile("\\b(out|in)\\s")
+    if result_is_err(rr) {
+        return true
+    }
+    let re: Regex = result_unwrap(rr)
+    return regex_is_match(re, body)
+}
+
+# ----------------------------------------------------------------------------
+# 1. the carrier rule
+# ----------------------------------------------------------------------------
+fn sec1(acc: Acc) -> void uses IO, Fs, Proc {
+    section("1. the carrier rule")
+    let src8: str = write_src(acc, "out8.hls", out8_hls())
+    let r8: RunResult = compile_to(acc, src8, "out8.c")
+    if r8.code == 0 {
+        pass_msg(acc, "port: an 8-bit letter constraint with a 16-bit dx port is accepted")
+    } else {
+        fail_msg(acc, "port: the outb form rejected: " + clip(r8.combined, 140))
+    }
+    let text: str = read_or(scratch(acc, "out8.c"), "")
+    if text.contains("(int8_t)") && text.contains("(int16_t)") {
+        pass_msg(acc, "port: the two widths of one instruction get two carriers")
+    } else {
+        fail_msg(acc, "port: the carriers are not per-operand widths")
+    }
+
+    let srcin: str = write_src(acc, "in8.hls", in8_hls())
+    let rin: RunResult = compile_to(acc, srcin, "in8.c")
+    if rin.code == 0 {
+        pass_msg(acc, "port: an 8-bit output binds a sub-register through a register variable")
+    } else {
+        fail_msg(acc, "port: the inb form rejected: " + clip(rin.combined, 140))
+    }
+    let text_in: str = read_or(scratch(acc, "in8.c"), "")
+    let rr: Result[Regex, str] = regex_compile("register int8_t \\w+ __asm__\\(\"al\"\\)")
+    let mut has_regvar: bool = false
+    if result_is_ok(rr) {
+        let re: Regex = result_unwrap(rr)
+        if regex_is_match(re, text_in) {
+            has_regvar = true
+        }
+    }
+    if has_regvar {
+        pass_msg(acc, "port: the 8-bit output is an int8_t register variable named al")
+    } else {
+        fail_msg(acc, "port: no int8_t register variable for al")
+    }
+
+    let srcw: str = write_src(acc, "wide.hls", wide_hls())
+    let rw: RunResult = compile_to(acc, srcw, "wide.c")
+    if rw.code != 0 && rw.combined.contains("64-bit register") {
+        pass_msg(acc, "port: a 64-bit template on a narrow register is still rejected")
+    } else {
+        fail_msg(acc, "port: a narrow register on movq was accepted")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 2. core/port.hls
+# ----------------------------------------------------------------------------
+fn sec2(acc: Acc) -> void uses IO, Fs {
+    section("2. core/port.hls")
+    if !file_exists(core_port()) {
+        fail_msg(acc, "port: core/port.hls missing")
+        return
+    }
+    let src: str = read_file(core_port())
+    if decl_word(src, "enum", "PortWidth") {
+        pass_msg(acc, "port: core.port declares enum PortWidth")
+    } else {
+        fail_msg(acc, "port: core.port missing enum PortWidth")
+    }
+    let imports: list[str] = import_paths(src)
+    if imports.len() == 1 && imports.get(0) == "core.result" {
+        pass_msg(acc, "port: core.port imports only core.result (freestanding-safe)")
+    } else {
+        fail_msg(acc, "port: core.port imports " + str_join(imports, ", "))
+    }
+    let lines: list[str] = src.split("\n")
+    let mut has_effects: bool = false
+    let mut has_extern: bool = false
+    let mut li: int = 0
+    while li < lines.len() {
+        let line: str = lines.get(li)
+        if line.trim().starts_with("#") {
+            li = li + 1
+            continue
+        }
+        if line.starts_with("fn ") && line.contains(" uses ") {
+            has_effects = true
+        }
+        if line.trim().starts_with("extern") {
+            has_extern = true
+        }
+        li = li + 1
+    }
+    if !has_effects && !has_extern {
+        pass_msg(acc, "port: core.port declares no effects and no externs")
+    } else {
+        fail_msg(acc, "port: core.port declares effects or externs")
+    }
+    let fns: list[str] = core_fns()
+    let mut fi: int = 0
+    while fi < fns.len() {
+        let f: str = fns.get(fi)
+        if decl_word(src, "fn", f) {
+            pass_msg(acc, "port: core.port exposes " + f)
+        } else {
+            fail_msg(acc, "port: core.port missing " + f)
+        }
+        fi = fi + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 3. the PATTERN
+# ----------------------------------------------------------------------------
+fn sec3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("3. the PATTERN")
+    let demo_c: str = "demo.c"
+    let rc: RunResult = compile_to(acc, demo(), demo_c)
+    if rc.code != 0 {
+        fail_msg(acc, "port: the demo did not compile: " + clip(rc.combined, 160))
+        return
+    }
+    pass_msg(acc, "port: the demo compiles")
+    let demo_elf: str = scratch(acc, "demo.elf")
+    let g: RunResult = run_capture("gcc", ["-O2", "-Werror", "-ffreestanding", "-nostdlib",
+        "-fno-pie", "-no-pie", "-ffunction-sections", "-fno-stack-protector",
+        "-T", "link.ld", "-o", demo_elf, scratch(acc, demo_c)])
+    if g.code != 0 {
+        fail_msg(acc, "port: the demo did not link -Werror: " + clip(g.combined, 160))
+        return
+    }
+    if !which("objdump") {
+        fail_msg(acc, "port: objdump not available")
+        return
+    }
+    pass_msg(acc, "port: the demo links -Werror as a freestanding image")
+    let dis: RunResult = run_capture("objdump", ["-d", demo_elf])
+    let text: str = dis.out
+    # The six real instructions, as the hardware spells them.
+    let wants: list[str] = ["out    %al,(%dx)", "in     (%dx),%al",
+                            "out    %ax,(%dx)", "in     (%dx),%ax",
+                            "out    %eax,(%dx)", "in     (%dx),%eax"]
+    let whys: list[str] = ["outb", "inb", "outw", "inw", "outl", "inl"]
+    let mut i: int = 0
+    while i < wants.len() {
+        if text.contains(wants.get(i)) {
+            pass_msg(acc, "port: the image really contains " + whys.get(i))
+        } else {
+            fail_msg(acc, "port: " + whys.get(i) + " is missing from the disassembly")
+        }
+        i = i + 1
+    }
+    # `main` must touch NO port: a port access is privileged and the
+    # demo has to be runnable by the gate.
+    if main_touches_port(text) {
+        fail_msg(acc, "port: main touches a port, so the demo cannot run")
+    } else {
+        pass_msg(acc, "port: main issues no port access (the demo is runnable)")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 4. the demo
+# ----------------------------------------------------------------------------
+fn sec4(acc: Acc) -> void uses IO, Proc {
+    section("4. the demo")
+    let elf: str = scratch(acc, "demo.elf")
+    if !file_exists(elf) {
+        fail_msg(acc, "port: the demo image was not built")
+        return
+    }
+    let p: RunResult = run_capture(elf, [])
+    if p.code == 0 {
+        pass_msg(acc, "port: the demo image runs, exit 0")
+    } else {
+        fail_msg(acc, "port: the demo image exit=" + p.code.to_str())
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 5. the model
+# ----------------------------------------------------------------------------
+fn sec5(acc: Acc) -> void uses IO, Fs, Proc {
+    section("5. the model")
+    let r: RunResult = boot(acc, [ok_test()])
+    if r.code == 0 {
+        pass_msg(acc, "port: the ok-test is clean on the interpreter")
+    } else {
+        fail_msg(acc, "port: ok-test interpreter exit=" + r.code.to_str())
+    }
+    let comp: RunResult = compile_to(acc, ok_test(), "ok.c")
+    if comp.code != 0 {
+        fail_msg(acc, "port: the ok-test did not compile")
+    } else {
+        let nat: RunResult = gcc_hosted(acc, "ok", scratch(acc, "ok.c"))
+        if nat.spawned && nat.code == 0 {
+            pass_msg(acc, "port: the ok-test is clean natively")
+        } else {
+            fail_msg(acc, "port: the ok-test failed natively: " + clip(nat.combined, 140))
+        }
+    }
+    let text: str = strip_no_std(read_file(ok_test()))
+    let fs: str = write_src(acc, "ok_fs.hls", "#![freestanding]\n" + text)
+    let fcomp: RunResult = compile_to(acc, fs, "ok_fs.c")
+    if fcomp.code != 0 {
+        fail_msg(acc, "port: the ok-test did not compile as freestanding")
+    } else {
+        let fr: RunResult = gcc_fs(acc, "ok_fs", scratch(acc, "ok_fs.c"))
+        if fr.spawned && fr.code == 0 {
+            pass_msg(acc, "port: the ok-test links -nostdlib and exits 0")
+        } else {
+            fail_msg(acc, "port: the freestanding ok-test failed: " + clip(fr.combined, 140))
+        }
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 6. behaviour probes
+# ----------------------------------------------------------------------------
+fn sec6(acc: Acc) -> void uses IO, Fs, Proc {
+    section("6. behaviour probes")
+    let ps: list[Probe] = probes()
+    let mut i: int = 0
+    while i < ps.len() {
+        let p: Probe = ps.get(i)
+        let path: str = write_src(acc, "probe_" + p.name + ".hls", p.body)
+        let r: RunResult = boot(acc, [path])
+        if r.code != p.want {
+            fail_msg(acc, "port: probe " + p.name + " (interp) exit=" + r.code.to_str()
+                + " want=" + p.want.to_str() + " — " + clip(r.combined, 100))
+            i = i + 1
+            continue
+        }
+        let comp: RunResult = compile_to(acc, path, "probe_" + p.name + ".c")
+        if comp.code != 0 {
+            fail_msg(acc, "port: probe " + p.name + " did not compile")
+            i = i + 1
+            continue
+        }
+        let nat: RunResult = gcc_hosted(acc, "probe_" + p.name, scratch(acc, "probe_" + p.name + ".c"))
+        if !nat.spawned {
+            fail_msg(acc, "port: probe " + p.name + " did not link")
+            i = i + 1
+            continue
+        }
+        if nat.code != p.want {
+            fail_msg(acc, "port: probe " + p.name + " (native) exit=" + nat.code.to_str()
+                + " want=" + p.want.to_str() + " — " + clip(nat.combined, 100))
+            i = i + 1
+            continue
+        }
+        let fs: str = write_src(acc, "probe_" + p.name + "_fs.hls", "#![freestanding]\n" + p.body)
+        let fcomp: RunResult = compile_to(acc, fs, "probe_" + p.name + "_fs.c")
+        if fcomp.code != 0 {
+            fail_msg(acc, "port: probe " + p.name + " did not compile freestanding")
+            i = i + 1
+            continue
+        }
+        let fr: RunResult = gcc_fs(acc, "probe_" + p.name + "_fs", scratch(acc, "probe_" + p.name + "_fs.c"))
+        if !fr.spawned || fr.code != p.want {
+            fail_msg(acc, "port: probe " + p.name + " (-nostdlib) failed")
+            i = i + 1
+            continue
+        }
+        pass_msg(acc, "port: " + p.name + " — " + p.desc)
+        i = i + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 7. the tools
+# ----------------------------------------------------------------------------
+fn sec7(acc: Acc) -> void uses IO, Proc {
+    section("7. the tools")
+    let tools: list[ToolLeg] = [
+        ToolLeg { label: "hlfmt -c (ok-test)", argv: ["tools/hlfmt.py", "-c", ok_test()] },
+        ToolLeg { label: "hlfmt -c (demo)", argv: ["tools/hlfmt.py", "-c", demo()] },
+        ToolLeg { label: "hlfmt -c (core)", argv: ["tools/hlfmt.py", "-c", core_port()] },
+        ToolLeg { label: "hllint (ok-test)", argv: ["tools/hllint.py", ok_test()] },
+    ]
+    let mut i: int = 0
+    while i < tools.len() {
+        let t: ToolLeg = tools.get(i)
+        let r: RunResult = run_capture("python3", t.argv)
+        if r.code == 0 {
+            pass_msg(acc, "port: " + t.label)
+        } else {
+            fail_msg(acc, "port: " + t.label + ": " + clip(r.combined, 140))
+        }
+        i = i + 1
+    }
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let acc: Acc = acc_new("port")
+    sec1(acc)
+    sec2(acc)
+    sec3(acc)
+    sec4(acc)
+    sec5(acc)
+    sec6(acc)
+    sec7(acc)
+    return finish(acc, "Stage 88 -- core.port: x86 I/O ports")
+}

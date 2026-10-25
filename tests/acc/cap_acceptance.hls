@@ -1,0 +1,379 @@
+# ============================================================================
+# tests/acc/cap_acceptance.hls — Stage 111 acceptance gate, in Halis
+# (the Halis twin of what was tests/cap_acceptance.py; same seven
+# sections, same assertions, same needles — the harness is
+# tests/acc/harness.hls and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make cap-acceptance` (which compiles this file to bin/acc-cap
+# and runs it from the repo root).
+#
+# The old battery loaded programs in-process (load_program + check) for
+# its accept legs; the gate asks the same question through the front
+# door — `boot.py --check` exit 0 — so the gate itself carries no
+# Python beyond the oracle legs every gate spawns by design.
+#
+#  1. the parser        — Cap[E] accepts the nine effect names, rejects
+#                         everything else; `Cap` cannot be shadowed
+#  2. the mint rules    — cap_take("E") only in main or a fn declaring
+#                         E; wrong/unknown literals rejected
+#  3. the grants        — a direct Cap[E] parameter discharges E (all
+#                         nine effects, family form included); no token
+#                         transitively; pure fns hold no authority
+#  4. the opaqueness    — no clone (tokens or composites holding them),
+#                         no printing; tokens are not forgeable
+#  5. the crate modes   — Cap types and cap_take are no_std errors
+#  6. the differential  — the five feat_stage111 programs and the demo
+#                         are byte-identical interpreter vs native
+#                         (default AND -O fast)
+#  7. the audit         — --audit prints the Capability tokens section
+#                         (same words on both front-ends)
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+
+# ----------------------------------------------------------------------------
+# The gate's data.
+# ----------------------------------------------------------------------------
+
+fn demo() -> str {
+    return "examples/cap_demo.hls"
+}
+
+fn ok_tests() -> list[str] {
+    return [
+        "tests/ok/feat_stage111_cap_basic.hls",
+        "tests/ok/feat_stage111_cap_family.hls",
+        "tests/ok/feat_stage111_cap_name.hls",
+        "tests/ok/feat_stage111_cap_spawn.hls",
+        "tests/ok/feat_stage111_cap_struct.hls",
+    ]
+}
+
+fn effects() -> list[str] {
+    return ["IO", "Fs", "Clock", "Args", "Exit", "Net", "Rand", "Proc", "Conc"]
+}
+
+# ----------------------------------------------------------------------------
+# Shared legs.
+# ----------------------------------------------------------------------------
+
+# check_accept(acc, name, src) — boot --check must accept the source.
+fn check_accept(acc: Acc, name: str, src: str) -> bool uses IO, Fs, Proc {
+    let path: str = write_src(acc, name, src)
+    let r: RunResult = boot_check(acc, path)
+    if r.code == 0 {
+        pass_msg(acc, name + " accepted")
+        return true
+    }
+    fail_msg(acc, name + " rejected: " + clip(r.combined, 220))
+    return false
+}
+
+# check_deny(acc, name, src, expect) — boot's checker must reject the
+# source with the expected message.
+fn check_deny(acc: Acc, name: str, src: str, expect: str) -> void uses IO, Fs, Proc {
+    let path: str = write_src(acc, name, src)
+    let r: RunResult = boot_check(acc, path)
+    if r.code == 1 && r.combined.contains(expect) {
+        pass_msg(acc, name + " rejected (" + expect + ")")
+    } else {
+        fail_msg(acc, name + ": rc=" + r.code.to_str() + " expected '" + expect
+            + "' in: " + clip(r.combined, 220))
+    }
+}
+
+# check_deny_hlc(acc, name, src, expect) — the self-hosted compiler must
+# reject the source too.
+fn check_deny_hlc(acc: Acc, name: str, src: str, expect: str) -> void uses IO, Fs, Proc {
+    let path: str = write_src(acc, name, src)
+    let out_c: str = scratch(acc, name + ".c")
+    let r: RunResult = run_capture(hlc_path(acc), [path, out_c])
+    if r.code != 0 && r.combined.contains(expect) {
+        pass_msg(acc, name + " rejected by hlc (" + expect + ")")
+    } else {
+        fail_msg(acc, name + " (hlc): rc=" + r.code.to_str() + " expected '"
+            + expect + "' in: " + clip(r.combined, 220))
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 1. the parser: Cap[E] names an effect, nothing else does
+# ----------------------------------------------------------------------------
+fn sec1(acc: Acc) -> void uses IO, Fs, Proc {
+    section("1. the parser: Cap[E] names an effect, nothing else does")
+    let effs: list[str] = effects()
+    let mut i: int = 0
+    while i < effs.len() {
+        let eff: str = effs.get(i)
+        let src: str = "fn main() -> int {\n" +
+                       "    let c: Cap[" + eff + "] = cap_take(\"" + eff + "\")\n" +
+                       "    return 0\n" +
+                       "}\n"
+        let path: str = write_src(acc, "cap_" + eff + ".hls", src)
+        let r: RunResult = boot_check(acc, path)
+        if r.code == 0 {
+            pass_msg(acc, "Cap[" + eff + "] parses, checks, and mints")
+        } else {
+            fail_msg(acc, "Cap[" + eff + "] rejected: " + clip(r.combined, 160))
+        }
+        i = i + 1
+    }
+    check_deny(acc, "cap_bad_name.hls",
+        "fn main() -> int {\n" +
+        "    let c: Cap[What] = cap_take(\"Net\")\n" +
+        "    return 0\n" +
+        "}\n",
+        "unknown capability 'Cap[What]'")
+    check_deny(acc, "cap_bad_take.hls",
+        "fn main() -> int {\n" +
+        "    let c: Cap[Net] = cap_take(\"What\")\n" +
+        "    return 0\n" +
+        "}\n",
+        "unknown capability 'Cap[What]'")
+    check_deny(acc, "cap_nonliteral.hls",
+        "fn main() -> int {\n" +
+        "    let e: str = \"Net\"\n" +
+        "    let c: Cap[Net] = cap_take(e)\n" +
+        "    return 0\n" +
+        "}\n",
+        "string literal naming an effect")
+    check_deny(acc, "cap_shadow.hls",
+        "fn f[Cap](x: int) -> int { return x }\n" +
+        "fn main() -> int { return 0 }\n",
+        "type parameter cannot be named 'Cap'")
+}
+
+# ----------------------------------------------------------------------------
+# 2. the mint rules: main, or an explicit grant
+# ----------------------------------------------------------------------------
+fn sec2(acc: Acc) -> void uses IO, Fs, Proc {
+    section("2. the mint rules: main, or an explicit grant")
+    check_deny(acc, "cap_take_outside.hls",
+        "fn mint() -> int {\n" +
+        "    let c: Cap[Net] = cap_take(\"Net\")\n    return 0\n}\n" +
+        "fn main() -> int { return 0 }\n",
+        "cap_take('Net') may only be called from 'main' or a function declaring 'uses Net'")
+    check_deny(acc, "cap_take_wrong_decl.hls",
+        "fn mint() -> int uses Fs {\n" +
+        "    let c: Cap[Net] = cap_take(\"Net\")\n    return 0\n}\n" +
+        "fn main() -> int { return 0 }\n",
+        "cap_take('Net') may only be called from 'main' or a function declaring 'uses Net'")
+    # ...but a fn declaring the effect MAY split a token off.
+    check_accept(acc, "cap_take_declared.hls",
+        "fn mint() -> Cap[Net] uses Net {\n" +
+        "    return cap_take(\"Net\")\n}\n" +
+        "fn main() -> int {\n" +
+        "    let io: Cap[IO] = cap_take(\"IO\")\n" +
+        "    let c: Cap[Net] = mint()\n" +
+        "    println(cap_effect_name(c))\n" +
+        "    return 0\n" +
+        "}\n")
+}
+
+# ----------------------------------------------------------------------------
+# 3. the grants: signature-carried authority
+# ----------------------------------------------------------------------------
+fn sec3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("3. the grants: signature-carried authority")
+    check_deny(acc, "cap_missing_grant.hls",
+        "fn leak() -> int {\n" +
+        "    return net_lookup(\"localhost\").len()\n}\n" +
+        "fn main() -> int { return leak() }\n",
+        "requires effect 'Net' not declared")
+    check_deny(acc, "cap_transitive.hls",
+        "fn helper2() -> int {\n" +
+        "    return net_lookup(\"localhost\").len()\n}\n" +
+        "fn middle() -> int { return helper2() }\n" +
+        "fn main() -> int {\n" +
+        "    let c: Cap[Net] = cap_take(\"Net\")\n" +
+        "    return middle()\n}\n",
+        "requires effect 'Net' not declared")
+    check_deny(acc, "cap_pure_param.hls",
+        "fn hold(c: Cap[Net]) -> int pure { return 0 }\n" +
+        "fn main() -> int { return 0 }\n",
+        "pure function 'hold' cannot take a capability parameter")
+    check_deny(acc, "cap_struct_field_no_grant.hls",
+        "struct Bag { t: Cap[Net] }\n" +
+        "fn act(b: Bag) -> int {\n" +
+        "    return net_lookup(\"localhost\").len()\n}\n" +
+        "fn main() -> int {\n" +
+        "    let io: Cap[IO] = cap_take(\"IO\")\n" +
+        "    let c: Cap[Net] = cap_take(\"Net\")\n" +
+        "    let b: Bag = Bag { t: c }\n" +
+        "    return act(b)\n}\n",
+        "function 'act' calls 'net_lookup' which requires effect 'Net'")
+}
+
+# ----------------------------------------------------------------------------
+# 4. the opaqueness: unforgeable, unduplicable, unprintable
+# ----------------------------------------------------------------------------
+fn sec4(acc: Acc) -> void uses IO, Fs, Proc {
+    section("4. the opaqueness: unforgeable, unduplicable, unprintable")
+    check_deny(acc, "cap_clone.hls",
+        "fn dup(c: Cap[Net]) -> Cap[Net] {\n" +
+        "    let d: Cap[Net] = clone(c)\n    return d\n}\n" +
+        "fn main() -> int {\n" +
+        "    let c: Cap[Net] = cap_take(\"Net\")\n" +
+        "    let e: Cap[Net] = dup(c)\n    return 0\n}\n",
+        "clone() on type Cap[Net] is not supported")
+    check_deny(acc, "cap_clone_struct.hls",
+        "struct Bag { t: Cap[Net] }\n" +
+        "fn main() -> int {\n" +
+        "    let c: Cap[Net] = cap_take(\"Net\")\n" +
+        "    let b: Bag = Bag { t: c }\n" +
+        "    let b2: Bag = clone(b)\n    return 0\n}\n",
+        "clone() on type Bag is not supported")
+    check_deny(acc, "cap_print.hls",
+        "fn main() -> int {\n" +
+        "    let c: Cap[Net] = cap_take(\"Net\")\n" +
+        "    println(c)\n    return 0\n}\n",
+        "println expects argument 1 to be str, got Cap[Net]")
+    # no literal forgery: the only Cap values come from cap_take / params.
+    check_accept(acc, "cap_no_literal.hls",
+        "fn main() -> int {\n" +
+        "    let io: Cap[IO] = cap_take(\"IO\")\n" +
+        "    println(\"Net\")\n" +
+        "    return 0\n" +
+        "}\n")
+}
+
+# ----------------------------------------------------------------------------
+# 5. the crate modes: no OS, no authority
+# ----------------------------------------------------------------------------
+fn sec5(acc: Acc) -> void uses IO, Fs, Proc {
+    section("5. the crate modes: no OS, no authority")
+    check_deny(acc, "cap_type_no_std.hls",
+        "#![no_std]\n" +
+        "fn hold(c: Cap[Net]) -> int { return 0 }\n" +
+        "fn main() -> int { return 0 }\n",
+        "capability type 'Cap[Net]' is unavailable in #![no_std] mode")
+    check_deny(acc, "cap_take_no_std.hls",
+        "#![no_std]\n" +
+        "fn main() -> int {\n" +
+        "    let c: Cap[Net] = cap_take(\"Net\")\n" +
+        "    return 0\n" +
+        "}\n",
+        "cap_take() is not available in #![no_std] mode")
+}
+
+# ----------------------------------------------------------------------------
+# 6. the differential: interpreter vs native (both -O modes)
+# ----------------------------------------------------------------------------
+fn sec6(acc: Acc) -> void uses IO, Fs, Proc {
+    section("6. the differential: interpreter vs native (both -O modes)")
+    let srcs: list[str] = ok_tests()
+    srcs.push(demo())
+    let mut i: int = 0
+    while i < srcs.len() {
+        let src: str = srcs.get(i)
+        let base: str = basename(src)
+        let interp: RunResult = boot(acc, [src])
+        let mut native_ok: bool = true
+        let tags: list[str] = ["default", "fast"]
+        let mut t: int = 0
+        while t < tags.len() {
+            let tag: str = tags.get(t)
+            let out_c: str = scratch(acc, base + "_" + tag + ".c")
+            let bin_c: str = scratch(acc, base + "_" + tag)
+            let argv: list[str] = []
+            if tag == "fast" {
+                argv.push("-O")
+                argv.push("fast")
+            }
+            argv.push(src)
+            argv.push(out_c)
+            let comp: RunResult = run_capture(hlc_path(acc), argv)
+            if comp.code != 0 {
+                fail_msg(acc, base + " [" + tag + "]: hlc refused")
+                native_ok = false
+                t = t + 1
+                continue
+            }
+            let cc: RunResult = run_capture("gcc", ["-O2", "-o", bin_c, out_c,
+                "-lm", "-pthread"])
+            if cc.code != 0 {
+                fail_msg(acc, base + " [" + tag + "]: gcc refused")
+                native_ok = false
+                t = t + 1
+                continue
+            }
+            let nat: RunResult = run_capture(bin_c, [])
+            if nat.out != interp.out || nat.code != interp.code {
+                fail_msg(acc, base + " [" + tag + "]: interp(exit=" + interp.code.to_str()
+                    + ") != native(exit=" + nat.code.to_str() + ") interp: "
+                    + clip(interp.out, 120) + " native: " + clip(nat.out, 120))
+                native_ok = false
+            }
+            t = t + 1
+        }
+        if native_ok {
+            pass_msg(acc, base + " identical on both front-ends (default + -O fast)")
+        }
+        i = i + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 7. the audit: the Capability tokens section, word-for-word
+# ----------------------------------------------------------------------------
+fn sec7(acc: Acc) -> void uses IO, Fs, Proc {
+    section("7. the audit: the Capability tokens section, word-for-word")
+    let audit_src: str = write_src(acc, "cap_audit.hls", read_file(demo()))
+    let b: RunResult = boot(acc, ["--audit", audit_src])
+    let h: RunResult = run_capture(hlc_path(acc), ["--audit", audit_src])
+    let header: str = "Capability tokens (Cap[E] parameters / cap_take calls):"
+    if b.out.contains(header) && h.out.contains(header) {
+        pass_msg(acc, "both audits announce the section")
+    } else {
+        fail_msg(acc, "audit section header missing")
+    }
+    # The grant rows: main's six effects and fetch's Net, on both sides.
+    let want_a: str = "main: IO, Fs, Clock, Args, Exit, Net"
+    let want_b: str = "fetch: Net"
+    let mut b_a: bool = false
+    let mut b_b: bool = false
+    let mut h_a: bool = false
+    let mut h_b: bool = false
+    let blines: list[str] = b.out.split("\n")
+    let mut i: int = 0
+    while i < blines.len() {
+        let s: str = blines.get(i).trim()
+        if s == want_a {
+            b_a = true
+        }
+        if s == want_b {
+            b_b = true
+        }
+        i = i + 1
+    }
+    let hlines: list[str] = h.out.split("\n")
+    let mut j: int = 0
+    while j < hlines.len() {
+        let s: str = hlines.get(j).trim()
+        if s == want_a {
+            h_a = true
+        }
+        if s == want_b {
+            h_b = true
+        }
+        j = j + 1
+    }
+    if b_a && b_b && h_a && h_b {
+        pass_msg(acc, "grant rows agree: " + want_a + " / " + want_b)
+    } else {
+        fail_msg(acc, "grant rows differ between the front-ends")
+    }
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let acc: Acc = acc_new("cap")
+    sec1(acc)
+    sec2(acc)
+    sec3(acc)
+    sec4(acc)
+    sec5(acc)
+    sec6(acc)
+    sec7(acc)
+    return finish(acc, "Stage 111 -- capability tokens as values")
+}

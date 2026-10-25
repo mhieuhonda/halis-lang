@@ -1,0 +1,606 @@
+# ============================================================================
+# tests/acc/atomics_acceptance.hls — Stage 90 acceptance gate, in Halis
+# (the Halis twin of what was tests/atomics_acceptance.py; same six
+# sections, same assertions, same needles — the harness is
+# tests/acc/harness.hls and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make atomics-acceptance` (which compiles this file to
+# bin/acc-atomics and runs it from the repo root).
+#
+#  1. core/atomics.hls — the enum / structs / surface, ZERO imports
+#                        (freestanding-clean), no effects
+#  2. the memory orders — the four names, the two bits, and the fact
+#                        that a store cannot carry Acquire
+#  3. the model         — the RMW combinations, the CAS loop and its
+#                        give-up, the seqlock reader rule, RCU's reclaim
+#                        precondition, and the hazard-pointer re-check,
+#                        on the interpreter and both native paths
+#  4. the lowering      — a `lock`ed increment through `asm!` compiles
+#                        `-Werror`, LINKS, and the disassembly really
+#                        contains the fence; the locked-RMW gap stays
+#                        asserted, not forgotten
+#  5. the ok-test       — clean on all three paths
+#  6. the demo + tools  — the demo runs; hlfmt and hllint are clean
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.regex"
+
+# ----------------------------------------------------------------------------
+# The gate's data.
+# ----------------------------------------------------------------------------
+
+struct Probe {
+    name: str,
+    want: int,
+    desc: str,
+    body: str
+}
+
+struct ToolLeg {
+    label: str,
+    argv: list[str]
+}
+
+fn ok_test() -> str {
+    return "tests/ok/feat_stage90_atomics.hls"
+}
+
+fn demo() -> str {
+    return "examples/atomics_demo.hls"
+}
+
+fn core_atomics() -> str {
+    return "core/atomics.hls"
+}
+
+fn core_fns() -> list[str] {
+    return [
+        "mem_order_name", "mem_order_id", "mem_order_from_id",
+        "mem_order_has_acquire", "mem_order_has_release", "mem_order_stronger",
+        "mem_order_load_legal", "mem_order_store_legal", "atomic_new",
+        "atomic_load", "atomic_store", "atomic_fetch_add", "atomic_fetch_sub",
+        "atomic_fetch_and", "atomic_fetch_or", "atomic_fetch_xor", "atomic_cas",
+        "atomic_cas_ok", "atomic_cas_value", "atomic_cas_loop",
+        "atomic_cas_loop_gave_up", "atomic_cas_loop_iterations",
+        "atomic_cas_budget_ok", "seqlock_new", "seqlock_begin_write",
+        "seqlock_end_write", "seqlock_is_even", "seqlock_is_odd",
+        "seqlock_is_writing", "seqlock_read_ok", "seqlock_retry_budget_ok",
+        "rcu_new", "rcu_read_lock", "rcu_read_unlock", "rcu_publish",
+        "rcu_retire", "rcu_unsafe", "rcu_safe", "rcu_try_reclaim",
+        "rcu_reclaimed", "rcu_pending", "rcu_readers", "hazard_new",
+        "hazard_acquire", "hazard_ok", "hazard_release", "hazard_count",
+        "hazard_blocks_reclaim",
+    ]
+}
+
+# A `lock`ed increment: the lowering every atomics module needs. The
+# compiler's constraint machinery (Stage 83) is what makes the memory
+# clobber and the register binding expressible. What it cannot yet
+# express is the LOCKED read-modify-write itself: a locked instruction
+# needs a MEMORY destination, and HLS's asm has no `"+m"` write
+# constraint — that gap is asserted in section 4, not papered over.
+fn mem_hls() -> str {
+    return "#![freestanding]\n" +
+           "\n" +
+           "fn touch(addr: int) -> void {\n" +
+           "    let v: int = 0\n" +
+           "    asm!(\"movq {0}, {1}\", in(\"rax\") v, in(mem) addr)\n" +
+           "    return\n" +
+           "}\n" +
+           "\n" +
+           "fn fence() -> void {\n" +
+           "    # No clobber clause: Stage 83 banned \"cc\" and \"memory\" from it,\n" +
+           "    # because the DEFAULT list already carries both — so an asm! with no\n" +
+           "    # options is a fence the compiler will not move memory across.\n" +
+           "    asm!(\"mfence\")\n" +
+           "    return\n" +
+           "}\n" +
+           "\n" +
+           "fn main() -> int {\n" +
+           "    return 0\n" +
+           "}\n"
+}
+
+# The KNOWN GAP source: the assembler (correctly) refuses a locked
+# register destination, so `lock addq` on an `inout(reg)` operand does
+# not assemble.
+fn gap_hls() -> str {
+    return "#![freestanding]\n" +
+           "\n" +
+           "fn locked_add(mut p: int) -> int {\n" +
+           "    asm!(\"lock addq {0}, {1}\", in(\"rcx\") 1, inout(reg) p)\n" +
+           "    return p\n" +
+           "}\n" +
+           "\n" +
+           "fn main() -> int {\n" +
+           "    return 0\n" +
+           "}\n"
+}
+
+fn probes() -> list[Probe] {
+    return [
+        Probe {
+            name: "orders",
+            want: 0,
+            desc: "the four orders, their two bits, and the store rule",
+            body: "import \"core.atomics\"\n" +
+                  "fn main() -> int {\n" +
+                  "    if mem_order_id(MemOrder.Relaxed) != 0 { return 1 }\n" +
+                  "    if mem_order_id(MemOrder.Acquire) != 2 { return 2 }\n" +
+                  "    if mem_order_id(MemOrder.Release) != 3 { return 3 }\n" +
+                  "    if mem_order_id(MemOrder.AcqRel) != 4 { return 4 }\n" +
+                  "    # Acquire and Release are DIFFERENT halves.\n" +
+                  "    if !mem_order_has_acquire(MemOrder.Acquire) { return 5 }\n" +
+                  "    if mem_order_has_release(MemOrder.Acquire) { return 6 }\n" +
+                  "    if mem_order_has_acquire(MemOrder.Release) { return 7 }\n" +
+                  "    if !mem_order_has_release(MemOrder.Release) { return 8 }\n" +
+                  "    if !mem_order_has_acquire(MemOrder.AcqRel) { return 9 }\n" +
+                  "    if !mem_order_has_release(MemOrder.AcqRel) { return 10 }\n" +
+                  "    if mem_order_has_acquire(MemOrder.Relaxed) { return 11 }\n" +
+                  "    # A store cannot carry Acquire.\n" +
+                  "    if mem_order_store_legal(MemOrder.Acquire) { return 12 }\n" +
+                  "    if !mem_order_store_legal(MemOrder.Release) { return 13 }\n" +
+                  "    # Replacing a release with a relaxed WEAKENS the order.\n" +
+                  "    if mem_order_stronger(MemOrder.Relaxed, MemOrder.Release) { return 14 }\n" +
+                  "    if !mem_order_stronger(MemOrder.AcqRel, MemOrder.Acquire) { return 15 }\n" +
+                  "    return 0\n" +
+                  "}\n"
+        },
+        Probe {
+            name: "rmw-cas",
+            want: 0,
+            desc: "the RMW combinations, and the CAS loop's give-up",
+            body: "import \"core.atomics\"\n" +
+                  "fn main() -> int {\n" +
+                  "    let a: Atomic = atomic_new(5, MemOrder.AcqRel)\n" +
+                  "    if atomic_load(atomic_fetch_add(a, 3)) != 8 { return 1 }\n" +
+                  "    if atomic_load(atomic_fetch_sub(atomic_fetch_add(a, 3), 3)) != 5 { return 2 }\n" +
+                  "    if atomic_load(atomic_fetch_or(a, 8)) != 13 { return 3 }\n" +
+                  "    let a2: Atomic = atomic_store(a, 42)\n" +
+                  "    if atomic_load(a2) != 42 { return 4 }\n" +
+                  "    let ok: list[int] = atomic_cas(a2, 42, 7)\n" +
+                  "    if !atomic_cas_ok(ok) || atomic_cas_value(ok) != 7 { return 5 }\n" +
+                  "    let no: list[int] = atomic_cas(a2, 99, 9)\n" +
+                  "    if atomic_cas_ok(no) || atomic_cas_value(no) != 42 { return 6 }\n" +
+                  "    # Giving up is NOT success.\n" +
+                  "    let loss: list[int] = atomic_cas_loop(7, 99, 11, 4)\n" +
+                  "    if !atomic_cas_loop_gave_up(loss) { return 7 }\n" +
+                  "    if atomic_cas_loop_iterations(loss) != 4 { return 8 }\n" +
+                  "    if atomic_cas_loop_gave_up(atomic_cas_loop(7, 7, 11, 4)) { return 9 }\n" +
+                  "    if atomic_cas_budget_ok(0) { return 10 }\n" +
+                  "    return 0\n" +
+                  "}\n"
+        },
+        Probe {
+            name: "seqlock",
+            want: 0,
+            desc: "the seqlock writer's even->odd->even, and the reader's rule",
+            body: "import \"core.atomics\"\n" +
+                  "fn main() -> int {\n" +
+                  "    let mut l: SeqLock = seqlock_new()\n" +
+                  "    if !seqlock_is_even(l.seq) { return 1 }\n" +
+                  "    l = seqlock_begin_write(l)\n" +
+                  "    if !seqlock_is_writing(l) { return 2 }\n" +
+                  "    # While odd, NO reader may trust the data — including the case\n" +
+                  "    # where the two counter reads AGREE.\n" +
+                  "    if seqlock_read_ok(1, 1) { return 3 }\n" +
+                  "    l = seqlock_end_write(l)\n" +
+                  "    if !seqlock_is_even(l.seq) { return 4 }\n" +
+                  "    if !seqlock_read_ok(0, 0) { return 5 }\n" +
+                  "    if seqlock_read_ok(2, 3) { return 6 }\n" +
+                  "    if seqlock_read_ok(1, 0) { return 7 }\n" +
+                  "    if seqlock_retry_budget_ok(0) { return 8 }\n" +
+                  "    return 0\n" +
+                  "}\n"
+        },
+        Probe {
+            name: "rcu",
+            want: 0,
+            desc: "RCU's reclaim precondition, and the unsafe counter",
+            body: "import \"core.atomics\"\n" +
+                  "fn main() -> int {\n" +
+                  "    let mut r: RcuState = rcu_new()\n" +
+                  "    r = rcu_publish(r, 1048576)\n" +
+                  "    r = rcu_retire(r, 2097152)\n" +
+                  "    if rcu_pending(r) != 1 { return 1 }\n" +
+                  "    # A reader inside BLOCKS the reclaim.\n" +
+                  "    r = rcu_read_lock(r)\n" +
+                  "    if rcu_readers(r) != 1 { return 2 }\n" +
+                  "    let held: RcuState = rcu_try_reclaim(r)\n" +
+                  "    if rcu_pending(held) != 1 || rcu_reclaimed(held) != 0 { return 3 }\n" +
+                  "    r = rcu_read_unlock(held)\n" +
+                  "    let freed: RcuState = rcu_try_reclaim(r)\n" +
+                  "    if rcu_pending(freed) != 0 || rcu_reclaimed(freed) != 1 { return 4 }\n" +
+                  "    # The unsafe counter closes the same window for a reader with no\n" +
+                  "    # critical section.\n" +
+                  "    r = rcu_unsafe(freed)\n" +
+                  "    if rcu_readers(r) != 1 { return 5 }\n" +
+                  "    if rcu_pending(rcu_try_reclaim(r)) != 0 { return 6 }\n" +
+                  "    return 0\n" +
+                  "}\n"
+        },
+        Probe {
+            name: "hazard",
+            want: 0,
+            desc: "the hazard-pointer re-check, and the blocked reclaim",
+            body: "import \"core.atomics\"\n" +
+                  "fn main() -> int {\n" +
+                  "    let h: HazardState = hazard_new()\n" +
+                  "    let got: list[int] = hazard_acquire(h, 4096, 4096)\n" +
+                  "    if !hazard_ok(got) { return 1 }\n" +
+                  "    # acquire() returns the INDEX; the state it produced is what carries\n" +
+                  "    # the hazard, so a released state is back to zero.\n" +
+                  "    if hazard_count(hazard_release(h, got.get(1))) != 0 { return 2 }\n" +
+                  "    # A writer that moved the pointer between the load and the publish\n" +
+                  "    # is the window the re-read closes.\n" +
+                  "    if hazard_ok(hazard_acquire(h, 4096, 8192)) { return 3 }\n" +
+                  "    let held: HazardState = hazard_new()\n" +
+                  "    let mut with: list[int] = held.published\n" +
+                  "    with.push(4096)\n" +
+                  "    let h2: HazardState = HazardState { slot: held.slot, published: with, retired: held.retired }\n" +
+                  "    if !hazard_blocks_reclaim(h2, 4096) { return 4 }\n" +
+                  "    if hazard_blocks_reclaim(h2, 8192) { return 5 }\n" +
+                  "    if hazard_count(h2) != 1 { return 6 }\n" +
+                  "    if hazard_count(hazard_release(h2, 0)) != 0 { return 7 }\n" +
+                  "    return 0\n" +
+                  "}\n"
+        },
+    ]
+}
+
+# ----------------------------------------------------------------------------
+# Shared legs.
+# ----------------------------------------------------------------------------
+
+fn decl_word(src: str, kw: str, name: str) -> bool {
+    let rr: Result[Regex, str] = regex_compile(kw + "\\s+" + name + "\\b")
+    if result_is_err(rr) {
+        return false
+    }
+    let re: Regex = result_unwrap(rr)
+    return regex_is_match(re, src)
+}
+
+fn import_paths(src: str) -> list[str] {
+    let out: list[str] = []
+    let lines: list[str] = src.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i).trim()
+        if line.starts_with("import ") {
+            let rest: str = line.slice(7, line.len()).trim()
+            if rest.starts_with("\"") {
+                let tail: str = rest.slice(1, rest.len())
+                let end: int = tail.find("\"")
+                if end > 0 {
+                    out.push(tail.slice(0, end))
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn strip_no_std(text: str) -> str {
+    let lines: list[str] = text.split("\n")
+    let mut out: str = ""
+    let mut removed: bool = false
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i)
+        if !removed && line == "#![no_std]" {
+            removed = true
+            i = i + 1
+            continue
+        }
+        out = out + line + "\n"
+        i = i + 1
+    }
+    return out
+}
+
+fn hlc_run(acc: Acc, src: str) -> RunResult uses Fs, Proc {
+    let r: RunResult = RunResult {
+        code: -1, out: "", err: "", combined: "", spawned: false
+    }
+    let c_path: str = scratch(acc, stem(src) + ".c")
+    let exe: str = scratch(acc, stem(src) + ".bin")
+    let comp: RunResult = run_capture(hlc_path(acc), [src, c_path])
+    if comp.code != 0 {
+        r.combined = comp.combined
+        return r
+    }
+    let cc: RunResult = run_capture("gcc", ["-O2", "-Werror", "-o", exe, c_path, "-lm", "-pthread"])
+    if cc.code != 0 {
+        r.combined = cc.combined
+        return r
+    }
+    let runr: RunResult = run_capture(exe, [])
+    runr.spawned = true
+    return runr
+}
+
+fn hlc_run_fs(acc: Acc, src: str) -> RunResult uses Fs, Proc {
+    let r: RunResult = RunResult {
+        code: -1, out: "", err: "", combined: "", spawned: false
+    }
+    let c_path: str = scratch(acc, stem(src) + ".fs.c")
+    let exe: str = scratch(acc, stem(src) + ".fs")
+    let comp: RunResult = run_capture(hlc_path(acc), [src, c_path])
+    if comp.code != 0 {
+        r.combined = comp.combined
+        return r
+    }
+    let cc: RunResult = run_capture("gcc", ["-O2", "-ffreestanding", "-nostdlib",
+        "-ffunction-sections", "-fno-stack-protector", "-Wl,--gc-sections", "-o", exe, c_path])
+    if cc.code != 0 {
+        r.combined = cc.combined
+        return r
+    }
+    let runr: RunResult = run_capture(exe, [])
+    runr.spawned = true
+    return runr
+}
+
+# ----------------------------------------------------------------------------
+# 1. core/atomics.hls
+# ----------------------------------------------------------------------------
+fn sec1(acc: Acc) -> void uses IO, Fs {
+    section("1. core/atomics.hls")
+    if !file_exists(core_atomics()) {
+        fail_msg(acc, "atomics: core/atomics.hls missing")
+        return
+    }
+    let src: str = read_file(core_atomics())
+    if decl_word(src, "enum", "MemOrder") {
+        pass_msg(acc, "atomics: core.atomics declares enum MemOrder")
+    } else {
+        fail_msg(acc, "atomics: core.atomics missing enum MemOrder")
+    }
+    let structs: list[str] = ["Atomic", "SeqLock", "RcuState", "HazardState"]
+    let mut si: int = 0
+    while si < structs.len() {
+        let s: str = structs.get(si)
+        if decl_word(src, "struct", s) {
+            pass_msg(acc, "atomics: core.atomics declares struct " + s)
+        } else {
+            fail_msg(acc, "atomics: core.atomics missing struct " + s)
+        }
+        si = si + 1
+    }
+    let imports: list[str] = import_paths(src)
+    if imports.len() == 0 {
+        pass_msg(acc, "atomics: core.atomics has ZERO imports (freestanding-clean)")
+    } else {
+        fail_msg(acc, "atomics: core.atomics imports " + str_join(imports, ", "))
+    }
+    let lines: list[str] = src.split("\n")
+    let mut has_effects: bool = false
+    let mut has_extern: bool = false
+    let mut li: int = 0
+    while li < lines.len() {
+        let line: str = lines.get(li)
+        if line.trim().starts_with("#") {
+            li = li + 1
+            continue
+        }
+        if line.starts_with("fn ") && line.contains(" uses ") {
+            has_effects = true
+        }
+        if line.trim().starts_with("extern") {
+            has_extern = true
+        }
+        li = li + 1
+    }
+    if !has_effects && !has_extern {
+        pass_msg(acc, "atomics: core.atomics declares no effects and no externs")
+    } else {
+        fail_msg(acc, "atomics: core.atomics declares effects or externs")
+    }
+    let fns: list[str] = core_fns()
+    let mut fi: int = 0
+    while fi < fns.len() {
+        let f: str = fns.get(fi)
+        if decl_word(src, "fn", f) {
+            pass_msg(acc, "atomics: core.atomics exposes " + f)
+        } else {
+            fail_msg(acc, "atomics: core.atomics missing " + f)
+        }
+        fi = fi + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 2. the memory orders
+# ----------------------------------------------------------------------------
+fn sec2(acc: Acc) -> void uses IO, Fs, Proc {
+    section("2. the memory orders")
+    let orders: str = write_src(acc, "orders.hls", probes().get(0).body)
+    let r: RunResult = boot(acc, [orders])
+    if r.code == 0 {
+        pass_msg(acc, "atomics: the four orders and their two bits agree with the spec")
+    } else {
+        fail_msg(acc, "atomics: the order probe failed: " + clip(r.combined, 120))
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 3. the model
+# ----------------------------------------------------------------------------
+fn sec3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("3. the model")
+    let ps: list[Probe] = probes()
+    let mut i: int = 1
+    while i < ps.len() {
+        let p: Probe = ps.get(i)
+        let path: str = write_src(acc, "probe_" + p.name + ".hls", p.body)
+        let r: RunResult = boot(acc, [path])
+        if r.code != p.want {
+            fail_msg(acc, "atomics: probe " + p.name + " (interp) exit=" + r.code.to_str()
+                + " want=" + p.want.to_str() + " — " + clip(r.combined, 100))
+            i = i + 1
+            continue
+        }
+        let code: RunResult = hlc_run(acc, path)
+        if !code.spawned || code.code != p.want {
+            fail_msg(acc, "atomics: probe " + p.name + " (native) exit=" + code.code.to_str()
+                + " want=" + p.want.to_str() + " — " + clip(code.combined, 100))
+            i = i + 1
+            continue
+        }
+        let fs_path: str = write_src(acc, "probe_" + p.name + "_fs.hls", "#![freestanding]\n" + p.body)
+        let fcode: RunResult = hlc_run_fs(acc, fs_path)
+        if !fcode.spawned || fcode.code != p.want {
+            fail_msg(acc, "atomics: probe " + p.name + " (-nostdlib) exit=" + fcode.code.to_str()
+                + " want=" + p.want.to_str() + " — " + clip(fcode.combined, 100))
+            i = i + 1
+            continue
+        }
+        pass_msg(acc, "atomics: " + p.name + " — " + p.desc)
+        i = i + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 4. the lowering
+# ----------------------------------------------------------------------------
+fn sec4(acc: Acc) -> void uses IO, Fs, Proc {
+    section("4. the lowering")
+    let mem_src: str = write_src(acc, "mem.hls", mem_hls())
+    let mem_c: str = scratch(acc, "mem.c")
+    let r: RunResult = run_capture(hlc_path(acc), [mem_src, mem_c])
+    if r.code != 0 {
+        fail_msg(acc, "atomics: the memory-operand form did not compile: " + clip(r.combined, 160))
+    } else {
+        let text: str = read_or(mem_c, "")
+        if text.contains("\"m\"") {
+            pass_msg(acc, "atomics: asm! lowers the memory-operand class to \"m\"")
+        } else {
+            fail_msg(acc, "atomics: the \"m\" class is missing from the emitted C")
+        }
+        if text.contains("\"cc\", \"memory\"") || (text.contains("\"memory\"") && text.contains("\"cc\"")) {
+            pass_msg(acc, "atomics: the default clobber list carries cc and memory")
+        } else {
+            fail_msg(acc, "atomics: the cc/memory clobbers are missing")
+        }
+        if text.contains("__asm__ __volatile__") {
+            pass_msg(acc, "atomics: a device/atomic access is emitted __volatile__")
+        } else {
+            fail_msg(acc, "atomics: the access is not volatile")
+        }
+        let elf: str = scratch(acc, "mem.elf")
+        let g: RunResult = run_capture("gcc", ["-O2", "-Werror", "-ffreestanding", "-nostdlib",
+            "-fno-pie", "-no-pie", "-ffunction-sections", "-fno-stack-protector",
+            "-T", "link.ld", "-o", elf, mem_c])
+        if g.code != 0 {
+            fail_msg(acc, "atomics: the memory-operand image did not link: " + clip(g.combined, 160))
+        } else {
+            pass_msg(acc, "atomics: the memory-operand image links -Werror")
+            if which("objdump") {
+                let dis: RunResult = run_capture("objdump", ["-d", elf])
+                if dis.out.contains("mfence") {
+                    pass_msg(acc, "atomics: the fence is a real mfence in the image")
+                } else {
+                    fail_msg(acc, "atomics: no mfence in the disassembly")
+                }
+            }
+        }
+    }
+
+    # The KNOWN GAP, asserted so it cannot be quietly forgotten.
+    let gap: str = write_src(acc, "gap.hls", gap_hls())
+    let gap_c: str = scratch(acc, "gap.c")
+    let gc: RunResult = run_capture(hlc_path(acc), [gap, gap_c])
+    if gc.code != 0 {
+        fail_msg(acc, "atomics: the compiler should ACCEPT the locked-add source (it is valid asm)")
+        return
+    }
+    pass_msg(acc, "atomics: the compiler accepts a locked-add source")
+    let gap_elf: str = scratch(acc, "gap.elf")
+    let g: RunResult = run_capture("gcc", ["-O2", "-ffreestanding", "-nostdlib", "-fno-pie",
+        "-no-pie", "-ffunction-sections", "-fno-stack-protector", "-o", gap_elf, gap_c])
+    # The assembler refuses a LOCKED REGISTER destination — that is the
+    # rule that makes the gap real, and the message wording is
+    # gas-dependent ("lockable" / "register type mismatch").
+    if g.code != 0 && (g.combined.contains("lockable")
+            || g.combined.contains("register type mismatch")) {
+        pass_msg(acc, "atomics: the locked-add GAP is the assembler's memory-destination rule")
+    } else {
+        fail_msg(acc, "atomics: the locked-add gap changed shape (rc=" + g.code.to_str()
+            + ") — re-check the gate")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 5. the ok-test
+# ----------------------------------------------------------------------------
+fn sec5(acc: Acc) -> void uses IO, Fs, Proc {
+    section("5. the ok-test")
+    let r: RunResult = boot(acc, [ok_test()])
+    if r.code == 0 {
+        pass_msg(acc, "atomics: the ok-test is clean on the interpreter")
+    } else {
+        fail_msg(acc, "atomics: ok-test interpreter exit=" + r.code.to_str())
+    }
+    let code: RunResult = hlc_run(acc, ok_test())
+    if code.spawned && code.code == 0 {
+        pass_msg(acc, "atomics: the ok-test is clean natively")
+    } else {
+        fail_msg(acc, "atomics: ok-test native exit=" + code.code.to_str()
+            + " (" + clip(code.combined, 120) + ")")
+    }
+    let text: str = strip_no_std(read_file(ok_test()))
+    let fs_path: str = write_src(acc, "ok_fs.hls", "#![freestanding]\n" + text)
+    let fcode: RunResult = hlc_run_fs(acc, fs_path)
+    if fcode.spawned && fcode.code == 0 {
+        pass_msg(acc, "atomics: the ok-test links -nostdlib and exits 0 (freestanding)")
+    } else {
+        fail_msg(acc, "atomics: the freestanding ok-test exit=" + fcode.code.to_str()
+            + " (" + clip(fcode.combined, 120) + ")")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 6. the demo + tools
+# ----------------------------------------------------------------------------
+fn sec6(acc: Acc) -> void uses IO, Proc {
+    section("6. the demo + tools")
+    let code: RunResult = hlc_run(acc, demo())
+    if code.spawned && code.code == 0 {
+        pass_msg(acc, "atomics: examples/atomics_demo.hls runs, exit 0")
+    } else {
+        fail_msg(acc, "atomics: the demo exit=" + code.code.to_str()
+            + " (" + clip(code.combined, 120) + ")")
+    }
+    let tools: list[ToolLeg] = [
+        ToolLeg { label: "hlfmt -c (ok-test)", argv: ["tools/hlfmt.py", "-c", ok_test()] },
+        ToolLeg { label: "hlfmt -c (demo)", argv: ["tools/hlfmt.py", "-c", demo()] },
+        ToolLeg { label: "hlfmt -c (core)", argv: ["tools/hlfmt.py", "-c", core_atomics()] },
+        ToolLeg { label: "hllint (ok-test)", argv: ["tools/hllint.py", ok_test()] },
+    ]
+    let mut i: int = 0
+    while i < tools.len() {
+        let t: ToolLeg = tools.get(i)
+        let r: RunResult = run_capture("python3", t.argv)
+        if r.code == 0 {
+            pass_msg(acc, "atomics: " + t.label)
+        } else {
+            fail_msg(acc, "atomics: " + t.label + ": " + clip(r.combined, 140))
+        }
+        i = i + 1
+    }
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let acc: Acc = acc_new("atomics")
+    sec1(acc)
+    sec2(acc)
+    sec3(acc)
+    sec4(acc)
+    sec5(acc)
+    sec6(acc)
+    return finish(acc, "Stage 90 -- core.sync.nolock: lock-free primitives")
+}

@@ -188,9 +188,11 @@ supply-acceptance:
 	@echo "[Stage 103 acceptance] running tests/audit_acceptance.py..."
 	@$(PYTHON) tests/audit_acceptance.py
 
+# The gate itself is Halis (tests/acc/refine_acceptance.hls, compiled
+# native by bin/hlc through the $(BIN)/acc-% pattern rule).
 refine-acceptance: $(BIN)/hlc
-	@echo "[Stage 98 acceptance] running tests/refine_acceptance.py..."
-	@$(PYTHON) tests/refine_acceptance.py
+	@echo "[Stage 98 acceptance] running tests/acc/refine_acceptance.hls..."
+	@$(BIN)/acc-refine
 
 # Run the example programs to verify they still work after a change
 examples:
@@ -488,9 +490,11 @@ ffi-taint-acceptance: $(BIN)/hlc
 # The full gate: mint rules, signature-carried grants, opaqueness,
 # crate modes, the interpreter/native differential (default AND
 # -O fast) and the --audit Capability tokens section.
-cap-acceptance: $(BIN)/hlc
-	@echo "[Stage 111 acceptance] running tests/cap_acceptance.py..."
-	@$(PYTHON) tests/cap_acceptance.py
+# The gate itself is Halis (tests/acc/cap_acceptance.hls, compiled
+# native by bin/hlc through the $(BIN)/acc-% pattern rule).
+cap-acceptance: $(BIN)/acc-cap
+	@echo "[Stage 111 acceptance] running tests/acc/cap_acceptance.hls..."
+	@$(BIN)/acc-cap
 
 # ============================================================================
 # Stage 110 (v0.129.0-alpha): hls-sandbox — sandboxed package
