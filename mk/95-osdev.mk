@@ -375,9 +375,11 @@ freestanding-check:
 # enforcement, entry-only rule + implication, float-library
 # denylist, --audit + hlfmt, self-hosted emission shape, the
 # link-closure proof, and self-hosted parity on fail programs.
-freestanding-acceptance:
-	@echo "[Stage 77 acceptance] running tests/freestanding_acceptance.py..."
-	@$(PYTHON) tests/freestanding_acceptance.py
+# The gate itself is Halis (tests/acc/freestanding_acceptance.hls, compiled
+# native by bin/hlc through the $(BIN)/acc-%% pattern rule).
+freestanding-acceptance: $(BIN)/acc-freestanding
+	@echo "[Stage 77 acceptance] running tests/acc/freestanding_acceptance.hls..."
+	@$(BIN)/acc-freestanding
 	@echo "ACCEPTANCE OK: Stage 77 -- #![freestanding] mode (no libc, no OS calls)"
 
 # nostd: compile a `#![no_std]` program to hosted C + link normally.
@@ -463,9 +465,11 @@ panic-acceptance: $(BIN)/acc-panic
 # freestanding -nostdlib at 0, task runtime carries hl_thread_start /
 # HL_TASK_STACK_BYTES / pthread_attr_setguardsize, boot/hlc parity on
 # fail programs), hlfmt stability, and `--audit` purity.
-stackguard-acceptance:
-	@echo "[Stage 82 acceptance] running tests/stack_acceptance.py..."
-	@$(PYTHON) tests/stack_acceptance.py
+# The gate itself is Halis (tests/acc/stack_acceptance.hls, compiled
+# native by bin/hlc through the $(BIN)/acc-% pattern rule).
+stackguard-acceptance: $(BIN)/acc-stack
+	@echo "[Stage 82 acceptance] running tests/acc/stack_acceptance.hls..."
+	@$(BIN)/acc-stack
 	@echo "ACCEPTANCE OK: Stage 82 -- deterministic stack size + guard pages"
 
 # asmreg-acceptance: the Stage 83 acceptance gate. Runs the 7-section

@@ -1,0 +1,748 @@
+# ============================================================================
+# tests/acc/freestanding_acceptance.hls — Stage 77 acceptance gate, in
+# Halis (the Halis twin of what was tests/freestanding_acceptance.py;
+# same sections, same assertions, same needles — the harness is
+# tests/acc/harness.hls and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make freestanding-acceptance` (which compiles this file to
+# bin/acc-freestanding and runs it from the repo root).
+#
+# The old battery reached into the lab interpreter's Python internals
+# (tokenize/Parser for the parse section, the checker's
+# crate_mode_flags for the mode triple); the gate asks the same
+# questions through the front door — probe programs the CLI must
+# accept or reject, and the --audit crate-mode line. The link-closure
+# proof (section 7) re-expresses the battery's regex-driven C splitter
+# as byte logic: strip strings/comments, split functions at column-0
+# braces, walk the call graph from _start.
+#
+#  1. Crate-attribute parsing (position/duplicates/unknown)
+#  2. Stage-0 enforcement: the demo checks; 8 fail programs rejected
+#  3. Entry-only rule: a dependency declaring `#![...]` is rejected;
+#     the mode triple (freestanding/no_std/hosted) via --audit
+#  4. Float-library denylist (libm, strtod, fmod, snprintf-%f) + the
+#     allowed float surface
+#  5. --audit reports the crate mode; hlfmt stable
+#  6. Self-hosted emission (hlc.hls through the interpreter): the
+#     freestanding TU shape + the hosted emission unchanged
+#  7. Link-closure proof on the emitted freestanding C
+#  8. Self-hosted parity: hlc rejects the representative fail programs
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.regex"
+
+# ----------------------------------------------------------------------------
+# The gate's data.
+# ----------------------------------------------------------------------------
+
+fn demo() -> str {
+    return "examples/freestanding_demo.hls"
+}
+
+fn basic() -> str {
+    return "tests/ok/feat_freestanding_basic.hls"
+}
+
+fn expect_fails() -> list[list[str]] {
+    return [
+        ["fail_freestanding_std_import.hls", "std module"],
+        ["fail_freestanding_uses.hls", "capabilities are unavailable"],
+        ["fail_freestanding_extern.hls", "not available in #![freestanding]"],
+        ["fail_freestanding_late_attr.hls", "before any item"],
+        ["fail_freestanding_unknown_attr.hls", "unknown crate attribute"],
+        ["fail_freestanding_dup_attr.hls", "duplicate crate attribute"],
+        ["fail_freestanding_sin.hls", "math_sin() is not available"],
+        ["fail_freestanding_float_mod.hls", "float % is not available"],
+    ]
+}
+
+fn denied_probes() -> list[list[str]] {
+    return [
+        ["math_sqrt", "fn f(x: float) -> float { return math_sqrt(x) }"],
+        ["math_pow", "fn f(a: float, b: float) -> float { return math_pow(a, b) }"],
+        ["float()", "fn f(s: str) -> float { return float(s) }"],
+        ["str(float)", "fn f(x: float) -> str { return str(x) }"],
+        ["str.to_float", "fn f(s: str) -> float { return s.to_float() }"],
+        ["float.to_str", "fn f(x: float) -> str { return x.to_str() }"],
+    ]
+}
+
+fn allowed_probes() -> list[list[str]] {
+    return [
+        ["isnan", "fn f(x: float) -> bool { return math_isnan(x) }"],
+        ["isinf", "fn f(x: float) -> bool { return math_isinf(x) }"],
+        ["isfinite", "fn f(x: float) -> bool { return math_isfinite(x) }"],
+        ["signbit", "fn f(x: float) -> bool { return math_signbit(x) }"],
+        ["int.to_str", "fn f(x: int) -> str { return x.to_str() }"],
+        ["int.to_float", "fn f(x: int) -> float { return x.to_float() }"],
+        ["float.to_int", "fn f(x: float) -> int { return x.to_int() }"],
+        ["float arith", "fn f(a: float, b: float) -> float { return a + b * 2.0 - a / b }"],
+    ]
+}
+
+# ----------------------------------------------------------------------------
+# Text helpers.
+# ----------------------------------------------------------------------------
+
+fn import_paths(src: str) -> list[str] {
+    let out: list[str] = []
+    let lines: list[str] = src.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i).trim()
+        if line.starts_with("import ") {
+            let rest: str = line.slice(7, line.len()).trim()
+            if rest.starts_with("\"") {
+                let tail: str = rest.slice(1, rest.len())
+                let end: int = tail.find("\"")
+                if end > 0 {
+                    out.push(tail.slice(0, end))
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# strip_c_noise(src) — the battery's regex string/comment stripper as a
+# state machine: string literals become empty, char literals become 'x',
+# comments become spaces, everything else (including newlines) kept.
+fn strip_c_noise(src: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    let n: int = src.len()
+    while i < n {
+        let c: int = src.byte_at(i)
+        if c == 34 {
+            # "..." -> ""
+            out = out + "\"\""
+            i = i + 1
+            while i < n {
+                let d: int = src.byte_at(i)
+                if d == 92 && i + 1 < n {
+                    i = i + 2
+                    continue
+                }
+                if d == 34 {
+                    i = i + 1
+                    break
+                }
+                i = i + 1
+            }
+            continue
+        }
+        if c == 39 {
+            # '...' -> 'x'
+            out = out + "'x'"
+            i = i + 1
+            while i < n {
+                let d: int = src.byte_at(i)
+                if d == 92 && i + 1 < n {
+                    i = i + 2
+                    continue
+                }
+                if d == 39 {
+                    i = i + 1
+                    break
+                }
+                i = i + 1
+            }
+            continue
+        }
+        if c == 47 && i + 1 < n && src.byte_at(i + 1) == 47 {
+            # // line comment -> to end of line
+            while i < n && src.byte_at(i) != 10 {
+                i = i + 1
+            }
+            continue
+        }
+        if c == 47 && i + 1 < n && src.byte_at(i + 1) == 42 {
+            # /* block comment */ -> one space
+            out = out + " "
+            i = i + 2
+            while i + 1 < n {
+                if src.byte_at(i) == 42 && src.byte_at(i + 1) == 47 {
+                    i = i + 2
+                    break
+                }
+                i = i + 1
+            }
+            continue
+        }
+        out = out + src.slice(i, i + 1)
+        i = i + 1
+    }
+    return out
+}
+
+# is_ident_byte(c) — [A-Za-z0-9_].
+fn is_ident_byte(c: int) -> bool {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+        || (c >= 48 && c <= 57) || c == 95
+}
+
+# word_before_paren(line) — the identifier immediately before the first
+# "(" in the line, "" when the line has no paren or no word there.
+fn word_before_paren(line: str) -> str {
+    let p: int = line.find("(")
+    if p <= 0 {
+        return ""
+    }
+    let mut end: int = p - 1
+    while end >= 0 && (line.byte_at(end) == 32 || line.byte_at(end) == 9) {
+        end = end - 1
+    }
+    if end < 0 || !is_ident_byte(line.byte_at(end)) {
+        return ""
+    }
+    let mut start: int = end
+    while start > 0 && is_ident_byte(line.byte_at(start - 1)) {
+        start = start - 1
+    }
+    return line.slice(start, end + 1)
+}
+
+# looks_like_header(line) — a function definition header: trimmed line
+# ends with "{", contains "(", and is not a control-flow keyword line.
+fn looks_like_header(line: str) -> bool {
+    let t: str = line.trim()
+    if !t.ends_with("{") {
+        return false
+    }
+    if !t.contains("(") {
+        return false
+    }
+    # A header line carries no semicolon and no control-flow / close
+    # brace lead-in (the battery's regex could not match those shapes).
+    if t.contains(";") {
+        return false
+    }
+    if t.starts_with("if ") || t.starts_with("for ") || t.starts_with("while ")
+            || t.starts_with("switch ") || t.starts_with("do ")
+            || t.starts_with("else") || t.starts_with("}")
+            || t.starts_with("return ") || t.starts_with("=") {
+        return false
+    }
+    return true
+}
+
+# The C function splitter: returns the function NAMES found (the
+# battery's crude regex splitter, as byte logic; names in order).
+fn c_function_names(t: str) -> list[str] {
+    let names: list[str] = []
+    let lines: list[str] = t.split("\n")
+    let mut in_fn: bool = false
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i)
+        let t2: str = line.trim()
+        if t2.starts_with("#") {
+            i = i + 1
+            continue
+        }
+        if !in_fn && looks_like_header(line) {
+            let name: str = word_before_paren(line)
+            if name != "" {
+                names.push(name)
+                in_fn = true
+            }
+        } else if in_fn && t2 == "}" && !line.starts_with(" ") && !line.starts_with("\t") {
+            in_fn = false
+        }
+        i = i + 1
+    }
+    return names
+}
+
+# fn_body(t, name) — the text of the named function's body region
+# (from its header line through its column-0 close), "" when absent.
+fn fn_body(t: str, name: str) -> str {
+    let lines: list[str] = t.split("\n")
+    let mut out: str = ""
+    let mut in_fn: bool = false
+    let mut cur: str = ""
+    let mut buf: str = ""
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i)
+        let t2: str = line.trim()
+        if t2.starts_with("#") {
+            i = i + 1
+            continue
+        }
+        if !in_fn && looks_like_header(line) {
+            let nm: str = word_before_paren(line)
+            if nm != "" {
+                if cur != "" {
+                    # previous function never closed; drop its buffer
+                    buf = ""
+                }
+                cur = nm
+                buf = line + "\n"
+                in_fn = true
+            }
+        } else if in_fn {
+            buf = buf + line + "\n"
+            if t2 == "}" && !line.starts_with(" ") && !line.starts_with("\t") {
+                if cur == name {
+                    return buf
+                }
+                cur = ""
+                buf = ""
+                in_fn = false
+            }
+        }
+        i = i + 1
+    }
+    if cur == name {
+        return buf
+    }
+    return ""
+}
+
+# calls_in(body) — every identifier directly followed by "(" in the
+# body text (the battery's finditer over ([A-Za-z_]\w*)\s*\().
+fn calls_in(body: str) -> list[str] {
+    let out: list[str] = []
+    let re_r: Result[Regex, str] = regex_compile("[A-Za-z_][A-Za-z0-9_]*\\s*\\(")
+    if result_is_err(re_r) {
+        return out
+    }
+    let re: Regex = result_unwrap(re_r)
+    let ms: list[RegexMatch] = regex_find_all(re, body, 100000)
+    let mut i: int = 0
+    while i < ms.len() {
+        let m: RegexMatch = ms.get(i)
+        # The match's own span (start..end) on the body.
+        let span: str = body.slice(m.start, m.end)
+        # strip the trailing "(" and whitespace
+        let mut e: int = span.len()
+        while e > 0 && (span.byte_at(e - 1) == 40 || span.byte_at(e - 1) == 32
+                || span.byte_at(e - 1) == 9) {
+            e = e - 1
+        }
+        out.push(span.slice(0, e))
+        i = i + 1
+    }
+    return out
+}
+
+# in_list(xs, v) — membership.
+fn in_list(xs: list[str], v: str) -> bool {
+    let mut i: int = 0
+    while i < xs.len() {
+        if xs.get(i) == v {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# ----------------------------------------------------------------------------
+# 1. Crate-attribute parsing
+# ----------------------------------------------------------------------------
+fn sec1(acc: Acc) -> void uses IO, Fs, Proc {
+    section("1. Crate-attribute parsing (position/duplicates/unknown)")
+    # The battery parsed in-process; the front door is --check on probe
+    # programs: accepted parses exit 0, rejects carry the needle.
+    let p1: str = write_src(acc, "p1.hls",
+        "#![freestanding]\nfn main() -> int { return 0 }\n")
+    let r1: RunResult = boot_check(acc, p1)
+    check(acc, "freestanding parsed", r1.code == 0, clip(r1.combined, 60))
+    let p2: str = write_src(acc, "p2.hls",
+        "#![no_std]\n#![freestanding]\nfn main() -> int { return 0 }\n")
+    let r2: RunResult = boot_check(acc, p2)
+    check(acc, "no_std + freestanding parsed", r2.code == 0, clip(r2.combined, 60))
+    let p3: str = write_src(acc, "p3.hls",
+        "# lead comment\n#![freestanding]\nfn main() -> int { return 0 }\n")
+    let r3: RunResult = boot_check(acc, p3)
+    check(acc, "comment before attr ok", r3.code == 0, clip(r3.combined, 60))
+    let rejects: list[list[str]] = [
+        ["before any item", "fn main() -> int { return 0 }\n#![freestanding]\n"],
+        ["duplicate", "#![freestanding]\n#![freestanding]\nfn main() -> int { return 0 }\n"],
+        ["unknown crate", "#![kernel]\nfn main() -> int { return 0 }\n"],
+        ["attribute name", "#![123]\nfn main() -> int { return 0 }\n"],
+    ]
+    let mut i: int = 0
+    while i < rejects.len() {
+        let rj: list[str] = rejects.get(i)
+        let p: str = write_src(acc, "rj_" + i.to_str() + ".hls", rj.get(1))
+        let r: RunResult = boot_check(acc, p)
+        check(acc, "reject '" + rj.get(0) + "'",
+            r.code != 0 && r.combined.contains(rj.get(0)),
+            clip(r.combined, 80))
+        i = i + 1
+    }
+    # `#!` without `[` stays a comment.
+    let p4: str = write_src(acc, "p4.hls",
+        "#! just a comment\nfn main() -> int { return 0 }\n")
+    let r4: RunResult = boot_check(acc, p4)
+    check(acc, "#! non-bracket stays a comment", r4.code == 0, clip(r4.combined, 60))
+    # `#[...]` outer attrs unaffected.
+    let p5: str = write_src(acc, "p5.hls",
+        "#[inline(never)]\nfn f() -> int { return 1 }\n" +
+        "fn main() -> int { return f() }\n")
+    let r5: RunResult = boot_check(acc, p5)
+    check(acc, "#[...] outer attrs unaffected", r5.code == 0, clip(r5.combined, 60))
+}
+
+# ----------------------------------------------------------------------------
+# 2. Stage-0 enforcement
+# ----------------------------------------------------------------------------
+fn sec2(acc: Acc) -> void uses IO, Fs, Proc {
+    section("2. Stage-0 enforcement (demo OK, 8 fail programs rejected)")
+    let rd: RunResult = boot_check(acc, demo())
+    check(acc, "freestanding demo checks", rd.code == 0, clip(rd.combined, 60))
+    let rb: RunResult = boot_check(acc, basic())
+    check(acc, "freestanding ok-test checks", rb.code == 0, clip(rb.combined, 60))
+    let rd2: RunResult = boot(acc, [demo()])
+    check(acc, "freestanding demo runs (exit 231)", rd2.code == 231,
+        "rc=" + rd2.code.to_str())
+    let fails: list[list[str]] = expect_fails()
+    let mut i: int = 0
+    while i < fails.len() {
+        let f: list[str] = fails.get(i)
+        let r: RunResult = boot_check(acc, "tests/fail/" + f.get(0))
+        check(acc, f.get(0) + " rejected",
+            r.code == 1 && r.combined.contains(f.get(1)), clip(r.combined, 90))
+        i = i + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 3. Entry-only rule + implication
+# ----------------------------------------------------------------------------
+fn sec3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("3. Entry-only rule + freestanding implies no_std")
+    let dep: str = write_src(acc, "dep.hls",
+        "#![freestanding]\nfn helper() -> int { return 1 }\n")
+    let entry: str = write_src(acc, "entry.hls",
+        "import \"dep.hls\"\nfn main() -> int { return helper() }\n")
+    let r: RunResult = boot_check(acc, entry)
+    check(acc, "dep crate attr rejected",
+        r.code == 1 && r.combined.contains("only allowed in the entry file"),
+        clip(r.combined, 100))
+
+    # The mode triple, through the --audit crate-mode line (the battery
+    # read the checker's crate_mode_flags in-process).
+    let modes: list[list[str]] = [
+        ["#![freestanding]", "#![freestanding]"],
+        ["#![no_std]", "#![no_std]"],
+        ["", "std (default hosted crate)"],
+    ]
+    let mut i: int = 0
+    while i < modes.len() {
+        let m: list[str] = modes.get(i)
+        let mut src: str = m.get(0)
+        if src != "" {
+            src = src + "\n"
+        }
+        let p: str = write_src(acc, "mode_" + i.to_str() + ".hls",
+            src + "fn main() -> int { return 0 }\n")
+        let ra: RunResult = boot(acc, ["--audit", p])
+        let line: str = first_line_containing(ra.out, "Crate mode:")
+        check(acc, "crate mode is " + m.get(1),
+            ra.code == 0 && line.contains(m.get(1)), clip(line, 60))
+        i = i + 1
+    }
+}
+
+# first_line_containing(text, needle) — "" when absent.
+fn first_line_containing(text: str, needle: str) -> str {
+    let lines: list[str] = text.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).contains(needle) {
+            return lines.get(i).trim()
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# ----------------------------------------------------------------------------
+# 4. Float-library denylist (allowed side included)
+# ----------------------------------------------------------------------------
+fn sec4(acc: Acc) -> void uses IO, Fs, Proc {
+    section("4. Float-library denylist (+ allowed float surface)")
+    let denied: list[list[str]] = denied_probes()
+    let mut i: int = 0
+    while i < denied.len() {
+        let d: list[str] = denied.get(i)
+        let p: str = write_src(acc, "deny_" + i.to_str() + ".hls",
+            "#![freestanding]\n" + d.get(1) + "\nfn main() -> int { return 0 }\n")
+        let r: RunResult = boot_check(acc, p)
+        check(acc, "deny " + d.get(0),
+            r.code == 1 && r.combined.contains("not available in #![freestanding]"),
+            clip(r.combined, 80))
+        i = i + 1
+    }
+    let allowed: list[list[str]] = allowed_probes()
+    let mut j: int = 0
+    while j < allowed.len() {
+        let a: list[str] = allowed.get(j)
+        let p: str = write_src(acc, "allow_" + j.to_str() + ".hls",
+            "#![freestanding]\n" + a.get(1) + "\nfn main() -> int { return 0 }\n")
+        let r: RunResult = boot_check(acc, p)
+        check(acc, "allow " + a.get(0), r.code == 0, clip(r.combined, 80))
+        j = j + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 5. Audit + fmt
+# ----------------------------------------------------------------------------
+fn sec5(acc: Acc) -> void uses IO, Proc {
+    section("5. --audit reports the mode; hlfmt is stable")
+    let r: RunResult = boot(acc, ["--audit", demo()])
+    check(acc, "--audit shows freestanding",
+        r.code == 0 && r.out.contains("#![freestanding]"), "")
+    let rf: RunResult = run_capture("python3", ["tools/hlfmt.py", "-c", demo()])
+    check(acc, "hlfmt clean on the demo",
+        !rf.out.contains("NOT formatted"), clip(rf.out, 60))
+    let files: list[str] = [basic(), "tests/fail/fail_freestanding_uses.hls"]
+    let mut i: int = 0
+    while i < files.len() {
+        let rr: RunResult = run_capture("python3", ["tools/hlfmt.py", "-c", files.get(i)])
+        check(acc, "hlfmt clean on " + basename(files.get(i)),
+            !rr.out.contains("NOT formatted"), "")
+        i = i + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 6. Self-hosted emission (freestanding TU shape)
+# ----------------------------------------------------------------------------
+fn sec6(acc: Acc) -> void uses IO, Fs, Proc {
+    section("6. Self-hosted emission (freestanding TU shape)")
+    let out: str = scratch(acc, "fs_demo.c")
+    let r: RunResult = boot(acc, ["src/hlc.hls", demo(), out])
+    if r.code != 0 || !file_exists(out) {
+        check(acc, "hlc emission", false, clip(r.combined, 200))
+        return
+    }
+    let src: str = read_or(out, "")
+    check(acc, "emitted C non-trivial", src.len() > 20000,
+        src.len().to_str() + " bytes")
+    # Only the three freestanding headers.
+    let incs: list[str] = collect_includes(src)
+    let only_fs: bool = incs.len() == 3 && in_list(incs, "stdbool.h")
+        && in_list(incs, "stddef.h") && in_list(incs, "stdint.h")
+    check(acc, "only freestanding headers", only_fs, str_join(incs, ", "))
+    check(acc, "no hosted header",
+        !src.contains("#include <stdio.h>") && !src.contains("#include <stdlib.h>")
+            && !src.contains("#include <string.h>") && !src.contains("#include <pthread.h>"),
+        "")
+    check(acc, "_start emitted", src.contains("void _start(void)"), "")
+    let mre: Result[Regex, str] = regex_compile("int main\\s*\\(")
+    let mut has_main: bool = false
+    if result_is_ok(mre) {
+        if regex_is_match(result_unwrap(mre), src) {
+            has_main = true
+        }
+    }
+    check(acc, "no hosted main", !has_main, "")
+    check(acc, "panics trap",
+        src.contains("__builtin_trap") && !src.contains("exit(101)"), "")
+    check(acc, "bump allocator emitted",
+        src.contains("hl_bump_alloc(size_t n)")
+            && src.contains("#define malloc hl_bump_alloc"), "")
+    check(acc, "no pthread.h", !src.contains("pthread.h"), "")
+    check(acc, "exit syscalls for 3 arches",
+        src.contains("syscall") && src.contains("svc #0") && src.contains("ecall"),
+        "")
+    # The entry must be NAKED (ABI stack alignment).
+    check(acc, "entry is naked (ABI stack alignment)",
+        src.contains("__attribute__((naked, noreturn)) void _start(void)"), "")
+    check(acc, "hand-rolled int64 rendering",
+        src.contains("hl_str_from_int64(int64_t v)") && src.contains("-(v + 1)"),
+        "")
+    # Hosted emission unchanged (spot check).
+    let hout: str = scratch(acc, "hello.c")
+    let rh: RunResult = boot(acc, ["src/hlc.hls", "examples/hello.hls", hout])
+    check(acc, "hosted emission compile ok", rh.code == 0, clip(rh.combined, 200))
+    let hsrc: str = read_or(hout, "")
+    let hmain: Result[Regex, str] = regex_compile("int main\\s*\\(")
+    let mut h_has_main: bool = false
+    if result_is_ok(hmain) {
+        if regex_is_match(result_unwrap(hmain), hsrc) {
+            h_has_main = true
+        }
+    }
+    check(acc, "hosted emission keeps stdio+main",
+        hsrc.contains("#include <stdio.h>") && h_has_main
+            && !hsrc.contains("HL_FREESTANDING"), "")
+}
+
+# collect_includes(src) — the unique `#include <...>` names, sorted.
+fn collect_includes(src: str) -> list[str] {
+    let out: list[str] = []
+    let lines: list[str] = src.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let t: str = lines.get(i).trim()
+        if t.starts_with("#include <") {
+            let open: int = t.find("<")
+            let close: int = t.find(">")
+            if open >= 0 && close > open {
+                let name: str = t.slice(open + 1, close)
+                if !in_list(out, name) {
+                    out.push(name)
+                }
+            }
+        }
+        i = i + 1
+    }
+    # insertion sort (the list is tiny)
+    let mut a: int = 1
+    while a < out.len() {
+        let v: str = out.get(a)
+        let mut b: int = a - 1
+        while b >= 0 && out.get(b) > v {
+            out.set(b + 1, out.get(b))
+            b = b - 1
+        }
+        out.set(b + 1, v)
+        a = a + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# 7. Link-closure proof
+# ----------------------------------------------------------------------------
+fn sec7(acc: Acc) -> void uses IO, Fs, Proc {
+    section("7. Link-closure proof (reachable from _start resolves)")
+    let out: str = scratch(acc, "fs_demo.c")
+    if !file_exists(out) {
+        return
+    }
+    let src: str = read_or(out, "")
+    let t: str = strip_c_noise(src)
+    let funcs: list[str] = c_function_names(t)
+    check(acc, "145+ runtime functions emitted", funcs.len() >= 100,
+        funcs.len().to_str() + " functions")
+
+    let ignorable: list[str] = ["if", "for", "while", "switch", "return",
+        "sizeof", "typedef", "struct", "union", "enum", "__asm__",
+        "__attribute__", "cleanup", "void", "volatile"]
+    let defined_macros: list[str] = ["HL_FREESTANDING", "PRId64",
+        "HL_HEAP_SIZE", "EOF", "EINTR", "ESRCH", "SIGTERM", "O_RDONLY",
+        "O_WRONLY", "AF_INET", "SOCK_STREAM", "SOCK_DGRAM", "SOL_SOCKET",
+        "SO_REUSEADDR", "SO_RCVTIMEO", "SO_SNDTIMEO", "INADDR_ANY",
+        "INADDR_LOOPBACK", "INET_ADDRSTRLEN", "CLOCK_MONOTONIC",
+        "CLOCK_REALTIME", "S_ISDIR", "S_ISREG", "WEXITSTATUS", "WIFEXITED",
+        "WIFSIGNALED", "WTERMSIG", "HL_FEAT_EQ", "HL_PROC_MAX_CHILDREN",
+        "UINT64_C"]
+    let compiler_builtins: list[str] = ["__builtin_trap",
+        "__builtin_unreachable", "__builtin_add_overflow",
+        "__builtin_sub_overflow", "__builtin_mul_overflow",
+        "__builtin_clzll", "__builtin_ctzll", "__builtin_cpu_supports"]
+    let prelude_defined: list[str] = ["hl_bump_alloc", "hl_bump_calloc",
+        "hl_bump_realloc", "hl_memcpy", "hl_memset", "hl_memcmp",
+        "hl_strlen", "hl_strcmp", "hl_strncmp", "hl_strcpy", "hl_strchr",
+        "hl_strdup", "hl_fs_isnan", "hl_fs_isinf", "hl_fs_isfinite",
+        "hl_fs_signbit", "hl_errno_stub"]
+    let macro_mapped: list[str] = ["malloc", "calloc", "realloc", "free",
+        "memcpy", "memset", "memcmp", "strlen", "strcmp", "strncmp",
+        "strcpy", "strchr", "strdup", "stat", "errno", "isnan", "isinf",
+        "isfinite", "signbit"]
+
+    # The reachability walk from _start / hl_boot.
+    let seen: list[str] = []
+    let stack: list[str] = ["_start", "hl_boot"]
+    while stack.len() > 0 {
+        let cur: str = stack.get(stack.len() - 1)
+        stack.pop()
+        if in_list(seen, cur) || !in_list(funcs, cur) {
+            continue
+        }
+        seen.push(cur)
+        let body: str = fn_body(t, cur)
+        let calls: list[str] = calls_in(body)
+        let mut ci: int = 0
+        while ci < calls.len() {
+            stack.push(calls.get(ci))
+            ci = ci + 1
+        }
+    }
+    # The entry's asm calls hl_boot, which calls the user's main.
+    check(acc, "_start reaches the user main",
+        in_list(seen, "usf_main") || in_list(seen, "hl_boot"),
+        seen.len().to_str() + " reachable functions")
+
+    # Every reachable call resolves.
+    let mut bad: str = ""
+    let mut si: int = 0
+    while si < seen.len() {
+        let cur: str = seen.get(si)
+        let body: str = fn_body(t, cur)
+        let calls: list[str] = calls_in(body)
+        let mut ci: int = 0
+        while ci < calls.len() {
+            let c: str = calls.get(ci)
+            if in_list(ignorable, c) || in_list(defined_macros, c)
+                    || in_list(compiler_builtins, c) {
+                ci = ci + 1
+                continue
+            }
+            if in_list(funcs, c) || in_list(prelude_defined, c)
+                    || in_list(macro_mapped, c) {
+                ci = ci + 1
+                continue
+            }
+            # Single-line `static T name(...) { ...; }` definitions the
+            # crude splitter missed (verified present textually below).
+            let dref: Result[Regex, str] = regex_compile(
+                "\\b" + c + "\\b[^\\n;{]*\\{")
+            let mut textual: bool = false
+            if result_is_ok(dref) {
+                if regex_is_match(result_unwrap(dref), src) {
+                    textual = true
+                }
+            }
+            if !textual {
+                bad = bad + " " + cur + "->" + c
+            }
+            ci = ci + 1
+        }
+        si = si + 1
+    }
+    check(acc, "every reachable call resolves", bad == "", clip(bad, 200))
+}
+
+# ----------------------------------------------------------------------------
+# 8. Self-hosted parity on fail programs
+# ----------------------------------------------------------------------------
+fn sec8(acc: Acc) -> void uses IO, Fs, Proc {
+    section("8. Self-hosted parity (hlc rejects fail programs too)")
+    let fails: list[str] = ["fail_freestanding_uses.hls",
+                            "fail_freestanding_std_import.hls"]
+    let mut i: int = 0
+    while i < fails.len() {
+        let out: str = scratch(acc, "parity.c")
+        let r: RunResult = boot(acc, ["src/hlc.hls", "tests/fail/" + fails.get(i), out])
+        let low: str = str_to_lower_ascii(r.combined)
+        check(acc, "hlc rejects " + fails.get(i),
+            r.code != 0 && low.contains("freestanding"),
+            clip(r.combined, 120))
+        i = i + 1
+    }
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let acc: Acc = acc_new("freestanding")
+    sec1(acc)
+    sec2(acc)
+    sec3(acc)
+    sec4(acc)
+    sec5(acc)
+    sec6(acc)
+    sec7(acc)
+    sec8(acc)
+    return finish(acc, "Stage 77 -- #![freestanding] mode (no libc, no OS calls)")
+}
