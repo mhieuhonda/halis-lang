@@ -2188,13 +2188,32 @@ struct hl_proc_child {
 };
 static struct hl_proc_child hl_proc_children[HL_PROC_MAX_CHILDREN];
 
+static void hl_proc_reap_exited(void) {
+    for (int i = 0; i < HL_PROC_MAX_CHILDREN; i++) {
+        struct hl_proc_child* c = &hl_proc_children[i];
+        if (c->os_pid != 0 && c->exited &&
+            c->stdin_fd == -1 && c->stdout_fd == -1 &&
+            c->stderr_fd == -1) {
+            c->os_pid = 0;
+            c->exited = 0;
+            c->exit_status = 0;
+        }
+    }
+}
+
 static int hl_proc_alloc_slot(void) {
     for (int i = 0; i < HL_PROC_MAX_CHILDREN; i++) {
         if (hl_proc_children[i].os_pid == 0) {
             return i + 1;  /* Halis pid = slot + 1 (>= 1) */
         }
     }
-    return 0;  /* table full */
+    hl_proc_reap_exited();
+    for (int i = 0; i < HL_PROC_MAX_CHILDREN; i++) {
+        if (hl_proc_children[i].os_pid == 0) {
+            return i + 1;  /* Halis pid = slot + 1 (>= 1) */
+        }
+    }
+    return 0;  /* table full of LIVE children */
 }
 
 static int64_t hl_proc_spawn(hl_str* program, hl_list* args,
@@ -22601,13 +22620,32 @@ hl_list* usf_runtime_lines(bool u_fs_p, bool u_nl_p) {
     hl_list_push(u_r, hl_cstr("};"));
     hl_list_push(u_r, hl_cstr("static struct hl_proc_child hl_proc_children[HL_PROC_MAX_CHILDREN];"));
     hl_list_push(u_r, hl_cstr(""));
+    hl_list_push(u_r, hl_cstr("static void hl_proc_reap_exited(void) {"));
+    hl_list_push(u_r, hl_cstr("    for (int i = 0; i < HL_PROC_MAX_CHILDREN; i++) {"));
+    hl_list_push(u_r, hl_cstr("        struct hl_proc_child* c = &hl_proc_children[i];"));
+    hl_list_push(u_r, hl_cstr("        if (c->os_pid != 0 && c->exited &&"));
+    hl_list_push(u_r, hl_cstr("            c->stdin_fd == -1 && c->stdout_fd == -1 &&"));
+    hl_list_push(u_r, hl_cstr("            c->stderr_fd == -1) {"));
+    hl_list_push(u_r, hl_cstr("            c->os_pid = 0;"));
+    hl_list_push(u_r, hl_cstr("            c->exited = 0;"));
+    hl_list_push(u_r, hl_cstr("            c->exit_status = 0;"));
+    hl_list_push(u_r, hl_cstr("        }"));
+    hl_list_push(u_r, hl_cstr("    }"));
+    hl_list_push(u_r, hl_cstr("}"));
+    hl_list_push(u_r, hl_cstr(""));
     hl_list_push(u_r, hl_cstr("static int hl_proc_alloc_slot(void) {"));
     hl_list_push(u_r, hl_cstr("    for (int i = 0; i < HL_PROC_MAX_CHILDREN; i++) {"));
     hl_list_push(u_r, hl_cstr("        if (hl_proc_children[i].os_pid == 0) {"));
     hl_list_push(u_r, hl_cstr("            return i + 1;  /* Halis pid = slot + 1 (>= 1) */"));
     hl_list_push(u_r, hl_cstr("        }"));
     hl_list_push(u_r, hl_cstr("    }"));
-    hl_list_push(u_r, hl_cstr("    return 0;  /* table full */"));
+    hl_list_push(u_r, hl_cstr("    hl_proc_reap_exited();"));
+    hl_list_push(u_r, hl_cstr("    for (int i = 0; i < HL_PROC_MAX_CHILDREN; i++) {"));
+    hl_list_push(u_r, hl_cstr("        if (hl_proc_children[i].os_pid == 0) {"));
+    hl_list_push(u_r, hl_cstr("            return i + 1;  /* Halis pid = slot + 1 (>= 1) */"));
+    hl_list_push(u_r, hl_cstr("        }"));
+    hl_list_push(u_r, hl_cstr("    }"));
+    hl_list_push(u_r, hl_cstr("    return 0;  /* table full of LIVE children */"));
     hl_list_push(u_r, hl_cstr("}"));
     hl_list_push(u_r, hl_cstr(""));
     hl_list_push(u_r, hl_cstr("static int64_t hl_proc_spawn(hl_str* program, hl_list* args,"));

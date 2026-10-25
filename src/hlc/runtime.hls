@@ -3465,7 +3465,9 @@ fn runtime_lines(fs: bool, nl: bool) -> list[str] {
     # we expose our own pid namespace to keep differential testing
     # byte-exact. The table holds: pid (OS), stdin_fd, stdout_fd,
     # stderr_fd (parent ends of the pipes; -1 if not piped), and
-    # a state flag (1=alive, 0=exited, -1=slot free).
+    # the exited flag + cached exit status. Slots are reclaimed when
+    # the table fills (see hl_proc_reap_exited below), so the cap is
+    # on CONCURRENT children, not on lifetime spawns.
     r.push("#define HL_PROC_MAX_CHILDREN 64")
     r.push("struct hl_proc_child {")
     r.push("    pid_t os_pid;          /* OS pid, 0 if slot free */")
@@ -3477,15 +3479,51 @@ fn runtime_lines(fs: bool, nl: bool) -> list[str] {
     r.push("};")
     r.push("static struct hl_proc_child hl_proc_children[HL_PROC_MAX_CHILDREN];")
     r.push("")
+    # hl_proc_reap_exited — reclaim slots whose child has exited AND
+    # whose pipe ends the parent has fully closed (or never opened).
+    # Such a handle is spent: nothing more can be read, written or
+    # waited on it, yet the old allocator kept it forever — a program
+    # that spawned and waited one child at a time exhausted the table
+    # after HL_PROC_MAX_CHILDREN spawns *for its whole lifetime*. The
+    # reclaimer runs only when the table is full, so programs under
+    # the cap see byte-identical pid numbering (the differential
+    # corpus never observes a reuse); long-lived tools (the
+    # self-hosted acceptance gates) get an unbounded sequential
+    # spawn/wait budget, matching the interpreter's monotonic table.
+    # Slots whose pipes are still open are NEVER reclaimed — the
+    # read-after-wait pattern (drain a pipe after the child exits,
+    # as tests/ok/feat_stage47_process.hls does) keeps its slot and
+    # its buffered bytes until the parent closes the pipes itself.
+    r.push("static void hl_proc_reap_exited(void) {")
+    r.push("    for (int i = 0; i < HL_PROC_MAX_CHILDREN; i++) {")
+    r.push("        struct hl_proc_child* c = &hl_proc_children[i];")
+    r.push("        if (c->os_pid != 0 && c->exited &&")
+    r.push("            c->stdin_fd == -1 && c->stdout_fd == -1 &&")
+    r.push("            c->stderr_fd == -1) {")
+    r.push("            c->os_pid = 0;")
+    r.push("            c->exited = 0;")
+    r.push("            c->exit_status = 0;")
+    r.push("        }")
+    r.push("    }")
+    r.push("}")
+    r.push("")
     # hl_proc_alloc_slot — find a free slot, returning its index (1-based
     # Halis pid). Returns 0 if the table is full (caller reports -1).
+    # A full table first reaps spent (exited + fully closed) slots —
+    # see hl_proc_reap_exited — and rescans once.
     r.push("static int hl_proc_alloc_slot(void) {")
     r.push("    for (int i = 0; i < HL_PROC_MAX_CHILDREN; i++) {")
     r.push("        if (hl_proc_children[i].os_pid == 0) {")
     r.push("            return i + 1;  /* Halis pid = slot + 1 (>= 1) */")
     r.push("        }")
     r.push("    }")
-    r.push("    return 0;  /* table full */")
+    r.push("    hl_proc_reap_exited();")
+    r.push("    for (int i = 0; i < HL_PROC_MAX_CHILDREN; i++) {")
+    r.push("        if (hl_proc_children[i].os_pid == 0) {")
+    r.push("            return i + 1;  /* Halis pid = slot + 1 (>= 1) */")
+    r.push("        }")
+    r.push("    }")
+    r.push("    return 0;  /* table full of LIVE children */")
     r.push("}")
     r.push("")
     # hl_proc_spawn(program, args, stdin_kind, stdout_kind, stderr_kind)
