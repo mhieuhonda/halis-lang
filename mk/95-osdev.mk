@@ -141,9 +141,11 @@ boot-acceptance:
 # C carries section/aligned, the ok-test links -nostdlib, a covered
 # section compiles and runs under the shipped link.ld), hlfmt + hllint,
 # and `--audit` / `--opt-stats` reporting.
-link-acceptance:
-	@echo "[Stage 84 acceptance] running tests/link_acceptance.py..."
-	@$(PYTHON) tests/link_acceptance.py
+# The gate itself is Halis (tests/acc/link_acceptance.hls, compiled
+# native by bin/hlc through the $(BIN)/acc-% pattern rule).
+link-acceptance: $(BIN)/acc-link
+	@echo "[Stage 84 acceptance] running tests/acc/link_acceptance.hls..."
+	@$(BIN)/acc-link
 	@echo "ACCEPTANCE OK: Stage 84 -- linker-script integration + custom sections"
 
 .PHONY: freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance stackguard-acceptance asmreg-acceptance link-acceptance boot-acceptance idt-acceptance mmio-acceptance port-acceptance dma-acceptance atomics-acceptance irqsafe-acceptance test-linker

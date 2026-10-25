@@ -1,0 +1,847 @@
+# ============================================================================
+# tests/acc/link_acceptance.hls — Stage 84 acceptance gate, in Halis
+# (the Halis twin of what was tests/link_acceptance.py; same seven
+# sections, same assertions, same needles — the harness is
+# tests/acc/harness.hls and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make link-acceptance` (which compiles this file to
+# bin/acc-link and runs it from the repo root).
+#
+#  1. resolution + guards      — core.section importable, the
+#                                #[section]/#[align]/#![link_script]
+#                                attributes survive a standalone parse,
+#                                the crate attribute is entry-file-only
+#  2. standalone parse         — core/section.hls declares the expected
+#                                enums / structs / functions and imports
+#                                only core.option + core.result
+#  3. Stage-0 enforcement      — the no_std ok-test is clean on the
+#                                interpreter, the demo runs, all 13
+#                                fail programs are rejected with their
+#                                own diagnostic by BOTH compilers
+#  4. behaviour probes         — name validation, alignment rules,
+#                                section kinds, the script reader, the
+#                                coverage rules and the placement
+#                                solver, through small HLS programs
+#                                whose exit code names the first
+#                                failing assertion
+#  5. self-hosted emission     — the C carries the section/aligned
+#                                attributes, the freestanding TU is
+#                                shaped correctly, the ok-test links
+#                                -nostdlib
+#  6. hlfmt + linter           — the formatter round-trips the new
+#                                attributes and the linter stays clean
+#  7. --audit                  — both compilers report the linker
+#                                script and the annotation counts
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.regex"
+
+struct FailP {
+    name: str,
+    needle: str,
+    desc: str
+}
+
+struct Probe {
+    name: str,
+    want: int,
+    desc: str,
+    body: str
+}
+
+fn ok_test() -> str {
+    return "tests/ok/feat_stage84_section.hls"
+}
+
+fn demo() -> str {
+    return "examples/section_demo.hls"
+}
+
+fn core_section() -> str {
+    return "core/section.hls"
+}
+
+fn script_ld() -> str {
+    return "tests/stage84/place.ld"
+}
+
+# hlc_run — compile + link + run a Halis program through the NATIVE
+# compiler (the old battery's hlc_run). Returns a RunResult whose
+# `spawned` is false when the compile or the link failed (combined
+# then carries the compiler/cc diagnostics); otherwise code/out/err
+# are the run's.
+fn hlc_run(acc: Acc, src: str) -> RunResult uses Fs, Proc {
+    let r: RunResult = RunResult {
+        code: -1,
+        out: "",
+        err: "",
+        combined: "",
+        spawned: false
+    }
+    let c_path: str = scratch(acc, stem(src) + ".c")
+    let exe: str = scratch(acc, stem(src) + ".bin")
+    let comp: RunResult = run_capture(hlc_path(acc), [src, c_path])
+    if comp.code != 0 {
+        r.combined = comp.combined
+        return r
+    }
+    let cc: RunResult = run_capture("gcc", ["-O2", "-o", exe, c_path, "-lm", "-pthread"])
+    if cc.code != 0 {
+        r.combined = cc.combined
+        return r
+    }
+    let runr: RunResult = run_capture(exe, [])
+    runr.spawned = true
+    return runr
+}
+
+# ---------------------------------------------------------------------------
+# 1. resolution + guards
+# ---------------------------------------------------------------------------
+fn sec1(acc: Acc) -> void uses IO, Fs, Proc {
+    section("1. resolution + guards")
+    if file_exists(core_section()) {
+        pass_msg(acc, "link: core/section.hls present")
+    } else {
+        fail_msg(acc, "link: core/section.hls missing")
+    }
+
+    # A standalone parse of the entry file must not lose the attributes.
+    let probe: str = write_src(acc, "probe.hls",
+        "import \"core.section\"\n" +
+        "\n" +
+        "#[section(\".text.probe\")]\n" +
+        "#[align(64)]\n" +
+        "fn stub(x: int) -> int pure {\n" +
+        "    return x\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int {\n" +
+        "    return stub(1)\n" +
+        "}\n")
+
+    # `--check` / compile-to-C only: this probe is about the PARSE.
+    let bootr: RunResult = boot_check(acc, probe)
+    if bootr.code == 0 {
+        pass_msg(acc, "link: attributes parse standalone (boot)")
+    } else {
+        fail_msg(acc, "link: attributes rejected standalone (boot): "
+            + clip(bootr.combined, 120))
+    }
+    let probe_c: str = scratch(acc, "probe.c")
+    let hlcr: RunResult = run_capture(hlc_path(acc), [probe, probe_c])
+    if hlcr.code == 0 {
+        pass_msg(acc, "link: attributes parse standalone (hlc)")
+    } else {
+        fail_msg(acc, "link: attributes rejected standalone (hlc): "
+            + clip(hlcr.combined, 120))
+    }
+
+    # `#![link_script]` in a dependency is rejected (crate attributes
+    # are an entry-file property, like `#![freestanding]`).
+    let dep: str = write_src(acc, "dep.hls",
+        "#![link_script(\"place.ld\")]\n" +
+        "\n" +
+        "fn helper() -> int pure {\n" +
+        "    return 1\n" +
+        "}\n")
+    let entry: str = write_src(acc, "entry_dep.hls",
+        "import \"./dep.hls\"\n" +
+        "\n" +
+        "fn main() -> int {\n" +
+        "    return helper()\n" +
+        "}\n")
+    let r: RunResult = boot_check(acc, entry)
+    if r.code == 1 && r.combined.contains("only allowed in the entry file") {
+        pass_msg(acc, "link: #![link_script] is entry-file-only")
+    } else {
+        fail_msg(acc, "link: #![link_script] in a dependency not rejected: "
+            + clip(r.combined, 120))
+    }
+
+    # A missing linker script is an error, not a warning.
+    let r2: RunResult = boot_check(acc, "tests/fail/fail_stage84_link_script_missing.hls")
+    if r2.code == 1 && r2.combined.contains("cannot read the linker script") {
+        pass_msg(acc, "link: a missing linker script is rejected by name")
+    } else {
+        fail_msg(acc, "link: missing linker script not reported: "
+            + clip(r2.combined, 120))
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 2. standalone parse (core/section.hls)
+# ---------------------------------------------------------------------------
+fn sec2(acc: Acc) -> void uses IO, Fs {
+    section("2. standalone parse (core/section.hls)")
+    let src: str = read_file(core_section())
+    let enums: list[str] = ["SectionFault", "SectionKind", "LayoutFault", "ScriptFault"]
+    let mut i: int = 0
+    while i < enums.len() {
+        let e: str = enums.get(i)
+        if decl_word(src, "enum", e) {
+            pass_msg(acc, "link: core.section declares enum " + e)
+        } else {
+            fail_msg(acc, "link: core.section missing enum " + e)
+        }
+        i = i + 1
+    }
+    let structs: list[str] = ["OutputSection", "PlacedSection", "ImageLayout"]
+    let mut j: int = 0
+    while j < structs.len() {
+        let s: str = structs.get(j)
+        if decl_word(src, "struct", s) {
+            pass_msg(acc, "link: core.section declares struct " + s)
+        } else {
+            fail_msg(acc, "link: core.section missing struct " + s)
+        }
+        j = j + 1
+    }
+    let imports: list[str] = import_paths(src)
+    if imports.len() == 2 && imports.get(0) == "core.option"
+            && imports.get(1) == "core.result" {
+        pass_msg(acc, "link: core.section imports only core.option + core.result (freestanding-safe)")
+    } else {
+        fail_msg(acc, "link: core.section imports " + str_join(imports, ", "))
+    }
+    if !src.contains("uses ") && !src.contains("extern ") {
+        pass_msg(acc, "link: core.section declares no effects and no externs")
+    } else {
+        fail_msg(acc, "link: core.section declares effects or externs")
+    }
+    let fns: list[str] = ["section_check", "section_check_why", "section_align_ok",
+                          "section_kind", "parse_link_script", "script_placed_patterns",
+                          "script_covers", "layout_image", "layout_render",
+                          "layout_contains", "layout_file_bytes", "layout_load_end"]
+    let mut k: int = 0
+    while k < fns.len() {
+        let f: str = fns.get(k)
+        if decl_word(src, "fn", f) {
+            pass_msg(acc, "link: core.section exposes " + f)
+        } else {
+            fail_msg(acc, "link: core.section missing " + f)
+        }
+        k = k + 1
+    }
+}
+
+# decl_word(src, kw, name) — the old battery's re.search(r"\bkw\s+name\b").
+# A word-boundary regex through std.regex, not a plain contains(): a
+# "fn section_check_why" line must not satisfy a "fn section_check"
+# probe.
+fn decl_word(src: str, kw: str, name: str) -> bool {
+    let rr: Result[Regex, str] = regex_compile(kw + "\\s+" + name + "\\b")
+    if result_is_err(rr) {
+        return false
+    }
+    let re: Regex = result_unwrap(rr)
+    return regex_is_match(re, src)
+}
+
+# import_paths(src) — the ordered list of `import "..."` paths in a
+# source text (the old battery's re.findall over ^import lines).
+fn import_paths(src: str) -> list[str] {
+    let out: list[str] = []
+    let lines: list[str] = src.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i).trim()
+        if line.starts_with("import ") {
+            let rest: str = line.slice(7, line.len()).trim()
+            if rest.starts_with("\"") {
+                let tail: str = rest.slice(1, rest.len())
+                let end: int = tail.find("\"")
+                if end > 0 {
+                    out.push(tail.slice(0, end))
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ---------------------------------------------------------------------------
+# 3. Stage-0 enforcement
+# ---------------------------------------------------------------------------
+fn sec3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("3. Stage-0 enforcement")
+    let r: RunResult = boot(acc, [ok_test()])
+    if r.code == 0 {
+        pass_msg(acc, "link: ok-test clean on the interpreter")
+    } else {
+        fail_msg(acc, "link: ok-test interpreter exit=" + r.code.to_str())
+    }
+
+    let code_out: RunResult = hlc_run(acc, demo())
+    if code_out.spawned && code_out.code == 0 && code_out.out.contains("DEMO OK") {
+        pass_msg(acc, "link: examples/section_demo.hls runs natively, DEMO OK")
+    } else {
+        fail_msg(acc, "link: section_demo exit=" + code_out.code.to_str()
+            + " (" + clip(code_out.combined, 120) + ")")
+    }
+
+    let rb: RunResult = boot(acc, [demo()])
+    if rb.code == 0 && rb.out.contains("DEMO OK") {
+        pass_msg(acc, "link: section_demo runs on the interpreter, DEMO OK")
+    } else {
+        fail_msg(acc, "link: section_demo interpreter exit=" + rb.code.to_str())
+    }
+
+    let fails: list[FailP] = [
+        FailP { name: "fail_stage84_section_badchar", needle: "may only contain letters",
+                desc: "a space in a section name" },
+        FailP { name: "fail_stage84_section_start", needle: "must start with",
+                desc: "a leading digit" },
+        FailP { name: "fail_stage84_section_dupdot", needle: "must not contain '..'",
+                desc: "'..' in a section name" },
+        FailP { name: "fail_stage84_section_reserved", needle: "compiler-owned output section",
+                desc: "a reserved output section" },
+        FailP { name: "fail_stage84_section_long", needle: "the limit is 64",
+                desc: "an over-long section name" },
+        FailP { name: "fail_stage84_section_notstr", needle: "expects a string literal",
+                desc: "a computed section name" },
+        FailP { name: "fail_stage84_section_dup", needle: "appears more than once",
+                desc: "two #[section] on one fn" },
+        FailP { name: "fail_stage84_section_inline", needle: "mutually exclusive",
+                desc: "#[section] + #[inline(always)]" },
+        FailP { name: "fail_stage84_align_notpow2", needle: "power of two",
+                desc: "a non-power-of-two #[align]" },
+        FailP { name: "fail_stage84_align_dup", needle: "appears more than once",
+                desc: "two #[align] on one fn" },
+        FailP { name: "fail_stage84_link_script_missing", needle: "cannot read the linker script",
+                desc: "#![link_script] naming a missing file" },
+        FailP { name: "fail_stage84_link_script_nosections", needle: "no SECTIONS block",
+                desc: "#![link_script] naming a script with no SECTIONS" },
+        FailP { name: "fail_stage84_section_unplaced", needle: "is not placed by the linker script",
+                desc: "a #[section] the script never places" }
+    ]
+    let mut i: int = 0
+    while i < fails.len() {
+        let fp: FailP = fails.get(i)
+        let path: str = "tests/fail/" + fp.name + ".hls"
+        if !file_exists(path) {
+            fail_msg(acc, "link: " + path + " missing")
+            i = i + 1
+            continue
+        }
+        let b: RunResult = boot_check(acc, path)
+        if b.code != 1 {
+            fail_msg(acc, "link: " + fp.name + " not rejected by boot")
+            i = i + 1
+            continue
+        }
+        if !b.combined.contains(fp.needle) {
+            fail_msg(acc, "link: " + fp.name + " rejected without its diagnostic (" + fp.desc + ")")
+            i = i + 1
+            continue
+        }
+        let h: RunResult = run_capture(hlc_path(acc), ["--audit", path])
+        if h.code == 0 {
+            fail_msg(acc, "link: " + fp.name + " accepted by hlc (parity)")
+            i = i + 1
+            continue
+        }
+        if !h.combined.contains(fp.needle) {
+            fail_msg(acc, "link: " + fp.name + " hlc diagnostic differs (parity)")
+            i = i + 1
+            continue
+        }
+        pass_msg(acc, "link: " + fp.name + " rejected by both compilers (" + fp.desc + ")")
+        i = i + 1
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 4. behaviour probes
+# ---------------------------------------------------------------------------
+fn sec4(acc: Acc) -> void uses IO, Fs, Proc {
+    section("4. behaviour probes")
+    let probes: list[Probe] = [
+        Probe {
+            name: "validator",
+            want: 0,
+            desc: "the name validator matches the compilers' rules",
+            body: "import \"core.section\"\n" +
+                  "fn main() -> int {\n" +
+                  "    if section_fault_code(section_check(\".text.boot\")) != 0 { return 1 }\n" +
+                  "    if section_fault_code(section_check(\".text\")) != 6 { return 2 }\n" +
+                  "    if section_fault_code(section_check(\"\")) != 1 { return 3 }\n" +
+                  "    if section_fault_code(section_check(\".a b\")) != 4 { return 4 }\n" +
+                  "    if section_fault_code(section_check(\".a..b\")) != 5 { return 5 }\n" +
+                  "    if section_fault_code(section_check(\"0a\")) != 3 { return 6 }\n" +
+                  "    return 0\n" +
+                  "}\n"
+        },
+        Probe {
+            name: "kinds",
+            want: 0,
+            desc: "section kinds drive the page flags",
+            body: "import \"core.section\"\n" +
+                  "fn main() -> int {\n" +
+                  "    if section_kind_name(section_kind(\".text.isr\")) != \"text\" { return 1 }\n" +
+                  "    if section_kind_name(section_kind(\".data.rel.ro\")) != \"data\" { return 2 }\n" +
+                  "    if section_kind_name(section_kind(\".bss\")) != \"bss\" { return 3 }\n" +
+                  "    if section_kind_writable(section_kind(\".text\")) { return 4 }\n" +
+                  "    if !section_kind_executable(section_kind(\".text\")) { return 5 }\n" +
+                  "    if section_kind_has_bytes(section_kind(\".bss\")) { return 6 }\n" +
+                  "    return 0\n" +
+                  "}\n"
+        },
+        Probe {
+            name: "reader",
+            want: 0,
+            desc: "the script reader captures sections, ALIGN and input patterns",
+            body: "import \"core.result\"\n" +
+                  "import \"core.section\"\n" +
+                  "fn main() -> int {\n" +
+                  "    let s: str = \"SECTIONS { .text : ALIGN(4) { KEEP(*(.text .text.*)) } }\"\n" +
+                  "    let r: Result[list[OutputSection], ScriptFault] = parse_link_script(s)\n" +
+                  "    if result_is_err(r) { return 1 }\n" +
+                  "    let secs: list[OutputSection] = result_unwrap(r)\n" +
+                  "    if secs.len() != 1 { return 2 }\n" +
+                  "    if secs.get(0).align != 4 { return 3 }\n" +
+                  "    if secs.get(0).inputs.len() != 2 { return 4 }\n" +
+                  "    if result_is_ok(parse_link_script(\"ENTRY(x)\")) { return 5 }\n" +
+                  "    return 0\n" +
+                  "}\n"
+        },
+        Probe {
+            name: "comments",
+            want: 0,
+            desc: "a section named inside a comment is not real",
+            body: "import \"core.section\"\n" +
+                  "fn main() -> int {\n" +
+                  "    let s: str = \"/* SECTIONS { .bogus : { } } */ SECTIONS { .text : { *(.text) } }\"\n" +
+                  "    if script_covers_text(s, \".bogus\") != \"\" { return 1 }\n" +
+                  "    if script_covers_text(s, \".text\") != \".text\" { return 2 }\n" +
+                  "    if ls_strip_comments(\"a /* b */ c\").len() != 4 { return 3 }\n" +
+                  "    return 0\n" +
+                  "}\n"
+        },
+        Probe {
+            name: "coverage",
+            want: 0,
+            desc: "GNU ld prefix matching decides coverage",
+            body: "import \"core.result\"\n" +
+                  "import \"core.section\"\n" +
+                  "fn main() -> int {\n" +
+                  "    let secs: list[OutputSection] = result_unwrap(parse_link_script(\"SECTIONS { .text : { *(.text .text.*) } }\"))\n" +
+                  "    if script_covers(secs, \".text.isr\") != \".text\" { return 1 }\n" +
+                  "    if script_covers(secs, \".textx\") != \"\" { return 2 }\n" +
+                  "    if script_covers(secs, \".data\") != \"\" { return 3 }\n" +
+                  "    if pattern_matches(\".text*\", \".text.a\") != true { return 4 }\n" +
+                  "    if pattern_matches(\".text\", \".text.a\") != false { return 5 }\n" +
+                  "    return 0\n" +
+                  "}\n"
+        },
+        Probe {
+            name: "solver",
+            want: 0,
+            desc: "the placement solver honours ALIGN, NOLOAD and the pinned address",
+            body: "import \"core.result\"\n" +
+                  "import \"core.section\"\n" +
+                  "fn main() -> int {\n" +
+                  "    let sizes: map[str, int] = map_new()\n" +
+                  "    sizes.set(\".text\", 64)\n" +
+                  "    sizes.set(\".bss\", 4096)\n" +
+                  "    let secs: list[OutputSection] = [\n" +
+                  "        OutputSection{name: \".text\", vma: 0, align: 4, noload: false, inputs: []},\n" +
+                  "        OutputSection{name: \".bss\", vma: 0, align: 4096, noload: true, inputs: []}\n" +
+                  "    ]\n" +
+                  "    let l: ImageLayout = result_unwrap(layout_image(1048576, secs, sizes))\n" +
+                  "    if l.entries.get(0).vma != 1048576 { return 1 }\n" +
+                  "    if l.entries.get(1).vma != 1052672 { return 2 }\n" +
+                  "    if layout_file_bytes(l) != 64 { return 3 }\n" +
+                  "    if layout_load_end(l) != 1048640 { return 4 }\n" +
+                  "    if !layout_contains(l, 1053000) { return 5 }\n" +
+                  "    if layout_section_at(l, 1053000) != \".bss\" { return 6 }\n" +
+                  "    if layout_render(l).find(\"0x0000000000100000\") < 0 { return 7 }\n" +
+                  "    return 0\n" +
+                  "}\n"
+        },
+        Probe {
+            name: "overlap",
+            want: 0,
+            desc: "an overlapping or misaligned image is an error, not a wrong answer",
+            body: "import \"core.result\"\n" +
+                  "import \"core.section\"\n" +
+                  "fn main() -> int {\n" +
+                  "    let sizes: map[str, int] = map_new()\n" +
+                  "    sizes.set(\".text\", 64)\n" +
+                  "    sizes.set(\".data\", 64)\n" +
+                  "    let secs: list[OutputSection] = [\n" +
+                  "        OutputSection{name: \".text\", vma: 1048576, align: 4, noload: false, inputs: []},\n" +
+                  "        OutputSection{name: \".data\", vma: 1048600, align: 4, noload: false, inputs: []}\n" +
+                  "    ]\n" +
+                  "    if layout_fault_code(result_unwrap_err(layout_image(0, secs, sizes))) != 1 {\n" +
+                  "        return 1\n" +
+                  "    }\n" +
+                  "    let bad: list[OutputSection] = [\n" +
+                  "        OutputSection{name: \".text\", vma: 0, align: 3, noload: false, inputs: []}\n" +
+                  "    ]\n" +
+                  "    if layout_fault_code(result_unwrap_err(layout_image(0, bad, map_new()))) != 3 {\n" +
+                  "        return 2\n" +
+                  "    }\n" +
+                  "    return 0\n" +
+                  "}\n"
+        },
+        Probe {
+            name: "freestanding_read",
+            want: 0,
+            desc: "the reader fits the 1-MiB freestanding arena (no strip-then-scan copy)",
+            body: "#![freestanding]\n" +
+                  "import \"core.result\"\n" +
+                  "import \"core.section\"\n" +
+                  "fn main() -> int {\n" +
+                  "    # A kernel author reads its own script in early boot: the scan must\n" +
+                  "    # not need a heap larger than the 1-MiB freestanding arena.\n" +
+                  "    let s: str = \"SECTIONS { .text : ALIGN(4) { KEEP(*(.text .text.*)) } .data : { *(.data) } }\"\n" +
+                  "    let secs: list[OutputSection] = result_unwrap(parse_link_script(s))\n" +
+                  "    if secs.len() != 2 { return 1 }\n" +
+                  "    if script_covers(secs, \".text.boot\") != \".text\" { return 2 }\n" +
+                  "    return 0\n" +
+                  "}\n"
+        }
+    ]
+
+    let mut i: int = 0
+    while i < probes.len() {
+        let p: Probe = probes.get(i)
+        let path: str = write_src(acc, "probe_" + p.name + ".hls", p.body)
+        let r: RunResult = boot(acc, [path])
+        if r.code != p.want {
+            fail_msg(acc, "link: probe " + p.name + " (interp) exit="
+                + r.code.to_str() + " want=" + p.want.to_str() + " — "
+                + clip(r.combined, 100))
+            i = i + 1
+            continue
+        }
+        if p.body.starts_with("#![freestanding]") {
+            # A freestanding TU has no libc `main`; linking it against
+            # libc is the wrong check. The -nostdlib link below is the
+            # real one.
+            pass_msg(acc, "link: " + p.name + " — " + p.desc)
+            i = i + 1
+            continue
+        }
+        let nat: RunResult = hlc_run(acc, path)
+        if !nat.spawned || nat.code != p.want {
+            fail_msg(acc, "link: probe " + p.name + " (native) exit="
+                + nat.code.to_str() + " want=" + p.want.to_str() + " — "
+                + clip(nat.combined, 100))
+            i = i + 1
+            continue
+        }
+        pass_msg(acc, "link: " + p.name + " — " + p.desc)
+        i = i + 1
+    }
+
+    # The freestanding probe must also LINK -nostdlib (that is what
+    # makes the arena claim meaningful).
+    let fs_probe: str = scratch(acc, "probe_freestanding_read.hls")
+    if file_exists(fs_probe) {
+        let c: str = scratch(acc, "fsprobe.c")
+        let exe: str = scratch(acc, "fsprobe")
+        let r: RunResult = run_capture(hlc_path(acc), [fs_probe, c])
+        let ctext: str = read_or(c, "")
+        if r.code == 0 && ctext.contains("void _start(void)") {
+            let g: RunResult = run_capture("gcc", ["-O2", "-ffreestanding", "-nostdlib",
+                "-ffunction-sections", "-fno-stack-protector", "-Wl,--gc-sections",
+                "-o", exe, c])
+            if g.code == 0 {
+                let runr: RunResult = run_capture(exe, [])
+                if runr.code == 0 {
+                    pass_msg(acc, "link: the freestanding reader links -nostdlib and exits 0")
+                } else {
+                    fail_msg(acc, "link: freestanding reader exit=" + runr.code.to_str())
+                }
+            } else {
+                fail_msg(acc, "link: freestanding reader link failed: " + clip(g.err, 120))
+            }
+        } else {
+            fail_msg(acc, "link: freestanding reader emitted no _start")
+        }
+    }
+}
+
+# replace_first_exact_line(text, from, to) — the first line that equals
+# `from` byte for byte becomes `to`; everything else is untouched (the
+# old battery's anchored re.sub with count=1).
+fn replace_first_exact_line(text: str, from: str, to: str) -> str {
+    let lines: list[str] = text.split("\n")
+    let mut out: str = ""
+    let mut done: bool = false
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i)
+        if !done && line == from {
+            if i > 0 {
+                out = out + "\n"
+            }
+            out = out + to
+            done = true
+        } else {
+            if i > 0 {
+                out = out + "\n"
+            }
+            out = out + line
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ---------------------------------------------------------------------------
+# 5. self-hosted emission + parity
+# ---------------------------------------------------------------------------
+fn sec5(acc: Acc) -> void uses IO, Fs, Proc {
+    section("5. self-hosted emission + parity")
+    let demo_c: str = scratch(acc, "demo.c")
+    let dr: RunResult = run_capture(hlc_path(acc), [demo(), demo_c])
+    if dr.code == 0 {
+        # The demo does not itself annotate functions; a dedicated
+        # program does, so the attributes are checked on real emission.
+        let sec_src: str = write_src(acc, "emit.hls",
+            "#[section(\".text.emit_a\")]\n" +
+            "#[align(64)]\n" +
+            "fn emit_a(x: int) -> int pure {\n" +
+            "    return x + 1\n" +
+            "}\n" +
+            "\n" +
+            "#[section(\".text.emit_b\")]\n" +
+            "fn emit_b(x: int) -> int pure {\n" +
+            "    return x - 1\n" +
+            "}\n" +
+            "\n" +
+            "fn main() -> int {\n" +
+            "    return emit_a(2) + emit_b(1)\n" +
+            "}\n")
+        let emit_c: str = scratch(acc, "emit.c")
+        let r: RunResult = run_capture(hlc_path(acc), [sec_src, emit_c])
+        if r.code != 0 {
+            fail_msg(acc, "link: annotated program did not compile: "
+                + clip(r.combined, 120))
+        } else {
+            let text: str = read_file(emit_c)
+            if text.contains("__attribute__((section(\".text.emit_a\"), used))") {
+                pass_msg(acc, "link: C carries __attribute__((section(...), used))")
+            } else {
+                fail_msg(acc, "link: section attribute missing from the C")
+            }
+            if text.contains("__attribute__((aligned(64)))") {
+                pass_msg(acc, "link: C carries __attribute__((aligned(64)))")
+            } else {
+                fail_msg(acc, "link: aligned attribute missing from the C")
+            }
+            # `used` is load-bearing under --gc-sections.
+            if grep_count(text, "section(\".text.emit_a\"), used") >= 2 {
+                pass_msg(acc, "link: the attribute is on both the prototype and the definition")
+            } else {
+                fail_msg(acc, "link: section attribute appears on only one of prototype/definition")
+            }
+            let exe: str = scratch(acc, "emit")
+            let g: RunResult = run_capture("gcc", ["-O2", "-Werror", "-o", exe,
+                emit_c, "-lm", "-pthread"])
+            if g.code == 0 {
+                let runr: RunResult = run_capture(exe, [])
+                if runr.code == 3 {
+                    pass_msg(acc, "link: annotated program runs natively (3 + 1 - 1)")
+                } else {
+                    fail_msg(acc, "link: annotated program exit="
+                        + runr.code.to_str() + " want 3")
+                }
+            } else {
+                fail_msg(acc, "link: annotated program link failed: " + clip(g.err, 120))
+            }
+        }
+    }
+
+    # The ok-test must link -nostdlib.
+    let fs_ok: str = scratch(acc, "ok_fs.hls")
+    let src_text: str = read_file(ok_test())
+    # Replace the ATTRIBUTE on its own exact line, not a mention of it
+    # inside the header comment (the old battery's ^#!\[no_std\]$ with
+    # count=1 — the prose mention carries a leading "# " and never
+    # matched).
+    write_file(fs_ok, replace_first_exact_line(src_text, "#![no_std]", "#![freestanding]"))
+    let fs_c: str = scratch(acc, "ok_fs.c")
+    let fr: RunResult = run_capture(hlc_path(acc), [fs_ok, fs_c])
+    if fr.code == 0 {
+        let ctext: str = read_file(fs_c)
+        if ctext.contains("void _start(void)") {
+            pass_msg(acc, "link: ok-test emits a freestanding TU (_start)")
+            let exe: str = scratch(acc, "ok_fs")
+            let g: RunResult = run_capture("gcc", ["-O2", "-ffreestanding", "-nostdlib",
+                "-ffunction-sections", "-fno-stack-protector", "-Wl,--gc-sections",
+                "-o", exe, fs_c])
+            if g.code == 0 {
+                let runr: RunResult = run_capture(exe, [])
+                if runr.code == 0 {
+                    pass_msg(acc, "link: ok-test links -nostdlib and exits 0 (freestanding)")
+                } else {
+                    fail_msg(acc, "link: freestanding ok-test exit=" + runr.code.to_str())
+                }
+            } else {
+                fail_msg(acc, "link: freestanding ok-test link failed: " + clip(g.err, 120))
+            }
+        } else {
+            fail_msg(acc, "link: freestanding ok-test emitted no _start")
+        }
+    } else {
+        fail_msg(acc, "link: ok-test did not compile as freestanding")
+    }
+
+    # #![link_script] must be ACCEPTED when the coverage holds, and the
+    # compiled program must still run (a false positive here would make
+    # custom sections unusable).
+    let good: str = write_src(acc, "good.hls",
+        "#![link_script(\"" + path_join3(acc.root, script_ld()) + "\")]\n" +
+        "\n" +
+        "#[section(\".text.boot_stub\")]\n" +
+        "fn boot_stub(x: int) -> int pure {\n" +
+        "    return x * 2\n" +
+        "}\n" +
+        "\n" +
+        "#[section(\".device\")]\n" +
+        "fn dev(x: int) -> int pure {\n" +
+        "    return x + 1\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int {\n" +
+        "    return boot_stub(3) + dev(1)\n" +
+        "}\n")
+    let gr: RunResult = hlc_run(acc, good)
+    if gr.spawned && gr.code == 8 {
+        pass_msg(acc, "link: a covered #[section] compiles, links and runs under its script")
+    } else {
+        fail_msg(acc, "link: covered #[section] exit=" + gr.code.to_str()
+            + " (" + clip(gr.combined, 120) + ")")
+    }
+
+    # The shipped link.ld must place what the repo's own demo annotates.
+    let linkld: str = write_src(acc, "linkld.hls",
+        "#![link_script(\"" + path_join3(acc.root, "link.ld") + "\")]\n" +
+        "\n" +
+        "#[section(\".text.demo_stub\")]\n" +
+        "fn demo_stub(x: int) -> int pure {\n" +
+        "    return x\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int {\n" +
+        "    return demo_stub(0)\n" +
+        "}\n")
+    let lr: RunResult = hlc_run(acc, linkld)
+    if lr.spawned && lr.code == 0 {
+        pass_msg(acc, "link: the shipped link.ld places a custom section")
+    } else {
+        fail_msg(acc, "link: shipped link.ld run exit=" + lr.code.to_str()
+            + " (" + clip(lr.combined, 120) + ")")
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 6. hlfmt + linter
+# ---------------------------------------------------------------------------
+fn sec6(acc: Acc) -> void uses IO, Fs, Proc {
+    section("6. hlfmt + linter")
+    let fmt_src: str = write_src(acc, "fmt.hls",
+        "#[section(\".text.fmt\")]\n" +
+        "#[align(64)]\n" +
+        "fn f(x: int) -> int {\n" +
+        "    return x\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int {\n" +
+        "    return f(1)\n" +
+        "}\n")
+    let r: RunResult = run_capture("python3", ["tools/hlfmt.py", "-c", fmt_src])
+    if r.code == 0 {
+        pass_msg(acc, "link: hlfmt -c accepts the new attributes")
+    } else {
+        fail_msg(acc, "link: hlfmt -c rejected: " + clip(r.combined, 120))
+    }
+    # An UNformatted file carrying both attributes must format to
+    # something that still carries them, and be stable.
+    write_file(fmt_src,
+        "#[section(\".text.fmt\")]\n" +
+        "#[align(64)]\n" +
+        "fn f(x:int)->int{\n" +
+        "return x}\n" +
+        "\n" +
+        "fn main() -> int {\n" +
+        "return f(1)}\n")
+    let w1: RunResult = run_capture("python3", ["tools/hlfmt.py", "-w", fmt_src])
+    let once: str = read_file(fmt_src)
+    let w2: RunResult = run_capture("python3", ["tools/hlfmt.py", "-w", fmt_src])
+    let twice: str = read_file(fmt_src)
+    if once == twice && once.contains("#[section(\".text.fmt\")]")
+            && once.contains("#[align(64)]") {
+        pass_msg(acc, "link: hlfmt -w is stable and preserves both attributes")
+    } else {
+        fail_msg(acc, "link: hlfmt -w unstable or lossy: " + clip(twice, 200))
+    }
+    let lint: RunResult = run_capture("python3", ["tools/hllint.py", ok_test()])
+    if lint.code == 0 {
+        pass_msg(acc, "link: hllint clean on the ok-test")
+    } else {
+        fail_msg(acc, "link: hllint: " + clip(lint.combined, 160))
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 7. --audit
+# ---------------------------------------------------------------------------
+fn sec7(acc: Acc) -> void uses IO, Fs, Proc {
+    section("7. --audit")
+    let good: str = scratch(acc, "good.hls")
+    let legs: list[str] = ["boot", "hlc"]
+    let mut i: int = 0
+    while i < legs.len() {
+        let label: str = legs.get(i)
+        let r: RunResult = boot(acc, ["--audit", good])
+        if label == "hlc" {
+            let h: RunResult = run_capture(hlc_path(acc), ["--audit", good])
+            r.code = h.code
+            r.out = h.out
+            r.err = h.err
+            r.combined = h.combined
+            r.spawned = h.spawned
+        }
+        let text: str = r.combined
+        if r.code == 0 && text.contains("Linker script:") && text.contains("place.ld") {
+            if text.contains("section(s) named") {
+                pass_msg(acc, "link: --audit reports the script and the section count (" + label + ")")
+            } else {
+                fail_msg(acc, "link: --audit missing the section count (" + label + ")")
+            }
+        } else {
+            fail_msg(acc, "link: --audit did not report the linker script (" + label + "): "
+                + clip(text, 140))
+        }
+        i = i + 1
+    }
+
+    let stats_c: str = scratch(acc, "stats.c")
+    let st: RunResult = run_capture(hlc_path(acc), ["--opt-stats", good, stats_c])
+    let stext: str = st.combined
+    if st.code == 0 && stext.contains("#[section(\"X\")]") && stext.contains("#[align(N)]") {
+        pass_msg(acc, "link: --opt-stats counts the section and align annotations")
+    } else {
+        fail_msg(acc, "link: --opt-stats missing the new counters: " + clip(stext, 160))
+    }
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let acc: Acc = acc_new("link")
+    sec1(acc)
+    sec2(acc)
+    sec3(acc)
+    sec4(acc)
+    sec5(acc)
+    sec6(acc)
+    sec7(acc)
+    return finish(acc, "Stage 84 -- linker-script integration + custom sections")
+}

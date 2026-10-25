@@ -1,0 +1,498 @@
+# ============================================================================
+# tests/acc/harness.hls — the shared acceptance-gate harness, in Halis.
+# ----------------------------------------------------------------------------
+# Every `tests/acc/*_acceptance.hls` gate imports this module (relative
+# import: `import "./harness.hls"`) and gets the same ergonomics the old
+# Python batteries had:
+#
+#   fn main() -> int uses IO, Fs, Proc, Args, Exit {
+#       let acc: Acc = acc_new("link")
+#       section("1. resolution + guards")
+#       check(acc, "core/section.hls present", file_exists("core/section.hls"), "")
+#       let r: RunResult = run_capture("./bin/hlc", ["--audit", "x.hls"])
+#       check(acc, "audit reports the script", r.code == 0 && r.out.contains("script"), r.out)
+#       return finish(acc, "Stage 84 -- linker-script integration")
+#   }
+#
+# The gates are COMPILED NATIVE by bin/hlc + cc (see the Makefile's
+# $(BIN)/acc-% pattern rule): the harness itself is a native binary,
+# not a Python process — the interpreter stays an oracle the gates
+# SPAWN (python3 tools/hlinterp/boot.py ...) where a leg exercises it
+# by design, and nothing else.
+#
+# API notes for porting from the Python batteries:
+#
+#   subprocess.run(cmd, capture_output=True, text=True)
+#       -> run_capture(program, args)        (stdout+stderr piped)
+#   r.returncode / r.stdout / r.stderr
+#       -> r.code / r.out / r.err            (r.code == -1: spawn failed)
+#   subprocess.run(cmd) with inherited output
+#       -> run_quiet(program, args)          (stdio -> /dev/null, code only)
+#   os.system / shell one-liners (mkdir -p, rm -rf, cp, command -v)
+#       -> sh("mkdir -p a/b") / mkdirs() / rmrf() / cp() / which()
+#   tempfile.mkdtemp(prefix=..., dir=...)
+#       -> scratch(acc, "sub/dir")           (under tests/.acc-scratch/<gate>,
+#                                              recreated fresh, INSIDE the repo
+#                                              so `core.*` / relative imports of
+#                                              gate-written programs resolve)
+#   open(path).write(...) / open(path).read()
+#       -> write_file(path, text) / read_file(path)   (builtins, Fs)
+#   os.path.exists(path)
+#       -> file_exists(path)                 (builtin, Fs)
+#   re.search(r"enum\s+Foo\b", src)
+#       -> src.contains("enum Foo") when a plain substring is faithful,
+#          or std.regex: regex_is_match(re, src) for boundary-sensitive
+#          greps (import std.regex in the gate itself)
+#   os.environ["K"] = "v" (for spawned children)
+#       -> env_set_var("K", "v") from std.env (children inherit the parent)
+#   timeouts: the Python batteries wrapped every run in timeout=300 as a
+#   safety net; the Halis runtime has no per-child alarm yet, so a hung
+#   child hangs the gate (the CI job's own timeout is the backstop).
+#   Nothing in these trees hangs in practice — every child is a compiler,
+#   cc, git, or the project's own tools.
+#
+# Effects: every harness primitive names its capabilities; a gate's
+# functions inherit them transitively (a function calling check needs
+# `uses IO`, one spawning children needs `uses Proc`, and so on).
+# ============================================================================
+
+import "std.str"
+
+# ----------------------------------------------------------------------------
+# RunResult — the subprocess.run outcome.
+# ----------------------------------------------------------------------------
+
+struct RunResult {
+    code: int,        # encoded exit: 0..255 normal, 128+signum signalled,
+                      # -1 = the spawn itself failed (program not found)
+    out: str,         # captured stdout ("" when not piped / spawn failed)
+    err: str,         # captured stderr
+    combined: str,    # out + err, the batteries' usual needle haystack
+    spawned: bool,    # false when the spawn failed
+}
+
+# ----------------------------------------------------------------------------
+# Acc — the gate's counters and world.
+# ----------------------------------------------------------------------------
+
+struct Acc {
+    pass: int,        # assertions that held
+    fail: int,        # assertions that did not
+    gate: str,        # the gate's short name (link, nostd, size, ...)
+    root: str,        # the repo root (cwd at acc_new; gates run from it)
+    scratch_base: str # tests/.acc-scratch/<gate>, INSIDE the repo
+}
+
+# acc_new(gate) — open a gate. Refuses (exit 2) when the cwd is not the
+# repo root, the way the Python batteries' os.chdir(ROOT) never could:
+# loudly, with the fix in the message.
+fn acc_new(gate: str) -> Acc uses IO, Fs, Proc, Exit {
+    let root: str = cwd_get()
+    if !file_exists(path_join3(root, "tools/hlinterp/boot.py")) {
+        println(gate + "-acceptance: REFUSED — run from the repo root "
+            + "(cwd=" + root + "; the gates resolve every path against it)")
+        exit(2)
+    }
+    let base: str = path_join3(path_join3(root, "tests"), ".acc-scratch/" + gate)
+    rmrf(base)
+    mkdirs(base)
+    let a: Acc = Acc {
+        pass: 0,
+        fail: 0,
+        gate: gate,
+        root: root,
+        scratch_base: base
+    }
+    return a
+}
+
+# ----------------------------------------------------------------------------
+# Sections + checks — the batteries' print grammar, unchanged.
+# ----------------------------------------------------------------------------
+
+fn section(title: str) -> void uses IO {
+    println("")
+    println("=== " + title + " ===")
+}
+
+# check(acc, name, ok, detail) — one assertion. Prints
+#   "  [OK] name — detail"   /   "  [FAIL] name — detail"
+# and counts it. Returns ok so callers can branch on it.
+fn check(acc: Acc, name: str, ok: bool, detail: str) -> bool uses IO {
+    if ok {
+        acc.pass = acc.pass + 1
+        if detail == "" {
+            println("  [OK] " + name)
+        } else {
+            println("  [OK] " + name + " — " + detail)
+        }
+    } else {
+        acc.fail = acc.fail + 1
+        if detail == "" {
+            println("  [FAIL] " + name)
+        } else {
+            println("  [FAIL] " + name + " — " + detail)
+        }
+    }
+    return ok
+}
+
+# pass_msg / fail_msg — the osdev family's [PASS]/[FAIL] grammar.
+fn pass_msg(acc: Acc, name: str) -> void uses IO {
+    acc.pass = acc.pass + 1
+    println("  [PASS] " + name)
+}
+
+fn fail_msg(acc: Acc, name: str) -> void uses IO {
+    acc.fail = acc.fail + 1
+    println("  [FAIL] " + name)
+}
+
+# finish(acc, subject) — the closing summary. Prints
+#   RESULT: N PASS / M FAIL
+#   ACCEPTANCE OK: <subject>          (green)
+# and returns the process exit code (0 green / 1 red).
+fn finish(acc: Acc, subject: str) -> int uses IO {
+    println("")
+    println("======================================================================")
+    println("RESULT: " + acc.pass.to_str() + " PASS / " + acc.fail.to_str() + " FAIL")
+    println("======================================================================")
+    if acc.fail > 0 {
+        println(str_to_upper_ascii(acc.gate) + " ACCEPTANCE: " + acc.fail.to_str()
+            + " assertion(s) FAILED")
+        return 1
+    }
+    println("ACCEPTANCE OK: " + subject)
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# Subprocesses.
+# ----------------------------------------------------------------------------
+
+# run_capture(program, args) — spawn with stdout+stderr piped, stdin null;
+# drain both pipes to EOF, wait, close the pipe ends. Returns the
+# RunResult. Sequential-safe: the drained+closed slot is reclaimable by
+# the runtime's proc reclaimer, so a gate may run thousands of these.
+fn run_capture(program: str, args: list[str]) -> RunResult uses Proc {
+    let r: RunResult = RunResult {
+        code: -1,
+        out: "",
+        err: "",
+        combined: "",
+        spawned: false
+    }
+    let pid: int = proc_spawn(program, args, 2, 1, 1)
+    if pid < 1 {
+        return r
+    }
+    r.spawned = true
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    r.code = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    r.out = out
+    r.err = err
+    r.combined = out + err
+    return r
+}
+
+# run_quiet(program, args) — spawn with every stdio null; return the
+# encoded exit code only (-1 spawn failed). The cheapest leg.
+fn run_quiet(program: str, args: list[str]) -> int uses Proc {
+    let pid: int = proc_spawn(program, args, 2, 2, 2)
+    if pid < 1 {
+        return -1
+    }
+    let code: int = proc_wait(pid)
+    return code
+}
+
+# run_feed(program, args, stdin_text) — spawn with stdin piped; write the
+# text, close stdin, drain stdout+stderr, wait. For the gates that drive
+# a REPL / LSP / DAP child through a pipe.
+fn run_feed(program: str, args: list[str], stdin_text: str) -> RunResult uses Proc {
+    let r: RunResult = RunResult {
+        code: -1,
+        out: "",
+        err: "",
+        combined: "",
+        spawned: false
+    }
+    let pid: int = proc_spawn(program, args, 1, 1, 1)
+    if pid < 1 {
+        return r
+    }
+    r.spawned = true
+    if stdin_text != "" {
+        proc_child_write(pid, stdin_text)
+    }
+    proc_child_close(pid, 0)
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    r.code = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    r.out = out
+    r.err = err
+    r.combined = out + err
+    return r
+}
+
+# expect_ok(acc, name, program, args) — the most common leg in the
+# batteries: the command must exit 0. Detail carries the first line of
+# output when it did not.
+fn expect_ok(acc: Acc, name: str, program: str, args: list[str]) -> bool uses IO, Proc {
+    let r: RunResult = run_capture(program, args)
+    return check(acc, name, r.spawned && r.code == 0, first_line(r.combined))
+}
+
+# expect_refuse(acc, name, needle, program, args) — the other most common
+# leg: exit 1 with the diagnostic needle in stdout+stderr.
+fn expect_refuse(acc: Acc, name: str, needle: str, program: str, args: list[str]) -> bool uses IO, Proc {
+    let r: RunResult = run_capture(program, args)
+    return check(acc, name, r.spawned && r.code == 1 && r.combined.contains(needle),
+                 clip(r.combined, 120))
+}
+
+# ----------------------------------------------------------------------------
+# Shell one-liners — mkdir -p / rm -rf / cp / command -v. proc_exec is a
+# shell one-shot (system()); the harness only ever passes paths it built
+# itself from the gate's own scratch tree.
+# ----------------------------------------------------------------------------
+
+fn sh(cmd: str) -> int uses Proc {
+    return proc_exec(cmd)
+}
+
+fn mkdirs(path: str) -> int uses Proc {
+    return proc_exec("mkdir -p '" + shell_quote(path) + "'")
+}
+
+fn rmrf(path: str) -> int uses Proc {
+    return proc_exec("rm -rf '" + shell_quote(path) + "'")
+}
+
+fn cp(src: str, dst: str) -> int uses Proc {
+    return proc_exec("cp '" + shell_quote(src) + "' '" + shell_quote(dst) + "'")
+}
+
+# which(name) — true when the command resolves on PATH.
+fn which(name: str) -> bool uses Proc {
+    return proc_exec("command -v '" + shell_quote(name) + "' >/dev/null 2>&1") == 0
+}
+
+# shell_quote(s) — neutralise single quotes for the one-liners above.
+# Everything the harness passes is a path or a tool name it built itself;
+# the quoting is belt-and-braces so an odd path can never rewrite the
+# command around it.
+fn shell_quote(s: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c == 39 {
+            out = out + "'\\''"
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# Scratch world.
+# ----------------------------------------------------------------------------
+
+# scratch(acc, sub) — a fresh path under tests/.acc-scratch/<gate>/,
+# created (mkdir -p) and returned. Gates write their probe programs and
+# build outputs here; the directory lives INSIDE the repo so `core.*`
+# imports and relative `#![link_script]` paths resolve exactly the way
+# they do for a real crate. The base is wiped by acc_new, so a re-run
+# starts clean.
+fn scratch(acc: Acc, sub: str) -> str uses Proc {
+    let p: str = path_join3(acc.scratch_base, sub)
+    mkdirs(path_dir3(p))
+    return p
+}
+
+# write_src(acc, fname, text) — write a probe source file into the
+# scratch root and return its path. The one-liner every battery starts with.
+fn write_src(acc: Acc, fname: str, text: str) -> str uses Fs, Proc {
+    let p: str = scratch(acc, fname)
+    write_file(p, text)
+    return p
+}
+
+# ----------------------------------------------------------------------------
+# Text helpers the batteries lean on.
+# ----------------------------------------------------------------------------
+
+# first_line(text) — the first non-empty line, trimmed; "" for empty text.
+fn first_line(text: str) -> str {
+    let lines: list[str] = text.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let t: str = lines.get(i).trim()
+        if t != "" {
+            return t
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# clip(text, n) — first n bytes, one trailing "..." marker when cut.
+fn clip(text: str, n: int) -> str {
+    let t: str = text.trim()
+    if t.len() <= n {
+        return t
+    }
+    return t.slice(0, n) + "..."
+}
+
+# path_join3(base, rel) — base + "/" + rel without doubling a slash.
+fn path_join3(base: str, rel: str) -> str {
+    if base == "" {
+        return rel
+    }
+    if base.byte_at(base.len() - 1) == 47 {
+        return base + rel
+    }
+    return base + "/" + rel
+}
+
+# path_dir3(p) — everything before the last "/"; "." for a bare name.
+fn path_dir3(p: str) -> str {
+    let mut i: int = p.len() - 1
+    while i >= 0 {
+        if p.byte_at(i) == 47 {
+            if i == 0 {
+                return "/"
+            }
+            return p.slice(0, i)
+        }
+        i = i - 1
+    }
+    return "."
+}
+
+# basename(p) — everything after the last "/".
+fn basename(p: str) -> str {
+    let mut i: int = p.len() - 1
+    while i >= 0 {
+        if p.byte_at(i) == 47 {
+            return p.slice(i + 1, p.len())
+        }
+        i = i - 1
+    }
+    return p
+}
+
+# stem(p) — basename without the last extension.
+fn stem(p: str) -> str {
+    let b: str = basename(p)
+    let mut i: int = b.len() - 1
+    while i > 0 {
+        if b.byte_at(i) == 46 {
+            return b.slice(0, i)
+        }
+        i = i - 1
+    }
+    return b
+}
+
+# read_or(path, fallback) — read_file when the file exists, else the
+# fallback (the batteries' try/except FileNotFoundError idiom).
+fn read_or(path: str, fallback: str) -> str uses Fs {
+    if file_exists(path) {
+        return read_file(path)
+    }
+    return fallback
+}
+
+# grep_count(text, needle) — how many lines of the text contain the
+# needle (the batteries' line-census idiom).
+fn grep_count(text: str, needle: str) -> int {
+    let lines: list[str] = text.split("\n")
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).contains(needle) {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+# count_lines(text) — how Python's `for line in fh` counts: the number
+# of "\n" bytes, plus one when the text is non-empty and unterminated.
+fn count_lines(text: str) -> int {
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < text.len() {
+        if text.byte_at(i) == 10 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    if text.len() > 0 && text.byte_at(text.len() - 1) != 10 {
+        n = n + 1
+    }
+    return n
+}
+
+# ----------------------------------------------------------------------------
+# The compilers, as the batteries address them.
+# ----------------------------------------------------------------------------
+
+# boot(acc, args) — the lab interpreter, spawned as a child. The
+# interpreter stays an ORACLE the gates spawn where a leg exercises it
+# by design (differential parity); it is no longer the harness itself.
+fn boot(acc: Acc, args: list[str]) -> RunResult uses Proc {
+    let argv: list[str] = [path_join3(acc.root, "tools/hlinterp/boot.py")]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    return run_capture("python3", argv)
+}
+
+# boot_check(acc, path) — the interpreter's --check leg.
+fn boot_check(acc: Acc, path: str) -> RunResult uses Proc {
+    let args: list[str] = ["--check", path]
+    return boot(acc, args)
+}
+
+# hlc_path(acc) — the native compiler, built by `make bootstrap`.
+fn hlc_path(acc: Acc) -> str {
+    return path_join3(acc.root, "bin/hlc")
+}
+
+# ----------------------------------------------------------------------------
+# End of tests/acc/harness.hls
+# ============================================================================

@@ -110,6 +110,20 @@ snapshot-chain: $(BIN)/hls-snap
 snapshot-prove: $(BIN)/hls-snap
 	@$(BIN)/hls-snap prove
 
+# The acceptance gates, self-hosted: every tests/acc/*_acceptance.hls
+# battery is compiled NATIVE by bin/hlc + cc and run as a binary —
+# the gate itself is Halis, the way the kit is. A gate may still
+# spawn python3 tools/hlinterp/boot.py where a leg exercises the
+# interpreter BY DESIGN (the differential oracle) or a Python tool
+# that has not moved yet; the harness is tests/acc/harness.hls and
+# the scratch world lives under tests/.acc-scratch/ (gitignored,
+# wiped per run). The mk/*.mk targets depend on $(BIN)/acc-<gate>.
+$(BIN)/acc-%: tests/acc/%_acceptance.hls tests/acc/harness.hls $(wildcard std/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[acc] hlc compiles the $* gate (self-hosted, no python)..."
+	@$(BIN)/hlc tests/acc/$*_acceptance.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+
 # File target for the native compiler: acceptance targets declared with
 # `bin/hlc` as a prerequisite stay buildable after `make clean` or on a
 # fresh checkout, where the phony `bootstrap` goal alone is not enough.
