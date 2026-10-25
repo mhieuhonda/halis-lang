@@ -235,7 +235,10 @@ if "$TMP/hlc1" --target-feature avx2 benchmarks/simd_bench.hls "$TMP/s21b.c" >/d
         bad "simd-bench: checksum mismatch"
     fi
     if grep -q "simd_cpu_supports(avx2) = true" "$TMP/s21b.out"; then
-        if python3 scripts/simd_ratio.py --out "$TMP/s21b.out" --min 2.0 >/dev/null 2>&1; then
+        if ! [ -x bin/simd-ratio ]; then
+            make bin/simd-ratio >/dev/null 2>&1
+        fi
+        if ./bin/simd-ratio --out "$TMP/s21b.out" --min 2.0 >/dev/null 2>&1; then
             ratio_line=$(grep "RATIO" "$TMP/s21b.out" | tail -1)
             ok "simd-bench: acceptance ratio >= 2x ($ratio_line)"
         else

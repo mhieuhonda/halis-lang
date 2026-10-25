@@ -99,13 +99,15 @@ pgo: bootstrap
 # benchmark-class machines enforce the strict Stage 19 number with:
 #   make pgo-acceptance PGO_MAX_RATIO=0.80
 PGO_MAX_RATIO ?= 0.95
-pgo-acceptance: pgo
-	@python3 scripts/pgo_ratio.py --plain $(BIN)/hlc --trained $(BIN)/hlc_pgo \
+# The measurement itself is Halis (scripts/pgo_ratio.hls, compiled
+# native by bin/hlc through the $(BIN)/pgo-ratio rule).
+pgo-acceptance: pgo $(BIN)/pgo-ratio
+	@$(BIN)/pgo-ratio --plain $(BIN)/hlc --trained $(BIN)/hlc_pgo \
 	  --input $(HLC) --runs 9 --max-ratio $(PGO_MAX_RATIO)
 
 # pgo-report: same measurement, informational only (no gate).
-pgo-report: pgo
-	@python3 scripts/pgo_ratio.py --plain $(BIN)/hlc --trained $(BIN)/hlc_pgo \
+pgo-report: pgo $(BIN)/pgo-ratio
+	@$(BIN)/pgo-ratio --plain $(BIN)/hlc --trained $(BIN)/hlc_pgo \
 	  --input $(HLC) --runs 9 --noisy
 
 # Stage 19 perfection (v0.38.0-alpha): offline profile utilities.

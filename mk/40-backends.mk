@@ -33,7 +33,8 @@ simd-acceptance:
 	  || (echo "FAIL: checksum mismatch (vector != scalar)"; exit 1)
 	@if ! grep -q "simd_cpu_supports(avx2) = true" $(BIN)/simd_acc.out; then \
 	  echo "SKIP: host CPU has no AVX2 (intrinsic path inactive)"; exit 0; fi
-	@python3 scripts/simd_ratio.py --out $(BIN)/simd_acc.out --min 2.0
+	@$(MAKE) $(BIN)/simd-ratio
+	@$(BIN)/simd-ratio --out $(BIN)/simd_acc.out --min 2.0
 
 # ============================================================================
 # Stage 22 (v0.41.0-alpha): cross-compilation targets

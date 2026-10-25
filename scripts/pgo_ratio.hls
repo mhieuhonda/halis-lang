@@ -1,0 +1,248 @@
+# ============================================================================
+# pgo_ratio.hls — Stage 19 (v0.35.0-alpha) PGO acceptance measurement
+# (the Halis twin of what was scripts/pgo_ratio.py).
+# ----------------------------------------------------------------------------
+# Compares the wall time of the PGO-trained `hlc` against the plain
+# (non-PGO) build when compiling the same input (default: src/hlc.hls,
+# the self-compilation workload the roadmap's acceptance specifies).
+#
+# Methodology (unchanged from the battery):
+#   - N runs per binary (default 9), interleaved plain/trained ordering
+#     to cancel thermal / cache drift,
+#   - the MEDIAN is compared (individual runs are noisy on shared CI
+#     machines),
+#   - exit code 0 when the ratio is <= the --max-ratio threshold
+#     (default 0.80, the Stage 19 acceptance target),
+#   - also verifies the two compilers produce BYTE-IDENTICAL C output
+#     for the input program.
+#
+#   - the ratio carries a PERCENTILE breakdown (p25/p50/p75 of the
+#     per-run ratios) so a single noisy run cannot hide a regression;
+#     the gate still uses the median (p50).
+#   - --noisy: exit 0 (instead of 1) on a ratio failure but still
+#     print the FAIL line (informational runs).
+#
+# Usage:
+#   bin/pgo-ratio --plain bin/hlc --trained bin/hlc_pgo \
+#       --input src/hlc.hls --runs 9 [--max-ratio 0.80] [--noisy]
+# ============================================================================
+
+import "std.fmt"
+import "std.time"
+
+# sort_floats(xs) — in-place insertion sort (the lists are tiny).
+fn sort_floats(xs: list[float]) -> void {
+    let mut i: int = 1
+    while i < xs.len() {
+        let v: float = xs.get(i)
+        let mut j: int = i - 1
+        while j >= 0 && xs.get(j) > v {
+            xs.set(j + 1, xs.get(j))
+            j = j - 1
+        }
+        xs.set(j + 1, v)
+        i = i + 1
+    }
+}
+
+# median_of(xs) — the middle of the sorted values (the caller passes
+# each list pre-sorted).
+fn median_of(sorted: list[float]) -> float {
+    if sorted.len() == 0 {
+        return 0.0
+    }
+    return sorted.get(sorted.len() / 2)
+}
+
+# pct_of(sorted, p) — the p-quantile by nearest-rank on [0, 1].
+fn pct_of(sorted: list[float], p: float) -> float {
+    let n: int = sorted.len()
+    if n == 0 {
+        return 0.0
+    }
+    let mut idx: int = (p * (n - 1).to_float() + 0.5).to_int()
+    if idx < 0 {
+        idx = 0
+    }
+    if idx > n - 1 {
+        idx = n - 1
+    }
+    return sorted.get(idx)
+}
+
+# join_times(xs) — "0.123 0.456 ..." (the battery's %.3f join).
+fn join_times(xs: list[float]) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < xs.len() {
+        if i > 0 {
+            out = out + " "
+        }
+        out = out + fmt_float_with_precision(xs.get(i), 3)
+        i = i + 1
+    }
+    return out
+}
+
+fn main() -> int uses IO, Fs, Clock, Proc, Args, Exit {
+    let argv: list[str] = args()
+    let mut plain: str = ""
+    let mut trained: str = ""
+    let mut input_path: str = ""
+    let mut runs: int = 9
+    let mut max_ratio: float = 0.80
+    let mut noisy: bool = false
+    let mut i: int = 1
+    while i < argv.len() {
+        let a: str = argv.get(i)
+        if a == "--plain" && i + 1 < argv.len() {
+            plain = argv.get(i + 1)
+            i = i + 2
+            continue
+        }
+        if a == "--trained" && i + 1 < argv.len() {
+            trained = argv.get(i + 1)
+            i = i + 2
+            continue
+        }
+        if a == "--input" && i + 1 < argv.len() {
+            input_path = argv.get(i + 1)
+            i = i + 2
+            continue
+        }
+        if a == "--runs" && i + 1 < argv.len() {
+            runs = argv.get(i + 1).to_int()
+            i = i + 2
+            continue
+        }
+        if a == "--max-ratio" && i + 1 < argv.len() {
+            max_ratio = argv.get(i + 1).to_float()
+            i = i + 2
+            continue
+        }
+        if a == "--noisy" {
+            noisy = true
+            i = i + 1
+            continue
+        }
+        i = i + 1
+    }
+    if plain == "" || trained == "" || input_path == "" || runs < 1 {
+        println("usage: pgo-ratio --plain BIN --trained BIN --input FILE"
+            + " [--runs 9] [--max-ratio 0.80] [--noisy]")
+        return 2
+    }
+
+    # The compile outputs live under bin/ (wiped by make clean).
+    let out_p: str = "bin/.pgo_ratio_plain.c"
+    let out_t: str = "bin/.pgo_ratio_trained.c"
+    let plain_times: list[float] = []
+    let trained_times: list[float] = []
+    let mut r: int = 0
+    while r < runs {
+        # Interleave to cancel drift: plain, trained, trained, plain...
+        let t0: int = time_now_ms()
+        let cp: int = proc_wait_or_fail(plain, input_path, out_p)
+        let t1: int = time_now_ms()
+        if cp != 0 {
+            println("FAIL: the plain compiler exited " + cp.to_str())
+            return 1
+        }
+        plain_times.push((t1 - t0).to_float() / 1000.0)
+        let t2: int = time_now_ms()
+        let ct: int = proc_wait_or_fail(trained, input_path, out_t)
+        let t3: int = time_now_ms()
+        if ct != 0 {
+            println("FAIL: the trained compiler exited " + ct.to_str())
+            return 1
+        }
+        trained_times.push((t3 - t2).to_float() / 1000.0)
+        r = r + 1
+    }
+
+    # Byte-identical output check (the acceptance's second half).
+    let mut plain_c: str = ""
+    if file_exists(out_p) {
+        plain_c = read_file(out_p)
+    }
+    let mut trained_c: str = ""
+    if file_exists(out_t) {
+        trained_c = read_file(out_t)
+    }
+    let identical: bool = plain_c == trained_c && plain_c.len() > 0
+
+    # Per-run ratios FIRST (the interleaved capture kept the pairs in
+    # run order; sorting the marginals would destroy the pairing).
+    let per_run: list[float] = []
+    let mut k: int = 0
+    while k < plain_times.len() && k < trained_times.len() {
+        let p_i: float = plain_times.get(k)
+        let t_i: float = trained_times.get(k)
+        if p_i > 0.0 {
+            per_run.push(t_i / p_i)
+        } else {
+            per_run.push(1000000000000.0)
+        }
+        k = k + 1
+    }
+    sort_floats(per_run)
+
+    # The battery printed the per-run times in RUN order (its lists
+    # were never reordered); capture the joined view before sorting.
+    let plain_view: str = join_times(plain_times)
+    let trained_view: str = join_times(trained_times)
+    sort_floats(plain_times)
+    sort_floats(trained_times)
+    let pm: float = median_of(plain_times)
+    let tm: float = median_of(trained_times)
+    let mut ratio: float = 0.0
+    if pm > 0.0 {
+        ratio = tm / pm
+    } else {
+        ratio = 1000000000000.0
+    }
+    let p25: float = pct_of(per_run, 0.25)
+    let p50: float = pct_of(per_run, 0.50)
+    let p75: float = pct_of(per_run, 0.75)
+
+    println("plain   hlc : median " + fmt_float_with_precision(pm, 3) + "s  (runs: "
+        + plain_view + ")")
+    println("trained hlc : median " + fmt_float_with_precision(tm, 3) + "s  (runs: "
+        + trained_view + ")")
+    println("ratio       : " + fmt_float_with_precision(ratio * 100.0, 1)
+        + "%  (target <= " + fmt_float_with_precision(max_ratio * 100.0, 0) + "%)")
+    println("per-run ratio percentiles: p25=" + fmt_float_with_precision(p25 * 100.0, 1)
+        + "%  p50=" + fmt_float_with_precision(p50 * 100.0, 1)
+        + "%  p75=" + fmt_float_with_precision(p75 * 100.0, 1) + "%")
+    if identical {
+        println("byte-identical output: YES")
+    } else {
+        println("byte-identical output: NO")
+    }
+
+    if !identical {
+        println("FAIL: trained compiler output differs from plain build")
+        return 1
+    }
+    if ratio > max_ratio {
+        println("FAIL: ratio exceeds the acceptance threshold")
+        if noisy {
+            return 0
+        }
+        return 1
+    }
+    println("PASS: Stage 19 acceptance (PGO-trained hlc compiles the input in <= "
+        + fmt_float_with_precision(max_ratio * 100.0, 0)
+        + "% of the plain build's wall time, byte-identical output)")
+    return 0
+}
+
+# proc_wait_or_fail(exe, input, out) — spawn with every stdio null
+# and wait; the encoded exit code, -1 when the spawn failed.
+fn proc_wait_or_fail(exe: str, input_path: str, out: str) -> int uses Proc {
+    let pid: int = proc_spawn(exe, [input_path, out], 2, 2, 2)
+    if pid < 1 {
+        return -1
+    }
+    return proc_wait(pid)
+}

@@ -84,6 +84,40 @@ $(BIN)/hls-snap: tools/hls-snap.hls $(wildcard std/*.hls)
 	@$(BIN)/hlc tools/hls-snap.hls $(BIN)/hls-snap.c
 	@$(CC) $(CFLAGS) -o $(BIN)/hls-snap $(BIN)/hls-snap.c -lm -pthread
 
+# ----------------------------------------------------------------------------
+# The self-hosted lab tools: hlc compiles them, cc links them — no
+# Python. Each follows the snapshot-kit pattern (a missing bin/hlc is
+# compiled from the committed C snapshot, never a Python bootstrap):
+#   hls-spec-check   — the Stage 32 generic-specialisation verifier
+#   simd-ratio       — the Stage 21 SIMD acceptance measurement
+#   pgo-ratio        — the Stage 19 PGO acceptance measurement
+#   fix-makefile-indent — the recipe-indent repair tool
+# ----------------------------------------------------------------------------
+$(BIN)/hls-spec-check: tools/hls-spec-check.hls $(wildcard std/*.hls)
+	@mkdir -p $(BIN)
+	@test -x $(BIN)/hlc || { echo "[toolkit] cc: a compiler from the committed snapshot (bootstrap-free)..."; $(CC) $(CFLAGS) -o $(BIN)/hlc $(SNAP) -lm -pthread; }
+	@echo "[toolkit] hlc compiles hls-spec-check (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hls-spec-check.hls $(BIN)/hls-spec-check.c
+	@$(CC) $(CFLAGS) -o $(BIN)/hls-spec-check $(BIN)/hls-spec-check.c -lm -pthread
+
+$(BIN)/simd-ratio: scripts/simd_ratio.hls $(wildcard std/*.hls)
+	@mkdir -p $(BIN)
+	@test -x $(BIN)/hlc || { echo "[toolkit] cc: a compiler from the committed snapshot (bootstrap-free)..."; $(CC) $(CFLAGS) -o $(BIN)/hlc $(SNAP) -lm -pthread; }
+	@$(BIN)/hlc scripts/simd_ratio.hls $(BIN)/simd-ratio.c
+	@$(CC) $(CFLAGS) -o $(BIN)/simd-ratio $(BIN)/simd-ratio.c -lm -pthread
+
+$(BIN)/pgo-ratio: scripts/pgo_ratio.hls $(wildcard std/*.hls)
+	@mkdir -p $(BIN)
+	@test -x $(BIN)/hlc || { echo "[toolkit] cc: a compiler from the committed snapshot (bootstrap-free)..."; $(CC) $(CFLAGS) -o $(BIN)/hlc $(SNAP) -lm -pthread; }
+	@$(BIN)/hlc scripts/pgo_ratio.hls $(BIN)/pgo-ratio.c
+	@$(CC) $(CFLAGS) -o $(BIN)/pgo-ratio $(BIN)/pgo-ratio.c -lm -pthread
+
+$(BIN)/fix-makefile-indent: scripts/fix_makefile_indent.hls
+	@mkdir -p $(BIN)
+	@test -x $(BIN)/hlc || { echo "[toolkit] cc: a compiler from the committed snapshot (bootstrap-free)..."; $(CC) $(CFLAGS) -o $(BIN)/hlc $(SNAP) -lm -pthread; }
+	@$(BIN)/hlc scripts/fix_makefile_indent.hls $(BIN)/fix-makefile-indent.c
+	@$(CC) $(CFLAGS) -o $(BIN)/fix-makefile-indent $(BIN)/fix-makefile-indent.c -lm -pthread
+
 snapshot-status: $(BIN)/hls-snap
 	@$(BIN)/hls-snap status
 

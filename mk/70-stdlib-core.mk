@@ -29,8 +29,10 @@ bench-stdlib:
 	@$(PYTHON) tools/hls-bench-stdlib.py --threshold-us $(BENCH_THRESHOLD_US)
 
 # spec-check: verify generic specialisation of list_reverse_int.
-spec-check:
-	@$(PYTHON) tools/hls-spec-check.py
+# The verifier itself is Halis (tools/hls-spec-check.hls, compiled
+# native by bin/hlc through the $(BIN)/hls-spec-check rule).
+spec-check: $(BIN)/hls-spec-check
+	@$(BIN)/hls-spec-check
 
 # stage32-acceptance: the official Stage 32 gate (bench + spec).
 stage32-acceptance: bench-stdlib spec-check

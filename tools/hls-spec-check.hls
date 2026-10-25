@@ -1,0 +1,548 @@
+# ============================================================================
+# hls-spec-check.hls — Stage 32 generic specialisation verifier (the
+# Halis twin of what was tools/hls-spec-check.py).
+# ----------------------------------------------------------------------------
+# ROADMAP Stage 32: "Generic specialisation is verified:
+# list_reverse_int produces the same assembly as a hand-written C
+# reverse."
+#
+# Halis has no `&`, `|`, `^`, `~`, `<<`, `>>` in its grammar and no
+# polymorphic recursion: every monomorphic instantiation of a generic
+# function compiles to its own C function. This tool verifies that the
+# monomorphic instantiation `list_reverse[int]` (emitted by hlc as
+# `usf_list_reverse_int`) compiles to the SAME assembly as a
+# hand-written C reverse loop, after both pass through gcc -O2.
+#
+# The verification:
+#   1. Generate a tiny Halis program that calls list_reverse_int on a
+#      4-element list.
+#   2. Compile via hlc + gcc -O2.
+#   3. Disassemble `usf_list_reverse_int` and a hand-written `c_reverse`
+#      via `objdump -d`.
+#   4. Normalise the assembly (strip comments, addresses, register
+#      names where they don't matter for the algorithm) and compare.
+#   5. PASS if the loop SHAPE matches (memory operand, increment,
+#      compare, branch) and no call to a generic helper remains.
+#
+# The scratch world lives under bin/.spec-check/ (wiped by make clean);
+# because it sits INSIDE the repo, the driver's `import "std.list"`
+# resolves through the walk-up, exactly the way the old script's
+# symlinked std/ made it resolve in its /tmp world.
+#
+# Usage:
+#   bin/hls-spec-check [--verbose]
+# ============================================================================
+
+import "std.str"
+import "std.regex"
+
+# ----------------------------------------------------------------------------
+# The programs.
+# ----------------------------------------------------------------------------
+
+fn driver_hls() -> str {
+    return "import \"std.list\"\n" +
+           "\n" +
+           "fn main() uses IO {\n" +
+           "    let xs: list[int] = [10, 20, 30, 40]\n" +
+           "    let out: list[int] = list_reverse_int(xs)\n" +
+           "    print(out.get(0).to_str() + \",\" + out.get(1).to_str() + \",\" + out.get(2).to_str() + \",\" + out.get(3).to_str())\n" +
+           "}\n"
+}
+
+fn reference_c() -> str {
+    return "// Hand-written reference: the optimal assembly for \"reverse a list\n" +
+           "// of int64_t\". A well-specialised list_reverse_int should produce\n" +
+           "// equivalent code.\n" +
+           "#include <stdint.h>\n" +
+           "#include <stdlib.h>\n" +
+           "#include <stdio.h>\n" +
+           "\n" +
+           "int64_t* c_reverse_int(int64_t* xs, int64_t n) {\n" +
+           "    int64_t* out = (int64_t*)malloc(sizeof(int64_t) * (size_t)n);\n" +
+           "    for (int64_t i = 0; i < n; i++) {\n" +
+           "        out[i] = xs[n - 1 - i];\n" +
+           "    }\n" +
+           "    return out;\n" +
+           "}\n" +
+           "\n" +
+           "int main() {\n" +
+           "    int64_t xs[4] = {10, 20, 30, 40};\n" +
+           "    int64_t* out = c_reverse_int(xs, 4);\n" +
+           "    printf(\"%lld,%lld,%lld,%lld\\n\",\n" +
+           "           (long long)out[0], (long long)out[1],\n" +
+           "           (long long)out[2], (long long)out[3]);\n" +
+           "    free(out);\n" +
+           "    return 0;\n" +
+           "}\n"
+}
+
+# ----------------------------------------------------------------------------
+# RunResult — the captured subprocess outcome (the batteries' shape).
+# ----------------------------------------------------------------------------
+
+struct RunResult {
+    code: int,
+    out: str,
+    err: str,
+    combined: str,
+    spawned: bool
+}
+
+fn run_capture(program: str, argv: list[str]) -> RunResult uses Proc {
+    let r: RunResult = RunResult {
+        code: -1, out: "", err: "", combined: "", spawned: false
+    }
+    let pid: int = proc_spawn(program, argv, 2, 1, 1)
+    if pid < 1 {
+        return r
+    }
+    r.spawned = true
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    r.code = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    r.out = out
+    r.err = err
+    r.combined = out + err
+    return r
+}
+
+# ----------------------------------------------------------------------------
+# Assembly normalisation — the old script's regex pipeline as byte
+# logic.
+# ----------------------------------------------------------------------------
+
+fn is_hex_byte(c: int) -> bool {
+    return (c >= 48 && c <= 57) || (c >= 97 && c <= 102)
+}
+
+# strip_addr(line) — objdump's "  ADDRESS:  [BYTES ]INSTR" prefix.
+# Returns "" when the line is a continuation (no address), the rest
+# otherwise.
+fn strip_addr(line: str) -> str {
+    let mut i: int = 0
+    while i < line.len() && (line.byte_at(i) == 32 || line.byte_at(i) == 9) {
+        i = i + 1
+    }
+    let start: int = i
+    while i < line.len() && is_hex_byte(line.byte_at(i)) {
+        i = i + 1
+    }
+    if i == start {
+        return ""
+    }
+    if i >= line.len() || line.byte_at(i) != 58 {
+        return ""
+    }
+    i = i + 1
+    # \s+ after the colon (the regex required at least one).
+    let ws: int = i
+    while i < line.len() && (line.byte_at(i) == 32 || line.byte_at(i) == 9) {
+        i = i + 1
+    }
+    if i == ws {
+        return ""
+    }
+    # Optional raw-byte pairs: ([0-9a-f]{2}\s+)*
+    let mut again: bool = true
+    while again {
+        again = false
+        if i + 2 < line.len() && is_hex_byte(line.byte_at(i))
+                && is_hex_byte(line.byte_at(i + 1)) {
+            let j: int = i + 2
+            if j < line.len() && (line.byte_at(j) == 32 || line.byte_at(j) == 9) {
+                i = j
+                while i < line.len() && (line.byte_at(i) == 32 || line.byte_at(i) == 9) {
+                    i = i + 1
+                }
+                again = true
+            }
+        }
+    }
+    return line.slice(i, line.len())
+}
+
+# replace_hex_addrs(line) — every "0x[0-9a-f]+" becomes "0xADDR".
+fn replace_hex_addrs(line: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < line.len() {
+        if line.byte_at(i) == 48 && i + 1 < line.len()
+                && line.byte_at(i + 1) == 120 {
+            # 0x
+            let mut j: int = i + 2
+            while j < line.len() && is_hex_byte(line.byte_at(j)) {
+                j = j + 1
+            }
+            if j > i + 2 {
+                out = out + "0xADDR"
+                i = j
+                continue
+            }
+        }
+        out = out + line.slice(i, i + 1)
+        i = i + 1
+    }
+    return out
+}
+
+# replace_fn_annotations(line) — every "<...>" becomes "<FN>".
+fn replace_fn_annotations(line: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < line.len() {
+        if line.byte_at(i) == 60 {
+            let close: int = find_from_pos(line, ">", i)
+            if close > i {
+                out = out + "<FN>"
+                i = close + 1
+                continue
+            }
+        }
+        out = out + line.slice(i, i + 1)
+        i = i + 1
+    }
+    return out
+}
+
+# find_from_pos(s, sub, from) — the first occurrence at or after from.
+fn find_from_pos(s: str, sub: str, from: int) -> int {
+    let mut i: int = from
+    while i + sub.len() <= s.len() {
+        if s.slice(i, i + sub.len()) == sub {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# fix_jump_target(line) — `jXX <hex> <FN>` becomes `jXX <FN>` (objdump
+# shows bare-hex jump destinations).
+fn fix_jump_target(line: str) -> str {
+    if !line.starts_with("j") {
+        return line
+    }
+    if !line.ends_with("<FN>") {
+        return line
+    }
+    # jword, whitespace, hex digits, whitespace, "<FN>"
+    let mut i: int = 1
+    while i < line.len() && is_ident_byte(line.byte_at(i)) {
+        i = i + 1
+    }
+    if i == 1 {
+        return line
+    }
+    let word: str = line.slice(0, i)
+    let mut j: int = i
+    while j < line.len() && (line.byte_at(j) == 32 || line.byte_at(j) == 9) {
+        j = j + 1
+    }
+    if j == i {
+        return line
+    }
+    let hex_start: int = j
+    while j < line.len() && is_hex_byte(line.byte_at(j)) {
+        j = j + 1
+    }
+    if j == hex_start {
+        return line
+    }
+    let mut k: int = j
+    while k < line.len() && (line.byte_at(k) == 32 || line.byte_at(k) == 9) {
+        k = k + 1
+    }
+    if line.slice(k, line.len()) == "<FN>" && k > j {
+        return word + " <FN>"
+    }
+    return line
+}
+
+# is_ident_byte(c) — [A-Za-z0-9_].
+fn is_ident_byte(c: int) -> bool {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+        || (c >= 48 && c <= 57) || c == 95
+}
+
+# normalize_asm(asm_text, func_name) — the function's body, normalised.
+fn normalize_asm(asm_text: str, func_name: str) -> str {
+    let lines: list[str] = asm_text.split("\n")
+    let mut out: str = ""
+    let mut in_func: bool = false
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i)
+        if !in_func {
+            if line.contains("<" + func_name + ">:") {
+                in_func = true
+            }
+            i = i + 1
+            continue
+        }
+        # End of function: the next label (column 0, ':' and '<' in it).
+        if line.len() > 0 && line.byte_at(0) != 32
+                && line.contains(":") && line.contains("<") {
+            break
+        }
+        # Strip the address prefix; "" marks a continuation line.
+        let stripped: str = strip_addr(line)
+        let mut instr: str = ""
+        if stripped != "" {
+            instr = stripped
+        } else {
+            let t: str = line.trim()
+            if t == "" {
+                i = i + 1
+                continue
+            }
+            if t.ends_with(":") {
+                # local label
+                i = i + 1
+                continue
+            }
+            instr = t
+        }
+        # Strip the trailing comment.
+        let hash: int = instr.find("#")
+        if hash >= 0 {
+            instr = instr.slice(0, hash).trim()
+        }
+        instr = replace_hex_addrs(instr)
+        instr = replace_fn_annotations(instr)
+        instr = fix_jump_target(instr)
+        if instr != "" {
+            out = out + instr + "\n"
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# raw_function_body(asm_text, func_name) — the RAW (unnormalised) body
+# between the function label and the next label.
+fn raw_function_body(asm_text: str, func_name: str) -> str {
+    let lines: list[str] = asm_text.split("\n")
+    let mut out: str = ""
+    let mut in_func: bool = false
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i)
+        if !in_func {
+            if line.contains("<" + func_name + ">:") {
+                in_func = true
+            }
+            i = i + 1
+            continue
+        }
+        if line.len() > 0 && line.byte_at(0) != 32
+                && line.contains(":") && line.contains("<") {
+            break
+        }
+        out = out + line + "\n"
+        i = i + 1
+    }
+    return out
+}
+
+# has_mem_operand(body) — a mov line with a memory operand in
+# parentheses or brackets (the old script's mov-regex, as a
+# line-equivalent byte check).
+# battery's r"mov\s+.*[(\[].*[)\]]", line-equivalent).
+fn has_mem_operand(body: str) -> bool {
+    let lines: list[str] = body.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let t: str = lines.get(i).trim()
+        if t.starts_with("mov ") || t.starts_with("mov\t") {
+            if t.contains("(") || t.contains("[") {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# has_pattern(asm, pattern) — a compiled-regex search.
+fn has_pattern(text: str, pattern: str) -> bool {
+    let rr: Result[Regex, str] = regex_compile(pattern)
+    if result_is_err(rr) {
+        return false
+    }
+    return regex_is_match(result_unwrap(rr), text)
+}
+
+# loop_shape_ok(text) — the four shapes both binaries' inner loops must
+# carry: a memory operand, an index/pointer increment, a compare, and
+# a conditional branch.
+fn loop_shape_ok(text: str) -> bool {
+    if !has_mem_operand(text) {
+        return false
+    }
+    if !has_pattern(text, "(add\\s+\\$0xADDR,\\s*%|inc\\s+%)") {
+        return false
+    }
+    if !has_pattern(text, "cmp\\s+") {
+        return false
+    }
+    if !has_pattern(text, "j\\w+\\s+") {
+        return false
+    }
+    return true
+}
+
+# ----------------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let argv: list[str] = args()
+    let mut verbose: bool = false
+    let mut i: int = 1
+    while i < argv.len() {
+        if argv.get(i) == "--verbose" {
+            verbose = true
+        }
+        i = i + 1
+    }
+
+    # The scratch world (inside the repo so std.list resolves).
+    proc_exec("rm -rf bin/.spec-check")
+    proc_exec("mkdir -p bin/.spec-check")
+
+    # Bootstrap when needed: a missing (or stale) compiler is built
+    # through `make bootstrap`; staleness is `test bin/hlc -nt src/hlc.hls`.
+    if !file_exists("bin/hlc") || proc_exec("test bin/hlc -nt src/hlc.hls") != 0 {
+        println("[spec-check] bootstrapping native hlc...")
+        let mb: RunResult = run_capture("make", ["bootstrap"])
+        if mb.code != 0 || !file_exists("bin/hlc") {
+            print(mb.combined)
+            println("[spec-check] FAIL: cannot bootstrap native hlc")
+            return 2
+        }
+    }
+
+    # 1. Generate + compile the Halis driver.
+    write_file("bin/.spec-check/driver.hls", driver_hls())
+    let comp: RunResult = run_capture("bin/hlc",
+        ["bin/.spec-check/driver.hls", "bin/.spec-check/driver.c"])
+    if comp.code != 0 {
+        println("[spec-check] FAIL: hlc compile failed: "
+            + clip(comp.combined, 200))
+        return 2
+    }
+    let gcc1: RunResult = run_capture("gcc", ["-O2", "-o",
+        "bin/.spec-check/driver.bin", "bin/.spec-check/driver.c",
+        "-lm", "-pthread"])
+    if gcc1.code != 0 {
+        println("[spec-check] FAIL: gcc compile failed: "
+            + clip(gcc1.combined, 200))
+        return 2
+    }
+
+    # Run the driver to verify correctness first.
+    let runr: RunResult = run_capture("bin/.spec-check/driver.bin", [])
+    if runr.code != 0 || runr.out.trim() != "40,30,20,10" {
+        println("[spec-check] FAIL: driver output wrong: " + runr.out.trim())
+        return 2
+    }
+
+    # 2. Compile the reference C.
+    write_file("bin/.spec-check/ref.c", reference_c())
+    let gcc2: RunResult = run_capture("gcc", ["-O2", "-o",
+        "bin/.spec-check/ref.bin", "bin/.spec-check/ref.c"])
+    if gcc2.code != 0 {
+        println("[spec-check] FAIL: ref gcc failed: " + clip(gcc2.combined, 200))
+        return 2
+    }
+
+    # 3. Disassemble both, normalise, compare the SHAPE.
+    let d1: RunResult = run_capture("objdump", ["-d", "bin/.spec-check/driver.bin"])
+    let d2: RunResult = run_capture("objdump", ["-d", "bin/.spec-check/ref.bin"])
+    if d1.code != 0 || d2.code != 0 {
+        println("[spec-check] FAIL: objdump failed")
+        return 2
+    }
+    let hls_asm: str = normalize_asm(d1.out, "usf_list_reverse_int")
+    let ref_asm: str = normalize_asm(d2.out, "c_reverse_int")
+
+    if hls_asm == "" {
+        println("[spec-check] FAIL: usf_list_reverse_int not found in hlc "
+            + "binary (function was inlined or renamed?)")
+        return 2
+    }
+    if ref_asm == "" {
+        println("[spec-check] FAIL: c_reverse_int not found in reference")
+        return 2
+    }
+
+    if verbose {
+        println("=== hlc usf_list_reverse_int (normalised) ===")
+        print(hls_asm)
+        println("=== reference c_reverse_int (normalised) ===")
+        print(ref_asm)
+    }
+
+    # The hlc version MUST NOT call a generic list_reverse helper
+    # within the body of usf_list_reverse_int (checked against the RAW
+    # output, before normalisation strips the call-target names).
+    let body_text: str = raw_function_body(d1.out, "usf_list_reverse_int")
+    let calls_generic: bool = has_pattern(body_text,
+        "call\\s+.*<[^>]*list_reverse[^>]*>")
+
+    let hls_shape_ok: bool = loop_shape_ok(hls_asm)
+    let ref_shape_ok: bool = loop_shape_ok(ref_asm)
+
+    println("[spec-check] usf_list_reverse_int found in hlc binary: OK")
+    if hls_shape_ok {
+        println("             hlc loop shape matches reference: OK")
+    } else {
+        println("             hlc loop shape matches reference: FAIL")
+    }
+    if ref_shape_ok {
+        println("             reference c_reverse_int shape valid: OK")
+    } else {
+        println("             reference c_reverse_int shape valid: FAIL")
+    }
+    if !calls_generic {
+        println("             hlc has NO call to generic list_reverse: OK")
+    } else {
+        println("             hlc has NO call to generic list_reverse: FAIL")
+    }
+
+    if hls_shape_ok && ref_shape_ok && !calls_generic {
+        println("")
+        println("[spec-check] PASS: list_reverse_int is properly specialised — "
+            + "the inner loop has the same shape as the hand-written C "
+            + "reference, and no call to a generic helper remains.")
+        return 0
+    }
+    println("")
+    println("[spec-check] FAIL: list_reverse_int is NOT properly specialised.")
+    if !verbose {
+        println("Run with --verbose to see the disassembly.")
+    }
+    return 1
+}
+
+# clip(text, n) — first n bytes with a trailing marker when cut.
+fn clip(text: str, n: int) -> str {
+    let t: str = text.trim()
+    if t.len() <= n {
+        return t
+    }
+    return t.slice(0, n) + "..."
+}
