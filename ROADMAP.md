@@ -219,7 +219,7 @@ remains green.
 | 141 | API freeze — syntax + stdlib locked | ✅ | (done in v0.159.0-alpha) |
 | 142 | Pure-HLS bootstrap (remove `boot/` Python seed) | ✅ | (ignition moved in v0.161.0-alpha; the seed left the tree in v0.164.0-alpha) |
 | 143 | Bit-for-bit reproducible bootstrap chain | ✅ | (kit shipped in v0.162.0-alpha; the chain itself in v0.163.0-alpha) |
-| 144 | Independent third-party security audit (final) | ⬜ | 6 weeks |
+| 144 | Independent third-party security audit (final) | ✅ | (done in v0.165.0-alpha) |
 | 145 | LTS policy published (3 years bug-fix, 5 years security) | ⬜ | 2 weeks |
 | 146 | v1.0 Release Candidate 1 (feature freeze) | ⬜ | 4 weeks |
 | 147 | v1.0 Release Candidate 2 (bug-fix only) | ⬜ | 4 weeks |

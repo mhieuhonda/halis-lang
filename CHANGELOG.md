@@ -13,6 +13,127 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v0.165.0-alpha] — Stage 144: the FINAL independent third-party security audit
+- Phase X's first audit line. Stage 140 built the engagement kit —
+  the machinery any audit runs on — and this stage supplies the
+  word in its roadmap's parentheses. FINAL is a property of the
+  artifact, not of the paperwork: an audit is final when it was
+  run against the thing that will ship, when its closure is
+  demonstrated rather than declared, and when nothing can be
+  released while it is open. The new `tools/hls-finalaudit.py`
+  turns that word into nine commands and one ledger
+  (`.hlfa/final.jsonl`, machine-local like every ledger in this
+  tree): `engage`, `brief`, `evidence`, `file`, `triage`,
+  `signoff`, `gate`, `report`, `status`.
+- **The pinned-artifact law.** A Stage 140 engagement scoped ONE
+  digest and honestly recorded the drift when the scope moved
+  under the auditors. The final audit is narrower on purpose: it
+  audits the FROZEN ARTIFACT, and the signature pins THREE anchors
+  at once — the Stage 135 guarantee scope (imported live, never
+  copied), the Stage 141 API freeze (the committed document's
+  surface digest plus the head of its amendment chain, the chain
+  verified with the family's arithmetic before it can be pinned),
+  and the Stage 142/143 bootstrap snapshot (the manifest's closure
+  and snapshot digests, the bytes every release build starts
+  from). Every evidence pass re-derives all three live and
+  records what it ran; the signoff refuses to close on any anchor
+  that moved since the engagement — a moved surface is a NEW
+  ENGAGEMENT, not an amendment — and the gate enforces the same
+  law after the seal. A tree that carries no freeze, no manifest
+  or no guarantee ledger cannot even be engaged: the final audit
+  audits the frozen artifact, and such a tree has nothing final
+  to audit.
+- **Closure requires independence.** Stage 140's state machine
+  reached "remediated" on self-assessed evidence alone — honest
+  (the labels never lied) but not final. The signoff refuses
+  unless at least one INDEPENDENT pass is on record and the
+  LATEST pass of any label ran green: an audit that closes on
+  the project's own evidence is a rubber stamp with a paper
+  trail.
+- **The fix-landing law.** Stage 140 required the remediation
+  commit to EXIST; the final audit requires it to have LANDED:
+  an ancestor of the tree's HEAD at triage time, again at
+  signoff time, and again at the gate — a fix that is not in the
+  tree being released is a promise, not a fix. And it must
+  POSTDATE the finding it fixes: a commit whose committer
+  timestamp precedes the finding entry's is a contradiction,
+  refused with both timestamps named. The landing law needs a
+  real git history to read, so the signoff refuses a non-git
+  tree outright — and because `git rev-parse` walks UP the
+  directory tree, the kit's git helpers demand the repository
+  the tree OWNS: a tarball unpacked inside somebody else's repo
+  would otherwise answer landing questions about the wrong
+  history, silently.
+- **The seal.** `signoff` is the project's closing act (an
+  auditor cannot sign off — the auditors' deliverable is the
+  findings, not the closure). It writes ONE entry carrying the
+  tree, the three anchors re-derived live at seal time and the
+  closure census — and it SEALS the ledger: after the seal every
+  writer refuses, by name, because what comes after the seal is
+  the next audit, not an amendment. Readers still read; the
+  chain still verifies; the record is closed. The state machine
+  grows a seventh word — vacant -> open -> underway -> reported
+  -> responded -> remediated -> **sealed** — derived from the
+  census on every render, never stored.
+- **The gate.** `gate` is what the release process runs before
+  cutting a candidate: exit 0 only when the ledger is sealed, the
+  sealed tree is an ANCESTOR of the current HEAD (the candidate
+  is cut from the audited tree or its descendants — never
+  AROUND the audit), the three anchors still match what the seal
+  pinned, and every fix still lands. Anything else exits 1 with
+  the named refusal — a missing ledger says its own law: "a
+  release candidate is not cut from an unaudited tree." RC1 is
+  not a date on a calendar; it is what this gate says yes to.
+- **The findings protocol, the triage, the chain, the renders**
+  are Stage 140's, unchanged: findings are the auditors' to file
+  (against a live scope row, a closed five-word severity, exactly
+  one reproducer), the triage is the project's to give (one
+  verdict, a written reason, the strict verdict/fix pairing), the
+  ledger speaks the family's ONE arithmetic, every reader
+  verifies the whole chain first and names the broken line, and
+  the brief and report are deterministic per input — two renders
+  byte-identical, a hand-edited document visible as a diff.
+- **The acceptance gate.** `make finalaudit-acceptance` — nine
+  sections, 125 checks, over the real CLI, the real anchors, the
+  real checker and the real git surface: the convention (readers
+  on a missing ledger named; the gate's missing-ledger refusal
+  quoting its own law), the engagement law (the chain re-derived
+  by the gate itself through the family's imported arithmetic;
+  the THREE anchor digests re-derived by the gate's own
+  arithmetic over the committed files; the window, self-signature,
+  monologue and second-engagement refusals; the tree without a
+  freeze or manifest that cannot be engaged), the brief law (the
+  three anchors quoted live, deterministic renders, --stamp moving
+  only the Generated line, the anchored channel), the evidence
+  law (INDEPENDENT vs SELF-ASSESSED, the counts equal to the
+  guarantee engine's, the FAILED pass recorded with its
+  refusals while the chain stays green, the drifted anchor
+  recorded as a fact), the finding law (off-roster filings, the
+  closed vocabulary, the reproducer laws), the triage law (the
+  wish, the shape, the commit that names nothing, the commit
+  that never landed, the commit that predates its finding, the
+  one-response law, the auditor's refusal), the signoff law (the
+  solo ledger's rubber stamp, the untriaged finding, the fix
+  that no longer lands, the moved freeze, the unreadable
+  history; the happy seal pinned and then survived by four
+  writers' refusals while the readers still read), the gate law
+  (red on every unsealed state naming the state; green sealed;
+  green from a descendant; red around the audit; each anchor's
+  post-seal mutation named) — and the corpus showcase,
+  `tests/ok/feat_stage144_finalaudit.hls`, which pins the
+  decision procedure in pure HLS (the anchor law, the
+  independence-for-closure law, the landing law, the seven
+  states, the seal, the gate, the count law — 9 commands, 3
+  anchors, 5 entry kinds — and the honesty law),
+  hlfmt-canonical, hllint-clean, byte-identical on the
+  interpreter and natively.
+- **The record:** ROADMAP Stage 144 ticks; SPEC §82 walks the
+  laws; the README tour grows the block; the VS Code extension
+  manifest moves to 0.165.0-alpha. The freeze, the snapshot and
+  the guarantee ledger did not move — the new tool is a leaf
+  outside every frozen surface, and `make freeze-verify` /
+  `make snapshot-verify` say so on this very tree.
+
 ## [v0.164.0-alpha] — Stage 142, finished: the Python seed leaves the tree
 - Stage 142's roadmap line was always "Pure-HLS bootstrap (remove
   `boot/` Python seed)". v0.161.0-alpha moved the ignition — the

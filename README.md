@@ -649,6 +649,73 @@ make freeze-acceptance        # Stage 141 gate: the freeze battery
                                # the addition law, the amend law,
                                # the report law, the showcase)
 
+python3 tools/hls-finalaudit.py engage \
+       --firm "..." --auditor "A" --auditor "B" \
+       --window "2026-11-02/2026-12-24" --basis "..." \
+       --by mhieuhonda
+                               # Stage 144: the FINAL audit — the
+                               # engagement the v1.0 release
+                               # candidates wait on. The signature
+                               # pins the FROZEN ARTIFACT whole:
+                               # THREE anchors at once (the Stage
+                               # 135 guarantee scope, the Stage 141
+                               # freeze with its amendment-chain
+                               # head, the Stage 142/143 snapshot
+                               # manifest) — a tree that carries
+                               # none of them cannot even be engaged
+python3 tools/hls-finalaudit.py brief --out FINALBRIEF.md
+                               # the RFP: the three anchors quoted
+                               # live, the scope census, the closure
+                               # criteria, the commercial terms.
+                               # OPEN SOLICITATION before any ledger
+                               # exists — solicitation precedes
+                               # contract
+python3 tools/hls-finalaudit.py evidence --by "Dana Fischer"
+                               # the pass: re-runs the whole scope
+                               # through the real checker AND
+                               # re-derives the three anchors live —
+                               # the label follows the roster
+                               # (INDEPENDENT vs SELF-ASSESSED),
+                               # and an anchor that moved since the
+                               # signature is a fact the entry
+                               # records, never a silence
+python3 tools/hls-finalaudit.py signoff --by mhieuhonda
+                               # the closure: refuses without an
+                               # INDEPENDENT pass on record and a
+                               # green latest pass (an audit that
+                               # closes on the project's own
+                               # evidence is a rubber stamp with a
+                               # paper trail), without every fix
+                               # LANDED (an ancestor of HEAD, and
+                               # not older than the finding it
+                               # fixes), and on any anchor that moved
+                               # — a moved surface is a new
+                               # engagement, not an amendment. When
+                               # every law holds it writes the SEAL
+                               # and closes the ledger: nothing
+                               # appends after it
+make finalaudit-gate
+                               # what the release process runs
+                               # before cutting a candidate: green
+                               # only when the audit is sealed, the
+                               # sealed tree is an ANCESTOR of the
+                               # current HEAD (the release is cut
+                               # from the audited tree or its
+                               # descendants, never around the
+                               # audit), the three anchors still
+                               # hold and the fixes still land —
+                               # anything else exits 1 with the
+                               # named refusal. RC1 is not a date on
+                               # a calendar; it is what this gate
+                               # says yes to
+make finalaudit-acceptance    # Stage 144 gate: the final-audit
+                               # battery (the convention, the
+                               # engagement law, the brief law, the
+                               # evidence law, the finding law, the
+                               # triage law — the landing law — the
+                               # signoff law, the gate law, the
+                               # showcase)
+
 # 13. Stage 15-alpha: Safe C FFI (v0.13.0-alpha)
 python3 tools/hlinterp/boot.py examples/ffi_demo.hls           # call libc functions
 python3 tools/hlbindgen.py /usr/include/stdlib.h      # generate extern block from C header
