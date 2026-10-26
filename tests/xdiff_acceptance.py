@@ -385,7 +385,7 @@ print("=== 8. the corpus showcase — the fixture, then the full core ===")
 
 OK_F = os.path.join(REPO, "tests", "ok", "feat_stage133_xdiff.hls")
 
-p = subprocess.run([sys.executable, os.path.join(REPO, "tools", "hlfmt.py"),
+p = subprocess.run([os.path.join(REPO, "bin", "hlfmt"),
                     "--check", OK_F], capture_output=True, cwd=REPO)
 check(p.returncode == 0, "the fixture is hlfmt-canonical")
 p = subprocess.run([sys.executable, os.path.join(REPO, "tools", "hllint.py"),

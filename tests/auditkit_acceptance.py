@@ -93,7 +93,7 @@ from hltlog_parts.hltlog_common import GENESIS, chain_of  # noqa: E402
 KIT = [sys.executable, "tools/hls-auditkit.py"]
 GUAR = [sys.executable, "tools/hls-guarantee.py"]
 BOOT = [sys.executable, "tools/hlinterp/boot.py"]
-FMT = [sys.executable, "tools/hlfmt.py"]
+FMT = [os.path.join(ROOT, "bin", "hlfmt")]
 LINT = [sys.executable, "tools/hllint.py"]
 HLC = os.path.join(ROOT, "bin", "hlc")
 CC = os.environ.get("CC", "gcc")

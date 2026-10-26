@@ -446,9 +446,9 @@ for f in (DEMO, OK_TEST, "examples/audit_libs/geo.hls",
     p2f = os.path.join(TMP, "fmt2.hls")
     with open(p1f, "w") as fh:
         fh.write(original)
-    run([sys.executable, "tools/hlfmt.py", "-w", p1f])
+    run([os.path.join(ROOT, "bin", "hlfmt"), "-w", p1f])
     shutil.copyfile(p1f, p2f)
-    run([sys.executable, "tools/hlfmt.py", "-w", p2f])
+    run([os.path.join(ROOT, "bin", "hlfmt"), "-w", p2f])
     with open(p1f) as fh:
         once = fh.read()
     with open(p2f) as fh:

@@ -556,7 +556,7 @@ p = subprocess.run(BOOT + ["--check", FIXTURE], capture_output=True,
 check(p.returncode == 0 and "OK: types and effects valid" in p.stdout,
       "boot --check is green on the fixture")
 
-p = subprocess.run([sys.executable, "tools/hlfmt.py", "-c", FIXTURE],
+p = subprocess.run([os.path.join(ROOT, "bin", "hlfmt"), "-c", FIXTURE],
                    capture_output=True, text=True, cwd=ROOT, timeout=60)
 check("already formatted" in p.stdout, "the fixture is an hlfmt fixed point")
 

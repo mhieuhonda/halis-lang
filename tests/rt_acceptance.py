@@ -628,7 +628,7 @@ if NATIVE:
 
 for path in (FIXTURE, PANIC_FIXTURE, STEADY, OVER_ALLOCS, OVER_BYTES,
              DEADLINE, WARMUP, NO_CYCLES, LATE_WORK):
-    p = run([sys.executable, "tools/hlfmt.py", "-c", path])
+    p = run([os.path.join(ROOT, "bin", "hlfmt"), "-c", path])
     check("already formatted" in p.stdout,
           "%s is hlfmt-canonical" % os.path.basename(path))
 p = run([sys.executable, "tools/hllint.py", FIXTURE])

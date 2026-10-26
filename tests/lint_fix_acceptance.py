@@ -78,7 +78,7 @@ TMP = tempfile.mkdtemp(prefix="_gate_s118_", dir=os.path.join(ROOT, "tests"))
 
 HLC = os.path.join(ROOT, "bin", "hlc")
 HLLINT = [sys.executable, "tools/hllint.py"]
-HLFMT = [sys.executable, "tools/hlfmt.py"]
+HLFMT = [os.path.join(ROOT, "bin", "hlfmt")]
 BOOT = [sys.executable, "tools/hlinterp/boot.py"]
 
 

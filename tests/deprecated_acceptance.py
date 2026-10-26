@@ -76,7 +76,7 @@ BOOT = [sys.executable, "tools/hlinterp/boot.py"]
 HLC = os.path.join(ROOT, "bin", "hlc")
 CC = os.environ.get("CC", "gcc")
 LINT = [sys.executable, "tools/hllint.py"]
-FMT = [sys.executable, "tools/hlfmt.py"]
+FMT = [os.path.join(ROOT, "bin", "hlfmt")]
 NATIVE = os.path.isfile(HLC) and shutil.which(CC) is not None
 
 SHOWCASE = os.path.join(ROOT, "tests", "ok", "feat_stage130_deprecated.hls")

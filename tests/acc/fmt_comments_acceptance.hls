@@ -1,0 +1,545 @@
+# ============================================================================
+# tests/acc/fmt_comments_acceptance.hls — Stage 116 acceptance gate, in
+# Halis (the twin of what was tests/fmt_comments_acceptance.py; same
+# eight sections, same assertions). The formatter under test is the
+# native bin/hlfmt (tools/hlfmt.hls, compiled by bin/hlc) — the gate
+# drives it through the front door, the CLI, and carries its OWN copy
+# of the comment-scanner law (attribute-aware, string-aware) so the
+# preservation checks compare the tool's output against an independent
+# statement of the law, not against the tool's own internals.
+# ----------------------------------------------------------------------------
+# Run with `make fmt-comments-acceptance` (which compiles this file to
+# bin/acc-fmt-comments and runs it from the repo root).
+#
+#  1. the sigils       — #[...] / #![...] are attributes, not comments;
+#                        a comment after an attribute survives; # inside
+#                        strings never starts one
+#  2. the duplication  — an attribute line that also carries tokens
+#                        formats exactly once (three passes converge)
+#  3. the positions    — all seventeen seats a comment can take survive
+#  4. the re-indent    — stale comment indents adopt the block indent
+#  5. the preservation — comment text is byte-exact, sets preserved
+#  6. the one-liners   — a trailing comment attaches exactly once
+#  7. the differential — the stage corpus file: interpreter == native
+#                        before and after a pass (the oracle leg)
+#  8. the corpus       — every examples/ + ok/ + fail/ file formats
+#                        idempotently and keeps its comment set
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+
+# ----------------------------------------------------------------------------
+# The gate's own scanner — the law the Python battery imported from the
+# tool, restated independently (a shared bug could never satisfy both).
+# ----------------------------------------------------------------------------
+
+# scan_comment(line) -> (kind, body): kind 0 none, 1 comment-only,
+# 2 trailing. String-aware; `#[` / `#![` skip their whole bracket group.
+fn scan_comment(line: str) -> list[str] {
+    let out: list[str] = ["0", ""]
+    let mut in_str: bool = false
+    let mut j: int = 0
+    let n: int = line.len()
+    while j < n {
+        let c: int = line.byte_at(j)
+        if in_str {
+            if c == 92 && j + 1 < n {
+                j = j + 2
+                continue
+            }
+            if c == 34 {
+                in_str = false
+            }
+            j = j + 1
+            continue
+        }
+        if c == 34 {
+            in_str = true
+            j = j + 1
+            continue
+        }
+        if c == 35 {
+            if j + 1 < n && line.byte_at(j + 1) == 91 {
+                j = skip_attr_group(line, j)
+                continue
+            }
+            if j + 2 < n && line.byte_at(j + 1) == 33
+            && line.byte_at(j + 2) == 91 {
+                j = skip_attr_group(line, j)
+                continue
+            }
+            if line.slice(0, j).trim() == "" {
+                out.set(0, "1")
+                out.set(1, line.slice(j, line.len()).trim())
+            } else {
+                out.set(0, "2")
+                out.set(1, rstrip_ws(line.slice(j, line.len())))
+            }
+            return out
+        }
+        j = j + 1
+    }
+    return out
+}
+
+fn rstrip_ws(s: str) -> str {
+    let mut n: int = s.len()
+    while n > 0 {
+        let c: int = s.byte_at(n - 1)
+        if c == 32 || c == 9 || c == 10 || c == 13 || c == 12 || c == 11 {
+            n = n - 1
+        } else {
+            break
+        }
+    }
+    return s.slice(0, n)
+}
+
+fn skip_attr_group(line: str, j: int) -> int {
+    let mut depth: int = 0
+    let mut in_str: bool = false
+    let n: int = line.len()
+    let mut k: int = j
+    while k < n {
+        let c: int = line.byte_at(k)
+        if in_str {
+            if c == 92 && k + 1 < n {
+                k = k + 2
+                continue
+            }
+            if c == 34 {
+                in_str = false
+            }
+            k = k + 1
+            continue
+        }
+        if c == 34 {
+            in_str = true
+        } else if c == 91 {
+            depth = depth + 1
+        } else if c == 93 {
+            depth = depth - 1
+            if depth <= 0 {
+                return k + 1
+            }
+        }
+        k = k + 1
+    }
+    return n
+}
+
+# comment_bodies(src) — the sorted list of comment texts (kind-agnostic,
+# whitespace-normalised) the scanner law finds.
+fn comment_bodies(src: str) -> list[str] {
+    let lines: list[str] = src.split("\n")
+    let bodies: list[str] = []
+    let mut i: int = 0
+    while i < lines.len() {
+        let r: list[str] = scan_comment(lines.get(i))
+        if r.get(0) != "0" && r.get(1).trim() != "" {
+            bodies.push(r.get(1).trim())
+        }
+        i = i + 1
+    }
+    return sort_strs(bodies)
+}
+
+fn sort_strs(xs: list[str]) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < xs.len() {
+        out.push(xs.get(i))
+        i = i + 1
+    }
+    let mut a: int = 1
+    while a < out.len() {
+        let v: str = out.get(a)
+        let mut b: int = a
+        while b > 0 && out.get(b - 1) > v {
+            out.set(b, out.get(b - 1))
+            b = b - 1
+        }
+        out.set(b, v)
+        a = a + 1
+    }
+    return out
+}
+
+# bodies_equal(a, b) — same length, same texts in order.
+fn bodies_equal(a: list[str], b: list[str]) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    let mut i: int = 0
+    while i < a.len() {
+        if a.get(i) != b.get(i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# fmt_once(acc, name, src) — one formatting pass through bin/hlfmt.
+fn fmt_once(acc: Acc, name: str, src: str) -> str uses Fs, Proc {
+    let p: str = write_src(acc, name, src)
+    let r: RunResult = run_capture("./bin/hlfmt", [p])
+    return r.out
+}
+
+# passes(acc, name, src) — format, then format the output again; a pass
+# must be a fixed point of itself. Returns (out1, idem).
+fn passes(acc: Acc, name: str, src: str) -> list[str] uses Fs, Proc {
+    let out1: str = fmt_once(acc, name, src)
+    let out2: str = fmt_once(acc, name + ".p2", out1)
+    let r: list[str] = [out1]
+    if out2 == out1 {
+        r.push("1")
+    } else {
+        r.push("0")
+    }
+    return r
+}
+
+# expect_bodies(acc, name, src, expect...) — the scanner law case.
+fn expect_bodies(acc: Acc, name: str, src: str, expect: list[str])
+-> void uses IO, Fs, Proc {
+    let got: list[str] = comment_bodies(src)
+    check(acc, name, bodies_equal(got, sort_strs(expect)),
+    "scanned " + count_of(got))
+}
+
+fn count_of(xs: list[str]) -> str {
+    let n: int = xs.len()
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < n {
+        if i > 0 {
+            out = out + ", "
+        }
+        out = out + xs.get(i)
+        i = i + 1
+    }
+    return "[" + out + "]"
+}
+
+# ----------------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let acc: Acc = acc_new("fmt-comments")
+    let corpus: str = "tests/ok/feat_stage116_fmt_comments.hls"
+
+    section("1. the sigils: attributes are not comments")
+    expect_bodies(acc, "bare attribute line carries no comment entry",
+    "#[cold]\nfn f() -> int {\n    return 1\n}\n", [])
+    expect_bodies(acc, "crate attribute carries no comment entry",
+    "#![no_std]\nfn f() -> int {\n    return 1\n}\n", [])
+    expect_bodies(acc, "comment after an attribute survives",
+    "#[cold] # legacy path\nfn f() -> int {\n    return 1\n}\n",
+    ["# legacy path"])
+    expect_bodies(acc, "hash inside an attribute string is not a comment",
+    "#[doc(\"# not a comment\")]\nfn f() -> int {\n    return 1\n}\n", [])
+    expect_bodies(acc, "#! without [ stays a comment",
+    "#! run with the hls driver\nfn f() -> int {\n    return 1\n}\n",
+    ["#! run with the hls driver"])
+    expect_bodies(acc, "hash inside a string literal is not a comment",
+    "fn f() -> int {\n    let s: str = \"# not a comment\"\n    return 1\n}\n",
+    [])
+    expect_bodies(acc, "attribute stack keeps only the real banner",
+    "# banner\n#[inline(always)]\n#[cold]\nfn f() -> int {\n    return 1\n}\n",
+    ["# banner"])
+    expect_bodies(acc, "nested brackets inside an attribute do not leak",
+    "#[a([b])]\nfn f() -> int {\n    return 1\n}\n", [])
+    let r1: list[str] = passes(acc, "s1_attr_note.hls",
+    "#[cold] # why\nfn f() -> int {\n    return 1\n}\n")
+    check(acc, "attribute + trailing comment formats idempotently with the note kept",
+    r1.get(0).contains("# why") && r1.get(1) == "1", clip(r1.get(0), 60))
+
+    section("2. the duplication law: attribute lines format once")
+    let dup_src: str = "fn outer() -> int {\n"
+    + "    #[cold] fn inner() -> int {\n"
+    + "        return 1\n"
+    + "    }\n"
+    + "    return 0\n"
+    + "}\n"
+    let r2: list[str] = passes(acc, "s2_dup.hls", dup_src)
+    check(acc, "attribute-carrying nested fn appears exactly once",
+    grep_count(r2.get(0), "fn inner") == 1,
+    count_int(grep_count(r2.get(0), "fn inner")))
+    check(acc, "the attribute sigil itself survives exactly once",
+    r2.get(0).contains("#[cold]") && grep_count(r2.get(0), "#[cold]") == 1,
+    clip(r2.get(0), 60))
+    let once: str = fmt_once(acc, "s2_pass1.hls", dup_src)
+    let twice: str = fmt_once(acc, "s2_pass2.hls", once)
+    let thrice: str = fmt_once(acc, "s2_pass3.hls", twice)
+    check(acc, "three passes converge (no per-pass growth)",
+    thrice == r2.get(0) && twice == r2.get(0), "")
+
+    section("3. the positions: every seat a comment can take")
+    let pos_src: str = "# 01 file banner\n"
+    + "# 02 second banner line\n"
+    + "fn add(a: int, b: int) -> int {\n"
+    + "    # 03 interior at block top\n"
+    + "    return a + b  # 04 trailing on a statement\n"
+    + "}\n"
+    + "\n"
+    + "# 05 above a declaration\n"
+    + "fn wrapped() -> int {\n"
+    + "    let v: int = add(1,\n"
+    + "        # 06 inside a call\n"
+    + "        2)\n"
+    + "    let w: int = 1 +\n"
+    + "        # 07 mid-expression\n"
+    + "        v\n"
+    + "    return w  # 08 trailing before close\n"
+    + "}\n"
+    + "\n"
+    + "struct Box {\n"
+    + "    # 09 struct body\n"
+    + "    label: str,\n"
+    + "    size: int\n"
+    + "}\n"
+    + "\n"
+    + "fn rank(l: Level) -> int {\n"
+    + "    return match l {\n"
+    + "        # 10 match arm\n"
+    + "        Level.Low => 1,\n"
+    + "        # 11 second arm\n"
+    + "        Level.High => 2\n"
+    + "    }\n"
+    + "}\n"
+    + "\n"
+    + "enum Level {\n"
+    + "    Low,\n"
+    + "    High\n"
+    + "}\n"
+    + "\n"
+    + "fn main() -> int uses IO {\n"
+    + "    let b: Box = Box {\n"
+    + "        # 12 struct literal\n"
+    + "        label: \"x\",\n"
+    + "        size: 3\n"
+    + "    }\n"
+    + "    if b.size == 3 {\n"
+    + "        println(b.label)  # 13 trailing in if\n"
+    + "    }  # 14 on a closing brace\n"
+    + "    if b.size != 3 {\n"
+    + "        println(\"no\")\n"
+    + "    } else {\n"
+    + "        # 15 inside else\n"
+    + "        println(\"yes\")\n"
+    + "    }\n"
+    + "    # 16 before the final brace\n"
+    + "    return 0\n"
+    + "}\n"
+    + "# 17 EOF note\n"
+    let r3: list[str] = passes(acc, "s3_positions.hls", pos_src)
+    let mut missing: int = 0
+    let mut i: int = 1
+    while i <= 17 {
+        let needle: str = pad2(i)
+        if !r3.get(0).contains(needle) {
+            missing = missing + 1
+        }
+        i = i + 1
+    }
+    check(acc, "all 17 comment positions present after a pass",
+    missing == 0, count_int(missing))
+    check(acc, "the 17-position fixture is idempotent", r3.get(1) == "1", "")
+    let i1: int = r3.get(0).find("# 01")
+    let i5: int = r3.get(0).find("# 05")
+    let i9: int = r3.get(0).find("# 09")
+    let i17: int = r3.get(0).find("# 17")
+    check(acc, "comments keep their relative order",
+    i1 >= 0 && i1 <= i5 && i5 <= i9 && i9 <= i17,
+    count_int(i1) + " < " + count_int(i5) + " < " + count_int(i9)
+    + " < " + count_int(i17))
+    check(acc, "trailing comment stays glued to its statement",
+    r3.get(0).contains("return a + b # 04 trailing on a statement"),
+    "")
+
+    section("4. the re-indent law: stale indents do not survive")
+    let stale_src: str = "fn f() -> int {\n"
+    + "    if true {\n"
+    + "        if true {\n"
+    + "    # badly indented\n"
+    + "            return 1\n"
+    + "        }\n"
+    + "    }\n"
+    + "        # stale before close\n"
+    + "    return 0\n"
+    + "}\n"
+    + "      # stale top-level\n"
+    let r4: list[str] = passes(acc, "s4_stale.hls", stale_src)
+    check(acc, "deep comment adopts the block indent",
+    ("\n" + r4.get(0) + "\n").contains("\n            # badly indented\n"),
+    clip(r4.get(0), 60))
+    let mut top_ok: bool = false
+    let lns4: list[str] = r4.get(0).split("\n")
+    let mut li: int = 0
+    while li < lns4.len() {
+        if lns4.get(li).contains("stale top-level") {
+            top_ok = lns4.get(li) == "# stale top-level"
+        }
+        li = li + 1
+    }
+    check(acc, "top-level comment lands at column 0", top_ok, "")
+    check(acc, "re-indented fixture is idempotent", r4.get(1) == "1", "")
+    let stale_path: str = write_src(acc, "s4_stale_check.hls", stale_src)
+    let chk1: RunResult = run_capture("./bin/hlfmt", ["-c", stale_path])
+    check(acc, "hlfmt -c flags the stale-indented file", chk1.code != 0,
+    first_line(chk1.out))
+    let w1: RunResult = run_capture("./bin/hlfmt", ["-w", stale_path])
+    let chk2: RunResult = run_capture("./bin/hlfmt", ["-c", stale_path])
+    check(acc, "hlfmt -w repairs the file; -c passes afterwards",
+    w1.code == 0 && chk2.code == 0, first_line(chk2.out))
+
+    section("5. the preservation law: text survives byte-exact")
+    let utf8_src: str = "# café ☕ — reviewed by the team\n"
+    + "fn f() -> int {\n"
+    + "    let s: str = \"hash # inside\"\n"
+    + "    return 1  # giữ nguyên dấu tiếng Việt ☕\n"
+    + "}\n"
+    let r5: list[str] = passes(acc, "s5_utf8.hls", utf8_src)
+    check(acc, "multi-byte UTF-8 comment text survives",
+    r5.get(0).contains("# café ☕ — reviewed by the team"),
+    clip(r5.get(0), 60))
+    check(acc, "UTF-8 trailing comment survives",
+    r5.get(0).contains("# giữ nguyên dấu tiếng Việt ☕"), "")
+    check(acc, "comment set identical before and after (count + text)",
+    bodies_equal(comment_bodies(utf8_src), comment_bodies(r5.get(0))),
+    "")
+    check(acc, "UTF-8 fixture is idempotent", r5.get(1) == "1", "")
+    let noisy: str = "fn f() -> int {\n"
+    + "    let a: int = 1  # one\n"
+    + "    let b: int = 2  # two\n"
+    + "    # standalone\n"
+    + "    return a + b  # sum\n"
+    + "}\n"
+    let r5b: list[str] = passes(acc, "s5_noisy.hls", noisy)
+    check(acc, "no comment duplicated or dropped on a four-comment fixture",
+    grep_count(r5b.get(0), "#") == 4, count_int(grep_count(r5b.get(0), "#")))
+
+    section("6. the one-liners: attach exactly once")
+    let one_src: str = "fn f() -> int { return 0 } # done\n"
+    let r6: list[str] = passes(acc, "s6_one.hls", one_src)
+    check(acc, "one-liner trailing comment attached exactly once",
+    grep_count(r6.get(0), "# done") == 1,
+    count_int(grep_count(r6.get(0), "# done")))
+    let lns6: list[str] = rstrip_ws(r6.get(0)).split("\n")
+    let last6: str = lns6.get(lns6.len() - 1)
+    check(acc, "comment lands after the last segment the line produced",
+    last6.ends_with("# done"), last6)
+    check(acc, "one-liner fixture is idempotent", r6.get(1) == "1", "")
+    let open_src: str = "fn f() -> int { # why\n    return 1\n}\n"
+    let r6b: list[str] = passes(acc, "s6_open.hls", open_src)
+    check(acc, "comment after an opening brace stays on the brace line",
+    r6b.get(0).contains("fn f() -> int { # why") && r6b.get(1) == "1",
+    clip(r6b.get(0), 60))
+
+    section("7. the differential: formatting preserves semantics (the oracle leg)")
+    if !file_exists("./bin/hlc") {
+        fail_msg(acc, "bin/hlc missing — run make bootstrap first")
+    } else {
+        let interp_r: RunResult = boot(acc, [corpus])
+        let c1: str = scratch(acc, "s7_orig.c")
+        let b1: str = scratch(acc, "s7_orig_bin")
+        let comp1: RunResult = run_capture("./bin/hlc", [corpus, c1])
+        let cc1: int = run_quiet("gcc", ["-O2", "-o", b1, c1, "-lm",
+        "-pthread"])
+        let nat1: RunResult = run_capture(b1, [])
+        check(acc, "unformatted file: interpreter == native",
+        comp1.code == 0 && cc1 == 0 && nat1.out == interp_r.out,
+        clip(comp1.err, 60))
+        let fmt_path: str = write_src(acc, "s7_fmt.hls", fmt_once(acc,
+        "s7_fmt_in.hls", read_file(corpus)))
+        let interp_f: RunResult = boot(acc, [fmt_path])
+        let c2: str = scratch(acc, "s7_fmt.c")
+        let b2: str = scratch(acc, "s7_fmt_bin")
+        let comp2: RunResult = run_capture("./bin/hlc", [fmt_path, c2])
+        let cc2: int = run_quiet("gcc", ["-O2", "-o", b2, c2, "-lm",
+        "-pthread"])
+        let nat2: RunResult = run_capture(b2, [])
+        check(acc, "formatted file: interpreter == native (recompiles and reruns)",
+        comp2.code == 0 && cc2 == 0 && nat2.out == interp_f.out,
+        clip(comp2.err, 60))
+        check(acc, "formatting changed no output line (semantic witness)",
+        interp_r.out == interp_f.out, "")
+        check(acc, "the corpus file keeps every comment through the pass",
+        bodies_equal(comment_bodies(read_file(corpus)),
+        comment_bodies(read_file(fmt_path))), "")
+    }
+
+    section("8. the corpus: idempotent + preserving everywhere")
+    let files: list[str] = corpus_files(acc)
+    let mut non_idem: int = 0
+    let mut lost: int = 0
+    let mut nfiles: int = 0
+    let mut fi: int = 0
+    while fi < files.len() {
+        let f: str = files.get(fi)
+        let src: str = read_or(f, "")
+        nfiles = nfiles + 1
+        let out1: str = fmt_once(acc, "s8_pass.hls", src)
+        let out2: str = fmt_once(acc, "s8_pass2.hls", out1)
+        if out2 != out1 {
+            non_idem = non_idem + 1
+        }
+        if !bodies_equal(comment_bodies(src), comment_bodies(out1)) {
+            lost = lost + 1
+        }
+        fi = fi + 1
+    }
+    check(acc, count_int(nfiles) + " corpus files format idempotently",
+    non_idem == 0, count_int(non_idem) + " non-idempotent")
+    check(acc, count_int(nfiles) + " corpus files preserve their comment set",
+    lost == 0, count_int(lost) + " changed")
+    let lint_r: RunResult = run_capture("python3", ["tools/hllint.py",
+    corpus])
+    check(acc, "hllint stays clean on the stage fixture",
+    lint_r.code == 0, clip(lint_r.out, 80))
+
+    return finish(acc, "Stage 116 -- hlfmt preserves comments in all positions")
+}
+
+# pad2(i) — "# 01" .. "# 17" marker bodies.
+fn pad2(i: int) -> str {
+    if i < 10 {
+        return "# 0" + i.to_str()
+    }
+    return "# " + i.to_str()
+}
+
+fn count_int(n: int) -> str {
+    return n.to_str()
+}
+
+# corpus_files(acc) — examples/** (recursive) + tests/ok + tests/fail,
+# the Python battery's glob, in find(1) order.
+fn corpus_files(acc: Acc) -> list[str] uses Proc {
+    let out: list[str] = []
+    let r: RunResult = run_capture("find", ["examples", "-name", "*.hls",
+    "-type", "f"])
+    let mut i: int = 0
+    let lines: list[str] = r.out.split("\n")
+    while i < lines.len() {
+        if lines.get(i) != "" {
+            out.push(lines.get(i))
+        }
+        i = i + 1
+    }
+    let r2: RunResult = run_capture("find", ["tests/ok", "tests/fail",
+    "-maxdepth", "1", "-name", "*.hls", "-type", "f"])
+    i = 0
+    let lines2: list[str] = r2.out.split("\n")
+    while i < lines2.len() {
+        if lines2.get(i) != "" {
+            out.push(lines2.get(i))
+        }
+        i = i + 1
+    }
+    return out
+}

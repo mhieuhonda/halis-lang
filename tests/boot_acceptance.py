@@ -668,10 +668,10 @@ else:
 
 # Tools.
 for label, cmd, want in (
-        ("hlfmt -c (ok-test)", ["python3", "tools/hlfmt.py", "-c", OK_TEST], 0),
-        ("hlfmt -c (demo)", ["python3", "tools/hlfmt.py", "-c", DEMO], 0),
-        ("hlfmt -c (kernel)", ["python3", "tools/hlfmt.py", "-c", KERNEL], 0),
-        ("hlfmt -c (core)", ["python3", "tools/hlfmt.py", "-c", CORE], 0),
+        ("hlfmt -c (ok-test)", [os.path.join(ROOT, "bin", "hlfmt"), "-c", OK_TEST], 0),
+        ("hlfmt -c (demo)", [os.path.join(ROOT, "bin", "hlfmt"), "-c", DEMO], 0),
+        ("hlfmt -c (kernel)", [os.path.join(ROOT, "bin", "hlfmt"), "-c", KERNEL], 0),
+        ("hlfmt -c (core)", [os.path.join(ROOT, "bin", "hlfmt"), "-c", CORE], 0),
         ("hllint (ok-test)", ["python3", "tools/hllint.py", OK_TEST], 0)):
     r = run(cmd)
     if r.returncode == want:

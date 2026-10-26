@@ -96,7 +96,7 @@ os.chdir(ROOT)
 
 SIZE = [sys.executable, "tools/hls-size.py"]
 BOOT = [sys.executable, "tools/hlinterp/boot.py"]
-FMT = [sys.executable, "tools/hlfmt.py"]
+FMT = [os.path.join(ROOT, "bin", "hlfmt")]
 LINT = [sys.executable, "tools/hllint.py"]
 HLC = os.path.join(ROOT, "bin", "hlc")
 CC = os.environ.get("CC", "gcc")

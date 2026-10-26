@@ -608,9 +608,9 @@ for f in (DEMO, OK_TEST):
     p2 = os.path.join(TMP, "fmt2.hls")
     with open(p1, "w") as fh:
         fh.write(original)
-    run([sys.executable, "tools/hlfmt.py", "-w", p1])
+    run([os.path.join(ROOT, "bin", "hlfmt"), "-w", p1])
     shutil.copyfile(p1, p2)
-    run([sys.executable, "tools/hlfmt.py", "-w", p2])
+    run([os.path.join(ROOT, "bin", "hlfmt"), "-w", p2])
     with open(p1) as fh:
         once = fh.read()
     with open(p2) as fh:

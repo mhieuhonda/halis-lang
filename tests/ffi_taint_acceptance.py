@@ -48,7 +48,7 @@ sys.path.insert(0, ROOT)
 
 BOOT = [sys.executable, "tools/hlinterp/boot.py"]
 PROVE = [sys.executable, "tools/hlprove.py"]
-FMT = [sys.executable, "tools/hlfmt.py"]
+FMT = [os.path.join(ROOT, "bin", "hlfmt")]
 LINT = [sys.executable, "tools/hllint.py"]
 DEMO = "examples/ffi_taint_demo.hls"
 OK_TEST = "tests/ok/feat_stage109_ffi_taint.hls"

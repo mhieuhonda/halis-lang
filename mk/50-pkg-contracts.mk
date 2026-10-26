@@ -130,7 +130,7 @@ prove-acceptance:
 # Stage 97 acceptance gate: the SMT-based loop-invariant inference.
 # Requires a decider — a z3 binary or the z3-solver python module (the
 # gate says which to install when neither exists).
-invariant-acceptance: $(BIN)/hlc
+invariant-acceptance: $(BIN)/hlfmt $(BIN)/hlc
 	@echo "[Stage 97 acceptance] running tests/invariant_acceptance.py..."
 	@$(PYTHON) tests/invariant_acceptance.py
 
@@ -144,7 +144,7 @@ cvc5-acceptance:
 # Stage 100 acceptance gate: the separation-logic fragment. Requires a
 # decider — a z3 binary or the z3-solver python module (the gate says
 # which to install when neither exists).
-shapes-acceptance: $(BIN)/hlc
+shapes-acceptance: $(BIN)/hlfmt $(BIN)/hlc
 	@echo "[Stage 100 acceptance] running tests/shapes_acceptance.py..."
 	@$(PYTHON) tests/shapes_acceptance.py
 
@@ -152,7 +152,7 @@ shapes-acceptance: $(BIN)/hlc
 # (no solver needed): the engine battery, the soundness flips, the
 # interprocedural chain, the CLI report, the demo parity, the audit
 # parity between the front-ends, the fail tests and the tools.
-sidechannel-acceptance: $(BIN)/hlc
+sidechannel-acceptance: $(BIN)/hlfmt $(BIN)/hlc
 	@echo "[Stage 101 acceptance] running tests/sidechannel_acceptance.py..."
 	@$(PYTHON) tests/sidechannel_acceptance.py
 
@@ -161,7 +161,7 @@ sidechannel-acceptance: $(BIN)/hlc
 # cannot violate a claim), the chains, the CLI exits (0 verified,
 # 1 violated), the demo parity, the audit parity, the fail tests and
 # the tools.
-ct-acceptance: $(BIN)/hlc
+ct-acceptance: $(BIN)/hlfmt $(BIN)/hlc
 	@echo "[Stage 102 acceptance] running tests/consttime_acceptance.py..."
 	@$(PYTHON) tests/consttime_acceptance.py
 
@@ -184,7 +184,7 @@ supply-pkg:
 # policy, fail-closed, the package tree, drift, the mode parity, the
 # demos, the tools). Tool-only - no solver, no compiler needed; the
 # native half of the demo parity runs when bin/hlc exists.
-supply-acceptance:
+supply-acceptance: $(BIN)/hlfmt
 	@echo "[Stage 103 acceptance] running tests/audit_acceptance.py..."
 	@$(PYTHON) tests/audit_acceptance.py
 
@@ -253,7 +253,7 @@ sbom-release:
 # gate with the transparency-log chaining, the audit parity, the
 # demos, the tools). Tool-only - no solver, no compiler needed; the
 # native half of the demo parity runs when bin/hlc exists.
-sbom-acceptance:
+sbom-acceptance: $(BIN)/hlfmt
 	@echo "[Stage 104 acceptance] running tests/sbom_acceptance.py..."
 	@$(PYTHON) tests/sbom_acceptance.py
 
@@ -299,7 +299,7 @@ repro-verify:
 # tampered + drifted), the release gate with the transparency
 # chaining, the demos, the tools. Tool-only — no solver needed; the
 # engine half runs native when bin/hlc exists, boot otherwise.
-repro-acceptance:
+repro-acceptance: $(BIN)/hlfmt
 	@echo "[Stage 105 acceptance] running tests/repro_acceptance.py..."
 	@$(PYTHON) tests/repro_acceptance.py
 
@@ -351,7 +351,7 @@ sign-selftest:
 # transparency chaining, the ledger, the demos, the tools). Tool-only
 # — no solver, no compiler needed; the native half of the demo parity
 # runs when bin/hlc exists.
-sign-acceptance:
+sign-acceptance: $(BIN)/hlfmt
 	@echo "[Stage 106 acceptance] running tests/signed_acceptance.py..."
 	@$(PYTHON) tests/signed_acceptance.py
 
@@ -421,7 +421,7 @@ tlog-selftest:
 # grown, rewritten), the repo ledger end to end, the demos, the
 # tools). Tool-only — no solver needed; the native half of the demo
 # parity runs when bin/hlc exists.
-tlog-acceptance:
+tlog-acceptance: $(BIN)/hlfmt
 	@echo "[Stage 107 acceptance] running tests/tlog_acceptance.py..."
 	@$(PYTHON) tests/tlog_acceptance.py
 
@@ -461,7 +461,7 @@ reverify-selftest:
 # over the whole positive corpus, the refusals, the demos, the
 # report, the tools). Tool-only — no solver needed; the native half
 # of the demo parity runs when bin/hlc exists.
-reverify-acceptance:
+reverify-acceptance: $(BIN)/hlfmt
 	@echo "[Stage 108 acceptance] running tests/reverify_acceptance.py..."
 	@$(PYTHON) tests/reverify_acceptance.py
 
@@ -478,7 +478,7 @@ ffi-taint:
 # checker rules (source wrap, sink diagnostics, the well-formedness
 # refusals), the audit-parity census, the hlprove --taint report (pinned
 # lines), the demo + ok-test parity, the fail tests and the tools.
-ffi-taint-acceptance: $(BIN)/hlc
+ffi-taint-acceptance: $(BIN)/hlfmt $(BIN)/hlc
 	@echo "[Stage 109 acceptance] running tests/ffi_taint_acceptance.py..."
 	@$(PYTHON) tests/ffi_taint_acceptance.py
 
@@ -559,7 +559,7 @@ sandbox-selftest:
 # definition, the assembler, the policy, the derivation, the
 # enforcement — the kernel half, Linux + seccomp + cc, the shim,
 # the statement + ledger, the demos, the tools).
-sandbox-acceptance:
+sandbox-acceptance: $(BIN)/hlfmt
 	@echo "[Stage 110 acceptance] running tests/sandbox_acceptance.py..."
 	@$(PYTHON) tests/sandbox_acceptance.py
 
@@ -606,6 +606,6 @@ auditlog-selftest:
 # refusals, the launcher, the checkpoint verdicts, the ledgers, the
 # demos, the tools). Tool-only — no solver, no kernel half needed;
 # the native half of the demo parity runs when bin/hlc exists.
-auditlog-acceptance:
+auditlog-acceptance: $(BIN)/hlfmt
 	@echo "[Stage 112 acceptance] running tests/auditlog_acceptance.py..."
 	@$(PYTHON) tests/auditlog_acceptance.py

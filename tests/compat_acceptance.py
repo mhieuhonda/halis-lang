@@ -560,7 +560,7 @@ def _section_8():
 
     for f in (SHOWCASE, DEMO):
         label = os.path.relpath(f, ROOT)
-        p = run([sys.executable, "tools/hlfmt.py", "-c", f])
+        p = run([os.path.join(ROOT, "bin", "hlfmt"), "-c", f])
         check("already formatted" in p.stdout, "%s is hlfmt-canonical" % label)
         p = run([sys.executable, "tools/hllint.py", f])
         check("no warnings" in p.stdout, "%s is hllint-clean" % label)

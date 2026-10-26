@@ -1218,8 +1218,7 @@ def section_8():
     check(out.split("\n")[:6] == ["42", "43", "12", "24", "10", "big"],
           "the corpus output is the pinned 42 / 43 / 12 / 24 / 10 / big")
 
-    proc = subprocess.run([sys.executable, os.path.join(ROOT, "tools",
-                                                         "hlfmt.py"),
+    proc = subprocess.run([os.path.join(ROOT, "bin", "hlfmt"),
                            "-c", CORPUS], capture_output=True, timeout=60)
     check(proc.returncode == 0, "hlfmt holds the corpus stable")
 

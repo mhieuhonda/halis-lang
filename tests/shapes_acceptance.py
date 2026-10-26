@@ -557,8 +557,8 @@ else:
 print("=== 6. the tools ===")
 # ---------------------------------------------------------------------------
 
-fmt1 = run([sys.executable, "tools/hlfmt.py", DEMO])
-fmt2 = run([sys.executable, "tools/hlfmt.py", DEMO])
+fmt1 = run([os.path.join(ROOT, "bin", "hlfmt"), DEMO])
+fmt2 = run([os.path.join(ROOT, "bin", "hlfmt"), DEMO])
 if fmt1.returncode == 0 and fmt1.stdout == fmt2.stdout:
     ok("hlfmt: stable formatting on the demo")
 else:

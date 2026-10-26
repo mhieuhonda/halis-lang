@@ -345,8 +345,8 @@ if not bad_script:
 # ---------------------------------------------------------------------------
 print("=== 8. the tools ===")
 # ---------------------------------------------------------------------------
-fmt1 = run(["python3", "tools/hlfmt.py", DEMO])
-fmt2 = run(["python3", "tools/hlfmt.py", DEMO])
+fmt1 = run([os.path.join(ROOT, "bin", "hlfmt"), DEMO])
+fmt2 = run([os.path.join(ROOT, "bin", "hlfmt"), DEMO])
 if fmt1.returncode == 0 and fmt2.returncode == 0 \
         and fmt1.stdout == fmt2.stdout and fmt1.stdout.strip():
     ok("tools: hlfmt stable on the demo")

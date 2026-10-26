@@ -623,7 +623,7 @@ else:
 print("Section 8 — corpus hygiene")
 
 for path in (FIXTURE, CHURN, SERVER, CANARY):
-    p = run([sys.executable, "tools/hlfmt.py", "-c", path])
+    p = run([os.path.join(ROOT, "bin", "hlfmt"), "-c", path])
     check("already formatted" in p.stdout,
           "%s is hlfmt-canonical" % os.path.basename(path))
 p = run([sys.executable, "tools/hllint.py", FIXTURE])

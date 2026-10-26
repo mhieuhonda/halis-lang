@@ -78,7 +78,7 @@ os.chdir(ROOT)
 
 PERF = [sys.executable, os.path.join(ROOT, "tools", "hls-perf.py")]
 BOOT = [sys.executable, os.path.join(ROOT, "tools", "hlinterp", "boot.py")]
-FMT = [sys.executable, os.path.join(ROOT, "tools", "hlfmt.py")]
+FMT = [os.path.join(ROOT, "bin", "hlfmt")]
 LINT = [sys.executable, os.path.join(ROOT, "tools", "hllint.py")]
 HLC = os.path.join(ROOT, "bin", "hlc")
 CC = os.environ.get("CC", "gcc")

@@ -1,133 +1,1802 @@
 # ============================================================================
-# hlfmt.hls — Stage 14 release: a minimal self-hosted HLS formatter.
+# hlfmt.hls — the opinionated formatter for Halis, in Halis.
 # ----------------------------------------------------------------------------
-# This file demonstrates that the Halis toolchain can self-host its own
-# formatter. It implements a SUBSET of hlfmt.py's behaviour:
-#   - reads a .hls file from argv[1]
-#   - re-indents to canonical 4-space indent based on { } depth
-#   - normalises leading whitespace
-#   - preserves blank lines && `#` comments
-#   - writes the formatted output to stdout (or argv[2] if given)
+# The Stage 14 formatter grew up in Python (tools/hlfmt.py, 953 lines);
+# this file is its full native port — same token stream, same whitespace
+# laws, same comment handling, same `.hlfmt.toml` grammar, same exit
+# codes — compiled by bin/hlc and linked by cc into bin/hlfmt, so a
+# formatting pass (or a gate's `hlfmt stable` leg over a whole tree)
+# no longer pays a Python start-up per file.
 #
-# Limitations vs the Python hlfmt.py:
-#   - Does NOT preserve the full token-stream idempotency guarantees.
-#   - Does NOT do binary-operator spacing normalization.
-#   - String literals may be miscounted for brace tracking.
+# The laws, verbatim from the Python years:
+#
+#   - 4-space indentation (indent_width, 1..8; indent_style "tab" emits
+#     one tab per level); no tabs by default.
+#   - One statement per line (the source's line breaks are preserved).
+#   - Single space after commas and colons, around binary operators.
+#   - No space before `(`, `[`, `.`, `,`, `)`, `]`, `?`, `:`; no space
+#     after `(`, `[`, `.`, `!`, `?`.
+#   - Space before `{` (function/struct/enum/impl/match/if/while/for
+#     bodies); `} else {` stays on one line.
+#   - String literals re-emit with the four escapes the lexer accepts
+#     (\n \t \\ \") — every other byte round-trips verbatim (the whole
+#     pipeline is byte-oriented, latin-1 in the Python years, bytes
+#     here). Control bytes are refused, named.
+#   - Comment-only lines re-indent to the canonical block indent
+#     (reindent_comments = false replays the source prefix verbatim —
+#     the minimal-diff escape hatch); trailing comments re-attach to
+#     the line they sat on, exactly once. `#[...]` / `#![...]` are
+#     attributes, never comments.
+#   - Blank runs cap at max_blank_lines (default 1); trailing blanks
+#     at EOF are dropped; final_newline (default true) pins one \n.
+#   - Idempotent: running twice equals running once, under any config
+#     that formats as a fixed point under itself.
+#   - A lexer error is a WARNING plus byte-identical passthrough —
+#     `-w` on an unparseable file is a content no-op, never a mangling.
+#
+# The `.hlfmt.toml` grammar (Stage 117): flat `key = value` lines, the
+# optional `[hlfmt]` table, `#` comments (string-aware), five keys —
+# indent_width (1..8), indent_style ("space"|"tab"), final_newline
+# (bool), max_blank_lines (0..4), reindent_comments (bool). An unknown
+# key, a wrong type, an out-of-range value, a duplicate, another table
+# or a malformed string is a hard error naming file and line (exit 2).
+# Discovery walks from the target file's directory to the filesystem
+# root; the nearest file wins. --config PATH pins one file, --no-config
+# ignores discovery, --print-config prints the resolved values.
 #
 # Usage:
-#   bin/hlc tools/hlfmt.hls bin/hlfmt.c
-#   gcc -O2 -o bin/hlfmt bin/hlfmt.c -lm
-#   bin/hlfmt input.hls [output.hls]
+#   bin/hlfmt FILE.hls                 # formatted source to stdout
+#   bin/hlfmt -w FILE.hls              # write back
+#   bin/hlfmt -c FILE.hls              # check only (exit 1 when stale)
+#   bin/hlfmt -d FILE.hls              # unified diff against original
+#   bin/hlfmt --print-config FILE.hls  # the resolved .hlfmt.toml
+#
+# Exit codes: 0 ok; 1 file-not-found / not-formatted / render error;
+# 2 usage error or a config problem.
 # ============================================================================
 
-# Count the unmatched `{` braces in a line, ignoring those inside `"` strings.
-# (HLS string literals are bytes — the lexer treats `"` as the delimiter.)
-fn brace_delta(line: str) -> int {
-    let mut delta: int = 0
+import "core.result"
+import "std.str"
+
+# ============================================================================
+# The token model (the twin of tools/hlinterp/lexer.py — the formatter
+# only ever needs the token's kind, its source text and its line).
+# ============================================================================
+
+struct Tok {
+    k: str, # kw | ident | int | float | str | sym | eof
+    v: str, # the token's text (str tokens: the decoded bytes;
+    # int/float: the raw source text)
+    raw: str, # raw source text for int/float, "" otherwise
+    line: int, # 1-based
+    col: int # 1-based
+}
+
+fn is_keyword(word: str) -> bool {
+    return word == "fn" || word == "let" || word == "mut"
+    || word == "return" || word == "if" || word == "else"
+    || word == "while" || word == "for" || word == "in"
+    || word == "break" || word == "continue" || word == "struct"
+    || word == "impl" || word == "import" || word == "uses"
+    || word == "true" || word == "false" || word == "enum"
+    || word == "match" || word == "pure" || word == "extern"
+    || word == "requires" || word == "ensures" || word == "asm"
+    || word == "where"
+}
+
+fn is_ident_start(c: int) -> bool {
+    return(c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+}
+
+fn is_ident_char(c: int) -> bool {
+    return is_ident_start(c) || (c >= 48 && c <= 57)
+}
+
+fn is_digit(c: int) -> bool {
+    return c >= 48 && c <= 57
+}
+
+# lex_err_line(msg, line, col) — the HLError rendering the Python
+# lexer's exceptions carried: "msg (line L:C)".
+fn lex_err(msg: str, line: int, col: int) -> Result[list[Tok], str] {
+    return Result.Err(msg + " (line " + line.to_str() + ":"
+    + col.to_str() + ")")
+}
+
+# cmp_u64_str(a, b) — compare two digit strings of the SAME length
+# (leading zeros already stripped). -1 / 0 / 1.
+fn cmp_same_len_digits(a: str, b: str) -> int {
     let mut i: int = 0
+    while i < a.len() {
+        let x: int = a.byte_at(i) - 48
+        let y: int = b.byte_at(i) - 48
+        if x < y {
+            return -1
+        }
+        if x > y {
+            return 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+# strip_leading_zeros(d) — "0009" -> "9", "0" -> "0".
+fn strip_leading_zeros(d: str) -> str {
+    let mut i: int = 0
+    while i + 1 < d.len() && d.byte_at(i) == 48 {
+        i = i + 1
+    }
+    return d.slice(i, d.len())
+}
+
+# digits_gt_bound(d, bound) — is the digit string d strictly greater
+# than the bound ("9223372036854775808", 19 digits, no leading zeros)?
+fn digits_gt_bound(d: str, bound: str) -> bool {
+    if d.len() != bound.len() {
+        return d.len() > bound.len()
+    }
+    return cmp_same_len_digits(d, bound) > 0
+}
+
+# tokenize(src) — the Stage-0 lexer, byte for byte the law of
+# tools/hlinterp/lexer.py: keywords, identifiers, int/float literals
+# (underscores allowed; raw text preserved), strings with the four
+# escapes, two-char then one-char symbols, `#[` / `#![` attribute
+# sigils, `#` comments to end of line. Ok(tokens + eof), or
+# Err("msg (line L:C)").
+fn tokenize(src: str) -> Result[list[Tok], str] {
+    let toks: list[Tok] = []
+    let n: int = src.len()
+    let mut i: int = 0
+    let mut line: int = 1
+    let mut col: int = 1
+    while i < n {
+        let c: int = src.byte_at(i)
+        # ---- whitespace (a lone \r is a terminator; CRLF's \n counts) --
+        if c == 32 || c == 9 || c == 13 || c == 10 {
+            if c == 10 {
+                line = line + 1
+                col = 1
+            } else if c == 13 {
+                if i + 1 < n && src.byte_at(i + 1) == 10 {
+                    col = col + 1
+                } else {
+                    line = line + 1
+                    col = 1
+                }
+            } else {
+                col = col + 1
+            }
+            i = i + 1
+            continue
+        }
+        # ---- `#`: attribute sigils, or a comment to end of line --------
+        if c == 35 {
+            if i + 1 < n && src.byte_at(i + 1) == 91 {
+                toks.push(Tok {
+                    k: "sym", v: "#", raw: "", line: line, col: col
+                })
+                col = col + 1
+                i = i + 1
+                continue
+            }
+            if i + 2 < n && src.byte_at(i + 1) == 33
+            && src.byte_at(i + 2) == 91 {
+                toks.push(Tok {
+                    k: "sym", v: "#", raw: "", line: line, col: col
+                })
+                col = col + 1
+                i = i + 1
+                toks.push(Tok {
+                    k: "sym", v: "!", raw: "", line: line, col: col
+                })
+                col = col + 1
+                i = i + 1
+                continue
+            }
+            while i < n && src.byte_at(i) != 10 && src.byte_at(i) != 13 {
+                i = i + 1
+                col = col + 1
+            }
+            continue
+        }
+        # ---- identifier / keyword ---------------------------------------
+        if is_ident_start(c) {
+            let mut j: int = i
+            while j < n && is_ident_char(src.byte_at(j)) {
+                j = j + 1
+            }
+            let word: str = src.slice(i, j)
+            let mut kind: str = "ident"
+            if is_keyword(word) {
+                kind = "kw"
+            }
+            toks.push(Tok {
+                k: kind, v: word, raw: "", line: line, col: col
+            })
+            col = col + (j - i)
+            i = j
+            continue
+        }
+        # ---- number ------------------------------------------------------
+        if is_digit(c) {
+            let mut j: int = i
+            while j < n && (is_digit(src.byte_at(j)) || src.byte_at(j) == 95) {
+                j = j + 1
+            }
+            let mut is_float: bool = false
+            if j < n && src.byte_at(j) == 46 && j + 1 < n
+            && is_digit(src.byte_at(j + 1)) {
+                is_float = true
+                j = j + 1
+                while j < n && (is_digit(src.byte_at(j))
+                || src.byte_at(j) == 95) {
+                    j = j + 1
+                }
+            }
+            # Scientific notation: e/E, optional sign, at least one digit
+            # (otherwise the e is an identifier start and the adjoined-
+            # letters law below fires — same as Python).
+            if j < n && (src.byte_at(j) == 101 || src.byte_at(j) == 69) {
+                let mut k: int = j + 1
+                if k < n && (src.byte_at(k) == 43 || src.byte_at(k) == 45) {
+                    k = k + 1
+                }
+                if k < n && is_digit(src.byte_at(k)) {
+                    is_float = true
+                    j = k
+                    while j < n && (is_digit(src.byte_at(j))
+                    || src.byte_at(j) == 95) {
+                        j = j + 1
+                    }
+                }
+            }
+            let raw_text: str = src.slice(i, j)
+            let text: str = str_replace(raw_text, "_", "")
+            # Digits immediately followed by identifier characters are a
+            # named error (HLS has no hex / adjoined-letter literals).
+            if j < n && is_ident_start(src.byte_at(j)) {
+                let mut k2: int = j
+                while k2 < n && is_ident_char(src.byte_at(k2)) {
+                    k2 = k2 + 1
+                }
+                return lex_err("invalid numeric literal '"
+                + src.slice(i, k2) + "' (digits followed by letters — "
+                + "HLS has no hex/adjoined-letter literals)", line, col)
+            }
+            if is_float {
+                # The overflow law: 1e400 is refused at lex time.
+                let fv: float = text.to_float()
+                if math_isinf(fv) && !text.contains("inf") {
+                    return lex_err("float literal overflows to infinity: "
+                    + raw_text, line, col)
+                }
+                toks.push(Tok {
+                    k: "float", v: raw_text, raw: raw_text,
+                    line: line, col: col
+                })
+            } else {
+                # Python's int() refuses >= 4300 digits; the lexer's own
+                # law refuses anything strictly above 2^63 (a bare 2^63
+                # itself stays legal through the lexer — the checker's
+                # literal-range rule owns it, and - folds int64 min).
+                if text.len() >= 4300 {
+                    return lex_err("integer literal too large: "
+                    + text.len().to_str() + " digits", line, col)
+                }
+                let bare: str = strip_leading_zeros(text)
+                if digits_gt_bound(bare, "9223372036854775808") {
+                    return lex_err("integer literal out of int64 range: "
+                    + raw_text, line, col)
+                }
+                toks.push(Tok {
+                    k: "int", v: raw_text, raw: raw_text,
+                    line: line, col: col
+                })
+            }
+            col = col + (j - i)
+            i = j
+            continue
+        }
+        # ---- string literal ----------------------------------------------
+        if c == 34 {
+            let ln: int = line
+            let cl: int = col
+            i = i + 1
+            col = col + 1
+            let out: list[str] = []
+            let mut closed: bool = false
+            while i < n {
+                let ch: int = src.byte_at(i)
+                if ch == 34 {
+                    i = i + 1
+                    col = col + 1
+                    closed = true
+                    break
+                }
+                if ch == 92 {
+                    if i + 1 >= n {
+                        return lex_err("unterminated string", ln, cl)
+                    }
+                    let e: int = src.byte_at(i + 1)
+                    if e == 110 {
+                        out.push(chr(10))
+                    } else if e == 116 {
+                        out.push(chr(9))
+                    } else if e == 92 {
+                        out.push(chr(92))
+                    } else if e == 34 {
+                        out.push(chr(34))
+                    } else {
+                        return lex_err("invalid escape sequence: \\"
+                        + chr(e), line, col)
+                    }
+                    i = i + 2
+                    col = col + 2
+                    continue
+                }
+                if ch < 32 {
+                    return lex_err("string contains invalid control "
+                    + "character", line, col)
+                }
+                out.push(chr(ch))
+                col = col + 1
+                i = i + 1
+            }
+            if !closed {
+                return lex_err("unterminated string", ln, cl)
+            }
+            toks.push(Tok {
+                k: "str", v: join(out, ""), raw: "",
+                line: ln, col: cl
+            })
+            continue
+        }
+        # ---- two-char, then one-char symbols ------------------------------
+        if i + 1 < n {
+            let two: str = src.slice(i, i + 2)
+            if two == "->" || two == "==" || two == "!=" || two == "<="
+            || two == ">=" || two == "&&" || two == "||"
+            || two == "=>" {
+                toks.push(Tok {
+                    k: "sym", v: two, raw: "", line: line,
+                    col: col
+                })
+                i = i + 2
+                col = col + 2
+                continue
+            }
+        }
+        if c == 40 || c == 41 || c == 123 || c == 125 || c == 91
+        || c == 93 || c == 44 || c == 58 || c == 46 || c == 60
+        || c == 62 || c == 43 || c == 45 || c == 42 || c == 47
+        || c == 37 || c == 33 || c == 61 || c == 63 {
+            toks.push(Tok {
+                k: "sym", v: chr(c), raw: "", line: line,
+                col: col
+            })
+            i = i + 1
+            col = col + 1
+            continue
+        }
+        return lex_err("invalid character: '" + chr(c) + "'", line, col)
+    }
+    toks.push(Tok {
+        k: "eof", v: "", raw: "", line: line, col: col
+    })
+    return Result.Ok(toks)
+}
+
+# ============================================================================
+# The team configuration file, `.hlfmt.toml` (Stage 117) — five keys,
+# strict grammar, errors naming file and line.
+# ============================================================================
+
+struct FmtConfig {
+    indent_width: int, # spaces per level (style "space"), 1..8
+    indent_style: str, # "space" | "tab"
+    final_newline: bool, # trailing newline at EOF
+    max_blank_lines: int, # cap on a run of source blanks, 0..4
+    reindent_comments: bool # comment-only lines take the block indent
+}
+
+fn default_config() -> FmtConfig {
+    return FmtConfig {
+        indent_width: 4,
+        indent_style: "space",
+        final_newline: true,
+        max_blank_lines: 1,
+        reindent_comments: true
+    }
+}
+
+# The Python whitespace for strip()/rstrip() — space, \t, \n, \r, \f, \v.
+fn is_py_ws(c: int) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13 || c == 12 || c == 11
+}
+
+fn py_rstrip(s: str) -> str {
+    let mut n: int = s.len()
+    while n > 0 && is_py_ws(s.byte_at(n - 1)) {
+        n = n - 1
+    }
+    return s.slice(0, n)
+}
+
+fn py_strip(s: str) -> str {
+    let mut a: int = 0
+    let n: int = s.len()
+    while a < n && is_py_ws(s.byte_at(a)) {
+        a = a + 1
+    }
+    let mut b: int = n
+    while b > a && is_py_ws(s.byte_at(b - 1)) {
+        b = b - 1
+    }
+    return s.slice(a, b)
+}
+
+# known_config_key(key) — the closed key set (sorted, for error text).
+fn known_config_key(key: str) -> bool {
+    return key == "final_newline" || key == "indent_style"
+    || key == "indent_width" || key == "max_blank_lines"
+    || key == "reindent_comments"
+}
+
+# key_type(key) — 0 bool, 1 int-with-bounds, 2 str-choice; -1 unknown.
+fn key_type(key: str) -> int {
+    if key == "final_newline" || key == "reindent_comments" {
+        return 0
+    }
+    if key == "indent_width" || key == "max_blank_lines" {
+        return 1
+    }
+    if key == "indent_style" {
+        return 2
+    }
+    return -1
+}
+
+fn key_bound_lo(key: str) -> int {
+    if key == "max_blank_lines" {
+        return 0
+    }
+    return 1
+}
+
+fn key_bound_hi(key: str) -> int {
+    if key == "max_blank_lines" {
+        return 4
+    }
+    return 8
+}
+
+# repr_str(text) — Python's repr() for the plain strings this tool ever
+# prints (single quotes, no embedded quotes in the value half of a
+# config line by construction of the grammar).
+fn repr_str(text: str) -> str {
+    return "'" + text + "'"
+}
+
+# strip_config_comment(line) — drop the `#` comment, only OUTSIDE
+# double-quoted strings; validate the escape set the strict TOML basic
+# string grammar allows. Ok(stripped) / Err(message).
+fn strip_config_comment(line: str) -> Result[str, str] {
+    let out: list[str] = []
     let mut in_str: bool = false
-    while i < line.len() {
+    let mut i: int = 0
+    let n: int = line.len()
+    while i < n {
         let c: int = line.byte_at(i)
         if in_str {
-            if c == 34 {  # `"`
+            if c == 92 {
+                if i + 1 >= n {
+                    return Result.Err("unterminated escape at end of line")
+                }
+                let nxt: int = line.byte_at(i + 1)
+                if !(nxt == 98 || nxt == 116 || nxt == 110 || nxt == 102
+                || nxt == 114 || nxt == 34 || nxt == 92
+                || nxt == 117) {
+                    return Result.Err("invalid escape `\\"
+                    + chr(nxt) + "` (TOML basic strings allow \\b \\t "
+                    + "\\n \\f \\r \\\" \\\\ \\uXXXX)")
+                }
+                if nxt == 117 {
+                    if i + 6 > n {
+                        return Result.Err("invalid \\uXXXX escape")
+                    }
+                    let hexpart: str = line.slice(i + 2, i + 6)
+                    let mut h: int = 0
+                    let mut ok: bool = true
+                    while h < hexpart.len() {
+                        let hc: int = hexpart.byte_at(h)
+                        if !((hc >= 48 && hc <= 57) || (hc >= 97 && hc <= 102)
+                        || (hc >= 65 && hc <= 70)) {
+                            ok = false
+                        }
+                        h = h + 1
+                    }
+                    if !ok {
+                        return Result.Err("invalid \\uXXXX escape")
+                    }
+                    out.push(line.slice(i, i + 6))
+                    i = i + 6
+                    continue
+                }
+                out.push(line.slice(i, i + 2))
+                i = i + 2
+                continue
+            }
+            if c == 34 {
                 in_str = false
             }
+            out.push(chr(c))
             i = i + 1
             continue
         }
         if c == 34 {
             in_str = true
+            out.push(chr(c))
             i = i + 1
             continue
         }
-        if c == 35 {  # `#` — comment to end of line
+        if c == 35 {
             break
         }
-        if c == 123 {  # `{`
-            delta = delta + 1
-        }
-        if c == 125 {  # `}`
-            delta = delta - 1
-        }
+        out.push(chr(c))
         i = i + 1
     }
-    return delta
+    if in_str {
+        return Result.Err("unterminated string literal")
+    }
+    return Result.Ok(join(out, ""))
 }
 
-# Strip leading whitespace from a line. Returns the line with no leading
-# spaces or tabs.
-fn lstrip(line: str) -> str {
-    let mut i: int = 0
-    while i < line.len() {
-        let c: int = line.byte_at(i)
-        if c != 32 && c != 9 {  # space or tab
-            break
+# parse_config_int(text, key) — the int half of the value grammar.
+fn parse_config_int(text: str, key: str) -> Result[int, str] {
+    let body: str = text
+    let mut digits: str = body
+    if body.len() > 0 && body.byte_at(0) == 45 {
+        digits = body.slice(1, body.len())
+    }
+    if digits.len() == 0 {
+        return Result.Err("key `" + key + "` wants an integer, got "
+        + repr_str(text))
+    }
+    let mut d: int = 0
+    while d < digits.len() {
+        if !is_digit(digits.byte_at(d)) {
+            return Result.Err("key `" + key + "` wants an integer, got "
+            + repr_str(text))
         }
-        i = i + 1
+        d = d + 1
     }
-    if i == 0 {
-        return line
+    # Range over the SIGNED value (a leading '-' widens the low side;
+    # only the closed 1..8 / 0..4 windows are legal either way).
+    let mut v: int = 0
+    let mut k: int = 0
+    let neg: bool = body.len() > 0 && body.byte_at(0) == 45
+    let ds: str = digits
+    while k < ds.len() {
+        v = v * 10 + (ds.byte_at(k) - 48)
+        k = k + 1
     }
-    return line.slice(i, line.len())
+    let mut signed: int = v
+    if neg {
+        signed = -v
+    }
+    if key_type(key) == 1 {
+        let lo: int = key_bound_lo(key)
+        let hi: int = key_bound_hi(key)
+        if signed < lo || signed > hi {
+            return Result.Err("key `" + key + "` out of range ("
+            + lo.to_str() + ".." + hi.to_str() + "), got "
+            + text)
+        }
+    }
+    return Result.Ok(signed)
 }
 
-fn main() -> int uses IO {
-    let argv: list[str] = args()
-    if argv.len() < 2 {
-        println("usage: hlfmt <input.hls> [output.hls]")
-        return 1
+# apply_config_value(cfg, key, ...) — validated by the caller per type.
+# parse_and_apply(text, key, cfg) parses the value half and writes it.
+fn parse_and_apply(text: str, key: str, cfg: FmtConfig) -> Result[bool, str] {
+    let t: int = key_type(key)
+    if t == 0 {
+        if text == "true" {
+            if key == "final_newline" {
+                cfg.final_newline = true
+            } else {
+                cfg.reindent_comments = true
+            }
+            return Result.Ok(true)
+        }
+        if text == "false" {
+            if key == "final_newline" {
+                cfg.final_newline = false
+            } else {
+                cfg.reindent_comments = false
+            }
+            return Result.Ok(true)
+        }
+        return Result.Err("key `" + key + "` wants true or false, got "
+        + repr_str(text))
     }
-    let in_path: str = argv.get(1)
-    let src: str = read_file(in_path)
+    if t == 1 {
+        let r: Result[int, str] = parse_config_int(text, key)
+        if result_is_err(r) {
+            return Result.Err(result_unwrap_err(r))
+        }
+        let v: int = result_unwrap(r)
+        if key == "indent_width" {
+            cfg.indent_width = v
+        } else {
+            cfg.max_blank_lines = v
+        }
+        return Result.Ok(true)
+    }
+    # String keys — one COMPLETE double-quoted string.
+    if !text.starts_with("\"") {
+        return Result.Err("key `" + key + "` wants a double-quoted "
+        + "string, got " + repr_str(text))
+    }
+    if text.len() < 2 || !text.ends_with("\"") {
+        return Result.Err("unterminated string value for `" + key + "`")
+    }
+    let val: str = text.slice(1, text.len() - 1)
+    if key == "indent_style" {
+        if val != "space" && val != "tab" {
+            return Result.Err("key `" + key + "` wants one of space/tab, "
+            + "got " + repr_str(val))
+        }
+        cfg.indent_style = val
+    }
+    return Result.Ok(true)
+}
 
-    # Split on `\n`. The native runtime's str.split handles bytes.
-    let lines: list[str] = src.split("\n")
-    let mut depth: int = 0
+# parse_config(text, origin) — the `.hlfmt.toml` grammar: flat
+# `key = value` lines, the optional [hlfmt] table, comments and blanks.
+# Starts from the defaults (the caller's cfg) so the returned config is
+# FULLY resolved. Err carries "origin:line: message".
+fn parse_config(text: str, origin: str, cfg: FmtConfig) -> Result[FmtConfig, str] {
+    let lines: list[str] = text.split("\n")
+    let seen: list[str] = []
     let mut i: int = 0
-    let mut out_path: str = ""
-    if argv.len() >= 3 {
-        out_path = argv.get(2)
-    }
-
-    # Build the output incrementally — for stdout, print as we go; for
-    # a file, accumulate into a buffer.
-    let mut output: str = ""
     while i < lines.len() {
-        let line: str = lines.get(i)
-        let stripped: str = lstrip(line)
-        # Skip the final empty line from the split (trailing newline).
-        if i == lines.len() - 1 && stripped.len() == 0 {
-            i = i + 1
-            continue
+        let lineno: int = i + 1
+        let raw: str = lines.get(i)
+        let stripped_r: Result[str, str] = strip_config_comment(raw)
+        if result_is_err(stripped_r) {
+            return Result.Err(origin + ":" + lineno.to_str() + ": "
+            + result_unwrap_err(stripped_r))
         }
-        # If the line starts with `}`, decrease depth BEFORE emitting.
-        if stripped.len() > 0 && stripped.byte_at(0) == 125 {  # `}`
-            depth = depth - 1
-            if depth < 0 {
-                depth = 0
+        let line: str = py_strip(result_unwrap(stripped_r))
+        if line != "" {
+            if line.starts_with("[") {
+                if !line.ends_with("]") {
+                    return Result.Err(origin + ":" + lineno.to_str()
+                    + ": unterminated table header")
+                }
+                let name: str = py_strip(line.slice(1, line.len() - 1))
+                if name != "hlfmt" {
+                    return Result.Err(origin + ":" + lineno.to_str()
+                    + ": unsupported table [" + name
+                    + "] — .hlfmt.toml accepts top-level keys or the "
+                    + "optional [hlfmt] table")
+                }
+            } else {
+                let eq: int = line.find("=")
+                if eq < 0 {
+                    return Result.Err(origin + ":" + lineno.to_str()
+                    + ": expected `key = value`, got " + repr_str(line))
+                }
+                let key: str = py_strip(line.slice(0, eq))
+                let rest: str = py_strip(line.slice(eq + 1, line.len()))
+                if !known_config_key(key) {
+                    return Result.Err(origin + ":" + lineno.to_str()
+                    + ": unknown key `" + key + "` (known keys: "
+                    + "final_newline, indent_style, indent_width, "
+                    + "max_blank_lines, reindent_comments)")
+                }
+                let mut dup: bool = false
+                let mut s: int = 0
+                while s < seen.len() {
+                    if seen.get(s) == key {
+                        dup = true
+                    }
+                    s = s + 1
+                }
+                if dup {
+                    return Result.Err(origin + ":" + lineno.to_str()
+                    + ": duplicate key `" + key + "`")
+                }
+                if rest == "" {
+                    return Result.Err(origin + ":" + lineno.to_str()
+                    + ": key `" + key + "` has no value")
+                }
+                seen.push(key)
+                let applied: Result[bool, str] = parse_and_apply(rest, key, cfg)
+                if result_is_err(applied) {
+                    return Result.Err(origin + ":" + lineno.to_str() + ": "
+                    + result_unwrap_err(applied))
+                }
             }
         }
-        # Emit the line with the current indent + stripped content.
-        let mut indent_str: str = ""
-        let mut j: int = 0
-        while j < depth {
-            indent_str = indent_str + "    "
-            j = j + 1
+        i = i + 1
+    }
+    return Result.Ok(cfg)
+}
+
+# path_dirname(p) — everything before the last slash ("/" when none).
+fn path_dirname(p: str) -> str {
+    let mut n: int = p.len()
+    while n > 1 && p.byte_at(n - 1) == 47 {
+        n = n - 1
+    }
+    let mut k: int = n - 1
+    while k >= 0 {
+        if p.byte_at(k) == 47 {
+            if k == 0 {
+                return "/"
+            }
+            return p.slice(0, k)
         }
-        output = output + indent_str + stripped + "\n"
-        # Update depth based on braces in this line.
-        depth = depth + brace_delta(stripped)
-        if depth < 0 {
-            depth = 0
+        k = k - 1
+    }
+    return "."
+}
+
+# abspath_guess(p) — anchor a relative path at the cwd (no symlink
+# resolution; the walk only needs the textual spine, like Python's
+# os.path.abspath without realpath).
+fn abspath_guess(p: str) -> str uses Proc {
+    if p.len() == 0 {
+        return cwd_get()
+    }
+    if p.byte_at(0) == 47 {
+        return p
+    }
+    return cwd_get() + "/" + p
+}
+
+# find_config(target_path) — walk from the target's directory UP to the
+# filesystem root; the first `.hlfmt.toml` wins ("" when none).
+fn find_config(target_path: str) -> str uses Fs, Proc {
+    let mut d: str = abspath_guess(target_path)
+    if file_exists(d) {
+        d = path_dirname(d)
+    }
+    while true {
+        let cand: str = d + "/.hlfmt.toml"
+        if file_exists(cand) {
+            return cand
+        }
+        let parent: str = path_dirname(d)
+        if parent == d {
+            return ""
+        }
+        d = parent
+    }
+    return ""
+}
+
+struct CfgResolved {
+    cfg: FmtConfig,
+    source: str # "" = the built-in defaults
+}
+
+# resolve_config(target, config_path, no_config) — precedence:
+# --no-config > --config PATH > discovery > defaults.
+fn resolve_config(target_path: str, config_path: str, no_config: bool)
+-> Result[CfgResolved, str] uses Fs, Proc {
+    let cfg: FmtConfig = default_config()
+    if no_config {
+        return Result.Ok(CfgResolved {
+            cfg: cfg, source: ""
+        })
+    }
+    if config_path != "" {
+        if !file_exists(config_path) {
+            return Result.Err("config file not found: " + config_path)
+        }
+        let r: Result[FmtConfig, str] = parse_config(read_file(config_path),
+        config_path, cfg)
+        if result_is_err(r) {
+            return Result.Err(result_unwrap_err(r))
+        }
+        return Result.Ok(CfgResolved {
+            cfg: result_unwrap(r),
+            source: config_path
+        })
+    }
+    if target_path != "" {
+        let found: str = find_config(target_path)
+        if found != "" {
+            let r2: Result[FmtConfig, str] = parse_config(read_file(found),
+            found, cfg)
+            if result_is_err(r2) {
+                return Result.Err(result_unwrap_err(r2))
+            }
+            return Result.Ok(CfgResolved {
+                cfg: result_unwrap(r2),
+                source: found
+            })
+        }
+    }
+    return Result.Ok(CfgResolved {
+        cfg: cfg, source: ""
+    })
+}
+
+# config_to_toml(cfg, source) — the --print-config rendering.
+fn config_to_toml(cfg: FmtConfig, source: str) -> str {
+    let lines: list[str] = []
+    lines.push("# resolved by hlfmt (Stage 117, v0.136.0-alpha)")
+    if source == "" {
+        lines.push("# source: built-in defaults (no .hlfmt.toml found)")
+    } else {
+        lines.push("# source: " + source)
+    }
+    let mut fn_str: str = "false"
+    if cfg.final_newline {
+        fn_str = "true"
+    }
+    lines.push("final_newline = " + fn_str)
+    lines.push("indent_style = \"" + cfg.indent_style + "\"")
+    lines.push("indent_width = " + cfg.indent_width.to_str())
+    lines.push("max_blank_lines = " + cfg.max_blank_lines.to_str())
+    let mut ri_str: str = "false"
+    if cfg.reindent_comments {
+        ri_str = "true"
+    }
+    lines.push("reindent_comments = " + ri_str)
+    return join(lines, "\n") + "\n"
+}
+
+# ============================================================================
+# Comment extraction (Stage 116/117) — every `#` comment, keyed by its
+# 1-based line, string-aware and attribute-aware.
+# ============================================================================
+
+# kind: 0 = no comment on the line, 1 = comment-only, 2 = trailing.
+struct CommentEntry {
+    kind: int,
+    body: str, # "only": the stripped body; "trailing": as written
+    raw_indent: str # "only": the raw source prefix (reindent=false)
+}
+
+# attr_opens(line, j) — line[j:] opens `#[` or `#![`.
+fn attr_opens(line: str, j: int) -> bool {
+    let n: int = line.len()
+    if j + 1 < n && line.byte_at(j + 1) == 91 {
+        return true
+    }
+    if j + 2 < n && line.byte_at(j + 1) == 33 && line.byte_at(j + 2) == 91 {
+        return true
+    }
+    return false
+}
+
+# skip_attribute(line, j) — index just past the closing `]` of the
+# attribute group opening at j (bracket-depth and string aware).
+fn skip_attribute(line: str, j: int) -> int {
+    let mut depth: int = 0
+    let mut in_str: bool = false
+    let n: int = line.len()
+    let mut k: int = j
+    while k < n {
+        let c: int = line.byte_at(k)
+        if in_str {
+            if c == 92 && k + 1 < n {
+                k = k + 2
+                continue
+            }
+            if c == 34 {
+                in_str = false
+            }
+            k = k + 1
+            continue
+        }
+        if c == 34 {
+            in_str = true
+        } else if c == 91 {
+            depth = depth + 1
+        } else if c == 93 {
+            depth = depth - 1
+            if depth <= 0 {
+                return k + 1
+            }
+        }
+        k = k + 1
+    }
+    return n
+}
+
+# extract_comments(src) — one entry per source line (index = line - 1).
+fn extract_comments(src: str) -> list[CommentEntry] {
+    let lines: list[str] = src.split("\n")
+    let out: list[CommentEntry] = []
+    let mut i: int = 0
+    while i < lines.len() {
+        out.push(CommentEntry {
+            kind: 0, body: "", raw_indent: ""
+        })
+        i = i + 1
+    }
+    i = 0
+    while i < lines.len() {
+        let line: str = lines.get(i)
+        let mut in_str: bool = false
+        let mut j: int = 0
+        let n: int = line.len()
+        while j < n {
+            let c: int = line.byte_at(j)
+            if in_str {
+                if c == 92 && j + 1 < n {
+                    j = j + 2
+                    continue
+                }
+                if c == 34 {
+                    in_str = false
+                }
+                j = j + 1
+                continue
+            }
+            if c == 34 {
+                in_str = true
+                j = j + 1
+                continue
+            }
+            if c == 35 {
+                if attr_opens(line, j) {
+                    j = skip_attribute(line, j)
+                    continue
+                }
+                let e: CommentEntry = out.get(i)
+                if py_strip(line.slice(0, j)) == "" {
+                    e.kind = 1
+                    e.body = py_strip(line.slice(j, line.len()))
+                    e.raw_indent = line.slice(0, j)
+                } else {
+                    e.kind = 2
+                    e.body = py_rstrip(line.slice(j, line.len()))
+                }
+                break
+            }
+            j = j + 1
         }
         i = i + 1
     }
+    return out
+}
 
-    if out_path.len() == 0 || out_path == "-" {
-        print(output)
-    } else {
-        write_file(out_path, output)
-        println("Wrote " + out_path)
+# ============================================================================
+# The formatter core — the token walk.
+# ============================================================================
+
+# The whitespace law tables (kind-guarded: symbol rules apply only to
+# sym tokens, so a string literal holding `]` never matches).
+fn is_word_kind(k: str) -> bool {
+    return k == "kw" || k == "ident" || k == "int" || k == "float"
+    || k == "str"
+}
+
+fn in_no_space_before(v: str) -> bool {
+    return v == "(" || v == "[" || v == "." || v == "," || v == ")"
+    || v == "]" || v == "?" || v == ":"
+}
+
+fn in_no_space_after(v: str) -> bool {
+    return v == "(" || v == "[" || v == "." || v == "!" || v == "?"
+}
+
+fn in_space_after_syms(v: str) -> bool {
+    return v == "," || v == ":" || v == "=" || v == "==" || v == "!="
+    || v == "<=" || v == ">=" || v == "->" || v == "=>" || v == "+"
+    || v == "-" || v == "*" || v == "/" || v == "%" || v == "<"
+    || v == ">" || v == "&&" || v == "||"
+}
+
+fn in_space_before_syms(v: str) -> bool {
+    return v == "{" || v == "}" || v == "=>" || v == "->" || v == "+"
+    || v == "-" || v == "*" || v == "/" || v == "%" || v == "<"
+    || v == ">" || v == "=" || v == "==" || v == "!=" || v == "<="
+    || v == ">=" || v == "&&" || v == "||" || v == ","
+}
+
+# render_token(t) — the token as source text (strings re-escaped with
+# the four escapes the lexer accepts; int/float re-emit their RAW text
+# so a float like 0.00001 never survives as 1e-05).
+fn render_token(t: Tok) -> Result[str, str] {
+    if t.k == "str" {
+        let out: list[str] = ["\""]
+        let v: str = t.v
+        let mut i: int = 0
+        while i < v.len() {
+            let b: int = v.byte_at(i)
+            if b == 34 {
+                out.push("\\\"")
+            } else if b == 92 {
+                out.push("\\\\")
+            } else if b == 10 {
+                out.push("\\n")
+            } else if b == 9 {
+                out.push("\\t")
+            } else if b < 32 {
+                let hex: str = "0123456789abcdef"
+                let hi: int = b / 16
+                let lo: int = b % 16
+                return Result.Err("string literal contains control byte 0x"
+                + hex.slice(hi, hi + 1) + hex.slice(lo, lo + 1)
+                + " which cannot be represented in HLS string syntax "
+                + "(only \\n, \\t, \\\\, and \\\" escapes are supported)")
+            } else {
+                out.push(chr(b))
+            }
+            i = i + 1
+        }
+        out.push("\"")
+        return Result.Ok(join(out, ""))
     }
+    if t.raw != "" {
+        return Result.Ok(t.raw)
+    }
+    return Result.Ok(t.v)
+}
+
+# The walker's mutable state (structs pass by reference — the same
+# discipline the acceptance harness uses).
+struct FmtState {
+    cfg: FmtConfig,
+    out: list[str], # emitted output lines
+    parts: list[str], # the current line's parts
+    indent: int, # current brace depth
+    comments: list[CommentEntry],
+    code_line: list[bool] # 1-based line carries real tokens?
+}
+
+# st_indent_str(st) — the indent unit (width spaces, or one tab).
+fn st_indent_str(st: FmtState) -> str {
+    if st.cfg.indent_style == "tab" {
+        return str_repeat("\t", st.indent)
+    }
+    return str_repeat(" ", st.cfg.indent_width * st.indent)
+}
+
+# st_trailing_blanks(st) — the run of "" currently ending the output.
+fn st_trailing_blanks(st: FmtState) -> int {
+    let mut k: int = 0
+    let mut i: int = st.out.len() - 1
+    while i >= 0 {
+        if st.out.get(i) == "" {
+            k = k + 1
+        } else {
+            break
+        }
+        i = i - 1
+    }
+    return k
+}
+
+# st_emit_cur_line(st, force_blank) — flush the current line (blank-cap
+# law on force_blank).
+fn st_emit_cur_line(st: FmtState, force_blank: bool) -> void {
+    let line: str = py_rstrip(join(st.parts, ""))
+    if line != "" {
+        st.out.push(line)
+    } else if force_blank && st.out.len() > 0 {
+        if st_trailing_blanks(st) < st.cfg.max_blank_lines {
+            st.out.push("")
+        }
+    }
+    st.parts = []
+}
+
+# st_attach_trailing(st, ln) — append line ln's trailing comment to the
+# last emitted line, exactly once (at leave-time).
+fn st_attach_trailing(st: FmtState, ln: int) -> void {
+    if st.out.len() == 0 {
+        return
+    }
+    if ln < 1 || ln > st.comments.len() {
+        return
+    }
+    let cmt: CommentEntry = st.comments.get(ln - 1)
+    if cmt.kind == 2 && py_strip(cmt.body) != "" {
+        let last: int = st.out.len() - 1
+        st.out.set(last, py_rstrip(st.out.get(last) + " " + cmt.body))
+    }
+}
+
+# st_emit_comment_line(st, ln) — emit line ln's comment-only entry at the
+# canonical block indent (or the raw prefix when reindent is off).
+fn st_emit_comment_line(st: FmtState, ln: int) -> bool {
+    if ln < 1 || ln > st.comments.len() {
+        return false
+    }
+    let cmt: CommentEntry = st.comments.get(ln - 1)
+    if cmt.kind == 1 && py_strip(cmt.body) != ""
+    && !st.code_line.get(ln - 1) {
+        if st.cfg.reindent_comments {
+            st.out.push(st_indent_str(st) + cmt.body)
+        } else {
+            st.out.push(cmt.raw_indent + cmt.body)
+        }
+        return true
+    }
+    return false
+}
+
+# st_walk_gap(st, target_line) — the shared gap logic: flush the current
+# line, attach its trailing comment, walk every source line between here
+# and the token (comment-only lines emitted, intentional blanks kept
+# under the cap).
+fn st_walk_gap(st: FmtState, cur_line_num: int, target_line: int) -> int {
+    let gap: int = target_line - cur_line_num
+    if gap > 0 {
+        let had_pending: bool = st.parts.len() > 0
+        st_emit_cur_line(st, false)
+        st_attach_trailing(st, cur_line_num)
+        if !had_pending {
+            st_emit_comment_line(st, cur_line_num)
+        }
+        let mut ln: int = cur_line_num + 1
+        while ln < target_line {
+            if !st_emit_comment_line(st, ln) {
+                st_emit_cur_line(st, true)
+            }
+            ln = ln + 1
+        }
+        return target_line
+    }
+    return cur_line_num
+}
+
+# format_source(src, cfg) — the token walk. Ok(formatted) — a LEX error
+# is a warning plus byte-identical passthrough; Err only for a string
+# literal that HLS syntax cannot re-represent.
+fn format_source(src: str, cfg: FmtConfig) -> Result[str, str] uses IO {
+    let toks_r: Result[list[Tok], str] = tokenize(src)
+    if result_is_err(toks_r) {
+        eprintln("warning: " + result_unwrap_err(toks_r))
+        return Result.Ok(src)
+    }
+    let toks: list[Tok] = result_unwrap(toks_r)
+    let st: FmtState = FmtState {
+        cfg: cfg,
+        out: [],
+        parts: [],
+        indent: 0,
+        comments: extract_comments(src),
+        code_line: []
+    }
+    let mut cl: int = 0
+    while cl < st.comments.len() {
+        st.code_line.push(false)
+        cl = cl + 1
+    }
+    let mut ti: int = 0
+    while ti < toks.len() {
+        let t: Tok = toks.get(ti)
+        if t.k != "eof" {
+            let li: int = t.line - 1
+            if li >= 0 && li < st.code_line.len() {
+                st.code_line.set(li, true)
+            }
+        }
+        ti = ti + 1
+    }
+
+    let mut cur_line_num: int = 1
+    let mut prev: Tok = Tok {
+        k: "", v: "", raw: "", line: 0, col: 0
+    }
+    let mut has_prev: bool = false
+    let mut pending_unary: bool = false
+    let mut i: int = 0
+    let n: int = toks.len()
+    while i < n {
+        let t: Tok = toks.get(i)
+        if t.k == "eof" {
+            cur_line_num = st_walk_gap(st, cur_line_num, t.line)
+            st_emit_cur_line(st, false)
+            st_attach_trailing(st, cur_line_num)
+            break
+        }
+        # Advance over the gap (blank/comment lines) before the token.
+        cur_line_num = st_walk_gap(st, cur_line_num, t.line)
+        if t.k == "sym" && t.v == "{" {
+            # Open brace: space before, flush, indent in.
+            if st.parts.len() > 0
+            && !st.parts.get(st.parts.len() - 1).ends_with(" ") {
+                st.parts.push(" ")
+            }
+            st.parts.push("{")
+            st_emit_cur_line(st, false)
+            st.indent = st.indent + 1
+            prev = t
+            has_prev = true
+            i = i + 1
+            continue
+        }
+        if t.k == "sym" && t.v == "}" {
+            # Close brace: flush, indent out, emit `}`; peek for a
+            # same-line continuation (`,` `)` `]` `;` `=>` or `else`).
+            st_emit_cur_line(st, false)
+            if st.indent > 0 {
+                st.indent = st.indent - 1
+            }
+            st.parts.push(st_indent_str(st))
+            st.parts.push("}")
+            let mut nxt_k: str = ""
+            let mut nxt_v: str = ""
+            let mut has_nxt: bool = false
+            if i + 1 < n {
+                let nt: Tok = toks.get(i + 1)
+                nxt_k = nt.k
+                nxt_v = nt.v
+                has_nxt = true
+            }
+            if has_nxt && nxt_k == "sym" && (nxt_v == "," || nxt_v == ")"
+            || nxt_v == "]" || nxt_v == ";" || nxt_v == "=>") {
+                # the next iteration's whitespace logic keeps the line
+            } else if has_nxt && nxt_k == "kw" && nxt_v == "else" {
+                if st.parts.len() > 0
+                && !st.parts.get(st.parts.len() - 1).ends_with(" ") {
+                    st.parts.push(" ")
+                }
+            } else {
+                st_emit_cur_line(st, false)
+            }
+            prev = t
+            has_prev = true
+            i = i + 1
+            continue
+        }
+        # Regular token: indent a fresh line, then the whitespace law.
+        if st.parts.len() == 0 {
+            st.parts.push(st_indent_str(st))
+        }
+        if has_prev {
+            let prev_v: str = prev.v
+            let cur_v: str = t.v
+            let prev_kind: str = prev.k
+            let cur_kind: str = t.k
+            let prev_is_sym: bool = prev_kind == "sym"
+            let cur_is_sym: bool = cur_kind == "sym"
+            let mut need_space: bool = false
+            # Rule 1: two word-like tokens.
+            if is_word_kind(prev_kind) && is_word_kind(cur_kind) {
+                need_space = true
+            }
+            # Rule 2: closing `)` / `]` then a word.
+            if prev_is_sym && (prev_v == ")" || prev_v == "]")
+            && is_word_kind(cur_kind) {
+                need_space = true
+            }
+            # Rule 3: a word/closer before a sym with a space-before law.
+            if(is_word_kind(prev_kind)
+            || (prev_is_sym && (prev_v == ")" || prev_v == "]")))
+            && cur_is_sym && in_space_before_syms(cur_v) {
+                need_space = true
+            }
+            # Rule 4: a binop before a word or an opener.
+            if prev_is_sym && in_space_after_syms(prev_v)
+            && (is_word_kind(cur_kind)
+            || (cur_is_sym && (cur_v == "(" || cur_v == "["))) {
+                need_space = true
+            }
+            # Override: no space before closers/commas — except a binop
+            # still keeps its space before `(` / `[`.
+            if cur_is_sym && in_no_space_before(cur_v)
+            && !(prev_is_sym && in_space_after_syms(prev_v)
+            && (cur_v == "(" || cur_v == "[")) {
+                need_space = false
+            }
+            # Override: no space after openers/members/unary-not.
+            if prev_is_sym && in_no_space_after(prev_v) {
+                need_space = false
+            }
+            # Unary `!` after a word or operator keeps its space.
+            if cur_is_sym && cur_v == "!"
+            && (is_word_kind(prev_kind)
+            || (prev_is_sym && in_space_after_syms(prev_v))) {
+                need_space = true
+            }
+            # The asm! postfix `!` hugs the keyword.
+            if cur_is_sym && cur_v == "!" && prev_kind == "kw"
+            && prev_v == "asm" {
+                need_space = false
+            }
+            # Never double spaces; never a leading space.
+            if st.parts.len() > 0
+            && st.parts.get(st.parts.len() - 1).ends_with(" ") {
+                need_space = false
+            }
+            if st.parts.len() == 1
+            && py_strip(st.parts.get(0)) == "" {
+                need_space = false
+            }
+            # Unary minus folds onto its operand.
+            if pending_unary {
+                need_space = false
+                pending_unary = false
+            }
+            if cur_is_sym && cur_v == "-"
+            && (prev_v == "return"
+            || !(is_word_kind(prev_kind)
+            || (prev_is_sym && (prev_v == ")"
+            || prev_v == "]")))) {
+                pending_unary = true
+                if(prev_is_sym && in_space_after_syms(prev_v))
+                || prev_v == "return" {
+                    need_space = true
+                }
+            }
+            if need_space {
+                st.parts.push(" ")
+            }
+        }
+        let rendered: Result[str, str] = render_token(t)
+        if result_is_err(rendered) {
+            return Result.Err(result_unwrap_err(rendered))
+        }
+        st.parts.push(result_unwrap(rendered))
+        prev = t
+        has_prev = true
+        i = i + 1
+    }
+    st_emit_cur_line(st, false)
+    # Drop trailing blanks; pin the final newline.
+    while st.out.len() > 0 && st.out.get(st.out.len() - 1) == "" {
+        st.out.pop()
+    }
+    let result: str = join(st.out, "\n")
+    if st.cfg.final_newline && !result.ends_with("\n") {
+        return Result.Ok(result + "\n")
+    }
+    return Result.Ok(result)
+}
+
+# ============================================================================
+# The unified diff (the -d mode) — a Myers line diff with unified
+# hunks. Only user-facing (no gate byte-pins its grouping), but it is
+# honest: a real minimal edit script, context shown, deletions and
+# insertions in file order.
+# ============================================================================
+
+# diff_lines(a, b) — the Myers O((N+M)D) edit script as a list of
+# (tag, line): tag -1 = delete from a, 1 = insert from b, 0 = equal.
+struct DiffOp {
+    tag: int,
+    line: str
+}
+
+fn diff_lines(a: list[str], b: list[str]) -> list[DiffOp] {
+    let ops: list[DiffOp] = []
+    let n: int = a.len()
+    let m: int = b.len()
+    # Trim the common prefix and suffix first (the usual case: a format
+    # pass changes a handful of interior lines).
+    let mut pre: int = 0
+    while pre < n && pre < m && a.get(pre) == b.get(pre) {
+        pre = pre + 1
+    }
+    let mut suf: int = 0
+    while suf < n - pre && suf < m - pre
+    && a.get(n - 1 - suf) == b.get(m - 1 - suf) {
+        suf = suf + 1
+    }
+    let mut i: int = 0
+    while i < pre {
+        ops.push(DiffOp {
+            tag: 0, line: a.get(i)
+        })
+        i = i + 1
+    }
+    let a_mid: list[str] = []
+    i = pre
+    while i < n - suf {
+        a_mid.push(a.get(i))
+        i = i + 1
+    }
+    let b_mid: list[str] = []
+    i = pre
+    while i < m - suf {
+        b_mid.push(b.get(i))
+        i = i + 1
+    }
+    # Middle: Myers with a single forward pass over d.
+    let an: int = a_mid.len()
+    let bn: int = b_mid.len()
+    if an == 0 && bn == 0 {
+        # nothing in the middle
+    } else if an == 0 {
+        let mut k2: int = 0
+        while k2 < bn {
+            ops.push(DiffOp {
+                tag: 1, line: b_mid.get(k2)
+            })
+            k2 = k2 + 1
+        }
+    } else if bn == 0 {
+        let mut k2: int = 0
+        while k2 < an {
+            ops.push(DiffOp {
+                tag: -1, line: a_mid.get(k2)
+            })
+            k2 = k2 + 1
+        }
+    } else {
+        # LCS by table, O(an*bn) — fine for the source-file diffs -d
+        # serves (the common prefix/suffix trim keeps the middle small).
+        let w: int = an + 1
+        let table: list[int] = []
+        let mut zi: int = 0
+        while zi < w * (bn + 1) {
+            table.push(0)
+            zi = zi + 1
+        }
+        let mut fb: int = bn
+        while fb > 0 {
+            let mut fa: int = an
+            while fa > 0 {
+                let idx: int = fa * w + fb
+                if a_mid.get(fa - 1) == b_mid.get(fb - 1) {
+                    table.set(idx, table.get((fa + 1) * w + fb + 1) + 1)
+                } else {
+                    let down: int = table.get(fa * w + fb + 1)
+                    let right: int = table.get((fa + 1) * w + fb)
+                    if down >= right {
+                        table.set(idx, down)
+                    } else {
+                        table.set(idx, right)
+                    }
+                }
+                fa = fa - 1
+            }
+            fb = fb - 1
+        }
+        # Walk the table: 0-based ai/bi cursors into a_mid/b_mid.
+        let mut ai: int = 0
+        let mut bi: int = 0
+        while ai < an && bi < bn {
+            if a_mid.get(ai) == b_mid.get(bi) {
+                ops.push(DiffOp {
+                    tag: 0, line: a_mid.get(ai)
+                })
+                ai = ai + 1
+                bi = bi + 1
+            } else if table.get((ai + 1) * w + bi + 1) >= table.get((ai + 1) * w + bi) {
+                ops.push(DiffOp {
+                    tag: -1, line: a_mid.get(ai)
+                })
+                ai = ai + 1
+            } else {
+                ops.push(DiffOp {
+                    tag: 1, line: b_mid.get(bi)
+                })
+                bi = bi + 1
+            }
+        }
+        while ai < an {
+            ops.push(DiffOp {
+                tag: -1, line: a_mid.get(ai)
+            })
+            ai = ai + 1
+        }
+        while bi < bn {
+            ops.push(DiffOp {
+                tag: 1, line: b_mid.get(bi)
+            })
+            bi = bi + 1
+        }
+    }
+    i = n - suf
+    while i < n {
+        ops.push(DiffOp {
+            tag: 0, line: a.get(i)
+        })
+        i = i + 1
+    }
+    return ops
+}
+
+# unified_diff(a, b, fromfile, tofile) — unified hunks with 3 context
+# lines, difflib's header shape (no timestamps).
+fn unified_diff(a: list[str], b: list[str], fromfile: str, tofile: str) -> str {
+    let ops: list[DiffOp] = diff_lines(a, b)
+    let out: list[str] = []
+    let ctx: int = 3
+    let mut i: int = 0
+    let n: int = ops.len()
+    let mut a_pos: int = 0
+    let mut b_pos: int = 0
+    let mut any_hunk: bool = false
+    while i < n {
+        if ops.get(i).tag != 0 {
+            # A change block: back up `ctx` equals, emit the hunk.
+            let mut start: int = i
+            let mut back: int = 0
+            while start > 0 && ops.get(start - 1).tag == 0 && back < ctx {
+                start = start - 1
+                back = back + 1
+            }
+            # a_pos/b_pos count lines consumed BEFORE `start`.
+            let mut sa: int = 0
+            let mut sb: int = 0
+            let mut k: int = 0
+            while k < start {
+                if ops.get(k).tag == 0 {
+                    sa = sa + 1
+                    sb = sb + 1
+                } else if ops.get(k).tag == -1 {
+                    sa = sa + 1
+                } else {
+                    sb = sb + 1
+                }
+                k = k + 1
+            }
+            # Extend the hunk to its last change + ctx forward.
+            let mut j: int = i
+            let mut last_change: int = i
+            while j < n {
+                if ops.get(j).tag != 0 {
+                    last_change = j
+                }
+                j = j + 1
+            }
+            # Merge policy: extend while the next change is within
+            # 2*ctx equals (difflib's grouping).
+            let mut end: int = last_change + 1
+            let mut fwd: int = 0
+            while end < n && ops.get(end).tag == 0 && fwd < ctx {
+                end = end + 1
+                fwd = fwd + 1
+            }
+            # Count the hunk's span.
+            let mut ha: int = 0
+            let mut hb: int = 0
+            k = start
+            while k < end {
+                if ops.get(k).tag == 0 {
+                    ha = ha + 1
+                    hb = hb + 1
+                } else if ops.get(k).tag == -1 {
+                    ha = ha + 1
+                } else {
+                    hb = hb + 1
+                }
+                k = k + 1
+            }
+            any_hunk = true
+            let mut ra: str = hunk_range(sa, ha)
+            if sa == 0 {
+                ra = "0,0"
+            }
+            let mut rb: str = hunk_range(sb, hb)
+            if sb == 0 {
+                rb = "0,0"
+            }
+            out.push("--- " + fromfile)
+            out.push("+++ " + tofile)
+            out.push("@@ -" + ra + " +" + rb + " @@")
+            k = start
+            while k < end {
+                if ops.get(k).tag == 0 {
+                    out.push(" " + ops.get(k).line)
+                } else if ops.get(k).tag == -1 {
+                    out.push("-" + ops.get(k).line)
+                } else {
+                    out.push("+" + ops.get(k).line)
+                }
+                k = k + 1
+            }
+            i = end
+        } else {
+            i = i + 1
+        }
+    }
+    if !any_hunk {
+        return ""
+    }
+    return join(out, "\n") + "\n"
+}
+
+# hunk_range(start, count) — "start" when count == 1, else "start,count".
+fn hunk_range(start: int, count: int) -> str {
+    if count == 1 {
+        return start.to_str()
+    }
+    return start.to_str() + "," + count.to_str()
+}
+
+# ============================================================================
+# The CLI.
+# ============================================================================
+
+# splitlines_keepends(text) — Python's splitlines(keepends=True): every
+# line WITH its terminator, "" for the empty string input.
+fn splitlines_keepends(text: str) -> list[str] {
+    if text == "" {
+        return[]
+    }
+    let out: list[str] = []
+    let n: int = text.len()
+    let mut i: int = 0
+    let mut start: int = 0
+    while i < n {
+        let c: int = text.byte_at(i)
+        if c == 10 {
+            out.push(text.slice(start, i + 1))
+            start = i + 1
+        } else if c == 13 {
+            if i + 1 < n && text.byte_at(i + 1) == 10 {
+                out.push(text.slice(start, i + 2))
+                start = i + 2
+                i = i + 1
+            } else {
+                out.push(text.slice(start, i + 1))
+                start = i + 1
+            }
+        }
+        i = i + 1
+    }
+    if start < n {
+        out.push(text.slice(start, n))
+    }
+    return out
+}
+
+fn usage_text() -> str {
+    return "usage: hlfmt [-h] [-w] [-c] [-d] [--config PATH] "
+    + "[--no-config] [--print-config] file"
+}
+
+fn main() -> int uses IO, Fs, Args, Exit, Proc {
+    let argv: list[str] = args()
+    let mut file: str = ""
+    let mut want_write: bool = false
+    let mut want_check: bool = false
+    let mut want_diff: bool = false
+    let mut config_path: str = ""
+    let mut no_config: bool = false
+    let mut want_print_config: bool = false
+    let mut i: int = 1
+    while i < argv.len() {
+        let a: str = argv.get(i)
+        if a == "-w" || a == "--write" {
+            want_write = true
+        } else if a == "-c" || a == "--check" {
+            want_check = true
+        } else if a == "-d" || a == "--diff" {
+            want_diff = true
+        } else if a == "--no-config" {
+            no_config = true
+        } else if a == "--print-config" {
+            want_print_config = true
+        } else if a == "--config" {
+            if i + 1 >= argv.len() {
+                eprintln(usage_text())
+                eprintln("hlfmt: error: argument --config: expected one "
+                + "argument")
+                return 2
+            }
+            i = i + 1
+            config_path = argv.get(i)
+        } else if a.starts_with("--config=") {
+            config_path = a.slice(9, a.len())
+        } else if a == "-h" || a == "--help" {
+            println(usage_text())
+            println("")
+            println("hlfmt — opinionated formatter for Halis (HLS)")
+            println("")
+            println("positional arguments:")
+            println("  file                  HLS source file to format")
+            println("")
+            println("options:")
+            println("  -h, --help            show this help message and exit")
+            println("  -w, --write           write back to file")
+            println("  -c, --check           exit non-zero if not formatted")
+            println("  -d, --diff           print unified diff")
+            println("  --config PATH         pin one .hlfmt.toml")
+            println("  --no-config          ignore config discovery")
+            println("  --print-config        print the resolved config")
+            return 0
+        } else if a.len() > 1 && a.byte_at(0) == 45 {
+            eprintln(usage_text())
+            eprintln("hlfmt: error: unrecognized arguments: " + a)
+            return 2
+        } else {
+            if file != "" {
+                eprintln(usage_text())
+                eprintln("hlfmt: error: unrecognized arguments: " + a)
+                return 2
+            }
+            file = a
+        }
+        i = i + 1
+    }
+    if file == "" {
+        eprintln(usage_text())
+        eprintln("hlfmt: error: the following arguments are required: file")
+        return 2
+    }
+    if config_path != "" && no_config {
+        eprintln("error: --config and --no-config are mutually exclusive")
+        return 2
+    }
+    if !file_exists(file) {
+        eprintln("error: file not found: " + file)
+        return 1
+    }
+    let resolved: Result[CfgResolved, str] = resolve_config(file, config_path,
+    no_config)
+    if result_is_err(resolved) {
+        eprintln("error: " + result_unwrap_err(resolved))
+        return 2
+    }
+    let res: CfgResolved = result_unwrap(resolved)
+    if want_print_config {
+        print(config_to_toml(res.cfg, res.source))
+        return 0
+    }
+    let src: str = read_file(file)
+    let formatted_r: Result[str, str] = format_source(src, res.cfg)
+    if result_is_err(formatted_r) {
+        eprintln("error: " + result_unwrap_err(formatted_r))
+        return 1
+    }
+    let formatted: str = result_unwrap(formatted_r)
+    if want_check {
+        if formatted == src {
+            println(file + ": already formatted")
+            return 0
+        }
+        println(file + ": NOT formatted")
+        return 1
+    }
+    if want_diff {
+        let orig_lines: list[str] = splitlines_keepends(src)
+        let new_lines: list[str] = splitlines_keepends(formatted)
+        print(unified_diff_lines(orig_lines, new_lines, file, file + ".fmt"))
+        return 0
+    }
+    if want_write {
+        write_file(file, formatted)
+        println(file + ": formatted")
+        return 0
+    }
+    print(formatted)
     return 0
+}
+
+# unified_diff_lines — the -d driver over keepends lines (the header
+# hunks strip each line's terminator for display, like difflib).
+fn unified_diff_lines(orig: list[str], new: list[str], fromfile: str,
+tofile: str) -> str {
+    let a: list[str] = []
+    let mut i: int = 0
+    while i < orig.len() {
+        a.push(py_rstrip_newline(orig.get(i)))
+        i = i + 1
+    }
+    let b: list[str] = []
+    i = 0
+    while i < new.len() {
+        b.push(py_rstrip_newline(new.get(i)))
+        i = i + 1
+    }
+    return unified_diff(a, b, fromfile, tofile)
+}
+
+fn py_rstrip_newline(s: str) -> str {
+    let cr: str = chr(13)
+    if s.ends_with(cr + "\n") {
+        return s.slice(0, s.len() - 2)
+    }
+    if s.ends_with("\n") || s.ends_with(cr) {
+        return s.slice(0, s.len() - 1)
+    }
+    return s
 }

@@ -1,0 +1,679 @@
+# ============================================================================
+# tests/acc/fmt_config_acceptance.hls — Stage 117 acceptance gate, in
+# Halis (the twin of what was tests/fmt_config_acceptance.py; same
+# eight sections, same needles). The formatter under test is the native
+# bin/hlfmt — the in-process calls the Python battery made
+# (format_source / parse_config / resolve_config) are asked through
+# the front door: the CLI, its files and its exit codes.
+# ----------------------------------------------------------------------------
+# Run with `make fmt-config-acceptance` (which compiles this file to
+# bin/acc-fmt-config and runs it from the repo root).
+#
+#  1. the discovery   — the nearest .hlfmt.toml wins; --config pins one
+#                      file; --no-config ignores discovery
+#  2. the knobs      — each key does exactly what it says
+#  3. the strictness  — a typo is an error (exit 2, file and line), and
+#                      a bad config never touches the target file
+#  4. the grammar    — the accepted surface parses; --print-config
+#                      reflects it and round-trips
+#  5. the fixed point — every knob combination formats as a fixed
+#                      point under itself; an empty config is the
+#                      byte-identical to the defaults
+#  6. the default law — no file means the Stage 116 constants
+#  7. the differential— a config pass preserves semantics (the oracle
+#                      leg: interpreter == native before and after)
+#  8. the corpus      — idempotent under the defaults and a sampled
+#                      alternate config, comment sets preserved
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+
+# ----------------------------------------------------------------------------
+# Fixtures.
+# ----------------------------------------------------------------------------
+
+fn messy_src() -> str {
+    return "fn add(a: int,   b: int) -> int {\n"
+    + "return a+b\n"
+    + "}\n"
+    + "\n"
+    + "\n"
+    + "\n"
+    + "fn main() -> int uses IO {\n"
+    + "        # a stale deep note\n"
+    + "let x: int = add(1, 2)\n"
+    + "println(x.to_str())  # trailing\n"
+    + "return 0\n"
+    + "}\n"
+}
+
+fn unformatted_src() -> str {
+    return "fn f() -> int {\n"
+    + "if true {\n"
+    + "return 1\n"
+    + "}\n"
+    + "return 0\n"
+    + "}\n"
+}
+
+# fmt_out(acc, name, src, extra_args) — one pass through bin/hlfmt with
+# the given extra CLI args (e.g. ["--config", path]).
+fn fmt_out(acc: Acc, name: str, src: str, extra: list[str]) -> str
+uses Fs, Proc {
+    let p: str = write_src(acc, name, src)
+    let argv: list[str] = []
+    let mut i: int = 0
+    while i < extra.len() {
+        argv.push(extra.get(i))
+        i = i + 1
+    }
+    argv.push(p)
+    let r: RunResult = run_capture("./bin/hlfmt", argv)
+    return r.out
+}
+
+# idem_out(acc, name, src, extra) — format twice under the same config;
+# returns [out1, "1"/"0"].
+fn idem_out(acc: Acc, name: str, src: str, extra: list[str]) -> list[str]
+uses Fs, Proc {
+    let out1: str = fmt_out(acc, name, src, extra)
+    let out2: str = fmt_out(acc, name + ".p2", out1, extra)
+    let r: list[str] = [out1]
+    if out2 == out1 {
+        r.push("1")
+    } else {
+        r.push("0")
+    }
+    return r
+}
+
+# cfg_toml(acc, name, text) — write a config file, return its path.
+fn cfg_toml(acc: Acc, name: str, text: str) -> str uses Fs, Proc {
+    return write_src(acc, name, text)
+}
+
+fn ct(n: int) -> str {
+    return n.to_str()
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let acc: Acc = acc_new("fmt-config")
+    let corpus: str = "tests/ok/feat_stage117_fmt_config.hls"
+    let messy: str = messy_src()
+    let unform: str = unformatted_src()
+
+    section("1. the discovery: the nearest .hlfmt.toml wins")
+    # 1a. a config next to the file applies.
+    let root_a: str = cfg_toml(acc, "disc_a/.hlfmt.toml",
+    "indent_width = 2\n")
+    let f_a: str = write_src(acc, "disc_a/pkg/deep/thing.hls", unform)
+    let w_a: RunResult = run_capture("./bin/hlfmt", ["-w", f_a])
+    check(acc, "a config in the file's tree applies (2-space indents landed)",
+    w_a.code == 0 && read_file(f_a).contains("\n  if true {\n"),
+    clip(read_or(f_a, ""), 60))
+    # 1b. the NEAREST file wins: root sets 4, the subdir sets 2.
+    cfg_toml(acc, "disc_b/.hlfmt.toml", "indent_width = 4\n")
+    cfg_toml(acc, "disc_b/sub/.hlfmt.toml", "indent_width = 2\n")
+    let f_deep: str = write_src(acc, "disc_b/sub/inner.hls", unform)
+    let f_root: str = write_src(acc, "disc_b/toplevel.hls", unform)
+    run_capture("./bin/hlfmt", ["-w", f_deep])
+    run_capture("./bin/hlfmt", ["-w", f_root])
+    check(acc, "the nearest file wins for a deep target (2 spaces)",
+    read_file(f_deep).contains("\n  if true {\n"), "")
+    check(acc, "the root file keeps the root config (4 spaces)",
+    read_file(f_root).contains("\n    if true {\n"), "")
+    # 1c. --config pins one file and beats discovery.
+    let pin: str = cfg_toml(acc, "pinned.toml", "indent_width = 8\n")
+    let f_c: str = write_src(acc, "disc_c/thing.hls", unform)
+    run_capture("./bin/hlfmt", ["--config", pin, "-w", f_c])
+    check(acc, "--config pins a file outside the walk (8 spaces landed)",
+    read_file(f_c).contains("\n        if true {\n"), "")
+    # 1d. --no-config ignores discovery entirely.
+    let f_d: str = write_src(acc, "disc_a/no_cfg.hls", unform)
+    run_capture("./bin/hlfmt", ["--no-config", "-w", f_d])
+    check(acc, "--no-config ignores the discovered file (defaults won)",
+    read_file(f_d).contains("\n    if true {\n")
+    && !read_file(f_d).contains("\n  if true {\n"), "")
+    # 1e. no config anywhere means defaults.
+    let f_e: str = write_src(acc, "clean_zone/thing.hls", unform)
+    run_capture("./bin/hlfmt", ["-w", f_e])
+    check(acc, "no config anywhere resolves to the built-in defaults",
+    read_file(f_e).contains("\n    if true {\n"), "")
+    # 1f. the resolution anchors at the TARGET, not the cwd (front door:
+    # --print-config names the source file it resolved).
+    let pc_a: RunResult = run_capture("./bin/hlfmt", ["--print-config", f_a])
+    check(acc, "resolution anchors at the target file (source named)",
+    pc_a.code == 0 && pc_a.out.contains("# source: " + root_a)
+    && pc_a.out.contains("indent_width = 2"), clip(pc_a.out, 60))
+    let pc_d: RunResult = run_capture("./bin/hlfmt", ["--no-config",
+    "--print-config", f_d])
+    check(acc, "--no-config yields pure defaults",
+    pc_d.code == 0
+    && pc_d.out.contains("# source: built-in defaults")
+    && pc_d.out.contains("indent_width = 4")
+    && pc_d.out.contains("final_newline = true"), "")
+
+    section("2. the knobs: each key does what it says")
+    let w_sweep: list[int] = [1, 2, 3, 5, 8]
+    let mut wi: int = 0
+    while wi < w_sweep.len() {
+        let width: int = w_sweep.get(wi)
+        let cp: str = cfg_toml(acc, "w" + ct(width) + ".toml",
+        "indent_width = " + ct(width) + "\n")
+        let r: list[str] = idem_out(acc, "s2_w" + ct(width) + ".hls", unform,
+        ["--config", cp])
+        let unit: str = str_repeat(" ", width)
+        check(acc, "indent_width = " + ct(width) + " formats at "
+        + ct(width) + " spaces per level",
+        r.get(0).contains("\n" + str_repeat(unit, 2) + "return 1\n")
+        && r.get(1) == "1", clip(r.get(0), 40))
+        wi = wi + 1
+    }
+    let tabp: str = cfg_toml(acc, "tab.toml", "indent_style = \"tab\"\n")
+    let rt: list[str] = idem_out(acc, "s2_tab.hls", unform,
+    ["--config", tabp])
+    check(acc, "indent_style = \"tab\" emits one tab per level",
+    rt.get(0).contains("\n\t\treturn 1\n") && rt.get(1) == "1",
+    clip(rt.get(0), 40))
+    let fnlp: str = cfg_toml(acc, "fnl.toml", "final_newline = false\n")
+    let rf: list[str] = idem_out(acc, "s2_fnl.hls", unform,
+    ["--config", fnlp])
+    check(acc, "final_newline = false drops the EOF newline (still idempotent)",
+    !rf.get(0).ends_with("\n") && rf.get(1) == "1", "")
+    let mbl0: str = cfg_toml(acc, "mbl0.toml", "max_blank_lines = 0\n")
+    let rm: list[str] = idem_out(acc, "s2_mbl0.hls", messy,
+    ["--config", mbl0])
+    check(acc, "max_blank_lines = 0 squeezes every blank line",
+    !rm.get(0).contains("\n\n") && rm.get(1) == "1", "")
+    let mbl3: str = cfg_toml(acc, "mbl3.toml", "max_blank_lines = 3\n")
+    let many_src: str = str_replace(unform, "}\nreturn 0", "}\n\n\n\n\n\nreturn 0")
+    let rm3: list[str] = idem_out(acc, "s2_mbl3.hls", many_src,
+    ["--config", mbl3])
+    let best: int = longest_blank_run(rm3.get(0))
+    check(acc, "max_blank_lines = 3 caps a 6-blank run at exactly 3",
+    best == 3 && rm3.get(1) == "1", "longest run " + ct(best))
+    let rin_off: str = cfg_toml(acc, "rin.toml", "reindent_comments = false\n")
+    let rr: list[str] = idem_out(acc, "s2_rin.hls", messy,
+    ["--config", rin_off])
+    check(acc, "reindent_comments = false keeps the stale indent verbatim",
+    rr.get(0).contains("        # a stale deep note") && rr.get(1) == "1",
+    "")
+    let rr0: list[str] = idem_out(acc, "s2_rin0.hls", messy, [])
+    check(acc, "the default re-indents the same note to the block (Stage 116 law)",
+    rr0.get(0).contains("    # a stale deep note") && rr0.get(1) == "1",
+    "")
+
+    section("3. the strictness: a typo is an error, never a style")
+    let bad_cases: list[list[str]] = [
+    ["unknown key", "banana = 2\n", "unknown key"],
+    ["wrong type for an int", "indent_width = \"four\"\n",
+    "wants an integer"],
+    ["wrong type for a bool", "final_newline = 1\n",
+    "wants true or false"],
+    ["wrong type for a str", "indent_style = tab\n", "double-quoted"],
+    ["out of range low", "indent_width = 0\n", "out of range"],
+    ["out of range high", "indent_width = 9\n", "out of range"],
+    ["blanks out of range", "max_blank_lines = 5\n", "out of range"],
+    ["blanks negative", "max_blank_lines = -1\n", "out of range"],
+    ["bad choice", "indent_style = \"banaba\"\n", "wants one of"],
+    ["duplicate key", "indent_width = 2\nindent_width = 3\n",
+    "duplicate"],
+    ["unsupported table", "[editor]\nindent_width = 2\n",
+    "unsupported table"],
+    ["no equals", "indent_width 2\n", "expected `key = value`"],
+    ["no value", "indent_width =\n", "no value"],
+    ["unterminated string", "indent_style = \"tab\n", "unterminated"],
+    ["unterminated header", "[hlfmt\n", "unterminated table header"],
+    ["bad escape", "indent_style = \"t\\x\"\n", "invalid escape"]
+    ]
+    let target: str = write_src(acc, "strict_target.hls", unform)
+    let before: str = read_file(target)
+    let mut bi: int = 0
+    while bi < bad_cases.len() {
+        let desc: str = bad_cases.get(bi).get(0)
+        let cfg_text: str = bad_cases.get(bi).get(1)
+        let needle: str = bad_cases.get(bi).get(2)
+        let badp: str = cfg_toml(acc, "bad.toml", cfg_text)
+        let p: RunResult = run_capture("./bin/hlfmt", ["--config", badp,
+        "-w", target])
+        check(acc, desc + " exits 2 with a diagnostic (" + needle + "...)",
+        p.code == 2 && p.err.contains(needle), clip(first_line(p.err), 72))
+        check(acc, desc + " leaves the target file untouched",
+        read_file(target) == before, "")
+        bi = bi + 1
+    }
+    let ghost: RunResult = run_capture("./bin/hlfmt", ["--config",
+    scratch(acc, "ghost.toml"), "-w", "examples/hello.hls"])
+    check(acc, "missing --config file exits 2",
+    ghost.code == 2 && ghost.err.contains("not found"),
+    clip(first_line(ghost.err), 60))
+    let both: RunResult = run_capture("./bin/hlfmt", ["--config", pin,
+    "--no-config", "-w", f_a])
+    check(acc, "--config + --no-config is rejected (exit 2)",
+    both.code == 2 && both.err.contains("mutually exclusive"),
+    clip(first_line(both.err), 60))
+    # Errors name the file AND the line.
+    let lp: str = cfg_toml(acc, "line_probe.toml",
+    "final_newline = true\n\nbanana = 3\n")
+    let lpr: RunResult = run_capture("./bin/hlfmt", ["--config", lp,
+    "-w", target])
+    check(acc, "config errors name file and line",
+    lpr.code == 2 && lpr.err.contains("line_probe.toml:3"),
+    clip(first_line(lpr.err), 72))
+
+    section("4. the grammar: the accepted surface parses")
+    let good: str = "# team style — smallest diff set wins\n"
+    + "[hlfmt]\n"
+    + "indent_width = 2   # two spaces, like the web team\n"
+    + "\n"
+    + "indent_style = \"space\"\n"
+    + "final_newline = false\n"
+    + "max_blank_lines = 0\n"
+    + "reindent_comments = false  # legacy tree, minimal diffs\n"
+    let goodp: str = cfg_toml(acc, "good.toml", good)
+    let pcg: RunResult = run_capture("./bin/hlfmt", ["--print-config",
+    "--config", goodp, "examples/hello.hls"])
+    let expect_render: str = "# resolved by hlfmt (Stage 117, v0.136.0-alpha)\n"
+    + "# source: " + goodp + "\n"
+    + "final_newline = false\n"
+    + "indent_style = \"space\"\n"
+    + "indent_width = 2\n"
+    + "max_blank_lines = 0\n"
+    + "reindent_comments = false\n"
+    check(acc, "the full accepted grammar parses (comments, blanks, [hlfmt])",
+    pcg.code == 0 && pcg.out == expect_render, clip(pcg.out, 60))
+    let pcp: RunResult = run_capture("./bin/hlfmt", ["--config", goodp,
+    "--print-config", "examples/hello.hls"])
+    check(acc, "--print-config reports the pinned file's resolved values",
+    pcp.code == 0 && pcp.out.contains("indent_width = 2")
+    && pcp.out.contains("final_newline = false")
+    && pcp.out.contains(goodp), "")
+    let pcd: RunResult = run_capture("./bin/hlfmt", ["--no-config",
+    "--print-config", "examples/hello.hls"])
+    check(acc, "--print-config prints the built-in defaults when nothing applies",
+    pcd.code == 0 && pcd.out.contains("built-in defaults")
+    && pcd.out.contains("indent_width = 4")
+    && pcd.out.contains("max_blank_lines = 1")
+    && pcd.out.contains("indent_style = \"space\"")
+    && pcd.out.contains("final_newline = true")
+    && pcd.out.contains("reindent_comments = true"), "")
+    # The rendered TOML round-trips through the parser.
+    let body: str = strip_comment_lines(pcp.out)
+    let rtp: str = cfg_toml(acc, "roundtrip.toml", body)
+    let rtr: RunResult = run_capture("./bin/hlfmt", ["--config", rtp,
+    "--print-config", "examples/hello.hls"])
+    check(acc, "--print-config output re-parses as valid config TOML",
+    rtr.code == 0 && rtr.out.contains("indent_width = 2")
+    && rtr.out.contains("final_newline = false"),
+    clip(rtr.out, 60))
+
+    section("5. the fixed point: a config is a law unto itself")
+    let widths: list[int] = [1, 2, 4, 8]
+    let styles: list[str] = ["space", "tab"]
+    let blankss: list[int] = [0, 1, 3]
+    let eofs: list[bool] = [true, false]
+    let mut combo_fail: str = ""
+    let mut combos: int = 0
+    let mut cw: int = 0
+    while cw < widths.len() {
+        let mut cs: int = 0
+        while cs < styles.len() {
+            let mut cb: int = 0
+            while cb < blankss.len() {
+                let mut ce: int = 0
+                while ce < eofs.len() {
+                    let mut eof_txt: str = "false"
+                    if eofs.get(ce) {
+                        eof_txt = "true"
+                    }
+                    let cp: str = cfg_toml(acc, "combo.toml",
+                    "indent_width = " + ct(widths.get(cw)) + "\n"
+                    + "indent_style = \"" + styles.get(cs) + "\"\n"
+                    + "max_blank_lines = " + ct(blankss.get(cb)) + "\n"
+                    + "final_newline = " + eof_txt + "\n")
+                    let r: list[str] = idem_out(acc, "s5_combo.hls", messy,
+                    ["--config", cp])
+                    combos = combos + 1
+                    if r.get(1) != "1" && combo_fail == "" {
+                        combo_fail = "w=" + ct(widths.get(cw)) + " s="
+                        + styles.get(cs) + " b=" + ct(blankss.get(cb))
+                        + " eof=" + eof_txt
+                    }
+                    ce = ce + 1
+                }
+                cb = cb + 1
+            }
+            cs = cs + 1
+        }
+        cw = cw + 1
+    }
+    check(acc, ct(combos) + " knob combinations format as fixed points under themselves",
+    combo_fail == "", combo_fail)
+    # An EMPTY config file is byte-identical to the defaults.
+    let emptyp: str = cfg_toml(acc, "empty.toml", "# nothing pinned\n")
+    let with_empty: str = fmt_out(acc, "s5_empty.hls", messy,
+    ["--config", emptyp])
+    let plain_out: str = fmt_out(acc, "s5_plain.hls", messy, [])
+    check(acc, "an empty config file is byte-identical to the defaults",
+    with_empty == plain_out, "")
+
+    section("6. the default law: no file means the Stage 116 constants")
+    # An explicit all-defaults config == the implicit defaults.
+    let alldef: str = cfg_toml(acc, "alldef.toml",
+    "indent_width = 4\nindent_style = \"space\"\nfinal_newline = true\n"
+    + "max_blank_lines = 1\nreindent_comments = true\n")
+    let explicit_out: str = fmt_out(acc, "s6_explicit.hls", messy,
+    ["--config", alldef])
+    check(acc, "explicit DEFAULT_CONFIG == implicit defaults (byte-identical)",
+    explicit_out == plain_out, "")
+    # The corpus file under the default pass: comment set + idempotence.
+    let corpus_src: str = read_file(corpus)
+    let r6: list[str] = idem_out(acc, "s6_corpus.hls", corpus_src, [])
+    check(acc, "the default pass still preserves the corpus comment set",
+    same_comment_set(corpus_src, r6.get(0)), "")
+    check(acc, "the default pass is still a fixed point (Stage 116 idempotency)",
+    r6.get(1) == "1", "")
+    let stale: str = "fn f() -> int {\n"
+    + "    if true {\n"
+    + "    # badly indented\n"
+    + "        return 1\n"
+    + "    }\n"
+    + "    return 0\n"
+    + "}\n"
+    let r6s: list[str] = idem_out(acc, "s6_stale.hls", stale, [])
+    check(acc, "the re-indent law still lifts a stale comment to its block",
+    r6s.get(0).contains("\n        # badly indented\n"),
+    clip(r6s.get(0), 60))
+
+    section("7. the differential: a config pass preserves semantics (the oracle leg)")
+    if !file_exists("./bin/hlc") {
+        fail_msg(acc, "bin/hlc missing — run make bootstrap first")
+    } else {
+        let interp_r: RunResult = boot(acc, [corpus])
+        let c1: str = scratch(acc, "s7_orig.c")
+        let b1: str = scratch(acc, "s7_orig_bin")
+        let comp1: RunResult = run_capture("./bin/hlc", [corpus, c1])
+        let cc1: int = run_quiet("gcc", ["-O2", "-o", b1, c1, "-lm",
+        "-pthread"])
+        let nat1: RunResult = run_capture(b1, [])
+        check(acc, "unformatted file: interpreter == native",
+        comp1.code == 0 && cc1 == 0 && nat1.out == interp_r.out,
+        clip(comp1.err, 60))
+        let alt: str = cfg_toml(acc, "alt.toml",
+        "indent_width = 2\nmax_blank_lines = 0\n")
+        let alt_out: str = fmt_out(acc, "s7_alt_in.hls", corpus_src,
+        ["--config", alt])
+        let alt_path: str = write_src(acc, "s7_alt.hls", alt_out)
+        let interp_a: RunResult = boot(acc, [alt_path])
+        let c2: str = scratch(acc, "s7_alt.c")
+        let b2: str = scratch(acc, "s7_alt_bin")
+        let comp2: RunResult = run_capture("./bin/hlc", [alt_path, c2])
+        let cc2: int = run_quiet("gcc", ["-O2", "-o", b2, c2, "-lm",
+        "-pthread"])
+        let nat2: RunResult = run_capture(b2, [])
+        check(acc, "config-formatted file: interpreter == native (recompiles, reruns)",
+        comp2.code == 0 && cc2 == 0 && nat2.out == interp_a.out,
+        clip(comp2.err, 60))
+        check(acc, "the config pass changed no output line (semantic witness)",
+        interp_r.out == interp_a.out, "")
+    }
+
+    section("8. the corpus: idempotent under every config sampled")
+    let files: list[str] = corpus_files()
+    let alt: str = cfg_toml(acc, "alt8.toml",
+    "indent_width = 2\nmax_blank_lines = 0\n")
+    let mut non_idem: int = 0
+    let mut alt_non_idem: int = 0
+    let mut lost: int = 0
+    let mut nfiles: int = 0
+    let mut fi: int = 0
+    while fi < files.len() {
+        let f: str = files.get(fi)
+        let src: str = read_or(f, "")
+        nfiles = nfiles + 1
+        let out1: str = fmt_out(acc, "s8_pass.hls", src, [])
+        let out2: str = fmt_out(acc, "s8_pass2.hls", out1, [])
+        if out2 != out1 {
+            non_idem = non_idem + 1
+        }
+        if !same_comment_set(src, out1) {
+            lost = lost + 1
+        }
+        let a1: str = fmt_out(acc, "s8_alt.hls", src, ["--config", alt])
+        let a2: str = fmt_out(acc, "s8_alt2.hls", a1, ["--config", alt])
+        if a2 != a1 {
+            alt_non_idem = alt_non_idem + 1
+        }
+        fi = fi + 1
+    }
+    check(acc, ct(nfiles) + " corpus files format idempotently under the defaults",
+    non_idem == 0, ct(non_idem) + " non-idempotent")
+    check(acc, ct(nfiles) + " corpus files keep their comment set under the defaults",
+    lost == 0, ct(lost) + " changed")
+    check(acc, "the alternate config is a fixed point across the corpus too",
+    alt_non_idem == 0, ct(alt_non_idem) + " non-idempotent")
+    let lint_r: RunResult = run_capture("python3", ["tools/hllint.py",
+    corpus])
+    check(acc, "hllint stays clean on the stage fixture",
+    lint_r.code == 0, clip(lint_r.out, 80))
+    let chk: RunResult = run_capture("./bin/hlfmt", ["-c", corpus])
+    check(acc, "the stage fixture ships already formatted under the defaults",
+    chk.code == 0 && chk.out.contains("already formatted"),
+    clip(chk.out, 60))
+
+    return finish(acc, "Stage 117 -- hlfmt reads a team configuration file")
+}
+
+# ----------------------------------------------------------------------------
+# Helpers.
+# ----------------------------------------------------------------------------
+
+# longest_blank_run(text) — the biggest run of consecutive blank lines.
+fn longest_blank_run(text: str) -> int {
+    let lines: list[str] = text.split("\n")
+    let mut best: int = 0
+    let mut run: int = 0
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i) == "" {
+            run = run + 1
+            if run > best {
+                best = run
+            }
+        } else {
+            run = 0
+        }
+        i = i + 1
+    }
+    return best
+}
+
+# strip_comment_lines(text) — drop the `#`-prefixed lines (the
+# --print-config headers), keep the key = value body.
+fn strip_comment_lines(text: str) -> str {
+    let lines: list[str] = text.split("\n")
+    let kept: list[str] = []
+    let mut i: int = 0
+    while i < lines.len() {
+        let t: str = lines.get(i).trim()
+        if t != "" && !t.starts_with("#") {
+            kept.push(lines.get(i))
+        }
+        i = i + 1
+    }
+    return join(kept, "\n") + "\n"
+}
+
+# same_comment_set(a, b) — the gate's own scanner over both texts: the
+# same multiset of comment bodies (whitespace-normalised, sorted).
+fn same_comment_set(a: str, b: str) -> bool {
+    let ca: list[str] = comment_bodies(a)
+    let cb: list[str] = comment_bodies(b)
+    if ca.len() != cb.len() {
+        return false
+    }
+    let mut i: int = 0
+    while i < ca.len() {
+        if ca.get(i) != cb.get(i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# The scanner law (independent of the tool — see fmt_comments gate).
+fn rstrip_wsx(s: str) -> str {
+    let mut n: int = s.len()
+    while n > 0 {
+        let c: int = s.byte_at(n - 1)
+        if c == 32 || c == 9 || c == 10 || c == 13 || c == 12 || c == 11 {
+            n = n - 1
+        } else {
+            break
+        }
+    }
+    return s.slice(0, n)
+}
+
+fn scan_cmt(line: str) -> list[str] {
+    let out: list[str] = ["0", ""]
+    let mut in_str: bool = false
+    let mut j: int = 0
+    let n: int = line.len()
+    while j < n {
+        let c: int = line.byte_at(j)
+        if in_str {
+            if c == 92 && j + 1 < n {
+                j = j + 2
+                continue
+            }
+            if c == 34 {
+                in_str = false
+            }
+            j = j + 1
+            continue
+        }
+        if c == 34 {
+            in_str = true
+            j = j + 1
+            continue
+        }
+        if c == 35 {
+            if j + 1 < n && line.byte_at(j + 1) == 91 {
+                j = skip_attr(line, j)
+                continue
+            }
+            if j + 2 < n && line.byte_at(j + 1) == 33
+            && line.byte_at(j + 2) == 91 {
+                j = skip_attr(line, j)
+                continue
+            }
+            if line.slice(0, j).trim() == "" {
+                out.set(0, "1")
+                out.set(1, line.slice(j, line.len()).trim())
+            } else {
+                out.set(0, "2")
+                out.set(1, rstrip_wsx(line.slice(j, line.len())))
+            }
+            return out
+        }
+        j = j + 1
+    }
+    return out
+}
+
+fn skip_attr(line: str, j: int) -> int {
+    let mut depth: int = 0
+    let mut in_str: bool = false
+    let n: int = line.len()
+    let mut k: int = j
+    while k < n {
+        let c: int = line.byte_at(k)
+        if in_str {
+            if c == 92 && k + 1 < n {
+                k = k + 2
+                continue
+            }
+            if c == 34 {
+                in_str = false
+            }
+            k = k + 1
+            continue
+        }
+        if c == 34 {
+            in_str = true
+        } else if c == 91 {
+            depth = depth + 1
+        } else if c == 93 {
+            depth = depth - 1
+            if depth <= 0 {
+                return k + 1
+            }
+        }
+        k = k + 1
+    }
+    return n
+}
+
+fn comment_bodies(src: str) -> list[str] {
+    let lines: list[str] = src.split("\n")
+    let bodies: list[str] = []
+    let mut i: int = 0
+    while i < lines.len() {
+        let r: list[str] = scan_cmt(lines.get(i))
+        if r.get(0) != "0" && r.get(1).trim() != "" {
+            bodies.push(r.get(1).trim())
+        }
+        i = i + 1
+    }
+    return sort_bodies(bodies)
+}
+
+fn sort_bodies(xs: list[str]) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < xs.len() {
+        out.push(xs.get(i))
+        i = i + 1
+    }
+    let mut a: int = 1
+    while a < out.len() {
+        let v: str = out.get(a)
+        let mut b: int = a
+        while b > 0 && out.get(b - 1) > v {
+            out.set(b, out.get(b - 1))
+            b = b - 1
+        }
+        out.set(b, v)
+        a = a + 1
+    }
+    return out
+}
+
+# corpus_files() — examples/** (recursive) + tests/ok + tests/fail.
+fn corpus_files() -> list[str] uses Proc {
+    let out: list[str] = []
+    let r: RunResult = run_capture("find", ["examples", "-name", "*.hls",
+    "-type", "f"])
+    let lines: list[str] = r.out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i) != "" {
+            out.push(lines.get(i))
+        }
+        i = i + 1
+    }
+    let r2: RunResult = run_capture("find", ["tests/ok", "tests/fail",
+    "-maxdepth", "1", "-name", "*.hls", "-type", "f"])
+    let lines2: list[str] = r2.out.split("\n")
+    i = 0
+    while i < lines2.len() {
+        if lines2.get(i) != "" {
+            out.push(lines2.get(i))
+        }
+        i = i + 1
+    }
+    return out
+}

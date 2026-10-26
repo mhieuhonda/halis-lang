@@ -621,12 +621,23 @@ echo "=== 4b. Stage 14 release: tooling (hlfmt idempotent + hllint cfaware) ==="
 # hlfmt's canonical form, so checking `hlfmt -c` against the original
 # is too strict.)
 fmt_fail=0
+# The formatter is native now (tools/hlfmt.hls): build it once from the
+# same compiler this suite already builds, then the 650-file x2 loop is
+# 1300 native invocations instead of 1300 Python starts.
+if [ ! -x bin/hlfmt ]; then
+    "$TMP/hlc1" tools/hlfmt.hls bin/hlfmt.c >/dev/null 2>&1 \
+        && gcc -O2 -o bin/hlfmt bin/hlfmt.c -lm -pthread 2>/dev/null
+fi
+if [ ! -x bin/hlfmt ]; then
+    bad "hlfmt native build failed (bin/hlfmt)"
+    fmt_fail=1
+fi
 for f in examples/*.hls tests/ok/*.hls tests/fail/*.hls; do
     name=$(basename "$f" .hls)
     cp "$f" "$TMP/p1.hls"
-    python3 tools/hlfmt.py -w "$TMP/p1.hls" >/dev/null 2>&1
+    ./bin/hlfmt -w "$TMP/p1.hls" >/dev/null 2>&1
     cp "$TMP/p1.hls" "$TMP/p2.hls"
-    python3 tools/hlfmt.py -w "$TMP/p2.hls" >/dev/null 2>&1
+    ./bin/hlfmt -w "$TMP/p2.hls" >/dev/null 2>&1
     if diff -q "$TMP/p1.hls" "$TMP/p2.hls" >/dev/null 2>&1; then
         ok "hlfmt idempotent: $name"
     else

@@ -92,7 +92,7 @@ os.chdir(ROOT)
 
 MEM = [sys.executable, os.path.join(ROOT, "tools", "hls-mem.py")]
 BOOT = [sys.executable, os.path.join(ROOT, "tools", "hlinterp", "boot.py")]
-FMT = [sys.executable, os.path.join(ROOT, "tools", "hlfmt.py")]
+FMT = [os.path.join(ROOT, "bin", "hlfmt")]
 LINT = [sys.executable, os.path.join(ROOT, "tools", "hllint.py")]
 HLC = os.path.join(ROOT, "bin", "hlc")
 CC = os.environ.get("CC", "gcc")

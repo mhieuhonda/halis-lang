@@ -770,7 +770,7 @@ def section_integration():
     check(out.returncode == 0
           and out.stdout.decode("utf-8") == pinned,
           "corpus: boot.py runs it with the pinned output")
-    fmt = subprocess.run([PY, "tools/hlfmt.py", "-c", CORPUS],
+    fmt = subprocess.run([os.path.join(ROOT, "bin", "hlfmt"), "-c", CORPUS],
                          capture_output=True)
     check(fmt.returncode == 0, "corpus: hlfmt -c holds it canonical")
     lint = subprocess.run([PY, "tools/hllint.py", "--strict", CORPUS],

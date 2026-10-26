@@ -563,10 +563,10 @@ else:
 # ---------------------------------------------------------------------------
 print("Section 8 — corpus hygiene: canonical form, checks, no litter")
 
-p = subprocess.run([sys.executable, "tools/hlfmt.py", "-c", FIXTURE],
+p = subprocess.run([os.path.join(ROOT, "bin", "hlfmt"), "-c", FIXTURE],
                    capture_output=True, text=True)
 check("already formatted" in p.stdout, "the fixture is hlfmt-canonical")
-p = subprocess.run([sys.executable, "tools/hlfmt.py", "-c", LIB],
+p = subprocess.run([os.path.join(ROOT, "bin", "hlfmt"), "-c", LIB],
                    capture_output=True, text=True)
 check("already formatted" in p.stdout, "the bench lib is hlfmt-canonical")
 p = subprocess.run([sys.executable, "tools/hllint.py", FIXTURE],

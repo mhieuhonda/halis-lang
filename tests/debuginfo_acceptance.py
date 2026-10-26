@@ -441,7 +441,7 @@ if brc.returncode != 0:
 else:
     ok("front-end: the demo is an ordinary crate to the checker")
 
-fmt = run(["python3", "tools/hlfmt.py", DEMO])
+fmt = run([os.path.join(ROOT, "bin", "hlfmt"), DEMO])
 if fmt.returncode != 0 or not fmt.stdout.strip():
     bad("tools: hlfmt failed on the demo")
 else:

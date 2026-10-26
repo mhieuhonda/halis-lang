@@ -579,7 +579,7 @@ check(r.returncode == 0 and before == after
       "-u on the committed fixture is a no-op (bytes, report, no .tmp)")
 
 # The fixture is a formatter fixed point.
-fr = subprocess.run([sys.executable, "tools/hlfmt.py", "-c", FIXTURE],
+fr = subprocess.run([os.path.join(ROOT, "bin", "hlfmt"), "-c", FIXTURE],
                     capture_output=True, text=True)
 check(fr.returncode == 0 and "already formatted" in fr.stdout,
       "the fixture is an hlfmt fixed point")
