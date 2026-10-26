@@ -284,7 +284,7 @@ make semver-acceptance        # Stage 131 gate: the semver battery
                                # dialect, manifest enforcement over a
                                # real git dep, publish immutability,
                                # verify drift)
-python3 tools/hls-lts.py classify HEAD   # Stage 132: the LTS branch
+bin/hls-lts classify HEAD              # Stage 132: the LTS branch
                                # policy — backport-only after v1.0:
                                # init declares the branch from a
                                # >= 1.0.0 release tag, classify names
@@ -304,7 +304,7 @@ make lts-acceptance           # Stage 132 gate: the LTS battery
                                # repos, the tag law, the audit law,
                                # the release train, the corpus
                                # showcase)
-python3 tools/hls-lts.py window --tag v1.0.0 --at 2029-06-15
+bin/hls-lts window --tag v1.0.0 --at 2029-06-15
                                # Stage 145: the published support
                                # windows — 3 years bug-fix, 5 years
                                # security, counted from the base

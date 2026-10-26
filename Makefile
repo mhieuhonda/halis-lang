@@ -87,6 +87,16 @@ $(BIN)/hlfmt: tools/hlfmt.hls $(wildcard std/*.hls) $(wildcard core/*.hls) | $(B
 	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
 	@rm -f $@.c
 
+# hls-lts — the LTS policy tool, in Halis (the native twin of the
+# Python hls-lts that retired; the render it pins is the committed
+# LTS.md, byte for byte).
+$(BIN)/hls-lts: tools/hls-lts.hls $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hls-lts] hlc compiles the LTS policy tool (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hls-lts.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
 $(BIN)/hls-snap: tools/hls-snap.hls $(wildcard std/*.hls)
 	@mkdir -p $(BIN)
 	@test -x $(BIN)/hlc || { echo "[snapkit] cc: a compiler from the committed snapshot (bootstrap-free)..."; $(CC) $(CFLAGS) -o $(BIN)/hlc $(SNAP) -lm -pthread; }
@@ -552,7 +562,7 @@ semver-acceptance: $(BIN)/hlfmt
 # fmt-canonical, lint-clean). The gate builds its own scratch repos
 # under a temp root it removes afterwards; the developer's real
 # repository is never touched.
-lts-acceptance: $(BIN)/hlfmt
+lts-acceptance: $(BIN)/hlfmt $(BIN)/hls-lts
 	@echo "[Stage 132 acceptance] running tests/lts_acceptance.py..."
 	@$(PYTHON) tests/lts_acceptance.py
 	@echo "ACCEPTANCE OK: Stage 132 -- LTS branch policy (backport-only after v1.0)"
@@ -570,11 +580,11 @@ lts-acceptance: $(BIN)/hlfmt
 # security phase, `audit` judges history by the day each commit
 # landed, and `--at` pins the clock so the gates never depend on
 # when they run.
-lts-policy:
-	@$(PYTHON) tools/hls-lts.py policy
+lts-policy: $(BIN)/hls-lts
+	@$(BIN)/hls-lts policy
 
-lts-policy-verify:
-	@$(PYTHON) tools/hls-lts.py policy --check
+lts-policy-verify: $(BIN)/hls-lts
+	@$(BIN)/hls-lts policy --check
 
 # The Stage 145 acceptance gate: nine sections over the REAL policy
 # CLI and REAL scratch git repositories whose birthdays are
@@ -595,7 +605,7 @@ lts-policy-verify:
 # life), the publication law (the render deterministic, the
 # committed LTS.md matching, the drifted copy refused) — and the
 # corpus showcase, the window law as a pure-HLS program.
-lts-policy-acceptance: $(BIN)/hlfmt
+lts-policy-acceptance: $(BIN)/hlfmt $(BIN)/hls-lts
 	@echo "[Stage 145 acceptance] running tests/lts_policy_acceptance.py..."
 	@$(PYTHON) tests/lts_policy_acceptance.py
 	@echo "ACCEPTANCE OK: Stage 145 -- LTS policy published (3 years bug-fix, 5 years security)"

@@ -1,0 +1,2696 @@
+# ============================================================================
+# hls-lts.hls — the LTS branch policy, in Halis: backport-only after
+# v1.0, patch-only tags on the line, fail-closed everywhere (Stage
+# 132), plus the Stage 145 support windows — three years of bug fixes,
+# two more of security only, counted from the day the base release was
+# cut, in anniversaries.
+# ----------------------------------------------------------------------------
+# The twin of tools/hls-lts.py (the Python years), driven through the
+# same CLI the release manager drives; the gates (tests/lts_acceptance
+# and tests/lts_policy_acceptance) spawn this binary unchanged.
+#
+# Usage:
+#   bin/hls-lts init --tag v1.0.0 [--branch NAME] [--repo DIR]
+#   bin/hls-lts status [--json] [--repo DIR]
+#   bin/hls-lts classify COMMIT [--json] [--repo DIR]
+#   bin/hls-lts backport COMMIT [--dry-run] [--at DAY] [--repo DIR]
+#   bin/hls-lts tag-patch [--tag TAG] [--dry-run] [--at DAY] [--repo DIR]
+#   bin/hls-lts audit [--json] [--repo DIR]
+#   bin/hls-lts window [--tag TAG] [--at DAY] [--json] [--repo DIR]
+#   bin/hls-lts policy [--out PATH | --check]
+#
+# Exit codes: 0 the policy held; 1 a named policy refusal; 2 usage
+# error. Every refusal names the RULE, not just the fact.
+#
+# The version laws reuse the Stage 131 semver grammar (one grammar for
+# the whole project, from the package manifest to the release train).
+# ============================================================================
+
+import "std.result"
+import "std.str"
+import "std.json"
+
+# ============================================================================
+# Constants.
+# ============================================================================
+
+fn policy_version() -> str {
+    return "halis-lts-1"
+}
+
+fn policy_file() -> str {
+    return ".hls-lts.json"
+}
+
+fn default_branch() -> str {
+    return "release/1.0"
+}
+
+fn default_upstream() -> str {
+    return "main"
+}
+
+fn trailer_name() -> str {
+    return "Backported-from"
+}
+
+fn cherry_mark() -> str {
+    return "(cherry picked from commit "
+}
+
+fn bugfix_years() -> int {
+    return 3
+}
+
+fn security_years() -> int {
+    return 5
+}
+
+fn security_trailer() -> str {
+    return "Security"
+}
+
+fn policy_doc() -> str {
+    return "LTS.md"
+}
+
+fn phase_active() -> str {
+    return "active"
+}
+
+fn phase_security() -> str {
+    return "security"
+}
+
+fn phase_eol() -> str {
+    return "eol"
+}
+
+fn phase_meaning(p: str) -> str {
+    if p == "active" {
+        return "bug-fix and security backports land"
+    }
+    if p == "security" {
+        return "security backports only — plain fixes are refused"
+    }
+    return "end of life — nothing lands on a dead line"
+}
+
+# ============================================================================
+# The semver grammar (semver 2.0.0 §2) — the slice the LTS policy needs:
+# MAJOR.MINOR.PATCH[-PRERELEASE][+BUILD], no leading zeros in the core
+# or in numeric pre-release identifiers; one optional leading `v`.
+# ============================================================================
+
+struct SemVer {
+    ok: bool,
+    major: int,
+    minor: int,
+    patch: int,
+    prerelease: str, # "" when absent (presence = len > 0)
+    build: str # "" when absent
+}
+
+fn bad_version() -> SemVer {
+    return SemVer {
+        ok: false, major: 0, minor: 0, patch: 0,
+        prerelease: "", build: ""
+    }
+}
+
+fn is_digit_b(c: int) -> bool {
+    return c >= 48 && c <= 57
+}
+
+fn is_alpha_b(c: int) -> bool {
+    return(c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+}
+
+fn is_ident_b(c: int) -> bool {
+    return is_digit_b(c) || is_alpha_b(c) || c == 45
+}
+
+# parse_num(s, i) — a numeric identifier at i: "0" or [1-9][0-9]*.
+# Returns (value, next index), next == -1 on mismatch.
+fn parse_num(s: str, i: int) -> list[int] {
+    let r: list[int] = [-1, -1]
+    let n: int = s.len()
+    if i >= n {
+        return r
+    }
+    if s.byte_at(i) == 48 {
+        r.set(0, 0)
+        r.set(1, i + 1)
+        return r
+    }
+    if !(s.byte_at(i) >= 49 && s.byte_at(i) <= 57) {
+        return r
+    }
+    let mut j: int = i
+    let mut v: int = 0
+    while j < n && is_digit_b(s.byte_at(j)) {
+        v = v * 10 + (s.byte_at(j) - 48)
+        j = j + 1
+    }
+    r.set(0, v)
+    r.set(1, j)
+    return r
+}
+
+# parse_pre_id(s, i) — one pre-release identifier: numeric, or
+# alphanumeric with at least one letter/hyphen (so "00" fails).
+fn parse_pre_id(s: str, i: int) -> list[int] {
+    let r: list[int] = [-1, -1]
+    let n: int = s.len()
+    if i >= n {
+        return r
+    }
+    # numeric? must not carry a leading zero (unless it IS "0")
+    let num: list[int] = parse_num(s, i)
+    if num.get(1) > i {
+        let after: int = num.get(1)
+        if after >= n || s.byte_at(after) == 46 || s.byte_at(after) == 43 {
+            # a clean numeric identifier, bounded by '.' or '+' or end
+            r.set(0, 0)
+            r.set(1, after)
+            return r
+        }
+    }
+    # alphanumeric: [0-9A-Za-z-]* containing at least one letter/hyphen
+    let mut j: int = i
+    let mut has_letter: bool = false
+    while j < n {
+        let c: int = s.byte_at(j)
+        if c == 46 || c == 43 {
+            break
+        }
+        if !is_ident_b(c) {
+            return r
+        }
+        if is_alpha_b(c) || c == 45 {
+            has_letter = true
+        }
+        j = j + 1
+    }
+    if j > i && has_letter {
+        r.set(0, 0)
+        r.set(1, j)
+        return r
+    }
+    return r
+}
+
+# parse_build_id(s, i) — anything alphanumeric+hyphen (leading zeros
+# fine); bounded by '.' or end.
+fn parse_build_id(s: str, i: int) -> list[int] {
+    let r: list[int] = [-1, -1]
+    let n: int = s.len()
+    if i >= n {
+        return r
+    }
+    let mut j: int = i
+    while j < n {
+        let c: int = s.byte_at(j)
+        if c == 46 {
+            break
+        }
+        if !is_ident_b(c) {
+            return r
+        }
+        j = j + 1
+    }
+    if j > i {
+        r.set(0, 0)
+        r.set(1, j)
+        return r
+    }
+    return r
+}
+
+# parse_version(text) — the full grammar, no leading `v`.
+fn parse_version(text: str) -> SemVer {
+    let v: SemVer = bad_version()
+    let n: int = text.len()
+    let a: list[int] = parse_num(text, 0)
+    if a.get(1) < 1 {
+        return v
+    }
+    v.major = a.get(0)
+    let mut i: int = a.get(1)
+    if i >= n || text.byte_at(i) != 46 {
+        return bad_version()
+    }
+    let b: list[int] = parse_num(text, i + 1)
+    if b.get(1) < 0 {
+        return bad_version()
+    }
+    v.minor = b.get(0)
+    i = b.get(1)
+    if i >= n || text.byte_at(i) != 46 {
+        return bad_version()
+    }
+    let c: list[int] = parse_num(text, i + 1)
+    if c.get(1) < 0 {
+        return bad_version()
+    }
+    v.patch = c.get(0)
+    i = c.get(1)
+    if i >= n {
+        v.ok = true
+        return v
+    }
+    if text.byte_at(i) == 45 {
+        # pre-release: id (.id)*
+        let mut j: int = i + 1
+        let pr_a: list[int] = parse_pre_id(text, j)
+        if pr_a.get(1) < 0 {
+            return bad_version()
+        }
+        j = pr_a.get(1)
+        while j < n && text.byte_at(j) == 46 {
+            let nx: list[int] = parse_pre_id(text, j + 1)
+            if nx.get(1) < 0 {
+                return bad_version()
+            }
+            j = nx.get(1)
+        }
+        v.prerelease = text.slice(i + 1, j)
+        i = j
+        if i >= n {
+            v.ok = true
+            return v
+        }
+    }
+    if text.byte_at(i) == 43 {
+        let mut j: int = i + 1
+        let bu: list[int] = parse_build_id(text, j)
+        if bu.get(1) < 0 {
+            return bad_version()
+        }
+        j = bu.get(1)
+        while j < n && text.byte_at(j) == 46 {
+            let nx: list[int] = parse_build_id(text, j + 1)
+            if nx.get(1) < 0 {
+                return bad_version()
+            }
+            j = nx.get(1)
+        }
+        v.build = text.slice(i + 1, j)
+        i = j
+        if i >= n {
+            v.ok = true
+            return v
+        }
+    }
+    return bad_version()
+}
+
+# tag_version(tag) — one optional leading `v`, then the grammar.
+fn tag_version(tag: str) -> SemVer {
+    if tag.starts_with("v") {
+        return parse_version(tag.slice(1, tag.len()))
+    }
+    return parse_version(tag)
+}
+
+# ============================================================================
+# The calendar law — anniversaries, not day counts; February 29 clamps
+# to the 28th when the target year is not a leap year. Days are counted
+# as days-from-civil (the proleptic Gregorian ordinal), so horizon
+# differences are plain subtraction.
+# ============================================================================
+
+struct Day {
+    y: int,
+    m: int,
+    d: int,
+    ok: bool
+}
+
+fn bad_day() -> Day {
+    return Day {
+        y: 0, m: 0, d: 0, ok: false
+    }
+}
+
+fn day_iso(x: Day) -> str {
+    return pad4(x.y) + "-" + pad2n(x.m) + "-" + pad2n(x.d)
+}
+
+fn pad4(n: int) -> str {
+    let s: str = n.to_str()
+    let mut out: str = s
+    while out.len() < 4 {
+        out = "0" + out
+    }
+    return out
+}
+
+fn pad2n(n: int) -> str {
+    let s: str = n.to_str()
+    if s.len() < 2 {
+        return "0" + s
+    }
+    return s
+}
+
+# days_in_month(y, m) — the month's length (leap-aware).
+fn days_in_month(y: int, m: int) -> int {
+    if m == 2 {
+        let leap: bool = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)
+        if leap {
+            return 29
+        }
+        return 28
+    }
+    if m == 4 || m == 6 || m == 9 || m == 11 {
+        return 30
+    }
+    return 31
+}
+
+# days_from_civil(y, m, d) — Howard Hinnant's algorithm: the day
+# number (epoch -0001-11-25 relative); subtracting two of these gives
+# the exact calendar-day difference Python's date subtraction gives.
+fn days_from_civil(y: int, m: int, d: int) -> int {
+    let mut yy: int = y
+    let mm: int = m
+    if mm <= 2 {
+        yy = yy - 1
+    }
+    let era: int = floor_div(yy, 400)
+    let yoe: int = yy - era * 400
+    let mp: int = (mm + 9) % 12
+    let doy: int = (153 * mp + 2) / 5 + d - 1
+    let doe: int = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    return era * 146097 + doe - 719468
+}
+
+# civil_from_days(z) — the inverse; the fields of the day number.
+fn civil_from_days(z: int) -> Day {
+    let zz: int = z + 719468
+    let era: int = floor_div(zz, 146097)
+    let doe: int = zz - era * 146097
+    let yoe: int = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let yy: int = yoe + era * 400
+    let doy: int = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp: int = (5 * doy + 2) / 153
+    let dd: int = doy - (153 * mp + 2) / 5 + 1
+    let mut mm: int = mp + 3
+    if mm > 12 {
+        mm = mm - 12
+    }
+    let mut y2: int = yy
+    if mm <= 2 {
+        y2 = yy + 1
+    }
+    return Day {
+        y: y2, m: mm, d: dd, ok: true
+    }
+}
+
+fn floor_div(a: int, b: int) -> int {
+    let mut q: int = a / b
+    if a % b != 0 && ((a < 0) != (b < 0)) {
+        q = q - 1
+    }
+    return q
+}
+
+fn day_ord(x: Day) -> int {
+    return days_from_civil(x.y, x.m, x.d)
+}
+
+# parse_day(text) — YYYY-MM-DD, strictly (the DAY_RE law).
+fn parse_day(text: str) -> Day {
+    let t: str = text.trim()
+    if t.len() != 10 {
+        return bad_day()
+    }
+    let mut i: int = 0
+    while i < 10 {
+        let c: int = t.byte_at(i)
+        let want_digit: bool = i != 4 && i != 7
+        if want_digit {
+            if !is_digit_b(c) {
+                return bad_day()
+            }
+        } else if c != 45 {
+            return bad_day()
+        }
+        i = i + 1
+    }
+    let y: int = int_part(t, 0, 4)
+    let m: int = int_part(t, 5, 7)
+    let d: int = int_part(t, 8, 10)
+    if m < 1 || m > 12 {
+        return bad_day()
+    }
+    if d < 1 || d > days_in_month(y, m) {
+        return bad_day()
+    }
+    return Day {
+        y: y, m: m, d: d, ok: true
+    }
+}
+
+fn int_part(s: str, a: int, b: int) -> int {
+    let mut v: int = 0
+    let mut i: int = a
+    while i < b {
+        v = v * 10 + (s.byte_at(i) - 48)
+        i = i + 1
+    }
+    return v
+}
+
+# add_years(day, n) — the anniversary, Feb 29 clamped to the 28th.
+fn add_years(x: Day, years: int) -> Day {
+    let y: int = x.y + years
+    let mut d: int = x.d
+    if x.m == 2 && d == 29 && days_in_month(y, 2) < d {
+        d = 28
+    }
+    return Day {
+        y: y, m: x.m, d: d, ok: true
+    }
+}
+
+# today_utc() — the wall-clock day, from the epoch clock.
+fn today_utc() -> Day uses Clock {
+    let ms: int = system_time_now_ms()
+    return civil_from_days(ms / 86400000)
+}
+
+# ============================================================================
+# Git plumbing — every call is `git -C repo ...`, stdout and stderr
+# both captured, combined (the Python years merged them into stdout).
+# ============================================================================
+
+struct GitOut {
+    code: int,
+    out: str
+}
+
+fn git_run(repo: str, args: list[str]) -> GitOut uses Proc {
+    let full: list[str] = ["-C", repo]
+    let mut i: int = 0
+    while i < args.len() {
+        full.push(args.get(i))
+        i = i + 1
+    }
+    let g: RunCap = spawn_cap("git", full)
+    return GitOut {
+        code: g.code, out: g.out + g.err
+    }
+}
+
+# spawn_cap — proc_spawn with both pipes drained (the run_capture
+# discipline the gates' harness uses, inlined so this tool stands
+# alone).
+struct RunCap {
+    code: int,
+    out: str,
+    err: str
+}
+
+fn spawn_cap(program: str, args: list[str]) -> RunCap uses Proc {
+    let r: RunCap = RunCap {
+        code: -1, out: "", err: ""
+    }
+    let pid: int = proc_spawn(program, args, 2, 1, 1)
+    if pid < 1 {
+        return r
+    }
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    r.code = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    r.out = out
+    r.err = err
+    return r
+}
+
+# git_spawn_in — git with stdin piped (the commit --amend -F - path).
+fn git_spawn_in(repo: str, args: list[str], input_text: str) -> GitOut
+uses Proc {
+    let full: list[str] = ["-C", repo]
+    let mut i: int = 0
+    while i < args.len() {
+        full.push(args.get(i))
+        i = i + 1
+    }
+    let pid: int = proc_spawn("git", full, 1, 1, 1)
+    if pid < 1 {
+        return GitOut {
+            code: -1, out: ""
+        }
+    }
+    proc_child_write(pid, input_text)
+    proc_child_close(pid, 0)
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    let code: int = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    return GitOut {
+        code: code, out: out + err
+    }
+}
+
+fn strip_ends(s: str) -> str {
+    let mut a: int = 0
+    let n: int = s.len()
+    while a < n {
+        let c: int = s.byte_at(a)
+        if c == 32 || c == 9 || c == 10 || c == 13 || c == 12 || c == 11 {
+            a = a + 1
+        } else {
+            break
+        }
+    }
+    let mut b: int = n
+    while b > a {
+        let c: int = s.byte_at(b - 1)
+        if c == 32 || c == 9 || c == 10 || c == 13 || c == 12 || c == 11 {
+            b = b - 1
+        } else {
+            break
+        }
+    }
+    return s.slice(a, b)
+}
+
+fn git_out(repo: str, args: list[str]) -> str uses Proc {
+    return strip_ends(git_run(repo, args).out)
+}
+
+fn git_ok(repo: str, args: list[str]) -> bool uses Proc {
+    return git_run(repo, args).code == 0
+}
+
+# rev_parse(repo, ref) — full sha or "".
+fn rev_parse(repo: str, ref: str) -> str uses Proc {
+    let p: GitOut = git_run(repo, ["rev-parse", "--verify", "--quiet",
+    ref + "^{commit}"])
+    if p.code != 0 {
+        return ""
+    }
+    return strip_ends(p.out)
+}
+
+fn tag_exists(repo: str, tag: str) -> bool uses Proc {
+    return git_ok(repo, ["rev-parse", "-q", "--verify",
+    "refs/tags/" + tag])
+}
+
+fn tag_sha(repo: str, tag: str) -> str uses Proc {
+    return rev_parse(repo, "refs/tags/" + tag)
+}
+
+# tags_on(repo, branch) — the tags merged into branch, version-sorted.
+fn tags_on(repo: str, branch: str) -> list[str] uses Proc {
+    let p: GitOut = git_run(repo, ["tag", "--merged", branch,
+    "--sort=version:refname"])
+    if p.code != 0 {
+        return[]
+    }
+    let out: list[str] = []
+    let lines: list[str] = strip_ends(p.out).split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i) != "" {
+            out.push(lines.get(i))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# commits(repo, base, head) — rev-list --reverse, oldest first.
+fn commits(repo: str, base: str, head: str) -> list[str] uses Proc {
+    let p: GitOut = git_run(repo, ["rev-list", "--reverse",
+    base + ".." + head])
+    let out: list[str] = []
+    let lines: list[str] = p.out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i) != "" {
+            out.push(lines.get(i))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn branch_sha(repo: str, branch: str) -> str uses Proc {
+    return rev_parse(repo, branch)
+}
+
+fn has_branch(repo: str, branch: str) -> bool uses Proc {
+    return git_ok(repo, ["show-ref", "--verify", "--quiet",
+    "refs/heads/" + branch])
+}
+
+fn current_branch(repo: str) -> str uses Proc {
+    return git_out(repo, ["rev-parse", "--abbrev-ref", "HEAD"])
+}
+
+# is_dirty(repo) — tracked-file modifications only (untracked files
+# never block a cherry-pick; the policy file itself is untracked).
+fn is_dirty(repo: str) -> bool uses Proc {
+    return strip_ends(git_run(repo, ["status", "--porcelain", "-uno"]).out)
+    != ""
+}
+
+fn message_of(repo: str, sha: str) -> str uses Proc {
+    return git_out(repo, ["log", "-1", "--format=%B", sha])
+}
+
+fn subject_of(repo: str, sha: str) -> str uses Proc {
+    return git_out(repo, ["log", "-1", "--format=%s", sha])
+}
+
+fn commit_time(repo: str, sha: str) -> str uses Proc {
+    return git_out(repo, ["log", "-1", "--format=%cI", sha])
+}
+
+fn diff_of(repo: str, sha: str) -> str uses Proc {
+    return git_out(repo, ["show", "--format=", "--unified=0", sha])
+}
+
+fn diff_added_files(repo: str, sha: str) -> list[str] uses Proc {
+    let p: GitOut = git_run(repo, ["show", "--format=", "--name-status",
+    "--diff-filter=A", sha])
+    let out: list[str] = []
+    let lines: list[str] = p.out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if strip_ends(lines.get(i)) != "" {
+            out.push(strip_ends(lines.get(i)))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn is_repo(repo: str) -> bool uses Proc {
+    return git_ok(repo, ["rev-parse", "--git-dir"])
+}
+
+# ============================================================================
+# The message law — the prefix table is the project's own commit
+# vocabulary, with consequences.
+# ============================================================================
+
+fn bugfix_reason(p: str) -> str {
+    if p == "fix" {
+        return "the fix prefix names a defect repair"
+    }
+    if p == "bugfix" {
+        return "explicit bugfix prefix"
+    }
+    if p == "revert" {
+        return "a revert removes a defect the safest way"
+    }
+    if p == "hotfix" {
+        return "a hotfix is a fix under time pressure, still a fix"
+    }
+    if p == "regression" {
+        return "a regression repair restores shipped behaviour"
+    }
+    return ""
+}
+
+fn feature_reason(p: str) -> str {
+    if p == "feat" || p == "feature" {
+        return "a feature is exactly what an LTS never takes"
+    }
+    if p == "add" {
+        return "new functionality is a feature, however small"
+    }
+    if p == "stage" {
+        return "a roadmap stage is new functionality by definition"
+    }
+    if p == "spec" {
+        return "a spec change is a language change"
+    }
+    if p == "stdlib" {
+        return "new stdlib surface is a feature"
+    }
+    if p == "perf" {
+        return "a perf rewrite can change semantics; only provable "
+        + "repairs qualify for an LTS"
+    }
+    if p == "opt" {
+        return "an optimisation is not a repair"
+    }
+    if p == "refactor" {
+        return "a refactor is risk without a user-visible repair"
+    }
+    return ""
+}
+
+fn chore_reason(p: str) -> str {
+    if p == "chore" {
+        return "release bookkeeping changes no language surface"
+    }
+    if p == "release" {
+        return "a release commit is the bookkeeping itself"
+    }
+    if p == "docs" || p == "doc" {
+        return "documentation changes no language surface"
+    }
+    if p == "test" || p == "tests" {
+        return "test-only changes are safe on an LTS"
+    }
+    if p == "ci" {
+        return "CI bookkeeping changes no language surface"
+    }
+    if p == "meta" {
+        return "project meta bookkeeping"
+    }
+    return ""
+}
+
+fn prefix_class(p: str) -> str {
+    if bugfix_reason(p) != "" {
+        return "BUGFIX"
+    }
+    if feature_reason(p) != "" {
+        return "FEATURE"
+    }
+    if chore_reason(p) != "" {
+        return "CHORE"
+    }
+    return ""
+}
+
+# prefix_of(subject) — "word: rest" (a colon, then one whitespace);
+# a bare word with no colon is NOT a prefix (fail-closed).
+fn prefix_of(subject: str) -> str {
+    let n: int = subject.len()
+    if n < 1 {
+        return ""
+    }
+    let c0: int = subject.byte_at(0)
+    if !is_alpha_b(c0) {
+        return ""
+    }
+    let mut i: int = 1
+    while i < n {
+        let c: int = subject.byte_at(i)
+        if is_alpha_b(c) || is_digit_b(c) || c == 45 || c == 95 {
+            i = i + 1
+            continue
+        }
+        if c == 58 {
+            # \s after the colon: [ \t\n\r\f\v]
+            if i + 1 < n {
+                let w: int = subject.byte_at(i + 1)
+                if w == 32 || w == 9 || w == 10 || w == 13 || w == 12
+                || w == 11 {
+                    return subject.slice(0, i)
+                }
+            }
+            return ""
+        }
+        return ""
+    }
+    return ""
+}
+
+fn lower_ascii(s: str) -> str {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c >= 65 && c <= 90 {
+            out.push(chr(c + 32))
+        } else {
+            out.push(chr(c))
+        }
+        i = i + 1
+    }
+    return join(out, "")
+}
+
+# trailer_sha(message) — the Backported-from trailer's 40-hex value.
+fn trailer_sha(message: str) -> str {
+    let lines: list[str] = message.split("\n")
+    let want: str = lower_ascii(trailer_name() + ":")
+    let mut i: int = 0
+    while i < lines.len() {
+        let s: str = strip_ends(lines.get(i))
+        if starts_with_ci(s, want) {
+            let colon: int = s.find(":")
+            if colon >= 0 {
+                let val: str = strip_ends(s.slice(colon + 1, s.len()))
+                if is_hex40(val) {
+                    return val
+                }
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn starts_with_ci(s: str, lower_prefix: str) -> bool {
+    return lower_ascii(s).starts_with(lower_prefix)
+}
+
+fn is_hex40(s: str) -> bool {
+    if s.len() != 40 {
+        return false
+    }
+    let mut i: int = 0
+    while i < 40 {
+        let c: int = s.byte_at(i)
+        if !((c >= 48 && c <= 57) || (c >= 97 && c <= 102)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# security_mark(message) — the first `Security: <reason>` line's value
+# ("" when the trailer stands empty — an empty value is no marking).
+fn security_mark(message: str) -> str {
+    let lines: list[str] = message.split("\n")
+    let want: str = lower_ascii(security_trailer() + ":")
+    let mut i: int = 0
+    while i < lines.len() {
+        let s: str = strip_ends(lines.get(i))
+        if starts_with_ci(s, want) {
+            let colon: int = s.find(":")
+            if colon >= 0 {
+                return strip_ends(s.slice(colon + 1, s.len()))
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# cherry_pick_sha(message) — the sha inside git's "(cherry picked from
+# commit ...)" mark, when it names a commit that resolves.
+fn cherry_pick_sha(repo: str, message: str) -> str uses Proc {
+    if !message.contains(cherry_mark()) {
+        return ""
+    }
+    let needle: str = cherry_mark()
+    let at: int = message.find(needle)
+    let mut j: int = at + needle.len()
+    while j < message.len() && is_hex_b(message.byte_at(j)) {
+        j = j + 1
+    }
+    if j <= at + needle.len() {
+        return ""
+    }
+    let shorthex: str = message.slice(at + needle.len(), j)
+    let full: str = rev_parse(repo, shorthex)
+    return full
+}
+
+fn is_hex_b(c: int) -> bool {
+    return(c >= 48 && c <= 57) || (c >= 97 && c <= 102)
+}
+
+# ============================================================================
+# The diff gate — a BUGFIX whose diff introduces public API surface is
+# a FEATURE in disguise.
+# ============================================================================
+
+# fn_name_after(line, plus) — the identifier after `fn ` in a +/- diff
+# line, or "".
+fn is_ws_b(c: int) -> bool {
+    return c == 32 || c == 9
+}
+
+# safe_prefix(s, n) — Python's s[:n]: clamps at both ends.
+fn safe_prefix(s: str, n: int) -> str {
+    if n <= 0 {
+        return ""
+    }
+    if n >= s.len() {
+        return s
+    }
+    return s.slice(0, n)
+}
+
+fn fn_name_after(line: str) -> str {
+    # [-+]\s*(pub\s+)?fn\s+NAME — Halis has no `pub`, but the Python
+    # gate accepted it; keep the same shape.
+    let mut i: int = 1
+    let n: int = line.len()
+    while i < n && is_ws_b(line.byte_at(i)) {
+        i = i + 1
+    }
+    if n - i < 3 {
+        return ""
+    }
+    if n - i >= 4 && line.slice(i, i + 4) == "pub " {
+        i = i + 4
+        while i < n && is_ws_b(line.byte_at(i)) {
+            i = i + 1
+        }
+    }
+    if n - i < 3 || line.slice(i, i + 3) != "fn " {
+        return ""
+    }
+    i = i + 3
+    while i < n && is_ws_b(line.byte_at(i)) {
+        i = i + 1
+    }
+    let s: int = i
+    while i < n {
+        let c: int = line.byte_at(i)
+        if is_alpha_b(c) || c == 95 || is_digit_b(c) {
+            i = i + 1
+        } else {
+            break
+        }
+    }
+    if i == s {
+        return ""
+    }
+    if s == 0 {
+        return ""
+    }
+    let c0: int = line.byte_at(s)
+    if !(is_alpha_b(c0) || c0 == 95) {
+        return ""
+    }
+    return line.slice(s, i)
+}
+
+# new_public_names(diff) — new top-level fn names the diff introduces
+# in std/ or core/ Halis modules.
+struct Added {
+    path: str,
+    name: str
+}
+
+fn new_public_names(diff: str) -> list[str] {
+    let names: list[str] = []
+    let mut current: str = ""
+    let removed: list[str] = []
+    let added: list[Added] = []
+    let lines: list[str] = diff.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i)
+        if line.starts_with("diff --git ") {
+            current = ""
+        } else if line.starts_with("--- ") || line.starts_with("index ") {
+            # skip
+        } else if line.starts_with("+++ ") {
+            current = strip_ends(line.slice(4, line.len()))
+            if current.starts_with("b/") {
+                current = current.slice(2, current.len())
+            }
+            while removed.len() > 0 {
+                removed.pop()
+            }
+        } else if line.starts_with("-") {
+            let nm: str = fn_name_after(line)
+            if nm != "" {
+                removed.push(nm)
+            }
+        } else if line.starts_with("+") {
+            let nm: str = fn_name_after(line)
+            if nm != "" {
+                added.push(Added {
+                    path: current, name: nm
+                })
+            }
+        }
+        i = i + 1
+    }
+    let mut a: int = 0
+    while a < added.len() {
+        let path: str = added.get(a).path
+        let name: str = added.get(a).name
+        if path.ends_with(".hls")
+        && (path.starts_with("std/") || path.starts_with("core/")) {
+            let mut gone: bool = false
+            let mut k: int = 0
+            while k < removed.len() {
+                if removed.get(k) == name {
+                    gone = true
+                }
+                k = k + 1
+            }
+            let mut dup: bool = false
+            let mut k2: int = 0
+            while k2 < names.len() {
+                if names.get(k2) == name {
+                    dup = true
+                }
+                k2 = k2 + 1
+            }
+            if !gone && !dup {
+                names.push(name)
+            }
+        }
+        a = a + 1
+    }
+    return names
+}
+
+struct Cls {
+    sha: str,
+    subject: str,
+    cls: str,
+    reason: str,
+    reasons: list[str],
+    security: bool,
+    security_reason: str
+}
+
+# classify_commit(repo, sha) — the message law first; the diff gate may
+# re-class a BUGFIX into a FEATURE. The default is UNKNOWN (fail-closed).
+fn classify_commit(repo: str, sha: str) -> Cls uses Proc {
+    let msg: str = message_of(repo, sha)
+    let lines0: list[str] = msg.split("\n")
+    let subject: str = lines0.get(0)
+    let mut cls: str = "UNKNOWN"
+    let mut reason: str = "no recognized prefix — the classifier is fail-closed"
+    let pfx: str = prefix_of(subject)
+    if pfx != "" {
+        let p: str = lower_ascii(pfx)
+        let pc: str = prefix_class(p)
+        if pc != "" {
+            cls = pc
+            if bugfix_reason(p) != "" {
+                reason = bugfix_reason(p)
+            } else if feature_reason(p) != "" {
+                reason = feature_reason(p)
+            } else {
+                reason = chore_reason(p)
+            }
+        } else {
+            cls = "UNKNOWN"
+            reason = "prefix '" + p + "' is not in the policy table"
+        }
+    }
+    # The diff gate (only a BUGFIX can be re-classed; the reasons
+    # ride along when it is).
+    let reasons: list[str] = []
+    if cls == "BUGFIX" {
+        let diff: str = diff_of(repo, sha)
+        let added_files: list[str] = diff_added_files(repo, sha)
+        let mut extra: list[str] = []
+        let mut f: int = 0
+        while f < added_files.len() {
+            let line: str = added_files.get(f)
+            if line.starts_with("A\t") {
+                let rest: str = line.slice(2, line.len())
+                if rest.starts_with("std/") || rest.starts_with("core/") {
+                    extra.push("new std module file '" + rest
+                    + "' — new API surface is a feature")
+                }
+            }
+            f = f + 1
+        }
+        let names: list[str] = new_public_names(diff)
+        if names.len() > 0 {
+            let mut joined: str = ""
+            let mut nn: int = 0
+            while nn < names.len() && nn < 4 {
+                if nn > 0 {
+                    joined = joined + ", "
+                }
+                joined = joined + names.get(nn)
+                nn = nn + 1
+            }
+            extra.push("new public fn(s) " + joined
+            + " — new API surface is a feature")
+        }
+        let dl: list[str] = diff.split("\n")
+        let mut di: int = 0
+        while di < dl.len() {
+            if dl.get(di).starts_with("+++") && dl.get(di).contains("SPEC.md") {
+                extra.push("SPEC.md edits are language changes")
+                break
+            }
+            di = di + 1
+        }
+        if extra.len() > 0 {
+            cls = "FEATURE"
+            reasons.push(reason)
+            let mut e: int = 0
+            while e < extra.len() {
+                reasons.push(extra.get(e))
+                e = e + 1
+            }
+        } else {
+            reasons.push(reason)
+        }
+    } else {
+        reasons.push(reason)
+    }
+    let mark: str = security_mark(msg)
+    return Cls {
+        sha: rev_parse(repo, sha),
+        subject: subject,
+        cls: cls,
+        reason: reasons.get(0),
+        reasons: reasons,
+        security: mark != "",
+        security_reason: mark
+    }
+}
+
+fn is_backport_commit(repo: str, sha: str) -> bool uses Proc {
+    let m: str = message_of(repo, sha)
+    return trailer_sha(m) != "" || m.contains(cherry_mark())
+}
+
+# ============================================================================
+# The Stage 145 window law — the calendar, the phases, the marking.
+# ============================================================================
+
+# commit_day(repo, sha) — the committer day, from %cI's date part.
+fn commit_day(repo: str, sha: str) -> Day uses Proc {
+    let iso: str = commit_time(repo, sha)
+    if iso == "" {
+        return bad_day()
+    }
+    let t: str = strip_ends(iso)
+    let mut head10: str = ""
+    if t.len() >= 10 {
+        head10 = t.slice(0, 10)
+    }
+    return parse_day(head10)
+}
+
+# add_years is the calendar law (above). The window:
+struct Window {
+    bug_fix_until: Day,
+    security_until: Day
+}
+
+fn window_of(base: Day) -> Window {
+    return Window {
+        bug_fix_until: add_years(base, bugfix_years()),
+        security_until: add_years(base, security_years())
+    }
+}
+
+# phase_at(base, at) — the horizon day itself belongs to the phase it
+# closes: support runs THROUGH the anniversary.
+fn phase_at(base: Day, at: Day) -> str {
+    let w: Window = window_of(base)
+    if day_ord(at) <= day_ord(w.bug_fix_until) {
+        return phase_active()
+    }
+    if day_ord(at) <= day_ord(w.security_until) {
+        return phase_security()
+    }
+    return phase_eol()
+}
+
+# line_base_day(repo, pol) — the day the declared line was born.
+fn line_base_day(repo: str, pol: JsonValue) -> Day uses Proc {
+    if !json_object_has(pol, "base_sha") {
+        return bad_day()
+    }
+    let sha: str = json_str_value(json_object_get(pol, "base_sha"))
+    if sha == "" {
+        return bad_day()
+    }
+    return commit_day(repo, sha)
+}
+
+fn line_base_day_of_tag(repo: str, tag: str) -> Day uses Proc {
+    let sha: str = tag_sha(repo, tag)
+    if sha == "" {
+        return bad_day()
+    }
+    return commit_day(repo, sha)
+}
+
+# ============================================================================
+# The policy file.
+# ============================================================================
+
+# policy_path(repo) — repo + "/" + .hls-lts.json (no trailing-slash
+# doubling).
+fn policy_path(repo: str) -> str {
+    if repo.byte_at(repo.len() - 1) == 47 {
+        return repo + policy_file()
+    }
+    return repo + "/" + policy_file()
+}
+
+# load_policy(repo) — Ok(JsonValue) when the file stands; Err(message)
+# for an unknown version; Ok(json_null()) when absent.
+fn load_policy(repo: str) -> Result[JsonValue, str] uses Fs {
+    let path: str = policy_path(repo)
+    if !file_exists(path) {
+        return Result.Ok(json_null())
+    }
+    let parsed: Result[JsonValue, str] = json_parse_result(read_file(path))
+    if result_is_err(parsed) {
+        return Result.Err("policy file " + policy_file()
+        + " does not parse as JSON")
+    }
+    let data: JsonValue = result_unwrap(parsed)
+    if !json_object_has(data, "policy")
+    || json_str_value(json_object_get(data, "policy"))
+    != policy_version() {
+        return Result.Err("policy file " + policy_file()
+        + " has unknown policy version")
+    }
+    return Result.Ok(data)
+}
+
+# save_policy(repo, keys, vals) — the declaration, rendered sorted with
+# two-space indent (the shape the Python years wrote).
+fn save_policy(repo: str, branch: str, base_tag: str, base_sha: str,
+created: str) -> void uses Fs {
+    let keys: list[str] = ["base_sha", "base_tag", "branch", "created",
+    "policy"]
+    let vals: list[str] = [base_sha, base_tag, branch, created,
+    policy_version()]
+    let mut i: int = 0
+    let mut out: str = "{\n"
+    while i < keys.len() {
+        out = out + "  \"" + keys.get(i) + "\": " + json_quote(vals.get(i))
+        if i + 1 < keys.len() {
+            out = out + ","
+        }
+        out = out + "\n"
+        i = i + 1
+    }
+    out = out + "}\n"
+    write_file(policy_path(repo), out)
+}
+
+# json_quote(s) — a minimal JSON string escaper (\", \\, control bytes
+# as \uXXXX — the policy's values are shas, tags and ISO stamps, but
+# the law is the law).
+fn json_quote(s: str) -> str {
+    let out: list[str] = ["\""]
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c == 34 {
+            out.push("\\\"")
+        } else if c == 92 {
+            out.push("\\\\")
+        } else if c == 10 {
+            out.push("\\n")
+        } else if c == 9 {
+            out.push("\\t")
+        } else if c < 32 {
+            let hex: str = "0123456789abcdef"
+            out.push("\\u00" + hex.slice(c / 16, c / 16 + 1)
+            + hex.slice(c % 16, c % 16 + 1))
+        } else {
+            out.push(chr(c))
+        }
+        i = i + 1
+    }
+    out.push("\"")
+    return join(out, "")
+}
+
+# ============================================================================
+# The commands.
+# ============================================================================
+
+fn die(msg: str) -> int uses IO {
+    eprintln("hls-lts: " + msg)
+    return 1
+}
+
+# repo_arg(argv) — --repo's value, else the parent of this tool's
+# source tree (the repo root when driven from a checkout).
+fn repo_arg(argv: list[str]) -> str uses Proc {
+    let mut i: int = 1
+    while i < argv.len() {
+        if argv.get(i) == "--repo" && i + 1 < argv.len() {
+            return argv.get(i + 1)
+        }
+        i = i + 1
+    }
+    return cwd_get()
+}
+
+fn require_repo(repo: str) -> bool uses IO, Proc {
+    if !is_repo(repo) {
+        die("'" + repo + "' is not a git repository")
+        return false
+    }
+    return true
+}
+
+# cmd_init — the init law: the base tag must exist, parse as semver and
+# be a >= 1.0.0 RELEASE; the declaration is written; a missing branch
+# is created AT the base; re-init is an idempotent no-op.
+fn cmd_init(argv: list[str]) -> int uses IO, Fs, Proc {
+    let repo: str = repo_arg(argv)
+    if !require_repo(repo) {
+        return 1
+    }
+    let tag: str = flag_value(argv, "--tag", "")
+    let branch: str = flag_value(argv, "--branch", default_branch())
+    if tag == "" {
+        eprintln("usage: hls-lts init --tag v1.0.0 [--branch NAME]")
+        return 2
+    }
+
+    let pol_r: Result[JsonValue, str] = load_policy(repo)
+    if result_is_err(pol_r) {
+        return die("init: " + result_err_or(pol_r, ""))
+    }
+    let existing: JsonValue = result_unwrap(pol_r)
+    if !json_is_null(existing) {
+        let mut base_sha_now: str = ""
+        if tag_exists(repo, tag) {
+            base_sha_now = tag_sha(repo, tag)
+        }
+        if json_str_value(json_object_get(existing, "base_tag")) == tag
+        && json_str_value(json_object_get(existing, "branch"))
+        == branch
+        && base_sha_now
+        == json_str_value(json_object_get(existing, "base_sha")) {
+            println("hls-lts: policy already declared (idempotent no-op): "
+            + "branch " + branch + " from " + tag)
+            return 0
+        }
+        return die("init: a policy is already declared ("
+        + json_str_value(json_object_get(existing, "branch")) + " from "
+        + json_str_value(json_object_get(existing, "base_tag"))
+        + ") — one declaration per repository; a different base is "
+        + "a new policy decision, not a re-init")
+    }
+
+    let v: SemVer = tag_version(tag)
+    if !v.ok {
+        return die("init: base tag '" + tag + "' is not a valid semantic "
+        + "version (semver 2.0.0) — the LTS base must be a release "
+        + "tag")
+    }
+    if v.prerelease != "" {
+        return die("init: base tag '" + tag + "' carries a pre-release — "
+        + "the LTS policy begins AT v1.0.0, on a release")
+    }
+    if v.major < 1 {
+        return die("init: base tag '" + tag + "' is pre-1.0 — the LTS "
+        + "policy begins after v1.0 (backport-only AFTER v1.0)")
+    }
+    if !tag_exists(repo, tag) {
+        return die("init: tag '" + tag + "' does not exist in the "
+        + "repository")
+    }
+    let base_sha: str = tag_sha(repo, tag)
+    if base_sha == "" {
+        return die("init: tag '" + tag + "' does not name a commit")
+    }
+
+    if !has_branch(repo, branch) {
+        git_run(repo, ["branch", branch, base_sha])
+        println("hls-lts: created branch " + branch + " at "
+        + safe_prefix(base_sha, 12) + " (" + tag + ")")
+    }
+    save_policy(repo, branch, tag, base_sha, commit_time(repo, "HEAD"))
+    println("hls-lts: declared LTS branch '" + branch + "' from tag "
+    + tag + " (" + safe_prefix(base_sha, 12) + ")")
+    println("hls-lts: policy: backport-only — BUGFIX backports with '"
+    + trailer_name() + ": <sha>' trailers and chores only")
+    return 0
+}
+
+# cmd_status — the declaration, the state, the audit verdict.
+fn cmd_status(argv: list[str]) -> int uses IO, Fs, Proc {
+    let repo: str = repo_arg(argv)
+    if !require_repo(repo) {
+        return 1
+    }
+    let pol_r: Result[JsonValue, str] = load_policy(repo)
+    if result_is_err(pol_r) {
+        return die("status: " + result_err_or(pol_r, ""))
+    }
+    let pol: JsonValue = result_unwrap(pol_r)
+    if json_is_null(pol) {
+        return die("status: no LTS policy declared — run `hls-lts init "
+        + "--tag v1.0.0` after v1.0 exists")
+    }
+    let branch: str = json_str_value(json_object_get(pol, "branch"))
+    let base_sha: str = json_str_value(json_object_get(pol, "base_sha"))
+    let commit_list: list[str] = commits(repo, base_sha, branch)
+    let all_tags: list[str] = tags_on(repo, branch)
+    let tags: list[str] = []
+    let mut t: int = 0
+    while t < all_tags.len() {
+        if tag_version(all_tags.get(t)).ok {
+            tags.push(all_tags.get(t))
+        }
+        t = t + 1
+    }
+    let violations: list[str] = audit_violations(repo, pol)
+
+    let base_day: Day = line_base_day(repo, pol)
+    let mut win_line: str = "window: the base commit's day cannot be "
+    + "read — the phase is unknown (fail-closed)"
+    if base_day.ok {
+        let w: Window = window_of(base_day)
+        let today: Day = today_utc()
+        let ph: str = phase_at(base_day, today)
+        win_line = "window: bug fixes until " + day_iso(w.bug_fix_until)
+        + ", security until " + day_iso(w.security_until)
+        + " — phase today: " + ph + " (" + phase_meaning(ph) + ")"
+    }
+    if has_flag(argv, "--json") {
+        println(json_render_status(pol, commit_list, tags, violations,
+        base_day))
+    } else {
+        println("LTS policy " + json_str_value(json_object_get(pol, "policy"))
+        + " — branch " + branch + " from "
+        + json_str_value(json_object_get(pol, "base_tag")) + " ("
+        + safe_prefix(base_sha, 12) + ")")
+        println(win_line)
+        println("commits since base: " + commit_list.len().to_str())
+        let mut tag_line: str = "(none yet)"
+        if tags.len() > 0 {
+            tag_line = ""
+            let mut i: int = 0
+            while i < tags.len() {
+                if i > 0 {
+                    tag_line = tag_line + ", "
+                }
+                tag_line = tag_line + tags.get(i)
+                i = i + 1
+            }
+        }
+        println("tags on branch: " + tag_line)
+        if violations.len() > 0 {
+            println("audit: " + violations.len().to_str() + " violation(s)")
+            let mut i: int = 0
+            while i < violations.len() {
+                println("  - " + violations.get(i))
+                i = i + 1
+            }
+        } else {
+            println("audit: clean")
+        }
+    }
+    if violations.len() > 0 {
+        return 1
+    }
+    return 0
+}
+
+# cmd_classify — one commit, the class, the marking.
+fn cmd_classify(argv: list[str]) -> int uses IO, Fs, Proc {
+    let repo: str = repo_arg(argv)
+    if !require_repo(repo) {
+        return 1
+    }
+    let commit_arg: str = positional(argv)
+    if commit_arg == "" {
+        eprintln("usage: hls-lts classify COMMIT")
+        return 2
+    }
+    let sha: str = rev_parse(repo, commit_arg)
+    if sha == "" {
+        return die("classify: '" + commit_arg + "' does not name a commit")
+    }
+    let c: Cls = classify_commit(repo, sha)
+    if has_flag(argv, "--json") {
+        println(json_render_classify(c))
+        return 0
+    }
+    println("commit " + c.sha)
+    println("  subject: " + c.subject)
+    println("  class:   " + c.cls)
+    if c.security {
+        println("  security: marked — " + c.security_reason)
+    } else {
+        println("  security: unmarked — no 'Security: <reason>' trailer "
+        + "in the message (fail-closed)")
+    }
+    let mut i: int = 0
+    while i < c.reasons.len() {
+        println("  - " + c.reasons.get(i))
+        i = i + 1
+    }
+    return 0
+}
+
+# checkout_or_restore — leave the worktree where it was found.
+fn checkout_or_restore(repo: str, original: str, had_pick: bool) -> void
+uses Proc {
+    if had_pick {
+        git_run(repo, ["cherry-pick", "--abort"])
+        git_run(repo, ["cherry-pick", "--quit"])
+    }
+    git_run(repo, ["checkout", "-q", original])
+}
+
+# cmd_backport — the green path: a BUGFIX cherry-picks onto the branch
+# with a Backported-from trailer; the window law judges first.
+fn cmd_backport(argv: list[str]) -> int uses IO, Fs, Proc {
+    let repo: str = repo_arg(argv)
+    if !require_repo(repo) {
+        return 1
+    }
+    let pol_r: Result[JsonValue, str] = load_policy(repo)
+    if result_is_err(pol_r) {
+        return die("backport: " + result_err_or(pol_r, ""))
+    }
+    let pol: JsonValue = result_unwrap(pol_r)
+    if json_is_null(pol) {
+        return die("backport: no LTS policy declared — run `hls-lts init "
+        + "--tag v1.0.0` first")
+    }
+    let declared: str = json_str_value(json_object_get(pol, "branch"))
+    let branch: str = flag_value(argv, "--branch", declared)
+    if branch != declared {
+        return die("backport: branch '" + branch + "' is not the declared "
+        + "LTS branch ('" + declared + "') — one policy, one branch")
+    }
+    let commit_arg: str = positional(argv)
+    let sha: str = rev_parse(repo, commit_arg)
+    if sha == "" {
+        return die("backport: '" + commit_arg + "' does not name a commit")
+    }
+
+    let original: str = current_branch(repo)
+    if is_dirty(repo) {
+        return die("backport: the worktree has uncommitted changes — "
+        + "commit or stash them first (the tool refuses to stomp work)")
+    }
+
+    # The window gate, part one: the phase.
+    let at: Day = resolve_at(argv)
+    if !at.ok {
+        return die("backport: --at must be a plain ISO day, YYYY-MM-DD "
+        + "(the policy speaks in days)")
+    }
+    let base_day: Day = line_base_day(repo, pol)
+    if !base_day.ok {
+        return die("backport: the base commit's day cannot be read from "
+        + "git — the window law refuses to guess (fail-closed)")
+    }
+    let phase: str = phase_at(base_day, at)
+    let w: Window = window_of(base_day)
+    if phase == phase_eol() {
+        println("backport: REFUSED — the LTS line of "
+        + json_str_value(json_object_get(pol, "base_tag"))
+        + " reached end of life on " + day_iso(w.security_until)
+        + " — nothing lands on a dead line (judged at " + day_iso(at)
+        + ")")
+        return 1
+    }
+
+    let c: Cls = classify_commit(repo, sha)
+    if has_flag(argv, "--dry-run") {
+        println("backport: dry run")
+        println("  upstream commit " + safe_prefix(sha, 12) + " (" + c.subject
+        + ")")
+        println("  class: " + c.cls + " — " + c.reason)
+        println("  window: " + phase + " (since " + day_iso(base_day)
+        + ", until " + day_iso(w.bug_fix_until) + "; judged at "
+        + day_iso(at) + ")")
+        if c.security {
+            println("  security: marked — " + c.security_reason)
+        }
+        if c.cls == "BUGFIX" {
+            if phase == phase_security() && !c.security {
+                println("  would refuse: the line is security-only and "
+                + "this fix carries no 'Security:' trailer")
+            } else {
+                println("  would cherry-pick onto " + branch + " with a '"
+                + trailer_name() + ": " + sha + "' trailer")
+            }
+        } else {
+            println("  would refuse: only BUGFIX commits may be "
+            + "backported")
+        }
+        return 0
+    }
+
+    if c.cls != "BUGFIX" {
+        println("backport: REFUSED — commit " + safe_prefix(sha, 12)
+        + " classifies " + c.cls + ", only BUGFIX may be backported")
+        println("  reason: " + c.reason)
+        let mut i: int = 1
+        while i < c.reasons.len() {
+            println("  - " + c.reasons.get(i))
+            i = i + 1
+        }
+        return 1
+    }
+
+    # The window gate, part two: the security-only phase takes only
+    # marked fixes.
+    if phase == phase_security() && !c.security {
+        println("backport: REFUSED — the LTS line of "
+        + json_str_value(json_object_get(pol, "base_tag"))
+        + " is security-only since " + day_iso(w.bug_fix_until)
+        + " (until " + day_iso(w.security_until) + ", judged at "
+        + day_iso(at) + "): only fixes marked 'Security: <reason>' "
+        + "may land — this one carries no Security trailer")
+        return 1
+    }
+
+    git_run(repo, ["checkout", "-q", branch])
+    let pick: GitOut = git_run(repo, ["cherry-pick", "-x", sha])
+    if pick.code != 0 {
+        checkout_or_restore(repo, original, true)
+        git_run(repo, ["checkout", "-q", original])
+        let mut detail: str = pick.out
+        if detail.len() > 400 {
+            detail = detail.slice(0, 400)
+        }
+        return die("backport: REFUSED — cherry-pick conflicted: " + detail
+        + " (the branch is untouched)")
+    }
+    # Append the machine-readable provenance trailer.
+    let mut new_msg: str = message_of(repo, "HEAD")
+    while new_msg.ends_with("\n") {
+        new_msg = new_msg.slice(0, new_msg.len() - 1)
+    }
+    if trailer_sha(new_msg) == "" {
+        new_msg = new_msg + "\n\n" + trailer_name() + ": " + sha + "\n"
+        git_spawn_in(repo, ["commit", "--amend", "-q", "-F", "-"], new_msg)
+    }
+    let picked: str = rev_parse(repo, "HEAD")
+    println("backport: applied " + safe_prefix(sha, 12) + " onto " + branch
+    + " as " + safe_prefix(picked, 12))
+    println("  provenance: " + trailer_name() + ": " + sha)
+    if phase == phase_security() {
+        println("  window: security-only — the line takes security fixes "
+        + "until " + day_iso(w.security_until))
+    } else {
+        println("  window: " + phase + " — the line takes bug fixes "
+        + "until " + day_iso(w.bug_fix_until) + " (security until "
+        + day_iso(w.security_until) + ")")
+    }
+    git_run(repo, ["checkout", "-q", original])
+    return 0
+}
+
+# resolve_at(argv) — the pinned day, or today.
+fn resolve_at(argv: list[str]) -> Day uses Clock {
+    let v: str = flag_value(argv, "--at", "")
+    if v == "" {
+        return today_utc()
+    }
+    return parse_day(v)
+}
+
+struct TagEntry {
+    patch: int,
+    tag: str
+}
+
+struct ChainEntry {
+    patch: int,
+    tag: str
+}
+
+# lts_tag_law(pol, v, tag) — the version law for an LTS tag.
+fn lts_tag_law(pol: JsonValue, v: SemVer, tag: str) -> str {
+    let base: SemVer = tag_version(json_str_value(json_object_get(pol,
+    "base_tag")))
+    if v.prerelease != "" {
+        return "tag '" + tag + "' carries a pre-release — an LTS release "
+        + "is a release"
+    }
+    if v.build != "" {
+        return "tag '" + tag + "' carries build metadata — LTS tags are "
+        + "plain vMAJOR.MINOR.PATCH"
+    }
+    if v.major != base.major || v.minor != base.minor {
+        return "tag '" + tag + "' changes major.minor — an LTS branch is "
+        + "patch-only (base " + json_str_value(json_object_get(pol,
+        "base_tag")) + ")"
+    }
+    if v.major < 1 {
+        return "tag '" + tag + "' is pre-1.0 — the LTS policy begins at "
+        + "v1.0"
+    }
+    return ""
+}
+
+# cmd_tag_patch — cut the next LTS patch tag.
+fn cmd_tag_patch(argv: list[str]) -> int uses IO, Fs, Proc {
+    let repo: str = repo_arg(argv)
+    if !require_repo(repo) {
+        return 1
+    }
+    let pol_r: Result[JsonValue, str] = load_policy(repo)
+    if result_is_err(pol_r) {
+        return die("tag-patch: " + result_err_or(pol_r, ""))
+    }
+    let pol: JsonValue = result_unwrap(pol_r)
+    if json_is_null(pol) {
+        return die("tag-patch: no LTS policy declared — run `hls-lts init "
+        + "--tag v1.0.0` first")
+    }
+    let declared: str = json_str_value(json_object_get(pol, "branch"))
+    let branch: str = flag_value(argv, "--branch", declared)
+    if branch != declared {
+        return die("tag-patch: branch '" + branch + "' is not the "
+        + "declared LTS branch ('" + declared + "')")
+    }
+    let base: SemVer = tag_version(json_str_value(json_object_get(pol,
+    "base_tag")))
+
+    # The window gate: no release is cut from a dead line.
+    let at: Day = resolve_at(argv)
+    if !at.ok {
+        return die("tag-patch: --at must be a plain ISO day, YYYY-MM-DD "
+        + "(the policy speaks in days)")
+    }
+    let base_day: Day = line_base_day(repo, pol)
+    if !base_day.ok {
+        return die("tag-patch: the base commit's day cannot be read from "
+        + "git — the window law refuses to guess (fail-closed)")
+    }
+    let phase: str = phase_at(base_day, at)
+    let w: Window = window_of(base_day)
+    if phase == phase_eol() {
+        println("tag-patch: REFUSED — no release is cut from a dead line: "
+        + "the LTS line of " + json_str_value(json_object_get(pol,
+        "base_tag")) + " reached end of life on "
+        + day_iso(w.security_until) + " (judged at " + day_iso(at)
+        + ")")
+        return 1
+    }
+
+    # The last LTS tag on the branch: same major.minor, highest patch.
+    let lts_tags: list[TagEntry] = []
+    let all: list[str] = tags_on(repo, branch)
+    let mut t: int = 0
+    while t < all.len() {
+        let v: SemVer = tag_version(all.get(t))
+        if v.ok && v.major == base.major && v.minor == base.minor
+        && v.patch >= base.patch && v.prerelease == "" {
+            lts_tags.push(TagEntry {
+                patch: v.patch, tag: all.get(t)
+            })
+        }
+        t = t + 1
+    }
+    # sort by patch (then tag) — the Python tuple sort.
+    let mut a: int = 1
+    while a < lts_tags.len() {
+        let pv: TagEntry = lts_tags.get(a)
+        let mut b: int = a
+        while b > 0 {
+            let prev: TagEntry = lts_tags.get(b - 1)
+            let mut gt: bool = prev.patch > pv.patch
+            if prev.patch == pv.patch && prev.tag > pv.tag {
+                gt = true
+            }
+            if !gt {
+                break
+            }
+            lts_tags.set(b, prev)
+            b = b - 1
+        }
+        lts_tags.set(b, pv)
+        a = a + 1
+    }
+    let mut last_patch: int = base.patch - 1
+    let mut last_tag: str = json_str_value(json_object_get(pol, "base_tag"))
+    if lts_tags.len() > 0 {
+        last_patch = lts_tags.get(lts_tags.len() - 1).patch
+        last_tag = lts_tags.get(lts_tags.len() - 1).tag
+    }
+
+    let since_ref: str = last_tag
+    let head_sha: str = branch_sha(repo, branch)
+    let since_sha: str = rev_parse(repo, since_ref)
+    if head_sha == "" {
+        return die("tag-patch: branch '" + branch + "' does not resolve")
+    }
+
+    let mut want: str = flag_value(argv, "--tag", "")
+    if want != "" {
+        let v: SemVer = tag_version(want)
+        if !v.ok {
+            return die("tag-patch: '" + want + "' is not a valid semantic "
+            + "version")
+        }
+        let law: str = lts_tag_law(pol, v, want)
+        if law != "" {
+            println("tag-patch: REFUSED — " + law)
+            return 1
+        }
+        let expected: str = "v" + base.major.to_str() + "."
+        + base.minor.to_str() + "." + (last_patch + 1).to_str()
+        if v.patch != last_patch + 1 {
+            println("tag-patch: REFUSED — the LTS tag chain has no gaps: "
+            + want + " follows " + last_tag + " (expected " + expected
+            + ")")
+            return 1
+        }
+    } else {
+        want = "v" + base.major.to_str() + "." + base.minor.to_str() + "."
+        + (last_patch + 1).to_str()
+    }
+
+    if head_sha == since_sha {
+        println("tag-patch: REFUSED — no commits since " + last_tag
+        + ": an empty release is not a release (backport a fix "
+        + "first)")
+        return 1
+    }
+
+    # The security-release law: a release cut in the security-only phase
+    # carries at least one marked backport since the previous tag.
+    if phase == phase_security() {
+        let mut marked: int = 0
+        let cl: list[str] = commits(repo, since_sha, branch)
+        let mut ci: int = 0
+        while ci < cl.len() {
+            let tr: str = trailer_sha(message_of(repo, cl.get(ci)))
+            if tr != "" {
+                let up: str = rev_parse(repo, tr)
+                if up != "" {
+                    if classify_commit(repo, up).security {
+                        marked = marked + 1
+                    }
+                }
+            }
+            ci = ci + 1
+        }
+        if marked == 0 {
+            println("tag-patch: REFUSED — a release in the security-only "
+            + "phase carries at least one security backport — since "
+            + last_tag + " there is none (chore-only releases are how "
+            + "a security line pretends to be alive; judged at "
+            + day_iso(at) + ")")
+            return 1
+        }
+    }
+
+    if tag_exists(repo, want) {
+        return die("tag-patch: tag '" + want + "' already exists — the "
+        + "chain has no duplicates")
+    }
+    if has_flag(argv, "--dry-run") {
+        println("tag-patch: dry run — would tag " + want + " at " + branch
+        + " (" + branch_sha(repo, branch).slice(0, 12) + ")")
+        return 0
+    }
+    let msg: str = "Release " + want + " (LTS "
+    + json_str_value(json_object_get(pol, "base_tag")) + ")\n\nPatch "
+    + "release on the " + branch + " LTS branch (backport-only "
+    + "policy).\n"
+    git_run(repo, ["tag", "-a", want, branch, "-m", msg])
+    println("tag-patch: tagged " + want + " at " + branch + " ("
+    + branch_sha(repo, branch).slice(0, 12) + ")")
+    return 0
+}
+
+# audit_violations(repo, pol) — every commit and every tag on the
+# branch, each judged by the policy.
+fn audit_violations(repo: str, pol: JsonValue) -> list[str] uses Proc {
+    let violations: list[str] = []
+    let branch: str = json_str_value(json_object_get(pol, "branch"))
+    let base_sha: str = json_str_value(json_object_get(pol, "base_sha"))
+
+    let base_day: Day = line_base_day(repo, pol)
+    let w_ok: bool = base_day.ok
+    let w: Window = window_of(base_day)
+    if !w_ok {
+        violations.push("the base commit's day cannot be read — the "
+        + "window law refuses to judge history it cannot date "
+        + "(fail-closed)")
+    }
+
+    let cl: list[str] = commits(repo, base_sha, branch)
+    let mut i: int = 0
+    while i < cl.len() {
+        let sha: str = cl.get(i)
+        let msg: str = message_of(repo, sha)
+        let ml: list[str] = msg.split("\n")
+        let subject: str = ml.get(0)
+        let mut trailer: str = trailer_sha(msg)
+        if trailer == "" && msg.contains(cherry_mark()) {
+            trailer = cherry_pick_sha(repo, msg)
+        }
+
+        let landed: Day = commit_day(repo, sha)
+        let past_eol: bool = w_ok && landed.ok
+        && day_ord(landed) > day_ord(w.security_until)
+        let in_security: bool = w_ok && landed.ok
+        && day_ord(w.bug_fix_until) < day_ord(landed)
+        && day_ord(landed) <= day_ord(w.security_until)
+        if past_eol {
+            violations.push(safe_prefix(sha, 12) + " '" + clip_subj(subject, 60)
+            + "' landed on " + day_iso(landed) + ", past end of life ("
+            + day_iso(w.security_until) + ") — a dead line takes "
+            + "nothing, not even bookkeeping")
+            i = i + 1
+            continue
+        }
+
+        if trailer == "" {
+            let c: Cls = classify_commit(repo, sha)
+            if c.cls == "CHORE" {
+                i = i + 1
+                continue
+            }
+            let mut tail: str = "unclassified commits are refused (fail-closed)"
+            if c.cls == "FEATURE" {
+                tail = "only BUGFIX backports and chores may land"
+            }
+            violations.push(safe_prefix(sha, 12) + " '" + clip_subj(subject, 60)
+            + "' is " + c.cls + " on the LTS branch — " + tail)
+            i = i + 1
+            continue
+        }
+        let up: str = rev_parse(repo, trailer)
+        if up == "" {
+            violations.push(safe_prefix(sha, 12) + " '" + clip_subj(subject, 60)
+            + "' carries " + trailer_name() + ": "
+            + safe_prefix(trailer, 12) + " — the upstream commit does not "
+            + "exist here (provenance must be checkable)")
+            i = i + 1
+            continue
+        }
+        let c: Cls = classify_commit(repo, up)
+        if c.cls != "BUGFIX" {
+            violations.push(safe_prefix(sha, 12) + " '" + clip_subj(subject, 60)
+            + "' backports " + safe_prefix(trailer, 12) + ", which "
+            + "classifies " + c.cls + " — " + c.reason)
+            i = i + 1
+            continue
+        }
+
+        if in_security && !c.security {
+            violations.push(safe_prefix(sha, 12) + " '" + clip_subj(subject, 60)
+            + "' landed in the security-only phase (on "
+            + day_iso(landed) + ", after " + day_iso(w.bug_fix_until)
+            + ") without a Security mark — plain fixes do not land in "
+            + "that window")
+            i = i + 1
+            continue
+        }
+
+        # The backport's own diff must not introduce surface either.
+        let c2: Cls = classify_commit(repo, sha)
+        if c2.cls == "FEATURE" {
+            violations.push(safe_prefix(sha, 12) + " '"
+            + clip_subj(subject, 60) + "' resolves its backport into "
+            + "new API surface — " + c2.reason)
+        }
+        i = i + 1
+    }
+
+    # The tag law.
+    let base: SemVer = tag_version(json_str_value(json_object_get(pol,
+    "base_tag")))
+    let chain: list[ChainEntry] = []
+    let all: list[str] = tags_on(repo, branch)
+    let mut t: int = 0
+    while t < all.len() {
+        let tag: str = all.get(t)
+        let v: SemVer = tag_version(tag)
+        if !v.ok {
+            t = t + 1
+            continue
+        }
+        if v.major == base.major && v.minor == base.minor
+        && v.patch == base.patch {
+            t = t + 1
+            continue
+        }
+        if v.major > base.major || (v.major == base.major
+        && v.minor > base.minor) {
+            violations.push("tag " + tag + " cuts a release beyond the LTS "
+            + "line (" + json_str_value(json_object_get(pol, "base_tag"))
+            + ") from this branch")
+            t = t + 1
+            continue
+        }
+        if v.major != base.major || v.minor != base.minor {
+            t = t + 1
+            continue
+        }
+        let law: str = lts_tag_law(pol, v, tag)
+        if law != "" {
+            violations.push("tag " + tag + ": " + law)
+            t = t + 1
+            continue
+        }
+        # A release cut past end of life.
+        let tday: Day = line_base_day_of_tag(repo, tag)
+        if w_ok && tday.ok && day_ord(tday) > day_ord(w.security_until) {
+            violations.push("tag " + tag + " is cut from a commit dated "
+            + day_iso(tday) + ", past end of life ("
+            + day_iso(w.security_until) + ") — no release from a dead "
+            + "line")
+            t = t + 1
+            continue
+        }
+        chain.push(ChainEntry {
+            patch: v.patch, tag: tag
+        })
+        t = t + 1
+    }
+    # sort by patch
+    let mut a: int = 1
+    while a < chain.len() {
+        let cv: ChainEntry = chain.get(a)
+        let mut b: int = a
+        while b > 0 && chain.get(b - 1).patch > cv.patch {
+            chain.set(b, chain.get(b - 1))
+            b = b - 1
+        }
+        chain.set(b, cv)
+        a = a + 1
+    }
+    let mut expect: int = base.patch + 1
+    let mut e: int = 0
+    while e < chain.len() {
+        let p: int = chain.get(e).patch
+        let tg: str = chain.get(e).tag
+        if p != expect {
+            violations.push("tag chain has a gap or duplicate: " + tg
+            + " — expected v" + base.major.to_str() + "."
+            + base.minor.to_str() + "." + expect.to_str()
+            + " (the chain is +1 each release)")
+            expect = p
+        }
+        expect = expect + 1
+        e = e + 1
+    }
+    return violations
+}
+
+# clip_subj(s, n) — Python's [:60] on the subject.
+fn clip_subj(s: str, n: int) -> str {
+    if s.len() > n {
+        return s.slice(0, n)
+    }
+    return s
+}
+
+# cmd_audit — the branch judged, violation by violation.
+fn cmd_audit(argv: list[str]) -> int uses IO, Fs, Proc {
+    let repo: str = repo_arg(argv)
+    if !require_repo(repo) {
+        return 1
+    }
+    let pol_r: Result[JsonValue, str] = load_policy(repo)
+    if result_is_err(pol_r) {
+        return die("audit: " + result_err_or(pol_r, ""))
+    }
+    let pol: JsonValue = result_unwrap(pol_r)
+    if json_is_null(pol) {
+        return die("audit: no LTS policy declared — run `hls-lts init "
+        + "--tag v1.0.0` first")
+    }
+    let violations: list[str] = audit_violations(repo, pol)
+    let branch: str = json_str_value(json_object_get(pol, "branch"))
+    if has_flag(argv, "--json") {
+        let items: list[str] = []
+        let mut i: int = 0
+        while i < violations.len() {
+            items.push(json_quote(violations.get(i)))
+            i = i + 1
+        }
+        println("{\n  \"violations\": [" + join_json_items(items)
+        + "]\n}")
+        if violations.len() > 0 {
+            return 1
+        }
+        return 0
+    }
+    println("audit: branch " + branch + " (base "
+    + json_str_value(json_object_get(pol, "base_tag")) + ") — "
+    + commits(repo, json_str_value(json_object_get(pol, "base_sha")),
+    branch).len().to_str() + " commit(s), "
+    + tags_on(repo, branch).len().to_str() + " tag(s)")
+    if violations.len() > 0 {
+        println("audit: " + violations.len().to_str() + " violation(s):")
+        let mut i: int = 0
+        while i < violations.len() {
+            println("  - " + violations.get(i))
+            i = i + 1
+        }
+        return 1
+    }
+    println("audit: clean — every commit is a BUGFIX backport or a "
+    + "chore, every tag obeys the patch law")
+    return 0
+}
+
+fn join_json_items(items: list[str]) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < items.len() {
+        if i > 0 {
+            out = out + ", "
+        }
+        out = out + items.get(i)
+        i = i + 1
+    }
+    return out
+}
+
+# cmd_window — the line's support window and phase.
+fn cmd_window(argv: list[str]) -> int uses IO, Fs, Proc {
+    let repo: str = repo_arg(argv)
+    if !require_repo(repo) {
+        return 1
+    }
+    let at: Day = resolve_at(argv)
+    if !at.ok {
+        return die("window: --at must be a plain ISO day, YYYY-MM-DD "
+        + "(the policy speaks in days)")
+    }
+
+    let tag_arg: str = flag_value(argv, "--tag", "")
+    let mut base_day: Day = bad_day()
+    let mut label: str = ""
+    if tag_arg != "" {
+        let v: SemVer = tag_version(tag_arg)
+        if !v.ok {
+            return die("window: tag '" + tag_arg + "' is not a valid "
+            + "semantic version")
+        }
+        if v.prerelease != "" {
+            return die("window: tag '" + tag_arg + "' carries a "
+            + "pre-release — the support windows are a release's "
+            + "promise")
+        }
+        if v.major < 1 {
+            return die("window: tag '" + tag_arg + "' is pre-1.0 — the "
+            + "policy begins after v1.0")
+        }
+        if !tag_exists(repo, tag_arg) {
+            return die("window: tag '" + tag_arg + "' does not exist in "
+            + "the repository")
+        }
+        base_day = line_base_day_of_tag(repo, tag_arg)
+        label = tag_arg
+    } else {
+        let pol_r: Result[JsonValue, str] = load_policy(repo)
+        if result_is_err(pol_r) {
+            return die("window: " + result_err_or(pol_r, ""))
+        }
+        let pol: JsonValue = result_unwrap(pol_r)
+        if json_is_null(pol) {
+            return die("window: no LTS policy declared — name a tag with "
+            + "`window --tag v1.0.0`, or declare the line with "
+            + "`hls-lts init --tag v1.0.0`")
+        }
+        base_day = line_base_day(repo, pol)
+        label = json_str_value(json_object_get(pol, "base_tag"))
+    }
+
+    if !base_day.ok {
+        return die("window: the base commit's day cannot be read from "
+        + "git — the window law refuses to guess (fail-closed)")
+    }
+
+    let w: Window = window_of(base_day)
+    let phase: str = phase_at(base_day, at)
+    let days_bugfix_left: int = day_ord(w.bug_fix_until) - day_ord(at)
+    let days_security_left: int = day_ord(w.security_until) - day_ord(at)
+    if has_flag(argv, "--json") {
+        let items: list[str] = []
+        items.push("\"base_tag\": " + json_quote(label))
+        items.push("\"base_date\": " + json_quote(day_iso(base_day)))
+        items.push("\"bug_fix_until\": " + json_quote(day_iso(w.bug_fix_until)))
+        items.push("\"security_until\": "
+        + json_quote(day_iso(w.security_until)))
+        items.push("\"at\": " + json_quote(day_iso(at)))
+        items.push("\"phase\": " + json_quote(phase))
+        items.push("\"days_bugfix_left\": " + days_bugfix_left.to_str())
+        items.push("\"days_security_left\": " + days_security_left.to_str())
+        println("{\n  " + join_json_items(items) + "\n}")
+        return 0
+    }
+    println("LTS line of " + label + " — base released " + day_iso(base_day))
+    println("  bug fixes until:  " + day_iso(w.bug_fix_until)
+    + " (through the anniversary day)")
+    println("  security until:   " + day_iso(w.security_until)
+    + " (through the anniversary day)")
+    println("  phase at " + day_iso(at) + ": " + phase + " — "
+    + phase_meaning(phase))
+    if phase == phase_active() {
+        println("  full support days left: " + days_bugfix_left.to_str()
+        + " (then security-only until " + day_iso(w.security_until)
+        + ")")
+    } else if phase == phase_security() {
+        println("  security-only days left: " + days_security_left.to_str())
+    } else {
+        println("  the line ended " + day_iso(w.security_until) + " — "
+        + (-days_security_left).to_str() + " days past end of life")
+    }
+    return 0
+}
+
+# ============================================================================
+# The published document (Stage 145) — rendered from the constants,
+# deterministic per input; `policy --check` refuses drift.
+# ============================================================================
+
+fn render_policy() -> str {
+    # The exact line list the Python years rendered (the
+    # committed LTS.md is the pinned artifact — byte for byte).
+    let L: list[str] = []
+    L.push("# Long-term support policy — Halis (HLS)")
+    L.push("")
+    L.push("Generated from the live constants of `tools/hls-lts.hls` —")
+    L.push("this document is rendered, not maintained. Do not hand-edit;")
+    L.push("regenerate it with `bin/hls-lts policy --out")
+    L.push("LTS.md`. `make lts-policy-verify` re-derives the committed copy")
+    L.push("against the same render and refuses drift — the numbers below")
+    L.push("are the numbers the gates enforce, or the tree says no.")
+    L.push("")
+    L.push("## The promise")
+    L.push("")
+    L.push("Every LTS line this project opens gets **3 years of bug-fix")
+    L.push("support** and **5 years of security support**, counted from")
+    L.push("the day its base release was cut. The last 2 years of a 5-year")
+    L.push("line are security-only: after the third anniversary a plain")
+    L.push("bug fix is refused on the line even when it is a perfectly good")
+    L.push("fix, and after the fifth the line is dead and takes nothing at")
+    L.push("all. A published promise a tool cannot read is prose; this one")
+    L.push("is arithmetic (`hls-lts window`), it is enforced where a change")
+    L.push("would enter the branch (`hls-lts backport`, `hls-lts")
+    L.push("tag-patch`), and it audits history after the fact (`hls-lts")
+    L.push("audit`).")
+    L.push("")
+    L.push("## The line, and the day it is measured from")
+    L.push("")
+    L.push("An LTS line is a major.minor — `1.0` is the line of `v1.0.0`,")
+    L.push("`v1.0.1`, `v1.0.2` and every patch after. The window belongs to")
+    L.push("the LINE, not to each patch: it is measured from the committer")
+    L.push("day of the base release (`vMAJOR.MINOR.0`'s commit), and every")
+    L.push("patch on the line lives inside the same window. A line born")
+    L.push("late does not get a late window; a patch cut late does not")
+    L.push("extend one. `hls-lts init --tag vX.Y.0` declares the line;")
+    L.push("`hls-lts window` reads it, with `--at` to pin the day the law")
+    L.push("is judged on (default: today) — the same law, on any day.")
+    L.push("")
+    L.push("## The three phases")
+    L.push("")
+    L.push("| phase | days | what may land on the line |")
+    L.push("|-------|------|----------------------------|")
+    L.push("| `active` | base → base +3 years | any BUGFIX backport and chores |")
+    L.push("| `security` | base +3 → +5 years | SECURITY-marked BUGFIX backports and chores |")
+    L.push("| `eol` | past base +5 years | nothing — a dead line takes nothing |")
+    L.push("")
+    L.push("The horizon day itself belongs to the phase it closes: support")
+    L.push("runs THROUGH the anniversary, so the third birthday is the last")
+    L.push("full-support day and the day after it is security-only; the")
+    L.push("fifth birthday is the last supported day and the day after it")
+    L.push("is end of life.")
+    L.push("")
+    L.push("## The calendar law")
+    L.push("")
+    L.push("`base + N years` is the same month and day — an anniversary,")
+    L.push("not a fixed count of days. February 29 clamps to the 28th when")
+    L.push("the target year is not a leap year (a line born 2024-02-29 is")
+    L.push("bug-fixed through 2027-02-28). The policy speaks in days: every")
+    L.push("date is a calendar day, read from git's committer timestamp —")
+    L.push("the same clock the landing laws already read.")
+    L.push("")
+    L.push("## What makes a fix a security fix")
+    L.push("")
+    L.push("A `Security: <reason>` line in the commit message (a CVE id, a")
+    L.push("one-word severity, a sentence — anything non-empty). The name")
+    L.push("matches case-insensitively, the first such line decides, and an")
+    L.push("empty value is not a marking. Fail-closed, like everything in")
+    L.push("this policy: **no trailer, no security claim** — an unmarked")
+    L.push("fix is a plain fix, and a plain fix does not land on a")
+    L.push("security-only line. The trailer is a line of the message,")
+    L.push("wherever it stands; `hls-lts classify` reports the marking")
+    L.push("beside the class (a marked FEATURE is still a FEATURE, and")
+    L.push("still refused — the marking is a fact about a fix, not a key")
+    L.push("past the class law).")
+    L.push("")
+    L.push("## What the tool refuses")
+    L.push("")
+    L.push("- `backport` in the `security` phase: a plain BUGFIX is")
+    L.push("  refused with the phase and both horizons named; in `eol`,")
+    L.push("  everything is refused — the dead line takes no chores either.")
+    L.push("- `tag-patch` past end of life: no release is cut from a dead")
+    L.push("  line. In the `security` phase a release must carry at least")
+    L.push("  one security backport since the previous tag — a chore-only")
+    L.push("  release is how a security line pretends to be alive.")
+    L.push("- `audit`: history is judged the day it landed. A backport")
+    L.push("  that arrived in the security phase without the mark, any")
+    L.push("  commit past end of life, and any tag cut from a commit dated")
+    L.push("  past end of life are violations, named sha by sha.")
+    L.push("")
+    L.push("## Relationship to the branch policy")
+    L.push("")
+    L.push("This is the second dimension of the Stage 132 policy, not a new")
+    L.push("one. `halis-lts-1` keeps its name and its declaration; the")
+    L.push("window law derives from the base tag live on every run and")
+    L.push("adds no state. Stage 132 said WHAT may land on an LTS branch")
+    L.push("(backport-only, patch-only, fail-closed); this policy says")
+    L.push("WHEN — the same line, with a birthday and a death day.")
+    L.push("")
+    L.push("## When it begins")
+    L.push("")
+    L.push("The policy begins at v1.0 — a pre-1.0 LTS is a contradiction.")
+    L.push("Until the first LTS line is declared this document is the")
+    L.push("promise; the day `hls-lts init --tag v1.0.0` runs, it becomes")
+    L.push("the clock. The gates prove the law in the meantime on scratch")
+    L.push("lines with fabricated birthdays (`make lts-policy-acceptance`),")
+    L.push("so the enforcement is tested before it is ever needed.")
+    L.push("")
+    return join(L, "\n")
+}
+
+# cmd_policy — render / --out / --check.
+fn cmd_policy(argv: list[str]) -> int uses IO, Fs, Proc {
+    let text: str = render_policy()
+    if has_flag(argv, "--check") {
+        let repo: str = repo_arg(argv)
+        let path: str = path_join3(repo, policy_doc())
+        if !file_exists(path) {
+            return die("policy: " + policy_doc() + " is not published "
+            + "here — the policy document is missing (regenerate "
+            + "with `bin/hls-lts policy --out " + policy_doc() + "`)")
+        }
+        let committed: str = read_file(path)
+        if committed != text {
+            println("policy: REFUSED — the committed " + policy_doc()
+            + " drifted from the tool's render — a hand-edited "
+            + "policy is visible as a diff (regenerate with "
+            + "`bin/hls-lts policy --out " + policy_doc() + "`)")
+            return 1
+        }
+        println("policy: " + policy_doc() + " matches the render — the "
+        + "published promise is the enforced one ("
+        + bugfix_years().to_str() + " years bug-fix, "
+        + security_years().to_str() + " years security)")
+        return 0
+    }
+    let out: str = flag_value(argv, "--out", "")
+    if out != "" {
+        write_file(out, text)
+        println("policy: rendered " + out + " ("
+        + count_lines(text).to_str() + " lines)")
+        return 0
+    }
+    print(text)
+    return 0
+}
+
+fn count_lines(text: str) -> int {
+    # Python's splitlines(): the number of line terminators + a tail
+    # line when the text does not end on one.
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < text.len() {
+        if text.byte_at(i) == 10 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    if text.len() > 0 && !text.ends_with("\n") {
+        n = n + 1
+    }
+    return n
+}
+
+fn path_join3(base: str, rel: str) -> str {
+    if base.byte_at(base.len() - 1) == 47 {
+        return base + rel
+    }
+    return base + "/" + rel
+}
+
+# ============================================================================
+# The JSON renderers (--json outputs; valid JSON, the fields the gates
+# read).
+# ============================================================================
+
+fn json_render_status(pol: JsonValue, commit_list: list[str],
+tags: list[str], violations: list[str], base_day: Day) -> str
+uses Clock {
+    # the window (null when the base day cannot be read)
+    let mut win_obj: str = "null"
+    if base_day.ok {
+        let w: Window = window_of(base_day)
+        let today: Day = today_utc()
+        let ph: str = phase_at(base_day, today)
+        win_obj = "{"
+        + "\"base_date\": " + json_quote(day_iso(base_day)) + ", "
+        + "\"bug_fix_until\": "
+        + json_quote(day_iso(w.bug_fix_until)) + ", "
+        + "\"security_until\": "
+        + json_quote(day_iso(w.security_until)) + ", "
+        + "\"at\": " + json_quote(day_iso(today)) + ", "
+        + "\"phase\": " + json_quote(ph) + ", "
+        + "\"days_bugfix_left\": "
+        + (day_ord(w.bug_fix_until) - day_ord(today)).to_str() + ", "
+        + "\"days_security_left\": "
+        + (day_ord(w.security_until) - day_ord(today)).to_str()
+        + "}"
+    }
+    let out: list[str] = []
+    out.push("{")
+    out.push("  \"policy\": {")
+    let keys: list[str] = pol.obj_keys
+    let mut k: int = 0
+    while k < keys.len() {
+        let mut comma: str = ","
+        if k + 1 >= keys.len() {
+            comma = ""
+        }
+        out.push("    \"" + keys.get(k) + "\": "
+        + json_quote(json_str_value(pol.obj_vals.get(k))) + comma)
+        k = k + 1
+    }
+    out.push("  },")
+    out.push("  \"commits_since_base\": "
+    + commit_list.len().to_str() + ",")
+    let tag_items: list[str] = []
+    let mut t: int = 0
+    while t < tags.len() {
+        tag_items.push(json_quote(tags.get(t)))
+        t = t + 1
+    }
+    out.push("  \"tags\": [" + join_json_items(tag_items) + "],")
+    let v_items: list[str] = []
+    let mut v: int = 0
+    while v < violations.len() {
+        v_items.push(json_quote(violations.get(v)))
+        v = v + 1
+    }
+    out.push("  \"violations\": [" + join_json_items(v_items) + "],")
+    out.push("  \"window\": " + win_obj)
+    out.push("}")
+    return join(out, "\n")
+}
+
+fn json_render_classify(c: Cls) -> str {
+    let out: list[str] = []
+    out.push("{")
+    out.push("  \"sha\": " + json_quote(c.sha) + ",")
+    out.push("  \"subject\": " + json_quote(c.subject) + ",")
+    out.push("  \"class\": " + json_quote(c.cls) + ",")
+    out.push("  \"reason\": " + json_quote(c.reason) + ",")
+    let items: list[str] = []
+    let mut i: int = 0
+    while i < c.reasons.len() {
+        items.push(json_quote(c.reasons.get(i)))
+        i = i + 1
+    }
+    out.push("  \"reasons\": [" + join_json_items(items) + "],")
+    let mut sec_str: str = "false"
+    if c.security {
+        sec_str = "true"
+    }
+    out.push("  \"security\": " + sec_str + ",")
+    out.push("  \"security_reason\": " + json_quote(c.security_reason))
+    out.push("}")
+    return join(out, "\n")
+}
+
+# ============================================================================
+# The CLI.
+# ============================================================================
+
+fn usage_text() -> str {
+    return "usage: hls-lts {init,status,classify,backport,tag-patch,"
+    + "audit,window,policy} [options]"
+}
+
+fn flag_value(argv: list[str], name: str, default_value: str) -> str {
+    let mut i: int = 1
+    while i + 1 < argv.len() {
+        if argv.get(i) == name {
+            return argv.get(i + 1)
+        }
+        i = i + 1
+    }
+    return default_value
+}
+
+fn has_flag(argv: list[str], name: str) -> bool {
+    let mut i: int = 1
+    while i < argv.len() {
+        if argv.get(i) == name {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# positional(argv) — the first non-flag argument after the subcommand.
+fn positional(argv: list[str]) -> str {
+    let mut i: int = 2
+    while i < argv.len() {
+        let a: str = argv.get(i)
+        if a == "--repo" || a == "--tag" || a == "--branch" || a == "--at"
+        || a == "--out" {
+            i = i + 1
+            continue
+        }
+        if a.starts_with("--") || a.starts_with("-") {
+            i = i + 1
+            continue
+        }
+        return a
+    }
+    return ""
+}
+
+# known_flags(cmd) — the flags argparse accepted per subcommand; an
+# unknown --flag is a usage error (2), the argparse law.
+fn known_flag(cmd: str, f: str) -> bool {
+    if f == "--repo" {
+        return true
+    }
+    if cmd == "init" {
+        return f == "--tag" || f == "--branch"
+    }
+    if cmd == "status" || cmd == "audit" {
+        return f == "--json"
+    }
+    if cmd == "classify" {
+        return f == "--json"
+    }
+    if cmd == "backport" {
+        return f == "--branch" || f == "--dry-run" || f == "--at"
+    }
+    if cmd == "tag-patch" {
+        return f == "--tag" || f == "--branch" || f == "--dry-run"
+        || f == "--at"
+    }
+    if cmd == "window" {
+        return f == "--tag" || f == "--at" || f == "--json"
+    }
+    if cmd == "policy" {
+        return f == "--out" || f == "--check"
+    }
+    return false
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let argv: list[str] = args()
+    if argv.len() < 2 {
+        println(usage_text())
+        return 2
+    }
+    let cmd: str = argv.get(1)
+    # The argparse law: unknown flags are usage errors (exit 2).
+    let value_flags: list[str] = ["--tag", "--branch", "--repo", "--at",
+    "--out"]
+    let mut ai: int = 2
+    while ai < argv.len() {
+        let a: str = argv.get(ai)
+        if a.starts_with("--") {
+            let mut head: str = a
+            let eq: int = a.find("=")
+            if eq >= 0 {
+                head = a.slice(0, eq)
+            }
+            if !known_flag(cmd, head) {
+                eprintln(usage_text())
+                eprintln("hls-lts: error: unrecognized arguments: " + a)
+                return 2
+            }
+            let mut takes_value: bool = false
+            let mut vi: int = 0
+            while vi < value_flags.len() {
+                if value_flags.get(vi) == head {
+                    takes_value = true
+                }
+                vi = vi + 1
+            }
+            if takes_value && eq < 0 {
+                ai = ai + 1
+            }
+        }
+        ai = ai + 1
+    }
+    if cmd == "init" {
+        return cmd_init(argv)
+    }
+    if cmd == "status" {
+        return cmd_status(argv)
+    }
+    if cmd == "classify" {
+        return cmd_classify(argv)
+    }
+    if cmd == "backport" {
+        return cmd_backport(argv)
+    }
+    if cmd == "tag-patch" {
+        return cmd_tag_patch(argv)
+    }
+    if cmd == "audit" {
+        return cmd_audit(argv)
+    }
+    if cmd == "window" {
+        return cmd_window(argv)
+    }
+    if cmd == "policy" {
+        return cmd_policy(argv)
+    }
+    if cmd == "-h" || cmd == "--help" {
+        println(usage_text())
+        println("")
+        println("hls-lts — LTS branch policy (Stage 132) + support "
+        + "windows (Stage 145)")
+        return 0
+    }
+    eprintln(usage_text())
+    eprintln("hls-lts: error: unknown command " + cmd)
+    return 2
+}

@@ -76,7 +76,7 @@ import tempfile
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(ROOT)
 
-LTS = [sys.executable, os.path.join(ROOT, "tools", "hls-lts.py")]
+LTS = [os.path.join(ROOT, "bin", "hls-lts")]
 BOOT = [sys.executable, os.path.join(ROOT, "tools", "hlinterp", "boot.py")]
 FMT = [os.path.join(ROOT, "bin", "hlfmt")]
 LINT = [sys.executable, os.path.join(ROOT, "tools", "hllint.py")]

@@ -8824,7 +8824,7 @@ skip.
 
 After v1.0 the project maintains LTS release branches. An LTS
 branch that accepts whatever lands on it is not an LTS branch — it
-is main with a longer name. `tools/hls-lts.py` turns the policy
+is main with a longer name. `tools/hls-lts.hls` (compiled to bin/hls-lts) turns the policy
 into an executable contract with three laws, each enforced at the
 point where a change would enter the branch: **backport-only**,
 **patch-only**, and **fail-closed**.
@@ -10424,7 +10424,7 @@ WHEN. The roadmap's phrase is "3 years bug-fix, 5 years security",
 and a promise of that shape has to live in two places at once: a
 document a user can read without running anything, and a gate that
 refuses what the document forbids. One without the other is either
-prose or an undocumented refusal. `tools/hls-lts.py` and `LTS.md`
+prose or an undocumented refusal. `tools/hls-lts.hls` and `LTS.md`
 are those two places, wired so they cannot drift apart.
 
 ### 83.1. The publication

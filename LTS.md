@@ -1,8 +1,8 @@
 # Long-term support policy — Halis (HLS)
 
-Generated from the live constants of `tools/hls-lts.py` —
+Generated from the live constants of `tools/hls-lts.hls` —
 this document is rendered, not maintained. Do not hand-edit;
-regenerate it with `python3 tools/hls-lts.py policy --out
+regenerate it with `bin/hls-lts policy --out
 LTS.md`. `make lts-policy-verify` re-derives the committed copy
 against the same render and refuses drift — the numbers below
 are the numbers the gates enforce, or the tree says no.
