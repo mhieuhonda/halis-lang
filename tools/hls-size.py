@@ -502,10 +502,23 @@ def measure_self(instrument, root, cc):
                           "weigh", exit=2)
     hlc_c = os.path.join(root, "bin", "hlc.c")
     hlc_bin = os.path.join(root, NATIVE_COMPILER)
-    for path in (hlc_c, hlc_bin):
-        if not os.path.isfile(path):
-            raise HlSizeError("the hlc_self workload needs %s — run "
-                              "`make bootstrap` first" % path, exit=2)
+    if not os.path.isfile(hlc_bin):
+        raise HlSizeError("the hlc_self workload needs %s — run "
+                          "`make bootstrap` first" % hlc_bin, exit=2)
+    # The pure-HLS bootstrap (Stage 142) no longer leaves its emission
+    # in bin/ — it compares and deletes. The fixed-point law the
+    # bootstrap enforces says the bytes bin/hlc emits for src/hlc.hls
+    # ARE the chain's emission, so a missing bin/hlc.c is re-derived
+    # here on demand, never guessed around.
+    if not os.path.isfile(hlc_c):
+        emit = subprocess.run([hlc_bin, HLC_SOURCE_ENTRY, hlc_c],
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True)
+        if emit.returncode != 0 or not os.path.isfile(hlc_c):
+            raise HlSizeError("the hlc_self workload could not re-derive "
+                              "%s (hlc exited %d): %s"
+                              % (hlc_c, emit.returncode,
+                                 emit.stdout.strip()[:200]), exit=2)
     text, data, bss = section_sizes(hlc_bin, cc)
     return {
         "c_bytes": os.path.getsize(hlc_c),
