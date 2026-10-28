@@ -373,6 +373,16 @@ make rc-acceptance            # Stage 146 gate: the candidate
                                # freeze judging real commits in
                                # scratch repos, the sort law, the
                                # publication law)
+make rc2-acceptance           # Stage 147 gate: the bug-fix round
+                               # (the invocation refusals named
+                               # and exit-2 on both front-ends —
+                               # no panic on a path the user
+                               # typed — the broken pipe dying
+                               # quietly, the freeze still green
+                               # on the live tree, the successor
+                               # cut rehearsed end to end on a
+                               # scratch world, the corpus
+                               # showcase)
 python3 tools/hls-xdiff.py     # Stage 133: the cross-impl
                                # differential table — the SAME
                                # program through the interpreter,

@@ -13,6 +13,87 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v1.0.0-rc.2] — Stage 147: the bug-fix round, the successor candidate cut
+- The roadmap's phrase is "v1.0 Release Candidate 2 (bug-fix only)",
+  and the freeze kit made the shape of the release before the
+  release: every commit since the rc.1 anchor is judged by the same
+  classifier the LTS policy enforces, and this release is the first
+  candidate cut from a FROZEN tree — no new surface, no std/ or
+  core/ file added, SPEC.md untouched, the Stage 141 freeze digest
+  unchanged (`make freeze-verify` says so on this very tree). What
+  moved is what a bug-fix round may move: two defects in how the
+  toolchain refuses, both found by pointing the project's own
+  instruments at paths the corpus never names.
+- **A missing input file panicked instead of refusing.** `hlc
+  typo.hls out.c` died with `panic: cannot open file` at exit 101 —
+  the RUNTIME panic code, the same exit a compiled program's `panic()`
+  takes — for an error that never reached the compiler's front-end:
+  the file was unreadable before a single token was lexed. The
+  compiler's own `--pgo-use` already refuses the same condition the
+  right way (`error: --pgo-use: profile file not found: <path>`,
+  exit 2), and the interpreter's boot.py carried a dead `except
+  OSError` branch that intended exactly that shape — dead because
+  `load_program` converts the OS error into an HLError first, so the
+  branch could never fire and the invocation error surfaced as a
+  compile error at exit 1. Both ends now refuse the way the tool's
+  own precedent speaks: `error: cannot open file <path>`, exit 2, on
+  the compile path, the `--audit` path and the entry check alike —
+  an invocation error is named, not crashed on, and a scripting
+  wrapper can finally tell "the file I named is missing" apart from
+  "the program I compiled panicked".
+- **An output destination without its directory panicked after the
+  codegen ran.** `hlc main.hls no-such-dir/out.c` (and the same for
+  `--symbols`) compiled the whole program and then died in
+  `hl_write_file`. The refusal now happens up front, before a line
+  of codegen: the parent directory of every output path is checked
+  while the arguments are still being judged, and a missing one is
+  `error: cannot write file <path> (the directory does not exist)`,
+  exit 2 — the same law the input check applies, applied to the
+  other end of the pipe.
+- **A broken stdout pipe produced a Python traceback.** `boot.py
+  prog.hls | head -1` — the most ordinary shell idiom there is —
+  ended with `BrokenPipeError` and a traceback in stderr, because
+  Python ignores SIGPIPE where every C program (the native binary
+  included) dies silently on it. boot.py restores the kernel's
+  default disposition at startup, and the interpreter now exits the
+  way the binary it shadows always has: quietly, when the reader
+  hangs up.
+- **The acceptance gate.** `make rc2-acceptance` — five sections, 31
+  checks: the regression law (both refusals, both front-ends, the
+  audit path, the destination checks, the silent pipe — each pinned
+  with its exit code and its message shape), the working paths (a
+  program still runs, compiles, audits — the refusals did not eat
+  the road), the real-tree candidate laws (readiness green, the gate
+  over the live range naming only BUGFIX and CHORE, the three
+  version markers one voice), the successor rehearsal (the rc.1
+  candidate declared on a scratch world, then the whole RC2
+  choreography — Stage 147 ticked, the markers moved, the old
+  anchor leaving with the release commit, rc.2 declared, the gate
+  green across the full rc.1..rc.2 range, the record rendered and
+  drift-checked), and the corpus showcase.
+- **The corpus showcase.** `tests/ok/feat_stage147_rc2.hls` pins the
+  laws an RC2 stands on in pure HLS: the successor chain (rc.2 is
+  rc.1's successor, rc.4's successor is the release, the chain sorts
+  strictly upward, the release outranks its own candidates), the
+  stage mapping (rc.2 closes Stage 147), the refusal taxonomy the
+  bug fixes restored (an invocation error is a named refusal at
+  exit 2, never a panic at 101, never a compile error at 1), the
+  diff-gate re-class law (a fix that grows the surface is the
+  feature it really is), and the window law (the freeze travels
+  with the successor — BUGFIX and CHORE land, everything else is
+  refused) — hlfmt-canonical, hllint-clean, byte-identical on the
+  interpreter and natively.
+- **The record:** ROADMAP Stage 147 ticks; the README tour grows the
+  `rc2-acceptance` line; the version markers move together to
+  1.0.0-rc.2 — the changelog heading, the snapshot manifest (a
+  manifest-only refresh: the emitted C moved with the fix commit
+  that caused it), the editor manifest. The freeze, the guarantee
+  ledger and the snapshot fixed point did not move — `make
+  freeze-verify` / `make snapshot-verify` say so on this very tree.
+  Stage 146's own gates still pass untouched: `make rc-acceptance`,
+  green — the successor inherits the kit that certified its
+  predecessor.
+
 ## [v1.0.0-rc.1] — Stage 146: the release candidate, the feature freeze declared
 - The roadmap's phrase is "v1.0 Release Candidate 1 (feature freeze)",
   and it is two promises tied together: this tree is now GOOD ENOUGH
