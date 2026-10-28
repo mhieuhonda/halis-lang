@@ -474,8 +474,17 @@ def main():
     anchor_path = os.path.join(ROOT, ".hls-rc.json")
     if os.path.exists(anchor_path):
         anchor = json.load(open(anchor_path))
-        check(anchor.get("tag") == "v1.0.0-rc.1",
-              "the real tree's anchor is " + anchor.get("tag", "?"))
+        # RC2 fix: the anchor is whatever candidate the tree has
+        # legitimately reached — the kit's own successor rule moves it
+        # (rc.1 declares rc.2, and so on), so pinning THIS gate to
+        # rc.1 made every later candidate fail the gate that certified
+        # the line. The law is the SHAPE: the anchor carries a
+        # candidate tag of the v1.0.0 line, rc.1..rc.4.
+        atag = anchor.get("tag", "")
+        check(atag in ("v1.0.0-rc.1", "v1.0.0-rc.2", "v1.0.0-rc.3",
+                       "v1.0.0-rc.4"),
+              "the real tree's anchor is a candidate of the line ("
+              + atag + ")")
         r = rc("report", "--check")
         check(r.returncode == 0,
               "the committed RC.md matches its render")
