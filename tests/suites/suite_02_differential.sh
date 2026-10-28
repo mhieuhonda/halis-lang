@@ -623,8 +623,13 @@ echo "=== 4b. Stage 14 release: tooling (hlfmt idempotent + hllint cfaware) ==="
 fmt_fail=0
 # The formatter is native now (tools/hlfmt.hls): build it once from the
 # same compiler this suite already builds, then the 650-file x2 loop is
-# 1300 native invocations instead of 1300 Python starts.
+# 1300 native invocations instead of 1300 Python starts. bin/ is a
+# build directory, not a checkout artifact — this suite creates
+# nothing there until this step, so the directory must exist first
+# (the CI job runs without make bootstrap; the local tree always has
+# bin/ from it, which is why this only ever failed in CI).
 if [ ! -x bin/hlfmt ]; then
+    mkdir -p bin
     "$TMP/hlc1" tools/hlfmt.hls bin/hlfmt.c >/dev/null 2>&1 \
         && gcc -O2 -o bin/hlfmt bin/hlfmt.c -lm -pthread 2>/dev/null
 fi
