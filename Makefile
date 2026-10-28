@@ -140,6 +140,20 @@ rc-acceptance: $(BIN)/hlfmt $(BIN)/hls-rc
 	@$(PYTHON) tests/rc_acceptance.py
 	@echo "ACCEPTANCE OK: Stage 146 -- v1.0 Release Candidate 1 (feature freeze)"
 
+# The Stage 147 acceptance gate: the bug-fix round. Five sections over
+# the real CLIs and a scratch git world -- the invocation refusals the
+# RC2 fixes restored (a missing input file names the path at exit 2 on
+# BOTH front-ends, an unwritable destination refuses before codegen, a
+# broken stdout pipe dies silently), the working paths they must not
+# eat, the freeze still holding on the live tree, the successor
+# choreography rehearsed end to end (rc.1 anchored, Stage 147 ticked,
+# the markers moved, rc.2 declared, the gate green across the range,
+# the record drift-checked) -- and the corpus showcase.
+rc2-acceptance: $(BIN)/hlfmt $(BIN)/hls-rc
+	@echo "[Stage 147 acceptance] running tests/rc2_acceptance.py..."
+	@$(PYTHON) tests/rc2_acceptance.py
+	@echo "ACCEPTANCE OK: Stage 147 -- v1.0 Release Candidate 2 (bug-fix only)"
+
 
 $(BIN)/hls-snap: tools/hls-snap.hls $(wildcard std/*.hls)
 	@mkdir -p $(BIN)
