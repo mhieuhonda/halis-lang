@@ -32,7 +32,7 @@ else
   HL_CURL_DEFS :=
 endif
 
-.PHONY: all bootstrap bootstrap-nolibc xbootstrap-acceptance refine-acceptance test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full infer infer-smt model prove-acceptance invariant-acceptance cvc5 cvc5-acceptance shapes shapes-smt shapes-acceptance sidechannel sidechannel-acceptance ct ct-acceptance supply supply-pkg supply-acceptance sbom sbom-pkg sbom-release sbom-acceptance repro repro-pkg repro-release repro-verify repro-acceptance sign-keygen sign sign-verify sign-release sign-verify-release sign-selftest sign-acceptance tlog-verify tlog tlog-gossip tlog-witness tlog-witness-verify tlog-prove tlog-prove-verify tlog-selftest tlog-acceptance reverify reverify-json reverify-lto reverify-report reverify-selftest reverify-acceptance ffi-taint ffi-taint-acceptance sandbox sandbox-run sandbox-emit sandbox-release sandbox-verify-release sandbox-selftest sandbox-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve serve-acceptance wasm-pack wasm-pack-check wasm-pack-pack wasm-pack-acceptance aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance tui-acceptance color-acceptance progress-acceptance log-acceptance http-server-acceptance websocket-acceptance cookie-acceptance session-acceptance csrf-acceptance template-acceptance sse-acceptance graphql-acceptance openapi-acceptance jsffi-acceptance dom-acceptance freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance stackguard-acceptance asmreg-acceptance link-acceptance boot-acceptance idt-acceptance mmio-acceptance port-acceptance dma-acceptance atomics-acceptance irqsafe-acceptance triple triple-x86_64-acceptance triple-aarch64-acceptance triple-riscv64-acceptance debuginfo-acceptance cap cap-acceptance test-linker auditlog-list auditlog-show auditlog-verify auditlog-sign auditlog-verify-sign auditlog-selftest auditlog-acceptance lsp-def-acceptance lsp-hints-acceptance lsp-refactor-acceptance fmt-comments-acceptance fmt-config-acceptance lint-fix-acceptance snapshot-acceptance cases-acceptance dap-acceptance repl-acceptance bench-acceptance rss-acceptance rt-acceptance det-acceptance compat-acceptance migrate-acceptance deprecated-acceptance semver-acceptance lts-acceptance lts-policy lts-policy-verify lts-policy-acceptance xdiff xdiff-acceptance fuzzseed fuzzseed-acceptance guarantee guarantee-report guarantee-acceptance perf perf-gate perf-dashboard perf-acceptance mem mem-gate mem-dashboard memdash-acceptance ctime ctime-gate ctime-dashboard ctime-acceptance size size-gate size-dashboard size-acceptance auditkit-brief auditkit-evidence auditkit-report auditkit-acceptance freeze freeze-verify freeze-report freeze-acceptance snapshot-status snapshot-verify snapshot-regen snapshot-prove snapshot-chain purebootstrap-acceptance finalaudit-brief finalaudit-evidence finalaudit-report finalaudit-gate finalaudit-acceptance
+.PHONY: all bootstrap bootstrap-nolibc xbootstrap-acceptance refine-acceptance test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full infer infer-smt model prove-acceptance invariant-acceptance cvc5 cvc5-acceptance shapes shapes-smt shapes-acceptance sidechannel sidechannel-acceptance ct ct-acceptance supply supply-pkg supply-acceptance sbom sbom-pkg sbom-release sbom-acceptance repro repro-pkg repro-release repro-verify repro-acceptance sign-keygen sign sign-verify sign-release sign-verify-release sign-selftest sign-acceptance tlog-verify tlog tlog-gossip tlog-witness tlog-witness-verify tlog-prove tlog-prove-verify tlog-selftest tlog-acceptance reverify reverify-json reverify-lto reverify-report reverify-selftest reverify-acceptance ffi-taint ffi-taint-acceptance sandbox sandbox-run sandbox-emit sandbox-release sandbox-verify-release sandbox-selftest sandbox-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve serve-acceptance wasm-pack wasm-pack-check wasm-pack-pack wasm-pack-acceptance aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance tui-acceptance color-acceptance progress-acceptance log-acceptance http-server-acceptance websocket-acceptance cookie-acceptance session-acceptance csrf-acceptance template-acceptance sse-acceptance graphql-acceptance openapi-acceptance jsffi-acceptance dom-acceptance freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance stackguard-acceptance asmreg-acceptance link-acceptance boot-acceptance idt-acceptance mmio-acceptance port-acceptance dma-acceptance atomics-acceptance irqsafe-acceptance triple triple-x86_64-acceptance triple-aarch64-acceptance triple-riscv64-acceptance debuginfo-acceptance cap cap-acceptance test-linker auditlog-list auditlog-show auditlog-verify auditlog-sign auditlog-verify-sign auditlog-selftest auditlog-acceptance lsp-def-acceptance lsp-hints-acceptance lsp-refactor-acceptance fmt-comments-acceptance fmt-config-acceptance lint-fix-acceptance snapshot-acceptance cases-acceptance dap-acceptance repl-acceptance bench-acceptance rss-acceptance rt-acceptance det-acceptance compat-acceptance migrate-acceptance deprecated-acceptance semver-acceptance lts-acceptance lts-policy lts-policy-verify lts-policy-acceptance xdiff xdiff-acceptance fuzzseed fuzzseed-acceptance guarantee guarantee-report guarantee-acceptance perf perf-gate perf-dashboard perf-acceptance mem mem-gate mem-dashboard memdash-acceptance ctime ctime-gate ctime-dashboard ctime-acceptance size size-gate size-dashboard size-acceptance auditkit-brief auditkit-evidence auditkit-report auditkit-acceptance freeze freeze-verify freeze-report freeze-acceptance snapshot-status snapshot-verify snapshot-regen snapshot-prove snapshot-chain purebootstrap-acceptance finalaudit-brief finalaudit-evidence finalaudit-report finalaudit-gate finalaudit-acceptance rc-readiness rc-declare rc-gate rc-report rc-report-check rc-acceptance
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -96,6 +96,50 @@ $(BIN)/hls-lts: tools/hls-lts.hls $(wildcard std/*.hls) $(wildcard core/*.hls) |
 	@$(BIN)/hlc tools/hls-lts.hls $@.c
 	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
 	@rm -f $@.c
+
+# hls-rc — the release-candidate kit (Stage 146, v1.0.0-rc.1), in
+# Halis: readiness before the tag, the anchor that records it, the
+# freeze that follows it, the record it renders.
+$(BIN)/hls-rc: tools/hls-rc.hls $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hls-rc] hlc compiles the release-candidate kit (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hls-rc.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
+rc-readiness: $(BIN)/hls-rc
+	@$(BIN)/hls-rc readiness
+
+rc-declare: $(BIN)/hls-rc
+	@test -n "$(TAG)" || { echo "rc-declare: TAG=v1.0.0-rc.N is required"; exit 2; }
+	@$(BIN)/hls-rc declare --tag "$(TAG)"
+
+rc-gate: $(BIN)/hls-rc
+	@$(BIN)/hls-rc gate
+
+rc-report: $(BIN)/hls-rc
+	@$(BIN)/hls-rc report --out RC.md
+
+rc-report-check: $(BIN)/hls-rc
+	@$(BIN)/hls-rc report --check
+
+# The Stage 146 acceptance gate: nine sections over the REAL rc CLI
+# and REAL scratch git repositories — the convention (the exits, the
+# usage law, --json), the roadmap law (live parsing, the contiguous
+# closed prefix, the open tail confined to the RC stages), the freeze
+# law (the document's identity, the anchor commit in this history),
+# the marker law (one voice), the tag law (the rc grammar, the sort
+# law over real tags), the declare law (the anchor written, the
+# re-declare refused, the dirty tree refused), the gate law (fixes
+# and chores land, features and strangers are named sha by sha, the
+# diff gate re-classes), the report law (deterministic, drift
+# refused) — and the corpus showcase, the candidate laws as a
+# pure-HLS program.
+rc-acceptance: $(BIN)/hlfmt $(BIN)/hls-rc
+	@echo "[Stage 146 acceptance] running tests/rc_acceptance.py..."
+	@$(PYTHON) tests/rc_acceptance.py
+	@echo "ACCEPTANCE OK: Stage 146 -- v1.0 Release Candidate 1 (feature freeze)"
+
 
 $(BIN)/hls-snap: tools/hls-snap.hls $(wildcard std/*.hls)
 	@mkdir -p $(BIN)

@@ -1,0 +1,2475 @@
+# ============================================================================
+# hls-rc.hls — the release-candidate kit, in Halis: readiness before
+# the tag, the anchor that records it, the freeze that follows it
+# (Stage 146, v1.0.0-rc.1).
+# ----------------------------------------------------------------------------
+# Roadmap Stage 146 is one phrase: "v1.0 Release Candidate 1 (feature
+# freeze)". Until now the approach to v1.0 was tracked only in prose:
+# the roadmap Ticked a box, the changelog carried a heading, and
+# nothing in the tree could answer the only question a candidate must
+# answer — is this tree READY to be called 1.0.0-rc.1, and what may
+# still land after the tag is cut? This tool is that answer, and it
+# is fail-closed everywhere:
+#
+#   readiness  — the machine-checked checklist, each law named with
+#                 the fact it measured: the roadmap closed through
+#                 Stage 145 with the open set confined to the RC tail
+#                 (146..150); the API freeze document intact and
+#                 anchored in this history; the version markers (the
+#                 changelog heading, the snapshot manifest, the editor
+#                 manifest) speaking with one voice; the snapshot
+#                 present; LTS.md published while NO LTS line is
+#                 declared (the candidate opens no support window —
+#                 a pre-1.0 LTS is a contradiction).
+#
+#   declare    — cut the candidate ON PAPER: the tag grammar (a
+#                 1.0.0 rc pre-release, rc.1..rc.4 — the roadmap
+#                 planned four candidates, a fifth is a roadmap
+#                 amendment, not a release decision), the sort law
+#                 (the candidate is newer than every tag that exists),
+#                 the stage law (rc.N closes Stage 145+N — the roadmap
+#                 row is ticked by the very release that cuts it),
+#                 the marker law pinned to the tag, the tree clean.
+#                 It writes the ANCHOR — .hls-rc.json, the record the
+#                 freeze defends: tag, commit, day, freeze digest.
+#
+#   gate       — the feature-freeze law, from the anchor to v1.0.0:
+#                 every commit in the range is classified with the
+#                 SAME message grammar the LTS policy uses (the
+#                 project's own prefix vocabulary, one law everywhere)
+#                 and the diff gate re-classes a "fix" that adds std/
+#                 or core/ surface, names new public fns or edits
+#                 SPEC.md into the FEATURE it really is. BUGFIX and
+#                 CHORE land; FEATURE and UNKNOWN are named sha by
+#                 sha and the gate exits 1. Fail-closed: an
+#                 unrecognised commit is not a fix.
+#
+#   report     — the candidate's record rendered (RC.md at the
+#                 repository root): the readiness table, the anchor,
+#                 the freeze, the admission law, the road to v1.0.0
+#                 read LIVE from the roadmap's own rows. Deterministic
+#                 (no wall clock — the day is the anchor's committer
+#                 day), never rendered from a tree that fails
+#                 readiness, and --check re-derives the committed copy
+#                 and refuses drift, naming the regenerate command.
+#
+# The freeze DIGEST's arithmetic stays in the tool that owns it
+# (hls-freeze re-derives the surface live; `make freeze-verify`).
+# This kit pins the document's IDENTITY — its fields, its commit's
+# place in this history — and refuses to guess the rest.
+#
+# Usage:
+#   bin/hls-rc readiness [--json] [--root DIR]
+#   bin/hls-rc declare --tag v1.0.0-rc.1 [--at DAY] [--root DIR]
+#   bin/hls-rc gate [--range A..B] [--json] [--root DIR]
+#   bin/hls-rc report [--out RC.md | --check] [--root DIR]
+#
+# Exit codes: 0 the law held; 1 a named refusal; 2 usage error.
+# Every refusal names the RULE, not just the fact.
+# ============================================================================
+
+import "std.result"
+import "std.str"
+import "std.json"
+
+# ============================================================================
+# Constants.
+# ============================================================================
+
+fn kit_version() -> str {
+    return "halis-rc-1"
+}
+
+fn anchor_file() -> str {
+    return ".hls-rc.json"
+}
+
+fn rc_doc() -> str {
+    return "RC.md"
+}
+
+fn roadmap_doc() -> str {
+    return "ROADMAP.md"
+}
+
+fn changelog_doc() -> str {
+    return "CHANGELOG.md"
+}
+
+fn freeze_doc() -> str {
+    return "tests/api_freeze.json"
+}
+
+fn vscode_manifest() -> str {
+    return "editors/vscode/halis/package.json"
+}
+
+fn snapshot_manifest() -> str {
+    return "snapshot/MANIFEST.json"
+}
+
+fn snapshot_c() -> str {
+    return "snapshot/hlc.c"
+}
+
+fn lts_doc() -> str {
+    return "LTS.md"
+}
+
+fn lts_policy_file() -> str {
+    return ".hls-lts.json"
+}
+
+# The RC stage mapping: rc.N closes Stage 145+N. The roadmap planned
+# FOUR candidates (Stages 146..149) before the LTS release (150).
+fn first_rc_stage() -> int {
+    return 146
+}
+
+fn final_stage() -> int {
+    return 150
+}
+
+fn total_stages() -> int {
+    return 150
+}
+
+fn rc_stage_for(n: int) -> int {
+    return 145 + n
+}
+
+# ============================================================================
+# Byte and text helpers (the same shapes the sibling tools carry).
+# ============================================================================
+
+fn is_digit_b(c: int) -> bool {
+    return c >= 48 && c <= 57
+}
+
+fn is_alpha_b(c: int) -> bool {
+    return(c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+}
+
+fn is_ident_b(c: int) -> bool {
+    return is_digit_b(c) || is_alpha_b(c) || c == 45
+}
+
+fn is_ws_b(c: int) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13 || c == 12 || c == 11
+}
+
+fn strip_ends(s: str) -> str {
+    let mut a: int = 0
+    let n: int = s.len()
+    while a < n {
+        if is_ws_b(s.byte_at(a)) {
+            a = a + 1
+        } else {
+            break
+        }
+    }
+    let mut b: int = n
+    while b > a {
+        if is_ws_b(s.byte_at(b - 1)) {
+            b = b - 1
+        } else {
+            break
+        }
+    }
+    return s.slice(a, b)
+}
+
+fn lower_ascii(s: str) -> str {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c >= 65 && c <= 90 {
+            out.push(chr(c + 32))
+        } else {
+            out.push(chr(c))
+        }
+        i = i + 1
+    }
+    return join(out, "")
+}
+
+fn pad4(n: int) -> str {
+    let s: str = n.to_str()
+    if s.len() >= 4 {
+        return s
+    }
+    return str_repeat("0", 4 - s.len()) + s
+}
+
+fn pad2n(n: int) -> str {
+    let s: str = n.to_str()
+    if s.len() >= 2 {
+        return s
+    }
+    return "0" + s
+}
+
+fn safe_prefix(s: str, n: int) -> str {
+    if n >= s.len() {
+        return s
+    }
+    if n <= 0 {
+        return ""
+    }
+    return s.slice(0, n)
+}
+
+fn path_join2(base: str, rel: str) -> str {
+    if base.len() > 0 && base.byte_at(base.len() - 1) == 47 {
+        return base + rel
+    }
+    return base + "/" + rel
+}
+
+fn is_hex64(s: str) -> bool {
+    if s.len() != 64 {
+        return false
+    }
+    let mut i: int = 0
+    while i < 64 {
+        let c: int = s.byte_at(i)
+        if !((c >= 48 && c <= 57) || (c >= 97 && c <= 102)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn is_hex40(s: str) -> bool {
+    if s.len() != 40 {
+        return false
+    }
+    let mut i: int = 0
+    while i < 40 {
+        let c: int = s.byte_at(i)
+        if !((c >= 48 && c <= 57) || (c >= 97 && c <= 102)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# ============================================================================
+# The calendar — days, not timestamps: the anchor's day is a
+# committer DAY, and the gates never depend on when they run.
+# ============================================================================
+
+struct Day {
+    y: int,
+    m: int,
+    d: int,
+    ok: bool
+}
+
+fn bad_day() -> Day {
+    return Day {
+        y: 0, m: 0, d: 0, ok: false
+    }
+}
+
+fn days_in_month(y: int, m: int) -> int {
+    if m == 2 {
+        if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+            return 29
+        }
+        return 28
+    }
+    if m == 4 || m == 6 || m == 9 || m == 11 {
+        return 30
+    }
+    return 31
+}
+
+fn day_iso(x: Day) -> str {
+    return pad4(x.y) + "-" + pad2n(x.m) + "-" + pad2n(x.d)
+}
+
+# parse_day(text) — YYYY-MM-DD, strictly: the DAY the laws read. The
+# anchor's day comes from git's committer timestamp, --at pins it,
+# and no gate in this kit sleeps on a wall clock.
+fn parse_day(s: str) -> Day {
+    let t: str = strip_ends(s)
+    if t.len() != 10 {
+        return bad_day()
+    }
+    if t.byte_at(4) != 45 || t.byte_at(7) != 45 {
+        return bad_day()
+    }
+    let mut i: int = 0
+    while i < 10 {
+        if i == 4 || i == 7 {
+            i = i + 1
+            continue
+        }
+        if !is_digit_b(t.byte_at(i)) {
+            return bad_day()
+        }
+        i = i + 1
+    }
+    let y: int = int_part(t, 0, 4)
+    let m: int = int_part(t, 5, 7)
+    let d: int = int_part(t, 8, 10)
+    if m < 1 || m > 12 {
+        return bad_day()
+    }
+    if d < 1 || d > days_in_month(y, m) {
+        return bad_day()
+    }
+    return Day {
+        y: y, m: m, d: d, ok: true
+    }
+}
+
+fn int_part(s: str, a: int, b: int) -> int {
+    let mut v: int = 0
+    let mut i: int = a
+    while i < b {
+        v = v * 10 + (s.byte_at(i) - 48)
+        i = i + 1
+    }
+    return v
+}
+
+# ============================================================================
+# The semver grammar (semver 2.0.0 §2) — the slice the candidate law
+# needs, PLUS the precedence the LTS policy never had to compute: a
+# candidate must sort AFTER every tag that exists and BEFORE the
+# release it belongs to (§11.4).
+# ============================================================================
+
+struct SemVer {
+    ok: bool,
+    major: int,
+    minor: int,
+    patch: int,
+    prerelease: str, # "" when absent (presence = len > 0)
+    build: str # "" when absent
+}
+
+fn bad_version() -> SemVer {
+    return SemVer {
+        ok: false, major: 0, minor: 0, patch: 0,
+        prerelease: "", build: ""
+    }
+}
+
+# parse_num(s, i) — a numeric identifier at i: "0" or [1-9][0-9]*.
+# Returns (value, next index), next == -1 on mismatch.
+fn parse_num(s: str, i: int) -> list[int] {
+    let r: list[int] = [-1, -1]
+    let n: int = s.len()
+    if i >= n {
+        return r
+    }
+    if s.byte_at(i) == 48 {
+        r.set(0, 0)
+        r.set(1, i + 1)
+        return r
+    }
+    if !(s.byte_at(i) >= 49 && s.byte_at(i) <= 57) {
+        return r
+    }
+    let mut j: int = i
+    let mut v: int = 0
+    while j < n && is_digit_b(s.byte_at(j)) {
+        v = v * 10 + (s.byte_at(j) - 48)
+        j = j + 1
+    }
+    r.set(0, v)
+    r.set(1, j)
+    return r
+}
+
+# parse_pre_id(s, i) — one pre-release identifier: numeric, or
+# alphanumeric with at least one letter/hyphen (so "00" fails).
+fn parse_pre_id(s: str, i: int) -> list[int] {
+    let r: list[int] = [-1, -1]
+    let n: int = s.len()
+    if i >= n {
+        return r
+    }
+    # numeric? must not carry a leading zero (unless it IS "0")
+    let num: list[int] = parse_num(s, i)
+    if num.get(1) > i {
+        let after: int = num.get(1)
+        if after >= n || s.byte_at(after) == 46 || s.byte_at(after) == 43 {
+            # a clean numeric identifier, bounded by '.' or '+' or end
+            r.set(0, 0)
+            r.set(1, after)
+            return r
+        }
+    }
+    # alphanumeric: [0-9A-Za-z-]* containing at least one letter/hyphen
+    let mut j: int = i
+    let mut has_letter: bool = false
+    while j < n {
+        let c: int = s.byte_at(j)
+        if c == 46 || c == 43 {
+            break
+        }
+        if !is_ident_b(c) {
+            return r
+        }
+        if is_alpha_b(c) || c == 45 {
+            has_letter = true
+        }
+        j = j + 1
+    }
+    if j > i && has_letter {
+        r.set(0, 0)
+        r.set(1, j)
+        return r
+    }
+    return r
+}
+
+# parse_build_id(s, i) — anything alphanumeric+hyphen (leading zeros
+# fine); bounded by '.' or end.
+fn parse_build_id(s: str, i: int) -> list[int] {
+    let r: list[int] = [-1, -1]
+    let n: int = s.len()
+    if i >= n {
+        return r
+    }
+    let mut j: int = i
+    while j < n {
+        let c: int = s.byte_at(j)
+        if c == 46 {
+            break
+        }
+        if !is_ident_b(c) {
+            return r
+        }
+        j = j + 1
+    }
+    if j > i {
+        r.set(0, 0)
+        r.set(1, j)
+        return r
+    }
+    return r
+}
+
+# parse_version(text) — the full grammar, no leading `v`.
+fn parse_version(text: str) -> SemVer {
+    let v: SemVer = bad_version()
+    let n: int = text.len()
+    let a: list[int] = parse_num(text, 0)
+    if a.get(1) < 1 {
+        return v
+    }
+    v.major = a.get(0)
+    let mut i: int = a.get(1)
+    if i >= n || text.byte_at(i) != 46 {
+        return bad_version()
+    }
+    let b: list[int] = parse_num(text, i + 1)
+    if b.get(1) < 0 {
+        return bad_version()
+    }
+    v.minor = b.get(0)
+    i = b.get(1)
+    if i >= n || text.byte_at(i) != 46 {
+        return bad_version()
+    }
+    let c: list[int] = parse_num(text, i + 1)
+    if c.get(1) < 0 {
+        return bad_version()
+    }
+    v.patch = c.get(0)
+    i = c.get(1)
+    if i >= n {
+        v.ok = true
+        return v
+    }
+    if text.byte_at(i) == 45 {
+        # pre-release: id (.id)*
+        let mut j: int = i + 1
+        let pr_a: list[int] = parse_pre_id(text, j)
+        if pr_a.get(1) < 0 {
+            return bad_version()
+        }
+        j = pr_a.get(1)
+        while j < n && text.byte_at(j) == 46 {
+            let nx: list[int] = parse_pre_id(text, j + 1)
+            if nx.get(1) < 0 {
+                return bad_version()
+            }
+            j = nx.get(1)
+        }
+        v.prerelease = text.slice(i + 1, j)
+        i = j
+        if i >= n {
+            v.ok = true
+            return v
+        }
+    }
+    if text.byte_at(i) == 43 {
+        let mut j: int = i + 1
+        let bu: list[int] = parse_build_id(text, j)
+        if bu.get(1) < 0 {
+            return bad_version()
+        }
+        j = bu.get(1)
+        while j < n && text.byte_at(j) == 46 {
+            let nx: list[int] = parse_build_id(text, j + 1)
+            if nx.get(1) < 0 {
+                return bad_version()
+            }
+            j = nx.get(1)
+        }
+        v.build = text.slice(i + 1, j)
+        i = j
+        if i >= n {
+            v.ok = true
+            return v
+        }
+    }
+    return bad_version()
+}
+
+# tag_version(tag) — one optional leading `v`, then the grammar.
+fn tag_version(tag: str) -> SemVer {
+    if tag.starts_with("v") {
+        return parse_version(tag.slice(1, tag.len()))
+    }
+    return parse_version(tag)
+}
+
+# ----------------------------------------------------------------------------
+# Precedence (§11.4): split the pre-release on '.', compare pairwise —
+# numeric identifiers numerically, alphanumeric ASCII-lexically,
+# numeric < alphanumeric, a longer list wins over its own prefix; a
+# version WITHOUT a pre-release outranks every pre-release of itself.
+# ----------------------------------------------------------------------------
+
+fn pre_id_is_numeric(id: str) -> bool {
+    if id.len() < 1 {
+        return false
+    }
+    let mut i: int = 0
+    while i < id.len() {
+        if !is_digit_b(id.byte_at(i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn pre_id_value(id: str) -> int {
+    # the caller checked is_numeric; leading zeros cannot reach here
+    # (the grammar refused them at parse time).
+    return int_part(id, 0, id.len())
+}
+
+fn pre_id_cmp(a: str, b: str) -> int {
+    let na: bool = pre_id_is_numeric(a)
+    let nb: bool = pre_id_is_numeric(b)
+    if na && nb {
+        let va: int = pre_id_value(a)
+        let vb: int = pre_id_value(b)
+        if va < vb {
+            return -1
+        }
+        if va > vb {
+            return 1
+        }
+        return 0
+    }
+    # numeric < alphanumeric
+    if na {
+        return -1
+    }
+    if nb {
+        return 1
+    }
+    # ASCII-lexical
+    let mut n: int = a.len()
+    if b.len() < n {
+        n = b.len()
+    }
+    let mut i: int = 0
+    while i < n {
+        let ca: int = a.byte_at(i)
+        let cb: int = b.byte_at(i)
+        if ca < cb {
+            return -1
+        }
+        if ca > cb {
+            return 1
+        }
+        i = i + 1
+    }
+    if a.len() < b.len() {
+        return -1
+    }
+    if a.len() > b.len() {
+        return 1
+    }
+    return 0
+}
+
+fn prerelease_cmp(a: str, b: str) -> int {
+    # absent > present: the release outranks its own candidates
+    if a.len() == 0 && b.len() == 0 {
+        return 0
+    }
+    if a.len() == 0 {
+        return 1
+    }
+    if b.len() == 0 {
+        return -1
+    }
+    let ia: list[str] = a.split(".")
+    let ib: list[str] = b.split(".")
+    let mut n: int = ia.len()
+    if ib.len() < n {
+        n = ib.len()
+    }
+    let mut i: int = 0
+    while i < n {
+        let c: int = pre_id_cmp(ia.get(i), ib.get(i))
+        if c != 0 {
+            return c
+        }
+        i = i + 1
+    }
+    # a longer identifier list wins over its own prefix
+    if ia.len() < ib.len() {
+        return -1
+    }
+    if ia.len() > ib.len() {
+        return 1
+    }
+    return 0
+}
+
+# version_cmp(a, b) — -1 / 0 / 1; build metadata is excluded from
+# precedence (§10), and the candidate law never compares builds.
+fn version_cmp(a: SemVer, b: SemVer) -> int {
+    if a.major != b.major {
+        if a.major < b.major {
+            return -1
+        }
+        return 1
+    }
+    if a.minor != b.minor {
+        if a.minor < b.minor {
+            return -1
+        }
+        return 1
+    }
+    if a.patch != b.patch {
+        if a.patch < b.patch {
+            return -1
+        }
+        return 1
+    }
+    return prerelease_cmp(a.prerelease, b.prerelease)
+}
+
+# ============================================================================
+# The candidate grammar — a tag the RC kit will bless: v1.0.0-rc.N
+# (or rcN), N in 1..4, no build metadata. rc.N closes Stage 145+N.
+# ============================================================================
+
+struct RcTag {
+    ok: bool,
+    n: int, # the candidate number (1..4)
+    stage: int, # the roadmap stage it closes (145+n)
+    why: str # the named refusal when ok is false
+}
+
+fn bad_rc_tag(why: str) -> RcTag {
+    return RcTag {
+        ok: false, n: 0, stage: 0, why: why
+    }
+}
+
+fn rc_num_from_ids(ids: list[str]) -> RcTag {
+    # two shapes: "rc.N" (two identifiers) or "rcN" (one)
+    let mut num_s: str = ""
+    if ids.len() == 2 && ids.get(0) == "rc" {
+        num_s = ids.get(1)
+    } else if ids.len() == 1 && ids.get(0).starts_with("rc")
+    && ids.get(0).len() > 2 {
+        num_s = ids.get(0).slice(2, ids.get(0).len())
+    } else {
+        return bad_rc_tag("the pre-release is not an rc channel "
+        + "(want v1.0.0-rc.N) — -alpha and -beta are the channels "
+        + "this tree retired, and a bare v1.0.0 is Stage 150, not a "
+        + "candidate")
+    }
+    # the number: digits only, no leading zero, >= 1
+    if num_s.len() < 1 {
+        return bad_rc_tag("the rc number is missing (want v1.0.0-rc.N)")
+    }
+    let mut i: int = 0
+    while i < num_s.len() {
+        if !is_digit_b(num_s.byte_at(i)) {
+            return bad_rc_tag("the rc number is not a number (want "
+            + "v1.0.0-rc.N with N a plain integer)")
+        }
+        i = i + 1
+    }
+    if num_s.len() > 1 && num_s.byte_at(0) == 48 {
+        return bad_rc_tag("the rc number carries a leading zero (want "
+        + "rc.2, not rc.02)")
+    }
+    let n: int = int_part(num_s, 0, num_s.len())
+    if n < 1 {
+        return bad_rc_tag("the candidate numbering starts at rc.1")
+    }
+    if n > 4 {
+        return bad_rc_tag("the roadmap planned FOUR candidates (Stages "
+        + "146..149, rc.1..rc.4) before the LTS release; a fifth "
+        + "is a roadmap amendment, not a release decision")
+    }
+    return RcTag {
+        ok: true, n: n, stage: rc_stage_for(n), why: ""
+    }
+}
+
+fn parse_rc_tag(tag: str) -> RcTag {
+    let v: SemVer = tag_version(tag)
+    if !v.ok {
+        return bad_rc_tag("the tag does not parse as a version under "
+        + "the Stage 131 grammar (want v1.0.0-rc.N)")
+    }
+    if v.build.len() > 0 {
+        return bad_rc_tag("build metadata has no place in a candidate "
+        + "name — a candidate is named by its channel, not by a "
+        + "build")
+    }
+    if v.major != 1 || v.minor != 0 || v.patch != 0 {
+        return bad_rc_tag("the candidate line is 1.0.0 — got "
+        + v.major.to_str() + "." + v.minor.to_str() + "."
+        + v.patch.to_str())
+    }
+    if v.prerelease.len() == 0 {
+        return bad_rc_tag("a bare v1.0.0 is the LTS release (Stage "
+        + "150), not a candidate — the candidate carries the rc "
+        + "channel")
+    }
+    return rc_num_from_ids(v.prerelease.split("."))
+}
+
+# ============================================================================
+# Git plumbing — every call is `git -C root ...`, stdout and stderr
+# both captured (the same discipline the sibling tools carry).
+# ============================================================================
+
+struct GitOut {
+    code: int,
+    out: str
+}
+
+struct RunCap {
+    code: int,
+    out: str,
+    err: str
+}
+
+fn spawn_cap(program: str, args: list[str]) -> RunCap uses Proc {
+    let r: RunCap = RunCap {
+        code: -1, out: "", err: ""
+    }
+    let pid: int = proc_spawn(program, args, 2, 1, 1)
+    if pid < 1 {
+        return r
+    }
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    r.code = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    r.out = out
+    r.err = err
+    return r
+}
+
+fn git_run(root: str, args: list[str]) -> GitOut uses Proc {
+    let full: list[str] = ["-C", root]
+    let mut i: int = 0
+    while i < args.len() {
+        full.push(args.get(i))
+        i = i + 1
+    }
+    let g: RunCap = spawn_cap("git", full)
+    return GitOut {
+        code: g.code, out: g.out + g.err
+    }
+}
+
+fn git_out(root: str, args: list[str]) -> str uses Proc {
+    return strip_ends(git_run(root, args).out)
+}
+
+fn git_ok(root: str, args: list[str]) -> bool uses Proc {
+    return git_run(root, args).code == 0
+}
+
+fn is_repo(root: str) -> bool uses Proc {
+    return git_ok(root, ["rev-parse", "--git-dir"])
+}
+
+fn rev_parse(root: str, ref: str) -> str uses Proc {
+    let p: GitOut = git_run(root, ["rev-parse", "--verify", "--quiet",
+    ref + "^{commit}"])
+    if p.code != 0 {
+        return ""
+    }
+    return strip_ends(p.out)
+}
+
+fn head_sha(root: str) -> str uses Proc {
+    return rev_parse(root, "HEAD")
+}
+
+fn message_of(root: str, sha: str) -> str uses Proc {
+    return git_out(root, ["log", "-1", "--format=%B", sha])
+}
+
+fn commit_time(root: str, sha: str) -> str uses Proc {
+    return git_out(root, ["log", "-1", "--format=%cI", sha])
+}
+
+# commit_day(root, sha) — the committer day, from %cI's date part.
+fn commit_day(root: str, sha: str) -> Day uses Proc {
+    let iso: str = commit_time(root, sha)
+    if iso.len() < 10 {
+        return bad_day()
+    }
+    return parse_day(iso.slice(0, 10))
+}
+
+fn diff_of(root: str, sha: str) -> str uses Proc {
+    return git_out(root, ["show", "--format=", "--unified=0", sha])
+}
+
+fn diff_added_files(root: str, sha: str) -> list[str] uses Proc {
+    let p: GitOut = git_run(root, ["show", "--format=", "--name-status",
+    "--diff-filter=A", sha])
+    let out: list[str] = []
+    let lines: list[str] = p.out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if strip_ends(lines.get(i)) != "" {
+            out.push(strip_ends(lines.get(i)))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# commits(root, base, head) — rev-list --reverse, oldest first.
+fn commits(root: str, base: str, head: str) -> list[str] uses Proc {
+    let p: GitOut = git_run(root, ["rev-list", "--reverse",
+    base + ".." + head])
+    let out: list[str] = []
+    let lines: list[str] = p.out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i) != "" {
+            out.push(lines.get(i))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# all_tags(root) — every tag name, ANY order; the sort law compares
+# with the semver precedence itself (git's version sort is locale
+# shaped and the candidate law refuses to guess).
+fn all_tags(root: str) -> list[str] uses Proc {
+    let p: GitOut = git_run(root, ["tag", "--list"])
+    let out: list[str] = []
+    let lines: list[str] = p.out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i) != "" {
+            out.push(lines.get(i))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn is_ancestor(root: str, sha: str) -> bool uses Proc {
+    return git_ok(root, ["merge-base", "--is-ancestor", sha, "HEAD"])
+}
+
+# is_dirty(root) — tracked-file modifications only (untracked files
+# never block a declaration; the anchor itself is written after).
+fn is_dirty(root: str) -> bool uses Proc {
+    return strip_ends(git_run(root, ["status", "--porcelain", "-uno"]).out)
+    != ""
+}
+
+# ============================================================================
+# The message law — the prefix table is the project's own commit
+# vocabulary, THE SAME LAW the LTS policy enforces (one classifier,
+# every gate; copied verbatim from tools/hls-lts.hls so this tool
+# stands alone, and the two must never disagree).
+# ============================================================================
+
+fn bugfix_reason(p: str) -> str {
+    if p == "fix" {
+        return "the fix prefix names a defect repair"
+    }
+    if p == "bugfix" {
+        return "explicit bugfix prefix"
+    }
+    if p == "revert" {
+        return "a revert removes a defect the safest way"
+    }
+    if p == "hotfix" {
+        return "a hotfix is a fix under time pressure, still a fix"
+    }
+    if p == "regression" {
+        return "a regression repair restores shipped behaviour"
+    }
+    return ""
+}
+
+fn feature_reason(p: str) -> str {
+    if p == "feat" || p == "feature" {
+        return "a feature is exactly what a feature freeze refuses"
+    }
+    if p == "add" {
+        return "new functionality is a feature, however small"
+    }
+    if p == "stage" {
+        return "a roadmap stage is new functionality by definition"
+    }
+    if p == "spec" {
+        return "a spec change is a language change"
+    }
+    if p == "stdlib" {
+        return "new stdlib surface is a feature"
+    }
+    if p == "perf" {
+        return "a perf rewrite can change semantics; only provable "
+        + "repairs qualify past the freeze"
+    }
+    if p == "opt" {
+        return "an optimisation is not a repair"
+    }
+    if p == "refactor" {
+        return "a refactor is risk without a user-visible repair"
+    }
+    return ""
+}
+
+fn chore_reason(p: str) -> str {
+    if p == "chore" {
+        return "release bookkeeping changes no language surface"
+    }
+    if p == "release" {
+        return "a release commit is the bookkeeping itself"
+    }
+    if p == "docs" || p == "doc" {
+        return "documentation changes no language surface"
+    }
+    if p == "test" || p == "tests" {
+        return "test-only changes are safe past the freeze"
+    }
+    if p == "ci" {
+        return "CI bookkeeping changes no language surface"
+    }
+    if p == "meta" {
+        return "project meta bookkeeping"
+    }
+    return ""
+}
+
+fn prefix_class(p: str) -> str {
+    if bugfix_reason(p) != "" {
+        return "BUGFIX"
+    }
+    if feature_reason(p) != "" {
+        return "FEATURE"
+    }
+    if chore_reason(p) != "" {
+        return "CHORE"
+    }
+    return ""
+}
+
+# prefix_of(subject) — "word: rest" (a colon, then one whitespace);
+# a bare word with no colon is NOT a prefix (fail-closed).
+fn prefix_of(subject: str) -> str {
+    let n: int = subject.len()
+    if n < 1 {
+        return ""
+    }
+    let c0: int = subject.byte_at(0)
+    if !is_alpha_b(c0) {
+        return ""
+    }
+    let mut i: int = 1
+    while i < n {
+        let c: int = subject.byte_at(i)
+        if is_alpha_b(c) || is_digit_b(c) || c == 45 || c == 95 {
+            i = i + 1
+            continue
+        }
+        if c == 58 {
+            # \s after the colon: [ \t\n\r\f\v]
+            if i + 1 < n {
+                let w: int = subject.byte_at(i + 1)
+                if is_ws_b(w) {
+                    return subject.slice(0, i)
+                }
+            }
+            return ""
+        }
+        return ""
+    }
+    return ""
+}
+
+fn starts_with_ci(s: str, lower_prefix: str) -> bool {
+    return lower_ascii(s).starts_with(lower_prefix)
+}
+
+# security_mark(message) — the first `Security: <reason>` line's value
+# ("" when the trailer stands empty — an empty value is no marking).
+# The RC kit reports the marking beside the class; it changes nothing
+# about the admission law (a marked FEATURE is still a FEATURE).
+fn security_mark(message: str) -> str {
+    let lines: list[str] = message.split("\n")
+    let want: str = lower_ascii("Security:")
+    let mut i: int = 0
+    while i < lines.len() {
+        let s: str = strip_ends(lines.get(i))
+        if starts_with_ci(s, want) {
+            let colon: int = s.find(":")
+            if colon >= 0 {
+                let val: str = strip_ends(s.slice(colon + 1, s.len()))
+                if val.len() > 0 {
+                    return val
+                }
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# fn_name_after(line) — [-+]\s*(pub\s+)?fn\s+NAME, the diff walker's
+# new-public-fn detector (the LTS grammar's own, copied).
+fn fn_name_after(line: str) -> str {
+    let mut i: int = 1
+    let n: int = line.len()
+    while i < n && is_ws_b(line.byte_at(i)) {
+        i = i + 1
+    }
+    if n - i < 3 {
+        return ""
+    }
+    if n - i >= 4 && line.slice(i, i + 4) == "pub " {
+        i = i + 4
+        while i < n && is_ws_b(line.byte_at(i)) {
+            i = i + 1
+        }
+    }
+    if n - i < 3 || line.slice(i, i + 3) != "fn " {
+        return ""
+    }
+    i = i + 3
+    while i < n && is_ws_b(line.byte_at(i)) {
+        i = i + 1
+    }
+    let s: int = i
+    while i < n {
+        let c: int = line.byte_at(i)
+        if is_alpha_b(c) || c == 95 || is_digit_b(c) {
+            i = i + 1
+        } else {
+            break
+        }
+    }
+    if i == s {
+        return ""
+    }
+    if s == 0 {
+        return ""
+    }
+    let c0: int = line.byte_at(s)
+    if !(is_alpha_b(c0) || c0 == 95) {
+        return ""
+    }
+    return line.slice(s, i)
+}
+
+struct Added {
+    path: str,
+    name: str
+}
+
+# new_public_names(diff) — new top-level fn names the diff introduces
+# in std/ or core/ Halis modules.
+fn new_public_names(diff: str) -> list[str] {
+    let names: list[str] = []
+    let mut current: str = ""
+    let removed: list[str] = []
+    let added: list[Added] = []
+    let lines: list[str] = diff.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i)
+        if line.starts_with("diff --git ") {
+            current = ""
+        } else if line.starts_with("--- ") || line.starts_with("index ") {
+            # skip
+        } else if line.starts_with("+++ ") {
+            current = strip_ends(line.slice(4, line.len()))
+            if current.starts_with("b/") {
+                current = current.slice(2, current.len())
+            }
+            while removed.len() > 0 {
+                removed.pop()
+            }
+        } else if line.starts_with("-") {
+            let nm: str = fn_name_after(line)
+            if nm != "" {
+                removed.push(nm)
+            }
+        } else if line.starts_with("+") {
+            let nm: str = fn_name_after(line)
+            if nm != "" {
+                added.push(Added {
+                    path: current, name: nm
+                })
+            }
+        }
+        i = i + 1
+    }
+    let mut a: int = 0
+    while a < added.len() {
+        let path: str = added.get(a).path
+        let name: str = added.get(a).name
+        if path.ends_with(".hls")
+        && (path.starts_with("std/") || path.starts_with("core/")) {
+            let mut gone: bool = false
+            let mut k: int = 0
+            while k < removed.len() {
+                if removed.get(k) == name {
+                    gone = true
+                }
+                k = k + 1
+            }
+            let mut dup: bool = false
+            let mut k2: int = 0
+            while k2 < names.len() {
+                if names.get(k2) == name {
+                    dup = true
+                }
+                k2 = k2 + 1
+            }
+            if !gone && !dup {
+                names.push(name)
+            }
+        }
+        a = a + 1
+    }
+    return names
+}
+
+struct Cls {
+    sha: str,
+    subject: str,
+    cls: str,
+    reason: str,
+    reasons: list[str],
+    security: bool
+}
+
+# classify_commit(root, sha) — the message law first; the diff gate
+# may re-class a BUGFIX into a FEATURE. The default is UNKNOWN
+# (fail-closed).
+fn classify_commit(root: str, sha: str) -> Cls uses Proc {
+    let msg: str = message_of(root, sha)
+    let lines0: list[str] = msg.split("\n")
+    let subject: str = lines0.get(0)
+    let mut cls: str = "UNKNOWN"
+    let mut reason: str = "no recognized prefix — the classifier is "
+    + "fail-closed"
+    let pfx: str = prefix_of(subject)
+    if pfx != "" {
+        let p: str = lower_ascii(pfx)
+        let pc: str = prefix_class(p)
+        if pc != "" {
+            cls = pc
+            if bugfix_reason(p) != "" {
+                reason = bugfix_reason(p)
+            } else if feature_reason(p) != "" {
+                reason = feature_reason(p)
+            } else {
+                reason = chore_reason(p)
+            }
+        } else {
+            cls = "UNKNOWN"
+            reason = "prefix '" + p + "' is not in the policy table"
+        }
+    }
+    # The diff gate (only a BUGFIX can be re-classed; the reasons
+    # ride along when it is).
+    let reasons: list[str] = []
+    if cls == "BUGFIX" {
+        let diff: str = diff_of(root, sha)
+        let added_files: list[str] = diff_added_files(root, sha)
+        let mut extra: list[str] = []
+        let mut f: int = 0
+        while f < added_files.len() {
+            let line: str = added_files.get(f)
+            if line.starts_with("A\t") {
+                let rest: str = line.slice(2, line.len())
+                if rest.starts_with("std/") || rest.starts_with("core/") {
+                    extra.push("new std module file '" + rest
+                    + "' — new API surface is a feature")
+                }
+            }
+            f = f + 1
+        }
+        let names: list[str] = new_public_names(diff)
+        if names.len() > 0 {
+            let mut joined: str = ""
+            let mut nn: int = 0
+            while nn < names.len() && nn < 4 {
+                if nn > 0 {
+                    joined = joined + ", "
+                }
+                joined = joined + names.get(nn)
+                nn = nn + 1
+            }
+            extra.push("new public fn(s) " + joined
+            + " — new API surface is a feature")
+        }
+        let dl: list[str] = diff.split("\n")
+        let mut di: int = 0
+        while di < dl.len() {
+            if dl.get(di).starts_with("+++")
+            && dl.get(di).contains("SPEC.md") {
+                extra.push("SPEC.md edits are language changes")
+                break
+            }
+            di = di + 1
+        }
+        if extra.len() > 0 {
+            cls = "FEATURE"
+            reasons.push(reason)
+            let mut e: int = 0
+            while e < extra.len() {
+                reasons.push(extra.get(e))
+                e = e + 1
+            }
+        } else {
+            reasons.push(reason)
+        }
+    } else {
+        reasons.push(reason)
+    }
+    let mark: str = security_mark(msg)
+    return Cls {
+        sha: rev_parse(root, sha),
+        subject: subject,
+        cls: cls,
+        reason: reasons.get(0),
+        reasons: reasons,
+        security: mark != ""
+    }
+}
+
+# ============================================================================
+# The roadmap law — the stage table parsed LIVE from ROADMAP.md, never
+# from a copy: a row is "| 146 | title | status | effort |"; the
+# status cell speaks in the legend's own marks. A row that carries no
+# status cell (a cancelled stage) is closed by definition — cancelled
+# is not open.
+# ============================================================================
+
+struct StageRow {
+    num: int,
+    title: str,
+    open: bool, # ⬜ or 🔄 — an open stage
+    ticked: bool # ✅ — closed and done
+}
+
+fn read_stage_rows(root: str) -> list[StageRow] uses Fs {
+    let rows: list[StageRow] = []
+    let path: str = path_join2(root, roadmap_doc())
+    if !file_exists(path) {
+        return rows
+    }
+    let lines: list[str] = read_file(path).split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i)
+        if line.starts_with("|") {
+            # split the cells; the first cell after the leading pipe
+            # is the stage number when it parses as one.
+            let cells: list[str] = line.split("|")
+            # cells[0] is "" (before the leading '|')
+            if cells.len() >= 3 {
+                let num_s: str = strip_ends(cells.get(1))
+                if num_s.len() > 0 && num_s.len() <= 3 {
+                    let mut all_digits: bool = true
+                    let mut k: int = 0
+                    while k < num_s.len() {
+                        if !is_digit_b(num_s.byte_at(k)) {
+                            all_digits = false
+                        }
+                        k = k + 1
+                    }
+                    if all_digits {
+                        let num: int = int_part(num_s, 0, num_s.len())
+                        # the status cell: index 3 when the row is
+                        # wide enough; a narrow row (a cancelled
+                        # stage) carries none.
+                        let mut status: str = ""
+                        if cells.len() >= 5 {
+                            status = strip_ends(cells.get(3))
+                        }
+                        let done: bool = status.contains("✅")
+                        let open: bool = status.contains("⬜")
+                        || status.contains("🔄")
+                        rows.push(StageRow {
+                            num: num,
+                            title: strip_ends(cells.get(2)),
+                            open: open,
+                            ticked: done
+                        })
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return rows
+}
+
+struct RoadmapLaw {
+    ok: bool,
+    first_open: int, # 0 when none
+    detail: str
+}
+
+# check_roadmap(root, max_closed) — the roadmap must carry exactly the
+# 150 stages, numbered 1..150 in order; the closed stages must form a
+# contiguous prefix; no stage before first_rc_stage() may remain open
+# (the feature surface is frozen by Stage 141 — a feature stage still
+# open past 145 contradicts the candidate).
+fn check_roadmap(root: str) -> RoadmapLaw uses Fs {
+    let rows: list[StageRow] = read_stage_rows(root)
+    if rows.len() != total_stages() {
+        return RoadmapLaw {
+            ok: false, first_open: 0,
+            detail: "the stage table parses to " + rows.len().to_str()
+            + " rows, want exactly " + total_stages().to_str()
+            + " — the roadmap itself is broken, and a candidate is "
+            + "not cut from a broken map"
+        }
+    }
+    let mut i: int = 0
+    while i < rows.len() {
+        if rows.get(i).num != i + 1 {
+            return RoadmapLaw {
+                ok: false, first_open: 0,
+                detail: "stage row " + (i + 1).to_str() + " carries "
+                + "number " + rows.get(i).num.to_str() + " — the table "
+                + "must be numbered 1.." + total_stages().to_str()
+                + " in order"
+            }
+        }
+        i = i + 1
+    }
+    let mut first_open: int = 0
+    i = 0
+    while i < rows.len() {
+        if rows.get(i).open {
+            first_open = rows.get(i).num
+            break
+        }
+        i = i + 1
+    }
+    if first_open == 0 {
+        return RoadmapLaw {
+            ok: false, first_open: 0,
+            detail: "every stage is ticked — there is nothing left to "
+            + "candidate for (the LTS release is Stage "
+            + final_stage().to_str() + ")"
+        }
+    }
+    # contiguity: nothing open AFTER an open stage may hide a closed
+    # one before the next open (the open set is a contiguous tail).
+    let mut seen_open: bool = false
+    i = 0
+    while i < rows.len() {
+        if rows.get(i).open {
+            seen_open = true
+        } else if seen_open && rows.get(i).num < final_stage() + 1 {
+            # a closed stage sitting inside the open tail
+            return RoadmapLaw {
+                ok: false, first_open: first_open,
+                detail: "stage " + rows.get(i).num.to_str()
+                + " is closed but sits inside the open tail after "
+                + "stage " + first_open.to_str() + " — the open set "
+                + "must be a contiguous run"
+            }
+        }
+        i = i + 1
+    }
+    if first_open < first_rc_stage() {
+        return RoadmapLaw {
+            ok: false, first_open: first_open,
+            detail: "stage " + first_open.to_str() + " is still open — "
+            + "a feature stage (before Stage " + first_rc_stage().to_str()
+            + ") contradicts a candidate: the surface was frozen at "
+            + "Stage 141"
+        }
+    }
+    return RoadmapLaw {
+        ok: true, first_open: first_open,
+        detail: "stages 1.." + (first_open - 1).to_str() + " closed, "
+        + "the open set is the tail from Stage " + first_open.to_str()
+    }
+}
+
+# ============================================================================
+# The version markers — the changelog heading, the snapshot manifest
+# and the editor manifest must speak with one voice.
+# ============================================================================
+
+# changelog_head_version(root) — the first `## [v...]` heading's
+# version, "" when the changelog is missing or carries none.
+fn changelog_head_version(root: str) -> str uses Fs {
+    let path: str = path_join2(root, changelog_doc())
+    if !file_exists(path) {
+        return ""
+    }
+    let lines: list[str] = read_file(path).split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i)
+        if line.starts_with("## [v") && line.contains("]") {
+            let a: int = line.find("## [v") + 5
+            let b: int = line.find("]")
+            if b > a {
+                return line.slice(a, b)
+            }
+            return ""
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# manifest_version(root) — the snapshot manifest's version field
+# (the "v" prefixed shape the kit writes).
+fn manifest_version(root: str) -> str uses Fs {
+    let path: str = path_join2(root, snapshot_manifest())
+    if !file_exists(path) {
+        return ""
+    }
+    let parsed: Result[JsonValue, str] = json_parse_result(read_file(path))
+    if result_is_err(parsed) {
+        return ""
+    }
+    let data: JsonValue = result_unwrap(parsed)
+    if !json_object_has(data, "version") {
+        return ""
+    }
+    let v: JsonValue = json_object_get(data, "version")
+    if v.kind != "str" {
+        return ""
+    }
+    return json_str_value(v)
+}
+
+# vscode_version(root) — the editor manifest's version (no "v").
+fn vscode_version(root: str) -> str uses Fs {
+    let path: str = path_join2(root, vscode_manifest())
+    if !file_exists(path) {
+        return ""
+    }
+    let parsed: Result[JsonValue, str] = json_parse_result(read_file(path))
+    if result_is_err(parsed) {
+        return ""
+    }
+    let data: JsonValue = result_unwrap(parsed)
+    if !json_object_has(data, "version") {
+        return ""
+    }
+    let v: JsonValue = json_object_get(data, "version")
+    if v.kind != "str" {
+        return ""
+    }
+    return json_str_value(v)
+}
+
+# ============================================================================
+# The freeze identity — the document's fields, and the commit it was
+# frozen at standing in THIS history. The digest's arithmetic (the
+# live re-derivation of the surface) stays with hls-freeze itself;
+# this kit pins the identity and refuses to guess the rest.
+# ============================================================================
+
+struct FreezeId {
+    ok: bool,
+    digest: str,
+    release: str,
+    frozen_commit: str,
+    detail: str
+}
+
+fn check_freeze(root: str) -> FreezeId uses Fs, Proc {
+    let path: str = path_join2(root, freeze_doc())
+    if !file_exists(path) {
+        return FreezeId {
+            ok: false, digest: "", release: "", frozen_commit: "",
+            detail: freeze_doc() + " is missing — the API freeze ("
+            + "Stage 141) is not in this tree, and a candidate is "
+            + "not cut from an unfrozen surface"
+        }
+    }
+    let parsed: Result[JsonValue, str] = json_parse_result(read_file(path))
+    if result_is_err(parsed) {
+        return FreezeId {
+            ok: false, digest: "", release: "", frozen_commit: "",
+            detail: freeze_doc() + " does not parse as JSON"
+        }
+    }
+    let data: JsonValue = result_unwrap(parsed)
+    if !json_object_has(data, "tool")
+    || json_str_value(json_object_get(data, "tool")) != "hls-freeze" {
+        return FreezeId {
+            ok: false, digest: "", release: "", frozen_commit: "",
+            detail: freeze_doc() + " was not written by hls-freeze "
+            + "(the tool field disagrees) — whose surface is this?"
+        }
+    }
+    if !json_object_has(data, "stage")
+    || json_object_get(data, "stage").kind != "int"
+    || json_object_get(data, "stage").ival != 141 {
+        return FreezeId {
+            ok: false, digest: "", release: "", frozen_commit: "",
+            detail: freeze_doc() + " is not the Stage 141 freeze"
+        }
+    }
+    if !json_object_has(data, "digest")
+    || !is_hex64(json_str_value(json_object_get(data, "digest"))) {
+        return FreezeId {
+            ok: false, digest: "", release: "", frozen_commit: "",
+            detail: freeze_doc() + " carries no sha256 digest — the "
+            + "surface cannot be named"
+        }
+    }
+    let digest: str = json_str_value(json_object_get(data, "digest"))
+    let mut release: str = ""
+    if json_object_has(data, "release") {
+        release = json_str_value(json_object_get(data, "release"))
+    }
+    if !json_object_has(data, "frozen_commit")
+    || !is_hex40(json_str_value(json_object_get(data, "frozen_commit"))) {
+        return FreezeId {
+            ok: false, digest: digest, release: release,
+            frozen_commit: "",
+            detail: freeze_doc() + " names no frozen commit — the "
+            + "freeze is not anchored in this history"
+        }
+    }
+    let fc: str = json_str_value(json_object_get(data, "frozen_commit"))
+    if !is_ancestor(root, fc) {
+        return FreezeId {
+            ok: false, digest: digest, release: release,
+            frozen_commit: fc,
+            detail: "the frozen commit " + safe_prefix(fc, 12)
+            + " is not an ancestor of HEAD — the freeze does not "
+            + "belong to this history"
+        }
+    }
+    return FreezeId {
+        ok: true, digest: digest, release: release,
+        frozen_commit: fc,
+        detail: "the Stage 141 freeze, anchored at " + safe_prefix(fc, 12)
+    }
+}
+
+# ============================================================================
+# The readiness verdict — the checklist, each law named.
+# ============================================================================
+
+struct Law {
+    name: str,
+    ok: bool,
+    detail: str
+}
+
+struct Readiness {
+    ok: bool,
+    laws: list[Law],
+    head: str,
+    first_open: int
+}
+
+fn check_readiness(root: str) -> Readiness uses Fs, Proc {
+    let laws: list[Law] = []
+    let mut all_ok: bool = true
+
+    # 1. the repo law
+    if is_repo(root) {
+        laws.push(Law {
+            name: "the repo law",
+            ok: true,
+            detail: "the root is a git repository"
+        })
+    } else {
+        all_ok = false
+        laws.push(Law {
+            name: "the repo law",
+            ok: false,
+            detail: "the root is not a git repository — the anchor "
+            + "pins a commit, and there is no commit here"
+        })
+    }
+
+    # 2. the roadmap law
+    let rm: RoadmapLaw = check_roadmap(root)
+    laws.push(Law {
+        name: "the roadmap law",
+        ok: rm.ok,
+        detail: rm.detail
+    })
+    if !rm.ok {
+        all_ok = false
+    }
+
+    # 3. the freeze law
+    let fz: FreezeId = check_freeze(root)
+    laws.push(Law {
+        name: "the freeze law",
+        ok: fz.ok,
+        detail: fz.detail
+    })
+    if !fz.ok {
+        all_ok = false
+    }
+
+    # 4. the marker law — one voice on the release version
+    let head_v: str = changelog_head_version(root)
+    let man_v: str = manifest_version(root)
+    let vs_v: str = vscode_version(root)
+    if head_v.len() == 0 {
+        all_ok = false
+        laws.push(Law {
+            name: "the marker law",
+            ok: false,
+            detail: changelog_doc() + " carries no `## [v...]` release "
+            + "heading — the release train has no head"
+        })
+    } else if man_v != "v" + head_v || vs_v != head_v {
+        all_ok = false
+        laws.push(Law {
+            name: "the marker law",
+            ok: false,
+            detail: "the version markers disagree — changelog " + head_v
+            + ", manifest " + man_v + ", editor manifest " + vs_v
+            + " (regenerate the manifest with `make snapshot-regen`)"
+        })
+    } else {
+        laws.push(Law {
+            name: "the marker law",
+            ok: true,
+            detail: "changelog, snapshot manifest and editor manifest "
+            + "all speak " + head_v
+        })
+    }
+
+    # 5. the snapshot law — the seed is present
+    if file_exists(path_join2(root, snapshot_c())) {
+        laws.push(Law {
+            name: "the snapshot law",
+            ok: true,
+            detail: snapshot_c() + " is present — the bootstrap seed "
+            + "travels with the candidate"
+        })
+    } else {
+        all_ok = false
+        laws.push(Law {
+            name: "the snapshot law",
+            ok: false,
+            detail: snapshot_c() + " is missing — the seed IS the "
+            + "release; restore it from git history"
+        })
+    }
+
+    # 6. the LTS law — published, and NO line declared (a candidate
+    #    opens no support window; the LTS begins at v1.0.0)
+    let lts_path: str = path_join2(root, lts_doc())
+    let decl_path: str = path_join2(root, lts_policy_file())
+    if !file_exists(lts_path) {
+        all_ok = false
+        laws.push(Law {
+            name: "the lts law",
+            ok: false,
+            detail: lts_doc() + " is not published here — the support "
+            + "promise travels with the candidate"
+        })
+    } else if file_exists(decl_path) {
+        all_ok = false
+        laws.push(Law {
+            name: "the lts law",
+            ok: false,
+            detail: lts_policy_file() + " exists — an LTS line is "
+            + "already declared, and a candidate opens none (the "
+            + "window becomes the clock the day `hls-lts init --tag "
+            + "v1.0.0` runs, not before)"
+        })
+    } else {
+        laws.push(Law {
+            name: "the lts law",
+            ok: true,
+            detail: lts_doc() + " published, no line declared — the "
+            + "policy is the promise until v1.0.0 makes it the clock"
+        })
+    }
+
+    return Readiness {
+        ok: all_ok, laws: laws, head: head_v, first_open: rm.first_open
+    }
+}
+
+# ============================================================================
+# The anchor — .hls-rc.json, the record the freeze defends. Written by
+# declare, read by gate and report; one anchor per tree, and a
+# re-declaration is noise (the family refuses noise).
+# ============================================================================
+
+struct Anchor {
+    present: bool,
+    tag: str,
+    sha: str,
+    day: str,
+    stage: int,
+    freeze_digest: str,
+    next: str,
+    detail: str
+}
+
+fn bad_anchor(detail: str) -> Anchor {
+    return Anchor {
+        present: false, tag: "", sha: "", day: "", stage: 0,
+        freeze_digest: "", next: "", detail: detail
+    }
+}
+
+# load_anchor(root) — the anchor parsed; absent is a normal state
+# (present: false, detail names it).
+fn load_anchor(root: str) -> Anchor uses Fs {
+    let path: str = path_join2(root, anchor_file())
+    if !file_exists(path) {
+        return bad_anchor("no anchor in this tree")
+    }
+    let parsed: Result[JsonValue, str] = json_parse_result(read_file(path))
+    if result_is_err(parsed) {
+        return bad_anchor(anchor_file() + " does not parse as JSON")
+    }
+    let data: JsonValue = result_unwrap(parsed)
+    if !json_object_has(data, "kit")
+    || json_str_value(json_object_get(data, "kit")) != kit_version() {
+        return bad_anchor(anchor_file() + " was not written by "
+        + kit_version() + " — whose candidate is this?")
+    }
+    let mut tag: str = ""
+    let mut sha: str = ""
+    let mut day: str = ""
+    let mut digest: str = ""
+    let mut next: str = ""
+    let mut stage: int = 0
+    if json_object_has(data, "tag")
+    && json_object_get(data, "tag").kind == "str" {
+        tag = json_str_value(json_object_get(data, "tag"))
+    }
+    if json_object_has(data, "sha")
+    && json_object_get(data, "sha").kind == "str" {
+        sha = json_str_value(json_object_get(data, "sha"))
+    }
+    if json_object_has(data, "day")
+    && json_object_get(data, "day").kind == "str" {
+        day = json_str_value(json_object_get(data, "day"))
+    }
+    if json_object_has(data, "stage")
+    && json_object_get(data, "stage").kind == "int" {
+        stage = json_object_get(data, "stage").ival
+    }
+    if json_object_has(data, "freeze_digest")
+    && json_object_get(data, "freeze_digest").kind == "str" {
+        digest = json_str_value(json_object_get(data, "freeze_digest"))
+    }
+    if json_object_has(data, "next")
+    && json_object_get(data, "next").kind == "str" {
+        next = json_str_value(json_object_get(data, "next"))
+    }
+    if tag.len() == 0 || sha.len() != 40 || day.len() != 10 {
+        return bad_anchor(anchor_file() + " is missing its tag, sha or "
+        + "day — the anchor cannot name the candidate")
+    }
+    return Anchor {
+        present: true, tag: tag, sha: sha, day: day, stage: stage,
+        freeze_digest: digest, next: next,
+        detail: "the candidate " + tag + " anchored at " + sha
+    }
+}
+
+# write_anchor(root, ...) — the anchor file, rendered with a fixed
+# field order (the file is committed; its bytes are the release's).
+fn write_anchor(root: str, tag: str, sha: str, day: str, stage: int,
+freeze_digest: str, next: str) -> void uses Fs {
+    let mut out: str = "{\n"
+    out = out + "  \"day\": " + json_quote(day) + ",\n"
+    out = out + "  \"freeze_digest\": " + json_quote(freeze_digest)
+    + ",\n"
+    out = out + "  \"kit\": " + json_quote(kit_version()) + ",\n"
+    out = out + "  \"next\": " + json_quote(next) + ",\n"
+    out = out + "  \"sha\": " + json_quote(sha) + ",\n"
+    out = out + "  \"stage\": " + stage.to_str() + ",\n"
+    out = out + "  \"tag\": " + json_quote(tag) + "\n"
+    out = out + "}\n"
+    write_file(path_join2(root, anchor_file()), out)
+}
+
+# ============================================================================
+# json_quote — the minimal JSON string escaper (the policy family's
+# own: \", \\, control bytes as \uXXXX).
+# ============================================================================
+
+fn json_quote(s: str) -> str {
+    let out: list[str] = ["\""]
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c == 34 {
+            out.push("\\\"")
+        } else if c == 92 {
+            out.push("\\\\")
+        } else if c == 10 {
+            out.push("\\n")
+        } else if c == 9 {
+            out.push("\\t")
+        } else if c < 32 {
+            out.push("\\u00" + hex_byte(c))
+        } else {
+            out.push(chr(c))
+        }
+        i = i + 1
+    }
+    out.push("\"")
+    return join(out, "")
+}
+
+fn hex_byte(c: int) -> str {
+    let hex: str = "0123456789abcdef"
+    return hex.slice(c / 16, c / 16 + 1) + hex.slice(c % 16, c % 16 + 1)
+}
+
+# ============================================================================
+# The commands.
+# ============================================================================
+
+fn die(msg: str) -> int uses IO {
+    eprintln("hls-rc: " + msg)
+    return 1
+}
+
+# root_arg(argv) — --root's value, else "." (the tree this was invoked
+# in; the Makefile runs the kit from the repository root).
+fn root_arg(argv: list[str]) -> str {
+    let mut i: int = 1
+    while i < argv.len() {
+        if argv.get(i) == "--root" && i + 1 < argv.len() {
+            return argv.get(i + 1)
+        }
+        i = i + 1
+    }
+    return "."
+}
+
+fn flag_value(argv: list[str], name: str, default_value: str) -> str {
+    let mut i: int = 1
+    while i < argv.len() {
+        let a: str = argv.get(i)
+        if a == name && i + 1 < argv.len() {
+            return argv.get(i + 1)
+        }
+        if a.starts_with(name + "=") {
+            return a.slice(name.len() + 1, a.len())
+        }
+        i = i + 1
+    }
+    return default_value
+}
+
+fn has_flag(argv: list[str], name: str) -> bool {
+    let mut i: int = 1
+    while i < argv.len() {
+        if argv.get(i) == name {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn count_lines(text: str) -> int {
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < text.len() {
+        if text.byte_at(i) == 10 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    if text.len() > 0 && !text.ends_with("\n") {
+        n = n + 1
+    }
+    return n
+}
+
+# resolve_at(argv, root, sha) — the judged day: --at when given, else
+# the commit's committer day (the clock the landing laws read).
+fn resolve_at(argv: list[str], root: str, sha: str) -> Day uses Proc {
+    let at: str = flag_value(argv, "--at", "")
+    if at != "" {
+        return parse_day(at)
+    }
+    return commit_day(root, sha)
+}
+
+# ----------------------------------------------------------------------------
+# readiness
+# ----------------------------------------------------------------------------
+fn cmd_readiness(argv: list[str]) -> int uses IO, Fs, Proc {
+    let root: str = root_arg(argv)
+    let r: Readiness = check_readiness(root)
+    if has_flag(argv, "--json") {
+        let mut out: str = "{\"ready\": "
+        if r.ok {
+            out = out + "true"
+        } else {
+            out = out + "false"
+        }
+        out = out + ", \"head\": " + json_quote(r.head)
+        out = out + ", \"first_open\": " + r.first_open.to_str()
+        out = out + ", \"laws\": ["
+        let mut i: int = 0
+        while i < r.laws.len() {
+            let l: Law = r.laws.get(i)
+            if i > 0 {
+                out = out + ", "
+            }
+            out = out + "{\"law\": " + json_quote(l.name)
+            if l.ok {
+                out = out + ", \"ok\": true"
+            } else {
+                out = out + ", \"ok\": false"
+            }
+            out = out + ", \"detail\": " + json_quote(l.detail) + "}"
+            i = i + 1
+        }
+        out = out + "]}"
+        println(out)
+        if r.ok {
+            return 0
+        }
+        return 1
+    }
+    let mut i: int = 0
+    while i < r.laws.len() {
+        let l: Law = r.laws.get(i)
+        if l.ok {
+            println("  ok: " + l.name + " — " + l.detail)
+        } else {
+            println("  NOT READY: " + l.name + " — " + l.detail)
+        }
+        i = i + 1
+    }
+    if r.ok {
+        println("readiness: READY — the tree may be declared a "
+        + "candidate (bin/hls-rc declare --tag v1.0.0-rc.N)")
+        return 0
+    }
+    println("readiness: NOT READY — the laws above name what stands "
+    + "between this tree and the candidate")
+    return 1
+}
+
+# ----------------------------------------------------------------------------
+# declare — cut the candidate on paper: validate everything, then
+# write the anchor.
+# ----------------------------------------------------------------------------
+fn cmd_declare(argv: list[str]) -> int uses IO, Fs, Proc {
+    let root: str = root_arg(argv)
+    let tag: str = flag_value(argv, "--tag", "")
+    if tag.len() == 0 {
+        die("declare: --tag v1.0.0-rc.N is required — the candidate "
+        + "is named, not guessed")
+        return 2
+    }
+    let rt: RcTag = parse_rc_tag(tag)
+    if !rt.ok {
+        return die("declare: " + tag + " — " + rt.why)
+    }
+
+    # the anchor law first — a re-declaration is noise
+    let existing: Anchor = load_anchor(root)
+    if existing.present {
+        if existing.tag == tag {
+            return die("declare: " + tag + " is already anchored in "
+            + anchor_file() + " — a declaration that changes nothing "
+            + "is noise, and noise is how real anchors stop being read")
+        }
+        return die("declare: " + existing.tag + " is anchored in this "
+        + tree_word() + " — one anchor per tree; the candidate's "
+        + "successor is cut on the release line, not by re-declaring "
+        + "over " + existing.tag)
+    }
+
+    # the readiness laws
+    let r: Readiness = check_readiness(root)
+    let mut i: int = 0
+    let mut failed: bool = false
+    while i < r.laws.len() {
+        if !r.laws.get(i).ok {
+            failed = true
+        }
+        i = i + 1
+    }
+    if failed {
+        i = 0
+        while i < r.laws.len() {
+            let l: Law = r.laws.get(i)
+            if !l.ok {
+                eprintln("hls-rc: NOT READY: " + l.name + " — " + l.detail)
+            }
+            i = i + 1
+        }
+        return die("declare: the readiness laws above refuse the "
+        + "candidate — fix the tree, then declare")
+    }
+
+    # the stage law — rc.N closes Stage 145+N, and the roadmap row is
+    # ticked by the very release that cuts the candidate: by declare
+    # time the row is already marked, so the first open stage is the
+    # one AFTER the candidate's own
+    if r.first_open != rt.stage + 1 {
+        return die("declare: " + tag + " closes Stage "
+        + rt.stage.to_str() + ", but the roadmap's first open stage is "
+        + r.first_open.to_str() + " — tick Stage " + rt.stage.to_str()
+        + " in the release that carries the candidate, then declare")
+    }
+
+    # the marker law (tight) — the markers speak the TAG (the heading
+    # carries the version without the release `v`; the tag wears it)
+    if "v" + r.head != tag {
+        return die("declare: the changelog head is " + r.head + ", the "
+        + "candidate is " + tag + " — the release heading IS the "
+        + "candidate's name; write the changelog first")
+    }
+
+    # the sort law — newer than every tag that exists
+    let tags: list[str] = all_tags(root)
+    let v_new: SemVer = tag_version(tag)
+    let mut t: int = 0
+    while t < tags.len() {
+        let v_old: SemVer = tag_version(tags.get(t))
+        if v_old.ok && version_cmp(v_new, v_old) <= 0 {
+            return die("declare: " + tag + " does not sort after the "
+            + "existing tag " + tags.get(t) + " — the candidate is "
+            + "the newest release the tree has ever named")
+        }
+        t = t + 1
+    }
+
+    # the clean law — the anchor pins a committed tree
+    if is_dirty(root) {
+        return die("declare: the tracked tree is dirty — the anchor "
+        + "pins a commit; commit the release first")
+    }
+
+    # the record
+    let sha: str = head_sha(root)
+    if sha.len() != 40 {
+        return die("declare: HEAD does not resolve to a commit")
+    }
+    let day: Day = resolve_at(argv, root, sha)
+    if !day.ok {
+        return die("declare: the judged day is unreadable — pass "
+        + "--at YYYY-MM-DD or let the commit's committer day speak")
+    }
+    let fz: FreezeId = check_freeze(root)
+    let mut next: str = "v1.0.0"
+    if rt.n < 4 {
+        next = "v1.0.0-rc." + (rt.n + 1).to_str()
+    }
+    write_anchor(root, tag, sha, day_iso(day), rt.stage, fz.digest,
+    next)
+    println("declare: " + tag + " anchored — Stage "
+    + rt.stage.to_str() + " closes with this candidate")
+    println("  commit: " + sha)
+    println("  day:    " + day_iso(day) + " (the committer day; --at "
+    + "pins it)")
+    println("  freeze: " + fz.digest.slice(0, 16) + "... (Stage 141)")
+    println("  next:   " + next)
+    println("commit " + anchor_file() + " and render the record with "
+    + "`bin/hls-rc report --out " + rc_doc() + "`")
+    return 0
+}
+
+fn tree_word() -> str {
+    return "tree"
+}
+
+# ----------------------------------------------------------------------------
+# gate — the feature-freeze law: every commit in the range classified,
+# violations named sha by sha.
+# ----------------------------------------------------------------------------
+fn cmd_gate(argv: list[str]) -> int uses IO, Fs, Proc {
+    let root: str = root_arg(argv)
+    let range: str = flag_value(argv, "--range", "")
+
+    let mut base: str = ""
+    let mut head: str = "HEAD"
+    if range != "" {
+        # A..B — the range IS the law's jurisdiction; anything else is
+        # a usage error, not a refusal
+        let sep: int = range.find("..")
+        if sep < 1 {
+            eprintln(usage_text())
+            eprintln("hls-rc: error: --range wants A..B (git range "
+            + "syntax), got " + range)
+            return 2
+        }
+        base = range.slice(0, sep)
+        head = range.slice(sep + 2, range.len())
+    } else {
+        let anchor: Anchor = load_anchor(root)
+        if !anchor.present {
+            return die("gate: no anchor in this tree — the freeze "
+            + "defends a candidate; cut one first (bin/hls-rc declare "
+            + "--tag v1.0.0-rc.N)")
+        }
+        base = anchor.sha
+        if !is_ancestor(root, base) {
+            return die("gate: the anchored commit " + safe_prefix(base, 12)
+            + " is not an ancestor of HEAD — the candidate this gate "
+            + "defends is not in this history")
+        }
+    }
+
+    let shas: list[str] = commits(root, base, head)
+    let mut fixes: int = 0
+    let mut chores: int = 0
+    let mut marked: int = 0
+    let mut violations: int = 0
+    let mut i: int = 0
+    while i < shas.len() {
+        let c: Cls = classify_commit(root, shas.get(i))
+        if c.cls == "BUGFIX" {
+            fixes = fixes + 1
+            if c.security {
+                marked = marked + 1
+            }
+        } else if c.cls == "CHORE" {
+            chores = chores + 1
+        } else {
+            violations = violations + 1
+            let mut why: str = c.reason
+            let mut k: int = 1
+            while k < c.reasons.len() {
+                why = why + "; " + c.reasons.get(k)
+                k = k + 1
+            }
+            println("  VIOLATION: " + safe_prefix(c.sha, 12) + " "
+            + c.subject)
+            println("    " + c.cls + ": " + why)
+        }
+        i = i + 1
+    }
+    if violations > 0 {
+        println("gate: REFUSED — " + violations.to_str()
+        + " commit(s) outside the freeze between "
+        + safe_prefix(base, 12) + " and " + head)
+        println("  the candidate line takes BUGFIX and CHORE only; "
+        + "revert the commits above or amend the roadmap (a feature "
+        + "past the freeze is a roadmap amendment, not a commit)")
+        return 1
+    }
+    println("gate: " + shas.len().to_str() + " commit(s) since "
+    + safe_prefix(base, 12) + ", all inside the freeze (BUGFIX "
+    + fixes.to_str() + ", CHORE " + chores.to_str()
+    + ", Security-marked " + marked.to_str() + ")")
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# report — the candidate's record, rendered; --check refuses drift.
+# ----------------------------------------------------------------------------
+fn render_report(root: str) -> str uses Fs, Proc {
+    let anchor: Anchor = load_anchor(root)
+    let r: Readiness = check_readiness(root)
+    let fz: FreezeId = check_freeze(root)
+
+    let out: list[str] = []
+    out.push("# Release candidate — Halis (HLS)")
+    out.push("")
+    out.push("Generated from the live state of the tree by "
+    + "`tools/hls-rc.hls` — this document is rendered, not "
+    + "maintained. Do not hand-edit; regenerate it with `bin/hls-rc "
+    + "report --out " + rc_doc() + "`. `make rc-report-check` "
+    + "re-derives the committed copy against the same render and "
+    + "refuses drift.")
+    out.push("")
+    out.push("## The candidate")
+    out.push("")
+    out.push("- the tag: **" + anchor.tag + "** — the release "
+    + "candidate of v1.0.0, cut at roadmap Stage "
+    + anchor.stage.to_str() + " (v1.0 Release Candidate "
+    + safe_prefix(anchor.tag.slice(anchor.tag.len() - 1,
+    anchor.tag.len()), 1) + ", feature freeze)")
+    out.push("- the anchor: commit `" + anchor.sha + "`, cut on "
+    + anchor.day + " (the committer day), recorded in `"
+    + anchor_file() + "`")
+    out.push("- the freeze: the API surface travels frozen at digest `"
+    + safe_prefix(anchor.freeze_digest, 16) + "...` (Stage 141, frozen "
+    + "at " + safe_prefix(fz.frozen_commit, 12) + " since release "
+    + fz.release + "); from this anchor to v1.0.0 the surface cannot "
+    + "move except through the amendment chain (`hls-freeze amend "
+    + "--reason ... --by ...`)")
+    out.push("- the successor: " + anchor.next + " — the next step of "
+    + "the road below, cut the same way this one was: the roadmap "
+    + "row ticked, the markers agreeing, the gate green")
+    out.push("")
+    out.push("## The readiness the tag stands on")
+    out.push("")
+    out.push("| law | verdict |")
+    out.push("|-----|---------|")
+    let mut i: int = 0
+    while i < r.laws.len() {
+        let l: Law = r.laws.get(i)
+        let mut mark: str = "refused"
+        if l.ok {
+            mark = "held"
+        }
+        out.push("| " + l.name + " | " + mark + " — " + l.detail
+        + " |")
+        i = i + 1
+    }
+    out.push("")
+    out.push("## The freeze law — what lands between the candidate "
+    + "and v1.0.0")
+    out.push("")
+    out.push("| class | may land | the rule |")
+    out.push("|-------|----------|----------|")
+    out.push("| BUGFIX | yes | fix / bugfix / revert / hotfix / "
+    + "regression |")
+    out.push("| CHORE | yes | chore / release / docs / test / ci / "
+    + "meta |")
+    out.push("| FEATURE | no | feat / feature / add / stage / spec / "
+    + "stdlib / perf / opt / refactor |")
+    out.push("| UNKNOWN | no | no recognized prefix — fail-closed |")
+    out.push("")
+    out.push("A BUGFIX that adds a `std/` or `core/` file, introduces "
+    + "a new public function, or edits SPEC.md is re-classed into "
+    + "the FEATURE it really is (the diff gate). `bin/hls-rc gate` "
+    + "walks the range since the anchor and names every violation "
+    + "sha by sha; `make rc-gate` is the release gate.")
+    out.push("")
+    out.push("## The road to v1.0.0")
+    out.push("")
+    # the remaining stages, read LIVE from the roadmap's own rows
+    let rows: list[StageRow] = read_stage_rows(root)
+    let mut k: int = 0
+    while k < rows.len() {
+        if rows.get(k).num >= anchor.stage
+        && rows.get(k).num <= final_stage() {
+            let mut mark: str = "⬜"
+            if rows.get(k).ticked {
+                mark = "✅"
+            }
+            out.push("- Stage " + rows.get(k).num.to_str() + " — "
+            + rows.get(k).title + " [" + mark + "]")
+        }
+        k = k + 1
+    }
+    out.push("")
+    out.push("The LTS policy ([LTS.md](LTS.md)) begins at v1.0.0: the "
+    + "day `hls-lts init --tag v1.0.0` runs, the support windows "
+    + "become the clock. This candidate opens no LTS line — a "
+    + "pre-1.0 LTS is a contradiction. Until then the freeze law "
+    + "above is the only thing standing between the tree and the "
+    + "release, and `make rc-readiness` / `make rc-gate` / `make "
+    + "rc-report-check` keep every fact on this page re-derived.")
+    out.push("")
+    return join(out, "\n")
+}
+
+fn cmd_report(argv: list[str]) -> int uses IO, Fs, Proc {
+    let root: str = root_arg(argv)
+    let anchor: Anchor = load_anchor(root)
+    if !anchor.present {
+        return die("report: no anchor in this tree — the record "
+        + "renders from a declared candidate (bin/hls-rc declare "
+        + "--tag v1.0.0-rc.N)")
+    }
+    # the record is never rendered from a world that moved past the
+    # anchor: the markers must still speak the anchor's tag
+    let head_v: str = changelog_head_version(root)
+    if "v" + head_v != anchor.tag {
+        return die("report: the changelog head is " + head_v + ", the "
+        + "anchor is " + anchor.tag + " — the record renders at the "
+        + "candidate's own release, not after the train moved on")
+    }
+    let text: str = render_report(root)
+    if has_flag(argv, "--check") {
+        let path: str = path_join2(root, rc_doc())
+        if !file_exists(path) {
+            return die("report: " + rc_doc() + " is not published "
+            + "here — the record is missing (regenerate with "
+            + "`bin/hls-rc report --out " + rc_doc() + "`)")
+        }
+        let committed: str = read_file(path)
+        if committed != text {
+            println("report: REFUSED — the committed " + rc_doc()
+            + " drifted from the tool's render — a hand-edited record "
+            + "is visible as a diff (regenerate with `bin/hls-rc "
+            + "report --out " + rc_doc() + "`)")
+            return 1
+        }
+        println("report: " + rc_doc() + " matches the render — the "
+        + "published record is the anchored one")
+        return 0
+    }
+    let out: str = flag_value(argv, "--out", "")
+    if out != "" {
+        # --out resolves inside the tree the record belongs to (the
+        # Makefile drives from the root; --root drives elsewhere)
+        let mut path: str = out
+        if !(out.len() > 0 && out.byte_at(0) == 47) {
+            path = path_join2(root, out)
+        }
+        write_file(path, text)
+        println("report: rendered " + path + " ("
+        + count_lines(text).to_str() + " lines)")
+        return 0
+    }
+    print(text)
+    return 0
+}
+
+# ============================================================================
+# Usage and dispatch.
+# ============================================================================
+
+fn usage_text() -> str {
+    return "usage: hls-rc readiness [--json] [--root DIR]\n"
+    + "       hls-rc declare --tag v1.0.0-rc.N [--at DAY] [--root DIR]\n"
+    + "       hls-rc gate [--range A..B] [--json] [--root DIR]\n"
+    + "       hls-rc report [--out RC.md | --check] [--root DIR]"
+}
+
+fn known_flag(cmd: str, f: str) -> bool {
+    if f == "--root" || f == "--json" {
+        return true
+    }
+    if cmd == "declare" {
+        return f == "--tag" || f == "--at"
+    }
+    if cmd == "gate" {
+        return f == "--range"
+    }
+    if cmd == "report" {
+        return f == "--out" || f == "--check"
+    }
+    # fail-closed: a flag a command does not name is not known
+    return false
+}
+
+fn main() -> int uses IO, Fs, Proc, Args {
+    let argv: list[str] = args()
+    if argv.len() < 2 {
+        println(usage_text())
+        return 2
+    }
+    let cmd: str = argv.get(1)
+    # the argparse law: unknown flags are usage errors (exit 2)
+    let value_flags: list[str] = ["--root", "--tag", "--at", "--out",
+    "--range"]
+    let mut ai: int = 2
+    while ai < argv.len() {
+        let a: str = argv.get(ai)
+        if a.starts_with("--") {
+            let mut head: str = a
+            let eq: int = a.find("=")
+            if eq >= 0 {
+                head = a.slice(0, eq)
+            }
+            if !known_flag(cmd, head) {
+                eprintln(usage_text())
+                eprintln("hls-rc: error: unrecognized arguments: " + a)
+                return 2
+            }
+            let mut takes_value: bool = false
+            let mut vi: int = 0
+            while vi < value_flags.len() {
+                if value_flags.get(vi) == head {
+                    takes_value = true
+                }
+                vi = vi + 1
+            }
+            if takes_value && eq < 0 {
+                ai = ai + 1
+            }
+        }
+        ai = ai + 1
+    }
+    if cmd == "readiness" {
+        return cmd_readiness(argv)
+    }
+    if cmd == "declare" {
+        return cmd_declare(argv)
+    }
+    if cmd == "gate" {
+        return cmd_gate(argv)
+    }
+    if cmd == "report" {
+        return cmd_report(argv)
+    }
+    usage_error("unknown command " + cmd)
+    return 2
+}
+
+fn usage_error(detail: str) -> void uses IO {
+    println("hls-rc: usage error — " + detail)
+    println(usage_text())
+}
