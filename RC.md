@@ -4,7 +4,7 @@ Generated from the live state of the tree by `tools/hls-rc.hls` — this documen
 
 ## The candidate
 
-- the tag: **v1.0.0-rc.2** — the release candidate of v1.0.0, cut at roadmap Stage 147 (v1.0 Release Candidate 2, feature freeze)
+- the tag: **v1.0.0-rc.2** — the release candidate of v1.0.0, cut at roadmap Stage 147 (v1.0 Release Candidate 2, bug-fix only)
 - the anchor: commit `bb2ae69b7bf6bf55e7177c88ed5ef0d60338973f`, cut on 2026-10-28 (the committer day), recorded in `.hls-rc.json`
 - the freeze: the API surface travels frozen at digest `84d1068f80d62f3f...` (Stage 141, frozen at 9dbed2e1138d since release 0.159.0-alpha); from this anchor to v1.0.0 the surface cannot move except through the amendment chain (`hls-freeze amend --reason ... --by ...`)
 - the successor: v1.0.0-rc.3 — the next step of the road below, cut the same way this one was: the roadmap row ticked, the markers agreeing, the gate green
