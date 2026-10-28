@@ -31,10 +31,21 @@ Imports (Stage 6):
   Each file is parsed once; transitive imports are merged into one program.
 """
 import os
+import signal
 import sys
 import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+# RC2 fix: a compiled binary dies silently when its stdout pipe closes
+# (`prog | head -1` — the kernel's default SIGPIPE disposition). Python
+# ignores SIGPIPE, so the interpreter instead crashed with a
+# BrokenPipeError traceback after the pipe closed. Restore the default
+# disposition so the interpreter exits the way the native binary does.
+try:
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+except (AttributeError, ValueError):
+    pass  # no SIGPIPE on this platform (Windows), or not the main thread
 
 from tools.hlinterp.lexer import tokenize, HLError          # noqa: E402
 from tools.hlinterp.parser import Parser                     # noqa: E402
@@ -494,6 +505,16 @@ def run_cli():
     # fine, the boot crashed. `surrogateescape` restores the original
     # bytes verbatim (matching the C behaviour).
     prog_args = [a.encode("utf-8", "surrogateescape") for a in rest]
+    # RC2 fix: the OSError branch below was dead code — load_program's
+    # load_file converts a missing file into an HLError ("cannot open
+    # file: <path>", exit 1), so a missing ENTRY file was reported as a
+    # compile error instead of the invocation error the branch intends.
+    # Check the entry's existence here, where the branch can actually
+    # speak (same refusal the native hlc now makes: `error: cannot open
+    # file <path>`, exit 2 — an invocation error, not a compile error).
+    if not os.path.isfile(path):
+        sys.stderr.write("error: cannot open file %s\n" % path)
+        return 2
     try:
         program = load_program(path)
     except HLError as ex:

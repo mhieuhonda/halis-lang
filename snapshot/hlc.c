@@ -36104,40 +36104,45 @@ int64_t usf_main(void) {
     hl_str* hlc_h_9034 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
     if ((!hl_str_eq(u_audit_entry, hlc_h_9034))) {
         hl_str* u_entry_path __attribute__((cleanup(hl_cleanup_str))) = hl_retain(u_audit_entry);
+        if ((!hl_file_exists(hl_retain(u_entry_path)))) {
+            hl_str* hlc_h_9035 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("error: cannot open file ");
+            hl_println(hl_str_concat(hlc_h_9035, u_entry_path));
+            return 2;
+        }
         hl_str* u_src __attribute__((cleanup(hl_cleanup_str))) = hl_read_file(hl_retain(u_entry_path));
         Ctx* u_ctx __attribute__((cleanup(hl_cleanup_Ctx))) = usf_new_ctx(hl_retain(u_src));
-        { Ctx* hlc_fb_9035 = u_ctx;
-          hl_str* __hl_old = hlc_fb_9035->f_entry_dir;
-          hlc_fb_9035->f_entry_dir = usf_dir_of(hl_retain(u_entry_path));
-          hl_str_release(__hl_old); }
         { Ctx* hlc_fb_9036 = u_ctx;
-          hl_str* __hl_old = hlc_fb_9036->f_repo_root;
-          hlc_fb_9036->f_repo_root = usf_parent_dir(hl_retain((u_ctx)->f_entry_dir));
+          hl_str* __hl_old = hlc_fb_9036->f_entry_dir;
+          hlc_fb_9036->f_entry_dir = usf_dir_of(hl_retain(u_entry_path));
           hl_str_release(__hl_old); }
         { Ctx* hlc_fb_9037 = u_ctx;
-          hl_str* __hl_old = hlc_fb_9037->f_target_triple;
-          hlc_fb_9037->f_target_triple = hl_retain(u_target_triple);
+          hl_str* __hl_old = hlc_fb_9037->f_repo_root;
+          hlc_fb_9037->f_repo_root = usf_parent_dir(hl_retain((u_ctx)->f_entry_dir));
+          hl_str_release(__hl_old); }
+        { Ctx* hlc_fb_9038 = u_ctx;
+          hl_str* __hl_old = hlc_fb_9038->f_target_triple;
+          hlc_fb_9038->f_target_triple = hl_retain(u_target_triple);
           hl_str_release(__hl_old); }
         usf_lex(hl_retain(u_ctx));
         usf_parse_program(hl_retain(u_ctx));
-        hl_str* hlc_h_9038 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
-        if (((!hl_str_eq(u_target_triple, hlc_h_9038)) && (!(u_ctx)->f_crate_freestanding))) {
+        hl_str* hlc_h_9039 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
+        if (((!hl_str_eq(u_target_triple, hlc_h_9039)) && (!(u_ctx)->f_crate_freestanding))) {
             (u_ctx)->f_crate_freestanding = true;
             (u_ctx)->f_crate_no_std = true;
         }
         hl_list* u_entry_imports __attribute__((cleanup(hl_cleanup_list))) = hl_retain((u_ctx)->f_imports);
         int64_t u_i = 0;
         while ((u_i < hl_list_len(u_entry_imports))) {
-            hl_str* u_imp __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_entry_imports, u_i, 412L)));
+            hl_str* u_imp __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_entry_imports, u_i, 419L)));
             hl_str* u_resolved __attribute__((cleanup(hl_cleanup_str))) = usf_resolve_import_path(hl_retain(u_imp), hl_retain((u_ctx)->f_entry_dir), hl_retain((u_ctx)->f_repo_root));
-            hl_str* hlc_h_9039 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
-            if (hl_str_eq(u_resolved, hlc_h_9039)) {
-                hl_str* hlc_h_9040 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("error: module not found: ");
-                hl_println(hl_str_concat(hlc_h_9040, u_imp));
+            hl_str* hlc_h_9040 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
+            if (hl_str_eq(u_resolved, hlc_h_9040)) {
+                hl_str* hlc_h_9041 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("error: module not found: ");
+                hl_println(hl_str_concat(hlc_h_9041, u_imp));
                 return 1;
             }
             usf_load_file_into(hl_retain(u_ctx), hl_retain(u_resolved));
-            u_i = hl_add_i64(u_i, 1, 419L);
+            u_i = hl_add_i64(u_i, 1, 426L);
         }
         usf_check_program(hl_retain(u_ctx));
         usf_print_audit(hl_retain(u_ctx));
@@ -36151,34 +36156,39 @@ int64_t usf_main(void) {
         hl_println(hl_cstr("       hlc --audit <input.hls>"));
         return 1;
     }
-    hl_str* hlc_h_9041 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
-    if ((!hl_str_eq(u_target_triple, hlc_h_9041))) {
+    hl_str* hlc_h_9042 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
+    if ((!hl_str_eq(u_target_triple, hlc_h_9042))) {
         if (u_no_libc) {
-            hl_str* hlc_h_9042 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("error: --no-libc is not available on target ");
-            hl_str* hlc_h_9043 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9042, u_target_triple);
-            hl_str* hlc_h_9044 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(" (the bare-metal triples build freestanding images, not hosted no-libc ones)");
-            hl_println(hl_str_concat(hlc_h_9043, hlc_h_9044));
+            hl_str* hlc_h_9043 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("error: --no-libc is not available on target ");
+            hl_str* hlc_h_9044 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9043, u_target_triple);
+            hl_str* hlc_h_9045 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(" (the bare-metal triples build freestanding images, not hosted no-libc ones)");
+            hl_println(hl_str_concat(hlc_h_9044, hlc_h_9045));
             return 2;
         }
-        hl_str* hlc_h_9045 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
-        if ((!hl_str_eq(u_target_feature, hlc_h_9045))) {
-            hl_str* hlc_h_9046 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("error: --target-feature is not available on target ");
-            hl_str* hlc_h_9047 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9046, u_target_triple);
-            hl_str* hlc_h_9048 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(" (bare-metal targets are integer-only: SIMD intrinsics use floating-point registers)");
-            hl_println(hl_str_concat(hlc_h_9047, hlc_h_9048));
+        hl_str* hlc_h_9046 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
+        if ((!hl_str_eq(u_target_feature, hlc_h_9046))) {
+            hl_str* hlc_h_9047 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("error: --target-feature is not available on target ");
+            hl_str* hlc_h_9048 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9047, u_target_triple);
+            hl_str* hlc_h_9049 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(" (bare-metal targets are integer-only: SIMD intrinsics use floating-point registers)");
+            hl_println(hl_str_concat(hlc_h_9048, hlc_h_9049));
             return 2;
         }
     }
-    hl_str* u_entry_path_2 __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_a, 0, 451L)));
+    hl_str* u_entry_path_2 __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_a, 0, 458L)));
+    if ((!hl_file_exists(hl_retain(u_entry_path_2)))) {
+        hl_str* hlc_h_9050 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("error: cannot open file ");
+        hl_println(hl_str_concat(hlc_h_9050, u_entry_path_2));
+        return 2;
+    }
     hl_str* u_src_2 __attribute__((cleanup(hl_cleanup_str))) = hl_read_file(hl_retain(u_entry_path_2));
     Ctx* u_ctx_2 __attribute__((cleanup(hl_cleanup_Ctx))) = usf_new_ctx(hl_retain(u_src_2));
-    { Ctx* hlc_fb_9049 = u_ctx_2;
-      hl_str* __hl_old = hlc_fb_9049->f_entry_dir;
-      hlc_fb_9049->f_entry_dir = usf_dir_of(hl_retain(u_entry_path_2));
+    { Ctx* hlc_fb_9051 = u_ctx_2;
+      hl_str* __hl_old = hlc_fb_9051->f_entry_dir;
+      hlc_fb_9051->f_entry_dir = usf_dir_of(hl_retain(u_entry_path_2));
       hl_str_release(__hl_old); }
-    { Ctx* hlc_fb_9050 = u_ctx_2;
-      hl_str* __hl_old = hlc_fb_9050->f_repo_root;
-      hlc_fb_9050->f_repo_root = usf_parent_dir(hl_retain((u_ctx_2)->f_entry_dir));
+    { Ctx* hlc_fb_9052 = u_ctx_2;
+      hl_str* __hl_old = hlc_fb_9052->f_repo_root;
+      hlc_fb_9052->f_repo_root = usf_parent_dir(hl_retain((u_ctx_2)->f_entry_dir));
       hl_str_release(__hl_old); }
     (u_ctx_2)->f_fast_mode = u_fast_mode;
     (u_ctx_2)->f_contracts_mode = u_contracts_mode;
@@ -36187,94 +36197,110 @@ int64_t usf_main(void) {
     (u_ctx_2)->f_lto_threshold = u_lto_threshold;
     (u_ctx_2)->f_lto_stats = u_lto_stats;
     (u_ctx_2)->f_opt_stats = u_opt_stats;
-    { Ctx* hlc_fb_9051 = u_ctx_2;
-      hl_str* __hl_old = hlc_fb_9051->f_target_feature;
-      hlc_fb_9051->f_target_feature = hl_retain(u_target_feature);
+    { Ctx* hlc_fb_9053 = u_ctx_2;
+      hl_str* __hl_old = hlc_fb_9053->f_target_feature;
+      hlc_fb_9053->f_target_feature = hl_retain(u_target_feature);
       hl_str_release(__hl_old); }
     (u_ctx_2)->f_no_libc = u_no_libc;
-    { Ctx* hlc_fb_9052 = u_ctx_2;
-      hl_str* __hl_old = hlc_fb_9052->f_target_triple;
-      hlc_fb_9052->f_target_triple = hl_retain(u_target_triple);
+    { Ctx* hlc_fb_9054 = u_ctx_2;
+      hl_str* __hl_old = hlc_fb_9054->f_target_triple;
+      hlc_fb_9054->f_target_triple = hl_retain(u_target_triple);
       hl_str_release(__hl_old); }
-    hl_str* u_out_path __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_a, 1, 474L)));
-    if ((u_debug_mode && ({ hl_str* hlc_h_9053 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("-"); hl_str_eq(u_out_path, hlc_h_9053); }))) {
+    hl_str* u_out_path __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_a, 1, 488L)));
+    if ((u_debug_mode && ({ hl_str* hlc_h_9055 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("-"); hl_str_eq(u_out_path, hlc_h_9055); }))) {
         hl_println(hl_cstr("error: --debug needs a file output path (the C line markers must name the generated C file)"));
         return 2;
     }
+    hl_str* hlc_h_9056 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("-");
+    if (((!hl_str_eq(u_out_path, hlc_h_9056)) && (!hl_fs_is_dir(usf_parent_dir(hl_retain(u_out_path)))))) {
+        hl_str* hlc_h_9057 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("error: cannot write file ");
+        hl_str* hlc_h_9058 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9057, u_out_path);
+        hl_str* hlc_h_9059 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(" (the directory does not exist)");
+        hl_println(hl_str_concat(hlc_h_9058, hlc_h_9059));
+        return 2;
+    }
+    hl_str* hlc_h_9060 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
+    if (((!hl_str_eq(u_symbols_path, hlc_h_9060)) && (!hl_fs_is_dir(usf_parent_dir(hl_retain(u_symbols_path)))))) {
+        hl_str* hlc_h_9061 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("error: cannot write file ");
+        hl_str* hlc_h_9062 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9061, u_symbols_path);
+        hl_str* hlc_h_9063 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(" (the directory does not exist)");
+        hl_println(hl_str_concat(hlc_h_9062, hlc_h_9063));
+        return 2;
+    }
     (u_ctx_2)->f_debug_mode = u_debug_mode;
-    { Ctx* hlc_fb_9054 = u_ctx_2;
-      hl_str* __hl_old = hlc_fb_9054->f_symbols_path;
-      hlc_fb_9054->f_symbols_path = hl_retain(u_symbols_path);
+    { Ctx* hlc_fb_9064 = u_ctx_2;
+      hl_str* __hl_old = hlc_fb_9064->f_symbols_path;
+      hlc_fb_9064->f_symbols_path = hl_retain(u_symbols_path);
       hl_str_release(__hl_old); }
-    hl_str* hlc_h_9055 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("-");
-    if ((!hl_str_eq(u_out_path, hlc_h_9055))) {
-        { Ctx* hlc_fb_9056 = u_ctx_2;
-          hl_str* __hl_old = hlc_fb_9056->f_out_name;
-          hlc_fb_9056->f_out_name = usf_file_basename(hl_retain(u_out_path));
+    hl_str* hlc_h_9065 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("-");
+    if ((!hl_str_eq(u_out_path, hlc_h_9065))) {
+        { Ctx* hlc_fb_9066 = u_ctx_2;
+          hl_str* __hl_old = hlc_fb_9066->f_out_name;
+          hlc_fb_9066->f_out_name = usf_file_basename(hl_retain(u_out_path));
           hl_str_release(__hl_old); }
     }
-    hl_str* hlc_h_9057 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
-    if ((!hl_str_eq(u_pgo_use_path, hlc_h_9057))) {
+    hl_str* hlc_h_9067 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
+    if ((!hl_str_eq(u_pgo_use_path, hlc_h_9067))) {
         if ((!hl_file_exists(hl_retain(u_pgo_use_path)))) {
-            hl_str* hlc_h_9058 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("error: --pgo-use: profile file not found: ");
-            hl_println(hl_str_concat(hlc_h_9058, u_pgo_use_path));
+            hl_str* hlc_h_9068 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("error: --pgo-use: profile file not found: ");
+            hl_println(hl_str_concat(hlc_h_9068, u_pgo_use_path));
             return 2;
         }
         hl_str* u_prof __attribute__((cleanup(hl_cleanup_str))) = hl_read_file(hl_retain(u_pgo_use_path));
         hl_str* u_perr __attribute__((cleanup(hl_cleanup_str))) = usf_pgo_load_profile(hl_retain(u_ctx_2), hl_retain(u_prof));
-        hl_str* hlc_h_9059 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
-        if ((!hl_str_eq(u_perr, hlc_h_9059))) {
-            hl_str* hlc_h_9060 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("error: --pgo-use: ");
-            hl_println(hl_str_concat(hlc_h_9060, u_perr));
+        hl_str* hlc_h_9069 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
+        if ((!hl_str_eq(u_perr, hlc_h_9069))) {
+            hl_str* hlc_h_9070 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("error: --pgo-use: ");
+            hl_println(hl_str_concat(hlc_h_9070, u_perr));
             return 2;
         }
     }
-    { Ctx* hlc_fb_9061 = u_ctx_2;
-      hl_str* __hl_old = hlc_fb_9061->f_cur_map_file;
-      hlc_fb_9061->f_cur_map_file = hl_retain(u_entry_path_2);
+    { Ctx* hlc_fb_9071 = u_ctx_2;
+      hl_str* __hl_old = hlc_fb_9071->f_cur_map_file;
+      hlc_fb_9071->f_cur_map_file = hl_retain(u_entry_path_2);
       hl_str_release(__hl_old); }
     usf_lex(hl_retain(u_ctx_2));
     usf_parse_program(hl_retain(u_ctx_2));
     hl_list* u_entry_imports_2 __attribute__((cleanup(hl_cleanup_list))) = hl_retain((u_ctx_2)->f_imports);
     int64_t u_i_2 = 0;
     while ((u_i_2 < hl_list_len(u_entry_imports_2))) {
-        hl_str* u_imp_2 __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_entry_imports_2, u_i_2, 511L)));
+        hl_str* u_imp_2 __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_entry_imports_2, u_i_2, 536L)));
         hl_str* u_resolved_2 __attribute__((cleanup(hl_cleanup_str))) = usf_resolve_import_path(hl_retain(u_imp_2), hl_retain((u_ctx_2)->f_entry_dir), hl_retain((u_ctx_2)->f_repo_root));
-        hl_str* hlc_h_9062 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
-        if (hl_str_eq(u_resolved_2, hlc_h_9062)) {
-            hl_str* hlc_h_9063 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("error: module not found: ");
-            hl_println(hl_str_concat(hlc_h_9063, u_imp_2));
+        hl_str* hlc_h_9072 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
+        if (hl_str_eq(u_resolved_2, hlc_h_9072)) {
+            hl_str* hlc_h_9073 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("error: module not found: ");
+            hl_println(hl_str_concat(hlc_h_9073, u_imp_2));
             return 1;
         }
         usf_load_file_into(hl_retain(u_ctx_2), hl_retain(u_resolved_2));
-        u_i_2 = hl_add_i64(u_i_2, 1, 518L);
+        u_i_2 = hl_add_i64(u_i_2, 1, 543L);
     }
-    { Ctx* hlc_fb_9064 = u_ctx_2;
-      hl_str* __hl_old = hlc_fb_9064->f_cur_map_file;
-      hlc_fb_9064->f_cur_map_file = hl_cstr("");
+    { Ctx* hlc_fb_9074 = u_ctx_2;
+      hl_str* __hl_old = hlc_fb_9074->f_cur_map_file;
+      hlc_fb_9074->f_cur_map_file = hl_cstr("");
       hl_str_release(__hl_old); }
-    hl_str* hlc_h_9065 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
-    if (((!hl_str_eq(u_target_triple, hlc_h_9065)) && (!(u_ctx_2)->f_crate_freestanding))) {
+    hl_str* hlc_h_9075 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
+    if (((!hl_str_eq(u_target_triple, hlc_h_9075)) && (!(u_ctx_2)->f_crate_freestanding))) {
         (u_ctx_2)->f_crate_freestanding = true;
         (u_ctx_2)->f_crate_no_std = true;
     }
     usf_check_program(hl_retain(u_ctx_2));
     hl_list* u_lines __attribute__((cleanup(hl_cleanup_list))) = usf_gen_program(hl_retain(u_ctx_2));
-    hl_str* hlc_h_9066 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("\n");
-    hl_str* u_code __attribute__((cleanup(hl_cleanup_str))) = hl_str_join(u_lines, hlc_h_9066);
-    hl_str* hlc_h_9067 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("-");
-    if (hl_str_eq(u_out_path, hlc_h_9067)) {
+    hl_str* hlc_h_9076 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("\n");
+    hl_str* u_code __attribute__((cleanup(hl_cleanup_str))) = hl_str_join(u_lines, hlc_h_9076);
+    hl_str* hlc_h_9077 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("-");
+    if (hl_str_eq(u_out_path, hlc_h_9077)) {
         hl_print(hl_retain(u_code));
         hl_println(hl_cstr(""));
     } else {
         hl_write_file(hl_retain(u_out_path), hl_retain(u_code));
     }
-    hl_str* hlc_h_9068 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
-    if ((!hl_str_eq(u_symbols_path, hlc_h_9068))) {
-        hl_str* hlc_h_9069 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("\n");
-        hl_str* hlc_h_9070 __attribute__((cleanup(hl_cleanup_str))) = hl_str_join((u_ctx_2)->f_symtab, hlc_h_9069);
-        hl_str* hlc_h_9071 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("\n");
-        hl_write_file(hl_retain(u_symbols_path), hl_str_concat(hlc_h_9070, hlc_h_9071));
+    hl_str* hlc_h_9078 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
+    if ((!hl_str_eq(u_symbols_path, hlc_h_9078))) {
+        hl_str* hlc_h_9079 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("\n");
+        hl_str* hlc_h_9080 __attribute__((cleanup(hl_cleanup_str))) = hl_str_join((u_ctx_2)->f_symtab, hlc_h_9079);
+        hl_str* hlc_h_9081 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("\n");
+        hl_write_file(hl_retain(u_symbols_path), hl_str_concat(hlc_h_9080, hlc_h_9081));
     }
     if ((u_ctx_2)->f_lto_stats) {
         usf_print_lto_stats(hl_retain(u_ctx_2));
@@ -36296,39 +36322,39 @@ void usf_print_lto_stats(Ctx* u_ctx_p) {
     int64_t u_struct_insts = hl_list_len((u_ctx)->f_struct_insts);
     int64_t u_enum_insts = hl_list_len((u_ctx)->f_enum_insts);
     hl_println(hl_cstr("=== LTO stats ==="));
-    hl_str* hlc_h_9072 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  functions in program        : ");
-    hl_str* hlc_h_9073 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_total_fns);
-    hl_println(hl_str_concat(hlc_h_9072, hlc_h_9073));
-    hl_str* hlc_h_9074 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  inline expansions (sites)   : ");
-    hl_str* hlc_h_9075 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_inline_n);
-    hl_println(hl_str_concat(hlc_h_9074, hlc_h_9075));
-    hl_str* hlc_h_9076 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  distinct callees inlined    : ");
-    hl_str* hlc_h_9077 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_inlined_keys);
-    hl_println(hl_str_concat(hlc_h_9076, hlc_h_9077));
-    hl_str* hlc_h_9078 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  bodies dropped (phase A+B)  : ");
-    hl_str* hlc_h_9079 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_dropped);
-    hl_println(hl_str_concat(hlc_h_9078, hlc_h_9079));
-    hl_str* hlc_h_9080 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  inline stmt budget          : ");
-    hl_str* hlc_h_9081 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_budget);
-    hl_str* hlc_h_9082 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9080, hlc_h_9081);
-    hl_str* hlc_h_9083 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(" (--lto-threshold)");
+    hl_str* hlc_h_9082 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  functions in program        : ");
+    hl_str* hlc_h_9083 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_total_fns);
     hl_println(hl_str_concat(hlc_h_9082, hlc_h_9083));
-    hl_str* hlc_h_9084 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  generic fn instantiations   : ");
-    hl_str* hlc_h_9085 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_gen_insts);
+    hl_str* hlc_h_9084 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  inline expansions (sites)   : ");
+    hl_str* hlc_h_9085 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_inline_n);
     hl_println(hl_str_concat(hlc_h_9084, hlc_h_9085));
-    hl_str* hlc_h_9086 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  generic struct instantiations: ");
-    hl_str* hlc_h_9087 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_struct_insts);
+    hl_str* hlc_h_9086 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  distinct callees inlined    : ");
+    hl_str* hlc_h_9087 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_inlined_keys);
     hl_println(hl_str_concat(hlc_h_9086, hlc_h_9087));
-    hl_str* hlc_h_9088 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  generic enum instantiations : ");
-    hl_str* hlc_h_9089 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_enum_insts);
+    hl_str* hlc_h_9088 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  bodies dropped (phase A+B)  : ");
+    hl_str* hlc_h_9089 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_dropped);
     hl_println(hl_str_concat(hlc_h_9088, hlc_h_9089));
+    hl_str* hlc_h_9090 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  inline stmt budget          : ");
+    hl_str* hlc_h_9091 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_budget);
+    hl_str* hlc_h_9092 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9090, hlc_h_9091);
+    hl_str* hlc_h_9093 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(" (--lto-threshold)");
+    hl_println(hl_str_concat(hlc_h_9092, hlc_h_9093));
+    hl_str* hlc_h_9094 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  generic fn instantiations   : ");
+    hl_str* hlc_h_9095 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_gen_insts);
+    hl_println(hl_str_concat(hlc_h_9094, hlc_h_9095));
+    hl_str* hlc_h_9096 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  generic struct instantiations: ");
+    hl_str* hlc_h_9097 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_struct_insts);
+    hl_println(hl_str_concat(hlc_h_9096, hlc_h_9097));
+    hl_str* hlc_h_9098 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  generic enum instantiations : ");
+    hl_str* hlc_h_9099 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_enum_insts);
+    hl_println(hl_str_concat(hlc_h_9098, hlc_h_9099));
     if ((u_inlined_keys > 0)) {
         hl_println(hl_cstr("  inlined callees:"));
         int64_t u_i = 0;
         while ((u_i < u_inlined_keys)) {
-            hl_str* hlc_h_9090 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("    ");
-            hl_println(hl_str_concat(hlc_h_9090, (hl_str*)hl_unbox_ptr(hl_list_get((u_ctx)->f_lto_inlined_report, u_i, 596L))));
-            u_i = hl_add_i64(u_i, 1, 597L);
+            hl_str* hlc_h_9100 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("    ");
+            hl_println(hl_str_concat(hlc_h_9100, (hl_str*)hl_unbox_ptr(hl_list_get((u_ctx)->f_lto_inlined_report, u_i, 621L))));
+            u_i = hl_add_i64(u_i, 1, 622L);
         }
     }
 }
@@ -36352,120 +36378,120 @@ void usf_print_opt_stats(Ctx* u_ctx_p) {
     int64_t u_pgo_inline_n = 0;
     int64_t u_i = 0;
     while ((u_i < hl_list_len((u_ctx)->f_fn_order))) {
-        hl_str* u_key __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get((u_ctx)->f_fn_order, u_i, 637L)));
+        hl_str* u_key __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get((u_ctx)->f_fn_order, u_i, 662L)));
         FnInfo* u_f __attribute__((cleanup(hl_cleanup_FnInfo))) = ((FnInfo*)hl_map_get_own((u_ctx)->f_fns, u_key, usf_dummy_fn()));
-        hl_str* hlc_h_9091 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("always");
-        if (hl_str_eq((u_f)->f_attr_inline, hlc_h_9091)) {
-            u_inline_always = hl_add_i64(u_inline_always, 1, 640L);
+        hl_str* hlc_h_9101 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("always");
+        if (hl_str_eq((u_f)->f_attr_inline, hlc_h_9101)) {
+            u_inline_always = hl_add_i64(u_inline_always, 1, 665L);
         }
-        hl_str* hlc_h_9092 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("never");
-        if (hl_str_eq((u_f)->f_attr_inline, hlc_h_9092)) {
-            u_inline_never = hl_add_i64(u_inline_never, 1, 643L);
+        hl_str* hlc_h_9102 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("never");
+        if (hl_str_eq((u_f)->f_attr_inline, hlc_h_9102)) {
+            u_inline_never = hl_add_i64(u_inline_never, 1, 668L);
         }
         if ((u_f)->f_attr_hot) {
-            u_hot_n = hl_add_i64(u_hot_n, 1, 646L);
+            u_hot_n = hl_add_i64(u_hot_n, 1, 671L);
         }
         if ((u_f)->f_attr_cold) {
-            u_cold_n = hl_add_i64(u_cold_n, 1, 649L);
+            u_cold_n = hl_add_i64(u_cold_n, 1, 674L);
         }
         if ((u_f)->f_attr_irq_handler) {
-            u_irq_n = hl_add_i64(u_irq_n, 1, 652L);
+            u_irq_n = hl_add_i64(u_irq_n, 1, 677L);
         }
         if ((u_f)->f_attr_no_red_zone) {
-            u_no_red_zone_n = hl_add_i64(u_no_red_zone_n, 1, 655L);
+            u_no_red_zone_n = hl_add_i64(u_no_red_zone_n, 1, 680L);
         }
         if (((u_f)->f_attr_stack_size >= 0)) {
-            u_stack_size_n = hl_add_i64(u_stack_size_n, 1, 658L);
+            u_stack_size_n = hl_add_i64(u_stack_size_n, 1, 683L);
         }
-        hl_str* hlc_h_9093 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
-        if ((!hl_str_eq((u_f)->f_attr_section, hlc_h_9093))) {
-            u_section_n = hl_add_i64(u_section_n, 1, 662L);
+        hl_str* hlc_h_9103 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
+        if ((!hl_str_eq((u_f)->f_attr_section, hlc_h_9103))) {
+            u_section_n = hl_add_i64(u_section_n, 1, 687L);
         }
         if (((u_f)->f_attr_align >= 0)) {
-            u_align_n = hl_add_i64(u_align_n, 1, 665L);
+            u_align_n = hl_add_i64(u_align_n, 1, 690L);
         }
         if ((u_f)->f_attr_tail_call) {
-            u_tail_call_n = hl_add_i64(u_tail_call_n, 1, 669L);
-            u_tail_site_n = hl_add_i64(u_tail_site_n, hl_map_get_i64((u_ctx)->f_tail_sites, u_key, 0), 670L);
+            u_tail_call_n = hl_add_i64(u_tail_call_n, 1, 694L);
+            u_tail_site_n = hl_add_i64(u_tail_site_n, hl_map_get_i64((u_ctx)->f_tail_sites, u_key, 0), 695L);
         }
-        hl_str* hlc_h_9094 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
-        if ((hl_str_eq((u_f)->f_attr_inline, hlc_h_9094) && usf_pgo_fn_is_hot(hl_retain(u_ctx), hl_retain(u_key)))) {
-            u_pgo_hot_n = hl_add_i64(u_pgo_hot_n, 1, 673L);
+        hl_str* hlc_h_9104 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
+        if ((hl_str_eq((u_f)->f_attr_inline, hlc_h_9104) && usf_pgo_fn_is_hot(hl_retain(u_ctx), hl_retain(u_key)))) {
+            u_pgo_hot_n = hl_add_i64(u_pgo_hot_n, 1, 698L);
         }
-        hl_str* hlc_h_9095 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
-        if ((hl_str_eq((u_f)->f_attr_inline, hlc_h_9095) && usf_pgo_fn_is_cold(hl_retain(u_ctx), hl_retain(u_key)))) {
-            u_pgo_cold_n = hl_add_i64(u_pgo_cold_n, 1, 676L);
+        hl_str* hlc_h_9105 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
+        if ((hl_str_eq((u_f)->f_attr_inline, hlc_h_9105) && usf_pgo_fn_is_cold(hl_retain(u_ctx), hl_retain(u_key)))) {
+            u_pgo_cold_n = hl_add_i64(u_pgo_cold_n, 1, 701L);
         }
-        hl_str* hlc_h_9096 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
-        if ((hl_str_eq((u_f)->f_attr_inline, hlc_h_9096) && usf_pgo_fn_inline(hl_retain(u_ctx), hl_retain(u_key)))) {
-            u_pgo_inline_n = hl_add_i64(u_pgo_inline_n, 1, 679L);
+        hl_str* hlc_h_9106 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
+        if ((hl_str_eq((u_f)->f_attr_inline, hlc_h_9106) && usf_pgo_fn_inline(hl_retain(u_ctx), hl_retain(u_key)))) {
+            u_pgo_inline_n = hl_add_i64(u_pgo_inline_n, 1, 704L);
         }
-        u_i = hl_add_i64(u_i, 1, 681L);
+        u_i = hl_add_i64(u_i, 1, 706L);
     }
     hl_println(hl_cstr("=== opt-stats ==="));
-    hl_str* hlc_h_9097 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  functions in program          : ");
-    hl_str* hlc_h_9098 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_total);
-    hl_println(hl_str_concat(hlc_h_9097, hlc_h_9098));
-    hl_str* hlc_h_9099 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  #[inline(always)] annotations: ");
-    hl_str* hlc_h_9100 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_inline_always);
-    hl_println(hl_str_concat(hlc_h_9099, hlc_h_9100));
-    hl_str* hlc_h_9101 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  #[inline(never)]  annotations: ");
-    hl_str* hlc_h_9102 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_inline_never);
-    hl_println(hl_str_concat(hlc_h_9101, hlc_h_9102));
-    hl_str* hlc_h_9103 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  #[hot]             annotations: ");
-    hl_str* hlc_h_9104 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_hot_n);
-    hl_println(hl_str_concat(hlc_h_9103, hlc_h_9104));
-    hl_str* hlc_h_9105 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  #[cold]            annotations: ");
-    hl_str* hlc_h_9106 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_cold_n);
-    hl_println(hl_str_concat(hlc_h_9105, hlc_h_9106));
-    hl_str* hlc_h_9107 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  #[irq_handler]     annotations: ");
-    hl_str* hlc_h_9108 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_irq_n);
+    hl_str* hlc_h_9107 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  functions in program          : ");
+    hl_str* hlc_h_9108 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_total);
     hl_println(hl_str_concat(hlc_h_9107, hlc_h_9108));
-    hl_str* hlc_h_9109 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  #[no_red_zone]     annotations: ");
-    hl_str* hlc_h_9110 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_no_red_zone_n);
+    hl_str* hlc_h_9109 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  #[inline(always)] annotations: ");
+    hl_str* hlc_h_9110 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_inline_always);
     hl_println(hl_str_concat(hlc_h_9109, hlc_h_9110));
-    hl_str* hlc_h_9111 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  #[stack_size(N)]   annotations: ");
-    hl_str* hlc_h_9112 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_stack_size_n);
+    hl_str* hlc_h_9111 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  #[inline(never)]  annotations: ");
+    hl_str* hlc_h_9112 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_inline_never);
     hl_println(hl_str_concat(hlc_h_9111, hlc_h_9112));
-    hl_str* hlc_h_9113 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  #[section(\"X\")]    annotations: ");
-    hl_str* hlc_h_9114 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_section_n);
+    hl_str* hlc_h_9113 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  #[hot]             annotations: ");
+    hl_str* hlc_h_9114 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_hot_n);
     hl_println(hl_str_concat(hlc_h_9113, hlc_h_9114));
-    hl_str* hlc_h_9115 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  #[align(N)]        annotations: ");
-    hl_str* hlc_h_9116 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_align_n);
+    hl_str* hlc_h_9115 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  #[cold]            annotations: ");
+    hl_str* hlc_h_9116 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_cold_n);
     hl_println(hl_str_concat(hlc_h_9115, hlc_h_9116));
+    hl_str* hlc_h_9117 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  #[irq_handler]     annotations: ");
+    hl_str* hlc_h_9118 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_irq_n);
+    hl_println(hl_str_concat(hlc_h_9117, hlc_h_9118));
+    hl_str* hlc_h_9119 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  #[no_red_zone]     annotations: ");
+    hl_str* hlc_h_9120 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_no_red_zone_n);
+    hl_println(hl_str_concat(hlc_h_9119, hlc_h_9120));
+    hl_str* hlc_h_9121 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  #[stack_size(N)]   annotations: ");
+    hl_str* hlc_h_9122 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_stack_size_n);
+    hl_println(hl_str_concat(hlc_h_9121, hlc_h_9122));
+    hl_str* hlc_h_9123 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  #[section(\"X\")]    annotations: ");
+    hl_str* hlc_h_9124 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_section_n);
+    hl_println(hl_str_concat(hlc_h_9123, hlc_h_9124));
+    hl_str* hlc_h_9125 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  #[align(N)]        annotations: ");
+    hl_str* hlc_h_9126 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_align_n);
+    hl_println(hl_str_concat(hlc_h_9125, hlc_h_9126));
     if (((u_ctx)->f_crate_stack_size >= 0)) {
-        hl_str* hlc_h_9117 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  #![stack_size(");
-        hl_str* hlc_h_9118 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64((u_ctx)->f_crate_stack_size);
-        hl_str* hlc_h_9119 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9117, hlc_h_9118);
-        hl_str* hlc_h_9120 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(")]   budget: worst chain ");
-        hl_str* hlc_h_9121 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9119, hlc_h_9120);
-        hl_str* hlc_h_9122 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64((u_ctx)->f_stack_budget_worst);
-        hl_str* hlc_h_9123 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9121, hlc_h_9122);
-        hl_str* hlc_h_9124 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(" bytes (");
-        hl_str* hlc_h_9125 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9123, hlc_h_9124);
-        hl_str* hlc_h_9126 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9125, (u_ctx)->f_stack_budget_path);
-        hl_str* hlc_h_9127 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(")");
-        hl_println(hl_str_concat(hlc_h_9126, hlc_h_9127));
-    }
-    hl_str* hlc_h_9128 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  #[tail_call]       annotations: ");
-    hl_str* hlc_h_9129 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_tail_call_n);
-    hl_str* hlc_h_9130 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9128, hlc_h_9129);
-    hl_str* hlc_h_9131 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(" (verified sites: ");
-    hl_str* hlc_h_9132 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9130, hlc_h_9131);
-    hl_str* hlc_h_9133 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_tail_site_n);
-    hl_str* hlc_h_9134 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9132, hlc_h_9133);
-    hl_str* hlc_h_9135 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(", stack O(1))");
-    hl_println(hl_str_concat(hlc_h_9134, hlc_h_9135));
-    if (usf_pgo_has_profile(hl_retain(u_ctx))) {
-        hl_str* hlc_h_9136 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  PGO-derived hot (no annotation): ");
-        hl_str* hlc_h_9137 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_pgo_hot_n);
+        hl_str* hlc_h_9127 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  #![stack_size(");
+        hl_str* hlc_h_9128 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64((u_ctx)->f_crate_stack_size);
+        hl_str* hlc_h_9129 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9127, hlc_h_9128);
+        hl_str* hlc_h_9130 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(")]   budget: worst chain ");
+        hl_str* hlc_h_9131 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9129, hlc_h_9130);
+        hl_str* hlc_h_9132 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64((u_ctx)->f_stack_budget_worst);
+        hl_str* hlc_h_9133 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9131, hlc_h_9132);
+        hl_str* hlc_h_9134 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(" bytes (");
+        hl_str* hlc_h_9135 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9133, hlc_h_9134);
+        hl_str* hlc_h_9136 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9135, (u_ctx)->f_stack_budget_path);
+        hl_str* hlc_h_9137 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(")");
         hl_println(hl_str_concat(hlc_h_9136, hlc_h_9137));
-        hl_str* hlc_h_9138 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  PGO-derived cold (no annotation): ");
-        hl_str* hlc_h_9139 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_pgo_cold_n);
-        hl_println(hl_str_concat(hlc_h_9138, hlc_h_9139));
-        hl_str* hlc_h_9140 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  PGO-derived static-inline (no annotation): ");
-        hl_str* hlc_h_9141 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_pgo_inline_n);
-        hl_println(hl_str_concat(hlc_h_9140, hlc_h_9141));
+    }
+    hl_str* hlc_h_9138 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  #[tail_call]       annotations: ");
+    hl_str* hlc_h_9139 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_tail_call_n);
+    hl_str* hlc_h_9140 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9138, hlc_h_9139);
+    hl_str* hlc_h_9141 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(" (verified sites: ");
+    hl_str* hlc_h_9142 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9140, hlc_h_9141);
+    hl_str* hlc_h_9143 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_tail_site_n);
+    hl_str* hlc_h_9144 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9142, hlc_h_9143);
+    hl_str* hlc_h_9145 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(", stack O(1))");
+    hl_println(hl_str_concat(hlc_h_9144, hlc_h_9145));
+    if (usf_pgo_has_profile(hl_retain(u_ctx))) {
+        hl_str* hlc_h_9146 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  PGO-derived hot (no annotation): ");
+        hl_str* hlc_h_9147 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_pgo_hot_n);
+        hl_println(hl_str_concat(hlc_h_9146, hlc_h_9147));
+        hl_str* hlc_h_9148 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  PGO-derived cold (no annotation): ");
+        hl_str* hlc_h_9149 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_pgo_cold_n);
+        hl_println(hl_str_concat(hlc_h_9148, hlc_h_9149));
+        hl_str* hlc_h_9150 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  PGO-derived static-inline (no annotation): ");
+        hl_str* hlc_h_9151 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_pgo_inline_n);
+        hl_println(hl_str_concat(hlc_h_9150, hlc_h_9151));
     } else {
         hl_println(hl_cstr("  PGO profile: (none loaded; --pgo-use <file> to enable)"));
     }
@@ -36473,15 +36499,15 @@ void usf_print_opt_stats(Ctx* u_ctx_p) {
         int64_t u_inlined_n = hl_list_len((u_ctx)->f_lto_inlined_report);
         int64_t u_sites = (u_ctx)->f_lto_inline_n;
         int64_t u_dropped = (u_ctx)->f_lto_dropped;
-        hl_str* hlc_h_9142 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  LTO inline expansions (sites) : ");
-        hl_str* hlc_h_9143 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_sites);
-        hl_println(hl_str_concat(hlc_h_9142, hlc_h_9143));
-        hl_str* hlc_h_9144 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  LTO distinct callees inlined : ");
-        hl_str* hlc_h_9145 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_inlined_n);
-        hl_println(hl_str_concat(hlc_h_9144, hlc_h_9145));
-        hl_str* hlc_h_9146 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  LTO bodies dropped (A+B)      : ");
-        hl_str* hlc_h_9147 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_dropped);
-        hl_println(hl_str_concat(hlc_h_9146, hlc_h_9147));
+        hl_str* hlc_h_9152 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  LTO inline expansions (sites) : ");
+        hl_str* hlc_h_9153 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_sites);
+        hl_println(hl_str_concat(hlc_h_9152, hlc_h_9153));
+        hl_str* hlc_h_9154 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  LTO distinct callees inlined : ");
+        hl_str* hlc_h_9155 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_inlined_n);
+        hl_println(hl_str_concat(hlc_h_9154, hlc_h_9155));
+        hl_str* hlc_h_9156 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  LTO bodies dropped (A+B)      : ");
+        hl_str* hlc_h_9157 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_dropped);
+        hl_println(hl_str_concat(hlc_h_9156, hlc_h_9157));
     } else {
         hl_println(hl_cstr("  LTO: (disabled; --lto to enable)"));
     }
@@ -36493,40 +36519,40 @@ void usf_print_opt_stats(Ctx* u_ctx_p) {
     if ((hl_list_len((u_ctx)->f_layout_order) > 0)) {
         int64_t u_ci = 0;
         while ((u_ci < hl_list_len((u_ctx)->f_layout_order))) {
-            hl_str* u_lay __attribute__((cleanup(hl_cleanup_str))) = ((hl_str*)hl_map_get_own((u_ctx)->f_layout_map, (hl_str*)hl_unbox_ptr(hl_list_get((u_ctx)->f_layout_order, u_ci, 731L)), hl_cstr("?")));
-            hl_str* hlc_h_9148 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("stack");
-            if (hl_str_eq(u_lay, hlc_h_9148)) {
-                hlc_ss_i64(u_lay_counts, 0, 4, hl_add_i64(hlc_sg_i64(u_lay_counts, 0, 4, 733L), 1, 733L), 733L);
+            hl_str* u_lay __attribute__((cleanup(hl_cleanup_str))) = ((hl_str*)hl_map_get_own((u_ctx)->f_layout_map, (hl_str*)hl_unbox_ptr(hl_list_get((u_ctx)->f_layout_order, u_ci, 756L)), hl_cstr("?")));
+            hl_str* hlc_h_9158 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("stack");
+            if (hl_str_eq(u_lay, hlc_h_9158)) {
+                hlc_ss_i64(u_lay_counts, 0, 4, hl_add_i64(hlc_sg_i64(u_lay_counts, 0, 4, 758L), 1, 758L), 758L);
             } else {
-                hl_str* hlc_h_9149 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("boxed");
-                if (hl_str_eq(u_lay, hlc_h_9149)) {
-                    hlc_ss_i64(u_lay_counts, 1, 4, hl_add_i64(hlc_sg_i64(u_lay_counts, 1, 4, 735L), 1, 735L), 735L);
+                hl_str* hlc_h_9159 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("boxed");
+                if (hl_str_eq(u_lay, hlc_h_9159)) {
+                    hlc_ss_i64(u_lay_counts, 1, 4, hl_add_i64(hlc_sg_i64(u_lay_counts, 1, 4, 760L), 1, 760L), 760L);
                 } else {
-                    hl_str* hlc_h_9150 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("heap");
-                    if (hl_str_eq(u_lay, hlc_h_9150)) {
-                        hlc_ss_i64(u_lay_counts, 2, 4, hl_add_i64(hlc_sg_i64(u_lay_counts, 2, 4, 737L), 1, 737L), 737L);
+                    hl_str* hlc_h_9160 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("heap");
+                    if (hl_str_eq(u_lay, hlc_h_9160)) {
+                        hlc_ss_i64(u_lay_counts, 2, 4, hl_add_i64(hlc_sg_i64(u_lay_counts, 2, 4, 762L), 1, 762L), 762L);
                     } else {
-                        hlc_ss_i64(u_lay_counts, 3, 4, hl_add_i64(hlc_sg_i64(u_lay_counts, 3, 4, 739L), 1, 739L), 739L);
+                        hlc_ss_i64(u_lay_counts, 3, 4, hl_add_i64(hlc_sg_i64(u_lay_counts, 3, 4, 764L), 1, 764L), 764L);
                     }
                 }
             }
-            u_ci = hl_add_i64(u_ci, 1, 741L);
+            u_ci = hl_add_i64(u_ci, 1, 766L);
         }
-        hl_str* hlc_h_9151 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  stack-allocated list bindings  : ");
-        hl_str* hlc_h_9152 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(hlc_sg_i64(u_lay_counts, 0, 4, 743L));
-        hl_println(hl_str_concat(hlc_h_9151, hlc_h_9152));
-        hl_str* hlc_h_9153 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  boxed (forced heap) bindings   : ");
-        hl_str* hlc_h_9154 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(hlc_sg_i64(u_lay_counts, 1, 4, 744L));
-        hl_println(hl_str_concat(hlc_h_9153, hlc_h_9154));
-        hl_str* hlc_h_9155 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  heap (escaping) bindings       : ");
-        hl_str* hlc_h_9156 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(hlc_sg_i64(u_lay_counts, 2, 4, 745L));
-        hl_println(hl_str_concat(hlc_h_9155, hlc_h_9156));
-        hl_str* hlc_h_9157 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  heap (push/pop) bindings       : ");
-        hl_str* hlc_h_9158 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(hlc_sg_i64(u_lay_counts, 3, 4, 746L));
-        hl_println(hl_str_concat(hlc_h_9157, hlc_h_9158));
-        hl_str* hlc_h_9159 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  tracked list bindings          : ");
-        hl_str* hlc_h_9160 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(hl_list_len((u_ctx)->f_layout_order));
-        hl_println(hl_str_concat(hlc_h_9159, hlc_h_9160));
+        hl_str* hlc_h_9161 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  stack-allocated list bindings  : ");
+        hl_str* hlc_h_9162 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(hlc_sg_i64(u_lay_counts, 0, 4, 768L));
+        hl_println(hl_str_concat(hlc_h_9161, hlc_h_9162));
+        hl_str* hlc_h_9163 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  boxed (forced heap) bindings   : ");
+        hl_str* hlc_h_9164 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(hlc_sg_i64(u_lay_counts, 1, 4, 769L));
+        hl_println(hl_str_concat(hlc_h_9163, hlc_h_9164));
+        hl_str* hlc_h_9165 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  heap (escaping) bindings       : ");
+        hl_str* hlc_h_9166 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(hlc_sg_i64(u_lay_counts, 2, 4, 770L));
+        hl_println(hl_str_concat(hlc_h_9165, hlc_h_9166));
+        hl_str* hlc_h_9167 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  heap (push/pop) bindings       : ");
+        hl_str* hlc_h_9168 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(hlc_sg_i64(u_lay_counts, 3, 4, 771L));
+        hl_println(hl_str_concat(hlc_h_9167, hlc_h_9168));
+        hl_str* hlc_h_9169 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  tracked list bindings          : ");
+        hl_str* hlc_h_9170 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(hl_list_len((u_ctx)->f_layout_order));
+        hl_println(hl_str_concat(hlc_h_9169, hlc_h_9170));
     }
     hl_println(hl_cstr(""));
     hl_println(hl_cstr("  per-function decisions:"));
@@ -36539,15 +36565,15 @@ void usf_print_opt_stats(Ctx* u_ctx_p) {
     u_widths[3] = 20;
     int64_t u_j = 0;
     while ((u_j < hl_list_len((u_ctx)->f_fn_order))) {
-        hl_str* u_key_2 __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get((u_ctx)->f_fn_order, u_j, 761L)));
+        hl_str* u_key_2 __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get((u_ctx)->f_fn_order, u_j, 786L)));
         FnInfo* u_f_2 __attribute__((cleanup(hl_cleanup_FnInfo))) = ((FnInfo*)hl_map_get_own((u_ctx)->f_fns, u_key_2, usf_dummy_fn()));
         hl_str* u_inline_col __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
-        hl_str* hlc_h_9161 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("always");
-        if (hl_str_eq((u_f_2)->f_attr_inline, hlc_h_9161)) {
+        hl_str* hlc_h_9171 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("always");
+        if (hl_str_eq((u_f_2)->f_attr_inline, hlc_h_9171)) {
             { hl_str* __hl_old = u_inline_col; u_inline_col = hl_cstr("ALWAYS"); hl_str_release(__hl_old); }
         } else {
-            hl_str* hlc_h_9162 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("never");
-            if (hl_str_eq((u_f_2)->f_attr_inline, hlc_h_9162)) {
+            hl_str* hlc_h_9172 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("never");
+            if (hl_str_eq((u_f_2)->f_attr_inline, hlc_h_9172)) {
                 { hl_str* __hl_old = u_inline_col; u_inline_col = hl_cstr("NEVER"); hl_str_release(__hl_old); }
             } else {
                 if (usf_pgo_fn_inline(hl_retain(u_ctx), hl_retain(u_key_2))) {
@@ -36577,35 +36603,35 @@ void usf_print_opt_stats(Ctx* u_ctx_p) {
         }
         hl_str* u_frame_col __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
         if ((u_f_2)->f_attr_irq_handler) {
-            hl_str* hlc_h_9163 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("irq ");
-            { hl_str* __hl_old = u_frame_col; u_frame_col = hl_str_concat(u_frame_col, hlc_h_9163); hl_str_release(__hl_old); }
+            hl_str* hlc_h_9173 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("irq ");
+            { hl_str* __hl_old = u_frame_col; u_frame_col = hl_str_concat(u_frame_col, hlc_h_9173); hl_str_release(__hl_old); }
         }
         if ((u_f_2)->f_attr_no_red_zone) {
-            hl_str* hlc_h_9164 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("no-red-zone ");
-            { hl_str* __hl_old = u_frame_col; u_frame_col = hl_str_concat(u_frame_col, hlc_h_9164); hl_str_release(__hl_old); }
+            hl_str* hlc_h_9174 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("no-red-zone ");
+            { hl_str* __hl_old = u_frame_col; u_frame_col = hl_str_concat(u_frame_col, hlc_h_9174); hl_str_release(__hl_old); }
         }
         if (((u_f_2)->f_attr_stack_size >= 0)) {
-            hl_str* hlc_h_9165 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("stack<=");
-            hl_str* hlc_h_9166 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(u_frame_col, hlc_h_9165);
-            hl_str* hlc_h_9167 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64((u_f_2)->f_attr_stack_size);
-            { hl_str* __hl_old = u_frame_col; u_frame_col = hl_str_concat(hlc_h_9166, hlc_h_9167); hl_str_release(__hl_old); }
+            hl_str* hlc_h_9175 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("stack<=");
+            hl_str* hlc_h_9176 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(u_frame_col, hlc_h_9175);
+            hl_str* hlc_h_9177 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64((u_f_2)->f_attr_stack_size);
+            { hl_str* __hl_old = u_frame_col; u_frame_col = hl_str_concat(hlc_h_9176, hlc_h_9177); hl_str_release(__hl_old); }
         }
         if ((u_f_2)->f_attr_tail_call) {
             int64_t u_tc_n = hl_map_get_i64((u_ctx)->f_tail_sites, u_key_2, 0);
-            hl_str* hlc_h_9168 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("tail(");
-            hl_str* hlc_h_9169 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(u_frame_col, hlc_h_9168);
-            hl_str* hlc_h_9170 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_tc_n);
-            hl_str* hlc_h_9171 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9169, hlc_h_9170);
-            hl_str* hlc_h_9172 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(")");
-            { hl_str* __hl_old = u_frame_col; u_frame_col = hl_str_concat(hlc_h_9171, hlc_h_9172); hl_str_release(__hl_old); }
+            hl_str* hlc_h_9178 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("tail(");
+            hl_str* hlc_h_9179 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(u_frame_col, hlc_h_9178);
+            hl_str* hlc_h_9180 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_tc_n);
+            hl_str* hlc_h_9181 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9179, hlc_h_9180);
+            hl_str* hlc_h_9182 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(")");
+            { hl_str* __hl_old = u_frame_col; u_frame_col = hl_str_concat(hlc_h_9181, hlc_h_9182); hl_str_release(__hl_old); }
         }
-        hl_str* hlc_h_9173 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
-        if (hl_str_eq(u_frame_col, hlc_h_9173)) {
+        hl_str* hlc_h_9183 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
+        if (hl_str_eq(u_frame_col, hlc_h_9183)) {
             { hl_str* __hl_old = u_frame_col; u_frame_col = hl_cstr("-"); hl_str_release(__hl_old); }
         }
         hl_str* u_source_col __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
-        hl_str* hlc_h_9174 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
-        if ((((((((!hl_str_eq((u_f_2)->f_attr_inline, hlc_h_9174)) || (u_f_2)->f_attr_hot) || (u_f_2)->f_attr_cold) || (u_f_2)->f_attr_irq_handler) || (u_f_2)->f_attr_no_red_zone) || ((u_f_2)->f_attr_stack_size >= 0)) || (u_f_2)->f_attr_tail_call)) {
+        hl_str* hlc_h_9184 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
+        if ((((((((!hl_str_eq((u_f_2)->f_attr_inline, hlc_h_9184)) || (u_f_2)->f_attr_hot) || (u_f_2)->f_attr_cold) || (u_f_2)->f_attr_irq_handler) || (u_f_2)->f_attr_no_red_zone) || ((u_f_2)->f_attr_stack_size >= 0)) || (u_f_2)->f_attr_tail_call)) {
             { hl_str* __hl_old = u_source_col; u_source_col = hl_cstr("annotated"); hl_str_release(__hl_old); }
         } else {
             if (((usf_pgo_fn_is_hot(hl_retain(u_ctx), hl_retain(u_key_2)) || usf_pgo_fn_is_cold(hl_retain(u_ctx), hl_retain(u_key_2))) || usf_pgo_fn_inline(hl_retain(u_ctx), hl_retain(u_key_2)))) {
@@ -36614,25 +36640,25 @@ void usf_print_opt_stats(Ctx* u_ctx_p) {
                 { hl_str* __hl_old = u_source_col; u_source_col = hl_cstr("heuristic"); hl_str_release(__hl_old); }
             }
         }
-        hl_str* u_padded_name __attribute__((cleanup(hl_cleanup_str))) = usf_pad_right(hl_retain(u_key_2), hlc_sg_i64(u_widths, 0, 4, 816L));
-        hl_str* u_padded_inline __attribute__((cleanup(hl_cleanup_str))) = usf_pad_right(hl_retain(u_inline_col), hlc_sg_i64(u_widths, 1, 4, 817L));
-        hl_str* u_padded_hotcold __attribute__((cleanup(hl_cleanup_str))) = usf_pad_right(hl_retain(u_hotcold_col), hlc_sg_i64(u_widths, 2, 4, 818L));
-        hl_str* u_padded_frame __attribute__((cleanup(hl_cleanup_str))) = usf_pad_right(hl_retain(u_frame_col), hlc_sg_i64(u_widths, 3, 4, 819L));
-        hl_str* hlc_h_9175 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("    ");
-        hl_str* hlc_h_9176 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9175, u_padded_name);
-        hl_str* hlc_h_9177 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  ");
-        hl_str* hlc_h_9178 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9176, hlc_h_9177);
-        hl_str* hlc_h_9179 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9178, u_padded_inline);
-        hl_str* hlc_h_9180 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  ");
-        hl_str* hlc_h_9181 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9179, hlc_h_9180);
-        hl_str* hlc_h_9182 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9181, u_padded_hotcold);
-        hl_str* hlc_h_9183 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  ");
-        hl_str* hlc_h_9184 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9182, hlc_h_9183);
-        hl_str* hlc_h_9185 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9184, u_padded_frame);
-        hl_str* hlc_h_9186 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  ");
-        hl_str* hlc_h_9187 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9185, hlc_h_9186);
-        hl_println(hl_str_concat(hlc_h_9187, u_source_col));
-        u_j = hl_add_i64(u_j, 1, 822L);
+        hl_str* u_padded_name __attribute__((cleanup(hl_cleanup_str))) = usf_pad_right(hl_retain(u_key_2), hlc_sg_i64(u_widths, 0, 4, 841L));
+        hl_str* u_padded_inline __attribute__((cleanup(hl_cleanup_str))) = usf_pad_right(hl_retain(u_inline_col), hlc_sg_i64(u_widths, 1, 4, 842L));
+        hl_str* u_padded_hotcold __attribute__((cleanup(hl_cleanup_str))) = usf_pad_right(hl_retain(u_hotcold_col), hlc_sg_i64(u_widths, 2, 4, 843L));
+        hl_str* u_padded_frame __attribute__((cleanup(hl_cleanup_str))) = usf_pad_right(hl_retain(u_frame_col), hlc_sg_i64(u_widths, 3, 4, 844L));
+        hl_str* hlc_h_9185 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("    ");
+        hl_str* hlc_h_9186 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9185, u_padded_name);
+        hl_str* hlc_h_9187 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  ");
+        hl_str* hlc_h_9188 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9186, hlc_h_9187);
+        hl_str* hlc_h_9189 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9188, u_padded_inline);
+        hl_str* hlc_h_9190 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  ");
+        hl_str* hlc_h_9191 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9189, hlc_h_9190);
+        hl_str* hlc_h_9192 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9191, u_padded_hotcold);
+        hl_str* hlc_h_9193 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  ");
+        hl_str* hlc_h_9194 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9192, hlc_h_9193);
+        hl_str* hlc_h_9195 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9194, u_padded_frame);
+        hl_str* hlc_h_9196 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  ");
+        hl_str* hlc_h_9197 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9195, hlc_h_9196);
+        hl_println(hl_str_concat(hlc_h_9197, u_source_col));
+        u_j = hl_add_i64(u_j, 1, 847L);
     }
     if ((u_tail_call_n > 0)) {
         hl_println(hl_cstr(""));
@@ -36641,7 +36667,7 @@ void usf_print_opt_stats(Ctx* u_ctx_p) {
         hl_println(hl_cstr("    ----                          -----   ------  ---      -----"));
         int64_t u_tj = 0;
         while ((u_tj < hl_list_len((u_ctx)->f_fn_order))) {
-            hl_str* u_key_3 __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get((u_ctx)->f_fn_order, u_tj, 835L)));
+            hl_str* u_key_3 __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get((u_ctx)->f_fn_order, u_tj, 860L)));
             FnInfo* u_f_3 __attribute__((cleanup(hl_cleanup_FnInfo))) = ((FnInfo*)hl_map_get_own((u_ctx)->f_fns, u_key_3, usf_dummy_fn()));
             if ((u_f_3)->f_attr_tail_call) {
                 int64_t u_tc_n_2 = hl_map_get_i64((u_ctx)->f_tail_sites, u_key_3, 0);
@@ -36649,21 +36675,21 @@ void usf_print_opt_stats(Ctx* u_ctx_p) {
                 hl_str* u_padded_tsites __attribute__((cleanup(hl_cleanup_str))) = usf_pad_right(hl_str_from_int64(u_tc_n_2), 6);
                 hl_str* u_padded_tparams __attribute__((cleanup(hl_cleanup_str))) = usf_pad_right(hl_str_from_int64(hl_list_len((u_f_3)->f_params)), 7);
                 hl_str* u_padded_tret __attribute__((cleanup(hl_cleanup_str))) = usf_pad_right(hl_retain((u_f_3)->f_ret), 8);
-                hl_str* hlc_h_9188 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("    ");
-                hl_str* hlc_h_9189 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9188, u_padded_tname);
-                hl_str* hlc_h_9190 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  ");
-                hl_str* hlc_h_9191 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9189, hlc_h_9190);
-                hl_str* hlc_h_9192 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9191, u_padded_tsites);
-                hl_str* hlc_h_9193 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(" ");
-                hl_str* hlc_h_9194 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9192, hlc_h_9193);
-                hl_str* hlc_h_9195 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9194, u_padded_tparams);
-                hl_str* hlc_h_9196 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(" ");
-                hl_str* hlc_h_9197 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9195, hlc_h_9196);
-                hl_str* hlc_h_9198 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9197, u_padded_tret);
-                hl_str* hlc_h_9199 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(" constant");
-                hl_println(hl_str_concat(hlc_h_9198, hlc_h_9199));
+                hl_str* hlc_h_9198 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("    ");
+                hl_str* hlc_h_9199 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9198, u_padded_tname);
+                hl_str* hlc_h_9200 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  ");
+                hl_str* hlc_h_9201 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9199, hlc_h_9200);
+                hl_str* hlc_h_9202 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9201, u_padded_tsites);
+                hl_str* hlc_h_9203 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(" ");
+                hl_str* hlc_h_9204 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9202, hlc_h_9203);
+                hl_str* hlc_h_9205 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9204, u_padded_tparams);
+                hl_str* hlc_h_9206 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(" ");
+                hl_str* hlc_h_9207 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9205, hlc_h_9206);
+                hl_str* hlc_h_9208 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9207, u_padded_tret);
+                hl_str* hlc_h_9209 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(" constant");
+                hl_println(hl_str_concat(hlc_h_9208, hlc_h_9209));
             }
-            u_tj = hl_add_i64(u_tj, 1, 846L);
+            u_tj = hl_add_i64(u_tj, 1, 871L);
         }
     }
     if ((hl_list_len((u_ctx)->f_layout_order) > 0)) {
@@ -36673,7 +36699,7 @@ void usf_print_opt_stats(Ctx* u_ctx_p) {
         hl_println(hl_cstr("    ------                              ------     ---   ------"));
         int64_t u_lk_i = 0;
         while ((u_lk_i < hl_list_len((u_ctx)->f_layout_order))) {
-            hl_str* u_lkey __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get((u_ctx)->f_layout_order, u_lk_i, 861L)));
+            hl_str* u_lkey __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get((u_ctx)->f_layout_order, u_lk_i, 886L)));
             hl_str* u_lay_2 __attribute__((cleanup(hl_cleanup_str))) = ((hl_str*)hl_map_get_own((u_ctx)->f_layout_map, u_lkey, hl_cstr("?")));
             hl_str* u_why __attribute__((cleanup(hl_cleanup_str))) = ((hl_str*)hl_map_get_own((u_ctx)->f_layout_why, u_lkey, hl_cstr("")));
             int64_t u_capv = hl_map_get_i64((u_ctx)->f_layout_cap, u_lkey, 0);
@@ -36684,18 +36710,18 @@ void usf_print_opt_stats(Ctx* u_ctx_p) {
             hl_str* u_padded_lkey __attribute__((cleanup(hl_cleanup_str))) = usf_pad_right(hl_retain(u_disp_key), 36);
             hl_str* u_padded_lay __attribute__((cleanup(hl_cleanup_str))) = usf_pad_right(hl_retain(u_lay_2), 9);
             hl_str* u_padded_cap __attribute__((cleanup(hl_cleanup_str))) = usf_pad_right(hl_str_from_int64(u_capv), 5);
-            hl_str* hlc_h_9200 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("    ");
-            hl_str* hlc_h_9201 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9200, u_padded_lkey);
-            hl_str* hlc_h_9202 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  ");
-            hl_str* hlc_h_9203 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9201, hlc_h_9202);
-            hl_str* hlc_h_9204 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9203, u_padded_lay);
-            hl_str* hlc_h_9205 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  ");
-            hl_str* hlc_h_9206 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9204, hlc_h_9205);
-            hl_str* hlc_h_9207 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9206, u_padded_cap);
-            hl_str* hlc_h_9208 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  ");
-            hl_str* hlc_h_9209 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9207, hlc_h_9208);
-            hl_println(hl_str_concat(hlc_h_9209, u_why));
-            u_lk_i = hl_add_i64(u_lk_i, 1, 873L);
+            hl_str* hlc_h_9210 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("    ");
+            hl_str* hlc_h_9211 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9210, u_padded_lkey);
+            hl_str* hlc_h_9212 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  ");
+            hl_str* hlc_h_9213 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9211, hlc_h_9212);
+            hl_str* hlc_h_9214 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9213, u_padded_lay);
+            hl_str* hlc_h_9215 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  ");
+            hl_str* hlc_h_9216 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9214, hlc_h_9215);
+            hl_str* hlc_h_9217 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9216, u_padded_cap);
+            hl_str* hlc_h_9218 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  ");
+            hl_str* hlc_h_9219 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9217, hlc_h_9218);
+            hl_println(hl_str_concat(hlc_h_9219, u_why));
+            u_lk_i = hl_add_i64(u_lk_i, 1, 898L);
         }
     }
 }
@@ -36708,12 +36734,12 @@ void usf_print_audit(Ctx* u_ctx_p) {
     hl_println(hl_cstr("  function                       declared                       computed"));
     hl_println(hl_cstr("=============================================================================="));
     while ((u_i < hl_list_len(u_keys))) {
-        hl_str* u_key __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_keys, u_i, 888L)));
+        hl_str* u_key __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_keys, u_i, 913L)));
         FnInfo* u_f __attribute__((cleanup(hl_cleanup_FnInfo))) = ((FnInfo*)hl_map_get_own((u_ctx)->f_fns, u_key, usf_dummy_fn()));
         hl_list* u_declared __attribute__((cleanup(hl_cleanup_list))) = hl_retain((u_f)->f_effects);
         hl_list* u_computed __attribute__((cleanup(hl_cleanup_list))) = ((hl_list*)hl_map_get_own((u_ctx)->f_computed_effects, u_key, ({
-    hl_list* hlc_ll_9210 = hl_list_new(hl_str_release);
-    hlc_ll_9210;
+    hl_list* hlc_ll_9220 = hl_list_new(hl_str_release);
+    hlc_ll_9220;
 })));
         hl_str* u_decl_disp __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
         if ((u_f)->f_is_pure) {
@@ -36721,44 +36747,44 @@ void usf_print_audit(Ctx* u_ctx_p) {
         }
         int64_t u_j = 0;
         while ((u_j < hl_list_len(u_declared))) {
-            hl_str* hlc_h_9211 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
-            if ((!hl_str_eq(u_decl_disp, hlc_h_9211))) {
-                hl_str* hlc_h_9212 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(", ");
-                { hl_str* __hl_old = u_decl_disp; u_decl_disp = hl_str_concat(u_decl_disp, hlc_h_9212); hl_str_release(__hl_old); }
+            hl_str* hlc_h_9221 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
+            if ((!hl_str_eq(u_decl_disp, hlc_h_9221))) {
+                hl_str* hlc_h_9222 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(", ");
+                { hl_str* __hl_old = u_decl_disp; u_decl_disp = hl_str_concat(u_decl_disp, hlc_h_9222); hl_str_release(__hl_old); }
             }
-            { hl_str* __hl_old = u_decl_disp; u_decl_disp = hl_str_concat(u_decl_disp, (hl_str*)hl_unbox_ptr(hl_list_get(u_declared, u_j, 901L))); hl_str_release(__hl_old); }
-            u_j = hl_add_i64(u_j, 1, 902L);
+            { hl_str* __hl_old = u_decl_disp; u_decl_disp = hl_str_concat(u_decl_disp, (hl_str*)hl_unbox_ptr(hl_list_get(u_declared, u_j, 926L))); hl_str_release(__hl_old); }
+            u_j = hl_add_i64(u_j, 1, 927L);
         }
-        hl_str* hlc_h_9213 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
-        if (hl_str_eq(u_decl_disp, hlc_h_9213)) {
+        hl_str* hlc_h_9223 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
+        if (hl_str_eq(u_decl_disp, hlc_h_9223)) {
             { hl_str* __hl_old = u_decl_disp; u_decl_disp = hl_cstr("(none - pure)"); hl_str_release(__hl_old); }
         }
         hl_str* u_comp_disp __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
         int64_t u_k = 0;
         while ((u_k < hl_list_len(u_computed))) {
-            hl_str* hlc_h_9214 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
-            if ((!hl_str_eq(u_comp_disp, hlc_h_9214))) {
-                hl_str* hlc_h_9215 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(", ");
-                { hl_str* __hl_old = u_comp_disp; u_comp_disp = hl_str_concat(u_comp_disp, hlc_h_9215); hl_str_release(__hl_old); }
+            hl_str* hlc_h_9224 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
+            if ((!hl_str_eq(u_comp_disp, hlc_h_9224))) {
+                hl_str* hlc_h_9225 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(", ");
+                { hl_str* __hl_old = u_comp_disp; u_comp_disp = hl_str_concat(u_comp_disp, hlc_h_9225); hl_str_release(__hl_old); }
             }
-            { hl_str* __hl_old = u_comp_disp; u_comp_disp = hl_str_concat(u_comp_disp, (hl_str*)hl_unbox_ptr(hl_list_get(u_computed, u_k, 913L))); hl_str_release(__hl_old); }
-            u_k = hl_add_i64(u_k, 1, 914L);
+            { hl_str* __hl_old = u_comp_disp; u_comp_disp = hl_str_concat(u_comp_disp, (hl_str*)hl_unbox_ptr(hl_list_get(u_computed, u_k, 938L))); hl_str_release(__hl_old); }
+            u_k = hl_add_i64(u_k, 1, 939L);
         }
-        hl_str* hlc_h_9216 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
-        if (hl_str_eq(u_comp_disp, hlc_h_9216)) {
+        hl_str* hlc_h_9226 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
+        if (hl_str_eq(u_comp_disp, hlc_h_9226)) {
             { hl_str* __hl_old = u_comp_disp; u_comp_disp = hl_cstr("(none)"); hl_str_release(__hl_old); }
         }
         hl_str* u_padded __attribute__((cleanup(hl_cleanup_str))) = usf_pad_right(hl_retain(u_key), 30);
         hl_str* u_padded_decl __attribute__((cleanup(hl_cleanup_str))) = usf_pad_right(hl_retain(u_decl_disp), 30);
-        hl_str* hlc_h_9217 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  ");
-        hl_str* hlc_h_9218 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9217, u_padded);
-        hl_str* hlc_h_9219 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  ");
-        hl_str* hlc_h_9220 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9218, hlc_h_9219);
-        hl_str* hlc_h_9221 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9220, u_padded_decl);
-        hl_str* hlc_h_9222 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  ");
-        hl_str* hlc_h_9223 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9221, hlc_h_9222);
-        hl_println(hl_str_concat(hlc_h_9223, u_comp_disp));
-        u_i = hl_add_i64(u_i, 1, 923L);
+        hl_str* hlc_h_9227 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  ");
+        hl_str* hlc_h_9228 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9227, u_padded);
+        hl_str* hlc_h_9229 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  ");
+        hl_str* hlc_h_9230 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9228, hlc_h_9229);
+        hl_str* hlc_h_9231 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9230, u_padded_decl);
+        hl_str* hlc_h_9232 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  ");
+        hl_str* hlc_h_9233 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9231, hlc_h_9232);
+        hl_println(hl_str_concat(hlc_h_9233, u_comp_disp));
+        u_i = hl_add_i64(u_i, 1, 948L);
     }
     hl_println(hl_cstr("=============================================================================="));
     if ((u_ctx)->f_crate_freestanding) {
@@ -36770,192 +36796,192 @@ void usf_print_audit(Ctx* u_ctx_p) {
             hl_println(hl_cstr("  Crate mode: std (default hosted crate)"));
         }
     }
-    hl_str* hlc_h_9224 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
-    if ((!hl_str_eq((u_ctx)->f_target_triple, hlc_h_9224))) {
-        hl_str* hlc_h_9225 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  Target: ");
-        hl_str* hlc_h_9226 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9225, (u_ctx)->f_target_triple);
-        hl_str* hlc_h_9227 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(" (bare-metal, integer-only)");
-        hl_println(hl_str_concat(hlc_h_9226, hlc_h_9227));
+    hl_str* hlc_h_9234 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
+    if ((!hl_str_eq((u_ctx)->f_target_triple, hlc_h_9234))) {
+        hl_str* hlc_h_9235 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  Target: ");
+        hl_str* hlc_h_9236 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9235, (u_ctx)->f_target_triple);
+        hl_str* hlc_h_9237 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(" (bare-metal, integer-only)");
+        hl_println(hl_str_concat(hlc_h_9236, hlc_h_9237));
     }
     if (((u_ctx)->f_crate_stack_size >= 0)) {
-        hl_str* hlc_h_9228 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  Stack budget: #![stack_size(");
-        hl_str* hlc_h_9229 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64((u_ctx)->f_crate_stack_size);
-        hl_str* hlc_h_9230 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9228, hlc_h_9229);
-        hl_str* hlc_h_9231 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(")] \342\200\224 worst chain ");
-        hl_str* hlc_h_9232 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9230, hlc_h_9231);
-        hl_str* hlc_h_9233 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64((u_ctx)->f_stack_budget_worst);
-        hl_str* hlc_h_9234 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9232, hlc_h_9233);
-        hl_str* hlc_h_9235 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(" bytes (");
-        hl_str* hlc_h_9236 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9234, hlc_h_9235);
-        hl_str* hlc_h_9237 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9236, (u_ctx)->f_stack_budget_path);
-        hl_str* hlc_h_9238 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(")");
-        hl_println(hl_str_concat(hlc_h_9237, hlc_h_9238));
+        hl_str* hlc_h_9238 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  Stack budget: #![stack_size(");
+        hl_str* hlc_h_9239 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64((u_ctx)->f_crate_stack_size);
+        hl_str* hlc_h_9240 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9238, hlc_h_9239);
+        hl_str* hlc_h_9241 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(")] \342\200\224 worst chain ");
+        hl_str* hlc_h_9242 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9240, hlc_h_9241);
+        hl_str* hlc_h_9243 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64((u_ctx)->f_stack_budget_worst);
+        hl_str* hlc_h_9244 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9242, hlc_h_9243);
+        hl_str* hlc_h_9245 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(" bytes (");
+        hl_str* hlc_h_9246 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9244, hlc_h_9245);
+        hl_str* hlc_h_9247 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9246, (u_ctx)->f_stack_budget_path);
+        hl_str* hlc_h_9248 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(")");
+        hl_println(hl_str_concat(hlc_h_9247, hlc_h_9248));
     }
-    hl_str* hlc_h_9239 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
-    if ((!hl_str_eq((u_ctx)->f_crate_boot_header, hlc_h_9239))) {
-        hl_str* hlc_h_9240 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  Boot header: ");
-        hl_str* hlc_h_9241 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9240, (u_ctx)->f_crate_boot_header);
-        hl_str* hlc_h_9242 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(" (emitted into ");
-        hl_str* hlc_h_9243 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9241, hlc_h_9242);
-        hl_str* hlc_h_9244 __attribute__((cleanup(hl_cleanup_str))) = usf_boot_header_section(hl_retain((u_ctx)->f_crate_boot_header));
-        hl_str* hlc_h_9245 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9243, hlc_h_9244);
-        hl_str* hlc_h_9246 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(")");
-        hl_println(hl_str_concat(hlc_h_9245, hlc_h_9246));
+    hl_str* hlc_h_9249 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
+    if ((!hl_str_eq((u_ctx)->f_crate_boot_header, hlc_h_9249))) {
+        hl_str* hlc_h_9250 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  Boot header: ");
+        hl_str* hlc_h_9251 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9250, (u_ctx)->f_crate_boot_header);
+        hl_str* hlc_h_9252 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(" (emitted into ");
+        hl_str* hlc_h_9253 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9251, hlc_h_9252);
+        hl_str* hlc_h_9254 __attribute__((cleanup(hl_cleanup_str))) = usf_boot_header_section(hl_retain((u_ctx)->f_crate_boot_header));
+        hl_str* hlc_h_9255 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9253, hlc_h_9254);
+        hl_str* hlc_h_9256 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(")");
+        hl_println(hl_str_concat(hlc_h_9255, hlc_h_9256));
     }
     if ((hl_list_len((u_ctx)->f_irq_proof_lines) > 0)) {
         hl_println(hl_cstr("  Interrupt safety (Stage 91): every #[irq_handler] is proved to reach no allocation:"));
         int64_t u_irq_i = 0;
         while ((u_irq_i < hl_list_len((u_ctx)->f_irq_proof_lines))) {
-            hl_str* hlc_h_9247 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("    ");
-            hl_println(hl_str_concat(hlc_h_9247, (hl_str*)hl_unbox_ptr(hl_list_get((u_ctx)->f_irq_proof_lines, u_irq_i, 962L))));
-            u_irq_i = hl_add_i64(u_irq_i, 1, 963L);
+            hl_str* hlc_h_9257 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("    ");
+            hl_println(hl_str_concat(hlc_h_9257, (hl_str*)hl_unbox_ptr(hl_list_get((u_ctx)->f_irq_proof_lines, u_irq_i, 987L))));
+            u_irq_i = hl_add_i64(u_irq_i, 1, 988L);
         }
     }
     hl_list* u_secret_rows __attribute__((cleanup(hl_cleanup_list))) = ({
-    hl_list* hlc_ll_9248 = hl_list_new(hl_str_release);
-    hlc_ll_9248;
+    hl_list* hlc_ll_9258 = hl_list_new(hl_str_release);
+    hlc_ll_9258;
 });
     int64_t u_sec_i = 0;
     while ((u_sec_i < hl_list_len((u_ctx)->f_fn_order))) {
-        hl_str* u_skey __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get((u_ctx)->f_fn_order, u_sec_i, 972L)));
+        hl_str* u_skey __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get((u_ctx)->f_fn_order, u_sec_i, 997L)));
         FnInfo* u_sf __attribute__((cleanup(hl_cleanup_FnInfo))) = ((FnInfo*)hl_map_get_own((u_ctx)->f_fns, u_skey, usf_dummy_fn()));
-        hl_str* hlc_h_9249 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
-        if ((!hl_str_eq((u_sf)->f_attr_secrets, hlc_h_9249))) {
-            hl_str* hlc_h_9250 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(",");
-            hl_list* u_parts __attribute__((cleanup(hl_cleanup_list))) = hl_str_split((u_sf)->f_attr_secrets, hlc_h_9250);
+        hl_str* hlc_h_9259 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
+        if ((!hl_str_eq((u_sf)->f_attr_secrets, hlc_h_9259))) {
+            hl_str* hlc_h_9260 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(",");
+            hl_list* u_parts __attribute__((cleanup(hl_cleanup_list))) = hl_str_split((u_sf)->f_attr_secrets, hlc_h_9260);
             hl_str* u_joined __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
             int64_t u_pj = 0;
             while ((u_pj < hl_list_len(u_parts))) {
                 if ((u_pj == 0)) {
-                    { hl_str* __hl_old = u_joined; u_joined = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_parts, u_pj, 980L))); hl_str_release(__hl_old); }
+                    { hl_str* __hl_old = u_joined; u_joined = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_parts, u_pj, 1005L))); hl_str_release(__hl_old); }
                 } else {
-                    hl_str* hlc_h_9251 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(", ");
-                    hl_str* hlc_h_9252 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(u_joined, hlc_h_9251);
-                    { hl_str* __hl_old = u_joined; u_joined = hl_str_concat(hlc_h_9252, (hl_str*)hl_unbox_ptr(hl_list_get(u_parts, u_pj, 982L))); hl_str_release(__hl_old); }
+                    hl_str* hlc_h_9261 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(", ");
+                    hl_str* hlc_h_9262 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(u_joined, hlc_h_9261);
+                    { hl_str* __hl_old = u_joined; u_joined = hl_str_concat(hlc_h_9262, (hl_str*)hl_unbox_ptr(hl_list_get(u_parts, u_pj, 1007L))); hl_str_release(__hl_old); }
                 }
-                u_pj = hl_add_i64(u_pj, 1, 984L);
+                u_pj = hl_add_i64(u_pj, 1, 1009L);
             }
-            hl_str* hlc_h_9253 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("    ");
-            hl_str* hlc_h_9254 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9253, u_skey);
-            hl_str* hlc_h_9255 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(": ");
-            hl_str* hlc_h_9256 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9254, hlc_h_9255);
-            hl_list_push(u_secret_rows, hl_str_concat(hlc_h_9256, u_joined));
+            hl_str* hlc_h_9263 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("    ");
+            hl_str* hlc_h_9264 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9263, u_skey);
+            hl_str* hlc_h_9265 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(": ");
+            hl_str* hlc_h_9266 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9264, hlc_h_9265);
+            hl_list_push(u_secret_rows, hl_str_concat(hlc_h_9266, u_joined));
         }
-        u_sec_i = hl_add_i64(u_sec_i, 1, 988L);
+        u_sec_i = hl_add_i64(u_sec_i, 1, 1013L);
     }
     if ((hl_list_len(u_secret_rows) > 0)) {
-        hl_str* hlc_h_9257 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  #[secrets(...)] annotations: ");
-        hl_str* hlc_h_9258 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(hl_list_len(u_secret_rows));
-        hl_println(hl_str_concat(hlc_h_9257, hlc_h_9258));
+        hl_str* hlc_h_9267 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  #[secrets(...)] annotations: ");
+        hl_str* hlc_h_9268 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(hl_list_len(u_secret_rows));
+        hl_println(hl_str_concat(hlc_h_9267, hlc_h_9268));
         int64_t u_sec_j = 0;
         while ((u_sec_j < hl_list_len(u_secret_rows))) {
-            hl_println(hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_secret_rows, u_sec_j, 994L))));
-            u_sec_j = hl_add_i64(u_sec_j, 1, 995L);
+            hl_println(hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_secret_rows, u_sec_j, 1019L))));
+            u_sec_j = hl_add_i64(u_sec_j, 1, 1020L);
         }
     }
     hl_list* u_ct_rows __attribute__((cleanup(hl_cleanup_list))) = ({
-    hl_list* hlc_ll_9259 = hl_list_new(hl_str_release);
-    hlc_ll_9259;
+    hl_list* hlc_ll_9269 = hl_list_new(hl_str_release);
+    hlc_ll_9269;
 });
     int64_t u_cti = 0;
     while ((u_cti < hl_list_len((u_ctx)->f_fn_order))) {
-        hl_str* u_ckey __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get((u_ctx)->f_fn_order, u_cti, 1004L)));
+        hl_str* u_ckey __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get((u_ctx)->f_fn_order, u_cti, 1029L)));
         FnInfo* u_cf __attribute__((cleanup(hl_cleanup_FnInfo))) = ((FnInfo*)hl_map_get_own((u_ctx)->f_fns, u_ckey, usf_dummy_fn()));
-        if (((u_cf)->f_attr_ct && ({ hl_str* hlc_h_9260 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(""); (!hl_str_eq((u_cf)->f_attr_secrets, hlc_h_9260)); }))) {
-            hl_str* hlc_h_9261 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(",");
-            hl_list* u_cparts __attribute__((cleanup(hl_cleanup_list))) = hl_str_split((u_cf)->f_attr_secrets, hlc_h_9261);
+        if (((u_cf)->f_attr_ct && ({ hl_str* hlc_h_9270 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(""); (!hl_str_eq((u_cf)->f_attr_secrets, hlc_h_9270)); }))) {
+            hl_str* hlc_h_9271 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(",");
+            hl_list* u_cparts __attribute__((cleanup(hl_cleanup_list))) = hl_str_split((u_cf)->f_attr_secrets, hlc_h_9271);
             hl_str* u_cjoined __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
             int64_t u_cj = 0;
             while ((u_cj < hl_list_len(u_cparts))) {
                 if ((u_cj == 0)) {
-                    { hl_str* __hl_old = u_cjoined; u_cjoined = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_cparts, u_cj, 1012L))); hl_str_release(__hl_old); }
+                    { hl_str* __hl_old = u_cjoined; u_cjoined = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_cparts, u_cj, 1037L))); hl_str_release(__hl_old); }
                 } else {
-                    hl_str* hlc_h_9262 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(", ");
-                    hl_str* hlc_h_9263 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(u_cjoined, hlc_h_9262);
-                    { hl_str* __hl_old = u_cjoined; u_cjoined = hl_str_concat(hlc_h_9263, (hl_str*)hl_unbox_ptr(hl_list_get(u_cparts, u_cj, 1014L))); hl_str_release(__hl_old); }
+                    hl_str* hlc_h_9272 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(", ");
+                    hl_str* hlc_h_9273 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(u_cjoined, hlc_h_9272);
+                    { hl_str* __hl_old = u_cjoined; u_cjoined = hl_str_concat(hlc_h_9273, (hl_str*)hl_unbox_ptr(hl_list_get(u_cparts, u_cj, 1039L))); hl_str_release(__hl_old); }
                 }
-                u_cj = hl_add_i64(u_cj, 1, 1016L);
+                u_cj = hl_add_i64(u_cj, 1, 1041L);
             }
-            hl_str* hlc_h_9264 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("    ");
-            hl_str* hlc_h_9265 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9264, u_ckey);
-            hl_str* hlc_h_9266 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(": ct over ");
-            hl_str* hlc_h_9267 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9265, hlc_h_9266);
-            hl_list_push(u_ct_rows, hl_str_concat(hlc_h_9267, u_cjoined));
+            hl_str* hlc_h_9274 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("    ");
+            hl_str* hlc_h_9275 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9274, u_ckey);
+            hl_str* hlc_h_9276 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(": ct over ");
+            hl_str* hlc_h_9277 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9275, hlc_h_9276);
+            hl_list_push(u_ct_rows, hl_str_concat(hlc_h_9277, u_cjoined));
         }
-        u_cti = hl_add_i64(u_cti, 1, 1020L);
+        u_cti = hl_add_i64(u_cti, 1, 1045L);
     }
     if ((hl_list_len(u_ct_rows) > 0)) {
-        hl_str* hlc_h_9268 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  #[ct] claims: ");
-        hl_str* hlc_h_9269 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(hl_list_len(u_ct_rows));
-        hl_println(hl_str_concat(hlc_h_9268, hlc_h_9269));
+        hl_str* hlc_h_9278 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  #[ct] claims: ");
+        hl_str* hlc_h_9279 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(hl_list_len(u_ct_rows));
+        hl_println(hl_str_concat(hlc_h_9278, hlc_h_9279));
         int64_t u_ctj = 0;
         while ((u_ctj < hl_list_len(u_ct_rows))) {
-            hl_println(hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_ct_rows, u_ctj, 1026L))));
-            u_ctj = hl_add_i64(u_ctj, 1, 1027L);
+            hl_println(hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_ct_rows, u_ctj, 1051L))));
+            u_ctj = hl_add_i64(u_ctj, 1, 1052L);
         }
     }
-    hl_str* hlc_h_9270 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
-    if (hl_str_eq((u_ctx)->f_crate_link_script, hlc_h_9270)) {
+    hl_str* hlc_h_9280 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
+    if (hl_str_eq((u_ctx)->f_crate_link_script, hlc_h_9280)) {
         hl_println(hl_cstr("  Linker script: none declared (#![link_script] absent) \342\200\224 custom sections use the default linker layout"));
     } else {
         int64_t u_named = 0;
         int64_t u_aligned = 0;
         int64_t u_si = 0;
         while ((u_si < hl_list_len((u_ctx)->f_fn_order))) {
-            FnInfo* u_sf_2 __attribute__((cleanup(hl_cleanup_FnInfo))) = ((FnInfo*)hl_map_get_own((u_ctx)->f_fns, (hl_str*)hl_unbox_ptr(hl_list_get((u_ctx)->f_fn_order, u_si, 1037L)), usf_dummy_fn()));
-            hl_str* hlc_h_9271 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
-            if ((!hl_str_eq((u_sf_2)->f_attr_section, hlc_h_9271))) {
-                u_named = hl_add_i64(u_named, 1, 1039L);
+            FnInfo* u_sf_2 __attribute__((cleanup(hl_cleanup_FnInfo))) = ((FnInfo*)hl_map_get_own((u_ctx)->f_fns, (hl_str*)hl_unbox_ptr(hl_list_get((u_ctx)->f_fn_order, u_si, 1062L)), usf_dummy_fn()));
+            hl_str* hlc_h_9281 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
+            if ((!hl_str_eq((u_sf_2)->f_attr_section, hlc_h_9281))) {
+                u_named = hl_add_i64(u_named, 1, 1064L);
             }
             if (((u_sf_2)->f_attr_align >= 0)) {
-                u_aligned = hl_add_i64(u_aligned, 1, 1042L);
+                u_aligned = hl_add_i64(u_aligned, 1, 1067L);
             }
-            u_si = hl_add_i64(u_si, 1, 1044L);
+            u_si = hl_add_i64(u_si, 1, 1069L);
         }
-        hl_str* hlc_h_9272 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  Linker script: ");
-        hl_str* hlc_h_9273 __attribute__((cleanup(hl_cleanup_str))) = usf_link_script_path(hl_retain(u_ctx));
-        hl_str* hlc_h_9274 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9272, hlc_h_9273);
-        hl_str* hlc_h_9275 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(" \342\200\224 ");
-        hl_str* hlc_h_9276 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9274, hlc_h_9275);
-        hl_str* hlc_h_9277 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_named);
-        hl_str* hlc_h_9278 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9276, hlc_h_9277);
-        hl_str* hlc_h_9279 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(" section(s) named, ");
-        hl_str* hlc_h_9280 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9278, hlc_h_9279);
-        hl_str* hlc_h_9281 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(hl_list_len((u_ctx)->f_link_script_patterns));
-        hl_str* hlc_h_9282 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9280, hlc_h_9281);
-        hl_str* hlc_h_9283 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(" pattern(s) placed");
-        hl_println(hl_str_concat(hlc_h_9282, hlc_h_9283));
+        hl_str* hlc_h_9282 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  Linker script: ");
+        hl_str* hlc_h_9283 __attribute__((cleanup(hl_cleanup_str))) = usf_link_script_path(hl_retain(u_ctx));
+        hl_str* hlc_h_9284 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9282, hlc_h_9283);
+        hl_str* hlc_h_9285 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(" \342\200\224 ");
+        hl_str* hlc_h_9286 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9284, hlc_h_9285);
+        hl_str* hlc_h_9287 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_named);
+        hl_str* hlc_h_9288 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9286, hlc_h_9287);
+        hl_str* hlc_h_9289 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(" section(s) named, ");
+        hl_str* hlc_h_9290 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9288, hlc_h_9289);
+        hl_str* hlc_h_9291 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(hl_list_len((u_ctx)->f_link_script_patterns));
+        hl_str* hlc_h_9292 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9290, hlc_h_9291);
+        hl_str* hlc_h_9293 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(" pattern(s) placed");
+        hl_println(hl_str_concat(hlc_h_9292, hlc_h_9293));
         if ((u_aligned > 0)) {
-            hl_str* hlc_h_9284 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  #[align(N)] annotations: ");
-            hl_str* hlc_h_9285 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_aligned);
-            hl_println(hl_str_concat(hlc_h_9284, hlc_h_9285));
+            hl_str* hlc_h_9294 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("  #[align(N)] annotations: ");
+            hl_str* hlc_h_9295 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_aligned);
+            hl_println(hl_str_concat(hlc_h_9294, hlc_h_9295));
         }
     }
     hl_list* u_cap_rows __attribute__((cleanup(hl_cleanup_list))) = ({
-    hl_list* hlc_ll_9286 = hl_list_new(hl_str_release);
-    hlc_ll_9286;
+    hl_list* hlc_ll_9296 = hl_list_new(hl_str_release);
+    hlc_ll_9296;
 });
     int64_t u_capi = 0;
     while ((u_capi < hl_list_len((u_ctx)->f_fn_order))) {
-        hl_str* u_capkey __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get((u_ctx)->f_fn_order, u_capi, 1058L)));
+        hl_str* u_capkey __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get((u_ctx)->f_fn_order, u_capi, 1083L)));
         hl_list* u_cgrants __attribute__((cleanup(hl_cleanup_list))) = usf_cap_grants(hl_retain(u_ctx), hl_retain(u_capkey));
         if ((hl_list_len(u_cgrants) > 0)) {
-            hl_str* hlc_h_9287 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("    ");
-            hl_str* hlc_h_9288 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9287, u_capkey);
-            hl_str* hlc_h_9289 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(": ");
-            hl_str* hlc_h_9290 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9288, hlc_h_9289);
-            hl_str* hlc_h_9291 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(", ");
-            hl_str* hlc_h_9292 __attribute__((cleanup(hl_cleanup_str))) = hl_str_join(u_cgrants, hlc_h_9291);
-            hl_list_push(u_cap_rows, hl_str_concat(hlc_h_9290, hlc_h_9292));
+            hl_str* hlc_h_9297 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("    ");
+            hl_str* hlc_h_9298 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9297, u_capkey);
+            hl_str* hlc_h_9299 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(": ");
+            hl_str* hlc_h_9300 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9298, hlc_h_9299);
+            hl_str* hlc_h_9301 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(", ");
+            hl_str* hlc_h_9302 __attribute__((cleanup(hl_cleanup_str))) = hl_str_join(u_cgrants, hlc_h_9301);
+            hl_list_push(u_cap_rows, hl_str_concat(hlc_h_9300, hlc_h_9302));
         }
-        u_capi = hl_add_i64(u_capi, 1, 1063L);
+        u_capi = hl_add_i64(u_capi, 1, 1088L);
     }
     if ((hl_list_len(u_cap_rows) > 0)) {
         hl_println(hl_cstr("  Capability tokens (Cap[E] parameters / cap_take calls):"));
         int64_t u_capj = 0;
         while ((u_capj < hl_list_len(u_cap_rows))) {
-            hl_println(hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_cap_rows, u_capj, 1069L))));
-            u_capj = hl_add_i64(u_capj, 1, 1070L);
+            hl_println(hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_cap_rows, u_capj, 1094L))));
+            u_capj = hl_add_i64(u_capj, 1, 1095L);
         }
     }
     hl_println(hl_cstr("  Active effects:    IO, Fs, Clock, Args, Exit, Net, Rand, Proc"));
@@ -36973,56 +36999,56 @@ void usf_print_audit(Ctx* u_ctx_p) {
     hl_println(hl_cstr("  Explicit untaint:         taint_unwrap, std.sanitize.*"));
     hl_println(hl_cstr(""));
     hl_list* u_targs_users __attribute__((cleanup(hl_cleanup_list))) = ({
-    hl_list* hlc_ll_9293 = hl_list_new(hl_str_release);
-    hlc_ll_9293;
+    hl_list* hlc_ll_9303 = hl_list_new(hl_str_release);
+    hlc_ll_9303;
 });
     hl_list* u_rft_users __attribute__((cleanup(hl_cleanup_list))) = ({
-    hl_list* hlc_ll_9294 = hl_list_new(hl_str_release);
-    hlc_ll_9294;
+    hl_list* hlc_ll_9304 = hl_list_new(hl_str_release);
+    hlc_ll_9304;
 });
     hl_list* u_rl_users __attribute__((cleanup(hl_cleanup_list))) = ({
-    hl_list* hlc_ll_9295 = hl_list_new(hl_str_release);
-    hlc_ll_9295;
+    hl_list* hlc_ll_9305 = hl_list_new(hl_str_release);
+    hlc_ll_9305;
 });
     int64_t u_si_2 = 0;
     while ((u_si_2 < hl_list_len(u_keys))) {
-        hl_str* u_skey_2 __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_keys, u_si_2, 1096L)));
+        hl_str* u_skey_2 __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_keys, u_si_2, 1121L)));
         hl_list* u_callees __attribute__((cleanup(hl_cleanup_list))) = ((hl_list*)hl_map_get_own((u_ctx)->f_edges, u_skey_2, ({
-    hl_list* hlc_ll_9296 = hl_list_new(hl_str_release);
-    hlc_ll_9296;
+    hl_list* hlc_ll_9306 = hl_list_new(hl_str_release);
+    hlc_ll_9306;
 })));
         int64_t u_cj_2 = 0;
         while ((u_cj_2 < hl_list_len(u_callees))) {
-            hl_str* u_ce __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_callees, u_cj_2, 1100L)));
-            hl_str* hlc_h_9297 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("b:tainted_args");
-            if (hl_str_eq(u_ce, hlc_h_9297)) {
+            hl_str* u_ce __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_callees, u_cj_2, 1125L)));
+            hl_str* hlc_h_9307 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("b:tainted_args");
+            if (hl_str_eq(u_ce, hlc_h_9307)) {
                 if ((!usf_list_has(hl_retain(u_targs_users), hl_retain(u_skey_2)))) {
                     hl_list_push(u_targs_users, hl_retain(u_skey_2));
                 }
             }
-            hl_str* hlc_h_9298 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("b:read_file_tainted");
-            if (hl_str_eq(u_ce, hlc_h_9298)) {
+            hl_str* hlc_h_9308 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("b:read_file_tainted");
+            if (hl_str_eq(u_ce, hlc_h_9308)) {
                 if ((!usf_list_has(hl_retain(u_rft_users), hl_retain(u_skey_2)))) {
                     hl_list_push(u_rft_users, hl_retain(u_skey_2));
                 }
             }
-            hl_str* hlc_h_9299 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("b:read_line");
-            if (hl_str_eq(u_ce, hlc_h_9299)) {
+            hl_str* hlc_h_9309 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("b:read_line");
+            if (hl_str_eq(u_ce, hlc_h_9309)) {
                 if ((!usf_list_has(hl_retain(u_rl_users), hl_retain(u_skey_2)))) {
                     hl_list_push(u_rl_users, hl_retain(u_skey_2));
                 }
             }
-            u_cj_2 = hl_add_i64(u_cj_2, 1, 1116L);
+            u_cj_2 = hl_add_i64(u_cj_2, 1, 1141L);
         }
-        u_si_2 = hl_add_i64(u_si_2, 1, 1118L);
+        u_si_2 = hl_add_i64(u_si_2, 1, 1143L);
     }
     if ((hl_list_len(u_targs_users) > 0)) {
         hl_println(hl_cstr("  Functions calling tainted_args():"));
         int64_t u_ti = 0;
         while ((u_ti < hl_list_len(u_targs_users))) {
-            hl_str* hlc_h_9300 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("    - ");
-            hl_println(hl_str_concat(hlc_h_9300, (hl_str*)hl_unbox_ptr(hl_list_get(u_targs_users, u_ti, 1124L))));
-            u_ti = hl_add_i64(u_ti, 1, 1125L);
+            hl_str* hlc_h_9310 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("    - ");
+            hl_println(hl_str_concat(hlc_h_9310, (hl_str*)hl_unbox_ptr(hl_list_get(u_targs_users, u_ti, 1149L))));
+            u_ti = hl_add_i64(u_ti, 1, 1150L);
         }
     } else {
         hl_println(hl_cstr("  No function calls tainted_args() (no argv-taint sources in this program)."));
@@ -37031,9 +37057,9 @@ void usf_print_audit(Ctx* u_ctx_p) {
         hl_println(hl_cstr("  Functions calling read_file_tainted():"));
         int64_t u_ri = 0;
         while ((u_ri < hl_list_len(u_rft_users))) {
-            hl_str* hlc_h_9301 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("    - ");
-            hl_println(hl_str_concat(hlc_h_9301, (hl_str*)hl_unbox_ptr(hl_list_get(u_rft_users, u_ri, 1134L))));
-            u_ri = hl_add_i64(u_ri, 1, 1135L);
+            hl_str* hlc_h_9311 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("    - ");
+            hl_println(hl_str_concat(hlc_h_9311, (hl_str*)hl_unbox_ptr(hl_list_get(u_rft_users, u_ri, 1159L))));
+            u_ri = hl_add_i64(u_ri, 1, 1160L);
         }
     } else {
         hl_println(hl_cstr("  No function calls read_file_tainted()."));
@@ -37042,82 +37068,82 @@ void usf_print_audit(Ctx* u_ctx_p) {
         hl_println(hl_cstr("  Functions calling read_line():"));
         int64_t u_li = 0;
         while ((u_li < hl_list_len(u_rl_users))) {
-            hl_str* hlc_h_9302 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("    - ");
-            hl_println(hl_str_concat(hlc_h_9302, (hl_str*)hl_unbox_ptr(hl_list_get(u_rl_users, u_li, 1144L))));
-            u_li = hl_add_i64(u_li, 1, 1145L);
+            hl_str* hlc_h_9312 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("    - ");
+            hl_println(hl_str_concat(hlc_h_9312, (hl_str*)hl_unbox_ptr(hl_list_get(u_rl_users, u_li, 1169L))));
+            u_li = hl_add_i64(u_li, 1, 1170L);
         }
     } else {
         hl_println(hl_cstr("  No function calls read_line()."));
     }
     hl_list* u_ffi_src_rows __attribute__((cleanup(hl_cleanup_list))) = ({
-    hl_list* hlc_ll_9303 = hl_list_new(hl_str_release);
-    hlc_ll_9303;
+    hl_list* hlc_ll_9313 = hl_list_new(hl_str_release);
+    hlc_ll_9313;
 });
     hl_list* u_ffi_sink_rows __attribute__((cleanup(hl_cleanup_list))) = ({
-    hl_list* hlc_ll_9304 = hl_list_new(hl_str_release);
-    hlc_ll_9304;
+    hl_list* hlc_ll_9314 = hl_list_new(hl_str_release);
+    hlc_ll_9314;
 });
     hl_list* u_ffi_plain_rows __attribute__((cleanup(hl_cleanup_list))) = ({
-    hl_list* hlc_ll_9305 = hl_list_new(hl_str_release);
-    hlc_ll_9305;
+    hl_list* hlc_ll_9315 = hl_list_new(hl_str_release);
+    hlc_ll_9315;
 });
     int64_t u_fi = 0;
     while ((u_fi < hl_list_len(u_keys))) {
-        hl_str* u_fkey __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_keys, u_fi, 1163L)));
+        hl_str* u_fkey __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_keys, u_fi, 1188L)));
         FnInfo* u_ff __attribute__((cleanup(hl_cleanup_FnInfo))) = ((FnInfo*)hl_map_get_own((u_ctx)->f_fns, u_fkey, usf_dummy_fn()));
         if ((u_ff)->f_is_extern) {
             if ((u_ff)->f_attr_taint_source) {
-                hl_str* hlc_h_9306 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("    - ");
-                hl_str* hlc_h_9307 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9306, u_fkey);
-                hl_str* hlc_h_9308 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(": -> ");
-                hl_str* hlc_h_9309 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9307, hlc_h_9308);
-                hl_list_push(u_ffi_src_rows, hl_str_concat(hlc_h_9309, (u_ff)->f_ret));
-            }
-            hl_str* hlc_h_9310 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
-            if ((!hl_str_eq((u_ff)->f_attr_taint_sinks, hlc_h_9310))) {
-                hl_str* hlc_h_9311 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("    - ");
-                hl_str* hlc_h_9312 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9311, u_fkey);
-                hl_str* hlc_h_9313 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(": ");
-                hl_str* hlc_h_9314 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9312, hlc_h_9313);
-                hl_list_push(u_ffi_sink_rows, hl_str_concat(hlc_h_9314, (u_ff)->f_attr_taint_sinks));
-            }
-            if (((!(u_ff)->f_attr_taint_source) && ({ hl_str* hlc_h_9315 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(""); hl_str_eq((u_ff)->f_attr_taint_sinks, hlc_h_9315); }))) {
                 hl_str* hlc_h_9316 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("    - ");
                 hl_str* hlc_h_9317 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9316, u_fkey);
                 hl_str* hlc_h_9318 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(": -> ");
                 hl_str* hlc_h_9319 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9317, hlc_h_9318);
-                hl_list_push(u_ffi_plain_rows, hl_str_concat(hlc_h_9319, (u_ff)->f_ret));
+                hl_list_push(u_ffi_src_rows, hl_str_concat(hlc_h_9319, (u_ff)->f_ret));
+            }
+            hl_str* hlc_h_9320 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("");
+            if ((!hl_str_eq((u_ff)->f_attr_taint_sinks, hlc_h_9320))) {
+                hl_str* hlc_h_9321 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("    - ");
+                hl_str* hlc_h_9322 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9321, u_fkey);
+                hl_str* hlc_h_9323 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(": ");
+                hl_str* hlc_h_9324 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9322, hlc_h_9323);
+                hl_list_push(u_ffi_sink_rows, hl_str_concat(hlc_h_9324, (u_ff)->f_attr_taint_sinks));
+            }
+            if (((!(u_ff)->f_attr_taint_source) && ({ hl_str* hlc_h_9325 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(""); hl_str_eq((u_ff)->f_attr_taint_sinks, hlc_h_9325); }))) {
+                hl_str* hlc_h_9326 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("    - ");
+                hl_str* hlc_h_9327 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9326, u_fkey);
+                hl_str* hlc_h_9328 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(": -> ");
+                hl_str* hlc_h_9329 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9327, hlc_h_9328);
+                hl_list_push(u_ffi_plain_rows, hl_str_concat(hlc_h_9329, (u_ff)->f_ret));
             }
         }
-        u_fi = hl_add_i64(u_fi, 1, 1176L);
+        u_fi = hl_add_i64(u_fi, 1, 1201L);
     }
-    if ((hl_add_i64(hl_add_i64(hl_list_len(u_ffi_src_rows), hl_list_len(u_ffi_sink_rows), 1178L), hl_list_len(u_ffi_plain_rows), 1178L) == 0)) {
+    if ((hl_add_i64(hl_add_i64(hl_list_len(u_ffi_src_rows), hl_list_len(u_ffi_sink_rows), 1203L), hl_list_len(u_ffi_plain_rows), 1203L) == 0)) {
         hl_println(hl_cstr("  FFI taint marking (Stage 109): no extern declarations."));
     } else {
         hl_println(hl_cstr("  FFI taint marking (Stage 109):"));
-        hl_str* hlc_h_9320 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("    #[taint_source] externs (returns untrusted, typed tainted[ret]): ");
-        hl_str* hlc_h_9321 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(hl_list_len(u_ffi_src_rows));
-        hl_println(hl_str_concat(hlc_h_9320, hlc_h_9321));
+        hl_str* hlc_h_9330 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("    #[taint_source] externs (returns untrusted, typed tainted[ret]): ");
+        hl_str* hlc_h_9331 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(hl_list_len(u_ffi_src_rows));
+        hl_println(hl_str_concat(hlc_h_9330, hlc_h_9331));
         int64_t u_fsj = 0;
         while ((u_fsj < hl_list_len(u_ffi_src_rows))) {
-            hl_println(hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_ffi_src_rows, u_fsj, 1185L))));
-            u_fsj = hl_add_i64(u_fsj, 1, 1186L);
+            hl_println(hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_ffi_src_rows, u_fsj, 1210L))));
+            u_fsj = hl_add_i64(u_fsj, 1, 1211L);
         }
-        hl_str* hlc_h_9322 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("    #[taint_sink(...)] externs (declared sinks): ");
-        hl_str* hlc_h_9323 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(hl_list_len(u_ffi_sink_rows));
-        hl_println(hl_str_concat(hlc_h_9322, hlc_h_9323));
+        hl_str* hlc_h_9332 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("    #[taint_sink(...)] externs (declared sinks): ");
+        hl_str* hlc_h_9333 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(hl_list_len(u_ffi_sink_rows));
+        hl_println(hl_str_concat(hlc_h_9332, hlc_h_9333));
         int64_t u_fkj = 0;
         while ((u_fkj < hl_list_len(u_ffi_sink_rows))) {
-            hl_println(hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_ffi_sink_rows, u_fkj, 1191L))));
-            u_fkj = hl_add_i64(u_fkj, 1, 1192L);
+            hl_println(hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_ffi_sink_rows, u_fkj, 1216L))));
+            u_fkj = hl_add_i64(u_fkj, 1, 1217L);
         }
-        hl_str* hlc_h_9324 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("    Unmarked externs (returns TRUSTED by the taint lattice): ");
-        hl_str* hlc_h_9325 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(hl_list_len(u_ffi_plain_rows));
-        hl_println(hl_str_concat(hlc_h_9324, hlc_h_9325));
+        hl_str* hlc_h_9334 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr("    Unmarked externs (returns TRUSTED by the taint lattice): ");
+        hl_str* hlc_h_9335 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(hl_list_len(u_ffi_plain_rows));
+        hl_println(hl_str_concat(hlc_h_9334, hlc_h_9335));
         int64_t u_fpj = 0;
         while ((u_fpj < hl_list_len(u_ffi_plain_rows))) {
-            hl_println(hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_ffi_plain_rows, u_fpj, 1197L))));
-            u_fpj = hl_add_i64(u_fpj, 1, 1198L);
+            hl_println(hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_ffi_plain_rows, u_fpj, 1222L))));
+            u_fpj = hl_add_i64(u_fpj, 1, 1223L);
         }
     }
 }
@@ -37131,10 +37157,10 @@ hl_str* usf_pad_right(hl_str* u_s_p, int64_t u_n_p) {
     }
     hl_str* u_out __attribute__((cleanup(hl_cleanup_str))) = hl_retain(u_s);
     int64_t u_i = 0;
-    while ((u_i < hl_sub_i64(u_n, u_sl, 1211L))) {
-        hl_str* hlc_h_9326 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(" ");
-        { hl_str* __hl_old = u_out; u_out = hl_str_concat(u_out, hlc_h_9326); hl_str_release(__hl_old); }
-        u_i = hl_add_i64(u_i, 1, 1213L);
+    while ((u_i < hl_sub_i64(u_n, u_sl, 1236L))) {
+        hl_str* hlc_h_9336 __attribute__((cleanup(hl_cleanup_str))) = hl_cstr(" ");
+        { hl_str* __hl_old = u_out; u_out = hl_str_concat(u_out, hlc_h_9336); hl_str_release(__hl_old); }
+        u_i = hl_add_i64(u_i, 1, 1238L);
     }
     return hl_retain(u_out);
 }
