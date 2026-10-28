@@ -13,6 +13,95 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v1.0.0-rc.1] — Stage 146: the release candidate, the feature freeze declared
+- The roadmap's phrase is "v1.0 Release Candidate 1 (feature freeze)",
+  and it is two promises tied together: this tree is now GOOD ENOUGH
+  to be called 1.0.0-rc.1, and after this tag the surface does not
+  move again until v1.0.0. Until now both promises lived only in
+  prose — a roadmap box, a changelog heading — and nothing in the
+  tree could answer the only questions a candidate must answer: is
+  this tree READY to carry the name, and what may still land once it
+  does? This release ships the machinery that answers both,
+  fail-closed, in the native toolchain (`tools/hls-rc.hls`, written
+  in Halis, compiled by the compiler it certifies — no Python on any
+  path a release manager drives).
+- **`hls-rc readiness` is the checklist, each law named with the
+  fact it measured.** The roadmap law parses ROADMAP.md live — 150
+  rows, numbered in order, the closed stages a contiguous prefix,
+  the open set confined to the RC tail: a feature stage still open
+  past Stage 145 contradicts a candidate whose surface froze at
+  Stage 141. The freeze law pins the identity of
+  `tests/api_freeze.json` (written by hls-freeze, Stage 141, its
+  frozen commit an ancestor of HEAD — the digest's own arithmetic
+  stays in the tool that owns it; this kit refuses to guess a second
+  copy). The marker law demands one voice from the three places the
+  release version lives — the changelog heading, the snapshot
+  manifest, the editor manifest. The snapshot law requires the seed
+  on board. The LTS law requires LTS.md published while NO
+  `.hls-lts.json` exists: the candidate opens no support window — a
+  pre-1.0 LTS is a contradiction.
+- **`hls-rc declare` cuts the candidate on paper.** The tag grammar
+  is strict: `v1.0.0-rc.N` (or `rcN`), N in 1..4 — a bare v1.0.0 is
+  Stage 150, not a candidate; -alpha and -beta are the channels this
+  tree retired; build metadata names a build, not a candidate; a
+  fifth rc is a roadmap amendment, not a release decision. The stage
+  law binds candidate N to Stage 145+N and demands the row already
+  ticked by the release that carries it. The sort law uses the full
+  semver 2.0.0 §11.4 precedence (numeric identifiers numerically,
+  alphanumeric ASCII-lexically, numeric < alphanumeric, a longer
+  identifier list over its own prefix) to require the candidate to
+  outrank every tag the tree has ever named. The tree must be clean:
+  the anchor pins a commit. It then writes `.hls-rc.json` — the
+  ANCHOR: tag, commit, day (the committer day; `--at` pins it), the
+  freeze digest, the successor — and refuses a re-declaration as
+  noise, one anchor per tree.
+- **`hls-rc gate` is the feature freeze itself.** From the anchor to
+  v1.0.0, every commit is classified with the SAME prefix grammar
+  the LTS policy enforces — one classifier, every gate — and the
+  diff gate re-classes a "fix" that adds std/ or core/ surface,
+  introduces new public functions, or edits SPEC.md into the FEATURE
+  it really is. BUGFIX and CHORE land; FEATURE and UNKNOWN are named
+  sha by sha and the gate exits 1, because an unrecognised commit is
+  not a fix. `--range A..B` judges any range the release manager
+  points at; `make rc-gate` is the release sequence's step.
+- **`hls-rc report` renders the record (RC.md at the repository
+  root).** The readiness table, the anchor, the freeze, the admission
+  law, and the road to v1.0.0 read LIVE from the roadmap's own rows.
+  Deterministic per anchor (no wall clock — the day is the anchor's
+  committer day), never rendered from a tree whose markers moved
+  past the anchor, and `make rc-report-check` re-derives the
+  committed copy and refuses drift — a hand-edited record is visible
+  as a diff, the same publication law LTS.md already lives under.
+- **The acceptance gate.** `make rc-acceptance` — nine sections, 68
+  checks, over the real CLI and REAL scratch git repositories: the
+  convention (the usage law, the exits, --json), the readiness law
+  (the real tree green; scratch worlds failing one law at a time,
+  each named), the tag grammar shape by shape, the declare law (the
+  anchor written, the re-declare refused, the dirty tree refused),
+  the gate law commit by commit (fixes and chores land, a feature is
+  named, a stranger is named, a fix that grows the surface is
+  re-classed), the report law (deterministic, drift refused), the
+  sort law over real tags, the LTS handoff (the candidate opens no
+  window) — and the corpus showcase.
+- **The corpus showcase.** `tests/ok/feat_stage146_rc1.hls` pins the
+  decision procedure in pure HLS: the candidate grammar (both
+  spellings, the retired channels, the leading-zero law, the
+  four-candidate ceiling), the rc.N → Stage 145+N mapping, the §11.4
+  precedence table (rc.1 < rc.2 < rc.10, numeric < alphanumeric, the
+  release outranking its own candidates), the admission law per
+  class, and the readiness contiguity law — hlfmt-canonical,
+  hllint-clean, byte-identical on the interpreter and natively.
+- **The record:** ROADMAP Stage 146 ticks; SPEC §84 walks the laws;
+  the README tour grows the block and the layout gains RC.md and the
+  anchor. The version markers move together to 1.0.0-rc.1 — the
+  changelog heading, the snapshot manifest (a manifest-only refresh,
+  `make snapshot-regen`: the emitted C did not move), the editor
+  manifest. The freeze, the snapshot bytes and the guarantee ledger
+  did not move — `make freeze-verify` / `make snapshot-verify` say
+  so on this very tree. Stage 145's own gates still pass untouched:
+  `make lts-policy-acceptance`, green — the candidate inherits the
+  published promise and defers to it.
+
 ## [v0.166.0-alpha] — Stage 145: the LTS policy published (3 years bug-fix, 5 years security)
 - The roadmap's phrase is the promise: "LTS policy published (3
   years bug-fix, 5 years security)". Stage 132 built the executable

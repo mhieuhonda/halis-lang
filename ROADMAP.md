@@ -221,7 +221,7 @@ remains green.
 | 143 | Bit-for-bit reproducible bootstrap chain | ✅ | (kit shipped in v0.162.0-alpha; the chain itself in v0.163.0-alpha) |
 | 144 | Independent third-party security audit (final) | ✅ | (done in v0.165.0-alpha) |
 | 145 | LTS policy published (3 years bug-fix, 5 years security) | ✅ | (done in v0.166.0-alpha) |
-| 146 | v1.0 Release Candidate 1 (feature freeze) | ⬜ | 4 weeks |
+| 146 | v1.0 Release Candidate 1 (feature freeze) | ✅ | (done in v1.0.0-rc.1) |
 | 147 | v1.0 Release Candidate 2 (bug-fix only) | ⬜ | 4 weeks |
 | 148 | v1.0 Release Candidate 3 (final dry-run) | ⬜ | 4 weeks |
 | 149 | v1.0 Release Candidate 4 (sign-off) | ⬜ | 2 weeks |

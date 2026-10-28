@@ -10526,3 +10526,108 @@ The policy begins at v1.0 — a pre-1.0 LTS is a contradiction, and
 is declared, LTS.md is the promise and the gates prove the
 enforcement on scratch lines with fabricated birthdays; the day
 `hls-lts init --tag v1.0.0` runs, the document becomes the clock.
+
+## 84. The release candidate — readiness, the anchor, the feature freeze (Stage 146 — v1.0.0-rc.1)
+
+A candidate is two promises tied together: this tree is good enough
+to be called 1.0.0-rc.1, and after this tag the surface does not
+move again until v1.0.0. Stage 141 (§78) froze the API against its
+own derived document; this stage binds the RELEASE to the same
+discipline — the readiness is machine-checked, the act of cutting
+is recorded, and the freeze that follows is a gate over real
+commits, not a sentence in the roadmap. `tools/hls-rc.hls` (written
+in Halis, compiled by the compiler it certifies) carries the four
+commands; `RC.md` and `.hls-rc.json` are the two artifacts that
+travel with the tree.
+
+### 84.1. The readiness — six laws, each named with its fact
+
+- `hls-rc readiness` re-derives the checklist from the live tree on
+  every run, never from a cache: **the repo law** (the anchor pins a
+  commit; there must be a repository), **the roadmap law**
+  (ROADMAP.md parsed live — exactly 150 rows, numbered in order,
+  the closed stages a contiguous prefix, the open set confined to
+  the RC tail; a feature stage still open past Stage 145
+  contradicts a candidate whose surface froze at Stage 141; a
+  cancelled row carries no status cell and is closed by
+  definition), **the freeze law** (`tests/api_freeze.json` written
+  by hls-freeze at Stage 141, carrying a sha256 digest, its frozen
+  commit an ancestor of HEAD — the digest's arithmetic stays in the
+  tool that owns it, and this kit refuses to guess a second copy),
+  **the marker law** (one voice from the changelog heading, the
+  snapshot manifest and the editor manifest), **the snapshot law**
+  (the seed travels with the candidate), and **the LTS law**
+  (LTS.md published while NO `.hls-lts.json` exists — the candidate
+  opens no support window).
+- The verdict is `READY` / `NOT READY` with every failing law named
+  and its remedy spelled out; `--json` renders the same verdict for
+  the release automation.
+
+### 84.2. The candidate grammar and the anchor
+
+- A candidate of v1.0.0 is `v1.0.0-rc.N` (or `rcN`), N in 1..4. A
+  bare `v1.0.0` is the LTS release (Stage 150), not a candidate;
+  the `-alpha`/`-beta` channels are what this tree retired; build
+  metadata names a build, not a candidate; the number is
+  `0`-free (`rc.02` is a rendering) and starts at `rc.1`; a fifth
+  candidate is a roadmap amendment, not a release decision.
+- The **stage law**: candidate N closes Stage 145+N, and by declare
+  time the row is already ticked by the release that carries it —
+  the roadmap's first open stage is the one after the candidate's
+  own. The **sort law**: the candidate outranks every tag the tree
+  has ever named, judged with the full semver 2.0.0 §11.4
+  precedence — numeric identifiers numerically, alphanumeric
+  ASCII-lexically, numeric < alphanumeric, a longer identifier list
+  over its own prefix, the release outranking its own candidates.
+- `hls-rc declare --tag v1.0.0-rc.1` runs the readiness, tightens
+  the marker law to the tag itself, requires a clean tracked tree
+  (the anchor pins a commit), and writes **`.hls-rc.json`** — the
+  anchor: tag, commit, day (the committer day; `--at` pins it),
+  stage, freeze digest, successor. A re-declaration is refused as
+  noise; one anchor per tree.
+
+### 84.3. The feature freeze as a gate
+
+- From the anchor to v1.0.0, `hls-rc gate` classifies every commit
+  with the SAME prefix grammar the LTS policy (§71) enforces — one
+  classifier, every gate. BUGFIX (fix / bugfix / revert / hotfix /
+  regression) and CHORE (chore / release / docs / doc / test /
+  tests / ci / meta) land. FEATURE (feat / feature / add / stage /
+  spec / stdlib / perf / opt / refactor) and UNKNOWN (no recognized
+  prefix — fail-closed) are named sha by sha and the gate exits 1.
+- The **diff gate** rides along: a commit with a fix prefix that
+  adds a `std/` or `core/` file, introduces a new public function
+  in a Halis module, or edits SPEC.md is re-classed into the
+  FEATURE it really is — the message law first, the diff's
+  testimony second. A `Security:` trailer is reported beside the
+  class (a marked FEATURE is still a FEATURE); `--range A..B`
+  judges any range the release manager points at.
+
+### 84.4. The record and the publication law
+
+- `hls-rc report` renders **RC.md** at the repository root: the
+  candidate, the anchor, the freeze, the readiness table, the
+  admission law, and the road to v1.0.0 read LIVE from the
+  roadmap's own rows. The render is deterministic per anchor — no
+  wall clock (the day is the anchor's committer day), no tree
+  paths — and is never produced from a world whose markers moved
+  past the anchor: the record renders at the candidate's own
+  release, not after the train moved on.
+- `make rc-report-check` re-derives the committed copy and refuses
+  drift, naming the regenerate command — the same publication law
+  LTS.md lives under (§83): the page is a render, not a memo.
+- The acceptance gate (`make rc-acceptance`, nine sections, 68
+  checks) drives the real CLI over real scratch git repositories —
+  the checklist failing one law at a time, the grammar shape by
+  shape, the anchor written and defended, the gate judging real
+  commits, the render deterministic and drift-refused — and the
+  corpus fixture `tests/ok/feat_stage146_rc1.hls` pins the decision
+  procedure in pure HLS, byte-identical on the interpreter and
+  natively.
+
+The candidate defers to the published promise it inherits: the LTS
+policy begins at v1.0.0, and the day `hls-lts init --tag v1.0.0`
+runs (Stage 150), the support windows of §83 become the clock. Until
+then the freeze law above is the only thing standing between the
+tree and the release — and every fact on the record's page is
+re-derived on demand.

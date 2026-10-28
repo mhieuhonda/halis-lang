@@ -334,6 +334,45 @@ make lts-policy-acceptance    # Stage 145 gate: the window battery
                                # repos with fabricated birthdays,
                                # because a support window cannot
                                # wait three years to be tested)
+bin/hls-rc readiness          # Stage 146: the release-candidate
+                               # kit — the machine-checked
+                               # checklist (roadmap closed through
+                               # 145 with the open set in the RC
+                               # tail, the Stage 141 freeze
+                               # anchored in this history, the
+                               # version markers speaking one
+                               # voice, the seed on board, LTS.md
+                               # published with no line declared)
+bin/hls-rc declare --tag v1.0.0-rc.1
+                               # cut the candidate ON PAPER: the
+                               # rc grammar (rc.1..rc.4 — a fifth
+                               # is a roadmap amendment), the
+                               # semver sort law over every tag
+                               # that exists, the stage law
+                               # (rc.N closes 145+N), the tree
+                               # clean; writes .hls-rc.json — the
+                               # anchor: tag, commit, day, freeze
+                               # digest, successor
+bin/hls-rc gate               # the feature freeze itself: every
+                               # commit since the anchor judged
+                               # with the LTS classifier's own
+                               # grammar — fixes and chores land,
+                               # features and strangers are named
+                               # sha by sha; a "fix" that grows
+                               # std/ surface is re-classed into
+                               # the FEATURE it really is
+cat RC.md                     # the candidate's record — a render
+                               # from the live tree, deterministic
+                               # per anchor, drift refused
+make rc-report-check          # re-derive the committed RC.md
+make rc-acceptance            # Stage 146 gate: the candidate
+                               # battery (the readiness laws one
+                               # refusal at a time, the tag
+                               # grammar shape by shape, the
+                               # anchor written and defended, the
+                               # freeze judging real commits in
+                               # scratch repos, the sort law, the
+                               # publication law)
 python3 tools/hls-xdiff.py     # Stage 133: the cross-impl
                                # differential table — the SAME
                                # program through the interpreter,
@@ -880,6 +919,11 @@ halis-lang/
 ├── LTS.md               # Stage 145: the published support policy (3y
 │                        #   bug-fix, 5y security) — rendered from the
 │                        #   hls-lts constants, verified every run
+├── RC.md                # Stage 146: the release candidate's record —
+│                        #   rendered from the live tree by the rc kit,
+│                        #   deterministic per anchor, drift refused
+├── .hls-rc.json         # the anchor: the tag, its commit, its day and
+│                        #   the freeze digest the gate defends
 ├── snapshot/            # Stage 142: the committed C snapshot — the seed the
 │   ├── hlc.c            #   pure bootstrap compiles (hlc's own emission for
 │   └── MANIFEST.json    #   src/hlc.hls) + its content-addressed manifest
