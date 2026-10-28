@@ -13,6 +13,92 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v1.0.0-rc.3] — Stage 148: the final dry-run, the release day rehearsed
+- The roadmap's phrase is "v1.0 Release Candidate 3 (final dry-run)",
+  and the dry-run is exactly what this round is: the whole v1.0.0
+  release day — the last candidate's successor — performed end to
+  end with the real instruments on a scratch world, exactly as
+  Stage 150 will run it, so that whatever breaks breaks NOW instead
+  of on the day. The rehearsal walks a world candidate by candidate
+  (rc.1..rc.4, each cut the real way: the row ticked, the markers
+  moved, the old anchor leaving with the release commit, the record
+  rendered and drift-checked) to the eve of the release, then cuts
+  it: the markers move to 1.0.0, the anchor retires with the
+  release commit, the tag is cut, `hls-lts init --tag v1.0.0` opens
+  the line, the windows become the clock (3 years of bug fixes, 5
+  of security, from the base day) — and the RC kit RETIRES, named:
+  readiness refusing on both the roadmap law (nothing left to
+  candidate for) and the lts law (a line is declared), the gate and
+  the record refusing on the missing anchor. The morning after is
+  rehearsed with it: a fix lands on main, backports onto
+  release/1.0 with its `Backported-from` provenance, `hls-lts
+  tag-patch` cuts v1.0.1, the audit stays clean, and the gate over
+  the WHOLE road (rc.1 to the release) is green. The wrong turns
+  are rehearsed too: a bare v1.0.0 is refused by the rc grammar (it
+  is the LTS release, not a candidate), a pre-release is not an LTS
+  base, a pre-1.0 tag is not a line, and the line opens only on a
+  tag that exists — each refusal pinned with its words.
+- **The dry-run found two defects in the record, both fixed.** The
+  candidate's record is a render, and the render was mis-speaking.
+  The tag line hardcoded the FIRST candidate's identity — "(…,
+  feature freeze)" — onto every candidate after it, so rc.2's
+  committed record claimed the feature freeze where the roadmap row
+  it stood on said "bug-fix only"; a record that misquotes the map
+  it stands on is a record nobody can trust. The phrase now comes
+  from the row itself (the render reads the candidate's own
+  parenthetical off the live roadmap), and a row without one makes
+  no identity claim at all — the record never speaks a phrase the
+  roadmap did not say. The second lie sat at exactly the boundary
+  the dry-run rehearses: the successor line told every candidate
+  its successor was "cut the same way this one was" — true for
+  rc.1..rc.3, false for rc.4, whose successor is the release
+  itself: no declare (the grammar refuses a bare v1.0.0), the
+  anchor retiring with the release commit, the tag, the LTS line,
+  the windows. The last candidate's successor line now speaks the
+  release cut it actually precedes, and the release the whole line
+  walks toward is named by one constant both the successor rule
+  and the successor line share.
+- **The acceptance gate.** `make rc3-acceptance` — six sections, 43
+  checks: the record law (each candidate's record carries its own
+  phrase — feature freeze, bug-fix only, final dry-run, sign-off —
+  and rc.4's successor line speaks the release cut, and a
+  phraseless row renders no claim), the real-tree pre-flight
+  (readiness green, the gate green over the live range, the markers
+  one voice, the committed record drift-free and speaking its
+  stage's phrase off the live roadmap — the law reads the row where
+  the record stands, so it stays green for every candidate after
+  this one), the eve rehearsal (the whole candidate line walked on
+  one scratch world to the last anchor, its successor named), the
+  release day (the wrong turns, the cut, the clock, the retirement
+  on both laws, the idempotent line, the refused second line), the
+  day after (the fix, the backport with provenance, v1.0.1, the
+  audit, the whole road green), and the corpus showcase.
+- **The corpus showcase.** `tests/ok/feat_stage148_rc3.hls` pins
+  the dry-run's laws in pure HLS: the sequence law (the release
+  day is an ordered machine — a step runs when its predecessor is
+  done, and the one idempotent step is the line init), the
+  hand-off law (the boundary between the RC kit and the LTS kit is
+  exactly one artifact, the v1.0.0 tag — the last candidate's
+  successor IS the line's base, one boundary, two kits, no gap),
+  the retirement law (a retired kit refuses, named — it does not
+  pretend the world is still its own and it does not crash on the
+  hand-off), the order law (the tag needs the markers, the line
+  needs the tag, the backport needs the line and a fix to carry,
+  the patch needs the backport), and the window law (bug fixes
+  through the third anniversary, security through the fifth, the
+  horizon day belonging to the phase it closes) — hlfmt-canonical,
+  hllint-clean, byte-identical on the interpreter and natively.
+- **The record:** ROADMAP Stage 148 ticks; the README tour grows
+  the `rc3-acceptance` line; the version markers move together to
+  1.0.0-rc.3 — the changelog heading, the snapshot manifest
+  (manifest-only: the emitted C did not move this round), the
+  editor manifest. The freeze, the guarantee ledger and the
+  snapshot fixed point did not move — `make freeze-verify` /
+  `make guarantee-report` / `make snapshot-verify` say so on this
+  very tree. Stage 146's and Stage 147's own gates still pass
+  untouched: `make rc-acceptance`, `make rc2-acceptance`, green —
+  the successor inherits the kit that certified its predecessor.
+
 ## [v1.0.0-rc.2] — Stage 147: the bug-fix round, the successor candidate cut
 - The roadmap's phrase is "v1.0 Release Candidate 2 (bug-fix only)",
   and the freeze kit made the shape of the release before the

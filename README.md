@@ -383,6 +383,21 @@ make rc2-acceptance           # Stage 147 gate: the bug-fix round
                                # cut rehearsed end to end on a
                                # scratch world, the corpus
                                # showcase)
+make rc3-acceptance           # Stage 148 gate: the final dry-run
+                               # (the record quoting each
+                               # candidate's own phrase off the
+                               # roadmap, rc.4's successor line
+                               # speaking the release cut, the
+                               # whole candidate line walked on
+                               # one scratch world to the eve,
+                               # the release day itself — the
+                               # markers moved, the anchor
+                               # retired, the tag cut, the LTS
+                               # line opened, the windows the
+                               # clock, the RC kit refusing on
+                               # both laws — the morning after
+                               # rehearsed with it: the backport,
+                               # v1.0.1, the whole road green)
 python3 tools/hls-xdiff.py     # Stage 133: the cross-impl
                                # differential table — the SAME
                                # program through the interpreter,
