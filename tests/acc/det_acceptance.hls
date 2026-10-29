@@ -1,0 +1,837 @@
+# ============================================================================
+# tests/acc/det_acceptance.hls — Stage 127 acceptance gate, in Halis
+# (the Halis twin of tests/det_acceptance.py; same eight sections,
+# same assertions, same needles — the harness is tests/acc/harness.hls
+# and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make det-acceptance` (which compiles this file and runs it
+# from the repo root).
+#
+# Everything runs through the REAL verifier CLI (python3
+# tools/hls-det.py), the REAL compiler recipe (bin/hlc + gcc -O2 -lm
+# -pthread) and the REAL interpreter (boot.py --det). The armed/unarmed
+# env discipline mirrors the battery: HL_DET_SCHED=1 and HL_DET_TRACE=1
+# are set around an armed child and unset around an unarmed one
+# (std.env; children inherit). The trace is the stderr lines starting
+# with the reserved stem, compared line by line against the
+# hand-computed section-67 policy.
+#
+# The battery imported tools/hls-det.py for the validator's unit checks
+# (parse_trace / check_stdout_protocol — no CLI surface); the gate runs
+# the same module through a tiny python driver in its scratch and
+# asserts the printed CHECK lines under the battery's own names (the
+# repro-gate pattern: the front door a native binary has).
+#
+#  1. the convention  — usage gates are exit 2 (missing file,
+#                      non-.hls, --runs < 2, --timeout < 1); the flags
+#                      compose; a skipped leg says so loudly
+#  2. the policy      — the rotation/park_wake/bounded_wake traces are
+#                      the hand-computed policy on BOTH backends; the
+#                      select fixture's shape (one select op, both
+#                      channels fed after the park, list-order scan)
+#  3. the runtime     — the emitted C carries the det region, the arm
+#     wiring           call, the env + trace protocol; --no-libc stubs
+#                      the hooks; an unarmed binary matches the unarmed
+#                      interpreter on the showcase
+#  4. the             — every det_libs fixture certifies (exit 0,
+#     certification    parity agreed); --runs 8 --json carries the
+#                      config, the runs and the stats; argv reaches
+#                      the program on both legs
+#  5. the fairness    — the recv_or poll loop's exact answer
+#                      (empty_polls=0, got=3) and the tool's
+#                      certification; the hltest --det witness green
+#                      armed and unarmed
+#  6. the deadlock    — exit 101, empty stdout, the canonical Stage 16
+#     & panic parity   message, both backends and both modes; the tool
+#                      certifies the deterministic death honestly
+#  7. the honesty     — a clock-reading program is NOT DETERMINISTIC;
+#     gates            a forged step line is a protocol error; the
+#                      validator's unit checks (gap, malformed, unknown
+#                      op, look-alike, well-formed, stdout forgery,
+#                      chatter separation)
+#  8. the differential— trace/stdout/exit equality across backends for
+#     & the corpus     the whole fixture set; the showcase green
+#     hygiene          unarmed; every fixture hlfmt-canonical,
+#                      hllint-clean, checker-green; no verifier litter
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.json"
+import "std.result"
+import "std.env"
+
+# ----------------------------------------------------------------------------
+# The gate's constants (the battery's).
+# ----------------------------------------------------------------------------
+
+fn showcase() -> str {
+    return "tests/ok/feat_stage127_det.hls"
+}
+
+fn panic_fixture() -> str {
+    return "tests/ok/panic_stage127_det.hls"
+}
+
+fn libs_dir() -> str {
+    return "tests/det_libs"
+}
+
+fn det_hlc(acc: Acc) -> str {
+    return path_join3(acc.root, "bin/hlc")
+}
+
+fn native_ready(acc: Acc) -> bool uses Proc, Fs {
+    return file_exists(det_hlc(acc)) && which("gcc")
+}
+
+struct TraceCase {
+    label: str,
+    path: str,
+    steps: list[str]
+}
+
+# The section-67 policy, derived by hand. Each fixture's trace is the
+# rotation made visible: the FIFO queue, the wakee ahead of the waker,
+# the child's first turn before the parent's next.
+fn expected_traces() -> list[TraceCase] {
+    let rotation: list[str] = [
+        "__HLDET_STEP__ 0 t0 spawn t1",
+        "__HLDET_STEP__ 1 t1 recv ch0",
+        "__HLDET_STEP__ 2 t0 send ch0",
+        "__HLDET_STEP__ 3 t0 send ch0",
+        "__HLDET_STEP__ 4 t1 send ch1",
+        "__HLDET_STEP__ 5 t0 recv ch1",
+        "__HLDET_STEP__ 6 t1 recv ch0",
+        "__HLDET_STEP__ 7 t0 recv ch1",
+        "__HLDET_STEP__ 8 t1 send ch1",
+        "__HLDET_STEP__ 9 t1 finish",
+        "__HLDET_STEP__ 10 t0 join t1",
+    ]
+    let park_wake: list[str] = [
+        "__HLDET_STEP__ 0 t0 spawn t1",
+        "__HLDET_STEP__ 1 t1 recv ch0",
+        "__HLDET_STEP__ 2 t0 send ch0",
+        "__HLDET_STEP__ 3 t0 join t1",
+        "__HLDET_STEP__ 4 t1 finish",
+    ]
+    let bounded: list[str] = [
+        "__HLDET_STEP__ 0 t0 spawn t1",
+        "__HLDET_STEP__ 1 t1 send ch0",
+        "__HLDET_STEP__ 2 t0 spawn t2",
+        "__HLDET_STEP__ 3 t1 send ch0",
+        "__HLDET_STEP__ 4 t2 send ch0",
+        "__HLDET_STEP__ 5 t0 recv ch0",
+        "__HLDET_STEP__ 6 t0 recv ch0",
+        "__HLDET_STEP__ 7 t1 send ch0",
+        "__HLDET_STEP__ 8 t0 recv ch0",
+        "__HLDET_STEP__ 9 t1 finish",
+        "__HLDET_STEP__ 10 t0 recv ch0",
+        "__HLDET_STEP__ 11 t2 send ch0",
+        "__HLDET_STEP__ 12 t0 recv ch0",
+        "__HLDET_STEP__ 13 t2 send ch0",
+        "__HLDET_STEP__ 14 t0 recv ch0",
+        "__HLDET_STEP__ 15 t2 finish",
+        "__HLDET_STEP__ 16 t0 join t1",
+        "__HLDET_STEP__ 17 t0 join t2",
+    ]
+    return [
+        TraceCase { label: "rotation.hls",
+            path: path_join3(libs_dir(), "rotation.hls"), steps: rotation },
+        TraceCase { label: "park_wake.hls",
+            path: path_join3(libs_dir(), "park_wake.hls"), steps: park_wake },
+        TraceCase { label: "bounded_wake.hls",
+            path: path_join3(libs_dir(), "bounded_wake.hls"), steps: bounded },
+    ]
+}
+
+fn all_libs() -> list[str] {
+    return [path_join3(libs_dir(), "rotation.hls"),
+        path_join3(libs_dir(), "park_wake.hls"),
+        path_join3(libs_dir(), "bounded_wake.hls"),
+        path_join3(libs_dir(), "select_rotation.hls"),
+        path_join3(libs_dir(), "fairness_poll.hls"),
+        path_join3(libs_dir(), "deadlock.hls"),
+        path_join3(libs_dir(), "rotation_test.hls"),
+        showcase()]
+}
+
+# ----------------------------------------------------------------------------
+# JSON accessors — null-safe, so a failed leg FAILs instead of crashing.
+# ----------------------------------------------------------------------------
+
+fn parse_json(text: str) -> JsonValue {
+    let rr: Result[JsonValue, str] = json_parse_result(text)
+    if result_is_ok(rr) {
+        return result_unwrap(rr)
+    }
+    return json_null()
+}
+
+fn jstr(v: JsonValue, key: str) -> str {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_str(x) {
+        return json_str_value(x)
+    }
+    return ""
+}
+
+fn jint(v: JsonValue, key: str) -> int {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_int(x) {
+        return json_int_value(x)
+    }
+    return 0
+}
+
+fn jbool(v: JsonValue, key: str) -> bool {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_bool(x) {
+        return json_bool_value(x)
+    }
+    return false
+}
+
+fn jarr(v: JsonValue, key: str) -> list[JsonValue] {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_array(x) {
+        return x.arr
+    }
+    let empty: list[JsonValue] = []
+    return empty
+}
+
+# ----------------------------------------------------------------------------
+# The det run helpers.
+# ----------------------------------------------------------------------------
+
+struct DetRun {
+    code: int,
+    out: str,
+    steps: list[str],
+    err: str
+}
+
+fn det_run(code: int, r: RunResult) -> DetRun {
+    let steps: list[str] = []
+    let lines: list[str] = r.err.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).starts_with("__HLDET_STEP__ ") {
+            steps.push(lines.get(i))
+        }
+        i = i + 1
+    }
+    return DetRun { code: code, out: r.out, steps: steps, err: r.err }
+}
+
+# arm_env() / disarm_env() — the battery builds a fresh child env with
+# HL_DET_SCHED=1 + HL_DET_TRACE=1 for every traced run and leaves the
+# process env clean for every unarmed run; children inherit ours.
+fn arm_env() -> void uses Proc {
+    env_set_var("HL_DET_SCHED", "1")
+    env_set_var("HL_DET_TRACE", "1")
+}
+
+fn disarm_env() -> void uses Proc {
+    env_unset_var("HL_DET_SCHED")
+    env_unset_var("HL_DET_TRACE")
+}
+
+# det_trace_native(acc, src, name, argv) — compile with the house
+# recipe into the gate's scratch, run armed with the trace, return
+# (exit, stdout, steps, stderr). A failed compile surfaces as code -2
+# (the battery raises; the gate fails its legs loudly instead of dying).
+fn det_trace_native(acc: Acc, src: str, name: str, argv: list[str]) -> DetRun uses IO, Fs, Proc {
+    let c_path: str = scratch(acc, name + ".c")
+    let bin_path: str = scratch(acc, name)
+    let comp: RunResult = run_capture(det_hlc(acc), [src, c_path])
+    if comp.code != 0 {
+        return det_run(-2, comp)
+    }
+    let cc: RunResult = run_capture("gcc",
+        ["-O2", "-o", bin_path, c_path, "-lm", "-pthread"])
+    if cc.code != 0 {
+        return det_run(-2, cc)
+    }
+    arm_env()
+    let r: RunResult = run_capture(bin_path, argv)
+    disarm_env()
+    return det_run(r.code, r)
+}
+
+# det_trace_interp(acc, src, argv) — boot.py --det with the trace armed.
+fn det_trace_interp(acc: Acc, src: str, argv: list[str]) -> DetRun uses Proc {
+    let args: list[str] = ["--det", src]
+    let mut i: int = 0
+    while i < argv.len() {
+        args.push(argv.get(i))
+        i = i + 1
+    }
+    arm_env()
+    let r: RunResult = boot(acc, args)
+    disarm_env()
+    return det_run(r.code, r)
+}
+
+fn trace_eq(a: list[str], b: list[str]) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    let mut i: int = 0
+    while i < a.len() {
+        if a.get(i) != b.get(i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# tok(s, i) — s.split(" ")[i], "" past the end.
+fn tok(s: str, i: int) -> str {
+    let parts: list[str] = s.split(" ")
+    if i >= 0 && i < parts.len() {
+        return parts.get(i)
+    }
+    return ""
+}
+
+fn run_det_tool(acc: Acc, args: list[str]) -> RunResult uses Proc {
+    let argv: list[str] = [path_join3(acc.root, "tools/hls-det.py")]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    return run_capture("python3", argv)
+}
+
+# dir_names(path) — os.listdir via `ls -A` (dotfiles included), one
+# name per line, "" when the directory cannot be read.
+fn dir_names(path: str) -> list[str] uses Proc {
+    let r: RunResult = run_capture("ls", ["-A", path])
+    if r.code != 0 {
+        let empty: list[str] = []
+        return empty
+    }
+    let names: list[str] = []
+    let lines: list[str] = r.out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i) != "" {
+            names.push(lines.get(i))
+        }
+        i = i + 1
+    }
+    return names
+}
+
+# ----------------------------------------------------------------------------
+# The validator driver (section 7's unit checks — the battery imports
+# tools/hls-det.py; the gate drives the same module and asserts the
+# printed CHECK lines).
+# ----------------------------------------------------------------------------
+
+fn det_val_driver(acc: Acc) -> str uses Fs, Proc {
+    return write_src(acc, "det_val.py",
+        "import importlib.util as ilu, sys\n"
+        + "spec = ilu.spec_from_file_location(\"hls_det\", sys.argv[1])\n"
+        + "m = ilu.module_from_spec(spec)\n"
+        + "sys.modules[\"hls_det\"] = m\n"
+        + "spec.loader.exec_module(m)\n"
+        + "def b(x):\n"
+        + "    return \"1\" if x else \"0\"\n"
+        + "def pe(s):\n"
+        + "    try:\n"
+        + "        m.parse_trace(s.encode())\n"
+        + "    except m.ProtocolError:\n"
+        + "        return True\n"
+        + "    return False\n"
+        + "print(\"CHECK gap \" + b(pe(\"__HLDET_STEP__ 0 t0 recv ch0\\n"
+        + "__HLDET_STEP__ 2 t0 recv ch0\\n\")))\n"
+        + "print(\"CHECK malformed \" + b(pe(\"__HLDET_STEP__ x t0 recv ch0\\n\")))\n"
+        + "print(\"CHECK unknown_op \" + b(pe(\"__HLDET_STEP__ 0 t0 teleport ch0\\n\")))\n"
+        + "print(\"CHECK lookalike \" + b(pe(\"some __HLDET_ chatter\\n\")))\n"
+        + "print(\"CHECK wellformed \" + b(not pe(\"__HLDET_STEP__ 0 t0 spawn t1\\n"
+        + "__HLDET_STEP__ 1 t1 finish\\n\")))\n"
+        + "try:\n"
+        + "    m.check_stdout_protocol(b\"__HLDET_STEP__ 9 t9 recv ch9\\n\")\n"
+        + "    forgery = False\n"
+        + "except m.ProtocolError:\n"
+        + "    forgery = True\n"
+        + "print(\"CHECK stdout_forgery \" + b(forgery))\n"
+        + "steps, chatter = m.parse_trace(b\"__HLDET_STEP__ 0 t0 recv ch0\\n"
+        + "program chatter\\n\")\n"
+        + "print(\"CHECK chatter \" + b(steps == [\"__HLDET_STEP__ 0 t0 recv ch0\"] "
+        + "and chatter == [\"program chatter\"]))\n")
+}
+
+fn driver_check(acc: Acc, r: RunResult, key: str, name: str) -> void uses IO {
+    let lines: list[str] = r.out.split("\n")
+    let prefix: str = "CHECK " + key + " "
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).starts_with(prefix) {
+            let v: str = lines.get(i).slice(prefix.len(), lines.get(i).len()).trim()
+            check(acc, name, v == "1", "")
+            return
+        }
+        i = i + 1
+    }
+    check(acc, name, false, "driver produced no CHECK " + key
+        + " line: " + clip(r.combined, 100))
+}
+
+# ----------------------------------------------------------------------------
+# 1. the convention and the refusal matrix
+# ----------------------------------------------------------------------------
+fn sec1(acc: Acc) -> bool uses IO, Fs, Proc {
+    section("1. the convention and the refusal matrix")
+    let p: RunResult = run_det_tool(acc, ["no-such-file.hls"])
+    check(acc, "a missing workload is a usage failure (exit 2)",
+        p.code == 2 && p.err.contains("no such file"), clip(p.err, 80))
+
+    let p2: RunResult = run_det_tool(acc, ["Makefile"])
+    check(acc, "a non-.hls workload is a usage failure (exit 2)",
+        p2.code == 2 && p2.err.contains("not a .hls workload"),
+        clip(p2.err, 80))
+
+    let rot: str = path_join3(libs_dir(), "rotation.hls")
+    let p3: RunResult = run_det_tool(acc, ["--runs", "1", rot])
+    check(acc, "--runs 1 is refused (a determinism claim needs two runs)",
+        p3.code == 2 && p3.err.contains("at least two runs"), clip(p3.err, 80))
+
+    let p4: RunResult = run_det_tool(acc, ["--timeout", "0", rot])
+    check(acc, "a non-positive timeout is refused",
+        p4.code == 2 && p4.err.contains("--timeout must be >= 1"),
+        clip(p4.err, 80))
+
+    if !native_ready(acc) {
+        println("  [SKIP] the remaining sections need bin/hlc + gcc")
+        return false
+    }
+
+    let pw: str = path_join3(libs_dir(), "park_wake.hls")
+    let p5: RunResult = run_det_tool(acc, ["--no-parity", "--runs", "2", pw])
+    check(acc, "the flags compose and a skipped leg says so, loudly",
+        p5.code == 0 && p5.out.contains("SKIPPED (--no-parity, explicit)"),
+        clip(p5.combined, 120))
+    return true
+}
+
+# ----------------------------------------------------------------------------
+# 2. the policy: hand-computed interleaving traces
+# ----------------------------------------------------------------------------
+fn sec2(acc: Acc) -> void uses IO, Fs, Proc {
+    section("2. the policy: hand-computed interleaving traces")
+    let cases: list[TraceCase] = expected_traces()
+    let mut i: int = 0
+    while i < cases.len() {
+        let c: TraceCase = cases.get(i)
+        let name: str = stem(c.path)
+        let nrun: DetRun = det_trace_native(acc, c.path, name, [])
+        let irun: DetRun = det_trace_interp(acc, c.path, [])
+        check(acc, c.label + ": the native trace is the policy, line by line",
+            nrun.code == 0 && trace_eq(nrun.steps, c.steps),
+            "rc=" + nrun.code.to_str() + " steps=" + nrun.steps.len().to_str()
+                + " want=" + c.steps.len().to_str())
+        check(acc, c.label + ": the interpreter trace is the same policy",
+            irun.code == 0 && trace_eq(irun.steps, c.steps),
+            "rc=" + irun.code.to_str() + " steps=" + irun.steps.len().to_str())
+        i = i + 1
+    }
+
+    # The select fixture's trace is policy-derived but long; assert its
+    # SHAPE: the select parks on both channels (no ready scan hit before
+    # the feeders send) and the wake comes through the first fed channel.
+    let sel_path: str = path_join3(libs_dir(), "select_rotation.hls")
+    let nrun: DetRun = det_trace_native(acc, sel_path, "select_rotation", [])
+    let sel: list[str] = []
+    let mut k: int = 0
+    while k < nrun.steps.len() {
+        if tok(nrun.steps.get(k), 3) == "select" {
+            sel.push(nrun.steps.get(k))
+        }
+        k = k + 1
+    }
+    check(acc, "select_rotation: exactly one select op (it parks, then returns)",
+        nrun.code == 0 && sel.len() == 1, "rc=" + nrun.code.to_str())
+
+    let mut sel_idx: int = -1
+    let mut m: int = 0
+    while m < nrun.steps.len() {
+        if sel_idx < 0 && tok(nrun.steps.get(m), 3) == "select" {
+            sel_idx = m
+        }
+        m = m + 1
+    }
+    let mut feed_after: int = 0
+    let mut f: int = sel_idx + 1
+    while f < nrun.steps.len() {
+        if tok(nrun.steps.get(f), 3) == "send"
+            && (tok(nrun.steps.get(f), 4) == "ch0"
+                || tok(nrun.steps.get(f), 4) == "ch1") {
+            feed_after = feed_after + 1
+        }
+        f = f + 1
+    }
+    check(acc, "select_rotation: both select channels are fed after the park",
+        feed_after == 2, feed_after.to_str())
+    check(acc, "select_rotation: the scan returns list order (ch_a first)",
+        nrun.out.starts_with("idx=0 a=11 b=22"), clip(nrun.out, 60))
+    let irun: DetRun = det_trace_interp(acc, sel_path, [])
+    check(acc, "select_rotation: interpreter trace identical to native",
+        trace_eq(irun.steps, nrun.steps), "")
+}
+
+# ----------------------------------------------------------------------------
+# 3. the runtime wiring (region, arm call, unarmed parity)
+# ----------------------------------------------------------------------------
+fn sec3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("3. the runtime wiring (region, arm call, unarmed parity)")
+    # The hosted emission carries the region and main() arms it.
+    let pw: str = path_join3(libs_dir(), "park_wake.hls")
+    let c_path: str = scratch(acc, "wiring.c")
+    run_capture(det_hlc(acc), [pw, c_path])
+    let csrc: str = read_or(c_path, "")
+    check(acc, "the emitted C carries the det region",
+        csrc.contains("Stage 127 (v0.145.0-alpha): the deterministic scheduler"),
+        "")
+    check(acc, "main() arms the mode (the arm call is emitted)",
+        csrc.contains("hl_det_init();"), "")
+    check(acc, "the region reads its env and speaks the trace protocol",
+        csrc.contains("HL_DET_SCHED") && csrc.contains("__HLDET_STEP__"), "")
+
+    # A --no-libc emission carries the stub macros and none of the mode.
+    let nl_path: str = scratch(acc, "wiring_nl.c")
+    run_capture(det_hlc(acc), ["--no-libc", pw, nl_path])
+    let nlsrc: str = read_or(nl_path, "")
+    check(acc, "a --no-libc emission stubs the hooks away",
+        nlsrc.contains("#define hl_det_yield() ((void)0)"), "")
+    let at: int = nlsrc.find("hl_rt_deadlock_check")
+    let mut head: str = nlsrc
+    if at >= 0 {
+        head = nlsrc.slice(0, at)
+    }
+    check(acc, "a --no-libc emission defines no scheduler",
+        !head.contains("hl_det_init")
+            || !nlsrc.contains("static void hl_det_init"), "")
+    check(acc, "a --no-libc main() arms nothing",
+        !nlsrc.contains("hl_det_init();"), "")
+
+    # An unarmed binary behaves exactly as before: the showcase's
+    # unarmed native output equals its unarmed interpreter output (the
+    # differential suite's own discipline, checked here for the corpus).
+    disarm_env()
+    let irun: RunResult = boot(acc, [showcase()])
+    let sc_path: str = scratch(acc, "showcase.c")
+    let b_path: str = scratch(acc, "showcase")
+    run_capture(det_hlc(acc), [showcase(), sc_path])
+    run_capture("gcc", ["-O2", "-o", b_path, sc_path, "-lm", "-pthread"])
+    let nrun: RunResult = run_capture(b_path, [])
+    check(acc, "unarmed native == unarmed interpreter on the showcase",
+        nrun.code == irun.code && nrun.out == irun.out && nrun.code == 0,
+        "interp=" + irun.code.to_str() + " nat=" + nrun.code.to_str())
+}
+
+# ----------------------------------------------------------------------------
+# 4. the determinism certification (the REAL CLI)
+# ----------------------------------------------------------------------------
+fn sec4(acc: Acc) -> void uses IO, Fs, Proc {
+    section("4. the determinism certification (the REAL CLI)")
+    let libs: list[str] = all_libs()
+    let mut i: int = 0
+    while i < libs.len() {
+        let fixture: str = libs.get(i)
+        let p: RunResult = run_det_tool(acc, [fixture])
+        check(acc, rel_to_root(acc, fixture) + " certifies (det + parity)",
+            p.code == 0 && p.out.contains("DETERMINISTIC")
+                && p.out.contains("parity: interpreter agrees"),
+            clip(p.combined, 120))
+        i = i + 1
+    }
+
+    # --runs 8 stays stable; --json parses and carries the story.
+    let rot: str = path_join3(libs_dir(), "rotation.hls")
+    let jp: str = scratch(acc, "report.json")
+    let p8: RunResult = run_det_tool(acc, ["--runs", "8", "--json", jp, rot])
+    check(acc, "--runs 8 certifies", p8.code == 0, clip(p8.combined, 120))
+    let rep: JsonValue = parse_json(read_or(jp, ""))
+    let runs: list[JsonValue] = jarr(rep, "runs")
+    let parity: JsonValue = json_object_get(rep, "parity")
+    let stats: JsonValue = json_object_get(rep, "stats")
+    let config: JsonValue = json_object_get(rep, "config")
+    let mut steps_stable: bool = runs.len() == 8
+    if steps_stable {
+        let s0: int = jint(runs.get(0), "steps")
+        let mut r: int = 1
+        while r < runs.len() {
+            if jint(runs.get(r), "steps") != s0 {
+                steps_stable = false
+            }
+            r = r + 1
+        }
+    }
+    check(acc, "the json report carries the config, the runs and the stats",
+        jstr(rep, "verdict") == "DETERMINISTIC"
+            && jint(config, "runs") == 8
+            && jbool(parity, "checked")
+            && jbool(parity, "steps_match")
+            && jbool(parity, "stdout_match")
+            && jbool(parity, "exit_match")
+            && steps_stable
+            && jint(stats, "steps") == 11
+            && jint(stats, "tasks") == 2,
+        "runs=" + runs.len().to_str()
+            + " steps=" + jint(stats, "steps").to_str()
+            + " tasks=" + jint(stats, "tasks").to_str())
+
+    # argv reaches the program (the plan-driving convention).
+    let argv_src: str = write_src(acc, "argv_probe.hls",
+        "# argv probe: echoes its first PROGRAM argument back.\n"
+        + "fn main() -> int uses IO, Args {\n"
+        + "    let a: list[str] = args()\n"
+        + "    if a.len() > 1 {\n"
+        + "        println(\"argv1=\" + a.get(1))\n"
+        + "    } else {\n"
+        + "        println(\"argv1=missing\")\n"
+        + "    }\n"
+        + "    return 0\n"
+        + "}\n")
+    let p: RunResult = run_det_tool(acc, [argv_src, "hello-det"])
+    let mut probe_ok: bool = p.code == 0
+    if probe_ok {
+        # The tool's report does not echo program stdout; certify the
+        # passthrough on both legs directly.
+        let nrun: DetRun = det_trace_native(acc, argv_src, "argv_probe",
+            ["hello-det"])
+        let irun: DetRun = det_trace_interp(acc, argv_src, ["hello-det"])
+        probe_ok = nrun.out.contains("argv1=hello-det")
+            && irun.out.contains("argv1=hello-det")
+    }
+    check(acc, "program argv passes through the verifier (both legs)",
+        probe_ok, "")
+}
+
+# rel_to_root(acc, path) — os.path.relpath against the repo root (the
+# paths the gate uses are already root-relative when they start with
+# the root prefix, absolute-scratch otherwise).
+fn rel_to_root(acc: Acc, path: str) -> str {
+    if acc.root != "" && path.starts_with(acc.root + "/") {
+        return path.slice(acc.root.len() + 1, path.len())
+    }
+    return path
+}
+
+# ----------------------------------------------------------------------------
+# 5. the fairness and the starvation matrix
+# ----------------------------------------------------------------------------
+fn sec5(acc: Acc) -> void uses IO, Fs, Proc {
+    section("5. the fairness and the starvation matrix")
+    # The recv_or poll loop never parks — under the rotation every poll
+    # is a yield, so the producer always gets its turn. The exact
+    # program output is asserted on the binary; the tool's certification
+    # is asserted beside it.
+    let fair: str = path_join3(libs_dir(), "fairness_poll.hls")
+    let nrun: DetRun = det_trace_native(acc, fair, "fairness", [])
+    check(acc, "the poll loop terminates with the rotation's exact answer",
+        nrun.code == 0 && nrun.out.contains("empty_polls=0")
+            && nrun.out.contains("got=3"),
+        "rc=" + nrun.code.to_str() + " out=" + clip(nrun.out, 60))
+    let p: RunResult = run_det_tool(acc, [fair])
+    check(acc, "and the tool certifies the poll loop (det + parity)",
+        p.code == 0 && p.out.contains("DETERMINISTIC"), clip(p.combined, 120))
+
+    # The hltest witness: armed and unarmed, the tests pass.
+    let rot_test: str = path_join3(libs_dir(), "rotation_test.hls")
+    let h1: RunResult = run_capture("python3",
+        [path_join3(acc.root, "tools/hltest.py"), "--det", rot_test])
+    check(acc, "hltest --det runs the witness green",
+        h1.out.contains("2 pass, 0 fail"), clip(h1.combined, 80))
+    let h2: RunResult = run_capture("python3",
+        [path_join3(acc.root, "tools/hltest.py"), rot_test])
+    check(acc, "hltest unarmed runs it green too",
+        h2.out.contains("2 pass, 0 fail"), clip(h2.combined, 80))
+}
+
+# ----------------------------------------------------------------------------
+# 6. the deadlock and the panic parity
+# ----------------------------------------------------------------------------
+fn sec6(acc: Acc) -> void uses IO, Fs, Proc {
+    section("6. the deadlock and the panic parity")
+    let dl: str = path_join3(libs_dir(), "deadlock.hls")
+    let fixtures: list[str] = [dl, panic_fixture()]
+    let labels: list[str] = ["det_libs/deadlock", "ok/panic_stage127_det"]
+    let mut i: int = 0
+    while i < fixtures.len() {
+        let fixture: str = fixtures.get(i)
+        let label: str = labels.get(i)
+        let flat: str = str_replace(label, "/", "_")
+        let nrun: DetRun = det_trace_native(acc, fixture, flat, [])
+        let irun: DetRun = det_trace_interp(acc, fixture, [])
+        check(acc, label + ": exit 101, empty stdout, both backends, det mode",
+            nrun.code == 101 && irun.code == 101 && nrun.out == ""
+                && irun.out == "",
+            "nat=" + nrun.code.to_str() + " interp=" + irun.code.to_str())
+        let needle: str = "deadlock: all tasks are blocked on channel operations"
+        check(acc, label + ": the canonical Stage 16 message, both backends",
+            nrun.err.contains(needle) && irun.err.contains(needle), "")
+
+        # Unarmed: the same verdict through the preemptive scan.
+        disarm_env()
+        let c_path: str = scratch(acc, "dl_" + flat + ".c")
+        let b_path: str = scratch(acc, "dl_" + flat)
+        run_capture(det_hlc(acc), [fixture, c_path])
+        run_capture("gcc", ["-O2", "-o", b_path, c_path, "-lm", "-pthread"])
+        let p: RunResult = run_capture(b_path, [])
+        let p2: RunResult = boot(acc, [fixture])
+        check(acc, label + ": the preemptive verdict agrees (unarmed, both "
+            + "backends)", p.code == 101 && p2.code == 101,
+            "nat=" + p.code.to_str() + " interp=" + p2.code.to_str())
+
+        # The tool certifies the deterministic death and says so.
+        let pt: RunResult = run_det_tool(acc, [fixture])
+        check(acc, label + ": hls-det certifies the deterministic death, "
+            + "honestly",
+            pt.code == 0 && pt.out.contains("exit 101")
+                && pt.out.contains("certified, not the health"),
+            clip(pt.combined, 120))
+        i = i + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 7. the honesty gates
+# ----------------------------------------------------------------------------
+fn sec7(acc: Acc) -> void uses IO, Fs, Proc {
+    section("7. the honesty gates")
+    # A clock-reading program is nondeterministic however it is
+    # scheduled: the tool must refuse (the comparison is real, not
+    # vacuous).
+    let nondet: str = path_join3(libs_dir(), "nondet_source.hls")
+    let p: RunResult = run_det_tool(acc, [nondet])
+    check(acc, "a clock-reading workload is refused (NOT DETERMINISTIC)",
+        p.code == 1 && p.out.contains("NOT DETERMINISTIC"),
+        clip(p.combined, 120))
+
+    # A forged step line is a loud protocol error, never a silent pass.
+    let lookalike: str = path_join3(libs_dir(), "lookalike.hls")
+    let p2: RunResult = run_det_tool(acc, [lookalike])
+    check(acc, "a forged step line on stdout is a protocol error",
+        p2.code == 1 && p2.out.contains("protocol look-alike on stdout"),
+        clip(p2.combined, 120))
+
+    # The validator, unit-checked through the same module the battery
+    # imports (a python driver — no CLI surface for these internals).
+    let dv: RunResult = run_capture("python3",
+        [det_val_driver(acc), path_join3(acc.root, "tools/hls-det.py")])
+    driver_check(acc, dv, "gap", "validator: a seq gap is refused")
+    driver_check(acc, dv, "malformed", "validator: a malformed record is refused")
+    driver_check(acc, dv, "unknown_op", "validator: an unknown op is refused")
+    driver_check(acc, dv, "lookalike", "validator: a look-alike line is refused")
+    driver_check(acc, dv, "wellformed",
+        "validator: a well-formed dense trace parses")
+    driver_check(acc, dv, "stdout_forgery",
+        "validator: a stdout forgery is refused")
+    driver_check(acc, dv, "chatter",
+        "validator: chatter is separated from steps")
+}
+
+# ----------------------------------------------------------------------------
+# 8. the differential and the corpus hygiene
+# ----------------------------------------------------------------------------
+fn sec8(acc: Acc) -> void uses IO, Fs, Proc {
+    section("8. the differential and the corpus hygiene")
+    # The full fixture set: interpreter det trace == native det trace.
+    let libs: list[str] = all_libs()
+    let mut allsame: bool = true
+    let mut i: int = 0
+    while i < libs.len() {
+        let fixture: str = libs.get(i)
+        let name: str = "s8_" + stem(fixture)
+        let nrun: DetRun = det_trace_native(acc, fixture, name, [])
+        let irun: DetRun = det_trace_interp(acc, fixture, [])
+        if !trace_eq(nrun.steps, irun.steps) || nrun.out != irun.out
+            || nrun.code != irun.code {
+            allsame = false
+            fail_msg(acc, "  trace divergence on " + rel_to_root(acc, fixture))
+        }
+        i = i + 1
+    }
+    check(acc, "every fixture: stdout, trace and exit identical across backends",
+        allsame, "")
+
+    # The showcase is deterministic unarmed as well (it is in the ok
+    # corpus; we check the property directly).
+    disarm_env()
+    let p: RunResult = boot(acc, [showcase()])
+    check(acc, "the showcase runs green through the interpreter",
+        p.code == 0 && p.out.contains("doubled=12 total=6"),
+        clip(p.combined, 80))
+
+    # Corpus hygiene: canonical form, lints, checker.
+    let mut hygiene: list[str] = [showcase(), panic_fixture()]
+    let names: list[str] = dir_names(libs_dir())
+    let mut n: int = 0
+    while n < names.len() {
+        if names.get(n).ends_with(".hls") {
+            hygiene.push(path_join3(libs_dir(), names.get(n)))
+        }
+        n = n + 1
+    }
+    let mut h: int = 0
+    while h < hygiene.len() {
+        let f: str = hygiene.get(h)
+        let label: str = rel_to_root(acc, f)
+        let pf: RunResult = run_capture("./bin/hlfmt", ["-c", f])
+        check(acc, label + " is hlfmt-canonical",
+            pf.out.contains("already formatted"), clip(pf.out, 60))
+        let pl: RunResult = run_capture("python3",
+            [path_join3(acc.root, "tools/hllint.py"), f])
+        check(acc, label + " is hllint-clean",
+            pl.out.contains("no warnings"), clip(pl.out, 60))
+        let pb: RunResult = boot_check(acc, f)
+        check(acc, label + " boots through the real checker",
+            pb.out.contains("OK: types and effects valid"),
+            clip(pb.combined, 60))
+        h = h + 1
+    }
+
+    # No gate litter survives.
+    let mut litter: int = 0
+    let dirs: list[str] = [libs_dir(), acc.scratch_base, "tests"]
+    let mut d: int = 0
+    while d < dirs.len() {
+        let entries: list[str] = dir_names(dirs.get(d))
+        let mut e: int = 0
+        while e < entries.len() {
+            let nm: str = entries.get(e)
+            if nm.starts_with(".hls-det-") || nm.starts_with("hls-det-") {
+                litter = litter + 1
+            }
+            e = e + 1
+        }
+        d = d + 1
+    }
+    check(acc, "no verifier temp files survive anywhere the gate ran",
+        litter == 0, litter.to_str())
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let acc: Acc = acc_new("det")
+    if !sec1(acc) {
+        rmrf(acc.scratch_base)
+        return finish(acc, "Stage 127 -- hls-det, the determinism verifier")
+    }
+    sec2(acc)
+    sec3(acc)
+    sec4(acc)
+    sec5(acc)
+    sec6(acc)
+    sec7(acc)
+    sec8(acc)
+    # The battery's rmtree(TMP): the scratch world never outlives the gate.
+    rmrf(acc.scratch_base)
+    return finish(acc, "Stage 127 -- hls-det, the determinism verifier")
+}

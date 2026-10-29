@@ -1,0 +1,682 @@
+# ============================================================================
+# tests/acc/shapes_acceptance.hls — Stage 100 acceptance gate, in Halis
+# (the Halis twin of tests/shapes_acceptance.py; same six sections,
+# same assertions, same needles — the harness is tests/acc/harness.hls
+# and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make shapes-acceptance` (which compiles this file to
+# bin/acc-shapes and runs it from the repo root).
+#
+# The old battery drove the shape ENGINE through Python internals
+# (tools.hlinterp.proof: collect_shapes / verify_shapes and the
+# footprint's separation verdicts and loop triples); the gate asks the
+# same questions through the front door: `hlprove --shapes` per probe
+# (the report prints every PROVEN shape with its triple, every refusal
+# with its reason, the separation verdicts and the access census) and
+# the .shape.smt2 obligation dumps re-decided segment by segment
+# through the decider (z3 binary if present, else the z3-solver python
+# module — the same order make_decider() uses; the module is driven
+# through a `python3 -c` child, like every other tool the gate spawns).
+#
+# The gate REQUIRES a decider (a z3 binary or the z3-solver python
+# module) — a verification stage whose solver is missing has no gate,
+# and like the battery it says so and exits 1.
+#
+#  1. the engine — alias classes, separation verdicts and shape
+#     triples on a battery of functions: every PROVEN shape, every
+#     refusal and every access count pinned exactly
+#  2. the soundness flips — descending steps, the conditional bump,
+#     the non-strict condition, off-cursor and through-alias writes,
+#     the push inside the loop, the captured length: none claimed
+#  3. the obligations — every verified segment is z3-unsat, the
+#     .shape.smt2 dump re-decides clean from the file alone
+#  4. the CLI — `hlprove --shapes` reports the demo's shapes,
+#     refusals and totals; the honest no-solver path claims nothing;
+#     --z3 --cvc5 is still a caller error
+#  5. the demo — heap_demo.hls: interpreter and native output agree;
+#     the fragment changes nothing
+#  6. the tools — hlfmt stable, hllint clean on the new sources
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+
+# ----------------------------------------------------------------------------
+# The gate's subjects.
+# ----------------------------------------------------------------------------
+
+fn demo() -> str {
+    return "examples/heap_demo.hls"
+}
+
+fn ok_test() -> str {
+    return "tests/ok/feat_stage100_heaps.hls"
+}
+
+# ----------------------------------------------------------------------------
+# The probe programs (verbatim from the battery — the leading newline
+# keeps every loop on the line number the battery pinned).
+# ----------------------------------------------------------------------------
+
+fn fill_src() -> str {
+    return "\n" +
+    "fn fill(xs: list[int]) -> int {\n" +
+    "    for i: int in range(0, xs.len()) {\n" +
+    "        xs[i] = i * 2\n" +
+    "    }\n" +
+    "    return 0\n" +
+    "}\n" +
+    "fn main() -> int { return 0 }\n"
+}
+
+fn bump_src() -> str {
+    return "\n" +
+    "fn bump(xs: list[int]) -> int {\n" +
+    "    let mut i: int = 0\n" +
+    "    while i < len(xs) {\n" +
+    "        xs.set(i, xs.get(i) + 1)\n" +
+    "        i = i + 1\n" +
+    "    }\n" +
+    "    return 0\n" +
+    "}\n" +
+    "fn main() -> int { return 0 }\n"
+}
+
+fn condbump_src() -> str {
+    return "\n" +
+    "fn condbump(xs: list[int], flag: bool) -> int {\n" +
+    "    let mut i: int = 0\n" +
+    "    while i < xs.len() {\n" +
+    "        if flag {\n" +
+    "            i = i + 1\n" +
+    "        }\n" +
+    "        xs[i] = 5\n" +
+    "    }\n" +
+    "    return 0\n" +
+    "}\n" +
+    "fn main() -> int { return 0 }\n"
+}
+
+fn two_src() -> str {
+    return "\n" +
+    "fn two(dst: list[int], src: list[int]) -> int {\n" +
+    "    for i: int in range(0, dst.len()) {\n" +
+    "        dst[i] = 1\n" +
+    "    }\n" +
+    "    let mut j: int = 0\n" +
+    "    while j < src.len() {\n" +
+    "        src[j] = 2\n" +
+    "        j = j + 1\n" +
+    "    }\n" +
+    "    return 0\n" +
+    "}\n" +
+    "fn main() -> int { return 0 }\n"
+}
+
+fn tail_src() -> str {
+    return "\n" +
+    "fn tail(xs: list[int], start: int) -> int\n" +
+    "    requires start >= 0\n" +
+    "{\n" +
+    "    for i: int in range(start, xs.len()) {\n" +
+    "        xs[i] = 7\n" +
+    "    }\n" +
+    "    return 0\n" +
+    "}\n" +
+    "fn main() -> int { return 0 }\n"
+}
+
+fn separation_src() -> str {
+    return "\n" +
+    "fn freshpair(a: list[int]) -> int {\n" +
+    "    let buf: list[int] = [0, 0, 0]\n" +
+    "    a[0] = 1\n" +
+    "    buf[0] = 2\n" +
+    "    return 0\n" +
+    "}\n" +
+    "fn clonepair(a: list[int]) -> int {\n" +
+    "    let buf: list[int] = clone(a)\n" +
+    "    a[0] = 1\n" +
+    "    buf[0] = 2\n" +
+    "    return 0\n" +
+    "}\n" +
+    "fn twoparams(a: list[int], b: list[int]) -> int {\n" +
+    "    a[0] = 1\n" +
+    "    b[0] = 2\n" +
+    "    return 0\n" +
+    "}\n" +
+    "fn aliasmerge(a: list[int]) -> int {\n" +
+    "    let b2: list[int] = a\n" +
+    "    a[0] = 1\n" +
+    "    b2[0] = 2\n" +
+    "    return 0\n" +
+    "}\n" +
+    "fn main() -> int { return 0 }\n"
+}
+
+fn nonstrict_src() -> str {
+    return "\n" +
+    "fn nonstrict(xs: list[int]) -> int {\n" +
+    "    let mut i: int = 0\n" +
+    "    while i <= xs.len() {\n" +
+    "        xs[i] = 1\n" +
+    "        i = i + 1\n" +
+    "    }\n" +
+    "    return 0\n" +
+    "}\n" +
+    "fn main() -> int { return 0 }\n"
+}
+
+# ----------------------------------------------------------------------------
+# The soundness flips: (name, source, the pinned loop line, the pinned
+# refusal substring) — one a naive shape prover would get WRONG.
+# ----------------------------------------------------------------------------
+
+struct Flip {
+    name: str,
+    src: str,
+    line_needle: str,
+    needle: str
+}
+
+fn flip_list() -> list[Flip] {
+    let out: list[Flip] = []
+    out.push(Flip {
+        name: "descend: i' = i - 1 lands at -1 from i == 0",
+        src: "\n" +
+        "fn descend(xs: list[int]) -> int {\n" +
+        "    let mut i: int = 0\n" +
+        "    while i < xs.len() {\n" +
+        "        xs[i] = 1\n" +
+        "        i = i - 1\n" +
+        "    }\n" +
+        "    return 0\n" +
+        "}\n" +
+        "fn main() -> int { return 0 }\n",
+        line_needle: "    line 4: ",
+        needle: "preservation not discharged"
+    })
+    out.push(Flip {
+        name: "offcursor: xs[0] is not the cursor cell",
+        src: "\n" +
+        "fn offcursor(xs: list[int]) -> int {\n" +
+        "    let mut i: int = 0\n" +
+        "    while i < xs.len() {\n" +
+        "        xs[0] = 1\n" +
+        "        i = i + 1\n" +
+        "    }\n" +
+        "    return 0\n" +
+        "}\n" +
+        "fn main() -> int { return 0 }\n",
+        line_needle: "    line 4: ",
+        needle: "writes off the cursor cell"
+    })
+    out.push(Flip {
+        name: "grower: push changes len inside the loop",
+        src: "\n" +
+        "fn grower(xs: list[int]) -> int {\n" +
+        "    let mut i: int = 0\n" +
+        "    while i < xs.len() {\n" +
+        "        xs.push(i)\n" +
+        "        i = i + 1\n" +
+        "    }\n" +
+        "    return 0\n" +
+        "}\n" +
+        "fn main() -> int { return 0 }\n",
+        line_needle: "    line 4: ",
+        needle: "changes len"
+    })
+    out.push(Flip {
+        name: "captured: let n = xs.len() has no heap link",
+        src: "\n" +
+        "fn captured(xs: list[int]) -> int {\n" +
+        "    let n: int = xs.len()\n" +
+        "    let mut i: int = 0\n" +
+        "    while i < n {\n" +
+        "        xs[i] = 1\n" +
+        "        i = i + 1\n" +
+        "    }\n" +
+        "    return 0\n" +
+        "}\n" +
+        "fn main() -> int { return 0 }\n",
+        line_needle: "    line 5: ",
+        needle: "no heap anchor"
+    })
+    out.push(Flip {
+        name: "aliaswrite: a through-alias write is a wildcard write",
+        src: "\n" +
+        "fn aliaswrite(xs: list[int]) -> int {\n" +
+        "    let mut i: int = 0\n" +
+        "    while i < xs.len() {\n" +
+        "        let ys: list[int] = xs\n" +
+        "        ys[3] = 1\n" +
+        "        i = i + 1\n" +
+        "    }\n" +
+        "    return 0\n" +
+        "}\n" +
+        "fn main() -> int { return 0 }\n",
+        line_needle: "    line 4: ",
+        needle: "unknown provenance"
+    })
+    out.push(Flip {
+        name: "escaper: break ends the owned shape",
+        src: "\n" +
+        "fn escaper(xs: list[int]) -> int {\n" +
+        "    let mut i: int = 0\n" +
+        "    while i < xs.len() {\n" +
+        "        if xs[i] == 0 {\n" +
+        "            break\n" +
+        "        }\n" +
+        "        i = i + 1\n" +
+        "    }\n" +
+        "    return 0\n" +
+        "}\n" +
+        "fn main() -> int { return 0 }\n",
+        line_needle: "    line 4: ",
+        needle: "escapes"
+    })
+    out.push(Flip {
+        name: "varstart: no requires, a negative start is possible",
+        src: "\n" +
+        "fn varstart(xs: list[int], start: int) -> int {\n" +
+        "    for i: int in range(start, xs.len()) {\n" +
+        "        xs[i] = 1\n" +
+        "    }\n" +
+        "    return 0\n" +
+        "}\n" +
+        "fn main() -> int { return 0 }\n",
+        line_needle: "    line 3: ",
+        needle: "initiation not discharged"
+    })
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# Shared legs: the tool front door, the needle helpers and the decider.
+# ----------------------------------------------------------------------------
+
+fn hp(path: str, flags: list[str]) -> RunResult uses Proc {
+    let argv: list[str] = ["tools/hlprove.py", path]
+    let mut i: int = 0
+    while i < flags.len() {
+        argv.push(flags.get(i))
+        i = i + 1
+    }
+    return run_capture("python3", argv)
+}
+
+# fn_block(out, start_needle, end_needle) — one function's slice of the
+# shapes report (from its `  <fn>:` header to the next one).
+fn fn_block(out: str, start_needle: str, end_needle: str) -> str {
+    let a: int = out.find(start_needle)
+    if a < 0 {
+        return ""
+    }
+    let b: int = out.find(end_needle)
+    if b < 0 || b <= a {
+        return out.slice(a, out.len())
+    }
+    return out.slice(a, b)
+}
+
+fn split_reset(text: str) -> list[str] {
+    let out: list[str] = []
+    let mut start: int = 0
+    let mut going: bool = true
+    while going {
+        let rest: str = text.slice(start, text.len())
+        let rel: int = rest.find("(reset)")
+        if rel < 0 {
+            out.push(rest)
+            going = false
+        } else {
+            out.push(rest.slice(0, rel))
+            start = start + rel + 7
+        }
+    }
+    return out
+}
+
+fn first_verdict(out: str) -> str {
+    let lines: list[str] = out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let t: str = lines.get(i).trim()
+        if t == "sat" || t == "unsat" || t == "unknown" {
+            return t
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn z3_mod_script() -> str {
+    return "import sys, z3\n" +
+    "s = z3.Solver()\n" +
+    "s.from_string(open(sys.argv[1]).read())\n" +
+    "print(s.check())\n"
+}
+
+fn decide_z3(acc: Acc, text: str, tag: str) -> str uses Fs, Proc {
+    let p: str = write_src(acc, "z3seg_" + tag + ".smt2", text)
+    if which("z3") {
+        let r: RunResult = run_capture("z3", [p])
+        if r.code == 0 {
+            let v: str = first_verdict(r.out)
+            if v != "" {
+                return v
+            }
+        }
+        return "?"
+    }
+    let m: RunResult = run_capture("python3", ["-c", z3_mod_script(), p])
+    let v2: str = m.out.trim()
+    if v2 == "sat" || v2 == "unsat" || v2 == "unknown" {
+        return v2
+    }
+    return "?"
+}
+
+fn z3_available(acc: Acc) -> bool uses Fs, Proc {
+    if which("z3") {
+        return true
+    }
+    let p: str = write_src(acc, "z3probe.smt2", "(check-sat)\n")
+    let m: RunResult = run_capture("python3", ["-c", z3_mod_script(), p])
+    let v: str = m.out.trim()
+    return v == "sat" || v == "unsat" || v == "unknown"
+}
+
+fn ls_dir(path: str) -> list[str] uses Proc {
+    let out: list[str] = []
+    let r: RunResult = run_capture("ls", ["-1", path])
+    if r.code != 0 {
+        return out
+    }
+    let lines: list[str] = r.out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let t: str = lines.get(i).trim()
+        if t != "" {
+            out.push(t)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# 1. the engine
+# ----------------------------------------------------------------------------
+fn sec1(acc: Acc) -> void uses IO, Fs, Proc, Exit {
+    section("1. the engine")
+    if !z3_available(acc) {
+        fail_msg(acc, "no z3 binary and no z3-solver module — install one:"
+        + " pip install z3-solver (or put a z3 binary on PATH)")
+        exit(1)
+    }
+    pass_msg(acc, "a decider is available (z3 binary or z3-solver module)")
+    # -- the flagship for-range walk is proven, accesses counted --------
+    let p1: str = write_src(acc, "fill.hls", fill_src())
+    let r1: RunResult = hp(p1, ["--shapes"])
+    check(acc, "fill: for-range walk proven, 1/1 accesses in bounds by shape",
+    r1.out.contains("shape PROVEN (z3): lseg(xs, 0, i) * cell(xs, i)"
+    + " * lseg(xs, i + 1, xs.len())")
+    && r1.out.contains("accesses in bounds by shape: 1 of 1"),
+    clip(r1.out, 120))
+    # -- the while-anchored walk with set/get at the cursor --------------
+    let p2: str = write_src(acc, "bump.hls", bump_src())
+    let r2: RunResult = hp(p2, ["--shapes"])
+    check(acc, "bump: while walk via len()/set()/get() proven, 2/2 accesses",
+    r2.out.contains("shape PROVEN (z3)")
+    && r2.out.contains("accesses in bounds by shape: 2 of 2"),
+    clip(r2.out, 120))
+    # -- a conditional bump keeps the shape, loses the post-bump access --
+    let p3: str = write_src(acc, "condbump.hls", condbump_src())
+    let r3: RunResult = hp(p3, ["--shapes"])
+    check(acc, "condbump: shape proven, the post-bump access honestly blocked",
+    r3.out.contains("shape PROVEN (z3)")
+    && r3.out.contains("accesses in bounds by shape: 0 of 1")
+    && r3.out.contains("accesses NOT claimed: 1 (after the cursor"
+    + " update the cursor may sit at len)"),
+    clip(r3.out, 120))
+    # -- two walks over two roots in one function -------------------------
+    let p4: str = write_src(acc, "two.hls", two_src())
+    let r4: RunResult = hp(p4, ["--shapes"])
+    check(acc, "two: both walks proven (one for-range, one while)",
+    grep_count(r4.out, "shape PROVEN (z3)") == 2, clip(r4.out, 120))
+    # -- a var range start proven under its requires ----------------------
+    let p5: str = write_src(acc, "tail.hls", tail_src())
+    let r5: RunResult = hp(p5, ["--shapes"])
+    check(acc, "tail: var range start pinned by requires start >= 0",
+    r5.out.contains("shape PROVEN (z3)")
+    && r5.out.contains("accesses in bounds by shape: 1 of 1"),
+    clip(r5.out, 120))
+    # -- separation: fresh evidence proves, caller-owned refuses ----------
+    let p6: str = write_src(acc, "separation.hls", separation_src())
+    let r6: RunResult = hp(p6, ["--shapes"])
+    let fresh: str = fn_block(r6.out, "  freshpair:", "  clonepair:")
+    check(acc, "freshpair: own(a) * own(buf) PROVEN (a fresh allocation)",
+    fresh.contains("own(a) * own(buf) PROVEN"), clip(fresh, 90))
+    let clone: str = fn_block(r6.out, "  clonepair:", "  twoparams:")
+    check(acc, "clonepair: own(a) * own(buf) PROVEN (clone() is a fresh heap)",
+    clone.contains("own(a) * own(buf) PROVEN"), clip(clone, 90))
+    let twop: str = fn_block(r6.out, "  twoparams:", "  aliasmerge:")
+    check(acc, "twoparams: own(a) * own(b) REFUSED — caller-owned, f(xs, xs) "
+    + "aliases",
+    twop.contains("own(a) * own(b) REFUSED") && twop.contains("caller"),
+    clip(twop, 90))
+    let alias: str = fn_block(r6.out, "  aliasmerge:", "  SHAPES TOTAL:")
+    check(acc, "aliasmerge: one alias class — single writer, trivially separated",
+    alias.contains("separation: single writer — trivially separated"),
+    clip(alias, 90))
+}
+
+# ----------------------------------------------------------------------------
+# 2. the soundness flips
+# ----------------------------------------------------------------------------
+fn sec2(acc: Acc) -> void uses IO, Fs, Proc {
+    section("2. the soundness flips")
+    let flips: list[Flip] = flip_list()
+    let mut flip_ok: bool = true
+    let mut i: int = 0
+    while i < flips.len() {
+        let f: Flip = flips.get(i)
+        let p: str = write_src(acc, "flip" + i.to_str() + ".hls", f.src)
+        let r: RunResult = hp(p, ["--shapes"])
+        if !r.out.contains(f.line_needle) {
+            fail_msg(acc, f.name + ": no loop found at the pinned line")
+            flip_ok = false
+        } else if r.out.contains("shape PROVEN") {
+            fail_msg(acc, f.name + ": CLAIMED — unsound")
+            flip_ok = false
+        } else if !r.out.contains(f.needle) {
+            fail_msg(acc, f.name + ": refused but for the wrong reason")
+            flip_ok = false
+        } else {
+            pass_msg(acc, f.name + ": refused (" + f.needle + ")")
+        }
+        i = i + 1
+    }
+    if flip_ok {
+        pass_msg(acc, "all " + flips.len().to_str()
+        + " soundness flips refused with pinned reasons")
+    }
+    # the non-strict condition: the shape is provable, the accesses are not
+    let pn: str = write_src(acc, "nonstrict.hls", nonstrict_src())
+    let rn: RunResult = hp(pn, ["--shapes"])
+    check(acc, "nonstrict: shape proven, accesses refused (i may sit at len)",
+    rn.out.contains("shape PROVEN (z3)")
+    && rn.out.contains("accesses in bounds by shape: 0 of 1"),
+    clip(rn.out, 120))
+}
+
+# ----------------------------------------------------------------------------
+# 3. the obligations
+# ----------------------------------------------------------------------------
+fn sec3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("3. the obligations")
+    # Every verified segment must re-decide unsat from its .shape.smt2
+    # text alone — the dump is the artifact, not a summary.
+    let dump: RunResult = hp(demo(), ["--shapes", "--smt"])
+    let entries: list[str] = ls_dir("examples")
+    let mut dumps: list[str] = []
+    let mut i: int = 0
+    while i < entries.len() {
+        let f: str = entries.get(i)
+        if f.ends_with(".shape.smt2") {
+            dumps.push(f)
+        }
+        i = i + 1
+    }
+    if dump.code != 0 || dumps.len() == 0 {
+        fail_msg(acc, "the --shapes --smt dump failed (rc=" + dump.code.to_str()
+        + ", files=" + dumps.len().to_str() + ")")
+        return
+    }
+    pass_msg(acc, dumps.len().to_str() + " obligation files dumped next to the demo")
+    let mut seg_count: int = 0
+    let mut all_unsat: bool = true
+    let mut k: int = 0
+    while k < dumps.len() {
+        let fpath: str = path_join3("examples", dumps.get(k))
+        let text: str = read_or(fpath, "")
+        let segs: list[str] = split_reset(text)
+        let mut s: int = 0
+        while s < segs.len() {
+            let seg: str = segs.get(s).trim()
+            if seg != "" {
+                seg_count = seg_count + 1
+                if decide_z3(acc, seg, "shp" + k.to_str() + "_" + s.to_str()) != "unsat" {
+                    all_unsat = false
+                }
+            }
+            s = s + 1
+        }
+        rmrf(fpath)
+        k = k + 1
+    }
+    if seg_count > 0 && all_unsat {
+        pass_msg(acc, seg_count.to_str()
+        + " shape obligation segments on the demo, every one z3-unsat")
+        pass_msg(acc, "every dumped shape obligation re-decides unsat from its file")
+    } else {
+        fail_msg(acc, "obligations wrong (segments=" + seg_count.to_str() + ")")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 4. the CLI
+# ----------------------------------------------------------------------------
+fn sec4(acc: Acc) -> void uses IO, Fs, Proc {
+    section("4. the CLI")
+    let out: RunResult = hp(demo(), ["--shapes"])
+    if out.code != 0 {
+        fail_msg(acc, "hlprove --shapes exited " + out.code.to_str())
+        return
+    }
+    pass_msg(acc, "hlprove --shapes runs clean on the demo")
+    let txt: str = out.out
+    check(acc, "cli: the fragment's header is present",
+    txt.contains("Heap shapes (the separation-logic fragment):"), "")
+    check(acc, "cli: the for-range walk is proven with its triple",
+    txt.contains("shape PROVEN (z3): lseg(xs, 0, i) * cell(xs, i)"), "")
+    check(acc, "cli: the frame refusal names the offending line",
+    txt.contains("frame REFUSED: xs[..] = .. at line 65 writes off the"
+    + " cursor"), "")
+    check(acc, "cli: the separation refusal names the f(xs, xs) aliasing",
+    txt.contains("own(a) * own(b) REFUSED")
+    && txt.contains("f(xs, xs) aliases the parameters"), "")
+    check(acc, "cli: the fresh-buffer separation is proven",
+    txt.contains("own(a) * own(buf) PROVEN"), "")
+    check(acc, "cli: the blocked access is explained",
+    txt.contains("accesses NOT claimed"), "")
+    check(acc, "cli: the totals line closes the report",
+    txt.contains("SHAPES TOTAL: 4 loops proven, 1 refused, 0 unverified;"), "")
+    let plain: RunResult = hp(ok_test(), ["--shapes"])
+    check(acc, "cli: the ok-test's shapes report cleanly (totals line present)",
+    plain.code == 0 && plain.out.contains("SHAPES TOTAL:"),
+    "rc=" + plain.code.to_str())
+    # the honest no-solver path: with no decider, candidates are
+    # reported and nothing is claimed. Through the front door: a python
+    # without site-packages cannot import z3 and a stripped PATH hides
+    # any binary, so hlprove's own decider probe comes back empty.
+    let hon: RunResult = run_capture("/usr/bin/env",
+    ["PATH=/usr/bin:/bin", "/usr/bin/python3", "-S", "tools/hlprove.py",
+    demo(), "--shapes"])
+    check(acc, "cli: with no decider, candidates are reported and nothing "
+    + "is claimed",
+    hon.out.contains("nothing claimed") && hon.out.contains("0 loops proven")
+    && !hon.out.contains("PROVEN (z3)"),
+    clip(hon.out, 90))
+    let both: RunResult = hp(demo(), ["--z3", "--cvc5"])
+    check(acc, "cli: --z3 and --cvc5 together is a caller error (exit 2)",
+    both.code == 2, "rc=" + both.code.to_str())
+}
+
+# ----------------------------------------------------------------------------
+# 5. the demo
+# ----------------------------------------------------------------------------
+fn native_leg(acc: Acc, src: str, tag: str, expected: str) -> void
+uses IO, Fs, Proc {
+    let c_out: str = scratch(acc, "stage100_" + tag + ".c")
+    let comp: RunResult = run_capture("./bin/hlc", [src, c_out])
+    if comp.code != 0 {
+        fail_msg(acc, "hlc refused the " + tag + " (rc=" + comp.code.to_str() + ")")
+        return
+    }
+    let exe: str = scratch(acc, "stage100_" + tag)
+    let cc: RunResult = run_capture("cc", ["-O2", "-Werror", "-o", exe, c_out,
+    "-lm", "-pthread"])
+    if cc.code != 0 {
+        fail_msg(acc, "cc refused the generated C for the " + tag
+        + " (rc=" + cc.code.to_str() + ")")
+        return
+    }
+    let native: RunResult = run_capture(exe, [])
+    check(acc, "the " + tag + ": native output identical to the interpreter",
+    native.code == 0 && native.out == expected,
+    "rc=" + native.code.to_str())
+}
+
+fn sec5(acc: Acc) -> void uses IO, Fs, Proc {
+    section("5. the demo")
+    let interp: RunResult = boot(acc, [demo()])
+    check(acc, "the demo runs on the interpreter (rc=0)", interp.code == 0,
+    "rc=" + interp.code.to_str())
+    let ok_interp: RunResult = boot(acc, [ok_test()])
+    check(acc, "the ok-test runs on the interpreter (rc=0)", ok_interp.code == 0,
+    "rc=" + ok_interp.code.to_str())
+    if !file_exists("bin/hlc") {
+        fail_msg(acc, "bin/hlc missing — run make bootstrap first")
+        return
+    }
+    native_leg(acc, demo(), "demo", interp.out)
+    native_leg(acc, ok_test(), "ok-test", ok_interp.out)
+}
+
+# ----------------------------------------------------------------------------
+# 6. the tools
+# ----------------------------------------------------------------------------
+fn sec6(acc: Acc) -> void uses IO, Proc {
+    section("6. the tools")
+    let fmt1: RunResult = run_capture("./bin/hlfmt", [demo()])
+    let fmt2: RunResult = run_capture("./bin/hlfmt", [demo()])
+    check(acc, "hlfmt: stable formatting on the demo",
+    fmt1.code == 0 && fmt1.out == fmt2.out, "")
+    let lint1: RunResult = run_capture("python3", ["tools/hllint.py", demo()])
+    let lint2: RunResult = run_capture("python3", ["tools/hllint.py", ok_test()])
+    check(acc, "hllint: no findings on the demo or the ok-test",
+    lint1.code == 0 && lint2.code == 0, "")
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let acc: Acc = acc_new("shapes")
+    sec1(acc)
+    sec2(acc)
+    sec3(acc)
+    sec4(acc)
+    sec5(acc)
+    sec6(acc)
+    return finish(acc, "Stage 100 -- the separation-logic fragment (heap shapes)")
+}

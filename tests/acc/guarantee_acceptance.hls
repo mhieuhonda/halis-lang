@@ -1,0 +1,821 @@
+# ============================================================================
+# tests/acc/guarantee_acceptance.hls — Stage 135 acceptance gate, in Halis
+# (the Halis twin of tests/guarantee_acceptance.py; same eight sections,
+# same assertions, same needles — the harness is tests/acc/harness.hls
+# and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make guarantee-acceptance` (which compiles this file and
+# runs it from the repo root).
+#
+# The battery is all REAL-tool CLI (tools/hls-guarantee.py, boot.py,
+# hlfmt, hllint, bin/hlc) over a live-tree ledger with tampered-tree
+# negative space. The tampered trees are full copies of the repo (the
+# battery's shutil.copytree ignore list) made with tar; the drift
+# edits are std.str replacements on the copies. Two legs the battery
+# ran by IMPORTING a Python module (importlib: the ledger's own data
+# and self-validation, plus the Stage 124/127 statistics-style unit
+# checks) go through tiny python drivers in the gate's scratch — the
+# same module, the same expressions, printed as CHECK lines the gate
+# asserts (the front door a native binary has; the repro gate's
+# pattern). The ledger's per-row contract fields (claim/violation/
+# repro/out_of_scope) live only in the module, not in verify --json,
+# so the driver carries that leg verbatim.
+#
+#  1. the convention  — list/show/bare/verify exit codes and the
+#                      machine verdict (verified, no refusals)
+#  2. the ledger law  — 15 guarantees; ids unique + shaped G-<FAM>-NN;
+#                      families/severities from the vocabulary; the
+#                      pinned mapping row by row; exactly the two meta
+#                      rows carry no probe; every row contracted and
+#                      anchored; the ledger passes its own validation
+#  3. the anchor law  — every anchor resolves with a line number; a
+#                      tampered checker voids G-MEM-01 / G-SBX-01,
+#                      named, exit 1
+#  4. the probe law   — 30 probes green (27 refuse + 3 panic), the
+#                      sandbox probe's extra CLI args; a deleted probe
+#                      file is a named error; a weakened shadowing
+#                      refusal is caught (G-SPEC-01)
+#  5. the drift law   — anchor drift + probe drift together name both
+#                      guarantees; the report refuses a violated ledger
+#                      and writes nothing
+#  6. the report law  — two reports byte-identical; every id embedded;
+#                      the tree sha == git HEAD; report --json parses;
+#                      --stamp changes ONLY the Generated line; a
+#                      report without --out is usage error
+#  7. the bounty law  — the document carries the advisory channel and
+#                      90-day window, the severity vocabulary with
+#                      ranks, 15x contract/repro/scope, the honest
+#                      out-of-scope register; SECURITY.md still carries
+#                      the anchored channel; the critical rows open
+#                      the table
+#  8. the corpus      — tests/ok/feat_stage135_guarantee.hls showcase:
+#                      checker, exact interpreter output, hlfmt,
+#                      hllint, and (when bin/hlc + gcc exist) native
+#                      parity byte for byte
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.json"
+import "std.result"
+
+# ----------------------------------------------------------------------------
+# The gate's constants (the battery's).
+# ----------------------------------------------------------------------------
+
+fn showcase() -> str {
+    return "tests/ok/feat_stage135_guarantee.hls"
+}
+
+# SHOWCASE_OUT — the exact two-line interpreter output the battery pins.
+fn showcase_out() -> str {
+    return "stage 135: hls-guarantee\n  LEDGER OK: 15 guarantees anchored, probed, documented\n"
+}
+
+fn ledger_ids() -> list[str] {
+    return ["G-MEM-01", "G-MEM-02", "G-TYPE-01", "G-ARITH-01", "G-EFF-01",
+        "G-TAINT-01", "G-CONC-01", "G-MATCH-01", "G-CAP-01", "G-SBX-01",
+        "G-CT-01", "G-FFI-01", "G-SPEC-01", "G-DET-01", "G-CORPUS-01"]
+}
+
+fn pinned_fams() -> list[str] {
+    return ["memory", "memory", "types", "arithmetic", "effects", "taint",
+        "concurrency", "match", "capabilities", "sandbox", "consttime",
+        "ffi", "types", "determinism", "determinism"]
+}
+
+fn pinned_sevs() -> list[str] {
+    return ["critical", "critical", "critical", "critical", "critical",
+        "critical", "critical", "high", "high", "high", "high", "high",
+        "medium", "high", "medium"]
+}
+
+fn families() -> list[str] {
+    return ["types", "memory", "arithmetic", "effects", "taint",
+        "concurrency", "match", "capabilities", "sandbox", "consttime",
+        "ffi", "determinism"]
+}
+
+fn severities() -> list[str] {
+    return ["critical", "high", "medium"]
+}
+
+# ----------------------------------------------------------------------------
+# JSON accessors — null-safe, so a failed leg FAILs instead of crashing.
+# ----------------------------------------------------------------------------
+
+fn parse_json(text: str) -> JsonValue {
+    let rr: Result[JsonValue, str] = json_parse_result(text)
+    if result_is_ok(rr) {
+        return result_unwrap(rr)
+    }
+    return json_null()
+}
+
+fn jstr(v: JsonValue, key: str) -> str {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_str(x) {
+        return json_str_value(x)
+    }
+    return ""
+}
+
+fn jint(v: JsonValue, key: str) -> int {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_int(x) {
+        return json_int_value(x)
+    }
+    return 0
+}
+
+fn jbool(v: JsonValue, key: str) -> bool {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_bool(x) {
+        return json_bool_value(x)
+    }
+    return false
+}
+
+fn jarr(v: JsonValue, key: str) -> list[JsonValue] {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_array(x) {
+        return x.arr
+    }
+    let empty: list[JsonValue] = []
+    return empty
+}
+
+fn el_str(v: JsonValue) -> str {
+    if json_is_str(v) {
+        return json_str_value(v)
+    }
+    return ""
+}
+
+# ----------------------------------------------------------------------------
+# Small helpers.
+# ----------------------------------------------------------------------------
+
+fn run_guar(acc: Acc, args: list[str]) -> RunResult uses Proc {
+    let argv: list[str] = [path_join3(acc.root, "tools/hls-guarantee.py")]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    return run_capture("python3", argv)
+}
+
+fn native_ready(acc: Acc) -> bool uses Proc, Fs {
+    return file_exists(path_join3(acc.root, "bin/hlc")) && which("gcc")
+}
+
+# make_tampered_tree(acc, tag) — the battery's shutil.copytree of the
+# live repo minus the heavy dirs (ignore_patterns(".git", "bin",
+# "fuzz-corpus", "__pycache__", "*.pyc", ".guarantee-gate-*",
+# ".lts-gate-*")), plus tests/.acc-scratch (this gate's own scratch
+# world — a copy must not recurse into the copies it is making).
+fn make_tampered_tree(acc: Acc, tag: str) -> str uses Fs, Proc {
+    let dst: str = scratch(acc, "tree-" + tag)
+    let cmd: str = "mkdir -p '" + shell_quote(dst) + "'"
+        + " && tar -C '" + shell_quote(acc.root) + "'"
+        + " --exclude=.git --exclude=bin --exclude=fuzz-corpus"
+        + " --exclude=.acc-scratch --exclude=__pycache__ --exclude=*.pyc"
+        + " --exclude=.guarantee-gate-* --exclude=.lts-gate-*"
+        + " -cf - . | tar -C '" + shell_quote(dst) + "' -xf -"
+    sh(cmd)
+    return dst
+}
+
+# tamper(path, from, to) — read, replace-all, write back.
+fn tamper(path: str, from_s: str, to_s: str) -> void uses Fs {
+    write_file(path, str_replace(read_file(path), from_s, to_s))
+}
+
+# id_shaped(id) — "G-<FAM>-NN" with NN in 01..19 (the battery's
+# endswith(tuple("%02d" % n for n in range(1, 20)))).
+fn id_shaped(id: str) -> bool {
+    if !id.starts_with("G-") {
+        return false
+    }
+    let mut n: int = 1
+    while n <= 19 {
+        let mut suf: str = ""
+        if n < 10 {
+            suf = "0" + n.to_str()
+        } else {
+            suf = n.to_str()
+        }
+        if id.ends_with(suf) {
+            return true
+        }
+        n = n + 1
+    }
+    return false
+}
+
+fn in_list(hay: list[str], needle: str) -> bool {
+    let mut i: int = 0
+    while i < hay.len() {
+        if hay.get(i) == needle {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# nonempty_lines(text) — Python's [ln for ln in text.splitlines() if ln].
+fn nonempty_lines(text: str) -> list[str] {
+    let raw: list[str] = text.split("\n")
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < raw.len() {
+        if raw.get(i) != "" {
+            out.push(raw.get(i))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn lists_eq(a: list[str], b: list[str]) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    let mut i: int = 0
+    while i < a.len() {
+        if a.get(i) != b.get(i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# driver_check(acc, r, key, name) — one CHECK line from a python
+# driver, asserted under the battery's assertion name.
+fn driver_check(acc: Acc, r: RunResult, key: str, name: str) -> void uses IO {
+    let lines: list[str] = r.out.split("\n")
+    let prefix: str = "CHECK " + key + " "
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).starts_with(prefix) {
+            let v: str = lines.get(i).slice(prefix.len(), lines.get(i).len()).trim()
+            check(acc, name, v == "1", "")
+            return
+        }
+        i = i + 1
+    }
+    check(acc, name, false, "driver produced no CHECK " + key
+        + " line: " + clip(r.combined, 100))
+}
+
+# ----------------------------------------------------------------------------
+# The python drivers (the battery's importlib legs, printed as CHECKs).
+# ----------------------------------------------------------------------------
+
+# The ledger module's own data + self-validation (section 2).
+fn guar_mod_driver(acc: Acc) -> str uses Fs, Proc {
+    return write_src(acc, "guar_mod.py",
+        "import importlib.util as ilu, os, sys\n"
+        + "ROOT = sys.argv[1]\n"
+        + "spec = ilu.spec_from_file_location(\"hls_guarantee\", "
+        + "os.path.join(ROOT, \"tools\", \"hls-guarantee.py\"))\n"
+        + "m = ilu.module_from_spec(spec)\n"
+        + "sys.modules[\"hls_guarantee\"] = m\n"
+        + "spec.loader.exec_module(m)\n"
+        + "def b(x):\n"
+        + "    return \"1\" if x else \"0\"\n"
+        + "print(\"CHECK contract \" + b(all(g.get(\"claim\") and "
+        + "g.get(\"violation\") and g.get(\"repro\") and "
+        + "g.get(\"out_of_scope\") for g in m.LEDGER)))\n"
+        + "print(\"CHECK anchored \" + b(all(len(g[\"anchors\"]) >= 1 "
+        + "for g in m.LEDGER)))\n"
+        + "print(\"CHECK valid \" + b(m.validate_ledger() == []))\n")
+}
+
+# ----------------------------------------------------------------------------
+# 1. the convention
+# ----------------------------------------------------------------------------
+fn sec1(acc: Acc) -> void uses IO, Fs, Proc {
+    section("1. the convention")
+    let p: RunResult = run_guar(acc, ["list"])
+    check(acc, "list exits 0", p.code == 0, clip(p.combined, 80))
+    check(acc, "list prints the ledger ids",
+        p.out.contains("G-MEM-01") && p.out.contains("G-TAINT-01")
+            && p.out.contains("G-SBX-01") && p.out.contains("G-CORPUS-01"), "")
+
+    let p2: RunResult = run_guar(acc, ["show", "G-TAINT-01"])
+    check(acc, "show prints the full record",
+        p2.code == 0 && p2.out.contains("taint-sink"), clip(p2.combined, 80))
+
+    let p3: RunResult = run_guar(acc, ["show", "G-NOPE-99"])
+    check(acc, "an unknown id is usage error 2 naming the known ones",
+        p3.code == 2 && p3.err.contains("unknown guarantee id"),
+        clip(p3.combined, 80))
+
+    let p4: RunResult = run_guar(acc, [])
+    check(acc, "a bare invocation is usage error 2", p4.code == 2, "")
+
+    let p5: RunResult = run_guar(acc, ["verify"])
+    check(acc, "verify is green on the clean tree",
+        p5.code == 0 && p5.out.contains("LEDGER VERIFIED"),
+        clip(p5.combined, 120))
+
+    let p6: RunResult = run_guar(acc, ["verify", "--json"])
+    check(acc, "verify --json exits 0", p6.code == 0, clip(p6.combined, 80))
+    let rr: Result[JsonValue, str] = json_parse_result(p6.out)
+    if result_is_err(rr) {
+        check(acc, "verify --json broken: "
+            + clip(result_err_or(rr, ""), 80), false, "")
+    } else {
+        let data: JsonValue = result_unwrap(rr)
+        check(acc, "the machine verdict is verified with no refusals",
+            jstr(data, "verdict") == "verified"
+                && jarr(data, "refusals").len() == 0,
+            clip(p6.out, 120))
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 2. the ledger law
+# ----------------------------------------------------------------------------
+fn sec2(acc: Acc) -> void uses IO, Fs, Proc {
+    section("2. the ledger law")
+    let p: RunResult = run_guar(acc, ["verify", "--json"])
+    let data: JsonValue = parse_json(p.out)
+    let rows: list[JsonValue] = jarr(data, "guarantees")
+
+    check(acc, "exactly 15 guarantees", rows.len() == 15,
+        rows.len().to_str())
+    let ids: list[str] = []
+    let mut i: int = 0
+    while i < rows.len() {
+        ids.push(jstr(rows.get(i), "id"))
+        i = i + 1
+    }
+    let mut uniq: bool = true
+    let mut a: int = 0
+    while a < ids.len() {
+        let mut b: int = a + 1
+        while b < ids.len() {
+            if ids.get(a) == ids.get(b) {
+                uniq = false
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    check(acc, "ids are unique", uniq, "")
+    let mut shaped: bool = true
+    let mut k: int = 0
+    while k < ids.len() {
+        if !id_shaped(ids.get(k)) {
+            shaped = false
+        }
+        k = k + 1
+    }
+    check(acc, "ids are shaped G-<FAM>-NN", shaped, "")
+
+    let fams: list[str] = families()
+    let sevs: list[str] = severities()
+    let mut fam_ok: bool = true
+    let mut sev_ok: bool = true
+    let mut m: int = 0
+    while m < rows.len() {
+        if !in_list(fams, jstr(rows.get(m), "family")) {
+            fam_ok = false
+        }
+        if !in_list(sevs, jstr(rows.get(m), "severity")) {
+            sev_ok = false
+        }
+        m = m + 1
+    }
+    check(acc, "families from the fixed vocabulary", fam_ok, "")
+    check(acc, "severities from the fixed vocabulary", sev_ok, "")
+
+    # The mapping pinned row by row — the table a bounty triage starts
+    # from. A drift names the row and stops, exactly like the battery.
+    let want_ids: list[str] = ledger_ids()
+    let want_fams: list[str] = pinned_fams()
+    let want_sevs: list[str] = pinned_sevs()
+    let mut drifted: bool = false
+    let mut r: int = 0
+    while r < rows.len() {
+        let gid: str = jstr(rows.get(r), "id")
+        let mut wi: int = -1
+        let mut w: int = 0
+        while w < want_ids.len() {
+            if want_ids.get(w) == gid {
+                wi = w
+            }
+            w = w + 1
+        }
+        if wi < 0 || want_fams.get(wi) != jstr(rows.get(r), "family")
+            || want_sevs.get(wi) != jstr(rows.get(r), "severity") {
+            fail_msg(acc, gid + " mapping drifted: "
+                + jstr(rows.get(r), "family") + "/"
+                + jstr(rows.get(r), "severity"))
+            drifted = true
+            return
+        }
+        r = r + 1
+    }
+    if !drifted {
+        pass_msg(acc, "the severity/family mapping is pinned row by row")
+    }
+
+    # Exactly the two meta rows carry no probe — every other guarantee
+    # demonstrates itself. (The battery counts '"verdict"' occurrences
+    # in each row's JSON; a row with no probes is exactly a row with
+    # no probe verdicts.)
+    let no_probe: list[str] = []
+    let mut q: int = 0
+    while q < rows.len() {
+        if jarr(rows.get(q), "probes").len() == 0 {
+            no_probe.push(jstr(rows.get(q), "id"))
+        }
+        q = q + 1
+    }
+    check(acc, "exactly the two meta rows carry no probe — every other "
+        + "guarantee demonstrates itself",
+        no_probe.len() == 2 && no_probe.get(0) == "G-DET-01"
+            && no_probe.get(1) == "G-CORPUS-01",
+        str_join(no_probe, ", "))
+
+    # Every row fully contracted — checked against the ledger source,
+    # the same data the report renders (the python driver above).
+    let dm: RunResult = run_capture("python3", [guar_mod_driver(acc), acc.root])
+    driver_check(acc, dm, "contract",
+        "every row carries claim/violation/repro/out_of_scope")
+    driver_check(acc, dm, "anchored", "every row carries at least one anchor")
+    driver_check(acc, dm, "valid", "the ledger passes its own validation")
+}
+
+# ----------------------------------------------------------------------------
+# 3. the anchor law
+# ----------------------------------------------------------------------------
+fn sec3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("3. the anchor law")
+    let p: RunResult = run_guar(acc, ["verify", "--json"])
+    let data: JsonValue = parse_json(p.out)
+    let rows: list[JsonValue] = jarr(data, "guarantees")
+    let mut voids: int = 0
+    let mut lines: int = 0
+    let mut i: int = 0
+    while i < rows.len() {
+        let anchors: list[JsonValue] = jarr(rows.get(i), "anchors")
+        let mut a: int = 0
+        while a < anchors.len() {
+            if !jbool(anchors.get(a), "ok") {
+                voids = voids + 1
+            } else if jstr(anchors.get(a), "detail").starts_with("line ") {
+                lines = lines + 1
+            }
+            a = a + 1
+        }
+        i = i + 1
+    }
+    check(acc, "every anchor resolves in the live tree", voids == 0,
+        voids.to_str())
+    check(acc, "anchors carry live line numbers (" + lines.to_str()
+        + " resolved)", lines >= 25, "")
+
+    # The negative space: an enforcement point removed from a COPY of
+    # the tree voids its guarantee, named.
+    let t1: str = make_tampered_tree(acc, "anchor1")
+    let ef1: str = path_join3(t1, "tools/hlinterp/checking/expr.py")
+    tamper(ef1, "use of moved value", "moved value used")
+    let p1: RunResult = run_guar(acc, ["verify", "--root", t1])
+    check(acc, "a removed ownership anchor voids G-MEM-01, named",
+        p1.code == 1 && p1.err.contains("G-MEM-01")
+            && p1.err.contains("anchor void"), clip(p1.err, 120))
+
+    let t2: str = make_tampered_tree(acc, "anchor2")
+    let bf: str = path_join3(t2, "tools/hlinterp/boot.py")
+    tamper(bf, "--sandbox is incompatible", "--sandbox refuses this construct")
+    let p2: RunResult = run_guar(acc, ["verify", "--root", t2])
+    check(acc, "a reworded sandbox gate voids G-SBX-01, named",
+        p2.code == 1 && p2.err.contains("G-SBX-01"), clip(p2.err, 120))
+}
+
+# ----------------------------------------------------------------------------
+# 4. the probe law
+# ----------------------------------------------------------------------------
+fn sec4(acc: Acc) -> void uses IO, Fs, Proc {
+    section("4. the probe law")
+    let p: RunResult = run_guar(acc, ["verify", "--json"])
+    let data: JsonValue = parse_json(p.out)
+    let rows: list[JsonValue] = jarr(data, "guarantees")
+    let probes: list[JsonValue] = []
+    let mut i: int = 0
+    while i < rows.len() {
+        let ps: list[JsonValue] = jarr(rows.get(i), "probes")
+        let mut k: int = 0
+        while k < ps.len() {
+            probes.push(ps.get(k))
+            k = k + 1
+        }
+        i = i + 1
+    }
+    check(acc, "30 probes pinned in the ledger", probes.len() == 30,
+        probes.len().to_str())
+    let mut all_ok: bool = true
+    let mut refuses: int = 0
+    let mut panics: int = 0
+    let mut ref_detail: bool = true
+    let mut panic_detail: bool = true
+    let mut sbx: int = 0
+    let mut sbx_ok: bool = false
+    let mut j: int = 0
+    while j < probes.len() {
+        let pr: JsonValue = probes.get(j)
+        let verdict: str = jstr(pr, "verdict")
+        let kind: str = jstr(pr, "kind")
+        let detail: str = jstr(pr, "detail")
+        let path: str = jstr(pr, "path")
+        if verdict != "ok" {
+            all_ok = false
+        }
+        if kind == "refuse" {
+            refuses = refuses + 1
+            if !detail.contains("refused") {
+                ref_detail = false
+            }
+            if path.contains("sandbox_extern") {
+                sbx = sbx + 1
+                if verdict == "ok" {
+                    sbx_ok = true
+                }
+            }
+        }
+        if kind == "panic" {
+            panics = panics + 1
+            if !detail.contains("panicked") {
+                panic_detail = false
+            }
+        }
+        j = j + 1
+    }
+    check(acc, "every probe is green on the clean tree", all_ok, "")
+    check(acc, "27 refusal probes + 3 runtime panic probes",
+        refuses == 27 && panics == 3, refuses.to_str() + " + " + panics.to_str())
+    check(acc, "refusal probes record the checker's message", ref_detail, "")
+    check(acc, "panic probes record the runtime panic", panic_detail, "")
+    check(acc, "the sandbox probe runs through --sandbox (extra CLI args)",
+        sbx == 1 && sbx_ok, "")
+
+    # A deleted probe file is a named error.
+    let t: str = make_tampered_tree(acc, "probe1")
+    sh("rm -f '" + shell_quote(path_join3(t, "tests/fail/fail_taint_print.hls"))
+        + "'")
+    let p2: RunResult = run_guar(acc, ["verify", "--root", t])
+    check(acc, "a deleted probe file is a named error under its guarantee",
+        p2.code == 1 && p2.err.contains("G-TAINT-01")
+            && p2.err.contains("probe file missing"), clip(p2.err, 120))
+
+    # The checker's honesty is the only witness: a probe that the
+    # checker would ACCEPT must be surfaced as a violation. Proven by
+    # making the tampered checker weaker — the accepts-side of the
+    # same law the drift section proves on the anchor side.
+    let t2: str = make_tampered_tree(acc, "probe2")
+    let ef: str = path_join3(t2, "tools/hlinterp/checking/stmt.py")
+    tamper(ef,
+        "self.err(\"shadowing not allowed: %s\" % s[\"name\"], s)",
+        "self.err(\"name reuse: %s\" % s[\"name\"], s)")
+    let p3: RunResult = run_guar(acc, ["verify", "--root", t2])
+    check(acc, "a weakened shadowing refusal is caught by the pinned "
+        + "message (G-SPEC-01)",
+        p3.code == 1 && p3.err.contains("G-SPEC-01"), clip(p3.err, 120))
+}
+
+# ----------------------------------------------------------------------------
+# 5. the drift law
+# ----------------------------------------------------------------------------
+fn sec5(acc: Acc) -> void uses IO, Fs, Proc {
+    section("5. the drift law")
+    let t: str = make_tampered_tree(acc, "drift")
+    let ef: str = path_join3(t, "tools/hlinterp/checking/expr.py")
+    tamper(ef, "use of moved value", "moved value used")
+    sh("rm -f '" + shell_quote(path_join3(t, "tests/fail/fail_eprint_tainted.hls"))
+        + "'")
+    let p: RunResult = run_guar(acc, ["verify", "--root", t])
+    check(acc, "the combined drift exits 1", p.code == 1, "")
+    check(acc, "both drifted guarantees are named",
+        p.err.contains("G-MEM-01") && p.err.contains("G-TAINT-01"), "")
+
+    # The report refuses a violated ledger — no document from an
+    # unproven ledger.
+    let out: str = scratch(acc, "never.md")
+    let p2: RunResult = run_guar(acc, ["report", "--out", out, "--root", t])
+    check(acc, "report refuses a violated ledger and writes nothing",
+        p2.code == 1 && !file_exists(out), "")
+    check(acc, "the refusal names the violated ledger",
+        p2.err.contains("violated"), "")
+}
+
+# ----------------------------------------------------------------------------
+# 6. the report law
+# ----------------------------------------------------------------------------
+fn sec6(acc: Acc) -> void uses IO, Fs, Proc {
+    section("6. the report law")
+    let a: str = scratch(acc, "r1.md")
+    let b: str = scratch(acc, "r2.md")
+    let p1: RunResult = run_guar(acc, ["report", "--out", a, "--json",
+        scratch(acc, "r1.json")])
+    check(acc, "the report generates", p1.code == 0 && file_exists(a),
+        clip(p1.combined, 120))
+    let p2: RunResult = run_guar(acc, ["report", "--out", b])
+    check(acc, "the second report generates", p2.code == 0,
+        clip(p2.combined, 120))
+    let d1: str = read_or(a, "")
+    let d2: str = read_or(b, "")
+    check(acc, "two reports at the same tree are byte-identical",
+        (file_exists(a) && file_exists(b)) && d1 == d2, "")
+
+    let want_ids: list[str] = ledger_ids()
+    let mut missing: str = ""
+    let mut i: int = 0
+    while i < want_ids.len() {
+        if !d1.contains(want_ids.get(i)) {
+            missing = missing + " " + want_ids.get(i)
+        }
+        i = i + 1
+    }
+    check(acc, "the document embeds every guarantee id", missing == "",
+        clip(missing, 100))
+
+    let sha: RunResult = run_capture("git", ["rev-parse", "HEAD"])
+    let head: str = sha.out.trim()
+    check(acc, "the tree sha is the live HEAD", d1.contains("`" + head + "`"),
+        head)
+
+    let j1: JsonValue = parse_json(read_or(scratch(acc, "r1.json"), ""))
+    let mut j_ok: bool = jstr(j1, "verdict") == "verified"
+    j_ok = j_ok && jarr(j1, "guarantees").len() == 15
+    check(acc, "report --json parses with the verified verdict", j_ok, "")
+    let mut probes_ok: bool = jarr(j1, "guarantees").len() == 15
+    let grows: list[JsonValue] = jarr(j1, "guarantees")
+    let mut g: int = 0
+    while g < grows.len() {
+        let ps: list[JsonValue] = jarr(grows.get(g), "probes")
+        let mut k: int = 0
+        while k < ps.len() {
+            if jstr(ps.get(k), "verdict") != "ok" {
+                probes_ok = false
+            }
+            k = k + 1
+        }
+        g = g + 1
+    }
+    check(acc, "the json carries the green probe verdicts", probes_ok, "")
+
+    let s: str = scratch(acc, "r3.md")
+    run_guar(acc, ["report", "--out", s, "--stamp"])
+    let d3: str = read_or(s, "")
+    let l1: list[str] = nonempty_lines(d1)
+    # l3: d3's non-empty lines minus the "- Generated: " line.
+    let raw3: list[str] = d3.split("\n")
+    let l3: list[str] = []
+    let mut r: int = 0
+    while r < raw3.len() {
+        let ln: str = raw3.get(r)
+        if ln != "" && !ln.starts_with("- Generated: ") {
+            l3.push(ln)
+        }
+        r = r + 1
+    }
+    check(acc, "--stamp changes ONLY the Generated line",
+        lists_eq(l1, l3) && d3.contains("- Generated: "), "")
+
+    let p: RunResult = run_guar(acc, ["report"])
+    check(acc, "a report without --out is usage error", p.code == 2, "")
+}
+
+# ----------------------------------------------------------------------------
+# 7. the bounty law
+# ----------------------------------------------------------------------------
+fn sec7(acc: Acc) -> void uses IO, Fs, Proc {
+    section("7. the bounty law")
+    let d: str = read_or(scratch(acc, "r1.md"), "")
+
+    check(acc, "the reporting channel and the disclosure window are in "
+        + "the document (anchored live from SECURITY.md)",
+        d.contains("security/advisories") && d.contains("90-day"), "")
+    check(acc, "the severity vocabulary with ranks 0/1/2",
+        d.contains("| critical | 0 |") && d.contains("| high | 1 |")
+            && d.contains("| medium | 2 |"), "")
+    check(acc, "every guarantee carries contract + repro + scope",
+        str_count(d, "**Violation contract.**") == 15
+            && str_count(d, "**Reproduction.**") == 15
+            && str_count(d, "**Out of scope.**") == 15, "")
+
+    # The out-of-scope register: the text between "## Out of scope"
+    # and "## Reporting".
+    let at1: int = d.find("## Out of scope")
+    let mut oos: str = ""
+    if at1 >= 0 {
+        let rest: str = d.slice(at1, d.len())
+        let at2: int = rest.find("## Reporting")
+        if at2 >= 0 {
+            oos = rest.slice(0, at2)
+        } else {
+            oos = rest
+        }
+    }
+    check(acc, "the honest out-of-scope register carries >= 7 entries",
+        str_count(oos, "- ") >= 7, "")
+    check(acc, "the register keeps the documented escapes loud",
+        oos.contains("taint_unwrap()") && oos.contains("extern \"C\""), "")
+
+    # The ledger anchors SECURITY.md itself — the channel cannot
+    # silently move.
+    let stext: str = read_file("SECURITY.md")
+    check(acc, "SECURITY.md still carries the anchored channel",
+        stext.contains("security/advisories")
+            && stext.contains("90-day coordinated-disclosure"), "")
+
+    # A bounty entry maps onto the vocabulary: triage order is
+    # critical first, and the ledger order agrees.
+    let j1: JsonValue = parse_json(read_or(scratch(acc, "r1.json"), ""))
+    let grows: list[JsonValue] = jarr(j1, "guarantees")
+    let crit: list[str] = ["G-MEM-01", "G-MEM-02", "G-TYPE-01",
+        "G-ARITH-01", "G-EFF-01", "G-TAINT-01", "G-CONC-01"]
+    let mut order_ok: bool = grows.len() >= 7
+    if order_ok {
+        let mut c: int = 0
+        while c < crit.len() {
+            if jstr(grows.get(c), "id") != crit.get(c) {
+                order_ok = false
+            }
+            c = c + 1
+        }
+    }
+    check(acc, "the critical rows open the table", order_ok, "")
+}
+
+# ----------------------------------------------------------------------------
+# 8. the corpus showcase
+# ----------------------------------------------------------------------------
+fn sec8(acc: Acc) -> void uses IO, Fs, Proc {
+    section("8. the corpus showcase")
+    let sc: str = showcase()
+    let pc: RunResult = boot_check(acc, sc)
+    check(acc, "the showcase boots through the real checker", pc.code == 0,
+        clip(pc.combined, 80))
+
+    let pr: RunResult = boot(acc, [sc])
+    check(acc, "the showcase runs green on the interpreter, exact output",
+        pr.code == 0 && pr.out == showcase_out(),
+        "rc=" + pr.code.to_str() + " out=" + clip(pr.out, 80))
+
+    let pf: RunResult = run_capture("./bin/hlfmt", ["--check", sc])
+    check(acc, "the showcase is hlfmt-canonical", pf.code == 0, "")
+
+    let lint_argv: list[str] = [path_join3(acc.root, "tools/hllint.py"), sc]
+    let pl: RunResult = run_capture("python3", lint_argv)
+    check(acc, "the showcase is hllint-clean",
+        pl.code == 0 && pl.out.contains("no warnings"), "")
+
+    if native_ready(acc) {
+        let c_path: str = scratch(acc, "showcase.c")
+        let bin_path: str = scratch(acc, "showcase_bin")
+        let r1: RunResult = run_capture("./bin/hlc", [sc, c_path])
+        if r1.code != 0 {
+            check(acc, "hlc compiled the showcase: " + clip(r1.out, 120),
+                false, "")
+        } else {
+            let r2: RunResult = run_capture("gcc",
+                ["-O2", "-o", bin_path, c_path, "-lm", "-pthread"])
+            if r2.code != 0 {
+                check(acc, "gcc compiled the showcase: " + clip(r2.out, 120),
+                    false, "")
+            } else {
+                let rn: RunResult = run_capture(bin_path, [])
+                check(acc, "the showcase matches natively, byte for byte",
+                    rn.code == 0 && rn.out == showcase_out(), "")
+            }
+        }
+    } else {
+        println("  (bin/hlc or cc not available — native differential "
+            + "skipped, interpreter legs ran)")
+    }
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let acc: Acc = acc_new("guarantee")
+    sec1(acc)
+    sec2(acc)
+    sec3(acc)
+    sec4(acc)
+    sec5(acc)
+    sec6(acc)
+    sec7(acc)
+    sec8(acc)
+    # The battery's finally: shutil.rmtree(GATE, ignore_errors=True) —
+    # the tampered trees and report drafts never outlive the gate.
+    rmrf(acc.scratch_base)
+    return finish(acc, "Stage 135 -- the soundness guarantee ledger, "
+        + "documented AND re-demonstrated")
+}

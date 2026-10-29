@@ -1,0 +1,618 @@
+# ============================================================================
+# tests/acc/invariant_acceptance.hls — Stage 97 acceptance gate, in Halis
+# (the Halis twin of tests/invariant_acceptance.py; same six sections,
+# same assertions, same needles — the harness is tests/acc/harness.hls
+# and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make invariant-acceptance` (which compiles this file to
+# bin/acc-invariant and runs it from the repo root).
+#
+# The old battery drove the inference ENGINE through Python internals
+# (tools.hlinterp.proof: load_program / infer_loops / verify_loop and
+# the loop summaries' accepted/rejected sets); the gate asks the same
+# questions through the front door: `hlprove --infer-invariants` per
+# probe — the report prints every accepted invariant with its tag and
+# every refusal with its obligation — and the .smt2 obligation dumps
+# re-decided segment by segment through the decider (the z3 binary if
+# present, else the z3-solver python module — the same order
+# make_decider() uses; the module is driven through a `python3 -c`
+# child, the same way the gate spawns every other tool).
+#
+# The gate REQUIRES a decider (a z3 binary or the z3-solver python
+# module) — a verification stage whose solver is missing has no gate,
+# and like the battery it says so and exits 1.
+#
+#  1. the engine — candidate generation + verification on a battery
+#     of loop shapes: every accepted invariant and every refusal
+#     pinned exactly
+#  2. the soundness flips — loops naive inference would get WRONG
+#     (step-2 overshoot, the -2 skipper, the shrinking counter, the
+#     unmodeled body, the escape): none of them may be claimed
+#  3. the obligations — every verified segment is z3-unsat, the
+#     .smt2 dump re-decides clean end to end
+#  4. the CLI — `hlprove --infer-invariants` reports the demo's
+#     invariants, the refusal, and totals
+#  5. the demo — invariant_demo.hls: interpreter and native output
+#     agree; inference changes nothing
+#  6. the tools — hlfmt stable, hllint clean on the new sources
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+
+# ----------------------------------------------------------------------------
+# The gate's subjects.
+# ----------------------------------------------------------------------------
+
+fn demo() -> str {
+    return "examples/invariant_demo.hls"
+}
+
+fn ok_test() -> str {
+    return "tests/ok/feat_stage97_invariants.hls"
+}
+
+# ----------------------------------------------------------------------------
+# The probe programs (verbatim from the battery — the leading newline
+# keeps every loop on the line number the battery pinned).
+# ----------------------------------------------------------------------------
+
+fn sum_to_src() -> str {
+    return "\n" +
+    "fn sum_to(n: int) -> int\n" +
+    "    requires n >= 0\n" +
+    "{\n" +
+    "    let mut s: int = 0\n" +
+    "    let mut i: int = 0\n" +
+    "    while i < n {\n" +
+    "        s = s + i\n" +
+    "        i = i + 1\n" +
+    "    }\n" +
+    "    return s\n" +
+    "}\n" +
+    "fn main() -> int { return 0 }\n"
+}
+
+fn acc_src() -> str {
+    return "\n" +
+    "fn acc(n: int, base: int) -> int\n" +
+    "    requires n >= 0\n" +
+    "    requires base >= 1\n" +
+    "{\n" +
+    "    let mut i: int = base\n" +
+    "    let mut j: int = 0\n" +
+    "    while i > 0 {\n" +
+    "        j = j + i\n" +
+    "        i = i - 1\n" +
+    "    }\n" +
+    "    return j\n" +
+    "}\n" +
+    "fn main() -> int { return 0 }\n"
+}
+
+fn frs_src() -> str {
+    return "\n" +
+    "fn frs(a: int, b: int) -> int\n" +
+    "    requires a >= 0\n" +
+    "    requires b >= a\n" +
+    "{\n" +
+    "    let mut s: int = 0\n" +
+    "    for i: int in range(a, b) {\n" +
+    "        s = s + i\n" +
+    "    }\n" +
+    "    return s\n" +
+    "}\n" +
+    "fn main() -> int { return 0 }\n"
+}
+
+fn drift_src() -> str {
+    return "\n" +
+    "fn drift(n: int) -> int\n" +
+    "    requires n >= 0\n" +
+    "{\n" +
+    "    let mut i: int = 0\n" +
+    "    while i < n {\n" +
+    "        if i % 2 == 0 {\n" +
+    "            i = i + 1\n" +
+    "        } else {\n" +
+    "            i = i + 2\n" +
+    "        }\n" +
+    "    }\n" +
+    "    return i\n" +
+    "}\n" +
+    "fn main() -> int { return 0 }\n"
+}
+
+fn mod4_src() -> str {
+    return "\n" +
+    "fn mod4(n: int) -> int\n" +
+    "    requires n >= 0\n" +
+    "{\n" +
+    "    let mut x: int = 0\n" +
+    "    let mut k: int = 0\n" +
+    "    while k < n {\n" +
+    "        x = x + 4\n" +
+    "        k = k + 1\n" +
+    "    }\n" +
+    "    return x\n" +
+    "}\n" +
+    "fn main() -> int { return 0 }\n"
+}
+
+fn step_two_src() -> str {
+    return "\n" +
+    "fn step_two(n: int) -> int\n" +
+    "    requires n >= 0\n" +
+    "{\n" +
+    "    let mut i: int = 0\n" +
+    "    while i < n {\n" +
+    "        i = i + 2\n" +
+    "    }\n" +
+    "    return i\n" +
+    "}\n" +
+    "fn main() -> int { return 0 }\n"
+}
+
+fn skipper_src() -> str {
+    return "\n" +
+    "fn skipper(n: int) -> int\n" +
+    "    requires n >= 0\n" +
+    "{\n" +
+    "    let mut i: int = n\n" +
+    "    while i > 0 {\n" +
+    "        i = i - 2\n" +
+    "    }\n" +
+    "    return i\n" +
+    "}\n" +
+    "fn main() -> int { return 0 }\n"
+}
+
+fn shrink_src() -> str {
+    return "\n" +
+    "fn shrink(n: int) -> int\n" +
+    "    requires n >= 0\n" +
+    "{\n" +
+    "    let mut i: int = 0\n" +
+    "    while i < n {\n" +
+    "        i = i - 1\n" +
+    "    }\n" +
+    "    return i\n" +
+    "}\n" +
+    "fn main() -> int { return 0 }\n"
+}
+
+fn times2_src() -> str {
+    return "\n" +
+    "fn times2(n: int) -> int\n" +
+    "    requires n >= 0\n" +
+    "{\n" +
+    "    let mut i: int = 1\n" +
+    "    while i < n {\n" +
+    "        i = i * i\n" +
+    "    }\n" +
+    "    return i\n" +
+    "}\n" +
+    "fn main() -> int { return 0 }\n"
+}
+
+fn escaper_src() -> str {
+    return "\n" +
+    "fn escaper(n: int) -> int\n" +
+    "    requires n >= 0\n" +
+    "{\n" +
+    "    let mut i: int = 0\n" +
+    "    while i < n {\n" +
+    "        if i == 3 {\n" +
+    "            break\n" +
+    "        }\n" +
+    "        i = i + 1\n" +
+    "    }\n" +
+    "    return i\n" +
+    "}\n" +
+    "fn main() -> int { return 0 }\n"
+}
+
+# ----------------------------------------------------------------------------
+# Shared legs: the tool front door, the needle helpers and the decider.
+# ----------------------------------------------------------------------------
+
+# hp(path, flags) — `python3 tools/hlprove.py <path> <flags...>`.
+fn hp(path: str, flags: list[str]) -> RunResult uses Proc {
+    let argv: list[str] = ["tools/hlprove.py", path]
+    let mut i: int = 0
+    while i < flags.len() {
+        argv.push(flags.get(i))
+        i = i + 1
+    }
+    return run_capture("python3", argv)
+}
+
+# has_line_start(text, prefix) — some printed line begins with prefix.
+fn has_line_start(text: str, prefix: str) -> bool {
+    let lines: list[str] = text.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).starts_with(prefix) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# The accepted-invariant lines print as `      <text>   (<tag>)`; the
+# refusals print as `    rejected: <text> (<obligation>)`. Matching the
+# line start keeps the set semantics of the battery's accepted/rejected
+# sets (a candidate line or a refusal can never pass for an acceptance).
+fn has_accepted(out: str, t: str) -> bool {
+    return has_line_start(out, "      " + t + "   (")
+}
+
+fn has_rejected(out: str, t: str) -> bool {
+    return has_line_start(out, "    rejected: " + t + " (")
+}
+
+# count_loop_headers(out) — the `  fn:N: while/for ...` header lines of
+# the inference report (exactly two leading spaces).
+fn count_loop_headers(out: str) -> int {
+    let lines: list[str] = out.split("\n")
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < lines.len() {
+        let l: str = lines.get(i)
+        if l.starts_with("  ") && !l.starts_with("   ")
+        && (l.contains(": while ") || l.contains(": for ")) {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+# obligation_paths(out) — the `    obligations -> <path>` lines of an
+# --smt dump run: the files the run wrote next to the source.
+fn obligation_paths(out: str) -> list[str] {
+    let paths: list[str] = []
+    let lines: list[str] = out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let t: str = lines.get(i).trim()
+        if t.starts_with("obligations -> ") {
+            paths.push(t.slice(15, t.len()))
+        }
+        i = i + 1
+    }
+    return paths
+}
+
+# split_reset(text) — the (reset)-separated SMT segments of a dump.
+fn split_reset(text: str) -> list[str] {
+    let out: list[str] = []
+    let mut start: int = 0
+    let mut going: bool = true
+    while going {
+        let rest: str = text.slice(start, text.len())
+        let rel: int = rest.find("(reset)")
+        if rel < 0 {
+            out.push(rest)
+            going = false
+        } else {
+            out.push(rest.slice(0, rel))
+            start = start + rel + 7
+        }
+    }
+    return out
+}
+
+# first_verdict(out) — the first sat/unsat/unknown line, else "".
+fn first_verdict(out: str) -> str {
+    let lines: list[str] = out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let t: str = lines.get(i).trim()
+        if t == "sat" || t == "unsat" || t == "unknown" {
+            return t
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# z3_mod_script() — the z3-solver module decider, run through a
+# `python3 -c` child: one segment file in, the check() verdict out.
+fn z3_mod_script() -> str {
+    return "import sys, z3\n" +
+    "s = z3.Solver()\n" +
+    "s.from_string(open(sys.argv[1]).read())\n" +
+    "print(s.check())\n"
+}
+
+# decide_z3(acc, text, tag) — one obligation through the decider: the
+# z3 binary when it is on PATH, else the z3-solver module (the same
+# order make_decider() uses). Returns sat/unsat/unknown/?.
+fn decide_z3(acc: Acc, text: str, tag: str) -> str uses Fs, Proc {
+    let p: str = write_src(acc, "z3seg_" + tag + ".smt2", text)
+    if which("z3") {
+        let r: RunResult = run_capture("z3", [p])
+        if r.code == 0 {
+            let v: str = first_verdict(r.out)
+            if v != "" {
+                return v
+            }
+        }
+        return "?"
+    }
+    let m: RunResult = run_capture("python3", ["-c", z3_mod_script(), p])
+    let v2: str = m.out.trim()
+    if v2 == "sat" || v2 == "unsat" || v2 == "unknown" {
+        return v2
+    }
+    return "?"
+}
+
+# z3_available(acc) — a decider exists at all (binary or module).
+fn z3_available(acc: Acc) -> bool uses Fs, Proc {
+    if which("z3") {
+        return true
+    }
+    let p: str = write_src(acc, "z3probe.smt2", "(check-sat)\n")
+    let m: RunResult = run_capture("python3", ["-c", z3_mod_script(), p])
+    let v: str = m.out.trim()
+    return v == "sat" || v == "unsat" || v == "unknown"
+}
+
+# ls_dir(path) — the entries of a directory (the batteries' listdir).
+fn ls_dir(path: str) -> list[str] uses Proc {
+    let out: list[str] = []
+    let r: RunResult = run_capture("ls", ["-1", path])
+    if r.code != 0 {
+        return out
+    }
+    let lines: list[str] = r.out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let t: str = lines.get(i).trim()
+        if t != "" {
+            out.push(t)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# 1. the engine
+# ----------------------------------------------------------------------------
+fn sec1(acc: Acc) -> void uses IO, Fs, Proc, Exit {
+    section("1. the engine")
+    if !z3_available(acc) {
+        fail_msg(acc, "no z3 binary and no z3-solver module — install one:"
+        + " pip install z3-solver (or put a z3 binary on PATH)")
+        exit(1)
+    }
+    pass_msg(acc, "a decider is available (z3 binary or z3-solver module)")
+    # -- the flagship: strengthening (s' = s + i needs i >= 0) ----------
+    let p: str = write_src(acc, "sum_to.hls", sum_to_src())
+    let r: RunResult = hp(p, ["--infer-invariants"])
+    check(acc, "sum_to: i <= n, i >= 0 AND the strengthened s >= 0 are inferred",
+    has_accepted(r.out, "i <= n") && has_accepted(r.out, "i >= 0")
+    && has_accepted(r.out, "s >= 0"),
+    clip(r.out, 120))
+    check(acc, "sum_to: the stale entry bound i <= 0 is refused (preservation)",
+    has_rejected(r.out, "i <= 0"), "")
+    # -- the transition language ----------------------------------------
+    let p2: str = write_src(acc, "acc.hls", acc_src())
+    let r2: RunResult = hp(p2, ["--infer-invariants"])
+    check(acc, "acc: i >= 0 survives as the cond-bound; the stale i >= 1 does not",
+    has_accepted(r2.out, "i >= 0") && has_accepted(r2.out, "j >= 0")
+    && !has_accepted(r2.out, "i >= 1"),
+    clip(r2.out, 120))
+    # -- for-range: entry equation + runs-guard + range bound -----------
+    let p3: str = write_src(acc, "frs.hls", frs_src())
+    let r3: RunResult = hp(p3, ["--infer-invariants"])
+    if !r3.out.contains(": for i in range(a, b)") {
+        fail_msg(acc, "frs: no loop summary collected at all")
+    } else {
+        check(acc, "frs: range(a, b) yields i >= a, i <= b and the accumulator",
+        has_accepted(r3.out, "i >= a") && has_accepted(r3.out, "i <= b")
+        && has_accepted(r3.out, "s >= 0"), "")
+    }
+    # -- disjunctive transitions (conditional update) --------------------
+    let p4: str = write_src(acc, "drift.hls", drift_src())
+    let r4: RunResult = hp(p4, ["--infer-invariants"])
+    check(acc, "drift: the disjunctive transition i' = i + 1 | i + 2 is encoded",
+    r4.out.contains("loop-carried: i' = i + 1 | i + 2")
+    && has_accepted(r4.out, "i >= 0"),
+    clip(r4.out, 120))
+    # -- congruence (the non-interval family) ----------------------------
+    let p5: str = write_src(acc, "mod4.hls", mod4_src())
+    let r5: RunResult = hp(p5, ["--infer-invariants"])
+    check(acc, "mod4: the congruence x ≡ 0 (mod 4) is inferred (non-interval)",
+    has_accepted(r5.out, "x ≡ 0 (mod 4)"), clip(r5.out, 120))
+}
+
+# ----------------------------------------------------------------------------
+# 2. the soundness flips
+# ----------------------------------------------------------------------------
+fn sec2(acc: Acc) -> void uses IO, Fs, Proc {
+    section("2. the soundness flips")
+    # step-2 overshoot: i <= n is FALSE at the head; i <= n + 1 is the truth.
+    let p1: str = write_src(acc, "step_two.hls", step_two_src())
+    let r1: RunResult = hp(p1, ["--infer-invariants"])
+    check(acc, "step_two: i <= n refused, the overshoot bound i <= n + 1 kept",
+    !has_accepted(r1.out, "i <= n") && has_accepted(r1.out, "i <= n + 1")
+    && has_accepted(r1.out, "i >= 0"),
+    clip(r1.out, 120))
+    # the skipper: i >= 0 fails (1 steps to -1); the tight floor is -1.
+    let p2: str = write_src(acc, "skipper.hls", skipper_src())
+    let r2: RunResult = hp(p2, ["--infer-invariants"])
+    check(acc, "skipper: i >= 0 refused, the true floor i >= -1 discovered",
+    !has_accepted(r2.out, "i >= 0") && has_accepted(r2.out, "i >= -1"),
+    clip(r2.out, 120))
+    # the shrinking counter under i < n: i >= 0 is NOT inductive.
+    let p3: str = write_src(acc, "shrink.hls", shrink_src())
+    let r3: RunResult = hp(p3, ["--infer-invariants"])
+    check(acc, "shrink: i >= 0 refused (the condition does not stop the crossing)",
+    !has_accepted(r3.out, "i >= 0"), clip(r3.out, 120))
+    # unmodeled bodies claim nothing (i = i * i is genuinely non-affine).
+    let p4: str = write_src(acc, "times2.hls", times2_src())
+    let r4: RunResult = hp(p4, ["--infer-invariants"])
+    check(acc, "times2: the non-affine body is reported unmodeled",
+    r4.out.contains("unmodeled: i (non-affine update"), clip(r4.out, 120))
+    check(acc, "times2: no invariant is claimed over an unmodeled variable",
+    r4.out.contains("inferred: (none)"), "")
+    # escapes go wholesale unmodeled.
+    let p5: str = write_src(acc, "escaper.hls", escaper_src())
+    let r5: RunResult = hp(p5, ["--infer-invariants"])
+    check(acc, "escaper: the break sends i unmodeled and nothing is claimed",
+    r5.out.contains("unmodeled: i (") && r5.out.contains("inferred: (none)"),
+    clip(r5.out, 120))
+}
+
+# ----------------------------------------------------------------------------
+# 3. the obligations
+# ----------------------------------------------------------------------------
+fn sec3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("3. the obligations")
+    # Every segment of every verified loop must re-decide unsat from its
+    # .smt2 text alone — the dump is the artifact, not a summary.
+    let dump: RunResult = hp(demo(), ["--infer-invariants", "--smt"])
+    if dump.code != 0 {
+        fail_msg(acc, "the --smt dump run failed (rc=" + dump.code.to_str() + ")")
+    }
+    let entries: list[str] = ls_dir("examples")
+    let mut dumps: list[str] = []
+    let mut i: int = 0
+    while i < entries.len() {
+        let f: str = entries.get(i)
+        if f.ends_with(".smt2") && f.contains("__L") {
+            dumps.push(f)
+        }
+        i = i + 1
+    }
+    if dumps.len() == 0 {
+        fail_msg(acc, "the --smt dump wrote no obligation files")
+        return
+    }
+    pass_msg(acc, dumps.len().to_str() + " obligation files dumped next to the demo")
+    let mut seg_count: int = 0
+    let mut all_unsat: bool = true
+    let mut k: int = 0
+    while k < dumps.len() {
+        let fpath: str = path_join3("examples", dumps.get(k))
+        let text: str = read_or(fpath, "")
+        let segs: list[str] = split_reset(text)
+        let mut s: int = 0
+        while s < segs.len() {
+            let seg: str = segs.get(s).trim()
+            if seg != "" {
+                seg_count = seg_count + 1
+                if decide_z3(acc, seg, "inv" + k.to_str() + "_" + s.to_str()) != "unsat" {
+                    all_unsat = false
+                }
+            }
+            s = s + 1
+        }
+        rmrf(fpath)
+        k = k + 1
+    }
+    let nloops: int = count_loop_headers(dump.out)
+    if seg_count == 0 {
+        fail_msg(acc, "no obligation segments were generated for the demo")
+        return
+    }
+    if all_unsat {
+        pass_msg(acc, seg_count.to_str() + " obligation segments across "
+        + nloops.to_str() + " loops, every one z3-unsat")
+        pass_msg(acc, "every dumped obligation re-decides unsat from its file")
+    } else {
+        fail_msg(acc, "a dumped obligation is not unsat — the file lies")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 4. the CLI
+# ----------------------------------------------------------------------------
+fn sec4(acc: Acc) -> void uses IO, Fs, Proc {
+    section("4. the CLI")
+    let out: RunResult = hp(demo(), ["--infer-invariants"])
+    if out.code != 0 {
+        fail_msg(acc, "hlprove --infer-invariants exited " + out.code.to_str())
+        return
+    }
+    pass_msg(acc, "hlprove --infer-invariants runs clean on the demo")
+    let txt: str = out.out
+    check(acc, "cli: sum_to: while header with line",
+    txt.contains("sum_to:21: while i < n"), "")
+    check(acc, "cli: the strengthened accumulator is reported",
+    txt.contains("      s >= 0   (entry-bound)"), "")
+    check(acc, "cli: the overshoot bound is reported",
+    txt.contains("i <= n + 1   (cond-bound)"), "")
+    check(acc, "cli: the congruence is reported",
+    txt.contains("x ≡ 0 (mod 4)   (modular)"), "")
+    check(acc, "cli: the refusal names its obligation",
+    txt.contains("rejected: i >= 0 (preservation obligation not discharged)"), "")
+    check(acc, "cli: the totals line closes the report",
+    txt.contains("INFERENCE TOTAL:") && txt.contains("invariants verified"), "")
+    let plain: RunResult = hp(ok_test(), ["--infer-invariants"])
+    check(acc, "cli: the ok-test's loops infer cleanly (totals line present)",
+    plain.code == 0 && plain.out.contains("INFERENCE TOTAL:"),
+    "rc=" + plain.code.to_str())
+}
+
+# ----------------------------------------------------------------------------
+# 5. the demo
+# ----------------------------------------------------------------------------
+fn sec5(acc: Acc) -> void uses IO, Fs, Proc {
+    section("5. the demo")
+    let interp: RunResult = boot(acc, [demo()])
+    check(acc, "the demo runs on the interpreter (rc=0)", interp.code == 0,
+    "rc=" + interp.code.to_str())
+    if !file_exists("bin/hlc") {
+        fail_msg(acc, "bin/hlc missing — run make bootstrap first")
+        return
+    }
+    let c_out: str = scratch(acc, "invariant_demo.c")
+    let comp: RunResult = run_capture("./bin/hlc", [demo(), c_out])
+    if comp.code != 0 {
+        fail_msg(acc, "hlc refused the demo (rc=" + comp.code.to_str() + ")")
+        return
+    }
+    let exe: str = scratch(acc, "invariant_demo")
+    let cc: RunResult = run_capture("cc", ["-O2", "-Werror", "-o", exe, c_out,
+    "-lm", "-pthread"])
+    if cc.code != 0 {
+        fail_msg(acc, "cc refused the generated C (rc=" + cc.code.to_str() + ")")
+        return
+    }
+    let native: RunResult = run_capture(exe, [])
+    check(acc, "native (-O2 -Werror) output identical to the interpreter",
+    native.code == 0 && native.out == interp.out,
+    "rc=" + native.code.to_str())
+}
+
+# ----------------------------------------------------------------------------
+# 6. the tools
+# ----------------------------------------------------------------------------
+fn sec6(acc: Acc) -> void uses IO, Proc {
+    section("6. the tools")
+    let fmt1: RunResult = run_capture("./bin/hlfmt", [demo()])
+    let fmt2: RunResult = run_capture("./bin/hlfmt", [demo()])
+    check(acc, "hlfmt: stable formatting on the demo",
+    fmt1.code == 0 && fmt1.out == fmt2.out, "")
+    let lint1: RunResult = run_capture("python3", ["tools/hllint.py", demo()])
+    let lint2: RunResult = run_capture("python3", ["tools/hllint.py", ok_test()])
+    check(acc, "hllint: no findings on the demo or the ok-test",
+    lint1.code == 0 && lint2.code == 0, "")
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let acc: Acc = acc_new("invariant")
+    sec1(acc)
+    sec2(acc)
+    sec3(acc)
+    sec4(acc)
+    sec5(acc)
+    sec6(acc)
+    return finish(acc, "Stage 97 -- SMT-based loop-invariant inference")
+}
