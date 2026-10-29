@@ -596,10 +596,10 @@ LEDGER = [
         "the law to the freestanding binary, and `make snapshot-chain` "
         "re-proves it as two independent ignitions.",
         "enforced_by": "Makefile (bootstrap + snapshot-chain targets) + "
-                       "tests/xbootstrap_acceptance.py",
+                       "tests/acc/xbootstrap_acceptance.hls",
         "anchors": [
             ("Makefile", "fixed-point law: the derivation must equal the snapshot"),
-            ("tests/xbootstrap_acceptance.py", "byte"),
+            ("tests/acc/xbootstrap_acceptance.hls", "byte"),
         ],
         "probes": [],
         "violation":
