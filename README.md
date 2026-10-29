@@ -278,7 +278,7 @@ control and volatile I/O included.
 
 ## Releases and support
 
-**v1.0.0 is the current stable release** — see [RELEASES.md](RELEASES.md)
+**v1.0.1 is the current stable release** — see [RELEASES.md](RELEASES.md)
 for the record of every tag and the discipline for the next ones.
 
 The line `release/1.0` is the LTS stream: bug-fix backports only,

@@ -10,18 +10,43 @@ published [LTS policy](LTS.md): every LTS line gets **3 years of
 bug-fix support** and **5 years of security support**, counted from
 the day its base release was cut.
 
-**Current stable: v1.0.0** — released 2026-10-29, LTS line
-`release/1.0` (bug fixes through **2029-10-29**, security fixes
-through **2031-10-29**).
+**Current stable: v1.0.1** — released 2026-10-29, LTS line
+`release/1.0` (opened at v1.0.0; bug fixes through **2029-10-29**,
+security fixes through **2031-10-29**).
 
 ---
 
-## Unreleased
+## [v1.0.1] — 2026-10-29 — the installer's own release
 
-The next patch on the 1.0 line. `release/1.0` takes bug-fix backports
-only — each carrying a `Backported-from:` trailer naming its origin —
-and patch releases are cut with `hls-lts tag-patch`. Work that is not
-a bug fix belongs on `main` and belongs to the next minor.
+The first patch on the 1.0 line, cut from main where the
+release-binary work landed. v1.0.0's archives still carried the bare
+compiler — `hlc`, the licence, the readme — so the installer's
+whole-SDK check refused the only stable release there was, and the
+one-liner in the README had nothing to install. v1.0.1's archives are
+the SDK the pipeline builds since: `bin/hlc`, `bin/hlfmt`, `std/`,
+`core/`, the canonical example and a VERSION record, on all six
+platforms, under one `SHA256SUMS`.
+
+Fixed with it:
+
+- **The Release pipeline's Windows legs** prove the formatter's fixed
+  point in a form the Windows CRT cannot scramble. A MinGW program's
+  redirected stdout is a text-mode stream — every `\n` it emits lands
+  in the file as `\r\n` — so the byte law is judged in memory
+  (`hlfmt -c`) and the emitted stream is compared modulo exactly that
+  CR. The Linux and macOS legs gain the same in-memory check; their
+  byte-for-byte diff keeps its shape.
+- **install.sh** records in `.manifest` only the bin entries an
+  install actually creates — the launcher or the bare compiler, never
+  both, and the formatter under the name it carries on this OS — so
+  `--uninstall` no longer names a path that was never written. The
+  acceptance gate calls the formatter by its real name on Windows
+  (`hlfmt.exe`), and an upgrade that switches the compiler's spelling
+  removes the one the previous install left behind, when that
+  install's own record claims it.
+- **installation.md** speaks the installer's errors as the installer
+  says them, and the bootstrap comment matches Stage 142 — the
+  committed C snapshot, no seed.
 
 ---
 

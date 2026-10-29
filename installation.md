@@ -318,7 +318,7 @@ work from the source, and the checkout is the source of truth:
 ```bash
 git clone https://github.com/mhieuhonda/halis-lang.git
 cd halis-lang
-make bootstrap          # ~20 s: cc builds the seed, HLS takes over
+make bootstrap          # ~20 s: cc compiles the committed C snapshot, HLS takes over
 make bin/hlfmt          # the formatter, compiled by the fresh hlc
 make run F=examples/hello.hls
 make test               # the full suite (this one needs python3)
@@ -372,8 +372,8 @@ acceptance gates an installed SDK does not.
 | `the installed compiler did not compile the smoke program` | The binary refuses to run on this machine — wrong architecture is the usual suspect. Check `uname -m` against the archive you installed; report anything else. |
 | `$PREFIX is not writable` | Run under `sudo`, or pass `--prefix DIR` you own (the default flow already falls back to `~/.local` for non-root users). |
 | `net_tls_get` panics with "built without libcurl" | Expected with the release binaries. Build from source with libcurl's dev package present (see [optional pieces](#optional-pieces)) to enable it. |
-| Could not determine the latest release | The unauthenticated GitHub API is rate-limited. Pass `--ref` to name a version explicitly. |
-| Could not ask GitHub for the archive at all | Offline, firewalled, or behind a proxy — `curl` honours `http_proxy`/`https_proxy`; or mirror the release layout and point `HALIS_DIST_SERVER` at it. |
+| could not determine the latest release | The unauthenticated GitHub API is rate-limited. Pass `--ref` to name a version explicitly. |
+| could not fetch SHA256SUMS for … / could not fetch … | The tag is not a release tag, the network is down, or `HALIS_DIST_SERVER` points at a mirror that does not serve the release layout. Check the tag, retry, and mind the proxy — `curl` honours `http_proxy`/`https_proxy`. |
 
 ## Security notes
 
