@@ -1,0 +1,707 @@
+# ============================================================================
+# tests/acc/rc_acceptance.hls — Stage 146 acceptance gate, in Halis
+# (the Halis twin of tests/rc_acceptance.py; same nine sections, same
+# assertions, same needles — the harness is tests/acc/harness.hls and
+# the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Nine sections over the REAL rc CLI (bin/hls-rc) and REAL scratch git
+# repositories (seeded under tests/.acc-scratch/rc/, the gate's scratch
+# world) — a candidate cannot be rehearsed on the tree it will one day
+# bless.
+#
+# The battery set GIT_* env vars for every child so the scratch
+# commits carry a pinned committer day; the gate does the same with
+# std.env before the first child spawns. The battery's run() piped
+# stderr into stdout, so every needle it grepped in r.stdout is
+# grepped here in r.combined.
+#
+#  1. the convention  — the usage law (no command, unknown command,
+#                       unknown flag: exit 2), the readiness --json
+#                       shape (ready, head, first_open, laws)
+#  2. the readiness   — the checklist over the REAL tree and scratch
+#     law               trees that fail one law at a time: a feature
+#                       stage still open, a missing freeze document, a
+#                       freeze that hls-freeze did not write, a frozen
+#                       commit outside the history, the markers
+#                       disagreeing
+#  3. the tag law     — the candidate grammar refused shape by shape
+#                       (another line, the LTS release, a retired
+#                       channel, not-a-number, the roadmap planned
+#                       four, build metadata, the grammar)
+#  4. the declare     — the candidate cut ON PAPER over a scratch
+#     law               release: refused while the roadmap's own row
+#                       is unticked, the anchor written with its
+#                       tag/commit/day/freeze digest, the re-declare
+#                       refused as noise, a second anchor refused, the
+#                       dirty tree refused, the missing --tag a usage
+#                       error
+#  5. the gate law    — the feature freeze, commit by commit over
+#                       REAL history: fixes and chores land, a feat is
+#                       named sha by sha, an unprefixed commit is
+#                       refused fail-closed, a "fix" that adds std/
+#                       surface is re-classed FEATURE (the diff gate),
+#                       --range judges an arbitrary range, gate
+#                       without an anchor names the declare command
+#  6. the report law  — the record rendered deterministic (two renders
+#                       byte-identical), --check green on the
+#                       committed copy, drift refused with the
+#                       regenerate command named, report before any
+#                       declaration refused
+#  7. the sort law    — the candidate is the newest release the tree
+#                       has ever named: an older or equal tag refused,
+#                       judged over REAL git tags
+#  8. the LTS         — the candidate opens no support window: the
+#     handoff            anchor (when declared on this tree) stands
+#                       beside NO .hls-lts.json, LTS.md stays the
+#                       promise, and the real-tree publication (when
+#                       present) matches its render
+#  9. the corpus      — tests/ok/feat_stage146_rc1.hls is hlfmt-
+#     showcase          canonical, hllint-clean, boots through the
+#                       real checker, runs green on the interpreter
+#                       and (when bin/hlc exists) matches natively
+#                       byte for byte
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.json"
+import "std.result"
+import "std.env"
+
+# ----------------------------------------------------------------------------
+# The gate's data (the battery's constants).
+# ----------------------------------------------------------------------------
+
+fn freeze_digest() -> str {
+    return "84d1068f80d62f3f741785ce2241b423fa5bd36b4e28e0a872c6e772e4decaf6"
+}
+
+fn showcase() -> str {
+    return "tests/ok/feat_stage146_rc1.hls"
+}
+
+fn showcase_out() -> str {
+    return "stage 146: v1.0.0-rc.1\n"
+        + "  RC1 laws OK: grammar, stages, precedence, admission, "
+        + "readiness\n"
+}
+
+# ----------------------------------------------------------------------------
+# Port helpers — the battery's world builders and needle tools.
+# ----------------------------------------------------------------------------
+
+fn header(title: str) -> void uses IO {
+    println("")
+    println("--- " + title + " ---")
+}
+
+# rc(args) — the battery's rc(*argv, cwd=None): the child runs with the
+# gate's cwd (the repo root) and whatever --root the caller passes.
+fn rc(args: list[str]) -> RunResult uses Proc {
+    return run_capture("./bin/hls-rc", args)
+}
+
+fn git(repo: str, args: list[str]) -> RunResult uses Proc {
+    let argv: list[str] = ["-C", repo]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    return run_capture("git", argv)
+}
+
+# wf(repo, rel, content) — write inside a world, parents made.
+fn wf(repo: str, rel: str, content: str) -> void uses Fs, Proc {
+    let p: str = path_join3(repo, rel)
+    mkdirs(path_dir3(p))
+    write_file(p, content)
+}
+
+fn rf(repo: str, rel: str) -> str uses Fs {
+    return read_file(path_join3(repo, rel))
+}
+
+fn commit_all(repo: str, msg: str) -> str uses Proc {
+    git(repo, ["add", "-A"])
+    git(repo, ["commit", "-q", "-m", msg])
+    let r: RunResult = git(repo, ["rev-parse", "HEAD"])
+    return r.out.trim()
+}
+
+# py_tail(text, n) — Python's text[-n:] (the bad() details slice the
+# last 300 bytes of the child's output).
+fn py_tail(text: str, n: int) -> str {
+    if text.len() <= n {
+        return text
+    }
+    return text.slice(text.len() - n, text.len())
+}
+
+# dotdash(s) — the battery's tag.replace(".", "-").replace("+", "-"),
+# for scratch-world names derived from tags.
+fn dotdash(s: str) -> str {
+    return str_replace(str_replace(s, ".", "-"), "+", "-")
+}
+
+# f40() — Python's "f" * 40 (the unanchored freeze's bogus commit).
+fn f40() -> str {
+    return "ffffffff" + "ffffffff" + "ffffffff" + "ffffffff" + "ffffffff"
+}
+
+# JSON accessors with the battery's .get(key, default) semantics —
+# std.json's typed accessors panic on a kind mismatch, so guard first.
+fn jget_str(v: JsonValue, key: str) -> str {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_str(x) {
+        return json_str_value(x)
+    }
+    return ""
+}
+
+fn jget_int(v: JsonValue, key: str) -> int {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_int(x) {
+        return json_int_value(x)
+    }
+    return 0
+}
+
+# data.get(key) is False / is True — the key present and that bool.
+fn jget_bool_is(v: JsonValue, key: str, want: bool) -> bool {
+    let x: JsonValue = json_object_get(v, key)
+    return json_is_bool(x) && json_bool_value(x) == want
+}
+
+fn parse_json_or_null(text: str) -> JsonValue {
+    let rr: Result[JsonValue, str] = json_parse_result(text)
+    if result_is_ok(rr) {
+        return result_unwrap(rr)
+    }
+    return json_null()
+}
+
+# the anchor file (read_or: a world whose declare failed has none —
+# the accessors then see null, the way the battery's {} default reads)
+fn anchor_of(repo: str) -> JsonValue uses Fs {
+    return parse_json_or_null(read_or(path_join3(repo, ".hls-rc.json"), ""))
+}
+
+# The candidate line's legal states, read off the real tree:
+# 'eve' — the anchor stands, no line declared (the road still has a
+# Stage 150 to cut); 'released' — the anchor retired with the release
+# commit and the LTS line is declared. Anything else is a half-cut
+# release, and a half-cut release is not a state. The RC4-era gates
+# ran on the eve; after the release they must still run — the kit
+# inherits both ends of the line it certified.
+fn release_state() -> str uses Fs {
+    let anchor: bool = file_exists(".hls-rc.json")
+    let line: bool = file_exists(".hls-lts.json")
+    if anchor && !line {
+        return "eve"
+    }
+    if line && !anchor {
+        return "released"
+    }
+    return "half-cut"
+}
+
+# ----------------------------------------------------------------------------
+# The scratch worlds.
+# ----------------------------------------------------------------------------
+
+# roadmap(closed_through) — the stage table, live-shaped:
+# closed_through rows ticked, the rest open.
+fn roadmap(closed_through: int) -> str {
+    let rows: list[str] = []
+    let mut n: int = 1
+    while n <= 150 {
+        let mut st: str = "⬜"
+        if n <= closed_through {
+            st = "✅"
+        }
+        rows.push("| " + n.to_str() + " | stage " + n.to_str()
+            + " title | " + st + " | (done in v0.1.0) |")
+        n = n + 1
+    }
+    return "# ROADMAP\n\n"
+        + "| # | Stage | Status | Effort |\n"
+        + "|---|-------|--------|--------|\n"
+        + str_join(rows, "\n") + "\n"
+}
+
+# scratch_world(name, closed_through) — a minimal compliant world at
+# changelog v1.0.0-rc.1, stages closed through closed_through. Returns
+# the repo path.
+fn scratch_world(acc: Acc, name: str, closed_through: int) -> str
+    uses IO, Fs, Proc, Exit {
+    let repo: str = scratch(acc, name)
+    mkdirs(repo)
+    let init: RunResult = git(repo, ["init", "-q", "-b", "main"])
+    if init.code != 0 {
+        # a world that is not its own repository would commit into the
+        # gate's OUTER repo — refuse loudly instead
+        println("rc-acceptance: git init failed in " + repo + " — " + init.err)
+        exit(2)
+    }
+    wf(repo, "ROADMAP.md", roadmap(closed_through))
+    wf(repo, "CHANGELOG.md",
+        "## [v1.0.0-rc.1] — Stage 146: the candidate\n- the body\n")
+    wf(repo, "snapshot/MANIFEST.json",
+        "{\"closure\": {}, \"version\": \"v1.0.0-rc.1\"}")
+    wf(repo, "editors/vscode/halis/package.json",
+        "{\"name\": \"halis\", \"version\": \"1.0.0-rc.1\"}")
+    wf(repo, "LTS.md", "the promise\n")
+    wf(repo, "snapshot/hlc.c", "int main(void){return 0;}\n")
+    git(repo, ["add", "-A"])
+    git(repo, ["commit", "-q", "-m", "seed"])
+    let frozen: str = git(repo, ["rev-parse", "HEAD"]).out.trim()
+    let freeze: str = "{\"digest\": \"" + freeze_digest()
+        + "\", \"frozen_commit\": \"" + frozen
+        + "\", \"release\": \"0.159.0-alpha\", \"stage\": 141"
+        + ", \"surface\": {\"syntax\": {\"keywords\": [\"fn\"]}}"
+        + ", \"surface_version\": 1, \"tool\": \"hls-freeze\"}"
+    wf(repo, "tests/api_freeze.json", freeze)
+    git(repo, ["add", "-A"])
+    git(repo, ["commit", "-q", "-m", "the freeze document"])
+    return repo
+}
+
+# ----------------------------------------------------------------------------
+# 1. the convention — the usage law, the --json shape
+# ----------------------------------------------------------------------------
+
+fn sec1(acc: Acc) -> void uses IO, Fs, Proc {
+    header("1. the convention — the usage law, the --json shape")
+    let r: RunResult = rc([])
+    check(acc, "no command is a usage error (exit 2)", r.code == 2, "")
+    let r2: RunResult = rc(["frobnicate"])
+    check(acc, "an unknown command is a usage error", r2.code == 2, "")
+    let r3: RunResult = rc(["readiness", "--frobnicate"])
+    check(acc, "an unknown flag is a usage error", r3.code == 2, "")
+    let r4: RunResult = rc(["declare"])
+    check(acc, "declare without --tag is a usage error", r4.code == 2, "")
+    let r5: RunResult = rc(["gate", "--range", "norange"])
+    check(acc, "a malformed range is a usage error naming the grammar",
+        r5.code == 2 && r5.combined.contains("A..B"), "")
+
+    let rj: RunResult = rc(["readiness", "--json"])
+    if release_state() == "released" {
+        check(acc, "readiness --json on the released tree refuses (the "
+            + "verdict the retirement names)", rj.code == 1, "")
+        let data: JsonValue = parse_json_or_null(rj.combined)
+        if json_is_object(data) {
+            check(acc, "the verdict is ready:false (the release happened)",
+                jget_bool_is(data, "ready", false), "")
+        } else {
+            fail_msg(acc, "readiness --json does not parse: "
+                + clip(rj.combined, 80))
+        }
+    } else {
+        check(acc, "readiness --json on the real tree is green",
+            rj.code == 0, "")
+        let data: JsonValue = parse_json_or_null(rj.combined)
+        if json_is_object(data) {
+            let laws: JsonValue = json_object_get(data, "laws")
+            let n_laws: int = laws.arr.len()
+            check(acc, "the verdict is ready:true",
+                jget_bool_is(data, "ready", true), "")
+            check(acc, "the verdict names the head version and first open "
+                + "stage",
+                json_object_has(data, "head")
+                    && json_object_has(data, "first_open"), "")
+            check(acc, "the verdict carries the named laws ("
+                + n_laws.to_str() + ")",
+                json_is_array(laws) && n_laws >= 6, "")
+        } else {
+            fail_msg(acc, "readiness --json does not parse: "
+                + clip(rj.combined, 80))
+        }
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 2. the readiness law — the checklist, one law at a time
+# ----------------------------------------------------------------------------
+
+fn sec2(acc: Acc) -> void uses IO, Fs, Proc {
+    header("2. the readiness law — the checklist, one law at a time")
+    let r: RunResult = rc(["readiness"])
+    if release_state() == "released" {
+        check(acc, "the REAL tree is released (readiness refuses on both "
+            + "laws, named)",
+            r.code == 1 && r.combined.contains("NOT READY: the roadmap law")
+                && r.combined.contains("NOT READY: the lts law"), "")
+    } else {
+        check(acc, "the REAL tree is ready (145 closed, the tail from 146)",
+            r.code == 0 && r.combined.contains("READY"), "")
+    }
+
+    let repo: str = scratch_world(acc, "ready-ok", 145)
+    let r2: RunResult = rc(["readiness", "--root", repo])
+    check(acc, "a compliant scratch world is ready", r2.code == 0, "")
+
+    let repo2: str = scratch_world(acc, "ready-feature-open", 144)
+    let r3: RunResult = rc(["readiness", "--root", repo2])
+    check(acc, "a feature stage still open contradicts a candidate (named)",
+        r3.code == 1 && r3.combined.contains("stage 145"), "")
+
+    let repo3: str = scratch_world(acc, "ready-no-freeze", 145)
+    rmrf(path_join3(repo3, "tests/api_freeze.json"))
+    git(repo3, ["add", "-A"])
+    git(repo3, ["commit", "-q", "-m", "the freeze leaves"])
+    let r4: RunResult = rc(["readiness", "--root", repo3])
+    check(acc, "a missing freeze document is named",
+        r4.code == 1 && r4.combined.contains("api_freeze.json"), "")
+
+    let repo4: str = scratch_world(acc, "ready-foreign-freeze", 145)
+    wf(repo4, "tests/api_freeze.json",
+        str_replace(rf(repo4, "tests/api_freeze.json"),
+            "\"tool\": \"hls-freeze\"", "\"tool\": \"someone-elses-tool\""))
+    commit_all(repo4, "docs: whose surface is this")
+    let r5: RunResult = rc(["readiness", "--root", repo4])
+    check(acc, "a freeze hls-freeze did not write is refused",
+        r5.code == 1 && r5.combined.contains("hls-freeze"), "")
+
+    let repo5: str = scratch_world(acc, "ready-unanchored-freeze", 145)
+    let freeze5: JsonValue = parse_json_or_null(
+        rf(repo5, "tests/api_freeze.json"))
+    wf(repo5, "tests/api_freeze.json",
+        str_replace(rf(repo5, "tests/api_freeze.json"),
+            "\"frozen_commit\": \"" + jget_str(freeze5, "frozen_commit")
+                + "\"",
+            "\"frozen_commit\": \"" + f40() + "\""))
+    commit_all(repo5, "docs: the freeze unanchored")
+    let r6: RunResult = rc(["readiness", "--root", repo5])
+    check(acc, "a frozen commit outside this history is refused",
+        r6.code == 1 && r6.combined.contains("ancestor"), "")
+
+    let repo6: str = scratch_world(acc, "ready-markers", 145)
+    wf(repo6, "snapshot/MANIFEST.json",
+        "{\"closure\": {}, \"version\": \"v0.9.0\"}")
+    commit_all(repo6, "chore: the manifest speaks alone")
+    let r7: RunResult = rc(["readiness", "--root", repo6])
+    check(acc, "disagreeing markers are named with the regenerate command",
+        r7.code == 1 && r7.combined.contains("disagree")
+            && r7.combined.contains("snapshot-regen"), "")
+}
+
+# ----------------------------------------------------------------------------
+# 3. the tag law — the candidate grammar, shape by shape
+# ----------------------------------------------------------------------------
+
+fn tag_shapes() -> list[list[str]] {
+    return [
+        ["v2.0.0-rc.1", "another line"],
+        ["v1.0.0", "the LTS release"],
+        ["v1.0.0-alpha", "a retired channel"],
+        ["v1.0.0-beta.1", "a retired channel"],
+        ["v1.0.0-rc.0", "the numbering starts at 1"],
+        ["v1.0.0-rc.02", "a leading zero"],
+        ["v1.0.0-rc.x", "not a number"],
+        ["v1.0.0-rc.5", "the roadmap planned four"],
+        ["v1.0.0-rc.1+b7", "build metadata"],
+        ["not-a-version", "the grammar"],
+    ]
+}
+
+fn sec3(acc: Acc) -> void uses IO, Fs, Proc {
+    header("3. the tag law — the candidate grammar, shape by shape")
+    let shapes: list[list[str]] = tag_shapes()
+    let mut i: int = 0
+    while i < shapes.len() {
+        let tag: str = shapes.get(i).get(0)
+        let why: str = shapes.get(i).get(1)
+        let repo: str = scratch_world(acc,
+            "tag-" + dotdash(tag) + "-t", 146)
+        let r: RunResult = rc(["declare", "--tag", tag, "--root", repo])
+        check(acc, tag + " refused (" + why + ")", r.code == 1, "")
+        i = i + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 4. the declare law — the candidate cut on paper
+# ----------------------------------------------------------------------------
+
+fn sec4(acc: Acc) -> void uses IO, Fs, Proc {
+    header("4. the declare law — the candidate cut on paper")
+    let repo: str = scratch_world(acc, "declare-stage", 145)
+    let r: RunResult = rc(["declare", "--tag", "v1.0.0-rc.1", "--root", repo])
+    check(acc, "refused while the roadmap's own row is unticked",
+        r.code == 1 && r.combined.contains("Stage 146"), "")
+
+    wf(repo, "ROADMAP.md", roadmap(146))
+    commit_all(repo, "docs: stage 146 changelog + roadmap")
+    let r2: RunResult = rc(["declare", "--tag", "v1.0.0-rc.1", "--root", repo])
+    check(acc, "the release that carries the candidate declares it",
+        r2.code == 0 && r2.combined.contains("anchored"), "")
+    let anchor: JsonValue = anchor_of(repo)
+    check(acc, "the anchor names its kit",
+        jget_str(anchor, "kit") == "halis-rc-1", "")
+    check(acc, "the anchor names the tag",
+        jget_str(anchor, "tag") == "v1.0.0-rc.1", "")
+    check(acc, "the anchor pins a commit",
+        jget_str(anchor, "sha").len() == 40, "")
+    check(acc, "the anchor names the stage",
+        jget_int(anchor, "stage") == 146, "")
+    check(acc, "the anchor's day is the committer day",
+        jget_str(anchor, "day") == "2026-10-28", "")
+    check(acc, "the anchor carries the freeze digest",
+        jget_str(anchor, "freeze_digest") == freeze_digest(), "")
+    check(acc, "the anchor names the successor candidate",
+        jget_str(anchor, "next") == "v1.0.0-rc.2", "")
+
+    let r3: RunResult = rc(["declare", "--tag", "v1.0.0-rc.1", "--root", repo])
+    check(acc, "a re-declaration is refused as noise",
+        r3.code == 1 && r3.combined.contains("noise"), "")
+
+    let repo2: str = scratch_world(acc, "declare-second", 146)
+    let r4: RunResult = rc(["declare", "--tag", "v1.0.0-rc.1", "--root", repo2])
+    check(acc, "the second world declares clean", r4.code == 0, "")
+    let r5: RunResult = rc(["declare", "--tag", "v1.0.0-rc.2", "--root", repo2])
+    check(acc, "a second anchor is refused (one candidate per tree)",
+        r5.code == 1 && r5.combined.contains("one anchor per tree"), "")
+
+    let repo3: str = scratch_world(acc, "declare-dirty", 146)
+    wf(repo3, "snapshot/hlc.c", "int main(void){return 1;}\n")
+    let r6: RunResult = rc(["declare", "--tag", "v1.0.0-rc.1", "--root", repo3])
+    check(acc, "a dirty tree is refused (the anchor pins a commit)",
+        r6.code == 1 && r6.combined.contains("dirty"), "")
+}
+
+# ----------------------------------------------------------------------------
+# 5. the gate law — the freeze, commit by commit
+# ----------------------------------------------------------------------------
+
+fn sec5(acc: Acc) -> void uses IO, Fs, Proc {
+    header("5. the gate law — the freeze, commit by commit")
+    let repo: str = scratch_world(acc, "gate-noanchor", 145)
+    let r0: RunResult = rc(["gate", "--root", repo])
+    check(acc, "gate without an anchor names the declare command",
+        r0.code == 1 && r0.combined.contains("declare"), "")
+
+    let repo2: str = scratch_world(acc, "gate-live", 146)
+    let d: RunResult = rc(["declare", "--tag", "v1.0.0-rc.1", "--root", repo2])
+    check(acc, "the candidate declared for the gate", d.code == 0, "")
+    let r: RunResult = rc(["gate", "--root", repo2])
+    check(acc, "an empty range is green",
+        r.code == 0 && r.combined.contains("0 commit(s)"), "")
+
+    wf(repo2, "notes.md", "one\n")
+    commit_all(repo2, "fix: the proc table reaps spent slots")
+    let r2: RunResult = rc(["gate", "--root", repo2])
+    check(acc, "a fix lands",
+        r2.code == 0 && r2.combined.contains("BUGFIX 1"), "")
+
+    wf(repo2, "notes.md", "one\ntwo\n")
+    commit_all(repo2, "docs: the record moves")
+    let r3: RunResult = rc(["gate", "--root", repo2])
+    if r3.code == 0 && r3.combined.contains("CHORE 1") {
+        pass_msg(acc, "a chore lands")
+    } else {
+        fail_msg(acc, "a chore lands — the gate said: "
+            + py_tail(r3.combined, 300).trim())
+    }
+
+    wf(repo2, "notes.md", "one\ntwo\nthree\n")
+    commit_all(repo2, "feat: a surface nobody froze")
+    let r4: RunResult = rc(["gate", "--root", repo2])
+    if r4.code == 1 && r4.combined.contains("VIOLATION")
+            && r4.combined.contains("FEATURE") {
+        pass_msg(acc, "a feature is named sha by sha")
+    } else {
+        fail_msg(acc, "a feature is named sha by sha — the gate said: "
+            + py_tail(r4.combined, 300).trim())
+    }
+
+    wf(repo2, "notes.md", "one\ntwo\nthree\nfour\n")
+    commit_all(repo2, "just a thing")
+    let r5: RunResult = rc(["gate", "--root", repo2])
+    if r5.code == 1 && r5.combined.contains("UNKNOWN") {
+        pass_msg(acc, "an unprefixed commit is refused fail-closed")
+    } else {
+        fail_msg(acc, "an unprefixed commit is refused fail-closed — the "
+            + "gate said: " + py_tail(r5.combined, 300).trim())
+    }
+
+    # the diff gate: a fix that grows the surface is a feature
+    wf(repo2, "std/new_surface.hls",
+        "fn list_new_int() -> int {\n    return 0\n}\n")
+    commit_all(repo2, "fix: patch the allocator")
+    let r6: RunResult = rc(["gate", "--root", repo2])
+    check(acc, "a fix that adds std/ surface is re-classed FEATURE",
+        r6.code == 1 && r6.combined.contains("new API surface is a feature"),
+        "")
+
+    # --range judges an arbitrary range: only the fix commit inside
+    let r7: RunResult = rc(["gate", "--range", "HEAD~4..HEAD~3",
+        "--root", repo2])
+    if r7.code == 0 && r7.combined.contains("1 commit(s)") {
+        pass_msg(acc, "--range judges the range it is given")
+    } else {
+        fail_msg(acc, "--range judges the range it is given — the gate "
+            + "said: " + py_tail(r7.combined, 300).trim())
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 6. the report law — the record rendered and defended
+# ----------------------------------------------------------------------------
+
+fn sec6(acc: Acc) -> void uses IO, Fs, Proc {
+    header("6. the report law — the record rendered and defended")
+    let repo: str = scratch_world(acc, "report-live", 146)
+    let r: RunResult = rc(["report", "--out", "RC.md", "--root", repo])
+    check(acc, "report before any declaration names the declare command",
+        r.code == 1 && r.combined.contains("declare"), "")
+    let d: RunResult = rc(["declare", "--tag", "v1.0.0-rc.1", "--root", repo])
+    check(acc, "declared for the report", d.code == 0, "")
+
+    let out_a: str = scratch(acc, "report-a.md")
+    let out_b: str = scratch(acc, "report-b.md")
+    let ra: RunResult = rc(["report", "--out", out_a, "--root", repo])
+    let rb: RunResult = rc(["report", "--out", out_b, "--root", repo])
+    check(acc, "two renders both succeed", ra.code == 0 && rb.code == 0, "")
+    check(acc, "the render is deterministic (two runs byte-identical)",
+        read_file(out_a) == read_file(out_b), "")
+
+    let r2: RunResult = rc(["report", "--out", "RC.md", "--root", repo])
+    let r3: RunResult = rc(["report", "--check", "--root", repo])
+    check(acc, "--check is green on the committed copy",
+        r2.code == 0 && r3.code == 0
+            && r3.combined.contains("matches the render"), "")
+
+    wf(repo, "RC.md", rf(repo, "RC.md") + "hand edit\n")
+    let r4: RunResult = rc(["report", "--check", "--root", repo])
+    check(acc, "a drifted record is refused with the regenerate command",
+        r4.code == 1 && r4.combined.contains("regenerate"), "")
+}
+
+# ----------------------------------------------------------------------------
+# 7. the sort law — the newest release the tree ever named
+# ----------------------------------------------------------------------------
+
+fn sec7(acc: Acc) -> void uses IO, Fs, Proc {
+    header("7. the sort law — the newest release the tree ever named")
+    let repo: str = scratch_world(acc, "sort-law", 146)
+    git(repo, ["tag", "v1.0.0-rc.1"])
+    let r: RunResult = rc(["declare", "--tag", "v1.0.0-rc.1", "--root", repo])
+    check(acc, "an equal tag is refused",
+        r.code == 1 && r.combined.contains("sort after"), "")
+    let r2: RunResult = rc(["declare", "--tag", "v0.166.0-alpha",
+        "--root", repo])
+    check(acc, "an older line is refused by the grammar before the sort",
+        r2.code == 1, "")
+    git(repo, ["tag", "v0.166.0-alpha"])
+    let r3: RunResult = rc(["declare", "--tag", "v1.0.0-rc.1", "--root", repo])
+    check(acc, "the candidate must outrank every tag that exists",
+        r3.code == 1 && r3.combined.contains("sort after"), "")
+}
+
+# ----------------------------------------------------------------------------
+# 8. the LTS handoff — the candidate opens no window
+# ----------------------------------------------------------------------------
+
+fn sec8(acc: Acc) -> void uses IO, Fs, Proc {
+    header("8. the LTS handoff — the candidate opens no window")
+    if release_state() == "released" {
+        check(acc, "the LTS line IS declared on the released tree (the "
+            + "handoff this section watched for, happened)",
+            file_exists(".hls-lts.json"), "")
+    } else {
+        check(acc, "no LTS line is declared on the real tree",
+            !file_exists(".hls-lts.json"), "")
+    }
+    check(acc, "LTS.md stays published", file_exists("LTS.md"), "")
+    let lts: str = read_or("LTS.md", "")
+    check(acc, "the promise names the day it becomes the clock",
+        lts.contains("hls-lts init --tag v1.0.0"), "")
+    if file_exists(".hls-rc.json") {
+        let anchor: JsonValue = parse_json_or_null(read_file(".hls-rc.json"))
+        # RC2 fix: the anchor is whatever candidate the tree has
+        # legitimately reached — the kit's own successor rule moves it
+        # (rc.1 declares rc.2, and so on), so pinning THIS gate to
+        # rc.1 made every later candidate fail the gate that certified
+        # the line. The law is the SHAPE: the anchor carries a
+        # candidate tag of the v1.0.0 line, rc.1..rc.4.
+        let atag: str = jget_str(anchor, "tag")
+        check(acc, "the real tree's anchor is a candidate of the line ("
+            + atag + ")",
+            atag == "v1.0.0-rc.1" || atag == "v1.0.0-rc.2"
+                || atag == "v1.0.0-rc.3" || atag == "v1.0.0-rc.4", "")
+        let rc2: RunResult = rc(["report", "--check"])
+        check(acc, "the committed RC.md matches its render", rc2.code == 0, "")
+        let g: RunResult = rc(["gate"])
+        check(acc, "the real tree's range since the anchor is inside the "
+            + "freeze", g.code == 0, "")
+    } else {
+        if release_state() == "released" {
+            check(acc, "the anchor retired with the release commit (the "
+                + "record is history now, not a law)",
+                !file_exists(".hls-rc.json"), "")
+        } else {
+            let r: RunResult = rc(["readiness"])
+            check(acc, "the anchor is not cut yet; readiness still green",
+                r.code == 0, "")
+        }
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 9. the corpus showcase — the laws as a pure-HLS program
+# ----------------------------------------------------------------------------
+
+fn sec9(acc: Acc) -> void uses IO, Fs, Proc {
+    header("9. the corpus showcase — the laws as a pure-HLS program")
+    check(acc, path_join3(acc.root, showcase()) + " exists",
+        file_exists(showcase()), "")
+    let fmt: RunResult = run_capture("./bin/hlfmt", [showcase()])
+    check(acc, "hlfmt-canonical (the formatter would not change a byte)",
+        fmt.combined == read_file(showcase()), "")
+    let lint: RunResult = run_capture("python3",
+        ["tools/hllint.py", showcase()])
+    check(acc, "hllint-clean",
+        lint.code == 0 && lint.combined.contains("no warnings"), "")
+    let run: RunResult = boot(acc, [showcase()])
+    check(acc, "boots green on the interpreter with the pinned output",
+        run.code == 0 && run.combined == showcase_out(), "")
+    if file_exists("bin/hlc") && which("gcc") {
+        let cpath: str = scratch(acc, "rc1_corpus.c")
+        let bpath: str = scratch(acc, "rc1_corpus")
+        let comp: RunResult = run_capture("./bin/hlc", [showcase(), cpath])
+        check(acc, "bin/hlc compiles the showcase", comp.code == 0, "")
+        let link: RunResult = run_capture("gcc",
+            ["-O2", "-o", bpath, cpath, "-lm", "-pthread"])
+        check(acc, "cc links the showcase", link.code == 0, "")
+        let nat: RunResult = run_capture(bpath, [])
+        check(acc, "the native binary matches the interpreter byte for byte",
+            nat.code == 0 && nat.combined == showcase_out(), "")
+    } else {
+        println("  skip: native differential (bin/hlc or cc missing)")
+    }
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    # the battery's GIT_ENV — every child (git, the kit) sees the
+    # pinned identity and the pinned committer day
+    env_set_var("GIT_AUTHOR_NAME", "rc146-gate")
+    env_set_var("GIT_AUTHOR_EMAIL", "rc146-gate@example.invalid")
+    env_set_var("GIT_COMMITTER_NAME", "rc146-gate")
+    env_set_var("GIT_COMMITTER_EMAIL", "rc146-gate@example.invalid")
+    env_set_var("GIT_COMMITTER_DATE", "2026-10-28T09:00:00+00:00")
+    env_set_var("GIT_AUTHOR_DATE", "2026-10-28T09:00:00+00:00")
+    let acc: Acc = acc_new("rc")
+    sec1(acc)
+    sec2(acc)
+    sec3(acc)
+    sec4(acc)
+    sec5(acc)
+    sec6(acc)
+    sec7(acc)
+    sec8(acc)
+    sec9(acc)
+    return finish(acc,
+        "Stage 146 -- the release candidate, the feature freeze declared "
+        + "(v1.0.0-rc.1)")
+}

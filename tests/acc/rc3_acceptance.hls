@@ -1,0 +1,715 @@
+# ============================================================================
+# tests/acc/rc3_acceptance.hls — Stage 148 acceptance gate, in Halis
+# (the Halis twin of tests/rc3_acceptance.py; same six sections, same
+# assertions, same needles — the harness is tests/acc/harness.hls and
+# the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Six sections over the REAL CLIs (bin/hls-rc, bin/hls-lts) and REAL
+# scratch git repositories (tests/.acc-scratch/rc3/, the gate's
+# scratch world) — the release day itself is rehearsed end to end,
+# exactly as Stage 150 will run it, on worlds built for the purpose.
+#
+# The battery set GIT_* env vars for every child so the scratch
+# commits carry a pinned committer day; the gate does the same with
+# std.env before the first child spawns. The battery's rc()/lts()
+# helpers ran the kits with cwd=repo on the scratch worlds; the gate
+# chdirs to the world for the spawn and restores the repo root after
+# (--root/--repo ride along exactly as the battery appended them).
+#
+#  1. the record    — the render fixes this round ships, pinned as
+#     law             laws: the record's tag line quotes the roadmap
+#                     row's OWN phrase, the last candidate's successor
+#                     line speaks the RELEASE cut, and a roadmap row
+#                     without a phrase makes no identity claim at all;
+#  2. the real-tree — the tree this gate runs on is fit to be a
+#     pre-flight      candidate: readiness green, the gate green over
+#                     the live range, the markers one voice, the
+#                     committed record drift-free and speaking the
+#                     anchor stage's own phrase off the live roadmap;
+#  3. the eve       — the scratch world walked candidate by candidate
+#     rehearsal        (rc.1..rc.4, each cut the real way) until it
+#                     stands at the eve of the release, the last
+#                     anchor naming v1.0.0 as its successor;
+#  4. the release   — the wrong turns refused first (a bare v1.0.0 is
+#     day             not a candidate, a pre-release is not an LTS
+#                     base, a pre-1.0 tag is not a line, a tag that
+#                     does not exist opens nothing), then the cut
+#                     itself: the markers move to 1.0.0, the anchor
+#                     retires with the release commit, the tag is cut,
+#                     the LTS line opens, the windows become the clock
+#                     — and the RC kit RETIRES, named;
+#  5. the day       — the maintenance loop the morning after: a fix
+#     after           lands on main, backports onto the line with its
+#                     provenance trailer, tag-patch cuts v1.0.1, the
+#                     audit stays clean — and the gate over the WHOLE
+#                     road (rc.1 to the release) is green;
+#  6. the corpus    — tests/ok/feat_stage148_rc3.hls is hlfmt-
+#     showcase        canonical, hllint-clean, boots through the real
+#                     checker, runs green on the interpreter and (when
+#                     bin/hlc exists) matches natively byte for byte.
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.json"
+import "std.result"
+import "std.env"
+
+# ----------------------------------------------------------------------------
+# The gate's data (the battery's constants).
+# ----------------------------------------------------------------------------
+
+fn release_day() -> str {
+    return "2026-10-29"
+}
+
+fn freeze_digest() -> str {
+    return "84d1068f80d62f3f741785ce2241b423fa5bd36b4e28e0a872c6e772e4decaf6"
+}
+
+fn showcase() -> str {
+    return "tests/ok/feat_stage148_rc3.hls"
+}
+
+fn showcase_out() -> str {
+    return "stage 148: v1.0.0-rc.3\n"
+        + "  RC3 laws OK: sequence, handoff, retirement, order, "
+        + "window\n"
+}
+
+# ----------------------------------------------------------------------------
+# Port helpers — the battery's world builders and needle tools.
+# ----------------------------------------------------------------------------
+
+fn header(title: str) -> void uses IO {
+    println("")
+    println("--- " + title + " ---")
+}
+
+# rc(args, root_dir) — the battery's rc(*argv, cwd=None): --root is
+# appended ALWAYS (cwd or ROOT), and the child runs with cwd=root_dir.
+# The kit spawns its own git children in ITS cwd, so the gate chdirs
+# to the world for the spawn and restores the repo root after.
+fn rc(args: list[str], root_dir: str) -> RunResult uses Proc {
+    let home: str = cwd_get()
+    let argv: list[str] = []
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    argv.push("--root")
+    argv.push(root_dir)
+    env_set_current_dir(root_dir)
+    let r: RunResult = run_capture(path_join3(home, "bin/hls-rc"), argv)
+    env_set_current_dir(home)
+    return r
+}
+
+# lts(args, repo) — the battery's lts(*argv, cwd), the same chdir
+# dance with --repo appended last.
+fn lts(args: list[str], repo: str) -> RunResult uses Proc {
+    let home: str = cwd_get()
+    let argv: list[str] = []
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    argv.push("--repo")
+    argv.push(repo)
+    env_set_current_dir(repo)
+    let r: RunResult = run_capture(path_join3(home, "bin/hls-lts"), argv)
+    env_set_current_dir(home)
+    return r
+}
+
+fn git(repo: str, args: list[str]) -> RunResult uses Proc {
+    let argv: list[str] = ["-C", repo]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    return run_capture("git", argv)
+}
+
+# wf(repo, rel, content) — write inside a world, parents made.
+fn wf(repo: str, rel: str, content: str) -> void uses Fs, Proc {
+    let p: str = path_join3(repo, rel)
+    mkdirs(path_dir3(p))
+    write_file(p, content)
+}
+
+fn rf(repo: str, rel: str) -> str uses Fs {
+    return read_file(path_join3(repo, rel))
+}
+
+fn has(repo: str, rel: str) -> bool uses Fs {
+    return file_exists(path_join3(repo, rel))
+}
+
+fn commit_all(repo: str, msg: str) -> str uses Proc {
+    git(repo, ["add", "-A"])
+    git(repo, ["commit", "-q", "-m", msg])
+    let r: RunResult = git(repo, ["rev-parse", "HEAD"])
+    return r.out.trim()
+}
+
+# JSON accessors with the battery's .get(key, default) semantics —
+# std.json's typed accessors panic on a kind mismatch, so guard first.
+fn jget_str(v: JsonValue, key: str) -> str {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_str(x) {
+        return json_str_value(x)
+    }
+    return ""
+}
+
+fn jget_int(v: JsonValue, key: str) -> int {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_int(x) {
+        return json_int_value(x)
+    }
+    return 0
+}
+
+fn parse_json_or_null(text: str) -> JsonValue {
+    let rr: Result[JsonValue, str] = json_parse_result(text)
+    if result_is_ok(rr) {
+        return result_unwrap(rr)
+    }
+    return json_null()
+}
+
+# The candidate line's legal states, read off the real tree:
+# 'eve' — the anchor stands, no line declared; 'released' — the
+# anchor retired with the release commit and the LTS line is
+# declared. Anything else is a half-cut release, and a half-cut
+# release is not a state. This gate rehearsed the release day;
+# after the release it must still run — the rehearsal becomes the
+# record.
+fn release_state() -> str uses Fs {
+    let anchor: bool = file_exists(".hls-rc.json")
+    let line: bool = file_exists(".hls-lts.json")
+    if anchor && !line {
+        return "eve"
+    }
+    if line && !anchor {
+        return "released"
+    }
+    return "half-cut"
+}
+
+# the head release of the tree's record — the first `## [v...]`
+# line of RELEASES.md (the heading's version without the release `v`)
+fn real_head_version() -> str uses Fs {
+    let src: str = read_or("RELEASES.md", "")
+    let lines: list[str] = src.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i)
+        if line.starts_with("## [v") {
+            let end: int = line.find("]")
+            let start: int = line.find("[v")
+            if end > start {
+                return line.slice(start + 2, end)
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# ----------------------------------------------------------------------------
+# The scratch worlds.
+# ----------------------------------------------------------------------------
+
+# generic_roadmap(closed_through) — the plain stage table.
+fn generic_roadmap(closed_through: int) -> str {
+    let rows: list[str] = []
+    let mut n: int = 1
+    while n <= 150 {
+        let mut st: str = "⬜"
+        if n <= closed_through {
+            st = "✅"
+        }
+        rows.push("| " + n.to_str() + " | stage " + n.to_str()
+            + " title | " + st + " | (done in v0.1.0) |")
+        n = n + 1
+    }
+    return "# ROADMAP\n\n"
+        + "| # | Stage | Status | Effort |\n"
+        + "|---|-------|--------|--------|\n"
+        + str_join(rows, "\n") + "\n"
+}
+
+# road_title(n) — the fancy roadmap's REAL tail titles — the rows
+# whose parentheticals name each candidate's identity.
+fn road_title(n: int) -> str {
+    if n == 146 { return "v1.0 Release Candidate 1 (feature freeze)" }
+    if n == 147 { return "v1.0 Release Candidate 2 (bug-fix only)" }
+    if n == 148 { return "v1.0 Release Candidate 3 (final dry-run)" }
+    if n == 149 { return "v1.0 Release Candidate 4 (sign-off)" }
+    if n == 150 { return "HLS v1.0 — LTS release" }
+    return "stage " + n.to_str() + " title"
+}
+
+fn fancy_roadmap(closed_through: int) -> str {
+    let rows: list[str] = []
+    let mut n: int = 1
+    while n <= 150 {
+        let mut st: str = "⬜"
+        if n <= closed_through {
+            st = "✅"
+        }
+        rows.push("| " + n.to_str() + " | " + road_title(n) + " | " + st
+            + " | (done in v0.1.0) |")
+        n = n + 1
+    }
+    return "# ROADMAP\n\n"
+        + "| # | Stage | Status | Effort |\n"
+        + "|---|-------|--------|--------|\n"
+        + str_join(rows, "\n") + "\n"
+}
+
+# seed_world(name, roadmap_text) — a minimal compliant world at
+# Stage 145 closed, freeze anchored.
+fn seed_world(acc: Acc, name: str, roadmap_text: str) -> str
+    uses IO, Fs, Proc, Exit {
+    let repo: str = scratch(acc, name)
+    mkdirs(repo)
+    let init: RunResult = git(repo, ["init", "-q", "-b", "main"])
+    if init.code != 0 {
+        # a world that is not its own repository would commit into the
+        # gate's OUTER repo — refuse loudly instead
+        println("rc3-acceptance: git init failed in " + repo + " — "
+            + init.err)
+        exit(2)
+    }
+    wf(repo, "ROADMAP.md", roadmap_text)
+    wf(repo, "CHANGELOG.md",
+        "## [v0.165.0-alpha] — the last alpha\n- the body\n")
+    wf(repo, "snapshot/MANIFEST.json",
+        "{\"closure\": {}, \"version\": \"v0.165.0-alpha\"}")
+    wf(repo, "editors/vscode/halis/package.json",
+        "{\"name\": \"halis\", \"version\": \"0.165.0-alpha\"}")
+    wf(repo, "LTS.md", "the promise\n")
+    wf(repo, "snapshot/hlc.c", "int main(void){return 0;}\n")
+    git(repo, ["add", "-A"])
+    git(repo, ["commit", "-q", "-m", "seed"])
+    let frozen: str = git(repo, ["rev-parse", "HEAD"]).out.trim()
+    let freeze: str = "{\"digest\": \"" + freeze_digest()
+        + "\", \"frozen_commit\": \"" + frozen
+        + "\", \"release\": \"0.159.0-alpha\", \"stage\": 141"
+        + ", \"surface\": {\"syntax\": {\"keywords\": [\"fn\"]}}"
+        + ", \"surface_version\": 1, \"tool\": \"hls-freeze\"}"
+    wf(repo, "tests/api_freeze.json", freeze)
+    git(repo, ["add", "-A"])
+    git(repo, ["commit", "-q", "-m", "the freeze document"])
+    return repo
+}
+
+# walk_candidate(repo, n) — cut candidate n the real way: the row
+# ticked, the markers moved, the old anchor leaving with the release
+# commit, declare, the record rendered, the tag cut. Returns the
+# RC.md text.
+fn walk_candidate(acc: Acc, repo: str, n: int) -> str uses IO, Fs, Proc {
+    let stage: int = 145 + n
+    wf(repo, "ROADMAP.md", fancy_roadmap(stage))
+    wf(repo, "CHANGELOG.md", "## [v1.0.0-rc." + n.to_str() + "] — Stage "
+        + stage.to_str() + ": the candidate\n- the body\n")
+    wf(repo, "snapshot/MANIFEST.json", "{\"closure\": {}, \"version\": "
+        + "\"v1.0.0-rc." + n.to_str() + "\"}")
+    wf(repo, "editors/vscode/halis/package.json",
+        "{\"name\": \"halis\", \"version\": \"1.0.0-rc." + n.to_str()
+            + "\"}")
+    if has(repo, ".hls-rc.json") {
+        git(repo, ["rm", "-q", ".hls-rc.json"])
+    }
+    commit_all(repo, "docs: stage " + stage.to_str()
+        + " markers, the candidate " + n.to_str() + " line")
+    let r: RunResult = rc(["declare", "--tag", "v1.0.0-rc." + n.to_str()],
+        repo)
+    if r.code != 0 {
+        fail_msg(acc, "candidate rc." + n.to_str() + " did not declare: "
+            + clip(r.combined, 200))
+        return ""
+    }
+    rc(["report", "--out", "RC.md"], repo)
+    commit_all(repo, "release: v1.0.0-rc." + n.to_str()
+        + " anchored, the record rendered")
+    git(repo, ["tag", "v1.0.0-rc." + n.to_str()])
+    return rf(repo, "RC.md")
+}
+
+# tag_line_of(text) — the record's "- the tag: ..." line.
+fn tag_line_of(text: str) -> str {
+    let lines: list[str] = text.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).starts_with("- the tag: ") {
+            return lines.get(i)
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# successor_line_of(text) — the record's "- the successor: ..." line.
+fn successor_line_of(text: str) -> str {
+    let lines: list[str] = text.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).starts_with("- the successor: ") {
+            return lines.get(i)
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# tail_after_last(text, needle) — Python's text.split(needle)[-1]:
+# everything after the LAST occurrence of needle (the whole text when
+# the needle never occurs).
+fn tail_after_last(text: str, needle: str) -> str {
+    let mut rest: str = text
+    let mut at: int = rest.find(needle)
+    while at >= 0 {
+        rest = rest.slice(at + needle.len(), rest.len())
+        at = rest.find(needle)
+    }
+    return rest
+}
+
+# ----------------------------------------------------------------------------
+# 1. the record law — the render speaks the row's own phrase
+# ----------------------------------------------------------------------------
+
+fn sec1(acc: Acc) -> str uses IO, Fs, Proc {
+    header("1. the record law — the render speaks the row's own phrase")
+    let repo: str = seed_world(acc, "the-line", fancy_roadmap(145))
+
+    let record: str = walk_candidate(acc, repo, 1)
+    check(acc, "rc.1's record carries rc.1's own phrase (feature freeze)",
+        tag_line_of(record).contains(
+            "(v1.0 Release Candidate 1, feature freeze)"), "")
+    let record2: str = walk_candidate(acc, repo, 2)
+    check(acc, "rc.2's record carries rc.2's own phrase (bug-fix only)",
+        tag_line_of(record2).contains(
+            "(v1.0 Release Candidate 2, bug-fix only)"), "")
+    check(acc, "rc.2's record no longer wears rc.1's phrase",
+        !tag_line_of(record2).contains("feature freeze"), "")
+    let record3: str = walk_candidate(acc, repo, 3)
+    check(acc, "rc.3's record carries rc.3's own phrase (final dry-run)",
+        tag_line_of(record3).contains(
+            "(v1.0 Release Candidate 3, final dry-run)"), "")
+    check(acc, "rc.3's successor line still describes a candidate cut",
+        successor_line_of(record3).contains(
+            "cut the same way this one was"), "")
+    let record4: str = walk_candidate(acc, repo, 4)
+    check(acc, "rc.4's record carries rc.4's own phrase (sign-off)",
+        tag_line_of(record4).contains(
+            "(v1.0 Release Candidate 4, sign-off)"), "")
+    let succ: str = successor_line_of(record4)
+    check(acc, "rc.4's successor line speaks the release cut (the LTS "
+        + "line)",
+        succ.contains("v1.0.0") && succ.contains("hls-lts init")
+            && succ.contains("the windows becoming the clock"), "")
+    check(acc, "rc.4's successor line no longer claims the release is "
+        + "cut like a candidate",
+        !succ.contains("cut the same way this one was"), "")
+
+    # a roadmap row without a phrase makes no identity claim at all
+    let plain: str = seed_world(acc, "no-phrase", generic_roadmap(146))
+    wf(plain, "CHANGELOG.md",
+        "## [v1.0.0-rc.1] — Stage 146: the candidate\n- the body\n")
+    wf(plain, "snapshot/MANIFEST.json",
+        "{\"closure\": {}, \"version\": \"v1.0.0-rc.1\"}")
+    wf(plain, "editors/vscode/halis/package.json",
+        "{\"name\": \"halis\", \"version\": \"1.0.0-rc.1\"}")
+    commit_all(plain, "docs: stage 146 markers")
+    let r: RunResult = rc(["declare", "--tag", "v1.0.0-rc.1"], plain)
+    check(acc, "the generic world declares rc.1", r.code == 0, "")
+    rc(["report", "--out", "RC.md"], plain)
+    let record_p: str = rf(plain, "RC.md")
+    check(acc, "a row without a phrase makes no identity claim",
+        tag_line_of(record_p).ends_with("(v1.0 Release Candidate 1)"), "")
+    check(acc, "the record never speaks a phrase the roadmap did not say",
+        !record_p.contains("feature freeze"), "")
+    return repo
+}
+
+# ----------------------------------------------------------------------------
+# 2. the real-tree pre-flight — the tree may be a candidate
+# ----------------------------------------------------------------------------
+
+fn sec2(acc: Acc) -> void uses IO, Fs, Proc {
+    header("2. the real-tree pre-flight — the tree may be a candidate")
+    let root: str = cwd_get()
+    let r: RunResult = rc(["readiness"], root)
+    if release_state() == "released" {
+        check(acc, "the REAL tree is released (readiness refuses on both "
+            + "laws, named — the rehearsal's own retirement, come true)",
+            r.code == 1 && r.out.contains("NOT READY: the roadmap law")
+                && r.out.contains("NOT READY: the lts law"), "")
+        let g: RunResult = rc(["gate"], root)
+        check(acc, "the gate refuses on the missing anchor",
+            g.code == 1 && g.combined.contains("no anchor"), "")
+        let rc2: RunResult = rc(["report", "--check"], root)
+        check(acc, "the record refuses on the missing anchor",
+            rc2.code == 1 && rc2.combined.contains("no anchor"), "")
+    } else {
+        check(acc, "the REAL tree is ready",
+            r.code == 0 && r.out.contains("READY"), "")
+        let g: RunResult = rc(["gate"], root)
+        check(acc, "the gate over the live range names only BUGFIX and CHORE",
+            g.code == 0, "")
+        let rc2: RunResult = rc(["report", "--check"], root)
+        check(acc, "the committed record matches the render (drift refused)",
+            rc2.code == 0, "")
+    }
+
+    let head_v: str = real_head_version()
+    let man_v: str = jget_str(parse_json_or_null(read_or(
+        "snapshot/MANIFEST.json", "")), "version")
+    let vs_v: str = jget_str(parse_json_or_null(read_or(
+        "editors/vscode/halis/package.json", "")), "version")
+    check(acc, "the three markers speak with one voice (" + head_v + ")",
+        man_v == "v" + head_v && vs_v == head_v,
+        "manifest=" + man_v + " vscode=" + vs_v)
+
+    # the committed record speaks the anchor stage's own phrase, off
+    # the live roadmap (the law stays green for every candidate: each
+    # row's phrase is read where the record stands)
+    if has(root, ".hls-rc.json") {
+        let anchor: JsonValue = parse_json_or_null(
+            rf(root, ".hls-rc.json"))
+        let atag: str = jget_str(anchor, "tag")
+        check(acc, "the real tree's anchor is a candidate of the line ("
+            + atag + ")",
+            atag == "v1.0.0-rc.1" || atag == "v1.0.0-rc.2"
+                || atag == "v1.0.0-rc.3" || atag == "v1.0.0-rc.4", "")
+        let stage: int = jget_int(anchor, "stage")
+        let mut phrase: str = ""
+        let src: str = read_or("ROADMAP.md", "")
+        let lines: list[str] = src.split("\n")
+        let mut i: int = 0
+        while i < lines.len() {
+            let line: str = lines.get(i)
+            if line.starts_with("|") {
+                let cells: list[str] = line.split("|")
+                if cells.len() >= 4
+                        && cells.get(1).trim() == stage.to_str() {
+                    let title: str = cells.get(2).trim()
+                    if title.contains("(") && title.ends_with(")") {
+                        phrase = title.slice(title.find("(") + 1,
+                            title.len() - 1)
+                    }
+                    i = lines.len()
+                }
+            }
+            i = i + 1
+        }
+        let committed: str = rf(root, "RC.md")
+        if phrase != "" {
+            check(acc, "the committed record speaks Stage "
+                + stage.to_str() + "'s own phrase (" + phrase + ")",
+                tag_line_of(committed).contains(phrase), "")
+        } else {
+            # the battery's split("Candidate " + atag[-1])[-1]: the
+            # tail after the LAST "Candidate <n>" — no phrase, no
+            # identity claim
+            let n: str = atag.slice(atag.len() - 1, atag.len())
+            let tail: str = tail_after_last(committed, "Candidate " + n)
+            check(acc, "a row without a phrase makes no identity claim",
+                !tail.contains(", "), "")
+        }
+    } else {
+        check(acc, "no anchor on the tree — and the line is declared (the "
+            + "release, not a gap)",
+            release_state() == "released", "")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 3. the eve rehearsal — the last candidate, the real cut
+# ----------------------------------------------------------------------------
+
+fn sec3(acc: Acc, repo: str) -> void uses IO, Fs, Proc {
+    header("3. the eve rehearsal — the last candidate, the real cut")
+    let anchor: JsonValue = parse_json_or_null(rf(repo, ".hls-rc.json"))
+    check(acc, "the world stands at rc.4, Stage 149 closed",
+        jget_str(anchor, "tag") == "v1.0.0-rc.4"
+            && jget_int(anchor, "stage") == 149, "")
+    check(acc, "the last anchor names the release as its successor",
+        jget_str(anchor, "next") == "v1.0.0", "")
+    let r: RunResult = rc(["readiness"], repo)
+    check(acc, "the eve world is ready for the release",
+        r.code == 0 && r.out.contains("READY"), "")
+    let r2: RunResult = rc(["report", "--check"], repo)
+    check(acc, "the rc.4 record is the anchored render (drift refused)",
+        r2.code == 0, "")
+}
+
+# ----------------------------------------------------------------------------
+# 4. the release day — the wrong turns, then the cut
+# ----------------------------------------------------------------------------
+
+fn sec4(acc: Acc, repo: str) -> void uses IO, Fs, Proc {
+    header("4. the release day — the wrong turns, then the cut")
+    # the wrong turns first: the release cannot be cut wrong
+    let r: RunResult = rc(["declare", "--tag", "v1.0.0"], repo)
+    check(acc, "a bare v1.0.0 is refused as a candidate (the rc grammar)",
+        r.code == 1 && r.combined.contains("the LTS release"), "")
+    let r2: RunResult = lts(["init", "--tag", "v1.0.0-rc.4"], repo)
+    check(acc, "a pre-release is not an LTS base",
+        r2.code == 1 && r2.combined.contains("pre-release"), "")
+    let r3: RunResult = lts(["init", "--tag", "v0.166.0"], repo)
+    check(acc, "a pre-1.0 tag is not a line",
+        r3.code == 1 && r3.combined.contains("pre-1.0"), "")
+    let r4: RunResult = lts(["init", "--tag", "v1.0.0"], repo)
+    check(acc, "the line opens only on a tag that exists (the order law)",
+        r4.code == 1 && r4.combined.contains("does not exist"), "")
+
+    # the cut: the markers move, the anchor retires with the release
+    # commit, the tag is cut, the LTS line opens
+    wf(repo, "ROADMAP.md", fancy_roadmap(150))
+    wf(repo, "CHANGELOG.md",
+        "## [v1.0.0] — Stage 150: the LTS release\n- the body\n")
+    wf(repo, "snapshot/MANIFEST.json",
+        "{\"closure\": {}, \"version\": \"v1.0.0\"}")
+    wf(repo, "editors/vscode/halis/package.json",
+        "{\"name\": \"halis\", \"version\": \"1.0.0\"}")
+    git(repo, ["rm", "-q", ".hls-rc.json"])
+    commit_all(repo, "docs: stage 150 markers, the release")
+    git(repo, ["tag", "v1.0.0"])
+
+    let r5: RunResult = lts(["init", "--tag", "v1.0.0"], repo)
+    check(acc, "the LTS line opens on the v1.0.0 tag (branch release/1.0)",
+        r5.code == 0 && r5.out.contains("release/1.0"), "")
+    commit_all(repo, "release: the LTS line opens")
+
+    # the windows became the clock
+    let day_tail: str = release_day().slice(5, release_day().len())
+    let r6: RunResult = lts(["status"], repo)
+    check(acc, "the clock runs from the base day (3 years, 5 years)",
+        r6.code == 0 && r6.out.contains("bug fixes until 2029-" + day_tail)
+            && r6.out.contains("security until 2031-" + day_tail), "")
+    check(acc, "the fresh line audits clean",
+        r6.out.contains("audit: clean"), "")
+    let r7: RunResult = lts(["window", "--tag", "v1.0.0", "--at",
+        release_day()], repo)
+    check(acc, "the release day itself is active (the horizon belongs to "
+        + "the phase it closes)",
+        r7.code == 0 && r7.out.contains("phase at " + release_day()
+            + ": active"), "")
+
+    # the RC kit retires, named — both laws, not one
+    let r8: RunResult = rc(["readiness"], repo)
+    check(acc, "readiness refuses on BOTH laws after the release",
+        r8.code == 1 && r8.out.contains("NOT READY: the roadmap law")
+            && r8.out.contains("NOT READY: the lts law"), "")
+    let r9: RunResult = rc(["gate"], repo)
+    check(acc, "the gate refuses on the missing anchor",
+        r9.code == 1 && r9.combined.contains("no anchor"), "")
+    let r10: RunResult = rc(["report", "--check"], repo)
+    check(acc, "the record refuses on the missing anchor",
+        r10.code == 1 && r10.combined.contains("no anchor"), "")
+
+    # the line is idempotent; a second line is a new decision
+    let r11: RunResult = lts(["init", "--tag", "v1.0.0"], repo)
+    check(acc, "declaring the same line again is a no-op, not noise",
+        r11.code == 0 && r11.out.contains("idempotent"), "")
+    let r12: RunResult = lts(["init", "--tag", "v1.1.0"], repo)
+    check(acc, "a different base is a new policy decision, not a re-init",
+        r12.code == 1 && r12.combined.contains("one declaration"), "")
+}
+
+# ----------------------------------------------------------------------------
+# 5. the day after — the maintenance loop, the whole road
+# ----------------------------------------------------------------------------
+
+fn sec5(acc: Acc, repo: str) -> void uses IO, Fs, Proc {
+    header("5. the day after — the maintenance loop, the whole road")
+    wf(repo, "src/thing.hls", "fn broken() -> int {\n    return 1\n}\n")
+    let fix_sha: str = commit_all(repo,
+        "fix: the defect the first morning found")
+    let r: RunResult = lts(["backport", fix_sha], repo)
+    check(acc, "the fix backports onto the line with its provenance",
+        r.code == 0 && r.out.contains("applied")
+            && r.out.contains("Backported-from"), "")
+    let r2: RunResult = lts(["tag-patch"], repo)
+    check(acc, "tag-patch cuts v1.0.1 from the line",
+        r2.code == 0 && r2.out.contains("v1.0.1"), "")
+    let r3: RunResult = lts(["status"], repo)
+    check(acc, "the maintained line audits clean, v1.0.1 on the branch",
+        r3.code == 0 && r3.out.contains("audit: clean")
+            && r3.out.contains("v1.0.1"), "")
+
+    # the whole road, judged at the release: every commit from the
+    # first candidate's tag to the release inside the freeze
+    git(repo, ["checkout", "-q", "main"])
+    let r4: RunResult = rc(["gate", "--range", "v1.0.0-rc.1..HEAD"], repo)
+    check(acc, "the gate over the whole road (rc.1 to the release) is "
+        + "green", r4.code == 0, "")
+}
+
+# ----------------------------------------------------------------------------
+# 6. the corpus showcase — the dry-run laws in pure HLS
+# ----------------------------------------------------------------------------
+
+fn sec6(acc: Acc) -> void uses IO, Fs, Proc {
+    header("6. the corpus showcase — the dry-run laws in pure HLS")
+    let fmt_out: RunResult = run_capture("./bin/hlfmt", [showcase()])
+    let src: str = read_file(showcase())
+    check(acc, "the showcase is hlfmt-canonical",
+        fmt_out.code == 0 && fmt_out.out == src, "")
+    let lint: RunResult = run_capture("python3",
+        ["tools/hllint.py", showcase()])
+    check(acc, "the showcase is hllint-clean",
+        lint.code == 0 && lint.out.contains("no warnings"), "")
+    let chk: RunResult = boot(acc, ["--check", showcase()])
+    check(acc, "the showcase passes the real checker", chk.code == 0, "")
+    let run: RunResult = boot(acc, [showcase()])
+    check(acc, "the showcase runs green on the interpreter",
+        run.code == 0 && run.out == showcase_out(), "")
+    if file_exists("bin/hlc") && which("gcc") {
+        let out_c: str = scratch(acc, "showcase.c")
+        let comp: RunResult = run_capture("./bin/hlc", [showcase(), out_c])
+        if comp.code != 0 {
+            fail_msg(acc, "the showcase does not compile natively: "
+                + clip(comp.combined, 160))
+        } else {
+            let binp: str = scratch(acc, "showcase")
+            let link: RunResult = run_capture("gcc",
+                ["-O2", "-o", binp, out_c, "-lm", "-pthread"])
+            if link.code != 0 {
+                fail_msg(acc, "the showcase binary does not link")
+            } else {
+                let nat: RunResult = run_capture(binp, [])
+                check(acc, "the showcase matches natively, byte for byte",
+                    nat.code == 0 && nat.out == showcase_out(), "")
+            }
+        }
+    }
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    # the battery's GIT_ENV — every child (git, the kit) sees the
+    # pinned identity and the pinned committer day
+    env_set_var("GIT_AUTHOR_NAME", "rc148-gate")
+    env_set_var("GIT_AUTHOR_EMAIL", "rc148-gate@example.invalid")
+    env_set_var("GIT_COMMITTER_NAME", "rc148-gate")
+    env_set_var("GIT_COMMITTER_EMAIL", "rc148-gate@example.invalid")
+    env_set_var("GIT_COMMITTER_DATE", "2026-10-29T09:00:00+00:00")
+    env_set_var("GIT_AUTHOR_DATE", "2026-10-29T09:00:00+00:00")
+    let acc: Acc = acc_new("rc3")
+    let repo: str = sec1(acc)
+    sec2(acc)
+    sec3(acc, repo)
+    sec4(acc, repo)
+    sec5(acc, repo)
+    sec6(acc)
+    return finish(acc, "Stage 148 -- v1.0.0-rc.3, the final dry-run")
+}
