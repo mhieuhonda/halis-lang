@@ -1,0 +1,925 @@
+# ============================================================================
+# tests/acc/consttime_acceptance.hls — Stage 102 acceptance gate, in Halis
+# (the Halis twin of tests/consttime_acceptance.py; same eight sections,
+# same assertions, same needles — the harness is tests/acc/harness.hls and
+# the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make ct-acceptance` (which compiles this file and runs it from
+# the repo root).
+#
+# The old battery reached into the lab interpreter's Python internals
+# (load_program/check/analyze_consttime) for its first three sections;
+# the gate asks the same questions through the front door — the Stage 102
+# CLI (`python3 tools/hlprove.py <file> --consttime`), which prints the
+# same per-claim verdicts (the claim line, the secret reach, the policy
+# note, VERIFIED/VIOLATED with the sink lines and the chains). One claim
+# fact the report states only implicitly is pinned through its observable
+# consequence:
+#   - the claim's `returns_secret` — pick's return carries the secret —
+#     is asserted by giving the probe a caller that BRANCHES on the call
+#     and asking the Stage 101 audit the same file: the caller's BRANCH
+#     finding exists only if the return is secret, while the claim itself
+#     stays VERIFIED (no param-flow, the Section 2 imprecision law);
+#   - the probe sources are byte-identical to the battery's, so the
+#     `line N:` numbers in the needles are the battery's own.
+#
+#  1. the engine          — the verdict battery: the VERIFIED shapes
+#                           (branch-free selection, the MAC with its
+#                           len() policy note, the transitive chain)
+#                           and the VIOLATED shapes (own-body branch,
+#                           the callee branch with the chain, the
+#                           secret division and loop bound)
+#  2. the universes       — the precision flips a global fixpoint gets
+#                           wrong: an unrelated #[secrets] leak cannot
+#                           violate a claim, two claims are judged
+#                           independently, the claim covers the secrets
+#                           it passes DOWN (propagation), and the
+#                           return-secreteness imprecision is NOT
+#                           charged without a flow
+#  3. the chains          — the three-level chain, the self-body chain,
+#                           recursion terminating the fixpoint
+#  4. the CLI             --consttime on the demo (3 verified, exit 0),
+#                           on a violated program (exit 1), on a
+#                           claim-free program (honest line, exit 0)
+#  5. the demo            — interpreter and native agree byte for byte
+#  6. the audit parity    — boot.py --audit and hlc --audit print the
+#                           same #[ct] claims block, word for word
+#  7. the fail tests      — both front-ends reject the malformed
+#                           claims with the same words
+#  8. the tools           — hlfmt stable, hllint clean on the new sources
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+
+# ----------------------------------------------------------------------------
+# The gate's data.
+# ----------------------------------------------------------------------------
+
+fn demo() -> str {
+    return "examples/consttime_demo.hls"
+}
+
+fn ok_test() -> str {
+    return "tests/ok/feat_stage102_consttime.hls"
+}
+
+struct FailCase {
+    stem: str,
+    needle: str,
+    why: str
+}
+
+fn fail_programs() -> list[FailCase] {
+    return [
+        FailCase {
+            stem: "fail_stage102_ct_dup",
+            needle: "appears more than once on one function",
+            why: "the claim is per-function, so the second #[ct] is refused"
+        },
+        FailCase {
+            stem: "fail_stage102_ct_nosecrets",
+            needle: "must name the parameters it covers",
+            why: "a claim over nothing verifies nothing"
+        },
+    ]
+}
+
+# ----------------------------------------------------------------------------
+# Probe sources — byte-identical to the battery's claims_of() texts
+# (leading newline included: the `line N:` numbers in the needles are
+# the battery's own).
+# ----------------------------------------------------------------------------
+
+fn probe_pick() -> str {
+    return "\n" +
+        "#[secrets(mask)]\n" +
+        "#[ct]\n" +
+        "fn pick(mask: int, a: int, b: int) -> int {\n" +
+        "    return a * mask + b * (1 - mask)\n" +
+        "}\n" +
+        "\n" +
+        "fn probe_caller(x: int) -> int {\n" +
+        "    if pick(x, 1, 2) > 0 {\n" +
+        "        return 1\n" +
+        "    }\n" +
+        "    return 0\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int uses IO {\n" +
+        "    println(pick(1, 10, 20).to_str())\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+fn probe_gate() -> str {
+    return "\n" +
+        "#[secrets(s)]\n" +
+        "#[ct]\n" +
+        "fn gate(s: int) -> int {\n" +
+        "    if s > 10 {\n" +
+        "        return 1\n" +
+        "    }\n" +
+        "    return 0\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int uses IO {\n" +
+        "    println(gate(3).to_str())\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+fn probe_chain() -> str {
+    return "\n" +
+        "fn deep(x: int) -> int {\n" +
+        "    let mut y: int = 0\n" +
+        "    if x > 64 {\n" +
+        "        y = x - 64\n" +
+        "    } else {\n" +
+        "        y = x + 1\n" +
+        "    }\n" +
+        "    return y\n" +
+        "}\n" +
+        "\n" +
+        "fn mid(k: int) -> int {\n" +
+        "    return deep(k * 3)\n" +
+        "}\n" +
+        "\n" +
+        "#[secrets(master)]\n" +
+        "#[ct]\n" +
+        "fn top(master: int) -> int {\n" +
+        "    return mid(master)\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int uses IO {\n" +
+        "    println(top(7).to_str())\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+fn probe_workload() -> str {
+    return "\n" +
+        "fn workload(rounds: int) -> int {\n" +
+        "    let mut acc: int = 0\n" +
+        "    for i: int in range(0, rounds) {\n" +
+        "        acc = acc + i\n" +
+        "    }\n" +
+        "    acc = acc % rounds\n" +
+        "    return acc\n" +
+        "}\n" +
+        "\n" +
+        "#[secrets(n)]\n" +
+        "#[ct]\n" +
+        "fn drive(n: int) -> int {\n" +
+        "    return workload(n)\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int uses IO {\n" +
+        "    println(drive(6).to_str())\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+fn probe_fold() -> str {
+    return "\n" +
+        "#[secrets(acc, k)]\n" +
+        "#[ct]\n" +
+        "fn fold(mut acc: int, k: str) -> int {\n" +
+        "    let mut i: int = 0\n" +
+        "    while i < k.len() {\n" +
+        "        acc = acc + k.byte_at(i) * 31\n" +
+        "        i = i + 1\n" +
+        "    }\n" +
+        "    return acc\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int uses IO {\n" +
+        "    println(fold(0, \"abc\").to_str())\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+fn probe_universe() -> str {
+    return "\n" +
+        "#[secrets(s)]\n" +
+        "fn leaky(s: int) -> int {\n" +
+        "    if s > 10 {\n" +
+        "        return 1\n" +
+        "    }\n" +
+        "    return 0\n" +
+        "}\n" +
+        "\n" +
+        "#[secrets(mask)]\n" +
+        "#[ct]\n" +
+        "fn pick(mask: int, a: int, b: int) -> int {\n" +
+        "    return a * mask + b * (1 - mask)\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int uses IO {\n" +
+        "    println(pick(1, 10, 20).to_str())\n" +
+        "    println(leaky(42).to_str())\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+fn probe_independent() -> str {
+    return "\n" +
+        "#[secrets(s)]\n" +
+        "#[ct]\n" +
+        "fn good(s: int) -> int {\n" +
+        "    return s * 2\n" +
+        "}\n" +
+        "\n" +
+        "#[secrets(t)]\n" +
+        "#[ct]\n" +
+        "fn bad(t: int) -> int {\n" +
+        "    if t > 0 {\n" +
+        "        return 1\n" +
+        "    }\n" +
+        "    return 0\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int uses IO {\n" +
+        "    println(good(3).to_str())\n" +
+        "    println(bad(3).to_str())\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+fn probe_feed() -> str {
+    return "\n" +
+        "fn helper(k: int) -> int {\n" +
+        "    return k * 3 + 1\n" +
+        "}\n" +
+        "\n" +
+        "#[secrets(m)]\n" +
+        "#[ct]\n" +
+        "fn feed(m: int) -> int {\n" +
+        "    return helper(m)\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int uses IO {\n" +
+        "    println(feed(4).to_str())\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+fn probe_feed_leak() -> str {
+    return "\n" +
+        "fn helper(k: int) -> int {\n" +
+        "    if k > 100 {\n" +
+        "        return 1\n" +
+        "    }\n" +
+        "    return 0\n" +
+        "}\n" +
+        "\n" +
+        "#[secrets(m)]\n" +
+        "#[ct]\n" +
+        "fn feed(m: int) -> int {\n" +
+        "    return helper(m)\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int uses IO {\n" +
+        "    println(feed(4).to_str())\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+fn probe_imprecise() -> str {
+    return "\n" +
+        "fn h(k: int) -> int {\n" +
+        "    return k * 3\n" +
+        "}\n" +
+        "\n" +
+        "#[secrets(m)]\n" +
+        "#[ct]\n" +
+        "fn f(m: int) -> int {\n" +
+        "    return h(m)\n" +
+        "}\n" +
+        "\n" +
+        "fn g(z: int) -> int {\n" +
+        "    let r: int = h(5)\n" +
+        "    if r > 10 {\n" +
+        "        return 1\n" +
+        "    }\n" +
+        "    return 0\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int uses IO {\n" +
+        "    println(f(4).to_str())\n" +
+        "    println(g(0).to_str())\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+fn probe_rec() -> str {
+    return "\n" +
+        "#[secrets(acc)]\n" +
+        "#[ct]\n" +
+        "fn rec(n: int, acc: int) -> int {\n" +
+        "    if n <= 0 {\n" +
+        "        return acc\n" +
+        "    }\n" +
+        "    return rec(n - 1, acc + 2)\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int uses IO {\n" +
+        "    println(rec(3, 0).to_str())\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+fn probe_rec_leak() -> str {
+    return "\n" +
+        "#[secrets(acc)]\n" +
+        "#[ct]\n" +
+        "fn rec(mut acc: int, n: int) -> int {\n" +
+        "    if n <= 0 {\n" +
+        "        return acc\n" +
+        "    }\n" +
+        "    if acc > 100 {\n" +
+        "        acc = 100\n" +
+        "    }\n" +
+        "    return rec(acc + 2, n - 1)\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int uses IO {\n" +
+        "    println(rec(0, 3).to_str())\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+fn cli_violated_src() -> str {
+    return "\n" +
+        "#[secrets(s)]\n" +
+        "#[ct]\n" +
+        "fn gate(s: int) -> int {\n" +
+        "    if s > 10 {\n" +
+        "        return 1\n" +
+        "    }\n" +
+        "    return 0\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int uses IO {\n" +
+        "    println(gate(3).to_str())\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+# ----------------------------------------------------------------------------
+# Shared legs.
+# ----------------------------------------------------------------------------
+
+# prove(acc, args) — the Stage 101/102 front door, spawned as a child.
+fn prove(acc: Acc, args: list[str]) -> RunResult uses Proc {
+    let argv: list[str] = [path_join3(acc.root, "tools/hlprove.py")]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    return run_capture("python3", argv)
+}
+
+# ct_run(acc, name, src) — claims_of(): write the probe into the scratch
+# world and run the constant-time verifier over it.
+fn ct_run(acc: Acc, name: str, src: str) -> RunResult uses Fs, Proc {
+    let p: str = write_src(acc, "ct_" + name + ".hls", src)
+    return prove(acc, [p, "--consttime"])
+}
+
+# cli_section(out, name) — the report's per-claim block: from the
+# "  <name>:" header line to the next two-space header (the next claim,
+# or the TOTAL line). "" when the claim has no block.
+fn cli_section(out: str, name: str) -> str {
+    let lines: list[str] = out.split("\n")
+    let mut start: int = -1
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i) == "  " + name + ":" {
+            start = i
+            break
+        }
+        i = i + 1
+    }
+    if start < 0 {
+        return ""
+    }
+    let mut end: int = lines.len()
+    let mut j: int = start + 1
+    while j < lines.len() {
+        let l: str = lines.get(j)
+        if l.starts_with("  ") && !l.starts_with("    ") {
+            end = j
+            break
+        }
+        j = j + 1
+    }
+    let mut joined: str = ""
+    let mut k: int = start
+    while k < end {
+        if k > start {
+            joined = joined + "\n"
+        }
+        joined = joined + lines.get(k)
+        k = k + 1
+    }
+    return joined
+}
+
+# first_line(text) — Python's splitlines()[0].
+fn first_line_of(text: str) -> str {
+    let lines: list[str] = text.split("\n")
+    if lines.len() > 0 {
+        return lines.get(0)
+    }
+    return ""
+}
+
+# normalise(text) — the battery's Stage 86/91/93 convention: strip the
+# front-end-specific prefix and the line suffix.
+#   re.sub(r"^panic: ", "", ...)          — hlc's panic prefix
+#   re.sub(r"^[a-z ]*error: ", "", ...)   — "compile error: "/"type error: "
+#   re.sub(r" \(line \d+(?::\d+)?\)\s*$", "", ...) — the location suffix
+fn normalise(text: str) -> str {
+    let mut out: str = text.trim()
+    if out.starts_with("panic: ") {
+        out = out.slice(7, out.len())
+    }
+    let at: int = out.find("error: ")
+    if at >= 0 {
+        let mut all_lower: bool = true
+        let mut i: int = 0
+        while i < at {
+            let c: int = out.byte_at(i)
+            if !((c >= 97 && c <= 122) || c == 32) {
+                all_lower = false
+            }
+            i = i + 1
+        }
+        if all_lower {
+            out = out.slice(at + 7, out.len())
+        }
+    }
+    return strip_line_suffix(out)
+}
+
+# strip_line_suffix(out) — the ` \(line N(:M)?\)\s*$` rule: rstrip, then
+# a trailing "(line N)" or "(line N:M)" after a space and an opening
+# paren comes off with the paren pair.
+fn strip_line_suffix(out: str) -> str {
+    let mut t: str = out
+    while t.len() > 0 {
+        let c: int = t.byte_at(t.len() - 1)
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            t = t.slice(0, t.len() - 1)
+        } else {
+            break
+        }
+    }
+    if !t.ends_with(")") {
+        return t
+    }
+    # the LAST " (line " — the suffix must sit at the very end
+    let mut at: int = -1
+    let mut from: int = 0
+    let mut scanning: bool = true
+    while scanning {
+        let nxt: int = t.slice(from, t.len()).find(" (line ")
+        if nxt < 0 {
+            scanning = false
+        } else {
+            at = from + nxt
+            from = at + 1
+        }
+    }
+    if at < 0 {
+        return t
+    }
+    let inner: str = t.slice(at + 7, t.len() - 1)
+    if line_num_ok(inner) {
+        return t.slice(0, at)
+    }
+    return t
+}
+
+# line_num_ok(s) — \d+ or \d+:\d+ (the regex's number grammar).
+fn line_num_ok(s: str) -> bool {
+    if s.len() == 0 {
+        return false
+    }
+    let mut digits: int = 0
+    let mut colons: int = 0
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c >= 48 && c <= 57 {
+            digits = digits + 1
+        } else {
+            if c == 58 {
+                if colons > 0 || digits == 0 {
+                    return false
+                }
+                colons = colons + 1
+                digits = 0
+            } else {
+                return false
+            }
+        }
+        i = i + 1
+    }
+    return digits > 0
+}
+
+# audit_block(out, header) — the battery's audit_ct_block(): the header
+# line plus every indented continuation.
+fn audit_block(out: str, header: str) -> list[str] {
+    let lines: list[str] = out.split("\n")
+    let mut block: list[str] = []
+    let mut grabbing: bool = false
+    let mut i: int = 0
+    while i < lines.len() {
+        let ln: str = lines.get(i)
+        if !grabbing && ln.starts_with(header) {
+            grabbing = true
+            block.push(ln)
+        } else {
+            if grabbing {
+                if ln.starts_with("    ") {
+                    block.push(ln)
+                } else {
+                    break
+                }
+            }
+        }
+        i = i + 1
+    }
+    return block
+}
+
+fn blocks_equal(a: list[str], b: list[str]) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    let mut i: int = 0
+    while i < a.len() {
+        if a.get(i) != b.get(i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn block_dump(block: list[str]) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < block.len() {
+        out = out + block.get(i) + " | "
+        i = i + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# 1. the engine
+# ----------------------------------------------------------------------------
+fn sec1(acc: Acc) -> void uses IO, Fs, Proc {
+    section("1. the engine")
+
+    # -- the VERIFIED branch-free selection ---------------------------------
+    let r: RunResult = ct_run(acc, "pick", probe_pick())
+    let pick_sec: str = cli_section(r.combined, "pick")
+    check(acc, "pick: VERIFIED (data-only flow), the reach is the claim alone, "
+        + "the return is still secret",
+        pick_sec.contains("secret reach: pick (1 fn)")
+            && pick_sec.contains("VERIFIED: no secret-derived branch")
+            && r.combined.contains("CT TOTAL: 1 verified, 0 violated of 1 claims"),
+        clip(r.combined, 120))
+    # the return-secreteness half: the Stage 101 audit of the same file
+    # shows the caller's BRANCH on pick's result (only a secret return
+    # explains it), while the claim above stays VERIFIED (no param-flow).
+    let rs: RunResult = prove(acc,
+        [path_join3(acc.scratch_base, "ct_pick.hls"), "--sidechannel"])
+    let caller_sec: str = cli_section(rs.combined, "probe_caller")
+    check(acc, "pick: the return value carries the secret (the caller's "
+        + "branch is a sink; the claim itself is not charged)",
+        caller_sec.contains(": BRANCH — ")
+            && caller_sec.contains("pick(x, 1, 2) > 0"),
+        clip(rs.combined, 160))
+
+    # -- the VIOLATED own-body branch ---------------------------------------
+    let r2: RunResult = ct_run(acc, "gate", probe_gate())
+    let gate_sec: str = cli_section(r2.combined, "gate")
+    check(acc, "gate: VIOLATED on its own branch, the chain is the claim's "
+        + "own body",
+        gate_sec.contains("VIOLATED: 1 sink(s) reachable from the claim's "
+                + "secrets")
+            && gate_sec.contains("line 5: BRANCH — `(s > 10)`")
+            && gate_sec.contains("chain: gate (the claim's own body)"),
+        clip(r2.combined, 160))
+
+    # -- the VIOLATED transitive branch (the chain crosses two hops) --------
+    let r3: RunResult = ct_run(acc, "chain", probe_chain())
+    let top_sec: str = cli_section(r3.combined, "top")
+    check(acc, "chain: VIOLATED inside deep, the printed chain is "
+        + "top -> mid (k, line 19) -> deep (x, line 13)",
+        top_sec.contains("VIOLATED: 1 sink(s)")
+            && top_sec.contains("line 4: BRANCH — `(x > 64)` (inside deep)")
+            && top_sec.contains("chain: top -> mid (k, line 19) -> deep (x, line 13)"),
+        clip(r3.combined, 200))
+
+    # -- the VIOLATED division and loop bound inside a callee ---------------
+    let r4: RunResult = ct_run(acc, "workload", probe_workload())
+    let drive_sec: str = cli_section(r4.combined, "drive")
+    check(acc, "workload: the claim dies on the callee's LOOP-BOUND and "
+        + "DIVISION sinks",
+        drive_sec.contains("VIOLATED: 2 sink(s)")
+            && grep_count(drive_sec, ": LOOP-BOUND — ") == 1
+            && grep_count(drive_sec, ": DIVISION — ") == 1
+            && grep_count(drive_sec, ": BRANCH — ") == 0
+            && grep_count(drive_sec, ": INDEX — ") == 0,
+        clip(r4.combined, 160))
+
+    # -- the policy note rides along on a VERIFIED claim ---------------------
+    let r5: RunResult = ct_run(acc, "fold", probe_fold())
+    let fold_sec: str = cli_section(r5.combined, "fold")
+    check(acc, "fold: VERIFIED with the len() policy note counted, never hidden",
+        fold_sec.contains("VERIFIED: no secret-derived branch")
+            && fold_sec.contains("policy: .len() on a secret value — 1 use(s), "
+                + "public by policy"),
+        clip(fold_sec, 160))
+}
+
+# ----------------------------------------------------------------------------
+# 2. the universes
+# ----------------------------------------------------------------------------
+fn sec2(acc: Acc) -> void uses IO, Fs, Proc {
+    section("2. the universes")
+    # The cases a GLOBAL fixpoint gets wrong: the claim is judged in its
+    # OWN universe.
+
+    # an unrelated #[secrets] fn leaks — the claim is untouched.
+    let r: RunResult = ct_run(acc, "universe", probe_universe())
+    let pick_sec: str = cli_section(r.combined, "pick")
+    check(acc, "universe: leaky's BRANCH sink cannot violate pick — different "
+        + "universe",
+        pick_sec.contains("VERIFIED: no secret-derived branch")
+            && r.combined.contains("CT TOTAL: 1 verified, 0 violated of 1 claims"),
+        clip(r.combined, 120))
+
+    # two claims, one program: judged independently.
+    let r2: RunResult = ct_run(acc, "independent", probe_independent())
+    let good_sec: str = cli_section(r2.combined, "good")
+    let bad_sec: str = cli_section(r2.combined, "bad")
+    check(acc, "independent: good VERIFIED and bad VIOLATED in the same run",
+        good_sec.contains("VERIFIED: no secret-derived branch")
+            && bad_sec.contains("VIOLATED: 1 sink(s)")
+            && r2.combined.contains("CT TOTAL: 1 verified, 1 violated of 2 claims"),
+        clip(r2.combined, 160))
+
+    # the claim covers what it passes DOWN: the secret flows into a plain
+    # callee, so the callee is inside the claim's reach.
+    let r3: RunResult = ct_run(acc, "feed", probe_feed())
+    let feed_sec: str = cli_section(r3.combined, "feed")
+    check(acc, "feed: the propagated callee is inside the reach — and clean",
+        feed_sec.contains("secret reach: feed, helper (2 fns)")
+            && feed_sec.contains("VERIFIED: no secret-derived branch"),
+        clip(feed_sec, 160))
+
+    # ...and the same shape with a leaky callee dies BY the chain.
+    let r4: RunResult = ct_run(acc, "feed_leak", probe_feed_leak())
+    let feed_leak_sec: str = cli_section(r4.combined, "feed")
+    check(acc, "feed_leak: the secret passed down is the claim's own "
+        + "responsibility",
+        feed_leak_sec.contains("line 3: BRANCH — `(k > 100)` (inside helper)")
+            && feed_leak_sec.contains("chain: feed -> helper (k, line 12)"),
+        clip(r4.combined, 160))
+
+    # the return-secreteness imprecision is NOT charged without a flow:
+    # g branches on h(5) — public arg, secret-marked return — and f (the
+    # claim) is not g's supplier.
+    let r5: RunResult = ct_run(acc, "imprecise", probe_imprecise())
+    let f_sec: str = cli_section(r5.combined, "f")
+    check(acc, "imprecise: g's sink has no param-flow from f — not charged",
+        f_sec.contains("VERIFIED: no secret-derived branch")
+            && r5.code == 0
+            && r5.combined.contains("CT TOTAL: 1 verified, 0 violated of 1 claims"),
+        clip(r5.combined, 160))
+}
+
+# ----------------------------------------------------------------------------
+# 3. the chains
+# ----------------------------------------------------------------------------
+fn sec3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("3. the chains")
+
+    # recursion terminates the fixpoint and the clean recursive claim
+    # verifies.
+    let r: RunResult = ct_run(acc, "rec", probe_rec())
+    let rec_sec: str = cli_section(r.combined, "rec")
+    check(acc, "recursion: the fixpoint terminates, the clean claim verifies",
+        rec_sec.contains("VERIFIED: no secret-derived branch"),
+        clip(r.combined, 120))
+
+    # a VIOLATED recursive claim: the sink fires in the claim's own body.
+    let r2: RunResult = ct_run(acc, "rec_leak", probe_rec_leak())
+    let rec_leak_sec: str = cli_section(r2.combined, "rec")
+    check(acc, "recursion: the violated claim pins its own branch",
+        rec_leak_sec.contains("line 8: BRANCH — `(acc > 100)`")
+            && rec_leak_sec.contains("chain: rec (the claim's own body)"),
+        clip(r2.combined, 160))
+}
+
+# ----------------------------------------------------------------------------
+# 4. the CLI
+# ----------------------------------------------------------------------------
+fn sec4(acc: Acc) -> void uses IO, Fs, Proc {
+    section("4. the CLI")
+    let r: RunResult = prove(acc, [demo(), "--consttime"])
+    if r.code != 0 {
+        fail_msg(acc, "hlprove --consttime exited " + r.code.to_str()
+            + " on the demo")
+    } else {
+        pass_msg(acc, "hlprove --consttime runs clean on the demo (exit 0)")
+        let txt: str = r.out
+        check(acc, "cli: the selection claim is VERIFIED",
+            txt.contains("ct_pick:")
+                && txt.contains("VERIFIED: no secret-derived branch"), "")
+        check(acc, "cli: the MAC claim carries its policy note",
+            txt.contains("policy: .len() on a secret value — 1 use(s), "
+                + "public by policy"), "")
+        check(acc, "cli: the transitive claim names its reach",
+            txt.contains("secret reach: ct_expand, schedule_step (2 fns)"), "")
+        check(acc, "cli: the totals line closes the report",
+            txt.contains("CT TOTAL: 3 verified, 0 violated of 3 claims"), "")
+    }
+
+    let okt: RunResult = prove(acc, [ok_test(), "--consttime"])
+    check(acc, "cli: the ok-test's claimed shapes all verify",
+        okt.code == 0
+            && okt.out.contains("CT TOTAL: 3 verified, 0 violated of 3 claims"),
+        "rc=" + okt.code.to_str())
+
+    let violated: str = write_src(acc, "cli_violated.hls", cli_violated_src())
+    let vout: RunResult = prove(acc, [violated, "--consttime"])
+    check(acc, "cli: a violated claim exits 1 with the chain printed",
+        vout.code == 1
+            && vout.out.contains("VIOLATED")
+            && vout.out.contains("chain: gate (the claim's own body)")
+            && vout.out.contains("CT TOTAL: 0 verified, 1 violated of 1 claims"),
+        "rc=" + vout.code.to_str())
+
+    let none: RunResult = prove(acc, ["examples/hello.hls", "--consttime"])
+    check(acc, "cli: a claim-free program says so honestly (exit 0)",
+        none.code == 0 && none.out.contains("no #[ct] claims"),
+        "rc=" + none.code.to_str())
+}
+
+# ----------------------------------------------------------------------------
+# 5. the demo
+# ----------------------------------------------------------------------------
+fn sec5(acc: Acc) -> void uses IO, Fs, Proc {
+    section("5. the demo")
+    let interp: RunResult = boot(acc, [demo()])
+    check(acc, "the demo runs on the interpreter (rc=0)", interp.code == 0,
+        "rc=" + interp.code.to_str())
+
+    if !file_exists("./bin/hlc") {
+        fail_msg(acc, "bin/hlc missing — run make bootstrap first")
+        return
+    }
+    let c_out: str = scratch(acc, "consttime_demo.c")
+    let comp: RunResult = run_capture("./bin/hlc", [demo(), c_out])
+    if comp.code != 0 {
+        fail_msg(acc, "hlc refused the demo (rc=" + comp.code.to_str() + ")")
+        return
+    }
+    let exe: str = scratch(acc, "consttime_demo")
+    let cc: RunResult = run_capture("cc", ["-O2", "-Werror", "-o", exe, c_out,
+        "-lm", "-pthread"])
+    if cc.code != 0 {
+        fail_msg(acc, "cc refused the generated C (rc=" + cc.code.to_str() + ")")
+        return
+    }
+    let native: RunResult = run_capture(exe, [])
+    if native.code == 0 && native.out == interp.out {
+        pass_msg(acc, "native (-O2 -Werror) output identical to the interpreter")
+    } else {
+        fail_msg(acc, "native output diverges (rc=" + native.code.to_str() + ")")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 6. the audit parity
+# ----------------------------------------------------------------------------
+# boot.py --audit and hlc --audit must print the SAME #[ct] claims
+# block, word for word (the claim is a language-level fact, so the
+# two front-ends must state it identically).
+fn sec6(acc: Acc) -> void uses IO, Proc {
+    section("6. the audit parity")
+    let b: RunResult = boot(acc, ["--audit", demo()])
+    let h: RunResult = run_capture("./bin/hlc", ["--audit", demo()])
+    let b_block: list[str] = audit_block(b.out, "  #[ct] claims:")
+    let h_block: list[str] = audit_block(h.out, "  #[ct] claims:")
+    if b_block.len() > 0 && blocks_equal(b_block, h_block) {
+        pass_msg(acc, "audit parity: " + b_block.len().to_str()
+            + " #[ct] claims lines identical from both front-ends")
+        let mut i: int = 0
+        while i < b_block.len() {
+            pass_msg(acc, "    " + b_block.get(i).trim())
+            i = i + 1
+        }
+    } else {
+        fail_msg(acc, "audit parity: blocks differ — boot: "
+            + clip(block_dump(b_block), 200) + " / hlc: "
+            + clip(block_dump(h_block), 200))
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 7. the fail tests
+# ----------------------------------------------------------------------------
+fn sec7(acc: Acc) -> void uses IO, Fs, Proc {
+    section("7. the fail tests")
+    let cases: list[FailCase] = fail_programs()
+    let mut i: int = 0
+    while i < cases.len() {
+        let fc: FailCase = cases.get(i)
+        let src: str = "tests/fail/" + fc.stem + ".hls"
+        let b: RunResult = boot(acc, ["--check", src])
+        let outc: str = scratch(acc, fc.stem + ".c")
+        let h: RunResult = run_capture("./bin/hlc", [src, outc])
+        if b.code == 0 {
+            fail_msg(acc, fc.stem + ": boot accepted the malformed claim ("
+                + fc.why + ")")
+        } else {
+            if h.code == 0 {
+                fail_msg(acc, fc.stem + ": hlc accepted the malformed claim ("
+                    + fc.why + ")")
+            } else {
+                let bmsg: str = normalise(first_line_of(b.combined))
+                let hmsg: str = normalise(first_line_of(h.combined))
+                if bmsg != hmsg {
+                    fail_msg(acc, fc.stem
+                        + ": boot and hlc disagree on the words: boot: " + bmsg
+                        + " / hlc: " + hmsg)
+                } else {
+                    if !bmsg.contains(fc.needle) {
+                        fail_msg(acc, fc.stem
+                            + ": diagnostic does not name the rule ('"
+                            + fc.needle + "'): " + bmsg)
+                    } else {
+                        pass_msg(acc, fc.stem
+                            + " rejected identically by both front-ends ("
+                            + fc.why + ")")
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 8. the tools
+# ----------------------------------------------------------------------------
+fn sec8(acc: Acc) -> void uses IO, Fs, Proc {
+    section("8. the tools")
+    let files: list[str] = [demo(), ok_test()]
+    let mut i: int = 0
+    while i < files.len() {
+        let f: str = files.get(i)
+        let original: str = read_file(f)
+        let p1: str = scratch(acc, "fmt" + i.to_str() + "a.hls")
+        write_file(p1, original)
+        let _f1: RunResult = run_capture("./bin/hlfmt", ["-w", p1])
+        let p2: str = scratch(acc, "fmt" + i.to_str() + "b.hls")
+        cp(p1, p2)
+        let _f2: RunResult = run_capture("./bin/hlfmt", ["-w", p2])
+        let once: str = read_file(p1)
+        let twice: str = read_file(p2)
+        check(acc, "hlfmt: stable formatting on " + f, once == twice, "")
+        i = i + 1
+    }
+
+    let l1: RunResult = run_capture("python3",
+        [path_join3(acc.root, "tools/hllint.py"), demo()])
+    let l2: RunResult = run_capture("python3",
+        [path_join3(acc.root, "tools/hllint.py"), ok_test()])
+    check(acc, "hllint: no findings on the demo or the ok-test",
+        l1.code == 0 && l2.code == 0, "")
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let acc: Acc = acc_new("consttime")
+    sec1(acc)
+    sec2(acc)
+    sec3(acc)
+    sec4(acc)
+    sec5(acc)
+    sec6(acc)
+    sec7(acc)
+    sec8(acc)
+    return finish(acc, "Stage 102 -- the constant-time verifier")
+}

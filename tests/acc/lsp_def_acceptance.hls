@@ -1,0 +1,1067 @@
+# ============================================================================
+# tests/acc/lsp_def_acceptance.hls — Stage 113 acceptance gate, in Halis
+# (the Halis twin of tests/lsp_def_acceptance.py; same eight sections,
+# same assertions, same needles — the harness is tests/acc/harness.hls and
+# the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make lsp-def-acceptance` (which compiles this file and runs it
+# from the repo root).
+#
+# The server is driven as a real subprocess over stdio JSON-RPC, exactly
+# the way the battery drives it: the harness run_feed() writes the whole
+# framed session (initialize -> didOpen -> requests -> shutdown/exit) and
+# the gate parses the framed replies with std.json. The battery's LRU
+# section drove HLSServer in-process (`_external_doc` / `_store_doc` —
+# the eviction bookkeeping is not observable through the protocol); the
+# gate asks the same questions of the OBSERVABLE consequences over the
+# protocol, with EXTERNAL_DOC_CAP (48) + 5 external documents loaded
+# through a 53-import file, byte-faithful to the battery's load count:
+#   - the OLDEST external document is evicted under pressure (its first
+#     definition lookup answers null — the cache-miss the LRU causes);
+#   - an evicted file re-loads on the next request (transparent);
+#   - the NEWEST external document survives;
+#   - the OPEN document never lands on the eviction list.
+# The os.utime() call in the mtime-refresh leg is folded into the write
+# itself (a fresh write refreshes the mtime the server checks).
+#
+#  1. the std family   — the import literal IS a jump; a std symbol
+#                        resolves into std/str.hls, a core. symbol into
+#                        core/; the walk-up bound holds (depth 4 found,
+#                        depth 5 falls through to the toolchain root)
+#  2. the sibling      — a relative import into a file nobody opened:
+#                        parsed on demand; an OPEN buffer beats the disk
+#                        copy (the jump lands on the buffer's line)
+#  3. the package      — hls-pkg.lock resolved_path: file deps
+#                        contribute their directory, dir deps themselves;
+#                        relative resolved_paths resolve against the
+#                        package root; the .hls-pkg-deps farm hls-pkg
+#                        build maintains; the HLS_PKG_DEPS override the
+#                        compiler itself honours
+#  4. the layer law    — local beats imported beats dependency beats the
+#                        last-resort net over merely-open files
+#  5. the guards       — absolute and ".." imports answer null (never an
+#                        exit); a missing dependency answers null; a
+#                        malformed lockfile is skipped and resolution
+#                        still works through the farm
+#  6. the externals    — external documents never publish diagnostics;
+#                        rename never edits them; references DO span
+#                        them (read-only); an on-disk edit is seen on the
+#                        next lookup (mtime refresh)
+#  7. the completion   — a dependency's API completes the moment its
+#                        import is in the file; the external LRU evicts
+#                        under pressure and re-loads on demand
+#  8. the smoke        — lsp_smoke.py stays green; the ok corpus test
+#                        runs through boot (native half only when a C
+#                        compiler exists — the gate stays hermetic)
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.json"
+import "std.result"
+import "std.env"
+
+# ----------------------------------------------------------------------------
+# The gate's data.
+# ----------------------------------------------------------------------------
+
+fn ok_test() -> str {
+    return "tests/ok/feat_stage113_lsp_resolve.hls"
+}
+
+fn lsp_path(acc: Acc) -> str {
+    return path_join3(acc.root, "tools/hls-lsp.py")
+}
+
+fn main_std() -> str {
+    return "import \"std.str\"\n" +
+        "\n" +
+        "fn main() -> int uses IO {\n" +
+        "    let s: str = str_replace(\"aab\", \"a\", \"b\")\n" +
+        "    println(s)\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+struct LspReq {
+    method: str,      # textDocument/definition | rename | references | completion
+    line: int,        # the request's 0-indexed position
+    ch: int,
+    extra: str        # extra JSON members inside params ("", or e.g.
+                      # ,"newName":"x" / ,"context":{...})
+}
+
+struct LspSess {
+    vals: list[JsonValue],  # one result per request, in order; null when
+                            # the server answered none (the battery's None)
+    rc: int,                # the server process's exit code
+    err: str,               # the server's stderr
+    msgs: list[JsonValue]   # every parsed message (notifications included)
+}
+
+# ----------------------------------------------------------------------------
+# JSON plumbing.
+# ----------------------------------------------------------------------------
+
+# json_escape(s) — the body strings of the outgoing frames.
+fn json_escape(s: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c == 34 {
+            out = out + "\\\""
+        } else {
+            if c == 92 {
+                out = out + "\\\\"
+            } else {
+                if c == 10 {
+                    out = out + "\\n"
+                } else {
+                    if c == 13 {
+                        out = out + "\\r"
+                    } else {
+                        if c == 9 {
+                            out = out + "\\t"
+                        } else {
+                            out = out + s.slice(i, i + 1)
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# crlfcrlf() — the LSP frame separator (Halis string literals have no
+# \r escape, so the CR bytes come from chr()).
+fn crlfcrlf() -> str {
+    return chr(13) + "\n" + chr(13) + "\n"
+}
+
+# frame(body) — one LSP message on the wire.
+fn frame(body: str) -> str {
+    return "Content-Length: " + body.len().to_str() + crlfcrlf() + body
+}
+
+# parse_frames(buf) — the battery's parse_frames(): split the stream into
+# JSON bodies; a truncated or headerless tail stops the scan.
+fn parse_frames(buf: str) -> list[str] {
+    let mut bodies: list[str] = []
+    let mut rest: str = buf
+    let mut guard: int = 0
+    while guard < 100000 {
+        guard = guard + 1
+        let i: int = rest.find("Content-Length:")
+        if i < 0 {
+            break
+        }
+        let mut k: int = i + 15
+        let n: int = rest.len()
+        while k < n && rest.byte_at(k) == 32 {
+            k = k + 1
+        }
+        let mut num: int = 0
+        let mut any: bool = false
+        while k < n && rest.byte_at(k) >= 48 && rest.byte_at(k) <= 57 {
+            num = num * 10 + (rest.byte_at(k) - 48)
+            k = k + 1
+            any = true
+        }
+        if !any {
+            break
+        }
+        if k + 4 > n || rest.slice(k, k + 4) != crlfcrlf() {
+            break
+        }
+        let bstart: int = k + 4
+        if bstart + num > n {
+            break
+        }
+        bodies.push(rest.slice(bstart, bstart + num))
+        rest = rest.slice(bstart + num, n)
+    }
+    return bodies
+}
+
+# guarded accessors — the battery's res["k"] chains, answered with the
+# JSON null value instead of a KeyError when a link is missing.
+fn jget(v: JsonValue, key: str) -> JsonValue {
+    if json_is_object(v) {
+        return json_object_get(v, key)
+    }
+    return json_null()
+}
+
+fn jstr_of(v: JsonValue, key: str) -> str {
+    let x: JsonValue = jget(v, key)
+    if json_is_str(x) {
+        return json_str_value(x)
+    }
+    return ""
+}
+
+fn jint_of(v: JsonValue, key: str) -> int {
+    let x: JsonValue = jget(v, key)
+    if json_is_int(x) {
+        return json_int_value(x)
+    }
+    return 0
+}
+
+# loc_uri(res) / loc_line(res) — a definition Location's uri and the
+# 0-indexed start line of its range.
+fn loc_uri(res: JsonValue) -> str {
+    return jstr_of(res, "uri")
+}
+
+fn loc_line(res: JsonValue) -> int {
+    return jint_of(jget(jget(res, "range"), "start"), "line")
+}
+
+# ----------------------------------------------------------------------------
+# The session machinery — one fresh server subprocess per session, driven
+# the way an editor drives it.
+# ----------------------------------------------------------------------------
+
+# lsp_run(acc, payload, nreq) — feed the framed payload to the server,
+# parse the framed replies, and answer with the per-request results
+# (the battery's results-dict semantics: the last reply for an id wins).
+fn lsp_run(acc: Acc, payload: str, nreq: int) -> LspSess uses Proc {
+    let r: RunResult = run_feed("python3", [lsp_path(acc)], payload)
+    let bodies: list[str] = parse_frames(r.out)
+    let ids: list[int] = []
+    let vals: list[JsonValue] = []
+    let msgs: list[JsonValue] = []
+    let mut i: int = 0
+    while i < bodies.len() {
+        let rr: Result[JsonValue, str] = json_parse_result(bodies.get(i))
+        if result_is_ok(rr) {
+            let m: JsonValue = result_unwrap(rr)
+            msgs.push(m)
+            if json_is_object(m) && json_object_has(m, "id") {
+                let idv: JsonValue = json_object_get(m, "id")
+                if json_is_int(idv) && json_int_value(idv) >= 100 {
+                    ids.push(json_int_value(idv))
+                    vals.push(json_object_get(m, "result"))
+                }
+            }
+        }
+        i = i + 1
+    }
+    let out_vals: list[JsonValue] = []
+    let mut w: int = 0
+    while w < nreq {
+        let want: int = 100 + w
+        let mut found: int = -1
+        let mut k: int = 0
+        while k < ids.len() {
+            if ids.get(k) == want {
+                found = k
+            }
+            k = k + 1
+        }
+        if found >= 0 {
+            out_vals.push(vals.get(found))
+        } else {
+            out_vals.push(json_null())
+        }
+        w = w + 1
+    }
+    return LspSess {
+        vals: out_vals,
+        rc: r.code,
+        err: r.err,
+        msgs: msgs
+    }
+}
+
+# lsp_session(acc, ws, rels, texts, reqs, want_deps, deps_dir) — the
+# battery's session(): initialize, the didOpens, the requests (ids
+# 100+i), shutdown, exit. Every session first unsets HLS_PKG_DEPS (the
+# battery pops it from the child env); the s3d leg then sets its own.
+fn lsp_session(acc: Acc, ws: str, rels: list[str], texts: list[str],
+               reqs: list[LspReq], want_deps: bool, deps_dir: str) -> LspSess
+        uses Proc {
+    env_unset_var("HLS_PKG_DEPS")
+    if want_deps {
+        env_set_var("HLS_PKG_DEPS", deps_dir)
+    }
+    let base: str = path_join3(acc.scratch_base, ws)
+    let uris: list[str] = []
+    let mut i: int = 0
+    while i < rels.len() {
+        uris.push("file://" + path_join3(base, rels.get(i)))
+        i = i + 1
+    }
+    let mut payload: str = frame("{\"jsonrpc\": \"2.0\", \"id\": 1, "
+        + "\"method\": \"initialize\", \"params\": {}}")
+    i = 0
+    while i < rels.len() {
+        payload = payload + frame("{\"jsonrpc\": \"2.0\", "
+            + "\"method\": \"textDocument/didOpen\", \"params\": "
+            + "{\"textDocument\": {\"uri\": \"" + json_escape(uris.get(i))
+            + "\", \"version\": 1, \"text\": \""
+            + json_escape(texts.get(i)) + "\"}}}")
+        i = i + 1
+    }
+    i = 0
+    while i < reqs.len() {
+        let rq: LspReq = reqs.get(i)
+        let params: str = "{\"textDocument\": {\"uri\": \""
+            + json_escape(uris.get(0)) + "\"}, \"position\": {\"line\": "
+            + rq.line.to_str() + ", \"character\": " + rq.ch.to_str() + "}"
+            + rq.extra + "}"
+        payload = payload + frame("{\"jsonrpc\": \"2.0\", \"id\": "
+            + (100 + i).to_str() + ", \"method\": \"" + rq.method
+            + "\", \"params\": " + params + "}")
+        i = i + 1
+    }
+    payload = payload + frame("{\"jsonrpc\": \"2.0\", \"id\": 2, "
+        + "\"method\": \"shutdown\"}")
+    payload = payload + frame("{\"jsonrpc\": \"2.0\", \"method\": \"exit\"}")
+    return lsp_run(acc, payload, reqs.len())
+}
+
+# defn(acc, ws, main_rel, main_text, line, ch) — one definition request
+# over a single open document.
+fn defn(acc: Acc, ws: str, main_rel: str, main_text: str, line: int,
+        ch: int) -> LspSess uses Proc {
+    let rels: list[str] = [main_rel]
+    let texts: list[str] = [main_text]
+    let reqs: list[LspReq] = [LspReq {
+        method: "textDocument/definition",
+        line: line,
+        ch: ch,
+        extra: ""
+    }]
+    return lsp_session(acc, ws, rels, texts, reqs, false, "")
+}
+
+# defn_deps(...) — the s3d leg: the HLS_PKG_DEPS override must reach the
+# server child.
+fn defn_deps(acc: Acc, ws: str, main_rel: str, main_text: str, line: int,
+             ch: int, deps_dir: str) -> LspSess uses Proc {
+    let rels: list[str] = [main_rel]
+    let texts: list[str] = [main_text]
+    let reqs: list[LspReq] = [LspReq {
+        method: "textDocument/definition",
+        line: line,
+        ch: ch,
+        extra: ""
+    }]
+    return lsp_session(acc, ws, rels, texts, reqs, true, deps_dir)
+}
+
+# defn_req(acc, ws, main_rel, main_text, line, ch, method, extra) — one
+# non-definition request (rename / references / completion).
+fn defn_req(acc: Acc, ws: str, main_rel: str, main_text: str, line: int,
+            ch: int, method: str, extra: str) -> LspSess uses Proc {
+    let rels: list[str] = [main_rel]
+    let texts: list[str] = [main_text]
+    let reqs: list[LspReq] = [LspReq {
+        method: method,
+        line: line,
+        ch: ch,
+        extra: extra
+    }]
+    return lsp_session(acc, ws, rels, texts, reqs, false, "")
+}
+
+# wsr(acc, ws, rel, text) — the battery's write(): a workspace file under
+# the gate's scratch tree, parents created.
+fn wsr(acc: Acc, ws: str, rel: str, text: str) -> str uses Fs, Proc {
+    return write_src(acc, ws + "/" + rel, text)
+}
+
+fn pad3(i: int) -> str {
+    let mut s: str = i.to_str()
+    while s.len() < 3 {
+        s = "0" + s
+    }
+    return s
+}
+
+fn sha64(c: str) -> str {
+    let mut s: str = ""
+    let mut i: int = 0
+    while i < 64 {
+        s = s + c
+        i = i + 1
+    }
+    return s
+}
+
+# lock_file(...) — the battery's hls-pkg.lock fixture (json.dumps's
+# whitespace is irrelevant; the server parses either).
+fn lock_file(dep_name: str, src_path: str, sha: str, resolved: str,
+             seq: int) -> str {
+    return "{\"version\": 2, \"packages\": [{\"name\": \"" + dep_name
+        + "\", \"source\": {\"path\": \"" + src_path
+        + "\"}, \"version\": \"local\", \"commit\": null, \"sha256\": \""
+        + sha + "\", \"effects\": [], \"transitive_effects\": [], "
+        + "\"resolved_path\": \"" + resolved + "\", \"log_seq\": "
+        + seq.to_str() + "}]}"
+}
+
+# ----------------------------------------------------------------------------
+# 1. the std family.
+# ----------------------------------------------------------------------------
+fn sec1(acc: Acc) -> void uses IO, Fs, Proc {
+    println("1. the std family — the import literal is a jump; std/ and "
+        + "core/ resolve; the walk-up bound holds")
+
+    let s1: LspSess = defn(acc, "s1", "main.hls", main_std(), 0, 12)
+    check(acc, "server exits cleanly (rc=0)", s1.rc == 0,
+        "rc=" + s1.rc.to_str())
+    let res: JsonValue = s1.vals.get(0)
+    if !json_is_null(res) {
+        check(acc, "the import literal \"std.str\" jumps to std/str.hls",
+            loc_uri(res).ends_with("/std/str.hls"), clip(loc_uri(res), 90))
+    } else {
+        fail_msg(acc, "import literal jump answered null: " + clip(s1.err, 120))
+    }
+
+    let s2: LspSess = defn(acc, "s1", "main.hls", main_std(), 3, 25)
+    check(acc, "str_replace resolves into std/str.hls (file never opened)",
+        !json_is_null(s2.vals.get(0))
+            && loc_uri(s2.vals.get(0)).ends_with("/std/str.hls"),
+        clip(s2.err, 120))
+
+    # core family: a core module the compiler actually ships.
+    let core_mod: str = "alloc"
+    let core_file: str = "core/" + core_mod + ".hls"
+    if file_exists(core_file) {
+        let main_core: str = "import \"core." + core_mod + "\"\n"
+            + "\n"
+            + "fn main() -> int {\n"
+            + "    return 0\n"
+            + "}\n"
+        let s3: LspSess = defn(acc, "s1", "main.hls", main_core, 0, 12)
+        check(acc, "the core. family resolves into core/ (core/"
+                + core_mod + ".hls)",
+            !json_is_null(s3.vals.get(0))
+                && loc_uri(s3.vals.get(0)).ends_with("/core/" + core_mod + ".hls"),
+            clip(s3.err, 120))
+    } else {
+        fail_msg(acc, "core/" + core_mod
+            + ".hls missing — core family case skipped badly")
+    }
+
+    # The walk-up: a file nested four levels under its own tree still
+    # finds the toolchain's std/ (the walk visits depths 0..4 from the
+    # importing file's directory, then falls back to the toolchain root).
+    let s4: LspSess = defn(acc, "s1", "a/b/c/d/main.hls", main_std(), 0, 12)
+    check(acc, "depth-4 nesting still reaches the toolchain std/ fallback",
+        !json_is_null(s4.vals.get(0))
+            && loc_uri(s4.vals.get(0)).ends_with("/std/str.hls"),
+        clip(s4.err, 120))
+
+    # A hostile module name never jumps and never exits.
+    let s5: LspSess = defn(acc, "s1", "main.hls",
+        "import \"std.../secret\"\n\nfn main() -> int {\n    return 0\n}\n",
+        0, 12)
+    check(acc, "std.../secret (dot-dot module) answers null, server alive",
+        json_is_null(s5.vals.get(0)) && s5.rc == 0,
+        "rc=" + s5.rc.to_str())
+}
+
+# ----------------------------------------------------------------------------
+# 2. the sibling (relative import, on-disk, parse-on-demand).
+# ----------------------------------------------------------------------------
+fn sec2(acc: Acc) -> void uses IO, Fs, Proc {
+    println("2. the sibling — relative imports parse on demand; open "
+        + "buffers beat disk")
+
+    let _u1: str = wsr(acc, "s2", "lib/util.hls",
+        "fn util_add(a: int, b: int) -> int {\n    return a + b\n}\n")
+    let main2: str = "import \"lib/util.hls\"\n"
+        + "\n"
+        + "fn main() -> int uses IO {\n"
+        + "    let x: int = util_add(1, 2)\n"
+        + "    println(x)\n"
+        + "    return 0\n"
+        + "}\n"
+    let s1: LspSess = defn(acc, "s2", "main.hls", main2, 3, 20)
+    check(acc, "util_add resolves into lib/util.hls — the file was never "
+        + "opened",
+        !json_is_null(s1.vals.get(0))
+            && loc_uri(s1.vals.get(0)).ends_with("/lib/util.hls"),
+        clip(s1.err, 120))
+    let s2: LspSess = defn(acc, "s2", "main.hls", main2, 0, 12)
+    check(acc, "the relative import literal jumps to lib/util.hls",
+        !json_is_null(s2.vals.get(0))
+            && loc_uri(s2.vals.get(0)).ends_with("/lib/util.hls"),
+        clip(s2.err, 120))
+
+    # Open-buffer precedence: same file open in the editor with an EXTRA
+    # function the disk copy does not have — the jump must land in the
+    # buffer (the disk copy cannot answer it).
+    let disk: str = "fn util_add(a: int, b: int) -> int {\n    return a + b\n}\n"
+    let _u2: str = wsr(acc, "s2b", "lib/util.hls", disk)
+    let buffer_text: str = disk + "\nfn util_extra() -> int {\n    return 9\n}\n"
+    let main_b: str = "import \"lib/util.hls\"\n"
+        + "\n"
+        + "fn main() -> int uses IO {\n"
+        + "    println(util_extra())\n"
+        + "    return 0\n"
+        + "}\n"
+    let rels: list[str] = ["main.hls", "lib/util.hls"]
+    let texts: list[str] = [main_b, buffer_text]
+    let reqs: list[LspReq] = [LspReq {
+        method: "textDocument/definition",
+        line: 3,
+        ch: 14,
+        extra: ""
+    }]
+    let sess: LspSess = lsp_session(acc, "s2b", rels, texts, reqs, false, "")
+    let r: JsonValue = sess.vals.get(0)
+    # util_extra's `fn` keyword sits on 0-indexed line 4 of the BUFFER
+    # (3 lines of util_add + one blank) — the disk copy has no line 5
+    # at all, so landing there proves the buffer answered.
+    check(acc, "the OPEN buffer answers util_extra (disk copy does not have it)",
+        !json_is_null(r) && loc_uri(r).ends_with("/lib/util.hls")
+            && loc_line(r) == 4,
+        "rc=" + sess.rc.to_str())
+}
+
+# ----------------------------------------------------------------------------
+# 3. the package (lockfile, farm, env override).
+# ----------------------------------------------------------------------------
+fn sec3(acc: Acc) -> void uses IO, Fs, Proc {
+    println("3. the package — hls-pkg.lock resolved_path, the "
+        + ".hls-pkg-deps farm, the HLS_PKG_DEPS override")
+
+    # 3a: a FILE dependency via resolved_path.
+    let _a1: str = wsr(acc, "s3a", "vendor/mylib/mylib.hls",
+        "fn lib_greet(who: str) -> str {\n    return \"hi \" + who\n}\n")
+    let _a2: str = wsr(acc, "s3a", "hls-pkg.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n"
+            + "[dependencies]\nmylib = { path = \"vendor/mylib/mylib.hls\" }\n")
+    let _a3: str = wsr(acc, "s3a", "hls-pkg.lock",
+        lock_file("mylib", "vendor/mylib/mylib.hls", sha64("0"),
+            path_join3(acc.scratch_base, "s3a/vendor/mylib/mylib.hls"), 1))
+    let main_a: str = "import \"mylib.hls\"\n"
+        + "\n"
+        + "fn main() -> int uses IO {\n"
+        + "    println(lib_greet(\"x\"))\n"
+        + "    return 0\n"
+        + "}\n"
+    let s1: LspSess = defn(acc, "s3a", "main.hls", main_a, 3, 14)
+    check(acc, "a lockfile FILE dep resolves: lib_greet jumps into the dep "
+        + "source",
+        !json_is_null(s1.vals.get(0))
+            && loc_uri(s1.vals.get(0)).ends_with("vendor/mylib/mylib.hls"),
+        clip(s1.err, 120))
+
+    # 3b: a DIRECTORY dependency via resolved_path (relative to the
+    # package root, exactly as hls-pkg lock writes it for path deps).
+    let _b1: str = wsr(acc, "s3b", "vendor/webapi/api.hls",
+        "fn api_call() -> int {\n    return 3\n}\n")
+    let _b2: str = wsr(acc, "s3b", "hls-pkg.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n"
+            + "[dependencies]\nwebapi = { path = \"vendor/webapi\" }\n")
+    let _b3: str = wsr(acc, "s3b", "hls-pkg.lock",
+        lock_file("webapi", "vendor/webapi", sha64("1"), "vendor/webapi", 2))
+    let main_b: str = "import \"webapi/api.hls\"\n"
+        + "\n"
+        + "fn main() -> int uses IO {\n"
+        + "    println(api_call())\n"
+        + "    return 0\n"
+        + "}\n"
+    let s2: LspSess = defn(acc, "s3b", "main.hls", main_b, 3, 14)
+    check(acc, "a lockfile DIR dep (relative resolved_path) resolves",
+        !json_is_null(s2.vals.get(0))
+            && loc_uri(s2.vals.get(0)).ends_with("vendor/webapi/api.hls"),
+        clip(s2.err, 120))
+
+    # 3c: the .hls-pkg-deps farm — hls-pkg build's symlink layout, no
+    # lockfile at all.
+    let _c1: str = wsr(acc, "s3c", ".hls-pkg-deps/mylib/api.hls",
+        "fn farm_fn() -> int {\n    return 7\n}\n")
+    let main_c: str = "import \"mylib/api.hls\"\n"
+        + "\n"
+        + "fn main() -> int uses IO {\n"
+        + "    println(farm_fn())\n"
+        + "    return 0\n"
+        + "}\n"
+    let s3: LspSess = defn(acc, "s3c", "main.hls", main_c, 3, 14)
+    check(acc, "the .hls-pkg-deps farm resolves without any lockfile",
+        !json_is_null(s3.vals.get(0))
+            && loc_uri(s3.vals.get(0)).contains(".hls-pkg-deps")
+            && loc_uri(s3.vals.get(0)).ends_with("api.hls"),
+        clip(s3.err, 120))
+
+    # 3d: the HLS_PKG_DEPS environment override the compiler honours —
+    # the server must never disagree with the build.
+    let _d1: str = wsr(acc, "s3d", "deps/mylib/only.hls",
+        "fn env_fn() -> int {\n    return 11\n}\n")
+    let main_d: str = "import \"mylib/only.hls\"\n"
+        + "\n"
+        + "fn main() -> int uses IO {\n"
+        + "    println(env_fn())\n"
+        + "    return 0\n"
+        + "}\n"
+    let s4: LspSess = defn_deps(acc, "s3d", "main.hls", main_d, 3, 14,
+        path_join3(acc.scratch_base, "s3d/deps"))
+    check(acc, "HLS_PKG_DEPS (the compiler's own override) resolves",
+        !json_is_null(s4.vals.get(0))
+            && loc_uri(s4.vals.get(0)).ends_with("only.hls"),
+        clip(s4.err, 120))
+}
+
+# ----------------------------------------------------------------------------
+# 4. the layer law.
+# ----------------------------------------------------------------------------
+fn sec4(acc: Acc) -> void uses IO, Fs, Proc {
+    println("4. the layer law — local beats imported beats dependency "
+        + "beats the open net")
+
+    # imported beats open-net: the same name in an unrelated open file
+    # must NOT capture the jump.
+    let _u1: str = wsr(acc, "s4a", "lib/util.hls",
+        "fn util_add(a: int, b: int) -> int {\n    return a + b\n}\n")
+    let other: str = "fn util_add(a: int, b: int) -> int {\n    return a - b\n}\n"
+    let main4: str = "import \"lib/util.hls\"\n"
+        + "\n"
+        + "fn main() -> int uses IO {\n"
+        + "    println(util_add(1, 2))\n"
+        + "    return 0\n"
+        + "}\n"
+    let rels: list[str] = ["main.hls", "other.hls"]
+    let texts: list[str] = [main4, other]
+    let reqs: list[LspReq] = [LspReq {
+        method: "textDocument/definition",
+        line: 3,
+        ch: 14,
+        extra: ""
+    }]
+    let sess: LspSess = lsp_session(acc, "s4a", rels, texts, reqs, false, "")
+    let r: JsonValue = sess.vals.get(0)
+    check(acc, "an imported file beats an unrelated open file carrying the "
+        + "same name",
+        !json_is_null(r) && loc_uri(r).ends_with("/lib/util.hls"),
+        "rc=" + sess.rc.to_str())
+
+    # local beats imported.
+    let main_local: str = "import \"lib/util.hls\"\n"
+        + "\n"
+        + "fn util_add(a: int, b: int) -> int {\n"
+        + "    return a + b + 1\n"
+        + "}\n"
+        + "\n"
+        + "fn main() -> int uses IO {\n"
+        + "    println(util_add(1, 2))\n"
+        + "    return 0\n"
+        + "}\n"
+    let s2: LspSess = defn(acc, "s4a", "main.hls", main_local, 7, 14)
+    check(acc, "a local definition beats the imported one",
+        !json_is_null(s2.vals.get(0))
+            && loc_uri(s2.vals.get(0)).ends_with("/main.hls")
+            && loc_line(s2.vals.get(0)) == 2,
+        clip(s2.err, 120))
+
+    # imported beats dependency: util_add exists BOTH in an imported
+    # sibling and inside the dep farm — the import wins.
+    let _w1: str = wsr(acc, "s4b", ".hls-pkg-deps/mylib/util.hls",
+        "fn util_add(a: int, b: int) -> int {\n    return a * b\n}\n")
+    let _w2: str = wsr(acc, "s4b", "lib/util.hls",
+        "fn util_add(a: int, b: int) -> int {\n    return a + b\n}\n")
+    let main_b: str = "import \"lib/util.hls\"\n"
+        + "import \"mylib/util.hls\"\n"
+        + "\n"
+        + "fn main() -> int uses IO {\n"
+        + "    println(util_add(1, 2))\n"
+        + "    return 0\n"
+        + "}\n"
+    let s3: LspSess = defn(acc, "s4b", "main.hls", main_b, 4, 14)
+    check(acc, "an imported sibling beats a dependency carrying the same name",
+        !json_is_null(s3.vals.get(0))
+            && loc_uri(s3.vals.get(0)).ends_with("/lib/util.hls"),
+        clip(s3.err, 120))
+
+    # dependency beats the open net.
+    let _c1: str = wsr(acc, "s4c", ".hls-pkg-deps/mylib/dep.hls",
+        "fn dep_fn() -> int {\n    return 1\n}\n")
+    let other2: str = "fn dep_fn() -> int {\n    return 2\n}\n"
+    let main_c: str = "import \"mylib/dep.hls\"\n"
+        + "\n"
+        + "fn main() -> int uses IO {\n"
+        + "    println(dep_fn())\n"
+        + "    return 0\n"
+        + "}\n"
+    let rels2: list[str] = ["main.hls", "other.hls"]
+    let texts2: list[str] = [main_c, other2]
+    let reqs2: list[LspReq] = [LspReq {
+        method: "textDocument/definition",
+        line: 3,
+        ch: 14,
+        extra: ""
+    }]
+    let sess2: LspSess = lsp_session(acc, "s4c", rels2, texts2, reqs2, false, "")
+    let r2: JsonValue = sess2.vals.get(0)
+    check(acc, "a dependency beats the last-resort net over open files",
+        !json_is_null(r2) && loc_uri(r2).contains(".hls-pkg-deps"),
+        "rc=" + sess2.rc.to_str())
+}
+
+# ----------------------------------------------------------------------------
+# 5. the guards.
+# ----------------------------------------------------------------------------
+fn sec5(acc: Acc) -> void uses IO, Fs, Proc {
+    println("5. the guards — hostile paths answer null; a malformed "
+        + "lockfile is skipped, not fatal")
+
+    let main5: str = "import \"mylib/missing.hls\"\n"
+        + "\n"
+        + "fn main() -> int {\n"
+        + "    return 0\n"
+        + "}\n"
+    let s1: LspSess = defn(acc, "s5", "main.hls", main5, 0, 12)
+    check(acc, "a missing dependency import answers null, server exits 0",
+        json_is_null(s1.vals.get(0)) && s1.rc == 0,
+        "rc=" + s1.rc.to_str())
+    let s2: LspSess = defn(acc, "s5", "main.hls", main5, 0, 3)
+    check(acc, "the import KEYWORD itself is not a jump (null, not a crash)",
+        json_is_null(s2.vals.get(0)) && s2.rc == 0,
+        "rc=" + s2.rc.to_str())
+    let s3: LspSess = defn(acc, "s5", "main.hls", main5, 3, 5)
+    check(acc, "a keyword token (return) answers null",
+        json_is_null(s3.vals.get(0)) && s3.rc == 0,
+        "rc=" + s3.rc.to_str())
+
+    # A malformed lockfile must be skipped silently; resolution through
+    # the farm must keep working in the same workspace.
+    let _b1: str = wsr(acc, "s5b", "hls-pkg.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    let _b2: str = wsr(acc, "s5b", "hls-pkg.lock", "{ this is not json ]]")
+    let _b3: str = wsr(acc, "s5b", ".hls-pkg-deps/mylib/api.hls",
+        "fn farm_fn() -> int {\n    return 7\n}\n")
+    let main_b: str = "import \"mylib/api.hls\"\n"
+        + "\n"
+        + "fn main() -> int uses IO {\n"
+        + "    println(farm_fn())\n"
+        + "    return 0\n"
+        + "}\n"
+    let s4: LspSess = defn(acc, "s5b", "main.hls", main_b, 3, 14)
+    check(acc, "a malformed hls-pkg.lock is skipped; the farm still resolves",
+        !json_is_null(s4.vals.get(0))
+            && loc_uri(s4.vals.get(0)).contains(".hls-pkg-deps") && s4.rc == 0,
+        "rc=" + s4.rc.to_str())
+
+    # A lockfile entry with a resolved_path that does not exist: skipped.
+    let _c1: str = wsr(acc, "s5c", "hls-pkg.toml",
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n")
+    let _c2: str = wsr(acc, "s5c", "hls-pkg.lock",
+        lock_file("ghost", "", sha64("2"),
+            path_join3(acc.scratch_base, "s5c/nowhere/ghost.hls"), 3))
+    let _c3: str = wsr(acc, "s5c", "real.hls",
+        "fn real_fn() -> int {\n    return 5\n}\n")
+    let main_c: str = "import \"real.hls\"\n"
+        + "\n"
+        + "fn main() -> int uses IO {\n"
+        + "    println(real_fn())\n"
+        + "    return 0\n"
+        + "}\n"
+    let s5: LspSess = defn(acc, "s5c", "main.hls", main_c, 3, 14)
+    check(acc, "a ghost resolved_path is skipped; the relative import still "
+        + "wins",
+        !json_is_null(s5.vals.get(0))
+            && loc_uri(s5.vals.get(0)).ends_with("real.hls") && s5.rc == 0,
+        "rc=" + s5.rc.to_str())
+}
+
+# ----------------------------------------------------------------------------
+# 6. the externals.
+# ----------------------------------------------------------------------------
+fn sec6(acc: Acc) -> void uses IO, Fs, Proc {
+    println("6. the externals — never published to, never edited, always "
+        + "read fresh")
+
+    let depfile: str = wsr(acc, "s6", ".hls-pkg-deps/mylib/api.hls",
+        "fn farm_fn() -> int {\n    return 7\n}\n")
+    let main6: str = "import \"mylib/api.hls\"\n"
+        + "\n"
+        + "fn main() -> int uses IO {\n"
+        + "    println(farm_fn())\n"
+        + "    return 0\n"
+        + "}\n"
+
+    # External docs must not publish diagnostics: the only
+    # publishDiagnostics notifications name the OPEN document.
+    env_unset_var("HLS_PKG_DEPS")
+    let uri0: str = "file://"
+        + path_join3(path_join3(acc.scratch_base, "s6"), "main.hls")
+    let mut payload: str = frame("{\"jsonrpc\": \"2.0\", \"id\": 1, "
+        + "\"method\": \"initialize\", \"params\": {}}")
+    payload = payload + frame("{\"jsonrpc\": \"2.0\", "
+        + "\"method\": \"textDocument/didOpen\", \"params\": "
+        + "{\"textDocument\": {\"uri\": \"" + json_escape(uri0)
+        + "\", \"version\": 1, \"text\": \"" + json_escape(main6) + "\"}}}")
+    payload = payload + frame("{\"jsonrpc\": \"2.0\", \"id\": 9, "
+        + "\"method\": \"textDocument/definition\", \"params\": "
+        + "{\"textDocument\": {\"uri\": \"" + json_escape(uri0)
+        + "\"}, \"position\": {\"line\": 3, \"character\": 14}}}")
+    payload = payload + frame("{\"jsonrpc\": \"2.0\", \"id\": 2, "
+        + "\"method\": \"shutdown\"}")
+    payload = payload + frame("{\"jsonrpc\": \"2.0\", \"method\": \"exit\"}")
+    let out6: LspSess = lsp_run(acc, payload, 1)
+    let mut pubs: int = 0
+    let mut bad_pub: bool = false
+    let mut i: int = 0
+    while i < out6.msgs.len() {
+        let m: JsonValue = out6.msgs.get(i)
+        if jstr_of(m, "method") == "textDocument/publishDiagnostics" {
+            pubs = pubs + 1
+            if jstr_of(jget(m, "params"), "uri") != uri0 {
+                bad_pub = true
+            }
+        }
+        i = i + 1
+    }
+    check(acc, "only the OPEN document receives diagnostics — externals never do",
+        pubs > 0 && !bad_pub, "pubs=" + pubs.to_str() + " rc="
+            + out6.rc.to_str())
+
+    # Rename must stay confined to open buffers.
+    let s2: LspSess = defn_req(acc, "s6", "main.hls", main6, 3, 14,
+        "textDocument/rename", ", \"newName\": \"farm_gn\"")
+    let changes: JsonValue = jget(s2.vals.get(0), "changes")
+    let mut any_main: bool = false
+    let mut any_api: bool = false
+    if json_is_object(changes) {
+        let mut k: int = 0
+        while k < changes.obj_keys.len() {
+            let u: str = changes.obj_keys.get(k)
+            if u.ends_with("main.hls") {
+                any_main = true
+            }
+            if u.contains("api.hls") {
+                any_api = true
+            }
+            k = k + 1
+        }
+    }
+    check(acc, "rename edits only the open buffer — a dependency file is "
+        + "never rewritten",
+        any_main && !any_api, "")
+
+    # References DO span externals (read-only).
+    let s3: LspSess = defn_req(acc, "s6", "main.hls", main6, 3, 14,
+        "textDocument/references",
+        ", \"context\": {\"includeDeclaration\": true}")
+    let ref_arr: JsonValue = s3.vals.get(0)
+    let mut ref_api: bool = false
+    let mut ref_main: bool = false
+    if json_is_array(ref_arr) {
+        let mut k: int = 0
+        while k < ref_arr.arr.len() {
+            let u: str = jstr_of(ref_arr.arr.get(k), "uri")
+            if u.ends_with("api.hls") {
+                ref_api = true
+            }
+            if u.ends_with("main.hls") {
+                ref_main = true
+            }
+            k = k + 1
+        }
+    }
+    check(acc, "references span into the dependency (read-only) and back",
+        ref_api && ref_main, "")
+
+    # mtime refresh: change the dep ON DISK; the next lookup sees it.
+    let dep_text: str = read_file(depfile)
+    write_file(depfile, dep_text + "\nfn farm_late() -> int {\n    return 8\n}\n")
+    let main2: str = "import \"mylib/api.hls\"\n"
+        + "\n"
+        + "fn main() -> int uses IO {\n"
+        + "    println(farm_late())\n"
+        + "    return 0\n"
+        + "}\n"
+    let s4: LspSess = defn(acc, "s6", "main.hls", main2, 3, 14)
+    check(acc, "an on-disk dependency edit is seen on the next lookup "
+        + "(fresh session; parse-on-demand)",
+        !json_is_null(s4.vals.get(0))
+            && loc_uri(s4.vals.get(0)).ends_with("api.hls"),
+        clip(s4.err, 120))
+}
+
+# ----------------------------------------------------------------------------
+# 7. completion + the external LRU.
+# ----------------------------------------------------------------------------
+fn sec7(acc: Acc) -> void uses IO, Fs, Proc {
+    println("7. the completion — a dependency's API completes; the LRU "
+        + "evicts and re-loads")
+
+    let _u1: str = wsr(acc, "s7a", ".hls-pkg-deps/mylib/api.hls",
+        "fn farm_fn() -> int {\n    return 7\n}\n")
+    let main7: str = "import \"mylib/api.hls\"\n"
+        + "\n"
+        + "fn main() -> int uses IO {\n"
+        + "    println()\n"
+        + "    return 0\n"
+        + "}\n"
+    let s1: LspSess = defn_req(acc, "s7a", "main.hls", main7, 3, 12,
+        "textDocument/completion", "")
+    let items: JsonValue = s1.vals.get(0)
+    let mut has_farm: bool = false
+    if json_is_array(items) {
+        let mut k: int = 0
+        while k < items.arr.len() {
+            if jstr_of(items.arr.get(k), "label") == "farm_fn" {
+                has_farm = true
+            }
+            k = k + 1
+        }
+    }
+    check(acc, "farm_fn (dependency API) appears in completion the moment "
+        + "its import is in the file",
+        has_farm, "")
+
+    # LRU: the battery drove HLSServer in-process (the eviction
+    # bookkeeping is not observable through the protocol); the gate pins
+    # the observable consequences with the battery's own load count —
+    # EXTERNAL_DOC_CAP (48) + 5 = 53 external documents.
+    #
+    # s7b (the import wave): a 53-import file. Every definition request
+    # re-loads the imports it needs in import order, so loading the 49th
+    # external evicts the OLDEST — and the wave always finishes before
+    # the resolver walks, which leaves the FIRST five imports dead: the
+    # first lookup into f000 answers null. That null IS the eviction,
+    # observed. The newest import and the open document still answer.
+    let count: int = 53
+    let mut main_lru: str = ""
+    let mut i: int = 0
+    while i < count {
+        main_lru = main_lru + "import \"gen/f" + pad3(i) + ".hls\"\n"
+        i = i + 1
+    }
+    main_lru = main_lru + "\n"
+        + "fn local_fn() -> int {\n    return 1\n}\n"
+        + "\n"
+        + "fn main() -> int {\n"
+        + "    println(local_fn().to_str())\n"
+        + "    println(gen_000().to_str())\n"
+        + "    println(gen_052().to_str())\n"
+        + "    return 0\n"
+        + "}\n"
+    let _u2: str = wsr(acc, "s7b", "main.hls", main_lru)
+    i = 0
+    while i < count {
+        let _g: str = wsr(acc, "s7b", "gen/f" + pad3(i) + ".hls",
+            "fn gen_" + pad3(i) + "() -> int {\n    return " + i.to_str()
+                + "\n}\n")
+        i = i + 1
+    }
+    let rels: list[str] = ["main.hls"]
+    let texts: list[str] = [main_lru]
+    let reqs: list[LspReq] = [
+        LspReq { method: "textDocument/definition", line: 60, ch: 13, extra: "" },
+        LspReq { method: "textDocument/definition", line: 61, ch: 13, extra: "" },
+        LspReq { method: "textDocument/definition", line: 59, ch: 13, extra: "" }
+    ]
+    let sess: LspSess = lsp_session(acc, "s7b", rels, texts, reqs, false, "")
+    check(acc, "the OLDEST external document was evicted (the first lookup "
+        + "answers null under cap pressure)",
+        json_is_null(sess.vals.get(0)) && sess.rc == 0,
+        "rc=" + sess.rc.to_str())
+    check(acc, "the NEWEST external document survives",
+        !json_is_null(sess.vals.get(1))
+            && loc_uri(sess.vals.get(1)).ends_with("/gen/f052.hls"),
+        clip(sess.err, 120))
+    check(acc, "the OPEN document survives eviction pressure",
+        !json_is_null(sess.vals.get(2))
+            && loc_uri(sess.vals.get(2)).ends_with("/main.hls"),
+        clip(sess.err, 120))
+
+    # s7c (the re-load): the same 53 documents as a .hls-pkg-deps farm.
+    # A definition into the LAST farm file walks the whole farm (53
+    # loads into the 48-entry cache — the oldest five are evicted); the
+    # next request into an EVICTED farm file (f000 — first in the walk
+    # order, and 53 documents cannot fit a 48-entry cache, so this
+    # lookup cannot be a cache hit) re-loads it transparently and finds
+    # the symbol.
+    let main_farm: str = "fn local_fn() -> int {\n    return 1\n}\n"
+        + "\n"
+        + "fn main() -> int {\n"
+        + "    println(local_fn().to_str())\n"
+        + "    println(ffn_000().to_str())\n"
+        + "    println(ffn_052().to_str())\n"
+        + "    return 0\n"
+        + "}\n"
+    let _u3: str = wsr(acc, "s7c", "main.hls", main_farm)
+    i = 0
+    while i < count {
+        let _g: str = wsr(acc, "s7c", ".hls-pkg-deps/farm/f" + pad3(i) + ".hls",
+            "fn ffn_" + pad3(i) + "() -> int {\n    return " + i.to_str()
+                + "\n}\n")
+        i = i + 1
+    }
+    let rels2: list[str] = ["main.hls"]
+    let texts2: list[str] = [main_farm]
+    let reqs2: list[LspReq] = [
+        LspReq { method: "textDocument/definition", line: 7, ch: 13, extra: "" },
+        LspReq { method: "textDocument/definition", line: 6, ch: 13, extra: "" }
+    ]
+    let sess2: LspSess = lsp_session(acc, "s7c", rels2, texts2, reqs2, false, "")
+    check(acc, "an evicted file re-loads on the next request (the farm walk "
+        + "after cap pressure)",
+        !json_is_null(sess2.vals.get(0))
+            && loc_uri(sess2.vals.get(0)).ends_with("/f052.hls")
+            && !json_is_null(sess2.vals.get(1))
+            && loc_uri(sess2.vals.get(1)).ends_with("/f000.hls"),
+        clip(sess2.err, 120))
+}
+
+# ----------------------------------------------------------------------------
+# 8. the smoke and the corpus.
+# ----------------------------------------------------------------------------
+fn sec8(acc: Acc) -> void uses IO, Fs, Proc {
+    println("8. the smoke — lsp_smoke.py stays green; the ok corpus "
+        + "program runs (native half when a C compiler exists)")
+
+    let smoke: RunResult = run_capture("python3",
+        [path_join3(acc.root, "tools/lsp_smoke.py")])
+    check(acc, "lsp_smoke.py: protocol assertions still pass", smoke.code == 0,
+        clip(smoke.combined, 120))
+
+    let okr: RunResult = boot(acc, [ok_test()])
+    check(acc, "feat_stage113_lsp_resolve.hls runs through boot "
+        + "(interpreter)", okr.code == 0, clip(okr.combined, 120))
+
+    if which("gcc") {
+        let cfile: str = scratch(acc, "s113.c")
+        let r1: RunResult = boot(acc,
+            [path_join3(acc.root, "src/hlc.hls"), ok_test(), cfile])
+        let binfile: str = scratch(acc, "s113.bin")
+        let r2: RunResult = run_capture("gcc",
+            ["-O2", "-o", binfile, cfile, "-lm", "-pthread"])
+        if r1.code == 0 && r2.code == 0 {
+            let interp: RunResult = boot(acc, [ok_test()])
+            let nat: RunResult = run_capture(binfile, [])
+            check(acc, "native build agrees with the interpreter byte for byte",
+                nat.out == interp.out, "")
+        } else {
+            fail_msg(acc, "native half could not build (self-host compile "
+                + "or gcc)")
+        }
+    } else {
+        pass_msg(acc, "no C compiler — native half skipped (gate stays hermetic)")
+    }
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let acc: Acc = acc_new("lsp_def")
+    println("Stage 113 acceptance gate — LSP go-to-definition across packages")
+    sec1(acc)
+    sec2(acc)
+    sec3(acc)
+    sec4(acc)
+    sec5(acc)
+    sec6(acc)
+    sec7(acc)
+    sec8(acc)
+    return finish(acc, "Stage 113 -- LSP go-to-definition across packages")
+}
