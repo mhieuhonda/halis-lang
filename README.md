@@ -8,9 +8,10 @@
 
 Safety is the default. Effects are declared. Nothing hides.
 
-[![CI](https://github.com/mhieuhonda/halis-lang/actions/workflows/ci.yml/badge.svg)](https://github.com/mhieuhonda/halis-lang/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/badge/release-v1.0.0-375EAB)](https://github.com/mhieuhonda/halis-lang/releases)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/mhieuhonda/halis-lang?color=228be6)](https://github.com/mhieuhonda/halis-lang/releases)
+[![License](https://img.shields.io/badge/license-MIT-40c057)](LICENSE)
+[![Docs](https://img.shields.io/badge/docs-halis--lang-ae3ec9)](https://github.com/mhieuhonda/halis-lang#readme)
+[![Updated](https://img.shields.io/github/last-commit/mhieuhonda/halis-lang?label=updated&color=fab005)](https://github.com/mhieuhonda/halis-lang/commits)
 
 [Specification](SPEC.md) · [Releases](RELEASES.md) · [Security](SECURITY.md) · [Contributing](CONTRIBUTING.md) · [LTS policy](LTS.md)
 
