@@ -97,7 +97,7 @@ SEVERITY_MEANING = {
 # window changes, the quote must follow, or the ledger refuses.
 POLICY_ANCHORS = [
     (SECURITY_MD, "security/advisories"),
-    (SECURITY_MD, "90-day coordinated-disclosure"),
+    (SECURITY_MD, "90-day window"),
 ]
 
 # ---------------------------------------------------------------------------
