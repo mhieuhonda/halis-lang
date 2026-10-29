@@ -296,6 +296,7 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 | Document | What it covers |
 |----------|----------------|
 | [SPEC.md](SPEC.md) | The language reference — lexical rules, types, effects, taint, ownership, IR, every subsystem |
+| [installation.md](installation.md) | Installing the toolchain — every supported platform |
 | [RELEASES.md](RELEASES.md) | The release record and support discipline |
 | [SECURITY.md](SECURITY.md) | The security model, its honest limits, and how to report |
 | [LTS.md](LTS.md) | The support policy — rendered, not maintained |
