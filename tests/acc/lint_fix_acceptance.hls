@@ -1,0 +1,757 @@
+# ============================================================================
+# tests/acc/lint_fix_acceptance.hls — Stage 118 acceptance gate, in Halis
+# (the Halis twin of tests/lint_fix_acceptance.py; same eight
+# sections, same assertions, same needles — the harness is
+# tests/acc/harness.hls and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Every leg drives the real linter CLI (python3 tools/hllint.py) over
+# gate-written scratch files; file-edit verification is
+# write_src + read_file byte comparison. The battery's one white-box
+# leg — a Fixer subclass that corrupts the candidate edit to prove the
+# parse check rolls it back — runs as a spawned python3 driver
+# (tests cannot subclass Python classes in-process); it is the
+# battery's own CorruptFixer code, verbatim, in a child process.
+#
+#  1. the renames    — L001 is a scope rename: the declaration AND
+#                      every consistent occurrence get the underscore
+#                      prefix; `let mut` renames too; the value's side
+#                      effects survive; L002 renames an unused fn's
+#                      definition; an ambiguous short name is skipped;
+#                      extern declarations are never renamed
+#  2. the wraps      — L004 binds a typed discard for the plain call,
+#                      the method call, and a statement spanning lines
+#  3. the signature  — L006 deletes the whole `uses` clause (plain,
+#                      two effects, before a contract); an extern's
+#                      `uses` clause is skipped
+#  4. the deletions  — L007 deletes the unreachable run up to the
+#                      brace (L007 is the rescue: a checker-rejected
+#                      file becomes a runnable one); L010 deletes the
+#                      empty impl; L011/L012 delete the attribute line
+#                      while a sibling attribute survives
+#  5. the safety net — an unparseable file is never written and is
+#                      reported as an error; a fix the crate check
+#                      rejects is rolled back and reported; a
+#                      corrupted candidate edit is caught by the parse
+#                      check and rolled back; a stream target keeps
+#                      its name
+#  6. the fixed point— a second --fix changes nothing; --diff exits 1
+#                      while fixes are pending and 0 when clean;
+#                      --fix --diff is a usage error; --strict exits 1
+#                      when unfixable warnings remain
+#  7. the differential— the stage's ok fixture prints the SAME
+#                      markers from interpreter and native, before and
+#                      after --fix; the fixed file is an hlfmt fixed
+#                      point
+#  8. the corpus     — every tests/ok/ and examples/ file fixes on a
+#                      temp copy without crashing, re-lints clean, and
+#                      runnable originals print the same markers
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+
+# ----------------------------------------------------------------------------
+# The gate's data — the probe sources, byte for byte as the battery
+# writes them.
+# ----------------------------------------------------------------------------
+
+fn renames_a_src() -> str {
+    return "# rename scope probe\n" +
+        "fn scope_fn(n: int) -> int uses IO {\n" +
+        "    let mut y: int = n\n" +
+        "    y = exit_free(n)\n" +
+        "    println(\"ran\")\n" +
+        "    return 0\n" +
+        "}\n" +
+        "\n" +
+        "fn exit_free(m: int) -> int {\n" +
+        "    return m\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int uses IO {\n" +
+        "    let gone: int = scope_fn(1)\n" +
+        "    println(gone.to_str())\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+fn renames_b_src() -> str {
+    return "fn noisy() -> int uses IO {\n" +
+        "    println(\"side effect kept\")\n" +
+        "    return 1\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int uses IO {\n" +
+        "    let unused: int = noisy()\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+fn renames_c_src() -> str {
+    return "struct Saver {\n" +
+        "    n: int\n" +
+        "}\n" +
+        "\n" +
+        "impl Saver {\n" +
+        "    fn save(self: Saver) -> int {\n" +
+        "        return self.n\n" +
+        "    }\n" +
+        "}\n" +
+        "\n" +
+        "impl Saver {\n" +
+        "    fn save2(self: Saver) -> int {\n" +
+        "        return self.n\n" +
+        "    }\n" +
+        "}\n" +
+        "\n" +
+        "fn orphan_x() -> int {\n" +
+        "    return 3\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int uses IO {\n" +
+        "    let s: Saver = Saver { n: 1 }\n" +
+        "    println(s.save().to_str())\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+fn renames_d_src() -> str {
+    return "extern \"C\" {\n" +
+        "    fn puts(s: str) -> int uses IO\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int uses IO {\n" +
+        "    println(\"hi\")\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+fn wraps_a_src() -> str {
+    return "import \"std.result\"\n" +
+        "\n" +
+        "fn parse_it(s: str) -> Result[int, int] {\n" +
+        "    if s.len() == 0 {\n" +
+        "        return Result.Err(1)\n" +
+        "    }\n" +
+        "    return Result.Ok(s.len())\n" +
+        "}\n" +
+        "\n" +
+        "struct Cell {\n" +
+        "    v: int\n" +
+        "}\n" +
+        "\n" +
+        "impl Cell {\n" +
+        "    fn refresh(self: Cell) -> Result[int, int] {\n" +
+        "        return Result.Ok(self.v)\n" +
+        "    }\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int uses IO {\n" +
+        "    parse_it(\"hi\")\n" +
+        "    let c: Cell = Cell { v: 2 }\n" +
+        "    c.refresh()\n" +
+        "    parse_it(\n" +
+        "        \"a longer argument, one line down\")\n" +
+        "    println(\"wrapped\")\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+fn sig_a_src() -> str {
+    return "fn pure_one() -> int uses IO {\n" +
+        "    return 1\n" +
+        "}\n" +
+        "\n" +
+        "fn pure_two() -> int uses IO, Fs {\n" +
+        "    return 2\n" +
+        "}\n" +
+        "\n" +
+        "fn pure_three() -> int uses IO requires true {\n" +
+        "    return 3\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int uses IO {\n" +
+        "    println((pure_one() + pure_two() + pure_three()).to_str())\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+fn sig_b_src() -> str {
+    return "extern \"C\" {\n" +
+        "    fn getenv(name: str) -> str uses IO\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int uses IO {\n" +
+        "    println(\"x\")\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+fn del_a_src() -> str {
+    return "fn dead_tail(k: int) -> int {\n" +
+        "    let mut acc: int = 0\n" +
+        "    if k > 0 {\n" +
+        "        acc = 1\n" +
+        "    }\n" +
+        "    return acc\n" +
+        "    let never: int = 2\n" +
+        "    println(\"unreachable \" + never.to_str())\n" +
+        "    while false {\n" +
+        "        acc = acc + 1\n" +
+        "    }\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int uses IO {\n" +
+        "    println(dead_tail(1).to_str())\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+# acc_body(n) — the battery's "    acc = acc + %d" line run.
+fn acc_body(n: int) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < n {
+        if i > 0 {
+            out = out + "\n"
+        }
+        out = out + "    acc = acc + " + i.to_str()
+        i = i + 1
+    }
+    return out
+}
+
+fn del_b_src() -> str {
+    return "impl Nothing {\n" +
+        "}\n" +
+        "\n" +
+        "#[cold]\n" +
+        "#[inline(always)]\n" +
+        "fn hot_stub() -> int {\n" +
+        "    let mut acc: int = 0\n" +
+        acc_body(55) + "\n" +
+        "    return acc\n" +
+        "}\n" +
+        "\n" +
+        "#[tail_call]\n" +
+        "fn recurs(k: int) -> int {\n" +
+        "    let mut acc: int = 0\n" +
+        acc_body(32) + "\n" +
+        "    if k <= 0 {\n" +
+        "        return acc\n" +
+        "    }\n" +
+        "    return recurs(k - 1)\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int uses IO {\n" +
+        "    println((hot_stub() + recurs(1)).to_str())\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+fn broken_src() -> str {
+    return "fn broken( {\n    return 0\n}\n"
+}
+
+fn corrupt_src() -> str {
+    return "fn helper() -> int {\n" +
+        "    return 1\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int uses IO {\n" +
+        "    let stray: int = helper()\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+fn point_a_src() -> str {
+    return "fn one() -> int {\n" +
+        "    return 1\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int uses IO {\n" +
+        "    let unused_a: int = one()\n" +
+        "    println(\"x\")\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+fn point_b_src() -> str {
+    return "fn two() -> int {\n" +
+        "    return 2\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int uses IO {\n" +
+        "    let gone: int = two()\n" +
+        "    println(\"y\")\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+fn point_c_src() -> str {
+    return "struct Hidden {\n" +
+        "    field: int\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int uses IO {\n" +
+        "    let h: Hidden = Hidden { field: 1 }\n" +
+        "    println(\"z\")\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+# The battery's white-box CorruptFixer leg, verbatim, as a child
+# process (Halis gates spawn subprocesses; they cannot subclass a
+# Python class in-process). Exits 0 iff the corrupted candidate edit
+# was rolled back by the parse check.
+fn corrupt_driver_src() -> str {
+    return "#!/usr/bin/env python3\n" +
+        "# tests/lint_fix_acceptance.py section 5, CorruptFixer leg.\n" +
+        "import os\n" +
+        "import sys\n" +
+        "\n" +
+        "sys.path.insert(0, os.getcwd())\n" +
+        "\n" +
+        "from tools.hllint import Fixer\n" +
+        "\n" +
+        "\n" +
+        "class CorruptFixer(Fixer):\n" +
+        "    def _apply(self, src, edits):\n" +
+        "        out = super()._apply(src, edits)\n" +
+        "        return out.replace(b'fn main', b'fn main(')  # break it on purpose\n" +
+        "\n" +
+        "\n" +
+        "path = sys.argv[1]\n" +
+        "before = open(path, 'rb').read()\n" +
+        "fx = CorruptFixer(path=path)\n" +
+        "new_src, report = fx.fix_source(before)\n" +
+        "good = (new_src == before) and (not report['changed'])\n" +
+        "print('ROLLBACK-OK' if good else 'ROLLBACK-BAD')\n" +
+        "sys.exit(0 if good else 1)\n"
+}
+
+# ----------------------------------------------------------------------------
+# Shared legs.
+# ----------------------------------------------------------------------------
+
+fn lintc(args: list[str]) -> RunResult uses Proc {
+    let argv: list[str] = ["tools/hllint.py"]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    return run_capture("python3", argv)
+}
+
+# mask_line_interp — markers_of's per-line mask: a whole `ts=` line
+# becomes TS (hex letters vary with the clock); every other digit
+# becomes # (clock values).
+fn mask_line_interp(l: str) -> str {
+    if l.contains("ts=") {
+        return "TS"
+    }
+    return mask_digits(l)
+}
+
+fn mask_digits(l: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < l.len() {
+        let b: int = l.byte_at(i)
+        if b >= 48 && b <= 57 {
+            out = out + "#"
+        } else {
+            out = out + l.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn mask_all(text: str, interp: bool) -> str {
+    let lines: list[str] = text.split("\n")
+    let mut out: list[str] = []
+    let mut i: int = 0
+    while i < lines.len() {
+        if interp {
+            out.push(mask_line_interp(lines.get(i)))
+        } else {
+            out.push(mask_digits(lines.get(i)))
+        }
+        i = i + 1
+    }
+    return str_join(out, "\n")
+}
+
+# Markers — the battery's markers_of outcome: the masked lines hide
+# every digit (clock values) and every whole `ts=` line, so two runs
+# of a time-flavoured program compare equal.
+struct Markers {
+    rc: int,
+    masked: str,
+    raw: str
+}
+
+fn markers_of(acc: Acc, src_path: str) -> Markers uses Proc {
+    let r: RunResult = boot(acc, [src_path])
+    return Markers { rc: r.code, masked: mask_all(r.out, true), raw: r.out }
+}
+
+# NativeRun — the battery's build_and_run outcome.
+struct NativeRun {
+    rc: int,
+    out: str,
+    ok: bool
+}
+
+fn build_and_run(acc: Acc, path: str, tag: str) -> NativeRun uses IO, Fs, Proc {
+    let c: str = scratch(acc, "diff_" + tag + ".c")
+    let e: str = scratch(acc, "diff_" + tag)
+    let b: RunResult = run_capture("./bin/hlc", [path, c])
+    if b.code != 0 {
+        return NativeRun { rc: -1, out: "compile failed: " + clip(b.err, 80), ok: false }
+    }
+    let g: RunResult = run_capture("gcc", ["-O2", "-o", e, c, "-lm", "-pthread"])
+    if g.code != 0 {
+        return NativeRun { rc: -1, out: "gcc failed: " + clip(g.err, 80), ok: false }
+    }
+    let r: RunResult = run_capture(e, [])
+    return NativeRun { rc: r.code, out: r.out, ok: true }
+}
+
+# ----------------------------------------------------------------------------
+# 1. the renames (L001 scope rename, L002 definition rename)
+# ----------------------------------------------------------------------------
+fn sec1(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 1 — the renames (L001 scope rename, L002 definition rename)")
+    let p: str = write_src(acc, "renames/a.hls", renames_a_src())
+    let _r: RunResult = lintc(["--fix", p])
+    let text: str = read_file(p)
+    check(acc, "L001 renames the declaration (`let mut _y`)",
+        text.contains("let mut _y: int = n"), "")
+    check(acc, "L001 renames the assign target too (write-only binding)",
+        text.contains("_y = exit_free(n)"), "")
+    check(acc, "the enclosing fn's own name is untouched",
+        text.contains("fn scope_fn") && !text.contains("fn _scope_fn"), "")
+    check(acc, "the callee keeps its name",
+        text.contains("fn exit_free") && !text.contains("fn _exit_free"), "")
+    let r2: RunResult = lintc([p])
+    check(acc, "the fixed file re-lints clean",
+        r2.out.trim().ends_with("no warnings"), clip(r2.out, 80))
+    let m: Markers = markers_of(acc, p)
+    check(acc, "the scope-renamed function still computes and prints",
+        m.rc == 0 && m.raw.contains("ran"), "rc=" + m.rc.to_str())
+    # value side effects survive: noisy() still called after the rename
+    let p2: str = write_src(acc, "renames/b.hls", renames_b_src())
+    let _rf: RunResult = lintc(["--fix", p2])
+    let m2: Markers = markers_of(acc, p2)
+    check(acc, "the renamed binding's value still runs (side effect kept)",
+        m2.rc == 0 && m2.raw.contains("side effect kept"), "rc=" + m2.rc.to_str())
+    # ambiguous short names are skipped, never guessed
+    let p3: str = write_src(acc, "renames/c.hls", renames_c_src())
+    let _r3: RunResult = lintc(["--fix", p3])
+    let after: str = read_file(p3)
+    check(acc, "L002 renames the unique orphan fn",
+        after.contains("fn _orphan_x"), "")
+    check(acc, "the two `save` methods keep their names (rename would be a guess)",
+        after.contains("fn save(self: Saver)"), "")
+    # extern + handler fns are never renamed
+    let p4: str = write_src(acc, "renames/d.hls", renames_d_src())
+    let before4: str = read_file(p4)
+    let r4: RunResult = lintc(["--fix", p4])
+    check(acc, "an extern declaration is never renamed (the name is the C symbol)",
+        read_file(p4) == before4, "")
+    check(acc, "the extern skip is reported with a reason",
+        r4.out.contains("extern declaration"), clip(r4.out, 90))
+}
+
+# ----------------------------------------------------------------------------
+# 2. the wraps (L004 discard bindings)
+# ----------------------------------------------------------------------------
+fn sec2(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 2 — the wraps (L004 discard bindings)")
+    let p: str = write_src(acc, "wraps/a.hls", wraps_a_src())
+    let _r: RunResult = lintc(["--fix", p])
+    let text: str = read_file(p)
+    check(acc, "the plain call is wrapped in a typed discard",
+        text.contains("let _ignored: Result[int, int] = parse_it(\"hi\")"), "")
+    check(acc, "the method call is wrapped in a typed discard (unique name)",
+        text.contains("let _ignored2: Result[int, int] = c.refresh()"), "")
+    check(acc, "a multi-line statement is wrapped at its head, body untouched",
+        text.contains("let _ignored3: Result[int, int] = parse_it(")
+            && text.contains("\"a longer argument, one line down\")"), "")
+    let m: Markers = markers_of(acc, p)
+    check(acc, "the wrapped file still runs",
+        m.rc == 0 && m.raw.contains("wrapped"), "rc=" + m.rc.to_str())
+    let r2: RunResult = lintc([p])
+    check(acc, "the wrapped file re-lints clean",
+        r2.out.trim().ends_with("no warnings"), clip(r2.out, 80))
+}
+
+# ----------------------------------------------------------------------------
+# 3. the signature (L006 clause deletion)
+# ----------------------------------------------------------------------------
+fn sec3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 3 — the signature (L006 clause deletion)")
+    let p: str = write_src(acc, "sig/a.hls", sig_a_src())
+    let _r: RunResult = lintc(["--fix", p])
+    let text: str = read_file(p)
+    check(acc, "the single-effect clause is deleted",
+        text.contains("fn pure_one() -> int {"), "")
+    check(acc, "the two-effect clause is deleted",
+        text.contains("fn pure_two() -> int {"), "")
+    check(acc, "the clause before a contract is deleted, the contract survives",
+        text.contains("fn pure_three() -> int requires true {"), "")
+    let m: Markers = markers_of(acc, p)
+    check(acc, "the fixed signatures still compute the same values",
+        m.rc == 0 && m.raw.contains("6"), "rc=" + m.rc.to_str())
+    let r2: RunResult = lintc([p])
+    check(acc, "the fixed signatures re-lint clean",
+        r2.out.trim().ends_with("no warnings"), clip(r2.out, 80))
+    # an extern's uses clause is part of the FFI contract — skipped
+    let p2: str = write_src(acc, "sig/b.hls", sig_b_src())
+    let before: str = read_file(p2)
+    let rb: RunResult = lintc(["--fix", p2])
+    check(acc, "an extern `uses` clause is never deleted",
+        read_file(p2) == before, "")
+    check(acc, "the extern skip is reported with a reason",
+        rb.out.contains("extern declaration"), clip(rb.out, 90))
+}
+
+# ----------------------------------------------------------------------------
+# 4. the deletions (L007 dead code, L010 empty impl, L011/L012 attrs)
+# ----------------------------------------------------------------------------
+fn sec4(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 4 — the deletions (L007 dead code, L010 empty impl, "
+        + "L011/L012 attributes)")
+    # L007: the rescue — a checker-rejected file becomes a runnable one.
+    let p: str = write_src(acc, "del/a.hls", del_a_src())
+    let m0: Markers = markers_of(acc, p)
+    check(acc, "the checker rejects the dead-tail file before the fix",
+        m0.rc != 0, "rc=" + m0.rc.to_str())
+    let _r: RunResult = lintc(["--fix", p])
+    let text: str = read_file(p)
+    check(acc, "the unreachable run is deleted",
+        !text.contains("println(\"unreachable \" + never.to_str())"), "")
+    check(acc, "the live body and the closing brace survive",
+        text.contains("return acc\n}"), "")
+    check(acc, "no stale indent or blank line is glued to the brace",
+        !text.contains("    }\n}") && !text.contains("\n\n\n}"), "")
+    let m1: Markers = markers_of(acc, p)
+    let lines: list[str] = m1.raw.split("\n")
+    check(acc, "the rescued file compiles and runs after the fix",
+        m1.rc == 0 && lines.len() > 0 && lines.get(0).contains("1"),
+        "rc=" + m1.rc.to_str())
+    check(acc, "a binding inside the dead code dies with it (subsumed)",
+        !text.contains("let never"), "")
+    # L010 + attribute deletions, sibling attribute survives
+    let p2: str = write_src(acc, "del/b.hls", del_b_src())
+    let _r2: RunResult = lintc(["--fix", p2])
+    let text2: str = read_file(p2)
+    check(acc, "the empty impl block is deleted", !text2.contains("impl Nothing"), "")
+    check(acc, "the #[inline(always)] attribute is deleted",
+        !text2.contains("#[inline(always)]"), "")
+    check(acc, "the sibling #[cold] attribute survives", text2.contains("#[cold]"), "")
+    check(acc, "the #[tail_call] attribute is deleted",
+        !text2.contains("#[tail_call]"), "")
+    let m2: Markers = markers_of(acc, p2)
+    check(acc, "the attribute-deleted file still runs",
+        m2.rc == 0 && m2.raw.trim().len() > 0, "rc=" + m2.rc.to_str())
+    let r3: RunResult = lintc([p2])
+    check(acc, "the deletions re-lint clean",
+        r3.out.trim().ends_with("no warnings"), clip(r3.out, 80))
+}
+
+# ----------------------------------------------------------------------------
+# 5. the safety net (never parse, never guess, roll back)
+# ----------------------------------------------------------------------------
+fn sec5(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 5 — the safety net (never parse, never guess, roll back)")
+    let p: str = write_src(acc, "safety/broken.hls", broken_src())
+    let before: str = read_file(p)
+    let r: RunResult = lintc(["--fix", p])
+    check(acc, "an unparseable file is never written", read_file(p) == before, "")
+    check(acc, "the unparseable file is reported as an error (exit 1)",
+        r.code == 1 && r.err.contains("error:"), clip(r.err, 80))
+    # a rename that collides with an imported module is rolled back
+    let p2: str = write_src(acc, "safety/collide.hls",
+        read_file("examples/uuid_ulid_demo.hls"))
+    let before2: str = read_file(p2)
+    let r2: RunResult = lintc(["--fix", p2])
+    check(acc, "a fix the crate check rejects leaves the file byte-identical",
+        read_file(p2) == before2, "")
+    check(acc, "the rejected fix is reported, not silent",
+        r2.out.contains("rolled back") || r2.out.contains("not auto-fixed"),
+        clip(r2.out, 90))
+    # a corrupted candidate edit is caught by the parse check
+    let driver: str = write_src(acc, "safety/corrupt_fixer.py", corrupt_driver_src())
+    let p3: str = write_src(acc, "safety/corrupt.hls", corrupt_src())
+    let before3: str = read_file(p3)
+    let r3: RunResult = run_capture("python3", [driver, p3])
+    check(acc, "a corrupted candidate is rolled back (parse check)",
+        r3.code == 0 && r3.out.contains("ROLLBACK-OK"),
+        clip(r3.combined, 100))
+    # (the corrupt fixer never writes; the file must still be as written)
+    check(acc, "the corrupted-candidate probe leaves its file untouched",
+        read_file(p3) == before3, "")
+    # the crate net: a stream target rename is refused
+    let p4: str = write_src(acc, "safety/stream.hls",
+        read_file("tests/ok/feat_stage34_stream.hls"))
+    let before4: str = read_file(p4)
+    let _r4: RunResult = lintc(["--fix", p4])
+    check(acc, "a stream target keeps its name (the rename would stop resolving)",
+        read_file(p4) == before4, "")
+}
+
+# ----------------------------------------------------------------------------
+# 6. the fixed point, --diff, and the exit codes
+# ----------------------------------------------------------------------------
+fn sec6(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 6 — the fixed point, --diff, and the exit codes")
+    let p: str = write_src(acc, "point/a.hls", point_a_src())
+    let r1: RunResult = lintc(["--fix", p])
+    check(acc, "the first --fix reports what it fixed",
+        r1.out.contains("fixed"), clip(r1.out, 90))
+    let r2: RunResult = lintc(["--fix", p])
+    check(acc, "a second --fix run fixes nothing (fixed point)",
+        !r2.out.contains("fixed"), clip(r2.out, 90))
+    # --diff exit codes
+    let p2: str = write_src(acc, "point/b.hls", point_b_src())
+    let rd: RunResult = lintc(["--diff", p2])
+    check(acc, "--diff shows the pending diff and exits 1",
+        rd.code == 1 && rd.out.contains("---"), clip(rd.out, 90))
+    let _rf: RunResult = lintc(["--fix", p2])
+    let rd2: RunResult = lintc(["--diff", p2])
+    check(acc, "--diff on a clean file exits 0", rd2.code == 0, clip(rd2.out, 90))
+    # --fix --diff is a usage error
+    let r3: RunResult = lintc(["--fix", "--diff", p2])
+    check(acc, "--fix and --diff together are a usage error (exit 2)",
+        r3.code == 2, "rc=" + r3.code.to_str())
+    # --strict after a fix: remaining (unfixable) warnings still exit 1
+    let p3: str = write_src(acc, "point/c.hls", point_c_src())
+    let r4: RunResult = lintc(["--strict", "--fix", p3])
+    check(acc, "--strict exits 1 when an unfixable warning remains after the fix",
+        r4.code == 1 && r4.out.contains("L003"), clip(r4.out, 90))
+}
+
+# ----------------------------------------------------------------------------
+# 7. the differential (interpreter and native, before and after the fix)
+# ----------------------------------------------------------------------------
+fn sec7(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 7 — the differential (interpreter and native, before "
+        + "and after the fix)")
+    let fixture: str = "tests/ok/feat_stage118_lint_fix.hls"
+    let work: str = write_src(acc, "diff/fixture.hls", read_file(fixture))
+    let m0: Markers = markers_of(acc, fixture)
+    let m1: Markers = markers_of(acc, work)
+    check(acc, "the interpreter prints the same markers before and after --fix",
+        m0.rc == 0 && m0.rc == m1.rc && m0.masked == m1.masked,
+        "rc " + m0.rc.to_str() + " / " + m1.rc.to_str())
+    if which("gcc") && file_exists("bin/hlc") {
+        let n0: NativeRun = build_and_run(acc, fixture, "before")
+        let n1: NativeRun = build_and_run(acc, work, "after")
+        check(acc, "the native build prints the same markers before and after --fix",
+            n0.rc == 0 && n0.rc == n1.rc && n0.out == n1.out,
+            clip(n0.out, 80))
+        let masked_n: str = mask_all(n0.out, false)
+        check(acc, "interpreter and native agree on the fixed file's markers",
+            m0.masked == masked_n, "")
+    } else {
+        fail_msg(acc, "the native half of the differential could not run "
+            + "(no gcc or no bin/hlc)")
+    }
+    # the fixed file is still a fixed point under hlfmt
+    let f1: RunResult = run_capture("./bin/hlfmt", [work])
+    let f2: RunResult = run_capture("./bin/hlfmt", ["-c", work])
+    check(acc, "the fixed file is a fixed point under hlfmt",
+        f1.code == 0 && f2.out.contains("already formatted"), clip(f2.out, 80))
+}
+
+# ----------------------------------------------------------------------------
+# 8. the corpus (every ok file and example fixes safely)
+# ----------------------------------------------------------------------------
+fn sec8(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 8 — the corpus (every ok file and example fixes safely)")
+    # sorted(glob tests/ok/*.hls + examples/*.hls); fs_read_dir lists
+    # entry names sorted, so concatenating the two filtered listings
+    # gives the battery's corpus order.
+    let mut corpus: list[str] = []
+    let ex: list[str] = fs_read_dir("examples")
+    let okd: list[str] = fs_read_dir("tests/ok")
+    let mut i: int = 0
+    while i < ex.len() {
+        if ex.get(i).ends_with(".hls") {
+            corpus.push("examples/" + ex.get(i))
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < okd.len() {
+        if okd.get(i).ends_with(".hls") {
+            corpus.push("tests/ok/" + okd.get(i))
+        }
+        i = i + 1
+    }
+    let mut crashed: int = 0
+    let mut regressed: int = 0
+    let mut semantic: int = 0
+    let mut fixed_count: int = 0
+    let mut k: int = 0
+    while k < corpus.len() {
+        let f: str = corpus.get(k)
+        let t: str = acc.scratch_base + "/corpus_" + basename(f)
+        cp(f, t)
+        let rf: RunResult = lintc(["--fix", t])
+        if (rf.code != 0 && rf.code != 1) || rf.err.contains("Traceback") {
+            crashed = crashed + 1
+            fail_msg(acc, "--fix crashed on " + f)
+            k = k + 1
+            continue
+        }
+        let rl: RunResult = lintc([t])
+        if rl.code != 0 || rl.err.contains("Traceback") {
+            regressed = regressed + 1
+            fail_msg(acc, "the fixed copy of " + f + " does not re-lint")
+            k = k + 1
+            continue
+        }
+        if rf.out.contains("fixed") {
+            fixed_count = fixed_count + 1
+            let m_orig: Markers = markers_of(acc, f)
+            let m_copy: Markers = markers_of(acc, t)
+            if m_orig.rc == 0 && m_copy.rc != 0 {
+                semantic = semantic + 1
+                fail_msg(acc, "the fixed copy of " + f + " no longer runs")
+            } else if m_orig.rc == 0 && m_orig.masked != m_copy.masked {
+                semantic = semantic + 1
+                fail_msg(acc, "the fixed copy of " + f + " prints different markers")
+            }
+        }
+        k = k + 1
+    }
+    if crashed == 0 {
+        pass_msg(acc, "--fix runs without crashing on all " + corpus.len().to_str()
+            + " corpus files")
+    }
+    if regressed == 0 {
+        pass_msg(acc, "every fixed copy re-lints without crashing")
+    }
+    if semantic == 0 {
+        pass_msg(acc, "every runnable original prints the same markers after --fix ("
+            + fixed_count.to_str() + " files fixed)")
+    }
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let acc: Acc = acc_new("lintfix")
+    sec1(acc)
+    sec2(acc)
+    sec3(acc)
+    sec4(acc)
+    sec5(acc)
+    sec6(acc)
+    sec7(acc)
+    sec8(acc)
+    return finish(acc, "Stage 118 -- hllint autofix mode (--fix / --diff)")
+}

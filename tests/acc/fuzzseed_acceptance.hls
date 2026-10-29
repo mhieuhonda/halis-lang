@@ -1,0 +1,1016 @@
+# ============================================================================
+# tests/acc/fuzzseed_acceptance.hls — Stage 134 acceptance gate, in Halis
+# (the Halis twin of tests/fuzzseed_acceptance.py; same eight sections,
+# same assertions, same needles — the harness is tests/acc/harness.hls
+# and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make fuzzseed-acceptance` (which compiles this file and runs
+# it from the repo root).
+#
+# Eight sections over the REAL seeder CLI (tools/hls-fuzzseed.py), the
+# REAL parser and checker (boot.py), the REAL native backend (bin/hlc),
+# the REAL fuzzer (tools/hls-fuzz.py), and a scratch package cache laid
+# out exactly as hls-pkg lays a downloaded dependency out — populated
+# from tests/fuzzseed_pkg/ (pure_math, geom, list_ops, spin, crashy,
+# broken, impure_fs, impure_clock, externish, struct_param, shape, plus
+# the twin.demo identity package).
+#
+# The battery drove the tool's module internals in-process exactly
+# twice: fzz.purity_verdict(...) (section 4, the deny tables
+# re-applied) and fzz.MUTATION_OPS (section 7, the drop-counter
+# vocabulary). The gate runs those two reaches as a tiny python3
+# driver (scratch/driver_fzz.py) it writes into its scratch world —
+# the battery's own code, verbatim, in a child process. Every seed and
+# mutant re-verification goes through the front door:
+# `boot.py --check` IS parse + check.
+#
+#  1. the convention  — the CLI exits 0 on a green corpus, 2 on a
+#                       usage error; --json is machine-parseable and
+#                       names the tool, the result and the stamp law
+#  2. the harvest law — the cache layout walked as hls-pkg writes it;
+#                       provenance labels read pkg:<name>/...;
+#                       --no-in-tree keeps the run on the packages;
+#                       a file that does not parse is a NAMED skip
+#  3. the harness law — every seed re-verifies through the REAL
+#                       pipeline (boot.py --check) and carries the
+#                       fixed harness shape; the synthesis refusal is
+#                       named (area_of_rect / area_of) and never leaks
+#  4. the purity law  — now_label dies naming clock_ms; the declared
+#                       Fs world dies as loudly; the gate's corpus is
+#                       re-gated text-level; a machine probe
+#                       (isatty) is refused by name
+#  5. the identity    — the twin package lands ONCE, with BOTH
+#     law               provenances in the manifest
+#  6. the census law  — the ranked order is non-increasing; the
+#                       expected entry names are all present; the
+#                       method closure is exact, not greedy
+#  7. the mutation    — every surviving mutant re-checks; lineage
+#     law               names op and parent; drop keys are the tool's
+#                       op vocabulary; --keep-timeouts lifts the hang
+#                       refusal and the manifest says so
+#  8. the differential— every seed and mutant runs on BOTH backends,
+#     & the fuzzer       stdout bytes and exit codes identical; crashy
+#                       lands as 101 on both; the seeded fuzzer runs
+#                       the corpus green; --minimize returns a clean
+#                       seed unchanged
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.json"
+import "std.result"
+
+# ----------------------------------------------------------------------------
+# The gate's constants (the battery's).
+# ----------------------------------------------------------------------------
+
+fn pkg_src() -> str {
+    return "tests/fuzzseed_pkg/src"
+}
+
+fn pkg_manifest() -> str {
+    return "tests/fuzzseed_pkg/hls-pkg.toml"
+}
+
+fn fzz() -> str {
+    return "tools/hls-fuzzseed.py"
+}
+
+fn fuzz() -> str {
+    return "tools/hls-fuzz.py"
+}
+
+fn hlc_bin() -> str {
+    return "bin/hlc"
+}
+
+struct Ctx {
+    cache: str,
+    corpus: str,
+    corpus_kt: str,
+    corpus_probe: str
+}
+
+# DiffRun — the native half of a differential pair.
+struct DiffRun {
+    built: bool,
+    out: str,
+    rc: int,
+    err: str
+}
+
+# ----------------------------------------------------------------------------
+# The battery's [PASS]/[FAIL] grammar.
+# ----------------------------------------------------------------------------
+
+fn ok(acc: Acc, label: str) -> void uses IO {
+    acc.pass = acc.pass + 1
+    println("  [PASS] " + label)
+}
+
+fn bad(acc: Acc, label: str, detail: str) -> void uses IO {
+    acc.fail = acc.fail + 1
+    if detail == "" {
+        println("  [FAIL] " + label)
+    } else {
+        println("  [FAIL] " + label + ": " + detail)
+    }
+}
+
+fn chk(acc: Acc, label: str, cond: bool, detail: str) -> bool uses IO {
+    if cond {
+        ok(acc, label)
+    } else {
+        bad(acc, label, detail)
+    }
+    return cond
+}
+
+# ----------------------------------------------------------------------------
+# JSON accessors — the battery's dict/get idioms, null-safe end to end.
+# ----------------------------------------------------------------------------
+
+fn parse_json(text: str) -> JsonValue {
+    let rr: Result[JsonValue, str] = json_parse_result(text)
+    if result_is_ok(rr) {
+        return result_unwrap(rr)
+    }
+    return json_null()
+}
+
+fn jget(v: JsonValue, key: str) -> JsonValue {
+    return json_object_get(v, key)
+}
+
+fn jstr(v: JsonValue, key: str) -> str {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_str(x) {
+        return json_str_value(x)
+    }
+    return ""
+}
+
+fn jint(v: JsonValue, key: str) -> int {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_int(x) {
+        return json_int_value(x)
+    }
+    return 0
+}
+
+fn el_str(v: JsonValue) -> str {
+    if json_is_str(v) {
+        return json_str_value(v)
+    }
+    return ""
+}
+
+fn keys_of(v: JsonValue) -> list[str] {
+    let out: list[str] = []
+    if json_is_object(v) {
+        let mut i: int = 0
+        while i < v.obj_keys.len() {
+            out.push(v.obj_keys.get(i))
+            i = i + 1
+        }
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# Small text helpers.
+# ----------------------------------------------------------------------------
+
+fn first_seg(s: str) -> str {
+    let at: int = s.find("/")
+    if at > 0 {
+        return s.slice(0, at)
+    }
+    return s
+}
+
+fn pname_of(param: str) -> str {
+    let at: int = param.find(":")
+    if at > 0 {
+        return param.slice(0, at).trim()
+    }
+    return param.trim()
+}
+
+# find_from(text, needle, from) — Python's str.find(needle, start):
+# the first index at or after `from`, or -1.
+fn find_from(text: str, needle: str, from: int) -> int {
+    let tail: str = text.slice(from, text.len())
+    let at: int = tail.find(needle)
+    if at < 0 {
+        return -1
+    }
+    return from + at
+}
+
+# concat field `field` of every element of a JSON array of objects.
+fn concat_field(arr: JsonValue, field: str) -> str {
+    let mut out: str = ""
+    if json_is_array(arr) {
+        let mut i: int = 0
+        while i < arr.arr.len() {
+            out = out + " " + jstr(arr.arr.get(i), field)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn contains_int(xs: list[str], want: str) -> bool {
+    let mut i: int = 0
+    while i < xs.len() {
+        if xs.get(i) == want {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# ----------------------------------------------------------------------------
+# The seeder CLI, as the battery addresses it.
+# ----------------------------------------------------------------------------
+
+fn seed_cli(ctx: Ctx, extra: list[str], out: str) -> RunResult uses Proc {
+    let argv: list[str] = ["tools/hls-fuzzseed.py", "--pkg-cache", ctx.cache,
+        "--no-in-tree", "--out", out, "--seed", "134",
+        "--smoke-timeout", "3", "--quiet"]
+    let mut i: int = 0
+    while i < extra.len() {
+        argv.push(extra.get(i))
+        i = i + 1
+    }
+    return run_capture("python3", argv)
+}
+
+# build_scratch_cache — lay the fixture package out exactly as
+# hls-pkg's resolve_dependency does: <cache>/<dep-name>/<repo-hash>/...,
+# plus the twin package (pure_math re-read through a comment banner)
+# for the identity law.
+fn build_scratch_cache(ctx: Ctx) -> void uses IO, Fs, Proc {
+    mkdirs(ctx.cache)
+    let names: list[str] = ["fuzzseed.demo", "twin.demo"]
+    let digests: list[str] = ["0123456789abcdef", "fedcba9876543210"]
+    let mut i: int = 0
+    while i < names.len() {
+        let pkg: str = path_join3(path_join3(ctx.cache, names.get(i)),
+            digests.get(i))
+        mkdirs(path_join3(pkg, "src"))
+        cp(pkg_manifest(), path_join3(pkg, "hls-pkg.toml"))
+        let src_dir: str = path_join3(pkg, "src")
+        if names.get(i) == "fuzzseed.demo" {
+            let entries: list[str] = fs_read_dir(pkg_src())
+            let mut e: int = 0
+            while e < entries.len() {
+                let f: str = entries.get(e)
+                if f.ends_with(".hls") {
+                    cp(path_join3(pkg_src(), f), path_join3(src_dir, f))
+                }
+                e = e + 1
+            }
+        } else {
+            let text: str = read_file(path_join3(pkg_src(), "pure_math.hls"))
+            let twin: str = ("# twin.demo — the identity law's twin: the SAME\n"
+                + "# functions behind a different comment banner and\n"
+                + "# different spacing. The digest is the function,\n"
+                + "# not the file.\n\n\n" + str_replace(text, "    ", "        "))
+            write_file(path_join3(src_dir, "twin.hls"), twin)
+        }
+        i = i + 1
+    }
+}
+
+# interp_native — (stdout bytes, exit code) on the native backend via
+# bin/hlc. built=false carries the build failure text.
+fn interp_native(src_path: str, tmpdir: str) -> DiffRun uses IO, Proc {
+    let out_c: str = path_join3(tmpdir, "out.c")
+    let out_bin: str = path_join3(tmpdir, "out.bin")
+    if !file_exists(hlc_bin()) {
+        return DiffRun { built: false, out: "", rc: -1,
+            err: "bin/hlc missing (the battery would make bootstrap; "
+                + "the gate must not run make)" }
+    }
+    let p1: RunResult = run_capture(hlc_bin(), [src_path, out_c])
+    if p1.code != 0 {
+        return DiffRun { built: false, out: "", rc: -1, err: p1.combined }
+    }
+    let p2: RunResult = run_capture("gcc",
+        ["-O2", "-o", out_bin, out_c, "-lm", "-pthread"])
+    if p2.code != 0 {
+        return DiffRun { built: false, out: "", rc: -1, err: p2.combined }
+    }
+    let p3: RunResult = run_capture(out_bin, [])
+    return DiffRun { built: true, out: p3.combined, rc: p3.code, err: "" }
+}
+
+# interp_only — the interpreter half: stdout bytes and exit code.
+fn interp_only(acc: Acc, src_path: str) -> RunResult uses Proc {
+    return boot(acc, [src_path])
+}
+
+# ----------------------------------------------------------------------------
+# The python3 driver: the battery's two in-process reaches
+# (purity_verdict, MUTATION_OPS), verbatim, in a child process.
+# ----------------------------------------------------------------------------
+
+fn driver_src() -> str {
+    return "# driver_fzz.py — the fuzzseed battery's in-process reaches,\n" +
+        "# driven by the native gate through argv. Modes:\n" +
+        "#   puritytext SRC | purityfile PATH | ops\n" +
+        "import sys, os\n" +
+        "ROOT = os.getcwd()\n" +
+        "sys.path.insert(0, ROOT)\n" +
+        "import importlib.util\n" +
+        "spec = importlib.util.spec_from_file_location('fzz_gate',\n" +
+        "                                              'tools/hls-fuzzseed.py')\n" +
+        "fzz = importlib.util.module_from_spec(spec)\n" +
+        "spec.loader.exec_module(fzz)\n" +
+        "mode = sys.argv[1]\n" +
+        "try:\n" +
+        "    if mode == 'puritytext':\n" +
+        "        elig, why = fzz.purity_verdict(sys.argv[2])\n" +
+        "        print('eligible=%d' % int(elig))\n" +
+        "        print('reason=%s' % ('' if why is None else why))\n" +
+        "    elif mode == 'purityfile':\n" +
+        "        with open(sys.argv[2]) as f:\n" +
+        "            text = f.read()\n" +
+        "        elig, why = fzz.purity_verdict(text)\n" +
+        "        print('eligible=%d' % int(elig))\n" +
+        "        print('reason=%s' % ('' if why is None else why))\n" +
+        "    elif mode == 'ops':\n" +
+        "        print('ops=%s' % ','.join(fzz.MUTATION_OPS))\n" +
+        "except Exception as ex:\n" +
+        "    print('error=%s' % ex)\n"
+}
+
+fn value_after(out: str, prefix: str) -> str {
+    let lines: list[str] = out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).starts_with(prefix) {
+            return lines.get(i).slice(prefix.len(), lines.get(i).len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# ----------------------------------------------------------------------------
+# 1. the convention
+# ----------------------------------------------------------------------------
+fn sec1(acc: Acc, ctx: Ctx) -> void uses IO, Fs, Proc {
+    section("1. the convention")
+    # usage errors: a bad limit, and a --pkg-cache that is not there
+    let p: RunResult = run_capture("python3", [fzz(), "--limit", "-3"])
+    chk(acc, "a negative --limit is a usage error (exit 2)", p.code == 2,
+        clip(p.combined, 90))
+    chk(acc, "the usage refusal names the rule: " + clip(p.combined.trim(), 60),
+        p.combined.contains("usage error"), "")
+    let p2: RunResult = run_capture("python3",
+        [fzz(), "--pkg-cache", path_join3(acc.scratch_base, "not-there")])
+    chk(acc, "a missing --pkg-cache is a refusal (exit 2)", p2.code == 2, "")
+    chk(acc, "the missing-source refusal names the directory",
+        p2.combined.contains("does not exist"), "")
+
+    # the green convention: exit 0, manifest written, stamp law
+    build_scratch_cache(ctx)
+    let p3: RunResult = seed_cli(ctx,
+        ["--limit", "24", "--mutate", "1"], ctx.corpus)
+    chk(acc, "the default gate run exits 0 (green)", p3.code == 0,
+        clip(p3.combined, 120))
+    let man: JsonValue = parse_json(read_file(path_join3(ctx.corpus,
+        "manifest.json")))
+    chk(acc, "no wall-clock in the manifest by default (reproducible)",
+        json_is_null(jget(man, "stamp")), "")
+    let mut digests_a: list[str] = []
+    let seeds_a: JsonValue = jget(man, "seeds")
+    let mut ai: int = 0
+    while ai < seeds_a.arr.len() {
+        digests_a.push(jstr(seeds_a.arr.get(ai), "digest"))
+        ai = ai + 1
+    }
+    let p4: RunResult = seed_cli(ctx,
+        ["--limit", "24", "--mutate", "1", "--stamp", "2026-10-13T00:00:00Z"],
+        ctx.corpus)
+    let man2: JsonValue = parse_json(read_file(path_join3(ctx.corpus,
+        "manifest.json")))
+    chk(acc, "--stamp records exactly what was given",
+        p4.code == 0 && jstr(man2, "stamp") == "2026-10-13T00:00:00Z", "")
+
+    # --json is machine-parseable and names the result
+    let p5: RunResult = seed_cli(ctx,
+        ["--limit", "4", "--mutate", "0", "--json"], ctx.corpus)
+    chk(acc, "--json run exits 0", p5.code == 0, clip(p5.combined, 90))
+    let doc: JsonValue = parse_json(p5.out)
+    chk(acc, "--json names the result green", jstr(doc, "result") == "green", "")
+    chk(acc, "--json names the tool: " + clip(jstr(doc, "tool"), 40),
+        jstr(doc, "tool").contains("hls-fuzzseed"), "")
+    chk(acc, "--json echoes the configuration",
+        jint(doc, "limit") == 4 && jint(doc, "mutate") == 0, "")
+
+    # determinism: the same tree, the same seed, the same corpus
+    let p6: RunResult = seed_cli(ctx,
+        ["--limit", "24", "--mutate", "1"], ctx.corpus)
+    let man_b: JsonValue = parse_json(read_file(path_join3(ctx.corpus,
+        "manifest.json")))
+    let seeds_b: JsonValue = jget(man_b, "seeds")
+    let mut same: bool = p6.code == 0 && seeds_a.arr.len() == seeds_b.arr.len()
+    let mut bi: int = 0
+    while bi < seeds_b.arr.len() && bi < digests_a.len() {
+        if jstr(seeds_b.arr.get(bi), "digest") != digests_a.get(bi) {
+            same = false
+        }
+        bi = bi + 1
+    }
+    chk(acc, "two runs of the same tree and seed agree on the corpus", same, "")
+}
+
+# ----------------------------------------------------------------------------
+# 2. the harvest law
+# ----------------------------------------------------------------------------
+fn sec2(acc: Acc, ctx: Ctx) -> void uses IO, Fs {
+    section("2. the harvest law")
+    let man: JsonValue = parse_json(read_file(path_join3(ctx.corpus,
+        "manifest.json")))
+    let seeds: JsonValue = jget(man, "seeds")
+    chk(acc, "the package cache yields a non-empty corpus",
+        json_is_array(seeds) && seeds.arr.len() > 0, "")
+    let mut labels: list[str] = []
+    let mut in_pkg: bool = false
+    let mut i: int = 0
+    while i < seeds.arr.len() {
+        let s: JsonValue = seeds.arr.get(i)
+        let sources: JsonValue = jget(s, "sources")
+        if json_is_array(sources) {
+            let mut j: int = 0
+            while j < sources.arr.len() {
+                let src: str = el_str(sources.arr.get(j))
+                let label: str = first_seg(src)
+                if !contains_int(labels, label) {
+                    labels.push(label)
+                }
+                if src.contains("/fuzzseed.demo/") {
+                    in_pkg = true
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    chk(acc, "provenance labels read pkg:<cache-root> (no in-tree leak "
+            + "under --no-in-tree): " + str_join(labels, ", "),
+        labels.len() == 1 && labels.get(0) == "pkg:cache", "")
+    chk(acc, "the cache layout <name>/<hash>/... is walked to the files",
+        in_pkg, "")
+
+    # the parse refusal is named, never a crash
+    let skip_text: str = concat_field(jget(man, "skips"), "reason")
+    chk(acc, "broken.hls's parse error is a named skip with the parser's "
+            + "own words",
+        skip_text.contains("expected identifier but got '{'"), "")
+    let stats: JsonValue = jget(man, "stats")
+    chk(acc, "exactly one file failed to parse (broken.hls)",
+        jint(stats, "files_unparsed") == 1, "")
+    chk(acc, "all 12 fixture files were seen (11 modules + the twin)",
+        jint(stats, "files_seen") == 12, "")
+}
+
+# ----------------------------------------------------------------------------
+# 3. the harness law
+# ----------------------------------------------------------------------------
+fn sec3(acc: Acc, ctx: Ctx) -> void uses IO, Fs, Proc {
+    section("3. the harness law")
+    let man: JsonValue = parse_json(read_file(path_join3(ctx.corpus,
+        "manifest.json")))
+    let seeds: JsonValue = jget(man, "seeds")
+    let mut names: list[str] = []
+    let mut i: int = 0
+    while i < seeds.arr.len() {
+        names.push(jstr(seeds.arr.get(i), "fn"))
+        i = i + 1
+    }
+    let wants: list[str] = ["gcd", "isqrt", "lerp", "clamp3", "sum_list",
+        "reverse_strs", "contains_int", "second_of", "make_circle",
+        "perimeter_of_demo", "scale_x_len", "crashy"]
+    let mut w: int = 0
+    while w < wants.len() {
+        chk(acc, "seed present for fn '" + wants.get(w) + "'",
+            contains_int(names, wants.get(w)), "")
+        w = w + 1
+    }
+
+    # every seed independently re-verifies through the REAL pipeline
+    let mut rechecked: int = 0
+    let mut shape_ok: bool = true
+    let mut si: int = 0
+    while si < seeds.arr.len() {
+        let s: JsonValue = seeds.arr.get(si)
+        let sfile: str = jstr(s, "file")
+        let sfn: str = jstr(s, "fn")
+        let path: str = path_join3(ctx.corpus, sfile)
+        let r: RunResult = boot_check(acc, path)
+        if r.code == 0 {
+            rechecked = rechecked + 1
+        } else {
+            shape_ok = false
+            bad(acc, "seed " + sfile + " fails the real checker: "
+                + first_line(r.combined), "")
+        }
+        let text: str = read_file(path)
+        if !text.contains("fn main() -> int uses IO {") {
+            shape_ok = false
+            bad(acc, "seed " + sfile + " missing the harness main shape", "")
+        }
+        # param lets precede the call: every param summary name appears
+        # in a let before the first call of the fn
+        let main_at: int = text.find("fn main")
+        let call_at: int = find_from(text, sfn + "(", main_at)
+        if call_at < 0 {
+            shape_ok = false
+            bad(acc, "seed " + sfile + ": fn '" + sfn
+                + "' is never called in the harness", "")
+        }
+        let params: JsonValue = jget(s, "params")
+        if json_is_array(params) {
+            let mut pi: int = 0
+            while pi < params.arr.len() {
+                let pname: str = pname_of(el_str(params.arr.get(pi)))
+                let let_at: int = find_from(text, "let " + pname + ": ", main_at)
+                if let_at < 0 || (call_at >= 0 && let_at > call_at) {
+                    shape_ok = false
+                    bad(acc, "seed " + sfile + ": param '" + pname
+                        + "' not corner-valued before the call", "")
+                }
+                pi = pi + 1
+            }
+        }
+        if !text.slice(text.find("fn main"), text.len()).contains("return 0") {
+            shape_ok = false
+            bad(acc, "seed " + sfile + " missing 'return 0'", "")
+        }
+        si = si + 1
+    }
+    chk(acc, "all " + seeds.arr.len().to_str()
+            + " seeds re-verify through parse+check and carry the "
+            + "harness shape",
+        shape_ok && rechecked == seeds.arr.len(), "")
+
+    # the synthesis refusal is named
+    let skip_text: str = concat_field(jget(man, "skips"), "fn") + " "
+        + concat_field(jget(man, "skips"), "reason")
+    chk(acc, "area_of_rect refused by name: custom struct parameters have "
+            + "no invented value",
+        skip_text.contains("area_of_rect")
+            && skip_text.contains("no synthesizable literal"), "")
+    chk(acc, "area_of refused too (a custom enum parameter)",
+        skip_text.contains("area_of"), "")
+    # ...and the refusal never leaks into the corpus
+    let mut corpus_text: str = ""
+    let mut ci: int = 0
+    while ci < seeds.arr.len() {
+        corpus_text = corpus_text + read_file(path_join3(ctx.corpus,
+            jstr(seeds.arr.get(ci), "file")))
+        ci = ci + 1
+    }
+    chk(acc, "no refused fn definition leaks into any harness",
+        !corpus_text.contains("fn area_of_rect"), "")
+}
+
+# ----------------------------------------------------------------------------
+# 4. the purity law
+# ----------------------------------------------------------------------------
+fn sec4(acc: Acc, ctx: Ctx, driver: str) -> void uses IO, Fs, Proc {
+    section("4. the purity law")
+    let man: JsonValue = parse_json(read_file(path_join3(ctx.corpus,
+        "manifest.json")))
+    let skip_text: str = concat_field(jget(man, "skips"), "fn") + " "
+        + concat_field(jget(man, "skips"), "reason")
+    chk(acc, "now_label refused naming the DECLARED Clock effect (the "
+            + "declaration law runs before the text-level table)",
+        skip_text.contains("now_label") && skip_text.contains("'Clock'"), "")
+    let pv: RunResult = run_capture("python3",
+        [driver, "puritytext", "fn f() -> int { return clock_ms() }\n"])
+    chk(acc, "the text-level deny table names clock_ms on its own: "
+            + value_after(pv.out, "reason="),
+        pv.code == 0 && value_after(pv.out, "eligible=") == "0"
+            && value_after(pv.out, "reason=").contains("clock_ms"),
+        clip(pv.combined, 120))
+    chk(acc, "file_touch_count refused naming the DECLARED Fs effect",
+        skip_text.contains("file_touch_count") && skip_text.contains("Fs"), "")
+    chk(acc, "shout refused naming the import it needs (std.str)",
+        skip_text.contains("shout") && skip_text.contains("std.str"), "")
+
+    # every seed passes the same deny tables the tool claims to apply
+    let seeds: JsonValue = jget(man, "seeds")
+    let mut all_clean: bool = true
+    let mut i: int = 0
+    while i < seeds.arr.len() {
+        let s: JsonValue = seeds.arr.get(i)
+        let path: str = path_join3(ctx.corpus, jstr(s, "file"))
+        let r: RunResult = run_capture("python3", [driver, "purityfile", path])
+        if r.code != 0 || value_after(r.out, "eligible=") != "1" {
+            all_clean = false
+            bad(acc, "seed " + jstr(s, "file")
+                + " violates the purity gate: "
+                + value_after(r.out, "reason="), "")
+        }
+        i = i + 1
+    }
+    chk(acc, "every emitted seed passes the tool's own purity gate, "
+            + "re-applied here", all_clean, "")
+
+    # the seed-specific rows: a machine probe is refused by name
+    let probe_pkg: str = path_join3(path_join3(
+        path_join3(ctx.cache, "probe.demo"), "0000000000000000"), "src")
+    mkdirs(probe_pkg)
+    write_file(path_join3(probe_pkg, "probe.hls"),
+        "# probe.hls — a machine-dependent builtin\n"
+        + "fn probe_tty() -> bool {\n"
+        + "    return isatty(0)\n"
+        + "}\n")
+    let p: RunResult = seed_cli(ctx,
+        ["--limit", "40", "--mutate", "0", "--json"], ctx.corpus_probe)
+    let doc: JsonValue = parse_json(p.out)
+    let st: str = concat_field(jget(doc, "skips"), "fn") + " "
+        + concat_field(jget(doc, "skips"), "reason")
+    chk(acc, "isatty refused by name (the seed-specific deny rows are "
+            + "live, each reason named)", st.contains("isatty"), "")
+    sh("rm -f '" + path_join3(probe_pkg, "probe.hls") + "'")
+}
+
+# ----------------------------------------------------------------------------
+# 5. the identity law
+# ----------------------------------------------------------------------------
+fn sec5(acc: Acc, ctx: Ctx) -> void uses IO, Fs {
+    section("5. the identity law")
+    let man: JsonValue = parse_json(read_file(path_join3(ctx.corpus,
+        "manifest.json")))
+    let seeds: JsonValue = jget(man, "seeds")
+    let mut names: list[str] = []
+    let mut unique: bool = true
+    let mut merged: int = 0
+    let mut i: int = 0
+    while i < seeds.arr.len() {
+        let s: JsonValue = seeds.arr.get(i)
+        let n: str = jstr(s, "fn")
+        if contains_int(names, n) {
+            unique = false
+        }
+        names.push(n)
+        let sources: JsonValue = jget(s, "sources")
+        if json_is_array(sources) && sources.arr.len() >= 2 {
+            merged = merged + 1
+        }
+        i = i + 1
+    }
+    chk(acc, "no function appears twice in the corpus (digest identity)",
+        unique, "")
+    chk(acc, "the twin's functions merged: " + merged.to_str()
+            + " seeds carry >=2 provenances", merged >= 4, "")
+    let mut gcd_seen: int = 0
+    let mut gcd_ok: bool = false
+    let mut j: int = 0
+    while j < seeds.arr.len() {
+        let s: JsonValue = seeds.arr.get(j)
+        if jstr(s, "fn") == "gcd" {
+            gcd_seen = gcd_seen + 1
+            let sources: JsonValue = jget(s, "sources")
+            if json_is_array(sources) && sources.arr.len() == 2 {
+                let mut k: int = 0
+                while k < sources.arr.len() {
+                    if el_str(sources.arr.get(k)).contains("twin.demo") {
+                        gcd_ok = true
+                    }
+                    k = k + 1
+                }
+            }
+        }
+        j = j + 1
+    }
+    chk(acc, "gcd names BOTH packages in its provenance (fuzzseed.demo + "
+            + "twin.demo)", gcd_seen == 1 && gcd_ok, "")
+}
+
+# ----------------------------------------------------------------------------
+# 6. the census law
+# ----------------------------------------------------------------------------
+fn sec6(acc: Acc, ctx: Ctx) -> void uses IO, Fs {
+    section("6. the census law")
+    let man: JsonValue = parse_json(read_file(path_join3(ctx.corpus,
+        "manifest.json")))
+    let seeds: JsonValue = jget(man, "seeds")
+    let mut ordered: bool = true
+    let mut census_ok: bool = true
+    let mut i: int = 0
+    while i < seeds.arr.len() {
+        let s: JsonValue = seeds.arr.get(i)
+        if !json_is_object(jget(s, "census")) {
+            census_ok = false
+        }
+        if i + 1 < seeds.arr.len() {
+            let next: JsonValue = seeds.arr.get(i + 1)
+            if jint(s, "score") < jint(next, "score") {
+                ordered = false
+            }
+        }
+        i = i + 1
+    }
+    chk(acc, "the manifest's seed order is non-increasing in rank score",
+        ordered, "")
+    chk(acc, "every seed records its census (the rank is auditable)",
+        census_ok, "")
+
+    let mut scale: JsonValue = json_null()
+    let mut scale_n: int = 0
+    let mut si: int = 0
+    while si < seeds.arr.len() {
+        let s: JsonValue = seeds.arr.get(si)
+        if jstr(s, "fn") == "scale_x_len" {
+            scale = s
+            scale_n = scale_n + 1
+        }
+        si = si + 1
+    }
+    chk(acc, "scale_x_len seeded exactly once", scale_n == 1, "")
+    if scale_n == 1 {
+        let text: str = read_file(path_join3(ctx.corpus, jstr(scale, "file")))
+        chk(acc, "the method closure pulled in the Vec2 definition",
+            text.contains("struct Vec2 {"), "")
+        chk(acc, "the method closure pulled in the scale method body",
+            text.contains("fn scale(self: Vec2, k: float) -> Vec2 {"), "")
+        chk(acc, "scale_x_len outranks the scalar toys (census weight)",
+            jint(scale, "score") >= 5, "")
+    }
+
+    # the closure is exact, not greedy: a seed whose entry never calls
+    # the method never carries it
+    let mut leaked: bool = false
+    let mut li: int = 0
+    while li < seeds.arr.len() {
+        let s: JsonValue = seeds.arr.get(li)
+        let n: str = jstr(s, "fn")
+        if n == "gcd" || n == "isqrt" || n == "clamp3" || n == "sum_list" {
+            let text: str = read_file(path_join3(ctx.corpus, jstr(s, "file")))
+            if text.contains("fn scale(self") || text.contains("struct Vec2") {
+                leaked = true
+                bad(acc, n + "'s harness carries Vec2 machinery it never "
+                    + "demands", "")
+            }
+        }
+        li = li + 1
+    }
+    chk(acc, "no greedy closure leak into the scalar seeds", !leaked, "")
+}
+
+# ----------------------------------------------------------------------------
+# 7. the mutation law
+# ----------------------------------------------------------------------------
+fn sec7(acc: Acc, ctx: Ctx, driver: str) -> void uses IO, Fs, Proc {
+    section("7. the mutation law")
+    let man: JsonValue = parse_json(read_file(path_join3(ctx.corpus,
+        "manifest.json")))
+    let seeds: JsonValue = jget(man, "seeds")
+    let mut ops_seen: list[str] = []
+    let mut lineage_ok: bool = true
+    let mut parent_digests: list[str] = []
+    let mut parent_files: list[str] = []
+    let mut rechecked: int = 0
+    let mut i: int = 0
+    while i < seeds.arr.len() {
+        let s: JsonValue = seeds.arr.get(i)
+        parent_digests.push(jstr(s, "digest"))
+        parent_files.push(jstr(s, "file"))
+        i = i + 1
+    }
+    let mut si: int = 0
+    while si < seeds.arr.len() {
+        let s: JsonValue = seeds.arr.get(si)
+        let mutants: JsonValue = jget(s, "mutants")
+        if json_is_array(mutants) {
+            let mut mi: int = 0
+            while mi < mutants.arr.len() {
+                let m: JsonValue = mutants.arr.get(mi)
+                let op: str = jstr(m, "op")
+                if !contains_int(ops_seen, op) {
+                    ops_seen.push(op)
+                }
+                let parent: str = jstr(m, "parent")
+                let mut parent_known: bool = false
+                let mut di: int = 0
+                while di < parent_digests.len() {
+                    if parent_digests.get(di) == parent {
+                        parent_known = true
+                    }
+                    di = di + 1
+                }
+                if parent != jstr(s, "digest") || !parent_known {
+                    lineage_ok = false
+                    bad(acc, "mutant " + jstr(m, "file")
+                        + " has broken lineage", "")
+                }
+                let r: RunResult = boot_check(acc,
+                    path_join3(ctx.corpus, jstr(m, "file")))
+                if r.code == 0 {
+                    rechecked = rechecked + 1
+                } else {
+                    lineage_ok = false
+                    bad(acc, "mutant " + jstr(m, "file")
+                        + " fails the real checker: "
+                        + first_line(r.combined), "")
+                }
+                mi = mi + 1
+            }
+        }
+        si = si + 1
+    }
+    chk(acc, "all " + rechecked.to_str()
+            + " surviving mutants re-verify and carry valid lineage",
+        lineage_ok && rechecked > 0, "")
+    chk(acc, "at least one mutation op produced a mutant",
+        ops_seen.len() > 0, "")
+    let drops: JsonValue = jget(jget(man, "stats"), "mutant_drops_by_op")
+    let drop_keys: list[str] = keys_of(drops)
+    let rv: RunResult = run_capture("python3", [driver, "ops"])
+    let vocab: list[str] = value_after(rv.out, "ops=").split(",")
+    let mut keys_ok: bool = rv.code == 0
+    let mut ki: int = 0
+    while ki < drop_keys.len() {
+        if !contains_int(vocab, drop_keys.get(ki)) {
+            keys_ok = false
+        }
+        ki = ki + 1
+    }
+    chk(acc, "drop-counter keys are the tool's op vocabulary: "
+            + str_join(drop_keys, ", "), keys_ok, "")
+
+    # --keep-timeouts lifts the hang refusal, named in the manifest
+    let p: RunResult = seed_cli(ctx,
+        ["--limit", "40", "--mutate", "0", "--keep-timeouts"], ctx.corpus_kt)
+    let man_kt: JsonValue = parse_json(read_file(path_join3(ctx.corpus_kt,
+        "manifest.json")))
+    let seeds_kt: JsonValue = jget(man_kt, "seeds")
+    let mut spin_seen: int = 0
+    let mut spin_ok: bool = false
+    let mut ti: int = 0
+    while ti < seeds_kt.arr.len() {
+        let s: JsonValue = seeds_kt.arr.get(ti)
+        if jstr(s, "fn") == "spin_forever" {
+            spin_seen = spin_seen + 1
+            if jstr(s, "smoke") == "timeout" {
+                spin_ok = true
+            }
+        }
+        ti = ti + 1
+    }
+    chk(acc, "--keep-timeouts admits the hanging seed with smoke=timeout",
+        p.code == 0 && spin_seen == 1 && spin_ok, "")
+    let skip_text: str = concat_field(jget(man, "skips"), "fn") + " "
+        + concat_field(jget(man, "skips"), "reason")
+    chk(acc, "the default run REFUSED the hang by name (wasted fuzz time)",
+        skip_text.contains("spin_forever"), "")
+    let mut hang_in_corpus: bool = false
+    let mut ui: int = 0
+    while ui < seeds.arr.len() {
+        if jstr(seeds.arr.get(ui), "fn") == "spin_forever" {
+            hang_in_corpus = true
+        }
+        ui = ui + 1
+    }
+    chk(acc, "the default corpus contains no hanging seed", !hang_in_corpus, "")
+}
+
+# ----------------------------------------------------------------------------
+# 8. the differential & the fuzzer
+# ----------------------------------------------------------------------------
+fn sec8(acc: Acc, ctx: Ctx) -> void uses IO, Fs, Proc {
+    section("8. the differential & the fuzzer")
+    let man: JsonValue = parse_json(read_file(path_join3(ctx.corpus,
+        "manifest.json")))
+    let seeds: JsonValue = jget(man, "seeds")
+    let tmpdir: str = scratch(acc, "diff")
+    mkdirs(tmpdir)
+    let mut plan: list[str] = []
+    let mut i: int = 0
+    while i < seeds.arr.len() {
+        plan.push(jstr(seeds.arr.get(i), "file"))
+        let mutants: JsonValue = jget(seeds.arr.get(i), "mutants")
+        if json_is_array(mutants) {
+            let mut mi: int = 0
+            while mi < mutants.arr.len() {
+                plan.push(jstr(mutants.arr.get(mi), "file"))
+                mi = mi + 1
+            }
+        }
+        i = i + 1
+    }
+    let mut mismatch: list[str] = []
+    let mut panicked: list[str] = []
+    let mut pi: int = 0
+    while pi < plan.len() {
+        let rel: str = plan.get(pi)
+        let path: str = path_join3(ctx.corpus, rel)
+        let ir: RunResult = interp_only(acc, path)
+        let nr: DiffRun = interp_native(path, tmpdir)
+        if !nr.built {
+            mismatch.push(rel + ": native build failed: "
+                + clip(nr.err, 80))
+            pi = pi + 1
+            continue
+        }
+        if ir.combined != nr.out || ir.code != nr.rc {
+            mismatch.push(rel + ": rc " + ir.code.to_str() + "/"
+                + nr.rc.to_str() + " out " + clip(ir.combined, 40) + "/"
+                + clip(nr.out, 40))
+        }
+        if ir.code == 101 && nr.rc == 101 {
+            panicked.push(rel)
+        }
+        pi = pi + 1
+    }
+    chk(acc, "all " + plan.len().to_str()
+            + " corpus programs are byte-identical on interp and native",
+        mismatch.len() == 0, clip(str_join(mismatch, " | "), 140))
+    let mut mm: int = 0
+    while mm < mismatch.len() && mm < 5 {
+        println("     mismatch: " + mismatch.get(mm))
+        mm = mm + 1
+    }
+    let mut crashy_101: bool = false
+    let mut ci: int = 0
+    while ci < panicked.len() {
+        if panicked.get(ci).contains("crashy") {
+            crashy_101 = true
+        }
+        ci = ci + 1
+    }
+    chk(acc, "crashy's panic lands as 101 on BOTH sides (a panic is a "
+            + "legitimate observable)", crashy_101, "")
+
+    # the fuzzer, seeded: the corpus runs green with the seeded
+    # counter above zero and zero divergences
+    let p: RunResult = run_capture("python3",
+        [fuzz(), "--seed-corpus", ctx.corpus, "--seed-ratio", "1.0",
+         "--seed", "42", "--n", "6", "--time", "3600"])
+    chk(acc, "the seeded fuzzer exits 0 (no divergence)", p.code == 0,
+        clip(p.combined, 120))
+    chk(acc, "the seeded counter is above zero: "
+            + last_line(p.combined),
+        p.combined.contains("6 seeded"), "")
+    chk(acc, "zero divergences over the corpus",
+        p.combined.contains("0 diverge"), "")
+    # and the mixed ratio: both populations move
+    let p2: RunResult = run_capture("python3",
+        [fuzz(), "--seed-corpus", ctx.corpus, "--seed-ratio", "0.5",
+         "--seed", "43", "--n", "8", "--time", "3600"])
+    chk(acc, "the mixed-ratio run is green too",
+        p2.code == 0 && p2.combined.contains("0 diverge"), "")
+
+    # the minimiser locates its region by name: a clean seed comes
+    # back unchanged (headers and closure defs intact)
+    let seed_path: str = path_join3(ctx.corpus,
+        jstr(seeds.arr.get(0), "file"))
+    let before: str = read_file(seed_path)
+    let p3: RunResult = run_capture("python3", [fuzz(), "--minimize",
+        seed_path])
+    chk(acc, "--minimize on a clean seed returns it unchanged",
+        p3.code == 0 && p3.out.trim() == before.trim(),
+        clip(p3.combined, 120))
+}
+
+fn last_line(text: str) -> str {
+    let lines: list[str] = text.split("\n")
+    let mut i: int = lines.len() - 1
+    while i >= 0 {
+        let t: str = lines.get(i).trim()
+        if t != "" {
+            return t
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let acc: Acc = acc_new("fuzzseed")
+    let driver: str = write_src(acc, "driver_fzz.py", driver_src())
+    let ctx: Ctx = Ctx {
+        cache: scratch(acc, "cache"),
+        corpus: scratch(acc, "corpus"),
+        corpus_kt: scratch(acc, "corpus_kt"),
+        corpus_probe: scratch(acc, "corpus_probe")
+    }
+    sec1(acc, ctx)
+    sec2(acc, ctx)
+    sec3(acc, ctx)
+    sec4(acc, ctx, driver)
+    sec5(acc, ctx)
+    sec6(acc, ctx)
+    sec7(acc, ctx, driver)
+    sec8(acc, ctx)
+    return finish(acc, "Stage 134 -- fuzz corpus seeding from real-world packages")
+}

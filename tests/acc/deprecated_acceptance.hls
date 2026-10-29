@@ -1,0 +1,711 @@
+# ============================================================================
+# tests/acc/deprecated_acceptance.hls — Stage 130 acceptance gate, in Halis
+# (the Halis twin of tests/deprecated_acceptance.py; same eight
+# sections, same assertions, same needles — the harness is
+# tests/acc/harness.hls and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# The old battery's section 2 reached into the boot interpreter's
+# Python internals (tokenize/Parser) to read the AST's attribute
+# values; the gate asks the same questions through the front door:
+# the refusal shapes through `boot.py --check` (the same named errors
+# the parser raises), the attribute-carrying shapes through the
+# linter's own L013 wording (the AST value is what the warning
+# prints: the message form quoted, the bare form "(no deprecation
+# message given)", an un-attributed fn silent, escapes decoded).
+#
+#  1. the convention  — the three refusal fixtures fail BOTH
+#     and the refusals  front-ends with the same core message;
+#                       --list shows L013 without the [fixable] tag;
+#                       --strict exits 1
+#  2. the parse laws  — the notice the AST carries: bare -> "", the
+#                       message -> the decoded string, escapes decoded
+#                       exactly as the lexer decodes them, absent ->
+#                       no notice at all; a duplicate is a named parse
+#                       error; an extern fn refuses one; the
+#                       unknown-attribute message names `deprecated`
+#                       in the known list; a non-literal message is
+#                       refused, named
+#  3. the self-hosted — bin/hlc compiles the ok fixture; the emitted C
+#     parity             carries NO deprecation machinery (the only
+#                        `deprecated` substring is the fixture's own
+#                        string literal); the fixed point holds
+#  4. the lint:       — L013 on a same-file deprecated call: both
+#     same-file          forms, line precision, the live replacements
+#                        silent, a deprecated fn's own body silent;
+#                        --rule L013 filters; --strict exits 1
+#  5. the lint:       — the message quoted across an import; the
+#     cross-module       ambiguous-method silence; the unambiguous
+#                        method warning carries the `method` qualifier
+#  6. the honesty     — --fix leaves a deprecated-call file
+#     gates              byte-identical; hlfmt preserves both
+#                        attribute forms byte for byte; a
+#                        missing-module crate still lints, exit 0
+#  7. the differential— the ok fixture runs green on BOTH backends
+#                        with byte-identical (exit, stdout); its L013
+#                        census is exactly the five warnings the
+#                        fixture documents
+#  8. the corpus      — the fixture, its module sibling and the demo
+#     hygiene            are hlfmt-canonical and checker-clean; the
+#                        demo runs green carrying exactly its two
+#                        warnings; no gate litter survives
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+
+# ----------------------------------------------------------------------------
+# The gate's data.
+# ----------------------------------------------------------------------------
+
+fn showcase() -> str {
+    return "tests/ok/feat_stage130_deprecated.hls"
+}
+
+fn module_path() -> str {
+    return "tests/ok/modules/depmod.hls"
+}
+
+fn demo_path() -> str {
+    return "examples/deprecated_demo.hls"
+}
+
+fn fails_dir() -> str {
+    return "tests/fail"
+}
+
+# Section 1's refusal fixtures: (file name, the core message both
+# front-ends must agree on).
+fn refuse_names() -> list[str] {
+    return [
+        "fail_stage130_deprecated_nonstr.hls",
+        "fail_stage130_deprecated_dup.hls",
+        "fail_stage130_deprecated_let.hls",
+    ]
+}
+
+fn refuse_wants() -> list[str] {
+    return [
+        "deprecated expects a string literal message but got '42'",
+        "deprecated attribute appears more than once on one function",
+        "unknown let-binding attribute 'deprecated'",
+    ]
+}
+
+# The same-file lint probe (section 4), byte for byte as the battery
+# writes it — the pinned warning lines cite lines 28/29/30.
+fn same_file_src() -> str {
+    return "#[deprecated(\"use fast_path(v) — the old form double-counts zero\")]\n" +
+        "fn slow_path(v: int) -> int {\n" +
+        "    if v == 0 {\n" +
+        "        return 1\n" +
+        "    }\n" +
+        "    return v * 3\n" +
+        "}\n" +
+        "\n" +
+        "fn fast_path(v: int) -> int {\n" +
+        "    if v == 0 {\n" +
+        "        return 1\n" +
+        "    }\n" +
+        "    return v * 3\n" +
+        "}\n" +
+        "\n" +
+        "#[deprecated]\n" +
+        "fn legacy_name(v: int) -> int {\n" +
+        "    return v + 11\n" +
+        "}\n" +
+        "\n" +
+        "#[deprecated(\"temporary glue\")]\n" +
+        "fn old_chain(v: int) -> int {\n" +
+        "    # silent: the caller is deprecated too\n" +
+        "    return slow_path(v) + legacy_name(v)\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int uses IO {\n" +
+        "    let a: int = slow_path(3)\n" +
+        "    let b: int = legacy_name(4)\n" +
+        "    let c: int = old_chain(2)\n" +
+        "    let d: int = fast_path(3)\n" +
+        "    println((a + b + c + d).to_str())\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+fn cross_lib_src() -> str {
+    return "#[deprecated(\"use lib_new() — the old name leaks the seed\")]\n" +
+        "fn lib_old(x: int) -> int {\n" +
+        "    return x + 100\n" +
+        "}\n" +
+        "\n" +
+        "fn lib_new(x: int) -> int {\n" +
+        "    return x + 1\n" +
+        "}\n"
+}
+
+fn cross_app_src() -> str {
+    return "import \"lib.hls\"\n" +
+        "\n" +
+        "fn main() -> int uses IO {\n" +
+        "    println(lib_old(1).to_str())\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+fn amb_src() -> str {
+    return "struct Meter {\n" +
+        "    v: int,\n" +
+        "}\n" +
+        "\n" +
+        "struct Gauge {\n" +
+        "    v: int,\n" +
+        "}\n" +
+        "\n" +
+        "impl Meter {\n" +
+        "    #[deprecated(\"use Meter.read2\")]\n" +
+        "    fn read(m: Meter) -> int {\n" +
+        "        return m.v\n" +
+        "    }\n" +
+        "}\n" +
+        "\n" +
+        "impl Gauge {\n" +
+        "    fn read(g: Gauge) -> int {\n" +
+        "        return g.v\n" +
+        "    }\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int {\n" +
+        "    let m: Meter = Meter { v: 1 }\n" +
+        "    let g: Gauge = Gauge { v: 2 }\n" +
+        "    return m.read() + g.read()\n" +
+        "}\n"
+}
+
+fn uniq_src() -> str {
+    return "struct Meter {\n" +
+        "    v: int,\n" +
+        "}\n" +
+        "\n" +
+        "impl Meter {\n" +
+        "    #[deprecated(\"use Meter.read2\")]\n" +
+        "    fn read(m: Meter) -> int {\n" +
+        "        return m.v\n" +
+        "    }\n" +
+        "    fn read2(m: Meter) -> int {\n" +
+        "        return m.v\n" +
+        "    }\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int {\n" +
+        "    let m: Meter = Meter { v: 1 }\n" +
+        "    return m.read()\n" +
+        "}\n"
+}
+
+fn honest_src() -> str {
+    return "#[deprecated(\"use fast_path(v)\")]\n" +
+        "fn slow_path(v: int) -> int {\n" +
+        "    return v * 3\n" +
+        "}\n" +
+        "\n" +
+        "fn fast_path(v: int) -> int {\n" +
+        "    return v * 3\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int uses IO {\n" +
+        "    println(slow_path(3).to_str())\n" +
+        "    println(fast_path(4).to_str())\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+fn fmt_msg_src() -> str {
+    return "#[deprecated(\"use g — the old form mis-handles negatives\")]\n" +
+        "fn f(x: int) -> int {\n" +
+        "    return x+1\n" +
+        "}\n" +
+        "\n" +
+        "fn main() -> int {\n" +
+        "    return f(1)\n" +
+        "}\n"
+}
+
+fn fmt_bare_src() -> str {
+    return "#[deprecated]\nfn f(x: int) -> int {\n    return x\n}\n" +
+        "\nfn main() -> int {\n    return f(1)\n}\n"
+}
+
+fn miss_src() -> str {
+    return "#[deprecated]\nfn alone(v: int) -> int {\n    return v\n}\n"
+}
+
+fn broken_src() -> str {
+    return "import \"no_such_module.hls\"\n" +
+        "\n" +
+        "fn main() -> int {\n    return 0\n}\n"
+}
+
+# ----------------------------------------------------------------------------
+# Section 2's parse-law probes (front door: boot --check for the
+# refusal shapes, hllint's L013 wording for the carried values).
+# ----------------------------------------------------------------------------
+
+fn probe_bare() -> str {
+    return "#[deprecated]\nfn f() -> int { return 1 }\nfn main() -> int { return f() }\n"
+}
+
+fn probe_msg() -> str {
+    return "#[deprecated(\"use g — the old form mis-handles negatives\")]\n" +
+        "fn f() -> int { return 1 }\nfn main() -> int { return f() }\n"
+}
+
+fn probe_esc() -> str {
+    return "#[deprecated(\"line one\\nline two\")]\n" +
+        "fn f() -> int { return 1 }\nfn main() -> int { return f() }\n"
+}
+
+fn probe_absent() -> str {
+    return "fn f() -> int { return 1 }\nfn main() -> int { return f() }\n"
+}
+
+fn probe_dup() -> str {
+    return "#[deprecated(\"a\")]\n#[deprecated]\nfn f() -> int { return 1 }\nfn main() -> int { return f() }\n"
+}
+
+fn probe_extern() -> str {
+    return "extern \"C\" {\n    #[deprecated]\n    fn puts(s: str) -> int uses IO\n}\n" +
+        "fn main() -> int { return 0 }\n"
+}
+
+fn probe_nosuch() -> str {
+    return "#[nosuch]\nfn f() -> int { return 1 }\nfn main() -> int { return f() }\n"
+}
+
+fn probe_nonstr() -> str {
+    return "#[deprecated(42)]\nfn f() -> int { return 1 }\nfn main() -> int { return f() }\n"
+}
+
+# ----------------------------------------------------------------------------
+# Shared legs.
+# ----------------------------------------------------------------------------
+
+fn lint(args: list[str]) -> RunResult uses Proc {
+    let argv: list[str] = ["tools/hllint.py"]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    return run_capture("python3", argv)
+}
+
+# core(msg) — the message both front-ends must agree on: everything
+# after the last 'error: '/'syntax error: ' marker (the battery's own
+# normalisation, ported).
+fn core(msg: str) -> str {
+    let mut out: str = msg
+    let m1: str = "panic: syntax error: "
+    let m2: str = "compile error: "
+    let i1: int = out.find(m1)
+    if i1 >= 0 {
+        out = out.slice(i1 + m1.len(), out.len())
+    }
+    let i2: int = out.find(m2)
+    if i2 >= 0 {
+        out = out.slice(i2 + m2.len(), out.len())
+    }
+    return out.trim()
+}
+
+# tail_piece(name) — the battery's name.split("_")[-1].
+fn tail_piece(s: str) -> str {
+    let mut i: int = s.len() - 1
+    while i >= 0 {
+        if s.byte_at(i) == 95 {
+            return s.slice(i + 1, s.len())
+        }
+        i = i - 1
+    }
+    return s
+}
+
+# ----------------------------------------------------------------------------
+# 1. the convention and the refusals
+# ----------------------------------------------------------------------------
+fn sec1(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 1 — the convention and the refusals")
+    let names: list[str] = refuse_names()
+    let wants: list[str] = refuse_wants()
+    let native: bool = file_exists("bin/hlc") && which("gcc")
+    let mut i: int = 0
+    while i < names.len() {
+        let name: str = names.get(i)
+        let want: str = wants.get(i)
+        let path: str = fails_dir() + "/" + name
+        let p: RunResult = boot_check(acc, path)
+        check(acc, "boot rejects " + tail_piece(name) + " (" + want.slice(0, 40) + "...)",
+            p.code != 0 && p.combined.contains(want), clip(p.combined, 100))
+        if native {
+            let sink: str = scratch(acc, "refuse.c")
+            let p2: RunResult = run_capture("./bin/hlc", [path, sink])
+            check(acc, "hlc rejects " + tail_piece(name) + " with the same core message",
+                p2.code != 0 && core(p2.combined).contains(want), clip(p2.combined, 100))
+        }
+        i = i + 1
+    }
+    let pl: RunResult = lint(["--list"])
+    check(acc, "--list names L013 deprecated-call",
+        pl.out.contains("L013") && pl.out.contains("deprecated-call"), clip(pl.out, 90))
+    let lines: list[str] = pl.out.split("\n")
+    let mut l013_line: str = ""
+    let mut j: int = 0
+    while j < lines.len() {
+        if lines.get(j).contains("L013") {
+            l013_line = lines.get(j)
+            break
+        }
+        j = j + 1
+    }
+    check(acc, "L013 carries no [fixable] tag (the replacement is a design decision)",
+        l013_line != "" && !l013_line.contains("[fixable]"), clip(l013_line, 90))
+    let ps: RunResult = lint(["--strict", demo_path()])
+    check(acc, "--strict exits 1 on a deprecated call", ps.code == 1, "")
+}
+
+# ----------------------------------------------------------------------------
+# 2. the parse laws (the boot AST)
+# ----------------------------------------------------------------------------
+fn sec2(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 2 — the parse laws (the boot AST)")
+    # bare form: the notice exists with an empty message (L013 says so
+    # instead of inventing one).
+    let pb: str = write_src(acc, "laws/bare.hls", probe_bare())
+    let rb: RunResult = lint([pb])
+    check(acc, "the bare #[deprecated] carries an empty message",
+        rb.out.contains("warning [L013] call to deprecated 'f' (no deprecation message given)"),
+        clip(rb.out, 100))
+    # message form: the decoded literal is what the warning quotes.
+    let pm: str = write_src(acc, "laws/msg.hls", probe_msg())
+    let rm: RunResult = lint([pm])
+    check(acc, "the message form carries the decoded string",
+        rm.out.contains("call to deprecated 'f': use g — the old form mis-handles negatives"),
+        clip(rm.out, 100))
+    # escapes decode exactly as the lexer decodes them (the decoded
+    # newline reaches the warning text).
+    let pe: str = write_src(acc, "laws/esc.hls", probe_esc())
+    let re: RunResult = lint([pe])
+    check(acc, "message escapes decode with the lexer's own rules",
+        re.out.contains("call to deprecated 'f': line one\nline two"), clip(re.out, 100))
+    # absent: no notice at all (the AST reads None — nothing warns).
+    let pa: str = write_src(acc, "laws/absent.hls", probe_absent())
+    let ra: RunResult = lint([pa])
+    check(acc, "an un-attributed fn reads deprecated = None",
+        ra.out.contains("no warnings"), clip(ra.out, 60))
+    # duplicate: a named parse error.
+    let pd: str = write_src(acc, "laws/dup.hls", probe_dup())
+    let rd: RunResult = boot_check(acc, pd)
+    check(acc, "a duplicated notice is a parse error, named",
+        rd.code == 1 && rd.combined.contains("more than once"), clip(rd.combined, 100))
+    # externs never carry one (the parser rejects attrs in extern
+    # blocks: the C declaration is the contract).
+    let px: str = write_src(acc, "laws/extern.hls", probe_extern())
+    let rx: RunResult = boot_check(acc, px)
+    check(acc, "an extern declaration refuses the notice (the C declaration is the contract)",
+        rx.code == 1 && (rx.combined.contains("attribute") || rx.combined.contains("extern")),
+        clip(rx.combined, 100))
+    # the unknown-attribute message names deprecated among the known.
+    let pn: str = write_src(acc, "laws/nosuch.hls", probe_nosuch())
+    let rnn: RunResult = boot_check(acc, pn)
+    check(acc, "the unknown-attribute message lists deprecated as known",
+        rnn.code == 1 && rnn.combined.contains("deprecated"), clip(rnn.combined, 110))
+    # a non-string message is refused, named.
+    let pq: str = write_src(acc, "laws/nonstr.hls", probe_nonstr())
+    let rq: RunResult = boot_check(acc, pq)
+    check(acc, "a non-literal message is refused, named",
+        rq.code == 1 && rq.combined.contains("string literal"), clip(rq.combined, 100))
+}
+
+# ----------------------------------------------------------------------------
+# 3. the self-hosted parity
+# ----------------------------------------------------------------------------
+fn sec3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 3 — the self-hosted parity")
+    if !file_exists("bin/hlc") {
+        println("  (bin/hlc absent — the self-hosted sections are skipped, named, not silent)")
+        return
+    }
+    # The self-hosted compiler accepts the showcase...
+    let c_path: str = scratch(acc, "showcase.c")
+    let p: RunResult = run_capture("./bin/hlc", [showcase(), c_path])
+    check(acc, "hlc compiles the ok fixture", p.code == 0, clip(p.combined, 90))
+    # ...and the emitted C carries NO deprecation machinery: the only
+    # `deprecated` substring is the fixture's own string literal.
+    let c_src: str = read_or(c_path, "")
+    let lines: list[str] = c_src.split("\n")
+    let mut hits: int = 0
+    let mut first_hit: str = ""
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).contains("deprecated") {
+            hits = hits + 1
+            if hits == 1 {
+                first_hit = lines.get(i)
+            }
+        }
+        i = i + 1
+    }
+    check(acc, "zero codegen: the only deprecated substring is the fixture's own message literal",
+        hits == 1 && first_hit.contains("\"deprecated OK: \""),
+        hits.to_str() + " hit(s)")
+    # The fixed point: the compiler still compiles itself.
+    let c2: str = scratch(acc, "self.c")
+    let p2: RunResult = run_capture("./bin/hlc", ["src/hlc.hls", c2])
+    check(acc, "the self-hosted compiler re-compiles itself with the attribute code in place",
+        p2.code == 0, clip(p2.combined, 90))
+}
+
+# ----------------------------------------------------------------------------
+# 4. the lint: same-file
+# ----------------------------------------------------------------------------
+fn sec4(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 4 — the lint: same-file")
+    let path: str = write_src(acc, "same/app.hls", same_file_src())
+    let p: RunResult = lint([path])
+    let out: str = p.out
+    check(acc, "the message form warns with the message quoted, at its line",
+        out.contains("app.hls:28: warning [L013] call to deprecated 'slow_path': "
+            + "use fast_path(v) — the old form double-counts zero"), clip(out, 130))
+    check(acc, "the bare form warns without inventing a message",
+        out.contains("app.hls:29: warning [L013] call to deprecated 'legacy_name' "
+            + "(no deprecation message given)"), "")
+    check(acc, "exactly three call sites warn (the deprecated body stays silent; the live replacement never warns)",
+        str_count(out, "[L013]") == 3, str_count(out, "[L013]").to_str())
+    check(acc, "a called deprecated fn is not ALSO flagged unused (L002)",
+        !out.contains("[L002] function 'old_chain'"), "")
+    let pr: RunResult = lint(["--rule", "L013", path])
+    check(acc, "--rule L013 selects the deprecation walk alone",
+        str_count(pr.out, "[L013]") == 3 && !pr.out.contains("L002")
+            && !pr.out.contains("L001"), clip(pr.out, 90))
+    let ps: RunResult = lint(["--strict", path])
+    check(acc, "--strict exits 1 while the calls stand", ps.code == 1, "")
+}
+
+# ----------------------------------------------------------------------------
+# 5. the lint: cross-module and methods
+# ----------------------------------------------------------------------------
+fn sec5(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 5 — the lint: cross-module and methods")
+    let _lib: str = write_src(acc, "cross/lib.hls", cross_lib_src())
+    let app: str = write_src(acc, "cross/app.hls", cross_app_src())
+    let p: RunResult = lint([app])
+    check(acc, "a deprecation in an IMPORTED module warns in the importer, message quoted",
+        p.out.contains("app.hls:4: warning [L013] call to deprecated 'lib_old': "
+            + "use lib_new() — the old name leaks the seed"), clip(p.out, 120))
+    check(acc, "the warning names the linted file, never the module's own",
+        !str_replace(str_replace(p.out, "lib_old", ""), "lib_new", "").contains("lib.hls"),
+        clip(p.out, 60))
+    # Methods: the ambiguous case stays silent, the unique one warns.
+    let amb: str = write_src(acc, "cross/amb.hls", amb_src())
+    let pa: RunResult = lint([amb])
+    check(acc, "a method name with a live twin elsewhere stays SILENT (no receiver-type analysis means no lying)",
+        !pa.out.contains("[L013]"), clip(pa.out, 90))
+    let uniq: str = write_src(acc, "cross/uniq.hls", uniq_src())
+    let pu: RunResult = lint([uniq])
+    check(acc, "an unambiguous deprecated method warns with the `method` qualifier",
+        pu.out.contains("warning [L013] call to deprecated method 'read': use Meter.read2"),
+        clip(pu.out, 100))
+}
+
+# ----------------------------------------------------------------------------
+# 6. the honesty gates
+# ----------------------------------------------------------------------------
+fn sec6(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 6 — the honesty gates")
+    let path: str = write_src(acc, "honest/app.hls", honest_src())
+    # --fix must not touch it: L013 has no mechanical fix.
+    let p: RunResult = lint(["--fix", path])
+    let after: str = read_file(path)
+    check(acc, "--fix leaves a deprecated-call file byte-identical (L013 is not fixable)",
+        after == honest_src(), "")
+    check(acc, "the fix report never claims a deprecation was fixed",
+        !p.out.contains("fixed") || p.out.contains("fixed 0")
+            || !p.out.contains("no warnings"), clip(p.out, 90))
+    # hlfmt preserves both attribute forms byte for byte.
+    let fmtme: str = write_src(acc, "honest/fmt.hls", fmt_msg_src())
+    let _w1: RunResult = run_capture("./bin/hlfmt", ["-w", fmtme])
+    let src: str = read_file(fmtme)
+    check(acc, "hlfmt preserves the message form byte for byte",
+        src.contains("#[deprecated(\"use g — the old form mis-handles negatives\")]"), "")
+    write_file(fmtme, fmt_bare_src())
+    let _w2: RunResult = run_capture("./bin/hlfmt", ["-w", fmtme])
+    check(acc, "hlfmt preserves the bare form",
+        read_file(fmtme).starts_with("#[deprecated]\n"), clip(read_file(fmtme), 60))
+    # A missing-module crate: the fallback keeps the same-file
+    # registry alive (and never crashes).
+    let _miss: str = write_src(acc, "honest/miss.hls", miss_src())
+    let broken: str = write_src(acc, "honest/broken.hls", broken_src())
+    let pb: RunResult = lint([broken])
+    check(acc, "a crate that cannot load still lints (no crash, exit 0)", pb.code == 0, "")
+}
+
+# ----------------------------------------------------------------------------
+# 7. the differential and the pinned census
+# ----------------------------------------------------------------------------
+fn sec7(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 7 — the differential and the pinned census")
+    let p: RunResult = boot(acc, [showcase()])
+    let icmd: int = p.code
+    let iout: str = p.combined
+    check(acc, "the ok fixture runs green on the interpreter",
+        icmd == 0 && iout.contains("deprecated OK: 113"), clip(iout, 60))
+    if file_exists("bin/hlc") && which("gcc") {
+        let c_path: str = scratch(acc, "show.c")
+        let p2: RunResult = run_capture("./bin/hlc", [showcase(), c_path])
+        if p2.code == 0 {
+            let binp: str = scratch(acc, "show")
+            let r: RunResult = run_capture("gcc", ["-O2", "-o", binp, c_path, "-lm", "-pthread"])
+            if r.code == 0 {
+                let n: RunResult = run_capture(binp, [])
+                check(acc, "the ok fixture: interpreter == native, byte for byte",
+                    n.code == icmd && n.combined == iout,
+                    "rc " + icmd.to_str() + " vs " + n.code.to_str())
+            } else {
+                fail_msg(acc, "gcc failed on the emitted C")
+            }
+        } else {
+            fail_msg(acc, "hlc failed to compile the ok fixture")
+        }
+    } else {
+        println("  (bin/hlc absent — the native leg is skipped, named, not silent)")
+    }
+    # The pinned census: exactly the five warnings the fixture
+    # documents, byte for byte.
+    let pl: RunResult = lint([showcase()])
+    let lines: list[str] = pl.out.split("\n")
+    let mut census: str = ""
+    let mut count: int = 0
+    let mut others: int = 0
+    let mut i: int = 0
+    while i < lines.len() {
+        let ln: str = lines.get(i)
+        if ln.contains("[L013]") {
+            count = count + 1
+            census = census + ln + "\n"
+        } else if ln.contains("warning") {
+            others = others + 1
+        }
+        i = i + 1
+    }
+    check(acc, "the census: exactly five L013 warnings (three same-file, two cross-module)",
+        count == 5, count.to_str())
+    check(acc, "the census: the message form quoted",
+        census.contains("'slow_path': use fast_path(v) — the old form double-counts zero"), "")
+    check(acc, "the census: the bare form named",
+        census.contains("'legacy_name' (no deprecation message given)"), "")
+    check(acc, "the census: the cross-module notices fire in the importer",
+        census.contains("'depmod_slow': use depmod_fast(v)")
+            && census.contains("'depmod_legacy' (no deprecation message given)"), "")
+    check(acc, "the census: the deprecated wrapper's own call site warns from main",
+        census.contains("'old_chain': temporary glue; dies with the legacy surface"), "")
+    check(acc, "the census: nothing ELSE warns (no L001/L002 noise on the fixture)",
+        others == 0, others.to_str())
+}
+
+# ----------------------------------------------------------------------------
+# 8. the corpus hygiene
+# ----------------------------------------------------------------------------
+fn walk_baks(root: str) -> int uses Fs {
+    let mut count: int = 0
+    let mut dirs: list[str] = [root]
+    let mut i: int = 0
+    while i < dirs.len() {
+        let d: str = dirs.get(i)
+        let entries: list[str] = fs_read_dir(d)
+        let mut j: int = 0
+        while j < entries.len() {
+            let full: str = d + "/" + entries.get(j)
+            if fs_is_dir(full) {
+                dirs.push(full)
+            } else if entries.get(j).ends_with(".bak") {
+                count = count + 1
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return count
+}
+
+fn sec8(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 8 — the corpus hygiene")
+    let files: list[str] = [showcase(), module_path(), demo_path()]
+    let labels: list[str] = ["the ok fixture", "the module sibling", "the demo"]
+    let mut i: int = 0
+    while i < files.len() {
+        let p: RunResult = run_capture("./bin/hlfmt", ["--check", files.get(i)])
+        check(acc, labels.get(i) + " is hlfmt-canonical",
+            p.code == 0 && p.out.contains("already formatted"), clip(p.out, 80))
+        i = i + 1
+    }
+    let boots: list[str] = [showcase(), demo_path()]
+    let blabels: list[str] = ["the ok fixture", "the demo"]
+    let mut j: int = 0
+    while j < boots.len() {
+        let p: RunResult = boot_check(acc, boots.get(j))
+        check(acc, blabels.get(j) + " boots through the real checker",
+            p.out.contains("OK: types and effects valid"), clip(p.combined, 80))
+        j = j + 1
+    }
+    let p: RunResult = boot(acc, [demo_path()])
+    check(acc, "the demo runs green",
+        p.code == 0 && p.combined.contains("deprecated demo OK"), clip(p.combined, 80))
+    let pl: RunResult = lint([demo_path()])
+    let lines: list[str] = pl.out.split("\n")
+    let mut first: str = ""
+    let mut second: str = ""
+    let mut count: int = 0
+    let mut k: int = 0
+    while k < lines.len() {
+        if lines.get(k).contains("[L013]") {
+            count = count + 1
+            if count == 1 {
+                first = lines.get(k)
+            } else if count == 2 {
+                second = lines.get(k)
+            }
+        }
+        k = k + 1
+    }
+    check(acc, "the demo carries exactly its two documented warnings",
+        count == 2 && first.contains("shout") && second.contains("legacy_id"),
+        count.to_str())
+    # No gate litter.
+    let mut litter: int = 0
+    let roots: list[str] = [".", "tests"]
+    let mut m: int = 0
+    while m < roots.len() {
+        let entries: list[str] = fs_read_dir(roots.get(m))
+        let mut e: int = 0
+        while e < entries.len() {
+            if entries.get(e).starts_with("hls-deprecated-gate-") {
+                litter = litter + 1
+            }
+            e = e + 1
+        }
+        m = m + 1
+    }
+    check(acc, "no gate temp files survive in the repo", litter == 0, litter.to_str())
+    litter = litter + walk_baks("tests/ok")
+    check(acc, "no .bak litter anywhere in the corpus", litter == 0, litter.to_str())
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let acc: Acc = acc_new("deprecated")
+    sec1(acc)
+    sec2(acc)
+    sec3(acc)
+    sec4(acc)
+    sec5(acc)
+    sec6(acc)
+    sec7(acc)
+    sec8(acc)
+    return finish(acc, "Stage 130 -- the deprecation mechanism (#[deprecated] + L013)")
+}

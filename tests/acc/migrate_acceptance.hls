@@ -1,0 +1,1055 @@
+# ============================================================================
+# tests/acc/migrate_acceptance.hls — Stage 129 acceptance gate, in Halis
+# (the Halis twin of tests/migrate_acceptance.py; same eight sections,
+# same assertions, same needles — the harness is tests/acc/harness.hls
+# and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make migrate-acceptance` (which compiles this file and runs
+# it from the repo root).
+#
+# The battery drove the REAL codemod CLI over the REAL migration bed
+# (tests/migrate_tree) and, for section 2, imported the tool's Python
+# module for the unit laws. The gate asks the same questions through
+# the front door: every law the battery read out of the module is
+# pinned here by the CLI behaviour that law produces — the --rules
+# registry order, the gated --json rule selections (parse_version),
+# and the xxh64-spec / hex64-word / asm-width / html-escape-slash
+# REWRITES the tool itself computes (the five libxxhash 0.8.3 vectors,
+# the Stage-85 words, the 52 narrow GPR spellings, the lexer's escape
+# set, the html entity set). The subjects are unchanged:
+# tools/hls-migrate.py and tests/migrate_tree.
+#
+#  1. the convention  — usage gates are exit 2 (no PATH, malformed
+#     & the refusals    versions, a backwards walk, unknown rule ids,
+#                       non-.hls files, missing paths, an empty
+#                       directory); --rules lists the six real rules
+#                       with their real since-versions; --version
+#  2. the registry    — the oldest-first order; the release-tag
+#     & the laws        grammar (3-part+suffix, the 2-part v1.0, the
+#                       patch level, junk refused); the version-sort
+#                       law (9 < 10 < 100); the five libxxhash 0.8.3
+#                       XXH64 vectors the xxh64-spec rule recomputes
+#                       against; the hex64 word law (minimal-digit,
+#                       negative and int64 boundary forms); the
+#                       narrow-GPR map's completeness (52 spellings,
+#                       16 destinations); the string decoder's escape
+#                       set; the html_escape entity set
+#  3. the plan        — the FULL-RANGE plan over the untouched bed:
+#     over the bed      exit 1, 18 findings (17 auto + 1 manual)
+#                       across exactly 4 files, the per-file rule
+#                       census, the precise line:col of named
+#                       findings — and the bed is byte-identical
+#                       afterwards (a plan never touches a file)
+#  4. the walk        — --apply --verify: exit 0, 17 edits across 3
+#                       files, all three rewritten files verify OK
+#                       through the real checker; the .bak beside
+#                       each rewritten file is byte-identical to the
+#                       original (the first backup wins);
+#                       legacy/old_io.hls is untouched and .bak-less;
+#                       the migrated app and digest RUN on the
+#                       interpreter; the migrated kernel checks
+#                       clean; the native differential over the
+#                       runnable pair (bin/hlc exists here)
+#  5. the version     — the roadmap phrase verbatim
+#     gate              (`--from v0.34.0-alpha --to v1.0`); a v0.110
+#                       dialect and the since==from boundary are
+#                       CLEAN; --only/--skip compose with the gate;
+#                       the json carries the gated selection
+#  6. the idempotence — the applied tree re-plans with exactly the
+#     & the honesty     one MANUAL finding; a re-apply writes 0 edits
+#                       and keeps the first .bak; --diff emits unified
+#                       diffs; --json carries the census; a
+#                       lexer-invalid escape golden is MANUAL advice,
+#                       never rewritten; the mirrored golden-first
+#                       comparison form migrates too
+#  7. the verify      — --apply --verify fails loudly (exit 1) when a
+#     gate              migrated file still fails the checker; a
+#                       rewritten file with an unresolved MANUAL
+#                       finding is SKIPPED, named, exit 0
+#  8. the corpus      — tests/ok/feat_stage129_migrate.hls is
+#     hygiene            hlfmt-canonical, hllint-clean, boots through
+#                       the real checker, runs green on the
+#                       interpreter and matches natively byte for
+#                       byte; the pristine bed still fails the
+#                       checker in exactly the pre-migration places;
+#                       no .bak litter survives anywhere
+#
+# The battery's timeout=300 wrappers have no Halis equivalent (no
+# per-child alarm); every child here is python3, the migrate tool,
+# boot.py, bin/hlc, gcc or the harness's own one-liners.
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.json"
+import "std.result"
+
+# ----------------------------------------------------------------------------
+# Fixed paths (the battery's ROOT-relative constants).
+# ----------------------------------------------------------------------------
+
+fn bed_path() -> str {
+    return "tests/migrate_tree"
+}
+
+fn showcase_path() -> str {
+    return "tests/ok/feat_stage129_migrate.hls"
+}
+
+fn readme_path() -> str {
+    return "README.md"
+}
+
+fn no_such_dir() -> str {
+    return "no_such_dir_here"
+}
+
+fn missing_a() -> str {
+    return "!acc-missing-pristine!"
+}
+
+fn missing_b() -> str {
+    return "!acc-missing-bed!"
+}
+
+# ----------------------------------------------------------------------------
+# Small helpers.
+# ----------------------------------------------------------------------------
+
+# mig(args) — the REAL codemod CLI, the same interface a user drives.
+# The battery's run() merged stdout+stderr into one stream; every
+# needle below reads r.combined for exactly that reason.
+fn mig(args: list[str]) -> RunResult uses Proc {
+    let argv: list[str] = ["tools/hls-migrate.py"]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    return run_capture("python3", argv)
+}
+
+fn native_ok() -> bool uses Fs, Proc {
+    return file_exists("bin/hlc") && which("gcc")
+}
+
+fn chk(acc: Acc, cond: bool, msg: str) -> bool uses IO {
+    return check(acc, msg, cond, "")
+}
+
+# bed_copy(acc, name) — a byte-exact copy of the untouched migration
+# bed (the battery's shutil.copytree over a fresh temp dir).
+fn bed_copy(acc: Acc, name: str) -> str uses Proc {
+    let tree: str = scratch(acc, name)
+    sh("cp -r '" + shell_quote(bed_path()) + "' '" + shell_quote(tree) + "'")
+    return tree
+}
+
+# jparse(text) — JSON or the null value (never a panic in the gate).
+fn jparse(text: str) -> JsonValue {
+    let rr: Result[JsonValue, str] = json_parse_result(text)
+    if result_is_ok(rr) {
+        return result_unwrap(rr)
+    }
+    return json_null()
+}
+
+fn jstr_of(v: JsonValue, key: str) -> str {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_str(x) {
+        return json_str_value(x)
+    }
+    return ""
+}
+
+fn jint_of(v: JsonValue, key: str) -> int {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_int(x) {
+        return json_int_value(x)
+    }
+    return -1
+}
+
+# rules_selected_joined(v) — the gated rule list as one string, so an
+# order-sensitive comparison is a single ==.
+fn rules_selected_joined(v: JsonValue) -> str {
+    let arr: JsonValue = json_object_get(v, "rules_selected")
+    let out: list[str] = []
+    if json_is_array(arr) {
+        let mut i: int = 0
+        while i < arr.arr.len() {
+            out.push(json_str_value(arr.arr.get(i)))
+            i = i + 1
+        }
+    }
+    return str_join(out, "|")
+}
+
+# native_recipe(hls_path, out_bin) — bin/hlc -> C, gcc -O2, run: the
+# house recipe. On a build failure the returned RunResult carries code
+# -2 (unreachable for a real child) and the compiler's output.
+fn native_recipe(hls_path: str, out_bin: str) -> RunResult uses Proc {
+    let c_path: str = out_bin + ".c"
+    let r: RunResult = run_capture("./bin/hlc", [hls_path, c_path])
+    if r.code != 0 {
+        let dead: RunResult = RunResult {
+            code: -2, out: "", err: "", combined: r.combined,
+            spawned: false
+        }
+        return dead
+    }
+    let g: RunResult = run_capture("gcc", ["-O2", "-o", out_bin, c_path,
+                                           "-lm", "-pthread"])
+    if g.code != 0 {
+        let dead2: RunResult = RunResult {
+            code: -2, out: "", err: "", combined: g.combined,
+            spawned: false
+        }
+        return dead2
+    }
+    return run_capture(out_bin, [])
+}
+
+# ----------------------------------------------------------------------------
+# Section 2's synthetic probes — the unit laws driven through the
+# rules that implement them.
+# ----------------------------------------------------------------------------
+
+fn rule_ids() -> list[str] {
+    return ["html-escape-slash", "rename-project", "import-guard",
+            "xxh64-spec", "asm-width", "hex64-word"]
+}
+
+fn rule_sinces() -> list[str] {
+    return ["v0.8.0-alpha", "v0.20.0-alpha", "v0.51.1-alpha",
+            "v0.82.0-alpha", "v0.102.0-alpha", "v0.103.0-alpha"]
+}
+
+# xxh64_probe_src() — five pinned digest expectations, each wrong, so
+# the tool's xxh64-spec rule must recompute every one with the spec
+# algorithm (the same function the battery called directly).
+fn xxh64_probe_src() -> str {
+    return "# five pinned XXH64 expectations, one per input class\n" +
+           "fn main() -> int {\n" +
+           "    if xxhash_str(\"\") != 1 {\n" +
+           "        return 1\n" +
+           "    }\n" +
+           "    if xxhash_str(\"a\") != 1 {\n" +
+           "        return 2\n" +
+           "    }\n" +
+           "    if xxhash_str(\"hello\") != 1 {\n" +
+           "        return 3\n" +
+           "    }\n" +
+           "    if xxhash_str(\"" + str_repeat("a", 32) + "\") != 1 {\n" +
+           "        return 4\n" +
+           "    }\n" +
+           "    if xxhash_str(\"" + str_repeat("a", 64) + "\") != 1 {\n" +
+           "        return 5\n" +
+           "    }\n" +
+           "    return 0\n" +
+           "}\n"
+}
+
+# hex64_probe_src() — minimal-digit, negative and int64-boundary
+# golden forms; the INT64_MAX golden is already the Stage-85 word and
+# must survive untouched.
+fn hex64_probe_src() -> str {
+    return "# hex64 golden forms across the word law\n" +
+           "fn main() -> int {\n" +
+           "    if hex64(0) != \"0x0\" {\n" +
+           "        return 1\n" +
+           "    }\n" +
+           "    if hex64(255) != \"0xff\" {\n" +
+           "        return 2\n" +
+           "    }\n" +
+           "    if hex64(-1) != \"-0x1\" {\n" +
+           "        return 3\n" +
+           "    }\n" +
+           "    if hex64(-9223372036854775808) != \"-0x8000000000000000\" {\n" +
+           "        return 4\n" +
+           "    }\n" +
+           "    if hex64(9223372036854775807) != \"0x7fffffffffffffff\" {\n" +
+           "        return 5\n" +
+           "    }\n" +
+           "    return 0\n" +
+           "}\n"
+}
+
+# The Stage 83 register facts: 52 narrow GPR spellings across the four
+# families, 16 destinations.
+fn narrow_names() -> list[str] {
+    return ["eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
+            "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d",
+            "ax", "bx", "cx", "dx", "si", "di", "bp", "sp",
+            "r8w", "r9w", "r10w", "r11w", "r12w", "r13w", "r14w", "r15w",
+            "ah", "bh", "ch", "dh",
+            "al", "bl", "cl", "dl", "sil", "dil", "bpl", "spl",
+            "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b"]
+}
+
+fn wide_names() -> list[str] {
+    return ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+            "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"]
+}
+
+fn narrow_probe_src() -> str {
+    let names: list[str] = narrow_names()
+    let mut body: str = "# the narrow-GPR census (the scanner is the subject)\n" +
+        "fn probe() {\n" +
+        "    asm!(\"nop\"\n"
+    let mut i: int = 0
+    while i < names.len() {
+        body = body + "        , out(\"" + names.get(i) + "\") x\n"
+        i = i + 1
+    }
+    body = body + "        , clobber(\"r9\") x\n" +
+        "    );\n" +
+        "}\n"
+    return body
+}
+
+# ----------------------------------------------------------------------------
+# 1. the convention and the refusals
+# ----------------------------------------------------------------------------
+fn sec1(acc: Acc) -> void uses IO, Fs, Proc {
+    section("1. the convention and the refusals")
+    let tmp: str = scratch(acc, "tmp")
+
+    let mut p: RunResult = mig([])
+    chk(acc, p.code == 2 && p.combined.contains("no PATH given"),
+        "no PATH is exit 2, named")
+
+    p = mig([tmp, "--from", "garbage"])
+    chk(acc, p.code == 2
+        && p.combined.contains("must be a release tag like v0.34.0-alpha"),
+        "a malformed --from is exit 2, named")
+
+    p = mig([tmp, "--to", "not-a-tag"])
+    chk(acc, p.code == 2 && p.combined.contains("--to must be a release tag"),
+        "a malformed --to is exit 2, named")
+
+    p = mig([tmp, "--from", "v1.0", "--to", "v0.1.0-alpha"])
+    chk(acc, p.code == 2 && p.combined.contains("walks forward"),
+        "a backwards walk is exit 2, named")
+
+    p = mig([tmp, "--only", "nosuch"])
+    chk(acc, p.code == 2 && p.combined.contains("unknown rule id: nosuch"),
+        "an unknown --only id is exit 2, named")
+
+    p = mig([tmp, "--skip", "nosuch"])
+    chk(acc, p.code == 2 && p.combined.contains("unknown rule id: nosuch"),
+        "an unknown --skip id is exit 2, named")
+
+    p = mig([readme_path()])
+    chk(acc, p.code == 2 && p.combined.contains("not a .hls file"),
+        "a non-.hls file is exit 2, named")
+
+    p = mig([no_such_dir()])
+    chk(acc, p.code == 2 && p.combined.contains("no such file or directory"),
+        "a missing path is exit 2, named")
+
+    let empty: str = scratch(acc, "empty_dir")
+    mkdirs(empty)
+    p = mig([empty])
+    chk(acc, p.code == 2 && p.combined.contains("no .hls files under"),
+        "an empty directory is exit 2, named")
+
+    p = mig(["--rules"])
+    check(acc, "--rules exits 0", p.code == 0, clip(p.combined, 80))
+    let ids: list[str] = rule_ids()
+    let mut i: int = 0
+    while i < ids.len() {
+        chk(acc, p.combined.contains(ids.get(i)),
+            "--rules names " + ids.get(i))
+        i = i + 1
+    }
+    let sinces: list[str] = rule_sinces()
+    i = 0
+    while i < sinces.len() {
+        chk(acc, p.combined.contains(sinces.get(i)),
+            "--rules dates " + sinces.get(i))
+        i = i + 1
+    }
+
+    p = mig(["--version"])
+    chk(acc, p.code == 0 && p.combined.contains("0.147.0-alpha"),
+        "--version says 0.147.0-alpha")
+}
+
+# ----------------------------------------------------------------------------
+# 2. the registry and the unit laws (through the rules that implement
+# them — see the header comment)
+# ----------------------------------------------------------------------------
+fn sec2(acc: Acc) -> void uses IO, Fs, Proc {
+    section("2. the registry and the unit laws")
+    let laws_tree: str = bed_copy(acc, "laws")
+
+    # The registry is oldest-first: the --rules listing names the six
+    # real rules in their release order.
+    let pr: RunResult = mig(["--rules"])
+    let ids: list[str] = rule_ids()
+    let mut ordered: bool = pr.code == 0
+    let mut last: int = -1
+    let mut i: int = 0
+    while i < ids.len() {
+        let at: int = pr.combined.find(ids.get(i))
+        if at < 0 || at < last {
+            ordered = false
+        }
+        last = at
+        i = i + 1
+    }
+    chk(acc, ordered, "the registry is oldest-first across the six real rules")
+
+    # parse_version through the gate: the selections below only hold
+    # if the release tags parse to the tuples the battery asserted.
+    let j34: RunResult = mig([laws_tree, "--from", "v0.34.0-alpha",
+                              "--to", "v1.0", "--json", "-"])
+    let v34: JsonValue = jparse(j34.out)
+    chk(acc, j34.code == 1
+        && rules_selected_joined(v34)
+            == "import-guard|xxh64-spec|asm-width|hex64-word",
+        "parse_version: 3-part + suffix (v0.34.0-alpha gates the four "
+        + "post-v0.34 rules)")
+
+    let j1: RunResult = mig([laws_tree, "--to", "v1.0", "--json", "-"])
+    chk(acc, j1.code != 2
+        && rules_selected_joined(jparse(j1.out))
+            == "html-escape-slash|rename-project|import-guard|xxh64-spec"
+               + "|asm-width|hex64-word",
+        "parse_version: the 2-part v1.0 (the default target)")
+
+    let j511: RunResult = mig([laws_tree, "--from", "v0.51.1-alpha",
+                               "--json", "-"])
+    let sel511: str = rules_selected_joined(jparse(j511.out))
+    let j510: RunResult = mig([laws_tree, "--from", "v0.51.0-alpha",
+                               "--json", "-"])
+    let sel510: str = rules_selected_joined(jparse(j510.out))
+    chk(acc, !sel511.contains("import-guard")
+        && sel510.contains("import-guard"),
+        "parse_version: the patch level (v0.51.1-alpha vs v0.51.0-alpha)")
+
+    let jbad: RunResult = mig([laws_tree, "--from", "0.34"])
+    chk(acc, jbad.code == 2
+        && jbad.combined.contains("must be a release tag"),
+        "parse_version: junk is refused")
+
+    # The version-sort law: 9 < 10 < 100, never alphabetical. Under a
+    # string sort v0.9.0-alpha would be the NEWEST dialect (CLEAN) and
+    # v0.100.0-alpha would fire more rules than v0.9.0-alpha, not fewer.
+    let j9: RunResult = mig([laws_tree, "--from", "v0.9.0-alpha",
+                             "--json", "-"])
+    let sel9: str = rules_selected_joined(jparse(j9.out))
+    let j10: RunResult = mig([laws_tree, "--from", "v0.10.0-alpha",
+                              "--json", "-"])
+    let sel10: str = rules_selected_joined(jparse(j10.out))
+    let j100: RunResult = mig([laws_tree, "--from", "v0.100.0-alpha",
+                               "--json", "-"])
+    let sel100: str = rules_selected_joined(jparse(j100.out))
+    chk(acc, sel9 == "rename-project|import-guard|xxh64-spec|asm-width"
+            + "|hex64-word"
+        && sel10 == sel9
+        && sel100 == "asm-width|hex64-word",
+        "the version-sort law: 9 < 10 < 100, never alphabetical")
+
+    # The five libxxhash-0.8.3 vectors (seed 0): the xxh64-spec rule
+    # recomputes every pinned expectation with the tool's own spec
+    # algorithm — the rewrites ARE the vectors.
+    let xpath: str = write_src(acc, "xxh/probe.hls", xxh64_probe_src())
+    let xa: RunResult = mig([xpath, "--only", "xxh64-spec", "--apply"])
+    let xsrc: str = read_or(xpath, "")
+    check(acc, "XXH64(b'') matches libxxhash 0.8.3",
+        xa.code == 0 && xsrc.contains("xxhash_str(\"\") != -1205034819632174695"),
+        clip(xa.combined, 90))
+    check(acc, "XXH64(b'a') matches libxxhash 0.8.3",
+        xsrc.contains("xxhash_str(\"a\") != -3292477735350538661"), "")
+    check(acc, "XXH64(b'hello') matches libxxhash 0.8.3",
+        xsrc.contains("xxhash_str(\"hello\") != 2794345569481354659"), "")
+    check(acc, "XXH64(b'aaaaaa' x 32) matches libxxhash 0.8.3",
+        xsrc.contains("xxhash_str(\"" + str_repeat("a", 32)
+            + "\") != -8831976466377237801"), "")
+    check(acc, "XXH64(b'aaaaaa' x 64) matches libxxhash 0.8.3",
+        xsrc.contains("xxhash_str(\"" + str_repeat("a", 64)
+            + "\") != -1379396020616355102"), "")
+
+    # The hex64 word law: minimal-digit, negative and boundary words —
+    # re-rendered by the hex64-word rule from the minimal/negative
+    # forms; the already-correct INT64_MAX golden survives untouched.
+    let hpath: str = write_src(acc, "hex/probe.hls", hex64_probe_src())
+    let ha: RunResult = mig([hpath, "--only", "hex64-word", "--apply"])
+    let hsrc: str = read_or(hpath, "")
+    chk(acc, ha.code == 0
+        && hsrc.contains("hex64(0) != \"0x0000000000000000\"")
+        && hsrc.contains("hex64(255) != \"0x00000000000000ff\"")
+        && hsrc.contains("hex64(-1) != \"0xffffffffffffffff\"")
+        && hsrc.contains("hex64(-9223372036854775808) != "
+            + "\"0x8000000000000000\"")
+        && hsrc.contains("hex64(9223372036854775807) != "
+            + "\"0x7fffffffffffffff\""),
+        "the hex64 word law: minimal, negative and boundary words")
+
+    # The narrow-GPR map: 52 narrow spellings, 16 destinations. The
+    # asm-width walk rewrites every one; the wide control survives.
+    let apath: str = write_src(acc, "asm/probe.hls", narrow_probe_src())
+    let aa: RunResult = mig([apath, "--only", "asm-width", "--apply"])
+    let asrc: str = read_or(apath, "")
+    let names: list[str] = narrow_names()
+    let wides: list[str] = wide_names()
+    let mut none_left: bool = aa.combined
+        .contains("applied 52 edits across 1 file")
+    let mut all_wide: bool = none_left
+    let mut k: int = 0
+    while k < names.len() {
+        if asrc.contains("\"" + names.get(k) + "\"") {
+            none_left = false
+        }
+        k = k + 1
+    }
+    k = 0
+    while k < wides.len() {
+        if !asrc.contains("\"" + wides.get(k) + "\"") {
+            all_wide = false
+        }
+        k = k + 1
+    }
+    chk(acc, none_left && all_wide,
+        "the narrow-GPR map: 52 narrow spellings, 16 destinations")
+    # Every family lands on its 64-bit name — the apply report names
+    # each narrow spelling and its destination (the battery's spot map).
+    chk(acc,
+        aa.combined.contains("'eax' binds a 32-bit register; Stage 83 "
+            + "rewrites narrow names to the full 64-bit spelling ('rax')")
+            && aa.combined.contains("'r8d' binds a 32-bit register; Stage 83 "
+                + "rewrites narrow names to the full 64-bit spelling ('r8')")
+            && aa.combined.contains("'dx' binds a 16-bit register; Stage 83 "
+                + "rewrites narrow names to the full 64-bit spelling ('rdx')")
+            && aa.combined.contains("'al' binds a 8-bit register; Stage 83 "
+                + "rewrites narrow names to the full 64-bit spelling ('rax')")
+            && aa.combined.contains("'ah' binds a 8-bit register; Stage 83 "
+                + "rewrites narrow names to the full 64-bit spelling ('rax')")
+            && aa.combined.contains("'r14d' binds a 32-bit register; Stage 83 "
+                + "rewrites narrow names to the full 64-bit spelling ('r14')")
+            && aa.combined.contains("'spl' binds a 8-bit register; Stage 83 "
+                + "rewrites narrow names to the full 64-bit spelling ('rsp')")
+            && aa.combined.contains("'r9b' binds a 8-bit register; Stage 83 "
+                + "rewrites narrow names to the full 64-bit spelling ('r9')"),
+        "the narrow-GPR map: every family lands on its 64-bit name")
+    chk(acc, asrc.contains("clobber(\"r9\")"),
+        "the narrow-GPR map: 64-bit names are not their own source")
+
+    # The string decoder: exactly the lexer's escape set (\n \t \\ \")
+    # round-trips through the rewriter; anything else is refused.
+    let epath: str = write_src(acc, "esc/probe.hls",
+        "# the escape-set census\n" +
+        "fn main() -> int {\n" +
+        "    if html_escape(\"a\\n\\t\\\\\\\"b\") != \"nope\" {\n" +
+        "        return 1\n" +
+        "    }\n" +
+        "    return 0\n" +
+        "}\n")
+    let ea: RunResult = mig([epath, "--only", "html-escape-slash", "--apply"])
+    let esrc: str = read_or(epath, "")
+    chk(acc, ea.code == 0
+        && esrc.contains("html_escape(\"a\\n\\t\\\\\\\"b\") != "
+            + "\"a\\n\\t\\\\&quot;b\""),
+        "the string decoder: exactly the lexer's escape set")
+
+    let qpath: str = write_src(acc, "escq/probe.hls",
+        "# an escape the lexer refuses\n" +
+        "fn main() -> int {\n" +
+        "    if html_escape(\"a\") != \"a\\q\" {\n" +
+        "        return 1\n" +
+        "    }\n" +
+        "    return 0\n" +
+        "}\n")
+    let qa: RunResult = mig([qpath, "--only", "html-escape-slash"])
+    chk(acc, qa.code == 1 && qa.combined.contains("not decodable")
+        && qa.combined.contains("MANUAL"),
+        "the string decoder: an unknown escape is refused, not guessed")
+
+    # html_escape_today, byte-wise: the forward slash and the full
+    # entity set — recomputed by the html-escape-slash rule itself.
+    let fpath: str = write_src(acc, "html/probe.hls",
+        "# the forward-slash hardening\n" +
+        "fn main() -> int {\n" +
+        "    if html_escape(\"</b>\") != \"&lt;/b&gt;\" {\n" +
+        "        return 1\n" +
+        "    }\n" +
+        "    return 0\n" +
+        "}\n")
+    let fa: RunResult = mig([fpath, "--only", "html-escape-slash", "--apply"])
+    let fsrc: str = read_or(fpath, "")
+    chk(acc, fa.code == 0
+        && fsrc.contains("html_escape(\"</b>\") != \"&lt;&#x2F;b&gt;\""),
+        "html_escape_today: the forward slash is escaped")
+
+    let gpath: str = write_src(acc, "html2/probe.hls",
+        "# the full entity set\n" +
+        "fn main() -> int {\n" +
+        "    if html_escape(\"a&b\\\"c'd<e>f\") != \"nope\" {\n" +
+        "        return 1\n" +
+        "    }\n" +
+        "    return 0\n" +
+        "}\n")
+    let ga: RunResult = mig([gpath, "--only", "html-escape-slash", "--apply"])
+    let gsrc: str = read_or(gpath, "")
+    chk(acc, ga.code == 0
+        && gsrc.contains("html_escape(\"a&b\\\"c'd<e>f\") != "
+            + "\"a&amp;b&quot;c&#39;d&lt;e&gt;f\""),
+        "html_escape_today: the full entity set, byte-wise")
+}
+
+# ----------------------------------------------------------------------------
+# 3. the plan over the real bed
+# ----------------------------------------------------------------------------
+fn sec3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("3. the plan over the real bed")
+    let keep: str = scratch(acc, "pristine")
+    mkdirs(keep)
+    sh("cp -r '" + shell_quote(bed_path()) + "' '"
+        + shell_quote(keep + "/tree") + "'")
+
+    let p: RunResult = mig([bed_path()])
+    check(acc, "a plan with findings is exit 1", p.code == 1,
+        clip(p.combined, 80))
+    let out: str = p.combined
+    chk(acc, out.contains("18 findings across 4 files (17 auto, 1 manual)"),
+        "the census: 18 findings (17 auto, 1 manual) across 4 files")
+    chk(acc, str_count(out, "[rename-project] AUTO") == 3
+        && str_count(out, "[html-escape-slash] AUTO") == 2
+        && str_count(out, "[hex64-word] AUTO") == 2
+        && str_count(out, "[xxh64-spec] AUTO") == 1
+        && str_count(out, "[import-guard] AUTO") == 2
+        && str_count(out, "[asm-width] AUTO") == 7
+        && str_count(out, "[import-guard] MANUAL") == 1,
+        "the per-rule census: 3+2+2+2+1+7 auto and 1 manual")
+
+    let needles: list[str] = [
+        "app.hls:26:8: [import-guard] AUTO",
+        "app.hls:11:19: [hex64-word] AUTO",
+        "digest.hls:16:31: [xxh64-spec] AUTO",
+        "kernel.hls:17:24: [asm-width] AUTO",
+        "legacy/old_io.hls:12:8: [import-guard] MANUAL"]
+    let mut i: int = 0
+    while i < needles.len() {
+        chk(acc, out.contains(needles.get(i)),
+            "the plan names " + needles.get(i))
+        i = i + 1
+    }
+
+    chk(acc, out.contains("must not contain '..'")
+        || out.contains("never auto-rewritten"),
+        "the MANUAL finding carries the guard's reason")
+
+    # The no-touch law: a plan is read-only, byte for byte. The --json
+    # census (section 6) proves the bed is exactly these five files.
+    let rels: list[str] = ["app.hls", "digest.hls", "helper.hls",
+                           "kernel.hls", "legacy/old_io.hls"]
+    let mut untouched: bool = true
+    i = 0
+    while i < rels.len() {
+        let a: str = read_or(keep + "/tree/" + rels.get(i), missing_a())
+        let b: str = read_or(bed_path() + "/" + rels.get(i), missing_b())
+        if a != b {
+            untouched = false
+        }
+        i = i + 1
+    }
+    chk(acc, untouched, "a plan never touches a file (byte-identical bed)")
+}
+
+# ----------------------------------------------------------------------------
+# 4. the walk: apply, verify, backups, the run
+# ----------------------------------------------------------------------------
+fn sec4(acc: Acc) -> void uses IO, Fs, Proc {
+    section("4. the walk: apply, verify, backups, the run")
+    let tree: str = bed_copy(acc, "walk")
+    let rels: list[str] = ["app.hls", "digest.hls", "kernel.hls"]
+    let pre: list[str] = []
+    pre.push(read_or(tree + "/app.hls", missing_a()))
+    pre.push(read_or(tree + "/digest.hls", missing_a()))
+    pre.push(read_or(tree + "/kernel.hls", missing_a()))
+    let pre_helper: str = read_or(tree + "/helper.hls", missing_a())
+    let pre_oldio: str = read_or(tree + "/legacy/old_io.hls", missing_a())
+
+    let p: RunResult = mig([tree, "--apply", "--verify"])
+    let out: str = p.combined
+    check(acc, "--apply --verify exits 0", p.code == 0, clip(out, 120))
+    chk(acc, out.contains("applied 17 edits across 3 files"),
+        "the apply summary: 17 edits across 3 files")
+    chk(acc, str_count(out, "verify OK") == 3,
+        "all three rewritten files verify OK through the checker")
+    chk(acc, out.contains("MANUAL work remains") && out.contains("old_io.hls"),
+        "the remaining MANUAL work is named")
+
+    # The .bak discipline: byte-identical to the original, first-wins.
+    let mut baks_ok: bool = true
+    let mut i: int = 0
+    while i < rels.len() {
+        let bak: str = read_or(tree + "/" + rels.get(i) + ".bak", missing_b())
+        if bak == missing_b() || bak != pre.get(i) {
+            baks_ok = false
+        }
+        i = i + 1
+    }
+    chk(acc, baks_ok, "each rewritten file carries a .bak of the original")
+
+    chk(acc, !file_exists(tree + "/legacy/old_io.hls.bak")
+        && read_or(tree + "/legacy/old_io.hls", missing_b()) == pre_oldio
+        && read_or(tree + "/helper.hls", missing_b()) == pre_helper,
+        "legacy/old_io.hls is untouched and .bak-less (MANUAL advice)")
+
+    # The migrated content, spot-read. (The header comment still names
+    # the OLD import as documentation — the ACTIVE import line is what
+    # migrated, so the assertions anchor on the line start.)
+    let app: str = read_or(tree + "/app.hls", "")
+    chk(acc, app.contains("\nimport \"./helper.hls\"")
+        && !app.contains("\nimport \"/helper.hls\""),
+        "the absolute import migrated file-relative")
+    chk(acc, app.contains("\"Halis is a programming language\"")
+        && !app.contains("Hieu Louis"),
+        "the project name migrated")
+    chk(acc, app.contains("hex64(255) != \"0x00000000000000ff\""),
+        "the hex64 golden migrated to the full word")
+    chk(acc, app.contains("html_escape(\"</b>\") != \"&lt;&#x2F;b&gt;\""),
+        "the html golden migrated to the escaped slash")
+    let k: str = read_or(tree + "/kernel.hls", "")
+    chk(acc, !k.contains("out(\"eax\")") && !k.contains("out(\"edx\")")
+        && !k.contains("in(\"dx\")") && !k.contains("out(\"al\")")
+        && !k.contains("inout(\"ecx\")") && !k.contains("clobber(\"r9d\")")
+        && !k.contains("out(\"r14d\")"),
+        "no narrow GPR spelling survives the asm-width walk")
+    chk(acc, k.contains("out(\"rax\")") && k.contains("out(\"rdx\")")
+        && k.contains("in(\"rdx\")") && k.contains("inout(\"rcx\")")
+        && k.contains("clobber(\"r9\")") && k.contains("out(\"r14\")"),
+        "the 64-bit spellings are in place")
+
+    # The migrated programs RUN on the interpreter.
+    let pa: RunResult = boot(acc, [tree + "/app.hls"])
+    chk(acc, pa.code == 0
+        && pa.out.contains("Halis is a programming language")
+        && pa.out.contains("app migrated OK"),
+        "the migrated app runs green on the interpreter, Halis named")
+    let pd: RunResult = boot(acc, [tree + "/digest.hls"])
+    chk(acc, pd.code == 0 && pd.out.contains("made by Halis")
+        && pd.out.contains("digest migrated OK"),
+        "the migrated digest runs green, the recomputed digest matches")
+    let pk: RunResult = boot(acc, ["--check", tree + "/kernel.hls"])
+    chk(acc, pk.code == 0
+        && pk.out.contains("OK: types and effects valid"),
+        "the migrated kernel checks clean")
+
+    # The native differential over the runnable pair (house recipe).
+    if native_ok() {
+        let mut same: bool = true
+        let mut detail: str = ""
+        let names: list[str] = ["app", "digest"]
+        let mut j: int = 0
+        while j < names.len() {
+            let hls: str = tree + "/" + names.get(j) + ".hls"
+            let bi: RunResult = boot(acc, [hls])
+            let nb: str = scratch(acc, "s4_" + names.get(j))
+            let r: RunResult = native_recipe(hls, nb)
+            if r.code == -2 {
+                same = false
+                detail = "native " + names.get(j) + ": " + clip(r.combined, 100)
+            } else if r.code != bi.code || r.out != bi.out {
+                same = false
+                detail = "native divergence on " + names.get(j)
+            }
+            j = j + 1
+        }
+        check(acc, "the migrated pair: interpreter == native, byte for byte",
+            same, detail)
+    } else {
+        println("  (bin/hlc absent — the native differential is skipped, "
+            + "named, not silent)")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 5. the version gate
+# ----------------------------------------------------------------------------
+fn sec5(acc: Acc) -> void uses IO, Fs, Proc {
+    section("5. the version gate")
+    let tree: str = bed_copy(acc, "gate34")
+
+    # The roadmap phrase, verbatim: hls migrate v0.34 -> v1.0.
+    let p: RunResult = mig([tree, "--from", "v0.34.0-alpha", "--to", "v1.0"])
+    let out: str = p.combined
+    check(acc, "the phrase's plan is exit 1 (work remains)", p.code == 1,
+        clip(out, 80))
+    chk(acc, !out.contains("[rename-project]")
+        && !out.contains("[html-escape-slash]"),
+        "the two pre-v0.34 dialects are gated off")
+    chk(acc, str_count(out, "[import-guard] AUTO") == 2
+        && str_count(out, "[xxh64-spec] AUTO") == 1
+        && str_count(out, "[asm-width] AUTO") == 7
+        && str_count(out, "[hex64-word] AUTO") == 2
+        && str_count(out, "[import-guard] MANUAL") == 1,
+        "exactly the four post-v0.34 rules fire (2+1+7+2 auto, 1 manual)")
+    chk(acc, out.contains("13 findings across 4 files (12 auto, 1 manual)"),
+        "the gated census: 13 findings (12 auto, 1 manual)")
+
+    # A v0.110 dialect: everything is behind it — CLEAN, exit 0.
+    let tree110: str = bed_copy(acc, "gate110")
+    let p110: RunResult = mig([tree110, "--from", "v0.110.0-alpha"])
+    chk(acc, p110.code == 0 && p110.combined.contains("CLEAN"),
+        "a v0.110 dialect is CLEAN: the gate is real, not noise")
+
+    # The since==from boundary: code written AT the breaking release
+    # already conforms — the rule does not fire.
+    let tree103: str = bed_copy(acc, "gate103")
+    let p103: RunResult = mig([tree103, "--from", "v0.103.0-alpha"])
+    chk(acc, p103.code == 0 && p103.combined.contains("CLEAN"),
+        "the since==from boundary: the rule is gated at its own release")
+
+    # One release earlier and exactly the newest rule fires.
+    let tree102: str = bed_copy(acc, "gate102")
+    let p102: RunResult = mig([tree102, "--from", "v0.102.0-alpha"])
+    chk(acc, p102.code == 1
+        && str_count(p102.combined, "[hex64-word] AUTO") == 2
+        && str_count(p102.combined, "[asm-width]") == 0,
+        "one release earlier: exactly hex64-word fires")
+
+    # --only / --skip compose with the gate.
+    let po: RunResult = mig([tree, "--from", "v0.34.0-alpha",
+                             "--only", "asm-width"])
+    chk(acc, po.code == 1 && str_count(po.combined, "[asm-width] AUTO") == 7
+        && !po.combined.contains("[hex64-word]"),
+        "--only asm-width selects the register walk alone")
+    let ps: RunResult = mig([tree, "--from", "v0.34.0-alpha", "--skip",
+                             "asm-width,import-guard"])
+    chk(acc, ps.code == 1 && !ps.combined.contains("[asm-width]")
+        && !ps.combined.contains("[import-guard]")
+        && ps.combined.contains("[hex64-word] AUTO"),
+        "--skip composes: the excluded rules never fire")
+
+    # The json carries the gated selection.
+    let jpath: str = scratch(acc, "gate.json")
+    let pj: RunResult = mig([tree, "--from", "v0.34.0-alpha", "--to", "v1.0",
+                             "--json", jpath])
+    let rec: JsonValue = jparse(read_or(jpath, ""))
+    chk(acc, rules_selected_joined(rec)
+        == "import-guard|xxh64-spec|asm-width|hex64-word",
+        "the json's rules_selected is the gated four")
+    let summ: JsonValue = json_object_get(rec, "summary")
+    chk(acc, pj.code != 2 && jint_of(summ, "findings_auto") == 12
+        && jint_of(summ, "findings_manual") == 1,
+        "the json summary agrees with the human census")
+}
+
+# ----------------------------------------------------------------------------
+# 6. the idempotence and the honesty gates
+# ----------------------------------------------------------------------------
+fn sec6(acc: Acc) -> void uses IO, Fs, Proc {
+    section("6. the idempotence and the honesty gates")
+    let tree: str = bed_copy(acc, "idem")
+    let p: RunResult = mig([tree, "--apply"])
+    check(acc, "the first apply succeeds", p.code == 0, clip(p.combined, 80))
+
+    # The fixed point: the re-plan finds exactly the MANUAL finding.
+    let rp: RunResult = mig([tree])
+    chk(acc, rp.code == 1
+        && rp.combined.contains("1 finding across 1 file (0 auto, 1 manual)"),
+        "the re-plan: exactly the MANUAL finding survives (0 auto)")
+
+    # A re-apply writes nothing and keeps the FIRST backup.
+    let before: str = read_or(tree + "/app.hls.bak", missing_a())
+    let ra: RunResult = mig([tree, "--apply"])
+    chk(acc, ra.code == 0
+        && ra.combined.contains("applied 0 edits across 0 files"),
+        "the re-apply writes 0 edits")
+    chk(acc, before != missing_a()
+        && read_or(tree + "/app.hls.bak", missing_b()) == before,
+        "the first backup wins (not overwritten by the re-apply)")
+
+    # --diff: unified diffs with real headers and real content.
+    let fresh: str = bed_copy(acc, "diffme")
+    let pd: RunResult = mig([fresh, "--diff"])
+    chk(acc, pd.code == 1, "a diff with work is exit 1")
+    chk(acc, pd.combined.contains("--- ") && pd.combined.contains("+++ ")
+        && pd.combined.contains("@@"),
+        "the diff carries unified headers")
+    chk(acc, pd.combined.contains("-import \"/helper.hls\"")
+        && pd.combined.contains("+import \"./helper.hls\""),
+        "the diff shows the import rewrite")
+    chk(acc, pd.combined
+        .contains("-    let who: str = \"Hieu Louis is a programming "
+            + "language\"")
+        && pd.combined
+        .contains("+    let who: str = \"Halis is a programming language\""),
+        "the diff shows the rename")
+
+    # --json to a file: the census, parseable.
+    let jpath: str = scratch(acc, "plan.json")
+    let pj: RunResult = mig([fresh, "--json", jpath])
+    check(acc, "--json FILE writes the report",
+        pj.code == 1 && file_exists(jpath), "")
+    let rec: JsonValue = jparse(read_or(jpath, ""))
+    let summ: JsonValue = json_object_get(rec, "summary")
+    chk(acc, jint_of(summ, "files_scanned") == 5
+        && jint_of(summ, "files_changed") == 3
+        && jint_of(summ, "findings_auto") == 17
+        && jint_of(summ, "findings_manual") == 1,
+        "the json census: 5 scanned, 3 changed, 17+1 findings")
+    chk(acc, rules_selected_joined(rec)
+        == "html-escape-slash|rename-project|import-guard|xxh64-spec"
+           + "|asm-width|hex64-word",
+        "the default gate selects all six rules")
+
+    # A golden the decoder cannot read is MANUAL advice, never a
+    # rewrite.
+    let synth: str = scratch(acc, "synth")
+    let epath: str = write_src(acc, "synth/escapes.hls",
+        "# an expectation with an escape the lexer refuses\n" +
+        "fn main() -> int {\n" +
+        "    if html_escape(\"a\") != \"a\\q\" {\n" +
+        "        return 1\n" +
+        "    }\n" +
+        "    return 0\n" +
+        "}\n")
+    let pe: RunResult = mig([synth])
+    chk(acc, pe.code == 1 && pe.combined.contains("not decodable")
+        && pe.combined.contains("MANUAL"),
+        "a lexer-invalid escape golden is MANUAL advice")
+    chk(acc, str_count(read_or(epath, missing_a()), "\"a\\q\"") == 1,
+        "the undecodable golden is untouched")
+
+    # The mirrored comparison form: golden first, hex64 call second.
+    let mpath: str = write_src(acc, "synth/mirror.hls",
+        "# the golden-first form the walk also owns\n" +
+        "fn main() -> int {\n" +
+        "    if \"0xff\" == hex64(255) {\n" +
+        "        return 1\n" +
+        "    }\n" +
+        "    return 0\n" +
+        "}\n")
+    let pm: RunResult = mig([synth])
+    chk(acc, pm.combined.contains("mirror.hls:3:8: [hex64-word] AUTO"),
+        "the mirrored hex64 comparison is found at its column")
+    let pma: RunResult = mig([synth, "--only", "hex64-word", "--apply"])
+    chk(acc, pma.code == 0
+        && read_or(mpath, missing_a())
+            .contains("if \"0x00000000000000ff\" == hex64(255)"),
+        "the mirrored golden migrates in place")
+}
+
+# ----------------------------------------------------------------------------
+# 7. the verify gate
+# ----------------------------------------------------------------------------
+fn sec7(acc: Acc) -> void uses IO, Fs, Proc {
+    section("7. the verify gate")
+    let tree: str = bed_copy(acc, "verify")
+    # A file the walk rewrites but which still carries a REAL type
+    # error: migration fixes the dialect, not the bug.
+    write_src(acc, "verify/broken.hls",
+        "# a v0.34-era file with a bug migration cannot fix\n" +
+        "import \"/helper.hls\"\n" +
+        "\n" +
+        "fn main() -> int {\n" +
+        "    let x: int = \"not an int\"\n" +
+        "    return x\n" +
+        "}\n")
+    let p: RunResult = mig([tree, "--apply", "--verify"])
+    let out: str = p.combined
+    chk(acc, p.code == 1 && out.contains("verify FAIL")
+        && out.contains("broken.hls"),
+        "a migrated file that still fails the checker is exit 1, named")
+    chk(acc, out.contains("verification FAILED for 1 file(s)"),
+        "the verify verdict is loud")
+
+    # A rewritten file with an unresolved MANUAL finding is SKIPPED,
+    # named — the tool refuses to certify what it knows is broken.
+    let tree2: str = bed_copy(acc, "verify2")
+    let mpath: str = write_src(acc, "verify2/mixed.hls",
+        "# rename fires, the .. import stays MANUAL\n" +
+        "import \"../helper.hls\"\n" +
+        "\n" +
+        "fn main() -> int {\n" +
+        "    let who: str = \"Hieu Louis\"\n" +
+        "    return 0\n" +
+        "}\n")
+    let p2: RunResult = mig([tree2, "--apply", "--verify"])
+    let out2: str = p2.combined
+    chk(acc, p2.code == 0 && out2.contains("verify skipped")
+        && out2.contains("mixed.hls") && out2.contains("import-guard"),
+        "a rewritten MANUAL-carrying file is skipped, named, exit 0")
+    chk(acc, str_count(read_or(mpath, missing_a()),
+                       "import \"../helper.hls\"") == 1,
+        "the '..' import survived the apply untouched")
+}
+
+# ----------------------------------------------------------------------------
+# 8. the corpus hygiene
+# ----------------------------------------------------------------------------
+fn sec8(acc: Acc) -> void uses IO, Fs, Proc {
+    section("8. the corpus hygiene")
+    let show: str = showcase_path()
+    let pf: RunResult = run_capture("./bin/hlfmt", ["--check", show])
+    chk(acc, pf.code == 0 && pf.combined.contains("already formatted"),
+        "the ok fixture is hlfmt-canonical")
+    let lint_argv: list[str] = ["tools/hllint.py", show]
+    let pl: RunResult = run_capture("python3", lint_argv)
+    chk(acc, pl.code == 0 && pl.combined.contains("no warnings"),
+        "the ok fixture is hllint-clean")
+    let pc: RunResult = boot(acc, ["--check", show])
+    chk(acc, pc.code == 0
+        && pc.out.contains("OK: types and effects valid"),
+        "the ok fixture boots through the real checker")
+    let pr: RunResult = boot(acc, [show])
+    chk(acc, pr.code == 0 && pr.out.contains("migrate laws OK"),
+        "the ok fixture runs green on the interpreter")
+
+    if native_ok() {
+        let nb: str = scratch(acc, "s8_showcase")
+        let n: RunResult = native_recipe(show, nb)
+        check(acc, "the ok fixture: interpreter == native, byte for byte",
+            n.code != -2 && n.code == pr.code && n.out == pr.out,
+            clip(n.combined, 120))
+    } else {
+        println("  (bin/hlc absent — the native leg is skipped, named, "
+            + "not silent)")
+    }
+
+    # The pristine bed still fails the checker in exactly the
+    # pre-migration places — the reason migration exists.
+    let p1: RunResult = boot(acc, ["--check", bed_path() + "/app.hls"])
+    chk(acc, p1.code != 0
+        && p1.combined.contains("must be relative, got absolute"),
+        "the pristine bed: the absolute import is rejected")
+    let p2: RunResult = boot(acc, ["--check", bed_path() + "/kernel.hls"])
+    chk(acc, p2.code != 0 && p2.combined.contains("is 32-bit"),
+        "the pristine bed: the narrow register is rejected")
+    let p3: RunResult = boot(acc, ["--check",
+                                   bed_path() + "/legacy/old_io.hls"])
+    chk(acc, p3.code != 0 && p3.combined.contains("'..' segments"),
+        "the pristine bed: the '..' segment is rejected")
+
+    # No .bak litter survives anywhere the gate works. The --json
+    # census (section 6) proves the bed is exactly these five files.
+    let rels: list[str] = ["app.hls", "digest.hls", "helper.hls",
+                           "kernel.hls", "legacy/old_io.hls"]
+    let mut litter: bool = false
+    let mut i: int = 0
+    while i < rels.len() {
+        if file_exists(bed_path() + "/" + rels.get(i) + ".bak") {
+            litter = true
+        }
+        i = i + 1
+    }
+    chk(acc, !litter, "no .bak litter in the pristine bed")
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let acc: Acc = acc_new("migrate")
+    sec1(acc)
+    sec2(acc)
+    sec3(acc)
+    sec4(acc)
+    sec5(acc)
+    sec6(acc)
+    sec7(acc)
+    sec8(acc)
+    return finish(acc, "Stage 129 -- hls-migrate, the migration tool")
+}

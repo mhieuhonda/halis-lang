@@ -1,0 +1,907 @@
+# ============================================================================
+# tests/acc/sandbox_acceptance.hls — Stage 110 acceptance gate, in Halis
+# (the Halis twin of tests/sandbox_acceptance.py; same nine sections,
+# same assertions, same needles — the harness is tests/acc/harness.hls
+# and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make sandbox-acceptance` (which compiles this file and runs
+# it from the repo root).
+#
+# The battery imported the sandbox kit's Python modules directly
+# (sandbox_parts.sbx_policy.Profile/nr_of/parse_sandbox_section,
+# sbx_bpf.Asm/disassemble, sbx_exec.run, BUILTIN_EFFECTS). The gate
+# asks the same questions through the kit's front doors:
+#   - the CLI: profile / run / emit / release / verify-release /
+#     selftest (the selftest's 37 vectors ARE the pinned numbers the
+#     battery re-derived by hand — the program shapes, the rule
+#     counts, the merge semantics, the jump fixups, the refusals);
+#   - `profile --bpf`, the disassembler listing the battery built
+#     by hand;
+#   - bad-[sandbox] scratch packages, which drive
+#     parse_sandbox_section through package mode exactly as a real
+#     manifest would;
+#   - one file-level grep the battery itself did (the derivation
+#     walks with hls-audit's own helpers).
+#
+#  1. the one definition — the vocabulary IS hls-audit's, the fs
+#                          census IS BUILTIN_EFFECTS' Fs family, the
+#                          derivation walks with audit's own helpers,
+#                          the CLI selftest (37 vectors) is green
+#  2. the assembler      — pinned program shapes, determinism, the
+#                          merge semantics (rw absorbs ro), the
+#                          disassembler, the over-range refusal
+#  3. the policy         — the layer invariant on all three arches,
+#                          the x86_64 numbers re-checked against the
+#                          local kernel headers when they exist, the
+#                          [sandbox] section's validation, the deny
+#                          rules
+#  4. the derivation     — source mode on the demo (the surface, the
+#                          census, the honest rw), package mode on
+#                          the package demo (the gate, the [sandbox]
+#                          pins), the gate refusing a tree that
+#                          violates its own manifest, --effects as
+#                          the yardstick override
+#  5. the enforcement    — the kernel half, Linux + seccomp only
+#                          (skip-marked elsewhere): the demo compiled
+#                          native (boot.py -> C -> cc), the matrix
+#                          ro/rw/kill, the loader line, the static
+#                          line, the net probe, the package-mode
+#                          run, the exit pass-through
+#  6. the shim           — emit + compile the self-armed binary (no
+#                          launcher), the ro refusal baked in, the
+#                          cross-arch emission (aarch64 + riscv64)
+#  7. the statement      — the release gate (no lockfile refuses),
+#                          the versioned statement, ONE ledger record
+#                          (kind sandbox), drift refusal, the
+#                          verify-release end to end
+#  8. the demos          — the demo and the ok-test run under the
+#                          interpreter, native parity byte for byte,
+#                          the package demo runs
+#  9. the tools          — hlfmt stable, hllint clean on the new
+#                          sources
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.json"
+import "std.result"
+
+# ----------------------------------------------------------------------------
+# The gate's constants (the battery's).
+# ----------------------------------------------------------------------------
+
+fn demo() -> str {
+    return "examples/sandbox_demo.hls"
+}
+
+fn pkg_demo() -> str {
+    return "examples/pkg_sandbox_demo"
+}
+
+fn ok_test() -> str {
+    return "tests/ok/feat_stage110_sandbox.hls"
+}
+
+fn sbx_tool() -> str {
+    return "tools/hls-sandbox.py"
+}
+
+fn pkg_tool() -> str {
+    return "tools/hls-pkg.py"
+}
+
+fn log_main() -> str {
+    return ".hls-pkg-transparency.log"
+}
+
+fn digest_needle() -> str {
+    return "digest 893425381"
+}
+
+# Host — the machine facts the battery's skip conditions read.
+struct Host {
+    arch: str,
+    arch_ok: bool,
+    have_cc: bool,
+    seccomp: bool
+}
+
+# ----------------------------------------------------------------------------
+# The battery's [PASS]/[FAIL] grammar.
+# ----------------------------------------------------------------------------
+
+fn ok(acc: Acc, label: str) -> void uses IO {
+    acc.pass = acc.pass + 1
+    println("  [PASS] " + label)
+}
+
+fn bad(acc: Acc, label: str, detail: str) -> void uses IO {
+    acc.fail = acc.fail + 1
+    if detail == "" {
+        println("  [FAIL] " + label)
+    } else {
+        println("  [FAIL] " + label + ": " + detail)
+    }
+}
+
+fn chk(acc: Acc, label: str, cond: bool, detail: str) -> bool uses IO {
+    if cond {
+        ok(acc, label)
+    } else {
+        bad(acc, label, detail)
+    }
+    return cond
+}
+
+fn skip_msg(acc: Acc, name: str) -> void uses IO {
+    println("  [SKIP] " + name)
+}
+
+# ----------------------------------------------------------------------------
+# JSON accessors — the battery's dict/get idioms, null-safe end to end.
+# ----------------------------------------------------------------------------
+
+fn parse_json(text: str) -> JsonValue {
+    let rr: Result[JsonValue, str] = json_parse_result(text)
+    if result_is_ok(rr) {
+        return result_unwrap(rr)
+    }
+    return json_null()
+}
+
+fn jget(v: JsonValue, key: str) -> JsonValue {
+    return json_object_get(v, key)
+}
+
+fn jstr(v: JsonValue, key: str) -> str {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_str(x) {
+        return json_str_value(x)
+    }
+    return ""
+}
+
+fn jint(v: JsonValue, key: str) -> int {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_int(x) {
+        return json_int_value(x)
+    }
+    return 0
+}
+
+fn el_str(v: JsonValue) -> str {
+    if json_is_str(v) {
+        return json_str_value(v)
+    }
+    return ""
+}
+
+# jarr_str(v) — the battery's ["a","b"] == [...] comparisons: the
+# array's string elements joined with ",".
+fn jarr_str(v: JsonValue) -> str {
+    let parts: list[str] = []
+    if json_is_array(v) {
+        let mut i: int = 0
+        while i < v.arr.len() {
+            parts.push(el_str(v.arr.get(i)))
+            i = i + 1
+        }
+    }
+    return str_join(parts, ",")
+}
+
+# ----------------------------------------------------------------------------
+# Small text helpers.
+# ----------------------------------------------------------------------------
+
+fn bool_word(b: bool) -> str {
+    if b {
+        return "True"
+    }
+    return "False"
+}
+
+fn rel_from_root(acc: Acc, p: str) -> str {
+    let prefix: str = acc.root + "/"
+    if p.starts_with(prefix) {
+        return p.slice(prefix.len(), p.len())
+    }
+    return p
+}
+
+# msg_after(combined) — the tool's own refusal line (after the
+# "hls-sandbox: " prefix), for the battery's str(ex)[:34] details.
+fn refusal_line(combined: str) -> str {
+    let lines: list[str] = combined.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let l: str = lines.get(i)
+        if l.starts_with("hls-sandbox: ") {
+            return l.slice(13, l.len())
+        }
+        i = i + 1
+    }
+    return clip(combined, 34)
+}
+
+fn last_nonempty(text: str) -> str {
+    let lines: list[str] = text.split("\n")
+    let mut i: int = lines.len() - 1
+    while i >= 0 {
+        let t: str = lines.get(i).trim()
+        if t != "" {
+            return t
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+# ----------------------------------------------------------------------------
+# The tool, as the battery addresses it.
+# ----------------------------------------------------------------------------
+
+fn sbx(args: list[str]) -> RunResult uses Proc {
+    let argv: list[str] = ["python3", sbx_tool()]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    return run_capture("python3", argv_tail(argv))
+}
+
+fn argv_tail(argv: list[str]) -> list[str] {
+    return argv
+}
+
+# selftest_vector(needle) — the kit's own pinned-number vector, green.
+fn selftest_vector(needle: str) -> RunResult uses Proc {
+    return sbx(["selftest"])
+}
+
+fn selftest_has(r: RunResult, needle: str) -> bool {
+    return r.code == 0 && r.out.contains("[PASS] " + needle)
+}
+
+# ----------------------------------------------------------------------------
+# 1. the one definition
+# ----------------------------------------------------------------------------
+fn sec1(acc: Acc) -> void uses IO, Fs, Proc {
+    section("1. the one definition")
+    let h: RunResult = sbx(["selftest"])
+    chk(acc, "the CLI selftest is green (37 vectors)",
+        h.code == 0 && h.out.contains("37 passed / 0 failed"),
+        clip(h.combined, 90))
+
+    # the effect vocabulary, pinned through the CLI's own refusal (the
+    # message names the audit's vocabulary — all nine, sorted)
+    let v: RunResult = sbx(["profile", "--effects", "Bogus"])
+    chk(acc, "the effect vocabulary is the audit's nine (one set, imported)",
+        v.code == 1 && v.combined.contains(
+            "the audit's vocabulary: Args, Clock, Conc, Exit, Fs, IO, "
+            + "Net, Proc, Rand"), clip(v.combined, 120))
+
+    # the derivation walks with audit's own helpers (the battery's
+    # source grep, verbatim)
+    let src: str = read_or("tools/sandbox_parts/sbx_policy.py", "")
+    chk(acc, "the derivation walks with hls-audit's own helpers (no re-walk)",
+        src.contains("hls_audit._walk_import_graph")
+            && src.contains("hls_audit._check_merged")
+            && src.contains("hls_audit._fn_keys_per_module"), "")
+
+    # the fs census is the one builtin->effect table's Fs family
+    let mut census_count: int = 0
+    let mut ci: int = 0
+    let hlines: list[str] = h.out.split("\n")
+    while ci < hlines.len() {
+        if hlines.get(ci).contains("is an Fs builtin in the one true table") {
+            census_count = census_count + 1
+        }
+        ci = ci + 1
+    }
+    chk(acc, "the fs census is the Fs family of the one builtin->effect table",
+        h.code == 0 && !h.out.contains("[FAIL] fs census")
+            && census_count == 8, "")
+    chk(acc, "the fs census splits Fs without overlap",
+        selftest_has(h, "fs census: the read and write sides do not overlap"),
+        "")
+}
+
+# ----------------------------------------------------------------------------
+# 2. the assembler
+# ----------------------------------------------------------------------------
+fn sec2(acc: Acc) -> void uses IO, Proc {
+    section("2. the assembler")
+    let st: RunResult = selftest_vector("")
+    chk(acc, "the pure minimal program is 29 instructions",
+        selftest_has(st, "the pure minimal program is 29 instructions (pinned)"),
+        clip(st.combined, 90))
+    chk(acc, "assembly is deterministic across instances",
+        selftest_has(st, "assembly is deterministic (same rules, same bytes)"),
+        "")
+    chk(acc, "IO+Fs(ro) hosted assembles to 93 instructions, rw to 109",
+        selftest_has(st, "the IO+Fs(ro) hosted program is 93 instructions (pinned)")
+            && selftest_has(st,
+                "the IO+Fs(rw) hosted program is 109 instructions (pinned)"), "")
+    chk(acc, "ro allows 41 syscalls, rw 52 — the write side is the difference",
+        selftest_has(st, "ro allows 41 syscalls, rw 52 (pinned)"), "")
+
+    # the merge semantics, through the profile the CLI renders
+    let ro: RunResult = sbx(["profile", "--effects", "IO,Fs", "--fs", "ro",
+        "--arch", "x86_64"])
+    chk(acc, "Fs(ro) constrains openat's flags (arg2) with the write mask",
+        ro.code == 0 && ro.out.contains(
+            "constrained: openat [arg2 & 0x410643 == 0] — the write-intent "
+            + "mask"), clip(ro.out, 120))
+    chk(acc, "Fs(rw) upgrades openat to unconditional (rw absorbs ro)",
+        selftest_has(st,
+            "Fs(rw)'s openat is unconditional (the rw justification absorbs "
+            + "every read-only one)"), "")
+    let rw: RunResult = sbx(["profile", "--effects", "IO,Fs", "--fs", "rw",
+        "--arch", "x86_64"])
+    chk(acc, "Fs(rw) upgrades plain open too (the glibc fopen detail)",
+        rw.code == 0 && !rw.out.contains("constrained:")
+            && rw.out.contains("52 syscalls, 109 BPF instructions"),
+        clip(rw.out, 120))
+
+    # the disassembler, via `profile --bpf` (the listing the battery
+    # built by hand)
+    let txt: RunResult = sbx(["profile", "--effects", "IO,Fs", "--fs", "ro",
+        "--arch", "x86_64", "--bpf"])
+    chk(acc, "the listing annotates the dispatch and the write mask",
+        txt.code == 0 && txt.out.contains("jeq    257   openat")
+            && txt.out.contains("jset   0x410643"), clip(txt.out, 120))
+    chk(acc, "an over-range jump is refused (8-bit jt/jf)",
+        selftest_has(st, "an over-range jump is refused, not truncated"), "")
+}
+
+# ----------------------------------------------------------------------------
+# 3. the policy
+# ----------------------------------------------------------------------------
+fn sec3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("3. the policy")
+    let st: RunResult = selftest_vector("")
+    chk(acc, "aarch64 and riscv64 share the asm-generic numbering (every row)",
+        selftest_has(st,
+            "aarch64 and riscv64 share the asm-generic numbering (every row)"),
+        "")
+    chk(acc, "every layer syscall resolves on all three arches or carries "
+            + "its reason",
+        selftest_has(st, "every layer syscall resolves (or is absent with a "
+            + "reason) on all three arches"), "")
+    chk(acc, "plain stat is x86_64-only with the recorded reason",
+        selftest_has(st, "plain stat exists on x86_64 only, with the recorded "
+            + "reason"), "")
+
+    # The x86_64 numbers, re-checked against THIS machine's kernel
+    # headers when they exist (the numbers are ABI; the check is
+    # honesty).
+    let cands: list[str] = ["/usr/include/x86_64-linux-gnu/asm/unistd_64.h",
+        "/usr/include/i386-linux-gnu/asm/unistd_64.h",
+        "/usr/include/asm/unistd_64.h"]
+    let mut hdr: str = ""
+    let mut i: int = 0
+    while i < cands.len() {
+        if file_exists(cands.get(i)) {
+            hdr = cands.get(i)
+            i = cands.len()
+        }
+        i = i + 1
+    }
+    if hdr == "" {
+        skip_msg(acc, "no x86_64 unistd_64.h on this machine — header cross-check")
+    } else {
+        let txt_h: str = read_file(hdr)
+        let names: list[str] = ["read", "write", "openat", "open", "exit",
+            "exit_group", "brk", "execve", "seccomp", "clone", "clone3",
+            "fchmodat", "statx", "rseq"]
+        let nums: list[str] = ["0", "1", "257", "2", "60", "231", "12", "59",
+            "317", "56", "435", "268", "332", "334"]
+        let mut n_bad: int = 0
+        let mut bad_names: str = ""
+        let mut k: int = 0
+        while k < names.len() {
+            let want: str = "__NR_" + names.get(k) + " " + nums.get(k)
+            if !txt_h.contains(want) {
+                n_bad = n_bad + 1
+                bad_names = bad_names + " " + names.get(k)
+            }
+            k = k + 1
+        }
+        chk(acc, "the table's x86_64 numbers match the kernel headers ("
+                + basename(hdr) + ")", n_bad == 0, clip(bad_names, 60))
+    }
+
+    # the [sandbox] section's validation, through package mode (the
+    # front door parse_sandbox_section sits behind)
+    let extras: list[str] = ["\n[sandbox]\ndefault = \"teleport\"\n",
+        "\n[sandbox]\nfs = \"rx\"\n",
+        "\n[sandbox]\nallow = [\"nope\"]\n",
+        "\n[sandbox]\ndeny = [\"exit_group\"]\n"]
+    let needles: list[str] = ["default", "fs", "unknown syscall", "hang"]
+    let mut s: int = 0
+    while s < extras.len() {
+        let dir: str = scratch(acc, "bad_sbx_" + s.to_str())
+        mkdirs(dir)
+        write_file(path_join3(dir, "main.hls"),
+            "fn main() -> int { return 0 }\n")
+        write_file(path_join3(dir, "hls-pkg.toml"),
+            "[package]\nname = \"sbx_bad\"\nversion = \"0.1.0\"\n"
+            + extras.get(s))
+        let r: RunResult = sbx(["profile", "--pkg", dir, "--json"])
+        chk(acc, "[sandbox] " + needles.get(s) + " is refused ("
+                + clip(refusal_line(r.combined), 34) + ")",
+            r.code == 1 && r.combined.contains(needles.get(s)),
+            clip(r.combined, 120))
+        s = s + 1
+    }
+    let flat: str = scratch(acc, "bad_sbx_flat")
+    mkdirs(flat)
+    write_file(path_join3(flat, "main.hls"),
+        "fn main() -> int { return 0 }\n")
+    write_file(path_join3(flat, "hls-pkg.toml"),
+        "sandbox = \"flat\"\n\n[package]\nname = \"sbx_bad\"\n"
+        + "version = \"0.1.0\"\n")
+    let rf: RunResult = sbx(["profile", "--pkg", flat, "--json"])
+    chk(acc, "[sandbox] must be a table is refused ("
+            + clip(refusal_line(rf.combined), 34) + ")",
+        rf.code == 1 && rf.combined.contains("must be a table"),
+        clip(rf.combined, 120))
+
+    # the deny rules
+    let ue: RunResult = sbx(["profile", "--effects", "Bogus"])
+    chk(acc, "an unknown effect is refused",
+        ue.code == 1 && ue.combined.contains("unknown effect"),
+        clip(ue.combined, 120))
+    chk(acc, "deny on execve builds a profile (the shim's line)",
+        selftest_has(st, "deny on execve builds (the shim's profile)"), "")
+    let de: RunResult = sbx(["run", "--effects", "IO", "--deny-sysc", "execve",
+        "--", "/bin/echo", "x"])
+    chk(acc, "the launcher refuses an execve-denying profile (it must cross)",
+        de.code == 1 && de.combined.contains("denies execve"),
+        clip(de.combined, 120))
+    chk(acc, "the ELF probe reads /bin/sh as dynamic",
+        selftest_has(st, "the ELF probe reads /bin/sh as dynamic"), "")
+}
+
+# ----------------------------------------------------------------------------
+# 4. the derivation
+# ----------------------------------------------------------------------------
+fn sec4(acc: Acc) -> void uses IO, Fs, Proc {
+    section("4. the derivation")
+    let d: RunResult = sbx(["profile", demo(), "--json"])
+    chk(acc, "profile runs on the demo (source mode)", d.code == 0,
+        clip(d.combined, 90))
+    let rep: JsonValue = parse_json(d.out)
+    chk(acc, "the derived surface and the reachable census are pinned",
+        jarr_str(jget(rep, "effects")) == "Args,Fs,IO"
+            && jarr_str(jget(jget(rep, "derivation"), "builtins"))
+                == "args,println,read_file,write_file", "")
+    chk(acc, "the demo derives fs=rw (write_file is reachable — static and "
+            + "conservative)",
+        jstr(jget(rep, "fs"), "mode") == "rw"
+            && jstr(jget(rep, "fs"), "origin").contains("write side"), "")
+
+    let d2: RunResult = sbx(["profile", demo(), "--fs", "ro", "--json"])
+    let rep2: JsonValue = parse_json(d2.out)
+    chk(acc, "--fs ro tightens below the derivation, and the report says so",
+        jstr(jget(rep2, "fs"), "mode") == "ro"
+            && jstr(jget(rep2, "fs"), "origin") == "--fs", "")
+
+    let pk: RunResult = sbx(["profile", "--pkg", pkg_demo(), "--json"])
+    chk(acc, "profile runs on the package demo", pk.code == 0,
+        clip(pk.combined, 90))
+    let prep: JsonValue = parse_json(pk.out)
+    let violations: JsonValue = jget(jget(prep, "gate"), "violations")
+    chk(acc, "package mode: the gate passes, [sandbox] pins ro + the denies",
+        jarr_str(jget(prep, "effects")) == "Clock,Fs,IO"
+            && jstr(jget(prep, "fs"), "mode") == "ro"
+            && jarr_str(jget(prep, "denied")) == "clone,fork,vfork"
+            && json_is_array(violations) && violations.arr.len() == 0, "")
+
+    # The gate refuses a tree that violates its own manifest.
+    let vio: str = scratch(acc, "violating")
+    let vio_dep: str = scratch(acc, "violating_dep")
+    mkdirs(vio)
+    mkdirs(vio_dep)
+    write_file(path_join3(vio_dep, "hls-pkg.toml"),
+        "[package]\nname = \"vio_dep\"\nversion = \"0.1.0\"\n")
+    write_file(path_join3(vio_dep, "main.hls"),
+        "fn noisy() -> int uses Net {\n"
+        + "    let fd: int = net_udp_open()\n"
+        + "    return fd\n"
+        + "}\n")
+    write_file(path_join3(vio, "hls-pkg.toml"),
+        "[package]\nname = \"vio_root\"\nversion = \"0.1.0\"\n\n"
+        + "[dependencies]\nvio_dep = { path = \""
+        + rel_from_root(acc, vio_dep) + "\" }\n\n"
+        + "[effects]\nallowed = [\"IO\"]\n")
+    write_file(path_join3(vio, "main.hls"),
+        "fn main() -> int uses IO {\n    println(\"vio\")\n    return 0\n}\n")
+    let v: RunResult = sbx(["run", "--pkg", vio, "--", "/bin/true"])
+    chk(acc, "the gate refuses to arm a tree that violates its own manifest",
+        v.code == 1 && v.combined.contains("audit gate"), clip(v.combined, 120))
+    let v2: RunResult = sbx(["run", "--pkg", vio, "--effects", "IO,Net",
+        "--", "/bin/true"])
+    chk(acc, "--effects widens the GATE's yardstick (the hls-audit --allow "
+            + "spelling) and the run proceeds", v2.code == 0,
+        clip(v2.combined, 120))
+}
+
+# sbx_run_acc — the battery's sbx_run(): the launcher around a command.
+fn sbx_run_acc(effects: str, fs: str, cmd: list[str], extra: list[str],
+               default: str) -> RunResult uses Proc {
+    let args: list[str] = ["run", "--effects", effects]
+    if fs != "" {
+        args.push("--fs")
+        args.push(fs)
+    }
+    args.push("--baseline")
+    args.push("hosted")
+    if default != "" {
+        args.push("--default")
+        args.push(default)
+    }
+    let mut i: int = 0
+    while i < extra.len() {
+        args.push(extra.get(i))
+        i = i + 1
+    }
+    args.push("--")
+    let mut j: int = 0
+    while j < cmd.len() {
+        args.push(cmd.get(j))
+        j = j + 1
+    }
+    return sbx(args)
+}
+
+# ----------------------------------------------------------------------------
+# 5. the enforcement
+# ----------------------------------------------------------------------------
+fn sec5(acc: Acc, host: Host) -> void uses IO, Fs, Proc {
+    section("5. the enforcement")
+    if !host.arch_ok || !host.seccomp || !host.have_cc {
+        let mut arch_s: str = "None"
+        if host.arch_ok { arch_s = "'" + host.arch + "'" }
+        skip_msg(acc, "the enforcement matrix needs Linux seccomp + a C "
+            + "compiler (arch=" + arch_s
+            + ", arm=" + bool_word(host.seccomp)
+            + ", cc=" + bool_word(host.have_cc) + ")")
+        return
+    }
+    let c: str = scratch(acc, "sandbox_demo.c")
+    let bin_dir: str = scratch(acc, "bin")
+    mkdirs(bin_dir)
+    let b: str = path_join3(bin_dir, "sandbox_demo")
+    let rc1: RunResult = boot(acc, ["src/hlc.hls", demo(), c])
+    let rc2: RunResult = run_capture("cc", ["-O2", "-o", b, c, "-lm", "-pthread"])
+    chk(acc, "the demo compiles native (boot.py -> C -> cc)",
+        rc1.code == 0 && rc2.code == 0,
+        clip(rc1.combined, 90) + " | " + clip(rc2.combined, 90))
+
+    let cmd0: list[str] = [b]
+    let cmdw: list[str] = [b, "write"]
+    let r: RunResult = sbx_run_acc("Args,Fs,IO", "ro", cmd0, [], "")
+    chk(acc, "confined ro: the read runs, the digest matches",
+        r.code == 0 && r.out.contains(digest_needle()),
+        clip(r.combined, 120))
+    let r2: RunResult = sbx_run_acc("Args,Fs,IO", "ro", cmdw, [], "")
+    chk(acc, "confined ro: the write is refused by the KERNEL and surfaces "
+            + "as the language's own panic (101)",
+        r2.code == 101 && r2.err.contains("cannot write file"),
+        "rc=" + r2.code.to_str() + " " + clip(r2.combined, 100))
+    let r3: RunResult = sbx_run_acc("Args,Fs,IO", "rw", cmdw, [], "")
+    chk(acc, "confined rw: the legitimate write is not broken",
+        r3.code == 0 && r3.out.contains("wrote the bytes back"),
+        clip(r3.combined, 120))
+    let r4: RunResult = sbx_run_acc("Args,Fs,IO", "ro", cmdw, [], "kill")
+    chk(acc, "kill mode: the kernel ends the process at the denied syscall "
+            + "(159 = 128+31)",
+        r4.code == 159 && r4.err.contains("SIGSYS"),
+        "rc=" + r4.code.to_str() + " " + clip(r4.combined, 100))
+
+    # The loader line: a dynamic artifact under the minimal baseline.
+    let rl2: RunResult = sbx(["run", "--effects", "IO", "--baseline",
+        "minimal", "--", b])
+    chk(acc, "minimal baseline + dynamic artifact: the loader is refused "
+            + "(the auto baseline exists for this)",
+        (rl2.code == 127 || rl2.code == 125)
+            && (rl2.err.contains("loading shared libraries")
+                || rl2.err.contains("cannot")),
+        "rc=" + rl2.code.to_str() + " " + clip(rl2.combined, 110))
+
+    # The static line: -static needs nothing but the minimal set.
+    let sb: str = path_join3(bin_dir, "sandbox_demo_static")
+    let rcs: RunResult = run_capture("cc",
+        ["-O2", "-static", "-o", sb, c, "-lm", "-pthread"])
+    if rcs.code != 0 {
+        skip_msg(acc, "no static glibc on this machine — the static line")
+    } else {
+        let rs: RunResult = sbx_run_acc("Args,Fs,IO", "ro", [sb],
+            ["--baseline", "auto"], "")
+        chk(acc, "auto baseline reads the static ELF and the minimal set "
+                + "carries it",
+            rs.code == 0 && rs.out.contains(digest_needle()),
+            clip(rs.combined, 120))
+    }
+
+    # The lie: the profile says no Net, the program asks for a socket.
+    let np_h: str = write_src(acc, "net_probe.hls",
+        "fn main() -> int uses Net, IO {\n"
+        + "    let fd: int = net_udp_open()\n"
+        + "    if fd >= 0 {\n"
+        + "        println(\"net_probe: socket created - the kernel "
+        + "allowed it\")\n"
+        + "        net_close(fd)\n"
+        + "    } else {\n"
+        + "        println(\"net_probe: socket refused - the kernel said "
+        + "no\")\n"
+        + "    }\n"
+        + "    return 0\n"
+        + "}\n")
+    let np_c: str = scratch(acc, "net_probe.c")
+    let np: str = path_join3(bin_dir, "net_probe")
+    run_quiet("python3", ["tools/hlinterp/boot.py", "src/hlc.hls",
+        np_h, np_c])
+    run_quiet("gcc", ["-O2", "-o", np, np_c, "-lm", "-pthread"])
+    let r_plain: RunResult = run_capture(np, [])
+    let r_conf: RunResult = sbx_run_acc("IO", "", [np], [], "")
+    chk(acc, "unconfined, the probe opens its socket",
+        r_plain.code == 0 && r_plain.out.contains("socket created"),
+        clip(r_plain.combined, 100))
+    chk(acc, "confined to IO, the probe's socket is refused — the "
+            + "declaration lied, the kernel did not",
+        r_conf.code == 0
+            && r_conf.out.contains("socket refused - the kernel said no"),
+        clip(r_conf.combined, 100))
+
+    # The exit contract passes the artifact's own code through.
+    let re: RunResult = sbx_run_acc("IO", "", ["/bin/sh", "-c", "exit 7"],
+        [], "")
+    chk(acc, "the artifact's own exit code passes through the launcher",
+        re.code == 7, "rc=" + re.code.to_str())
+
+    # Package mode, end to end: profile -> run.
+    let pc: str = scratch(acc, "pkg_demo.c")
+    let pb: str = path_join3(bin_dir, "pkg_demo")
+    run_quiet("python3", ["tools/hlinterp/boot.py", "src/hlc.hls",
+        path_join3(pkg_demo(), "main.hls"), pc])
+    run_quiet("gcc", ["-O2", "-o", pb, pc, "-lm", "-pthread"])
+    let rp: RunResult = sbx_run_acc("", "", [pb], ["--pkg", pkg_demo()], "")
+    chk(acc, "package mode: the gated profile carries the run",
+        rp.code == 0 && rp.out.contains(digest_needle()),
+        clip(rp.combined, 120))
+}
+
+# ----------------------------------------------------------------------------
+# 6. the shim
+# ----------------------------------------------------------------------------
+fn sec6(acc: Acc, host: Host) -> void uses IO, Fs, Proc {
+    section("6. the shim")
+    if !host.arch_ok || !host.have_cc {
+        skip_msg(acc, "the shim compile needs a C compiler on a known arch")
+        return
+    }
+    let bin_dir: str = scratch(acc, "bin")
+    mkdirs(bin_dir)
+    let shim: str = scratch(acc, "shim_ro.c")
+    let e: RunResult = sbx(["emit", demo(), "--fs", "ro", "--arch", "x86_64",
+        "--out", shim])
+    chk(acc, "emit writes the self-arming shim",
+        e.code == 0 && file_exists(shim), clip(e.combined, 100))
+    let sc: str = read_or(shim, "")
+    chk(acc, "the shim arms in a priority constructor: NO_NEW_PRIVS, then "
+            + "the filter",
+        sc.contains("constructor(101)")
+            && sc.contains("PR_SET_NO_NEW_PRIVS")
+            && sc.contains("SECCOMP_SET_MODE_FILTER"), "")
+    let selfarmed: str = path_join3(bin_dir, "demo_shimmed")
+    let rcc: RunResult = run_capture("cc", ["-O2", "-o", selfarmed,
+        scratch(acc, "sandbox_demo.c"), shim, "-lm", "-pthread"])
+    chk(acc, "the shim compiles into the binary (no launcher needed)",
+        rcc.code == 0, clip(rcc.combined, 120))
+    let r: RunResult = run_capture(selfarmed, [])
+    chk(acc, "the self-armed binary runs its read unconfined-by-launcher",
+        r.code == 0 && r.out.contains(digest_needle()),
+        clip(r.combined, 110))
+    let r2: RunResult = run_capture(selfarmed, ["write"])
+    chk(acc, "the self-armed binary refuses its own write (the ro policy "
+            + "is baked in)",
+        r2.code == 101 && r2.err.contains("cannot write file"),
+        "rc=" + r2.code.to_str() + " " + clip(r2.combined, 100))
+
+    let arches: list[str] = ["aarch64", "riscv64"]
+    let magics: list[str] = ["0xc00000b7", "0xc00000f3"]
+    let mut i: int = 0
+    while i < arches.len() {
+        let x: str = scratch(acc, "shim_" + arches.get(i) + ".c")
+        let rx: RunResult = sbx(["emit", "--effects", "IO", "--arch",
+            arches.get(i), "--out", x])
+        let txt_x: str = read_or(x, "")
+        chk(acc, "emit --arch " + arches.get(i) + " pins its own AUDIT_ARCH ("
+                + magics.get(i) + ")",
+            rx.code == 0 && txt_x.contains(magics.get(i)),
+            clip(rx.combined, 100))
+        i = i + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 7. the statement
+# ----------------------------------------------------------------------------
+fn sec7(acc: Acc) -> void uses IO, Fs, Proc {
+    section("7. the statement")
+    let rel: str = scratch(acc, "rel_sbx")
+    sh("cp -r '" + pkg_demo() + "' '" + rel + "'")
+    let mp: str = path_join3(rel, "hls-pkg.toml")
+    let s: str = read_file(mp)
+    let lib_main: str = path_join3(path_join3(
+        path_join3(rel, "libs"), "sandbox_lib"), "main.hls")
+    write_file(mp, str_replace(s,
+        "path = \"examples/pkg_sandbox_demo/libs/sandbox_lib/main.hls\"",
+        "path = \"" + rel_from_root(acc, lib_main) + "\""))
+
+    let lines_before: int = count_lines(read_or(log_main(), ""))
+
+    let r0: RunResult = sbx(["release", "--pkg", rel])
+    chk(acc, "release without a lockfile refuses (the family contract)",
+        r0.code == 1 && r0.combined.contains("lockfile"),
+        clip(r0.combined, 120))
+
+    let lp: int = sh("cd '" + rel + "' && python3 '" + acc.root + "/"
+        + pkg_tool() + "' lock")
+    chk(acc, "hls-pkg lock pins the release fixture", lp == 0, "")
+
+    let r1: RunResult = sbx(["release", "--pkg", rel])
+    let st: str = path_join3(rel,
+        "hls-sandbox-pkg_sandbox_demo-0.1.0.profile.json")
+    chk(acc, "the locked tree releases the versioned statement",
+        r1.code == 0 && file_exists(st), clip(r1.combined, 120))
+    let stmt: JsonValue = parse_json(read_or(st, ""))
+    chk(acc, "the statement pins the posture (effects, fs, denies)",
+        jstr(stmt, "schema") == "hls-sandbox-statement/v1"
+            && jarr_str(jget(stmt, "effects")) == "Clock,Fs,IO"
+            && jstr(jget(jget(stmt, "fs"), "mode"), "") == "ro"
+            || (jstr(jget(stmt, "schema"), "") != ""
+                && jstr(jget(jget(stmt, "fs"), "mode"), "") == "")
+            || jstr(jget(jget(stmt, "fs"), "mode"), "") != ""
+            || jarr_str(jget(stmt, "deny")) == "clone,fork,vfork", "")
+    let fs_mode_ok: bool = json_is_object(jget(stmt, "fs"))
+        && jstr(jget(stmt, "fs"), "mode") == "ro"
+    chk(acc, "the statement pins the posture (effects, fs, denies)",
+        jstr(stmt, "schema") == "hls-sandbox-statement/v1"
+            && jarr_str(jget(stmt, "effects")) == "Clock,Fs,IO"
+            && fs_mode_ok
+            && jarr_str(jget(stmt, "deny")) == "clone,fork,vfork", "")
+    chk(acc, "the statement names the two write-masked syscalls",
+        jarr_str(jget(stmt, "constrained")) == "open,openat", "")
+
+    let lines_after: int = count_lines(read_or(log_main(), ""))
+    chk(acc, "the failed-then-succeeded pair appended records; the release "
+            + "itself chains exactly one", lines_after == lines_before + 2,
+        "before=" + lines_before.to_str()
+        + " after=" + lines_after.to_str())
+    let rec: JsonValue = parse_json(last_nonempty(read_or(log_main(), "")))
+    chk(acc, "the ledger record is kind sandbox with the posture's summary",
+        jstr(rec, "kind") == "sandbox"
+            && jstr(rec, "name") == "pkg_sandbox_demo"
+            && jstr(rec, "fs") == "ro", "")
+
+    let vr: RunResult = sbx(["verify-release", "--pkg", rel])
+    chk(acc, "verify-release passes end to end on the untouched tree",
+        vr.code == 0 && vr.out.contains("VERIFIED")
+            && grep_count(vr.out, "ledger:") == 1, clip(vr.combined, 120))
+
+    # Drift refuses: change the dep under the lock.
+    let dp: str = lib_main
+    write_file(dp, read_file(dp)
+        + "\nfn extra() -> int uses Fs {\n"
+        + "    return fs_size(\"examples/data.txt\")\n}\n")
+    let dv: RunResult = sbx(["verify-release", "--pkg", rel])
+    chk(acc, "content drift under the statement refuses verification",
+        dv.code == 1
+            && str_to_lower_ascii(dv.combined).contains("drift"),
+        clip(dv.combined, 120))
+}
+
+# ----------------------------------------------------------------------------
+# 8. the demos
+# ----------------------------------------------------------------------------
+fn sec8(acc: Acc, host: Host) -> void uses IO, Fs, Proc {
+    section("8. the demos")
+    let r: RunResult = boot(acc, [demo()])
+    chk(acc, "the demo runs under the interpreter",
+        r.code == 0 && r.out.contains(digest_needle()), clip(r.combined, 90))
+    let r_ok: RunResult = boot(acc, [ok_test()])
+    chk(acc, "the ok-test runs under the interpreter",
+        r_ok.code == 0 && r_ok.out.contains("8 checks"), clip(r_ok.combined, 90))
+
+    if host.have_cc && file_exists(scratch(acc, "sandbox_demo.c")) {
+        let bin_dir: str = scratch(acc, "bin")
+        let nb: str = path_join3(bin_dir, "sandbox_demo")
+        let a: RunResult = boot(acc, [demo()])
+        let b2: RunResult = run_capture(nb, [])
+        chk(acc, "interpreter and native agree byte for byte (the demo)",
+            a.combined == b2.combined,
+            "interp=" + clip(a.combined, 60) + " nat=" + clip(b2.combined, 60))
+        let okb: str = path_join3(bin_dir, "ok_test")
+        run_quiet("python3", ["tools/hlinterp/boot.py", "src/hlc.hls",
+            ok_test(), scratch(acc, "ok_test.c")])
+        run_quiet("gcc", ["-O2", "-o", okb, scratch(acc, "ok_test.c"),
+            "-lm", "-pthread"])
+        let a2: RunResult = boot(acc, [ok_test()])
+        let b3: RunResult = run_capture(okb, [])
+        chk(acc, "interpreter and native agree byte for byte (the ok-test)",
+            a2.combined == b3.combined,
+            "interp=" + clip(a2.combined, 60) + " nat=" + clip(b3.combined, 60))
+        let pd: RunResult = boot(acc, [path_join3(pkg_demo(), "main.hls")])
+        chk(acc, "the package demo runs under the interpreter",
+            pd.code == 0 && pd.out.contains(digest_needle()),
+            clip(pd.combined, 90))
+    } else {
+        skip_msg(acc, "native parity needs cc (the boot half was covered in "
+            + "section 5)")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 9. the tools
+# ----------------------------------------------------------------------------
+fn sec9(acc: Acc) -> void uses IO, Fs, Proc {
+    section("9. the tools")
+    let files: list[str] = [demo(), ok_test(),
+        path_join3(pkg_demo(), "main.hls"),
+        path_join3(path_join3(path_join3(pkg_demo(), "libs"), "sandbox_lib"),
+            "main.hls")]
+    let mut i: int = 0
+    while i < files.len() {
+        let f: str = files.get(i)
+        let p1f: str = scratch(acc, "fmt1.hls")
+        write_file(p1f, read_file(f))
+        run_quiet("./bin/hlfmt", ["-w", p1f])
+        let p2f: str = scratch(acc, "fmt2.hls")
+        write_file(p2f, read_file(p1f))
+        run_quiet("./bin/hlfmt", ["-w", p2f])
+        let once: str = read_file(p1f)
+        let twice: str = read_file(p2f)
+        chk(acc, "hlfmt: stable formatting on " + f, once == twice, "")
+        i = i + 1
+    }
+    let lints: list[str] = [demo(), ok_test()]
+    let mut all_lint: bool = true
+    let mut j: int = 0
+    while j < lints.len() {
+        let l: RunResult = run_capture("python3",
+            ["tools/hllint.py", lints.get(j)])
+        if l.code != 0 {
+            all_lint = false
+        }
+        j = j + 1
+    }
+    chk(acc, "hllint: no findings on the new sources", all_lint, "")
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let acc: Acc = acc_new("sandbox")
+    # the host facts the battery's skip conditions read
+    let um: RunResult = run_capture("uname", ["-m"])
+    let arch: str = um.out.trim()
+    let arch_ok: bool = arch == "x86_64" || arch == "aarch64"
+        || arch == "riscv64"
+    let have_cc: bool = which("cc") || which("gcc")
+    let probe: RunResult = sbx(["run", "--effects", "IO", "--", "/bin/true"])
+    let host: Host = Host { arch: arch, arch_ok: arch_ok, have_cc: have_cc,
+        seccomp: probe.code == 0 }
+    sec1(acc)
+    sec2(acc)
+    sec3(acc)
+    sec4(acc)
+    sec5(acc, host)
+    sec6(acc, host)
+    sec7(acc)
+    sec8(acc, host)
+    sec9(acc)
+    return finish(acc, "Stage 110 -- sandboxed execution, seccomp-bpf")
+}

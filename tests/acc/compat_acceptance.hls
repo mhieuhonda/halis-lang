@@ -1,0 +1,1046 @@
+# ============================================================================
+# tests/acc/compat_acceptance.hls — Stage 128 acceptance gate, in Halis
+# (the Halis twin of tests/compat_acceptance.py; same eight sections,
+# same assertions, same needles — the harness is tests/acc/harness.hls
+# and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make compat-acceptance` (which compiles this file to
+# bin/acc-compat and runs it from the repo root). The gate drives the
+# REAL verifier CLI (python3 tools/hls-compat.py), the REAL git
+# history, and the REAL ledger (tests/compat_ledger.json) exactly the
+# way the battery does; forged-ledger variants are written by a small
+# python child (the battery's ledger_variant json.dump(indent=2)) and
+# the real bytes are restored after every run.
+#
+# Front-door notes: the battery importlib-loaded tools/hls-compat.py
+# for its unit checks (_vkey, _context_hash, _toolchain_fingerprint,
+# _clean_env, _rel_import_paths, load_ledger); the gate asks the same
+# questions through a small python child (tests/.acc-scratch/compat/
+# s128_unit.py) that prints JSON, and asserts on it HERE. The
+# battery's interpreter legs named boot/boot.py — the path the
+# interpreter had before it moved to tools/hlinterp/boot.py (the path
+# hls-compat.py itself resolves today); the gate uses the current one.
+#
+#  1. the convention  — usage gates are exit 2 (unknown tag, unknown
+#     & the refusals    travel tag, --timeout 0); a missing, corrupt
+#                       or schema-mismatched ledger is exit 2, loudly
+#  2. the census      — --discover over the real repository: the
+#     & the keying       release-tag count, the non-release tag named
+#                       (never silently dropped), the dedup factor;
+#                       the keying laws unit-checked (version sort,
+#                       content addressing, import-closure context,
+#                       toolchain fingerprint, the clean env)
+#  3. the ledger      — the real registry: nine entries — five breaks,
+#     discipline         three drifts and one resurrection — each sha
+#                       spot-checked against the git object it names;
+#                       --update-ledger drafts a failing set honestly
+#                       (a green program cannot be drafted) and never
+#                       writes the file
+#  4. the             — the REAL CLI over the FULL census: exit 0,
+#     certification      COMPATIBLE, the json carrying the census, the
+#                       config and every verdict; a restricted probe
+#                       certifies a single release end to end
+#  5. the regression  — the alarm, proven three ways: a probe commit
+#     alarm              tagged into real history is caught as a
+#                        REGRESSION with its error line quoted (then
+#                        cleaned up, history restored); a ledger entry
+#                        removed turns a sanctioned break into a
+#                        REGRESSION; an entry pointed at a green program
+#                        is RECONCILED; an invented entry on the full
+#                        census is STALE — every direction of ledger
+#                        drift fails the verdict
+#  6. the time-travel — the history witness over six sampled releases
+#     witness            (the bookends plus one per drift family): the
+#                        hand-computed agreement matrix, every waiver
+#                        VERIFIED against the history it claims (the
+#                        break really ran green at its release; the
+#                        resurrection really was red; the drift's two
+#                        stdout digests really are what the entry pins),
+#                        zero divergences, zero unnamed resurrections
+#  7. the native      — 149 historical programs compiled with the
+#     differential       house recipe and run: native (exit, stdout)
+#                        byte-identical to the interpreter leg; the
+#                        stage's two new files differential-checked
+#                        directly
+#  8. the corpus      — the showcase and the demo are hlfmt-canonical,
+#     hygiene            hllint-clean, checker-green; the ledger parses
+#                        with exactly its nine entries; no gate litter
+#                        survives anywhere the gate ran
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.json"
+import "std.result"
+import "std.sha256"
+
+# ----------------------------------------------------------------------------
+# The gate's data.
+# ----------------------------------------------------------------------------
+
+fn ledger_path() -> str {
+    return "tests/compat_ledger.json"
+}
+
+fn showcase() -> str {
+    return "tests/ok/feat_stage128_compat.hls"
+}
+
+fn compat_demo() -> str {
+    return "examples/compat_demo.hls"
+}
+
+# The hand-computed witness matrix, in the battery's frozen order
+# (family tags, then corpus / agree / break / resurrect / drift).
+fn family_tags() -> list[str] {
+    return ["v0.7.0-alpha", "v0.34.0-alpha", "v0.70.0-alpha", "v0.103.0-alpha"]
+}
+
+fn family_corpus() -> list[int] {
+    return [42, 103, 148, 194]
+}
+
+fn family_agree() -> list[int] {
+    return [39, 102, 145, 192]
+}
+
+fn family_break() -> list[int] {
+    return [1, 1, 3, 1]
+}
+
+fn family_resurrect() -> list[int] {
+    return [0, 0, 0, 1]
+}
+
+fn family_drift() -> list[int] {
+    return [2, 0, 0, 0]
+}
+
+fn unit_shim_src() -> str {
+    return "#!/usr/bin/env python3\n"
+        + "# s128 unit shim — the battery importlib-loaded tools/hls-compat.py\n"
+        + "# and asserted on its private helpers; the gate asks the same\n"
+        + "# questions through this child and asserts on the JSON it prints.\n"
+        + "import importlib.util\n"
+        + "import json\n"
+        + "import sys\n"
+        + "\n"
+        + "spec = importlib.util.spec_from_file_location('hls_compat_shim', 'tools/hls-compat.py')\n"
+        + "mod = importlib.util.module_from_spec(spec)\n"
+        + "spec.loader.exec_module(mod)\n"
+        + "\n"
+        + "mode = sys.argv[1]\n"
+        + "if mode == 'vkey':\n"
+        + "    print(json.dumps([list(mod._vkey(t)) for t in ('v0.9.0-alpha', 'v0.10.0-alpha', 'v0.100.0-alpha', 'v0.99.1-alpha')]))\n"
+        + "elif mode == 'ctx':\n"
+        + "    print(json.dumps([mod._context_hash(sys.argv[2], sys.argv[3]), mod._context_hash(sys.argv[4], sys.argv[5])]))\n"
+        + "elif mode == 'ctx1':\n"
+        + "    print(json.dumps([mod._context_hash(sys.argv[2], sys.argv[3])]))\n"
+        + "elif mode == 'fp':\n"
+        + "    print(json.dumps([mod._toolchain_fingerprint(sys.argv[2]), mod._toolchain_fingerprint(sys.argv[3])]))\n"
+        + "elif mode == 'fp1':\n"
+        + "    print(json.dumps([mod._toolchain_fingerprint(sys.argv[2])]))\n"
+        + "elif mode == 'env':\n"
+        + "    print(json.dumps(sorted(mod._clean_env())))\n"
+        + "elif mode == 'rels':\n"
+        + "    print(json.dumps(mod._rel_import_paths(sys.argv[2])))\n"
+        + "elif mode == 'ledger':\n"
+        + "    _data, by_key = mod.load_ledger(sys.argv[2])\n"
+        + "    print(json.dumps([len(by_key)]))\n"
+}
+
+fn mutate_shim_src() -> str {
+    return "#!/usr/bin/env python3\n"
+        + "# s128 ledger-variant shim — the battery's ledger_variant context\n"
+        + "# manager (json.dump(indent=2) + a trailing newline), by mode.\n"
+        + "import hashlib\n"
+        + "import json\n"
+        + "import sys\n"
+        + "\n"
+        + "LEDGER = 'tests/compat_ledger.json'\n"
+        + "mode = sys.argv[1]\n"
+        + "data = json.load(open(LEDGER))\n"
+        + "if mode == 'drop':\n"
+        + "    data['waivers'] = [x for x in data['waivers'] if x['file'] != 'feat_import.hls']\n"
+        + "elif mode == 'green':\n"
+        + "    green = hashlib.sha256(open('tests/ok/feat_import.hls', 'rb').read()).hexdigest()[:16]\n"
+        + "    for x in data['waivers']:\n"
+        + "        if x['file'] == 'feat_import.hls':\n"
+        + "            x['sha256_16'] = green\n"
+        + "elif mode == 'ghost':\n"
+        + "    data['waivers'].append({'file': 'feat_ghost.hls', 'sha256_16': '0' * 16, 'kind': 'break', 'sanctioned_change': 'invented', 'reason': 'matches nothing'})\n"
+        + "else:\n"
+        + "    sys.exit(2)\n"
+        + "with open(LEDGER, 'w') as fh:\n"
+        + "    json.dump(data, fh, indent=2)\n"
+        + "    fh.write('\\n')\n"
+}
+
+# ----------------------------------------------------------------------------
+# Small helpers.
+# ----------------------------------------------------------------------------
+
+# compat(acc, args) — the verifier CLI, the interface a user drives.
+fn compat(acc: Acc, args: list[str]) -> RunResult uses Proc {
+    let argv: list[str] = ["tools/hls-compat.py"]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    return run_capture("python3", argv)
+}
+
+# interp(acc, args) — today's Stage-0 interpreter (tools/hlinterp/boot.py;
+# the battery's constant predated the interpreter's move — see header).
+fn interp(acc: Acc, args: list[str]) -> RunResult uses Proc {
+    let argv: list[str] = ["tools/hlinterp/boot.py"]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    return run_capture("python3", argv)
+}
+
+# chk(acc, cond, msg) — the battery's check(cond, msg) grammar.
+fn chk(acc: Acc, cond: bool, msg: str) -> void uses IO {
+    if cond {
+        pass_msg(acc, msg)
+    } else {
+        fail_msg(acc, msg)
+    }
+}
+
+# jint_or(v, d) — Python's t.get(k, default) for an int field.
+fn jint_or(v: JsonValue, d: int) -> int {
+    if json_is_int(v) {
+        return json_int_value(v)
+    }
+    return d
+}
+
+# jarr_len_or1(v, key) — Python's len(t.get(k, ["x"])): a MISSING key
+# counts 1 (and so fails the == 0 check, exactly like the battery).
+fn jarr_len_or1(v: JsonValue, key: str) -> int {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_array(x) {
+        return x.arr.len()
+    }
+    return 1
+}
+
+# jarr_len_or0(v, key) — Python's len(rep["contents"].get(k, [])).
+fn jarr_len_or0(v: JsonValue, key: str) -> int {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_array(x) {
+        return x.arr.len()
+    }
+    return 0
+}
+
+# str_lt(a, b) — byte-lexicographic less-than (Python's str ordering).
+fn str_lt(a: str, b: str) -> bool {
+    let n: int = a.len()
+    let m: int = b.len()
+    let mut i: int = 0
+    while i < n && i < m {
+        let ba: int = a.byte_at(i)
+        let bb: int = b.byte_at(i)
+        if ba != bb {
+            return ba < bb
+        }
+        i = i + 1
+    }
+    return n < m
+}
+
+# count_char(s, ch) — Python's str.count("/") for the ls-tree corpus.
+fn count_char(s: str, ch: int) -> int {
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < s.len() {
+        if s.byte_at(i) == ch {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+# int_before(s, marker) — the digits that end right before the marker
+# (the census line's `\d+ file-instances` / `\d+ unique programs`).
+fn int_before(s: str, marker: str) -> int {
+    let idx: int = s.find(marker)
+    if idx < 0 {
+        return -1
+    }
+    let mut i: int = idx - 1
+    let mut val: int = 0
+    let mut mult: int = 1
+    let mut any: bool = false
+    while i >= 0 {
+        let b: int = s.byte_at(i)
+        if b >= 48 && b <= 57 {
+            val = val + (b - 48) * mult
+            mult = mult * 10
+            any = true
+            i = i - 1
+        } else {
+            break
+        }
+    }
+    if any {
+        return val
+    }
+    return -1
+}
+
+# dedup_gt50(s) — the census line's `dedup ([\d.]+)x` is a float the
+# battery compares > 50; compare it without floats: the integer part
+# decides, a 50 needs a nonzero fraction.
+# ParsedNum — digits parsed, and the index just past them.
+struct ParsedNum {
+    val: int,
+    next: int
+}
+
+fn parse_digits_at(s: str, from: int) -> ParsedNum {
+    let mut val: int = 0
+    let mut i: int = from
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        if b >= 48 && b <= 57 {
+            val = val * 10 + (b - 48)
+            i = i + 1
+        } else {
+            break
+        }
+    }
+    return ParsedNum { val: val, next: i }
+}
+
+fn dedup_gt50(s: str) -> bool {
+    let idx: int = s.find("(dedup ")
+    if idx < 0 {
+        return false
+    }
+    let from: int = idx + 7
+    let mut i: int = from
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        if (b >= 48 && b <= 57) || b == 46 {
+            i = i + 1
+        } else {
+            break
+        }
+    }
+    let num: str = s.slice(from, i)
+    let dot: int = num.find(".")
+    let mut ipart: int = 0
+    let mut frac: str = ""
+    if dot >= 0 {
+        let ip: ParsedNum = parse_digits_at(num, 0)
+        ipart = ip.val
+        frac = num.slice(dot + 1, num.len())
+    } else {
+        let ip2: ParsedNum = parse_digits_at(num, 0)
+        ipart = ip2.val
+    }
+    if ipart > 50 {
+        return true
+    }
+    if ipart < 50 {
+        return false
+    }
+    let mut fi: int = 0
+    while fi < frac.len() {
+        if frac.byte_at(fi) != 48 {
+            return true
+        }
+        fi = fi + 1
+    }
+    return false
+}
+
+# TagKey + tag_key(tag) — the battery's _vkey2:
+# v(major).(minor)[.(patch)][-(suffix)], tuple-ordered.
+struct TagKey {
+    tag: str,
+    maj: int,
+    min: int,
+    pat: int,
+    suf: str
+}
+
+fn tag_key(tag: str) -> TagKey {
+    let rest: str = tag.slice(1, tag.len())
+    let pm: ParsedNum = parse_digits_at(rest, 0)
+    let pm2: ParsedNum = parse_digits_at(rest, pm.next + 1)
+    let mut pat: int = 0
+    let mut suf: str = ""
+    let mut pos: int = pm2.next
+    if pos < rest.len() && rest.byte_at(pos) == 46 {
+        let pm3: ParsedNum = parse_digits_at(rest, pos + 1)
+        pat = pm3.val
+        pos = pm3.next
+    }
+    if pos < rest.len() && rest.byte_at(pos) == 45 {
+        suf = rest.slice(pos + 1, rest.len())
+    }
+    return TagKey { tag: tag, maj: pm.val, min: pm2.val, pat: pat, suf: suf }
+}
+
+fn key_lt(a: TagKey, b: TagKey) -> bool {
+    if a.maj != b.maj {
+        return a.maj < b.maj
+    }
+    if a.min != b.min {
+        return a.min < b.min
+    }
+    if a.pat != b.pat {
+        return a.pat < b.pat
+    }
+    return str_lt(a.suf, b.suf)
+}
+
+# vk_cmp(a, b) — the shim's two _vkey tuples as JSON arrays.
+fn vk_cmp(a: JsonValue, b: JsonValue) -> int {
+    let mut i: int = 0
+    while i < 3 {
+        let x: int = json_int_value(a.arr.get(i))
+        let y: int = json_int_value(b.arr.get(i))
+        if x != y {
+            if x < y {
+                return -1
+            }
+            return 1
+        }
+        i = i + 1
+    }
+    let sa: str = json_str_value(a.arr.get(3))
+    let sb: str = json_str_value(b.arr.get(3))
+    if str_lt(sa, sb) {
+        return -1
+    }
+    if sa == sb {
+        return 0
+    }
+    return 1
+}
+
+# shim_json(acc, args) — run the unit shim and parse its one JSON line.
+fn shim_json(acc: Acc, args: list[str]) -> JsonValue uses Fs, Proc {
+    let shim: str = write_src(acc, "s128_unit.py", unit_shim_src())
+    let argv: list[str] = [shim]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    let r: RunResult = run_capture("python3", argv)
+    let rr: Result[JsonValue, str] = json_parse_result(r.out.trim())
+    if result_is_err(rr) {
+        return json_null()
+    }
+    return result_unwrap(rr)
+}
+
+# filtered_status(acc) — `git status --porcelain` minus the untracked
+# gate files under tests/acc/ (the Halis gates themselves, expected
+# untracked while this porting effort lands; they never take part in
+# the probe's add/commit/reset dance).
+fn filtered_status(acc: Acc) -> str uses Proc {
+    let st: RunResult = run_capture("git", ["status", "--porcelain"])
+    let lines: list[str] = st.out.split("\n")
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < lines.len() {
+        let l: str = lines.get(i)
+        if l.trim() != "" && !l.starts_with("?? tests/acc/") {
+            out = out + l + "\n"
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# Section 1 — the convention and the refusal matrix
+# ----------------------------------------------------------------------------
+
+fn sec1(acc: Acc) -> void uses IO, Fs, Proc, Exit {
+    section("Section 1 — the convention and the refusal matrix")
+    let p: RunResult = compat(acc, ["--tags", "v0.999.0-nosuchtag"])
+    chk(acc, p.code == 2 && p.err.contains("not a release tag"),
+        "an unknown tag is a usage failure (exit 2)")
+    let p2: RunResult = compat(acc, ["--timeout", "0", "--tags", "v0.1.0"])
+    chk(acc, p2.code == 2 && p2.err.contains("--timeout must be >= 1"),
+        "a non-positive timeout is refused")
+    let p3: RunResult = compat(acc, ["--tags", "v0.1.0", "--time-travel", "v0.999.0-ghost"])
+    chk(acc, p3.code == 2 && p3.err.contains("not a release tag"),
+        "an unknown travel tag is a usage failure after the census")
+    # The ledger refusal matrix: the real bytes are saved, every forged
+    # variant is refused loudly, and the registry is restored after each.
+    let save: str = read_file(ledger_path())
+    rmrf(ledger_path())
+    let pm: RunResult = compat(acc, ["--tags", "v0.1.0"])
+    chk(acc, pm.code == 2 && pm.err.contains("no ledger at")
+            && pm.err.contains("--update-ledger"),
+        "a missing ledger is exit 2 with the drafting hint")
+    write_file(ledger_path(), save)
+    write_file(ledger_path(), "this is not json {{{")
+    let pc: RunResult = compat(acc, ["--tags", "v0.1.0"])
+    chk(acc, pc.code == 2 && pc.err.contains("does not parse"),
+        "a corrupt ledger is exit 2")
+    write_file(ledger_path(), save)
+    write_file(ledger_path(), "{\"schema\": 99, \"waivers\": []}")
+    let ps: RunResult = compat(acc, ["--tags", "v0.1.0"])
+    chk(acc, ps.code == 2 && ps.err.contains("schema mismatch"),
+        "a schema-mismatched ledger is exit 2")
+    write_file(ledger_path(), save)
+    write_file(ledger_path(), "{\"schema\": 1, \"waivers\": ["
+        + "{\"file\": \"x.hls\", \"sha256_16\": \"0000000000000000\","
+        + " \"sanctioned_change\": \"\", \"reason\": \"x\"}]}")
+    let pe: RunResult = compat(acc, ["--tags", "v0.1.0"])
+    chk(acc, pe.code == 2 && pe.err.contains("missing 'sanctioned_change'"),
+        "an entry with an empty field is refused")
+    write_file(ledger_path(), save)
+    write_file(ledger_path(), "{\"schema\": 1, \"waivers\": ["
+        + "{\"file\": \"x.hls\", \"sha256_16\": \"0000000000000000\","
+        + " \"kind\": \"maybe\", \"sanctioned_change\": \"x\", \"reason\": \"x\"}]}")
+    let pk: RunResult = compat(acc, ["--tags", "v0.1.0"])
+    chk(acc, pk.code == 2 && pk.err.contains("unknown kind"),
+        "an entry with an unknown kind is refused")
+    write_file(ledger_path(), save)
+    chk(acc, read_file(ledger_path()) == save,
+        "the refusal matrix leaves the real ledger untouched")
+    if !(file_exists("bin/hlc") && which("gcc")) {
+        println("  [SKIP] the remaining sections need bin/hlc + gcc")
+        println("")
+        println("RESULT: " + acc.pass.to_str() + " PASS / " + acc.fail.to_str() + " FAIL")
+        if acc.fail > 0 {
+            exit(1)
+        }
+        exit(0)
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Section 2 — the census and the keying laws
+# ----------------------------------------------------------------------------
+
+fn sec2(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 2 — the census and the keying laws")
+    let p: RunResult = compat(acc, ["--discover"])
+    let lines: list[str] = p.out.split("\n")
+    chk(acc, p.code == 0 && lines.get(0).contains("release tags"),
+        "--discover prints the tag census")
+    let mut midx: int = -1
+    let mut li: int = 0
+    while li < lines.len() {
+        if lines.get(li).contains("file-instances") {
+            midx = li
+            break
+        }
+        li = li + 1
+    }
+    chk(acc, midx >= 0, "the census prints the dedup line")
+    if midx >= 0 {
+        let m: str = lines.get(midx)
+        let instances: int = int_before(m, " file-instances")
+        let unique: int = int_before(m, " unique programs")
+        chk(acc, instances > 20000 && unique >= 300 && unique <= 400 && dedup_gt50(m),
+            "24k+ instances collapse to ~326 programs (dedup > 50x)")
+    }
+    chk(acc, lines.get(0).contains("deep-scan-7"),
+        "the non-release tag is counted and named, never dropped")
+
+    # The keying laws, unit-checked through the shim child.
+    let vks: JsonValue = shim_json(acc, ["vkey"])
+    let mut vkey_ok: bool = json_is_array(vks) && vks.arr.len() == 4
+    if vkey_ok {
+        let a: JsonValue = vks.arr.get(0)
+        let b: JsonValue = vks.arr.get(1)
+        let c: JsonValue = vks.arr.get(2)
+        let d: JsonValue = vks.arr.get(3)
+        vkey_ok = vk_cmp(a, b) < 0 && vk_cmp(c, d) > 0
+    }
+    chk(acc, vkey_ok, "the version sort orders 9 < 10 < 100 (not alphabetically)")
+
+    # Content addressing: the same file+helper in two different directories
+    # is the same program — the temp dir's name must not leak into the key.
+    let prog_src: str = "import \"helper.hls\"\n\nfn main() -> int uses IO {\n"
+        + "    println(\"hi\")\n    return 0\n}\n"
+    let helper1: str = "fn helper() -> int { return 1 }\n"
+    let bases: list[str] = [scratch(acc, "ctx_a"), scratch(acc, "ctx_b_whatever")]
+    let mut bi: int = 0
+    while bi < bases.len() {
+        let base: str = bases.get(bi)
+        write_file(scratch(acc, basename(base) + "/tests/ok/prog.hls"), prog_src)
+        mkdirs(scratch(acc, basename(base) + "/tests/ok/modules"))
+        write_file(scratch(acc, basename(base) + "/tests/ok/helper.hls"), helper1)
+        # helper must sit where the import resolves: prog dir + helper.hls
+        write_file(scratch(acc, basename(base) + "/helper.hls"), helper1)
+        bi = bi + 1
+    }
+    let ha_hb: JsonValue = shim_json(acc, ["ctx",
+        scratch(acc, "ctx_a/tests/ok/prog.hls"), scratch(acc, "ctx_a"),
+        scratch(acc, "ctx_b_whatever/tests/ok/prog.hls"), scratch(acc, "ctx_b_whatever")])
+    let mut ha: str = ""
+    let mut ctx_pair_ok: bool = json_is_array(ha_hb) && ha_hb.arr.len() == 2
+    if ctx_pair_ok {
+        let ja: JsonValue = ha_hb.arr.get(0)
+        let jb: JsonValue = ha_hb.arr.get(1)
+        ctx_pair_ok = json_is_str(ja) && json_is_str(jb)
+        if ctx_pair_ok {
+            ha = json_str_value(ja)
+            ctx_pair_ok = ha == json_str_value(jb)
+        }
+    }
+    chk(acc, ctx_pair_ok, "identical content in different trees hashes identically")
+    write_file(scratch(acc, "ctx_b_whatever/tests/ok/helper.hls"),
+        "fn helper() -> int { return 2 }\n")
+    let hc_j: JsonValue = shim_json(acc, ["ctx1",
+        scratch(acc, "ctx_b_whatever/tests/ok/prog.hls"), scratch(acc, "ctx_b_whatever")])
+    let mut hc_ok: bool = json_is_array(hc_j) && hc_j.arr.len() == 1
+    if hc_ok {
+        let jc: JsonValue = hc_j.arr.get(0)
+        hc_ok = json_is_str(jc) && json_str_value(jc) != ha && ha != ""
+    }
+    chk(acc, hc_ok, "a changed import sibling changes the context key")
+
+    # The toolchain fingerprint covers boot/, std/, core/ — the
+    # interpreter world. Two trees with identical interpreter worlds
+    # fingerprint identically; a changed interpreter file changes it.
+    let bootpy1: str = "#!/usr/bin/env python3\nprint('interpreter')\n"
+    write_file(scratch(acc, "ctx_a/boot/boot.py"), bootpy1)
+    write_file(scratch(acc, "ctx_b_whatever/boot/boot.py"), bootpy1)
+    let fa_fb: JsonValue = shim_json(acc, ["fp", scratch(acc, "ctx_a"),
+                                           scratch(acc, "ctx_b_whatever")])
+    let mut fa: str = ""
+    let mut fp_pair_ok: bool = json_is_array(fa_fb) && fa_fb.arr.len() == 2
+    if fp_pair_ok {
+        let ja: JsonValue = fa_fb.arr.get(0)
+        let jb: JsonValue = fa_fb.arr.get(1)
+        fp_pair_ok = json_is_str(ja) && json_is_str(jb)
+        if fp_pair_ok {
+            fa = json_str_value(ja)
+            fp_pair_ok = fa == json_str_value(jb)
+        }
+    }
+    chk(acc, fp_pair_ok, "identical toolchain trees fingerprint identically")
+    write_file(scratch(acc, "ctx_a/boot/boot.py"),
+        "#!/usr/bin/env python3\nprint('interpreter v2')\n")
+    let fa2_j: JsonValue = shim_json(acc, ["fp1", scratch(acc, "ctx_a")])
+    let mut fa2_ok: bool = json_is_array(fa2_j) && fa2_j.arr.len() == 1
+    if fa2_ok {
+        let ja: JsonValue = fa2_j.arr.get(0)
+        fa2_ok = json_is_str(ja) && json_str_value(ja) != fa && fa != ""
+    }
+    chk(acc, fa2_ok, "a changed interpreter file changes the fingerprint")
+
+    let envs: JsonValue = shim_json(acc, ["env"])
+    let mut clean: bool = json_is_array(envs)
+    if clean {
+        let mut ei: int = 0
+        while ei < envs.arr.len() {
+            if json_str_value(envs.arr.get(ei)) == "HL_DET_SCHED" {
+                clean = false
+            }
+            ei = ei + 1
+        }
+    }
+    chk(acc, clean, "the clean env strips HL_* mode variables")
+
+    let rels: JsonValue = shim_json(acc, ["rels",
+        "import \"std.str\"\nimport \"core.option\"\n"
+        + "import \"sibling.hls\"\nfn f() -> int { return 0 }\n"])
+    let mut rels_ok: bool = json_is_array(rels) && rels.arr.len() == 1
+    if rels_ok {
+        rels_ok = json_str_value(rels.arr.get(0)) == "sibling.hls"
+    }
+    chk(acc, rels_ok, "relative import extraction filters std./core. prefixes")
+}
+
+# ----------------------------------------------------------------------------
+# Section 3 — the ledger discipline
+# ----------------------------------------------------------------------------
+
+fn sec3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 3 — the ledger discipline")
+    let rr: Result[JsonValue, str] = json_parse_result(read_file(ledger_path()))
+    if result_is_ok(rr) {
+    let ledger: JsonValue = result_unwrap(rr)
+    let waivers: JsonValue = json_object_get(ledger, "waivers")
+    let mut n: int = 0
+    let mut cbreak: int = 0
+    let mut cdrift: int = 0
+    let mut cres: int = 0
+    if json_is_array(waivers) {
+        n = waivers.arr.len()
+        let mut i: int = 0
+        while i < n {
+            let w: JsonValue = waivers.arr.get(i)
+            # the loader's default: a missing kind is a break
+            let mut kind: str = "break"
+            if json_object_has(w, "kind") && json_is_str(json_object_get(w, "kind")) {
+                kind = json_str_value(json_object_get(w, "kind"))
+            }
+            if kind == "drift" {
+                cdrift = cdrift + 1
+            } else if kind == "resurrect" {
+                cres = cres + 1
+            } else {
+                cbreak = cbreak + 1
+            }
+            i = i + 1
+        }
+    }
+    chk(acc, n == 9 && cbreak == 5 && cdrift == 3 && cres == 1,
+        "the registry carries five breaks, three drifts and one resurrection")
+    # Each sha names a real historical object: spot-check three of them
+    # straight out of git.
+    let tags: list[str] = ["v0.34.0-alpha", "v0.70.0-alpha", "v0.103.0-alpha"]
+    let fnames: list[str] = ["feat_import.hls", "feat_stage43_hash.hls",
+                             "feat_stage58_config.hls"]
+    let wants: list[str] = ["4ec558d273622e1a", "c6f6c1cc5609a6dd", "9105e8783d808981"]
+    let mut si: int = 0
+    while si < tags.len() {
+        let r: RunResult = run_capture("git",
+            ["show", tags.get(si) + ":tests/ok/" + fnames.get(si)])
+        let got: str = sha256_hex(r.out).slice(0, 16)
+        chk(acc, r.code == 0 && got == wants.get(si),
+            "the ledger sha for " + fnames.get(si) + " matches the git object at "
+                + tags.get(si))
+        si = si + 1
+    }
+    let before: str = read_file(ledger_path())
+    let p: RunResult = compat(acc, ["--tags", "v0.103.0-alpha", "--update-ledger"])
+    let after: str = read_file(ledger_path())
+    chk(acc, p.code == 0 && p.out.contains("FAIL feat_stage84_section")
+            && p.out.contains("UNREVIEWED"),
+        "--update-ledger drafts the census-visible failure honestly")
+    chk(acc, !p.out.contains("FAIL feat_stage58_config"),
+        "the draft cannot see resurrections (the program is green today)")
+    chk(acc, before == after, "--update-ledger never writes the ledger file")
+    } else {
+        fail_msg(acc, "the registry carries five breaks, three drifts and one resurrection")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Section 4 — the certification (the REAL CLI, the FULL census)
+# ----------------------------------------------------------------------------
+
+fn sec4(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 4 — the certification (the REAL CLI, the FULL census)")
+    let jp: str = scratch(acc, "full_report.json")
+    let p: RunResult = compat(acc, ["--json", jp])
+    chk(acc, p.code == 0 && p.out.contains("verdict COMPATIBLE")
+            && p.out.contains("0 regressions"),
+        "the full census certifies: every prior ok corpus replays green")
+    let rr: Result[JsonValue, str] = json_parse_result(read_or(jp, ""))
+    if result_is_err(rr) {
+        fail_msg(acc, "the json report carries the census and every verdict (the"
+            + " fifth break, xxHash, panics — 101-is-green hides it from"
+            + " the census; the time-travel leg verifies it)")
+    } else {
+        let rep: JsonValue = result_unwrap(rr)
+        let verdict: str = json_str_value(json_object_get(rep, "verdict"))
+        let census: JsonValue = json_object_get(rep, "census")
+        let rtags: int = jint_or(json_object_get(census, "release_tags"), -1)
+        let uprog: int = jint_or(json_object_get(census, "unique_programs"), -1)
+        let contents: JsonValue = json_object_get(rep, "contents")
+        let waived_n: int = jarr_len_or0(contents, "WAIVED")
+        let reg_n: int = jarr_len_or0(contents, "REGRESSION")
+        let rec_n: int = jarr_len_or0(contents, "RECONCILED")
+        chk(acc, verdict == "COMPATIBLE" && rtags >= 170 && uprog >= 300
+                && waived_n == 4 && reg_n == 0 && rec_n == 0,
+            "the json report carries the census and every verdict (the"
+            + " fifth break, xxHash, panics — 101-is-green hides it from"
+            + " the census; the time-travel leg verifies it)")
+    }
+    let p2: RunResult = compat(acc, ["--tags", "v0.60.0-alpha"])
+    chk(acc, p2.code == 0 && p2.out.contains("verdict COMPATIBLE")
+            && str_count(p2.out, "WAIVED    feat_stage27") == 2,
+        "a restricted probe certifies v0.60.0-alpha (2 asm waivers)")
+}
+
+# ----------------------------------------------------------------------------
+# Section 5 — the regression alarm (proven, then cleaned up)
+# ----------------------------------------------------------------------------
+
+fn sec5(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 5 — the regression alarm (proven, then cleaned up)")
+    let backup: str = read_file(ledger_path())
+    let mpath: str = write_src(acc, "s128_mutate.py", mutate_shim_src())
+    # (a) an entry removed: a sanctioned break becomes a REGRESSION.
+    let _ra: RunResult = run_capture("python3", [mpath, "drop"])
+    let pa: RunResult = compat(acc, ["--tags", "v0.3.0"])
+    write_file(ledger_path(), backup)
+    chk(acc, pa.code == 1 && pa.out.contains("REGRESSION feat_import"),
+        "removing the ledger entry turns the break into a REGRESSION")
+    # (b) an entry pointed at a green program: RECONCILED, the stale waiver.
+    let _rb: RunResult = run_capture("python3", [mpath, "green"])
+    let pb: RunResult = compat(acc, ["--tags", "v0.145.0-alpha"])
+    write_file(ledger_path(), backup)
+    chk(acc, pb.code == 1 && pb.out.contains("RECONCILED feat_import"),
+        "a waiver on a green program is RECONCILED (trim the ledger)")
+    # (c) an invented entry on the FULL census: STALE.
+    let _rc: RunResult = run_capture("python3", [mpath, "ghost"])
+    let pc: RunResult = compat(acc, [])
+    write_file(ledger_path(), backup)
+    chk(acc, pc.code == 1 && pc.out.contains("STALE ledger entry feat_ghost"),
+        "an invented entry matches no historical content (STALE)")
+    chk(acc, read_file(ledger_path()) == backup,
+        "every forged-ledger run restored the real registry")
+    # (d) the end-to-end alarm: a probe commit tagged into real history.
+    let probe_tag: str = "v0.999.0-compatprobe"
+    let probe_head: str = run_capture("git", ["rev-parse", "HEAD"]).out.trim()
+    let dirty: str = filtered_status(acc)
+    if dirty != "" {
+        fail_msg(acc, "the probe needs a clean worktree (found: " + first_line(dirty) + ")")
+    } else {
+        let probe_file: str = "tests/ok/feat_compat_probe.hls"
+        write_file(probe_file,
+            "# compat gate probe: deliberately broken, tagged\n"
+            + "# into history for one run, then removed.\n"
+            + "fn main() -> int uses IO {\n"
+            + "    println(\"probe: \" + no_such_function(1))\n"
+            + "    return 0\n}\n")
+        let _ga: int = run_quiet("git", ["add", probe_file])
+        let _gc: int = run_quiet("git", ["commit", "-m", "compat gate probe (temporary)"])
+        let _gt: int = run_quiet("git", ["tag", probe_tag])
+        let pp: RunResult = compat(acc, ["--tags", probe_tag])
+        chk(acc, pp.code == 1 && pp.out.contains("REGRESSION feat_compat_probe")
+                && pp.out.contains("no_such_function"),
+            "a broken fixture tagged into history is caught, its error line quoted")
+        # the battery's finally: the tag dies, HEAD goes back one commit.
+        let _td: int = run_quiet("git", ["tag", "-d", probe_tag])
+        let _rh: int = run_quiet("git", ["reset", "--hard", "HEAD~1"])
+        let after_head: str = run_capture("git", ["rev-parse", "HEAD"]).out.trim()
+        chk(acc, after_head == probe_head && !file_exists(probe_file)
+                && filtered_status(acc) == "",
+            "history restored: the probe leaves no commit, tag or file")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Section 6 — the time-travel witness (six releases, hand-computed)
+# ----------------------------------------------------------------------------
+
+fn family_index(tag: str) -> int {
+    let ft: list[str] = family_tags()
+    let mut i: int = 0
+    while i < ft.len() {
+        if ft.get(i) == tag {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn sec6(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 6 — the time-travel witness (six releases, hand-computed)")
+    # The bookends: the oldest release and the latest one, corpus sizes
+    # computed from git at gate time (the latest changes as history grows).
+    let raw: RunResult = run_capture("git", ["tag", "--list", "v*"])
+    let all: list[str] = raw.out.split("\n")
+    let tags: list[str] = []
+    let mut ti: int = 0
+    while ti < all.len() {
+        let t: str = all.get(ti).trim()
+        if t != "" {
+            tags.push(t)
+        }
+        ti = ti + 1
+    }
+    let mut lo: TagKey = tag_key(tags.get(0))
+    let mut hi: TagKey = lo
+    let mut mi: int = 1
+    while mi < tags.len() {
+        let k: TagKey = tag_key(tags.get(mi))
+        if key_lt(k, lo) {
+            lo = k
+        }
+        if key_lt(hi, k) {
+            hi = k
+        }
+        mi = mi + 1
+    }
+    let trav: list[str] = [lo.tag, "v0.7.0-alpha", "v0.34.0-alpha", "v0.70.0-alpha",
+                           "v0.103.0-alpha", hi.tag]
+    let trav_arg: str = join(trav, ",")
+    let jp: str = scratch(acc, "travel_report.json")
+    let p: RunResult = compat(acc, ["--tags", trav_arg, "--time-travel", trav_arg,
+                                    "--json", jp])
+    chk(acc, p.code == 0 && p.out.contains("history agrees"),
+        "the witness certifies: six releases, history agrees")
+    let rr: Result[JsonValue, str] = json_parse_result(read_or(jp, ""))
+    if result_is_err(rr) {
+        let mut fi: int = 0
+        while fi < trav.len() {
+            fail_msg(acc, trav.get(fi)
+                + " (corpus ?): the hand-computed matrix, no old bugs, no divergences")
+            fi = fi + 1
+        }
+        return
+    }
+    let rep: JsonValue = result_unwrap(rr)
+    let tt: JsonValue = json_object_get(rep, "time_travel")
+    let mut vi: int = 0
+    while vi < trav.len() {
+        let tag: str = trav.get(vi)
+        let t: JsonValue = json_object_get(tt, tag)
+        let mut corpus: int = -1
+        let mut want_agree: int = -1
+        let mut want_break: int = -1
+        let mut want_res: int = -1
+        let mut want_drift: int = -1
+        let fam: int = family_index(tag)
+        if fam >= 0 {
+            corpus = family_corpus().get(fam)
+            want_agree = family_agree().get(fam)
+            want_break = family_break().get(fam)
+            want_res = family_resurrect().get(fam)
+            want_drift = family_drift().get(fam)
+        } else {
+            # A bookend: born green (the oldest) or certified green (the
+            # latest — the census's own claim about the newest corpus).
+            let listing: RunResult = run_capture("git",
+                ["ls-tree", "--name-only", "-r", tag, "tests/ok/"])
+            let files: list[str] = listing.out.split("\n")
+            let mut cnt: int = 0
+            let mut li: int = 0
+            while li < files.len() {
+                let f: str = files.get(li)
+                if f.ends_with(".hls") && count_char(f, 47) == 2 {
+                    cnt = cnt + 1
+                }
+                li = li + 1
+            }
+            corpus = cnt
+            want_agree = cnt
+            want_break = 0
+            want_res = 0
+            want_drift = 0
+        }
+        let got_agree: int = jint_or(json_object_get(t, "agree"), -1)
+        let got_break: int = jint_or(json_object_get(t, "break_waived"), -1)
+        let got_res: int = jint_or(json_object_get(t, "resurrect_waived"), -1)
+        let got_drift: int = jint_or(json_object_get(t, "drift_waived"), -1)
+        let n_oldbugs: int = jarr_len_or1(t, "old_bugs")
+        let n_divs: int = jarr_len_or1(t, "divergences")
+        let n_resur: int = jarr_len_or1(t, "resurrections")
+        chk(acc, got_agree == want_agree && got_break == want_break
+                && got_res == want_res && got_drift == want_drift
+                && n_oldbugs == 0 && n_divs == 0 && n_resur == 0,
+            tag + " (corpus " + corpus.to_str() + "): " + want_agree.to_str()
+                + " agree, " + want_break.to_str() + " break-waived, "
+                + want_res.to_str() + " resurrect-waived, " + want_drift.to_str()
+                + " drift-waived — the hand-computed matrix, no old bugs, no"
+                + " divergences")
+        vi = vi + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Section 7 — the native differential over historical programs
+# ----------------------------------------------------------------------------
+
+fn sec7(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 7 — the native differential over historical programs")
+    let jp: str = scratch(acc, "native_report.json")
+    let p: RunResult = compat(acc, ["--tags", "v0.1.0,v0.60.0-alpha", "--native",
+                                    "--json", jp])
+    chk(acc, p.code == 0 && p.out.contains("native agrees"),
+        "the native leg certifies two releases' corpora")
+    let rr: Result[JsonValue, str] = json_parse_result(read_or(jp, ""))
+    if result_is_err(rr) {
+        fail_msg(acc, "149 historical programs: native (exit, stdout) identical to the "
+            + "interpreter, zero divergences")
+    } else {
+        let rep: JsonValue = result_unwrap(rr)
+        let nat: JsonValue = json_object_get(rep, "native")
+        let ran: int = jint_or(json_object_get(nat, "ran"), -1)
+        let divs: JsonValue = json_object_get(nat, "divergences")
+        chk(acc, ran == 149 && json_is_array(divs) && divs.arr.len() == 0,
+            "149 historical programs: native (exit, stdout) identical to the "
+            + "interpreter, zero divergences")
+    }
+    # The stage's own two files, differential-checked directly.
+    let files: list[str] = [showcase(), compat_demo()]
+    let mut i: int = 0
+    while i < files.len() {
+        let f: str = files.get(i)
+        let c_path: str = scratch(acc, basename(f) + ".c")
+        let b_path: str = scratch(acc, basename(f) + ".bin")
+        let _hc: int = run_quiet("./bin/hlc", [f, c_path])
+        let _gc: int = run_quiet("gcc", ["-O2", "-o", b_path, c_path, "-lm", "-pthread"])
+        let pn: RunResult = run_capture(b_path, [])
+        let pi: RunResult = interp(acc, [f])
+        chk(acc, pn.code == 0 && pi.code == 0 && pn.out == pi.out,
+            f + ": native == interpreter, byte for byte")
+        i = i + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Section 8 — the corpus hygiene
+# ----------------------------------------------------------------------------
+
+fn sec8(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 8 — the corpus hygiene")
+    let files: list[str] = [showcase(), compat_demo()]
+    let mut i: int = 0
+    while i < files.len() {
+        let f: str = files.get(i)
+        let hf: RunResult = run_capture("./bin/hlfmt", ["-c", f])
+        chk(acc, hf.out.contains("already formatted"), f + " is hlfmt-canonical")
+        let hl: RunResult = run_capture("python3", ["tools/hllint.py", f])
+        chk(acc, hl.out.contains("no warnings"), f + " is hllint-clean")
+        let bc: RunResult = interp(acc, ["--check", f])
+        chk(acc, bc.out.contains("OK: types and effects valid"),
+            f + " boots through the real checker")
+        i = i + 1
+    }
+    # The ledger is valid, nine entries, and the tool loads it.
+    let loaded: JsonValue = shim_json(acc, ["ledger", ledger_path()])
+    let mut n: int = -1
+    if json_is_array(loaded) && loaded.arr.len() == 1 {
+        n = json_int_value(loaded.arr.get(0))
+    }
+    chk(acc, n == 9, "the registry loads through the tool's own loader")
+    # No gate litter survives.
+    let dirs: list[str] = [acc.scratch_base, "tests", "."]
+    let mut litter: bool = false
+    let mut di: int = 0
+    while di < dirs.len() {
+        let ls: RunResult = run_capture("ls", ["-1", dirs.get(di)])
+        let entries: list[str] = ls.out.split("\n")
+        let mut ei: int = 0
+        while ei < entries.len() {
+            if entries.get(ei).starts_with("hls-compat-") {
+                litter = true
+            }
+            ei = ei + 1
+        }
+        di = di + 1
+    }
+    chk(acc, !litter, "no verifier temp files survive anywhere the gate ran")
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let acc: Acc = acc_new("compat")
+    sec1(acc)
+    sec2(acc)
+    sec3(acc)
+    sec4(acc)
+    sec5(acc)
+    sec6(acc)
+    sec7(acc)
+    sec8(acc)
+    return finish(acc, "Stage 128 -- backwards-compatibility test suite (every prior version's ok/)")
+}

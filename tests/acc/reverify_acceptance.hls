@@ -1,0 +1,839 @@
+# ============================================================================
+# tests/acc/reverify_acceptance.hls — Stage 108 acceptance gate, in Halis
+# (the Halis twin of tests/reverify_acceptance.py; same nine sections,
+# same assertions, same needles — the harness is tests/acc/harness.hls
+# and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make reverify-acceptance` (which compiles this file and runs
+# it from the repo root).
+#
+# The battery drove the Python machinery in-process (load_program /
+# check, coll.harvest_baseline, ir.build_module / ir.optimize,
+# ircheck.analyze_function / _identity_cert, boot.proof's interval
+# arithmetic, replay.reconcile). The gate asks the same questions
+# through the front doors a native binary has:
+#   - `hls-reverify` CLI: FILE / FILE --json / --lto / --out / selftest
+#     (the --json report's baseline block IS coll.harvest_baseline's
+#     verdict — reconcile consumes it verbatim);
+#   - `hls-reverify selftest`, whose 40 vectors pin the one-definition
+#     identity, the certificates, the for-get discriminator, widening,
+#     the forged/dangling audits and the report determinism;
+#   - one tiny python3 driver (scratch/driver_rev.py) for the legs the
+#     battery ran against module internals with no CLI surface: the
+#     bp-object identity, the pinned ALGEBRAIC_IDENTITIES tuple, the
+#     per-function baseline harvest, the IR0/IR1 site multiset, and the
+#     synthetic forged/dangling IR vectors. It is the battery's own
+#     code, verbatim, in a child process.
+#
+#  1. the one definition — the replay imports boot.proof's interval
+#     arithmetic (never re-implements it); the identity-certificate
+#     whitelist is pinned; the CLI selftest (40 vectors) is green
+#  2. the baseline       — the harvest sees exactly what the prover
+#                          annotated, proven and checked, on every
+#                          contracted shape (ovf, div, bnd, slice) and
+#                          nothing on a non-contracted one
+#  3. the transform      — the optimiser's changes are visible to the
+#                          tool (site multiset stable, ty stamps ride,
+#                          the --lto transform runs, the for-get
+#                          exclusion)
+#  4. the replay         — the seeded shapes re-prove on the OPTIMISED
+#                          IR; the INT64_MIN/-1 corner and the delta-0
+#                          index bound stay refused; the const-range
+#                          loop replays through the IR
+#  5. the law            — REPLAY-OK on the whole positive corpus
+#                          (examples + tests/ok + benchmarks), the
+#                          class table lands where it must, the tool
+#                          is deterministic, the forged and broken-IR
+#                          vectors FAIL as designed
+#  6. the refusals       — negative tests refuse cleanly (exit 1, no
+#                          traceback); usage errors exit 2
+#  7. the demos          — the demo and the ok-test run; interpreter
+#                          and native agree byte for byte (native half
+#                          only when bin/hlc exists — hermetic)
+#  8. the report         — the schema pins, every section present,
+#                          --out writes the versioned report file, the
+#                          text report renders
+#  9. the tools          — hlfmt stable, hllint clean on the new
+#                          sources
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.json"
+import "std.result"
+
+# ----------------------------------------------------------------------------
+# The gate's constants (the battery's).
+# ----------------------------------------------------------------------------
+
+fn demo() -> str {
+    return "examples/reverify_demo.hls"
+}
+
+fn ok_test() -> str {
+    return "tests/ok/feat_stage108_reverify.hls"
+}
+
+fn elide() -> str {
+    return "tests/ok/feat_proof_elide.hls"
+}
+
+fn loop_test() -> str {
+    return "tests/ok/feat_contract_loop.hls"
+}
+
+# The battery's contracted sources, byte for byte.
+fn src_proof() -> str {
+    return "fn mix(acc: int, b: int) -> int\n" +
+        "    requires acc >= 0\n" +
+        "    requires acc <= 1000000006\n" +
+        "    requires b >= 0\n" +
+        "    requires b <= 255\n" +
+        "{\n" +
+        "    return (acc * 31 + b) % 1000000007\n" +
+        "}\n" +
+        "fn main() -> int uses IO {\n" +
+        "    let v: int = mix(999999999, 200)\n" +
+        "    println(v.to_str())\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+fn src_bnd() -> str {
+    return "fn pick(xs: list[int], i: int) -> int\n" +
+        "    requires i >= 0\n" +
+        "    requires i < 4\n" +
+        "    requires xs.len() >= 4\n" +
+        "{\n" +
+        "    return xs[i]\n" +
+        "}\n" +
+        "fn main() -> int uses IO {\n" +
+        "    let xs: list[int] = [10, 20, 30, 40]\n" +
+        "    println(pick(xs, 2).to_str())\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+fn src_slice() -> str {
+    return "fn cut(s: str, a: int) -> str\n" +
+        "    requires a >= 0\n" +
+        "    requires a <= 4\n" +
+        "    requires s.len() >= 8\n" +
+        "{\n" +
+        "    return s.slice(a, 4)\n" +
+        "}\n" +
+        "fn main() -> int uses IO {\n" +
+        "    println(cut(\"proven12\", 1))\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+fn src_unproven() -> str {
+    return "fn loose(xs: list[int], i: int) -> int {\n" +
+        "    return xs[i]\n" +
+        "}\n" +
+        "fn main() -> int uses IO {\n" +
+        "    let xs: list[int] = [1]\n" +
+        "    println(loose(xs, 0).to_str())\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+fn src_corner() -> str {
+    return "fn divc(a: int, b: int) -> int\n" +
+        "    requires b < 0\n" +
+        "    requires b >= -100\n" +
+        "{\n" +
+        "    return a / b\n" +
+        "}\n" +
+        "fn main() -> int uses IO {\n" +
+        "    println(divc(5, -2).to_str())\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+fn src_delta0() -> str {
+    return "fn pick0(xs: list[int], i: int) -> int\n" +
+        "    requires i >= 0\n" +
+        "    requires i <= 4\n" +
+        "    requires xs.len() >= 4\n" +
+        "{\n" +
+        "    return xs[i]\n" +
+        "}\n" +
+        "fn main() -> int uses IO {\n" +
+        "    let xs: list[int] = [10, 20, 30, 40]\n" +
+        "    println(pick0(xs, 2).to_str())\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+# ----------------------------------------------------------------------------
+# The battery's [PASS]/[FAIL] grammar.
+# ----------------------------------------------------------------------------
+
+fn ok(acc: Acc, label: str) -> void uses IO {
+    acc.pass = acc.pass + 1
+    println("  [PASS] " + label)
+}
+
+fn bad(acc: Acc, label: str, detail: str) -> void uses IO {
+    acc.fail = acc.fail + 1
+    if detail == "" {
+        println("  [FAIL] " + label)
+    } else {
+        println("  [FAIL] " + label + ": " + detail)
+    }
+}
+
+fn chk(acc: Acc, label: str, cond: bool, detail: str) -> bool uses IO {
+    if cond {
+        ok(acc, label)
+    } else {
+        bad(acc, label, detail)
+    }
+    return cond
+}
+
+fn skip_msg(acc: Acc, name: str) -> void uses IO {
+    println("  [SKIP] " + name)
+}
+
+# ----------------------------------------------------------------------------
+# JSON accessors — the battery's dict/get idioms, null-safe end to end.
+# ----------------------------------------------------------------------------
+
+fn parse_json(text: str) -> JsonValue {
+    let rr: Result[JsonValue, str] = json_parse_result(text)
+    if result_is_ok(rr) {
+        return result_unwrap(rr)
+    }
+    return json_null()
+}
+
+fn jget(v: JsonValue, key: str) -> JsonValue {
+    return json_object_get(v, key)
+}
+
+fn jstr(v: JsonValue, key: str) -> str {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_str(x) {
+        return json_str_value(x)
+    }
+    return ""
+}
+
+fn jint(v: JsonValue, key: str) -> int {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_int(x) {
+        return json_int_value(x)
+    }
+    return 0
+}
+
+fn jbool(v: JsonValue, key: str) -> bool {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_bool(x) {
+        return json_bool_value(x)
+    }
+    return false
+}
+
+# ----------------------------------------------------------------------------
+# Small text helpers.
+# ----------------------------------------------------------------------------
+
+# value_after(out, prefix) — the remainder of the first line that
+# starts with the prefix (the driver's key=value protocol).
+fn value_after(out: str, prefix: str) -> str {
+    let lines: list[str] = out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).starts_with(prefix) {
+            return lines.get(i).slice(prefix.len(), lines.get(i).len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# flag(out, prefix) — the integer after the prefix, -1 when absent.
+fn flag(out: str, prefix: str) -> int {
+    let v: str = value_after(out, prefix)
+    if v == "" {
+        return -1
+    }
+    return v.trim().to_int()
+}
+
+# last_nonempty(text) — the battery's out.strip().splitlines()[-1].
+fn last_nonempty(text: str) -> str {
+    let lines: list[str] = text.split("\n")
+    let mut i: int = lines.len() - 1
+    while i >= 0 {
+        let t: str = lines.get(i).trim()
+        if t != "" {
+            return t
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+# sort_strs(xs) — selection sort (in place over a copy), the battery's
+# sorted(...) where the sample identity matters (the tests/fail sample).
+fn sort_strs(xs: list[str]) -> list[str] {
+    let out: list[str] = []
+    let mut n: int = 0
+    while n < xs.len() {
+        out.push(xs.get(n))
+        n = n + 1
+    }
+    let mut i: int = 0
+    while i < out.len() {
+        let mut min: int = i
+        let mut j: int = i + 1
+        while j < out.len() {
+            if out.get(j) < out.get(min) {
+                min = j
+            }
+            j = j + 1
+        }
+        if min != i {
+            let tmp: str = out.get(i)
+            out.set(i, out.get(min))
+            out.set(min, tmp)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# The tool, as the battery addresses it.
+# ----------------------------------------------------------------------------
+
+fn rev(args: list[str]) -> RunResult uses Proc {
+    let argv: list[str] = ["tools/hls-reverify.py"]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    return run_capture("python3", argv)
+}
+
+# rev_text_is_ok(r) — the report's verdict is REPLAY-OK.
+fn verdict_of(r: RunResult) -> str {
+    return jstr(parse_json(r.out), "verdict")
+}
+
+# ----------------------------------------------------------------------------
+# The python3 driver: the battery's in-process reaches, verbatim, in a
+# child process (loaded by path exactly the way the battery loads it).
+# ----------------------------------------------------------------------------
+
+fn driver_src() -> str {
+    return "# driver_rev.py — the reverify battery's in-process reaches,\n" +
+        "# driven by the native gate through argv. Modes:\n" +
+        "#   onedef | alg | certs | baseline P F | sites P | forget |\n" +
+        "#   verdict P F | forge | dangle\n" +
+        "import sys, os\n" +
+        "ROOT = os.getcwd()\n" +
+        "sys.path.insert(0, ROOT)\n" +
+        "sys.path.insert(0, os.path.join(ROOT, 'tools'))\n" +
+        "mode = sys.argv[1]\n" +
+        "try:\n" +
+        "    if mode == 'onedef':\n" +
+        "        from hlreverify_parts import hlrev_ircheck as ircheck\n" +
+        "        from tools.hlinterp import proof as bp\n" +
+        "        v = (ircheck.bp.iv_add is bp.iv_add\n" +
+        "             and ircheck.bp.mul_fits is bp.mul_fits\n" +
+        "             and ircheck.bp.excludes_zero is bp.excludes_zero\n" +
+        "             and ircheck.bp.seed_from_requires is bp.seed_from_requires)\n" +
+        "        print('onedef=%d' % int(v))\n" +
+        "    elif mode == 'alg':\n" +
+        "        from hlreverify_parts import hlrev_common as com\n" +
+        "        want = ('alg:add-zero-right', 'alg:add-zero-left',\n" +
+        "                'alg:sub-zero-right', 'alg:mul-zero-right',\n" +
+        "                'alg:mul-zero-left', 'alg:mul-one-right',\n" +
+        "                'alg:mul-one-left')\n" +
+        "        print('alg=%d' % int(com.ALGEBRAIC_IDENTITIES == want))\n" +
+        "    elif mode == 'certs':\n" +
+        "        from hlreverify_parts import hlrev_ircheck as ircheck\n" +
+        "        v = ('var', 'x')\n" +
+        "        print('c1=%d' % int(ircheck._identity_cert('+', v, ('lit', 0)) is not None))\n" +
+        "        print('c2=%d' % int(ircheck._identity_cert('-', v, ('lit', 0)) is not None))\n" +
+        "        print('c3=%d' % int(ircheck._identity_cert('*', v, ('lit', 1)) is not None))\n" +
+        "        print('c4=%d' % int(ircheck._identity_cert('*', v, ('lit', 2)) is None))\n" +
+        "    elif mode == 'baseline':\n" +
+        "        from tools.hlinterp.boot import load_program\n" +
+        "        from tools.hlinterp.checker import check\n" +
+        "        from hlreverify_parts import hlrev_collect as coll\n" +
+        "        prog = load_program(sys.argv[2])\n" +
+        "        check(prog)\n" +
+        "        base = coll.harvest_baseline(prog)\n" +
+        "        rows = base.get(sys.argv[3])\n" +
+        "        if rows is None:\n" +
+        "            print('present=0')\n" +
+        "        else:\n" +
+        "            print('present=1')\n" +
+        "            print('kinds=%s' % ','.join(sorted(r[0] for r in rows)))\n" +
+        "            print('proven=%d' % sum(1 for r in rows if r[2]))\n" +
+        "    elif mode == 'sites':\n" +
+        "        from tools.hlinterp.boot import load_program\n" +
+        "        from tools.hlinterp.checker import check\n" +
+        "        from ir import build_module\n" +
+        "        from ir.optimize import optimize\n" +
+        "        from hlreverify_parts import hlrev_collect as coll\n" +
+        "        prog = load_program(sys.argv[2])\n" +
+        "        check(prog)\n" +
+        "        m0 = build_module(prog)\n" +
+        "        m1 = build_module(prog)\n" +
+        "        optimize(m1, fast=True)\n" +
+        "        s0 = coll.harvest_ir_sites(m0)\n" +
+        "        s1 = coll.harvest_ir_sites(m1)\n" +
+        "        print('mix_stable=%d' % int(s0.get('mix') == s1.get('mix')))\n" +
+        "        stamped = 0\n" +
+        "        for irf in m1.functions.values():\n" +
+        "            for blk in irf.blocks:\n" +
+        "                for ins in blk.instrs:\n" +
+        "                    if ins.op == 'binop' and (ins.attrs or {}).get('ty'):\n" +
+        "                        stamped += 1\n" +
+        "        print('stamped=%d' % stamped)\n" +
+        "        print('main_before=%d' % len(s0.get('main', [])))\n" +
+        "        print('main_after=%d' % len(s1.get('main', [])))\n" +
+        "    elif mode == 'forget':\n" +
+        "        from ir import Instr\n" +
+        "        from hlreverify_parts import hlrev_collect as coll\n" +
+        "        gen = Instr('v_x', 'list_get', [('var', 'v_xs'), ('var', 'v_x__i')], 1)\n" +
+        "        print('forget=%d' % int(coll.is_generated_for_get(gen)))\n" +
+        "    elif mode == 'verdict':\n" +
+        "        from tools.hlinterp.boot import load_program\n" +
+        "        from tools.hlinterp.checker import check\n" +
+        "        from ir import build_module\n" +
+        "        from ir.optimize import optimize\n" +
+        "        from hlreverify_parts import hlrev_ircheck as ircheck\n" +
+        "        prog = load_program(sys.argv[2])\n" +
+        "        check(prog)\n" +
+        "        m1 = build_module(prog)\n" +
+        "        optimize(m1, fast=True)\n" +
+        "        irf = m1.functions.get(sys.argv[3])\n" +
+        "        ast_fn = prog['fns'].get(sys.argv[3])\n" +
+        "        seed = ircheck.seed_function(ast_fn) if ast_fn else None\n" +
+        "        ana = ircheck.analyze_function(irf, seed) if irf else None\n" +
+        "        div = [v for v in ana.verdicts if v[0] == 'div'] if ana else []\n" +
+        "        print('div_n=%d' % len(div))\n" +
+        "        print('div_proven=%d' % int(bool(div) and bool(div[0][3])))\n" +
+        "    elif mode == 'forge':\n" +
+        "        from ir import HLIRFunction, Block, Instr\n" +
+        "        from hlreverify_parts import hlrev_ircheck as ircheck\n" +
+        "        blk = Block(name='entry')\n" +
+        "        blk.instrs = [\n" +
+        "            Instr('t1', 'const', [('lit', 2)], 1, attrs={'ty': 'int'}),\n" +
+        "            Instr('t2', 'binop', [('op', '*'), ('var', 'v_x'), ('var', 't1')], 1,\n" +
+        "                  attrs={'ty': 'int', 'safe_overflow': True}),\n" +
+        "        ]\n" +
+        "        blk.terminator = Instr(None, 'return', [], 2)\n" +
+        "        irf = HLIRFunction(name='forged', params=[('x', 'int')], ret='int',\n" +
+        "                           effects=set())\n" +
+        "        irf.blocks = [blk]\n" +
+        "        ana = ircheck.analyze_function(irf, ircheck.State())\n" +
+        "        print('n=%d' % len(ana.annotations))\n" +
+        "        print('certified=%d' % int(bool(ana.annotations)\n" +
+        "                                   and bool(ana.annotations[0][2])))\n" +
+        "    elif mode == 'dangle':\n" +
+        "        from ir import HLIRFunction, Block, Instr\n" +
+        "        from hlreverify_parts import hlrev_ircheck as ircheck\n" +
+        "        blk = Block(name='entry')\n" +
+        "        blk.instrs = [\n" +
+        "            Instr('t1', 'binop', [('op', '+'), ('var', 'v_ghost'), ('lit', 1)], 1,\n" +
+        "                  attrs={'ty': 'int'}),\n" +
+        "        ]\n" +
+        "        blk.terminator = Instr(None, 'return', [], 2)\n" +
+        "        irf = HLIRFunction(name='dangling', params=[], ret='int', effects=set())\n" +
+        "        irf.blocks = [blk]\n" +
+        "        ana = ircheck.analyze_function(irf, ircheck.State())\n" +
+        "        print('dangling=%d' % int(any(c == 'dangling-var' for c, _t in ana.integrity)))\n" +
+        "except Exception as ex:\n" +
+        "    print('error=%s' % ex)\n"
+}
+
+# ----------------------------------------------------------------------------
+# 1. the one definition
+# ----------------------------------------------------------------------------
+fn sec1(acc: Acc, driver: str) -> void uses IO, Proc {
+    section("1. the one definition")
+    let r: RunResult = run_capture("python3", [driver, "onedef"])
+    chk(acc, "the replay's interval arithmetic IS boot.proof's (one definition)",
+        r.code == 0 && flag(r.out, "onedef=") == 1, clip(r.combined, 120))
+    let r2: RunResult = run_capture("python3", [driver, "alg"])
+    chk(acc, "the identity whitelist is pinned (7 shapes)",
+        r2.code == 0 && flag(r2.out, "alg=") == 1, clip(r2.combined, 120))
+    let r3: RunResult = run_capture("python3", [driver, "certs"])
+    chk(acc, "x*2 has no certificate — the audit has teeth",
+        r3.code == 0 && flag(r3.out, "c1=") == 1 && flag(r3.out, "c2=") == 1
+            && flag(r3.out, "c3=") == 1 && flag(r3.out, "c4=") == 1,
+        clip(r3.combined, 120))
+    let p: RunResult = rev(["selftest"])
+    chk(acc, "the CLI selftest passes (40 vectors)",
+        p.code == 0 && p.out.contains("0 failed"), clip(p.combined, 80))
+}
+
+# ----------------------------------------------------------------------------
+# 2. the baseline
+# ----------------------------------------------------------------------------
+fn sec2(acc: Acc, driver: str) -> void uses IO, Fs, Proc {
+    section("2. the baseline")
+    let src: str = write_src(acc, "proof.hls", src_proof())
+    let b1: RunResult = run_capture("python3", [driver, "baseline", src, "mix"])
+    chk(acc, "the baseline sees the prover's verdicts on mix (1 div + 2 ovf, proven)",
+        b1.code == 0 && value_after(b1.out, "present=") == "1"
+            && value_after(b1.out, "kinds=") == "div,ovf,ovf"
+            && flag(b1.out, "proven=") == 3, clip(b1.combined, 140))
+    let src2: str = write_src(acc, "bnd.hls", src_bnd())
+    let b2: RunResult = run_capture("python3", [driver, "baseline", src2, "pick"])
+    chk(acc, "the baseline sees the proven bounds claim on pick",
+        b2.code == 0 && value_after(b2.out, "present=") == "1"
+            && value_after(b2.out, "kinds=") == "bnd"
+            && flag(b2.out, "proven=") == 1, clip(b2.combined, 140))
+    let src3: str = write_src(acc, "slice.hls", src_slice())
+    let b3: RunResult = run_capture("python3", [driver, "baseline", src3, "cut"])
+    chk(acc, "the baseline sees the proven slice claim on cut",
+        b3.code == 0 && value_after(b3.out, "present=") == "1"
+            && value_after(b3.out, "kinds=") == "bnd"
+            && flag(b3.out, "proven=") == 1, clip(b3.combined, 140))
+    let src4: str = write_src(acc, "unproven.hls", src_unproven())
+    let b4: RunResult = run_capture("python3", [driver, "baseline", src4, "loose"])
+    chk(acc, "a non-contracted function has no baseline claims (nothing to replay)",
+        b4.code == 0 && value_after(b4.out, "present=") == "0",
+        clip(b4.combined, 140))
+}
+
+# ----------------------------------------------------------------------------
+# 3. the transform
+# ----------------------------------------------------------------------------
+fn sec3(acc: Acc, driver: str, proof_path: str) -> void uses IO, Fs, Proc {
+    section("3. the transform")
+    let s: RunResult = run_capture("python3", [driver, "sites", proof_path])
+    chk(acc, "the site multiset is stable when the optimiser changes nothing",
+        s.code == 0 && flag(s.out, "mix_stable=") == 1, clip(s.combined, 140))
+    chk(acc, "the ty stamps ride the transformation",
+        flag(s.out, "stamped=") > 0, clip(s.combined, 140))
+    let lto: RunResult = rev([proof_path, "--lto", "--json"])
+    chk(acc, "the --lto transform runs",
+        lto.code == 0 && verdict_of(lto) == "REPLAY-OK", clip(lto.combined, 140))
+    chk(acc, "the site multiset per function is comparable across the transform",
+        flag(s.out, "main_after=") >= flag(s.out, "main_before=")
+            && flag(s.out, "main_after=") >= 0, clip(s.combined, 140))
+    let fg: RunResult = run_capture("python3", [driver, "forget"])
+    chk(acc, "the for-get discriminator holds",
+        fg.code == 0 && flag(fg.out, "forget=") == 1, clip(fg.combined, 140))
+}
+
+# ----------------------------------------------------------------------------
+# 4. the replay
+# ----------------------------------------------------------------------------
+fn sec4(acc: Acc, driver: str, proof_path: str) -> void uses IO, Fs, Proc {
+    section("4. the replay")
+    let vd: RunResult = run_capture("python3", [driver, "verdict", proof_path, "mix"])
+    chk(acc, "the seeded divisor re-proves on the transformed IR",
+        vd.code == 0 && flag(vd.out, "div_n=") >= 1
+            && flag(vd.out, "div_proven=") == 1, clip(vd.combined, 140))
+
+    # the INT64_MIN/-1 corner and the delta-0 bound stay refused — the
+    # selftest pins them; here the TOOL refuses them end to end:
+    let src5: str = write_src(acc, "corner.hls", src_corner())
+    let r5: RunResult = rev([src5, "--json"])
+    let d5: JsonValue = parse_json(r5.out)
+    let row5: JsonValue = jget(jget(jget(d5, "functions"), "divc"), "div@5")
+    chk(acc, "an unbounded dividend keeps its runtime check on both sides",
+        r5.code == 0 && jint(jget(row5, "baseline"), "proven") == 0
+            && jstr(row5, "class") == "replayed-checked", clip(r5.combined, 140))
+
+    let src6: str = write_src(acc, "delta0.hls", src_delta0())
+    let r6: RunResult = rev([src6, "--json"])
+    let d6: JsonValue = parse_json(r6.out)
+    let row6: JsonValue = jget(jget(jget(d6, "functions"), "pick0"), "bnd@6")
+    chk(acc, "i <= xs.len() (delta 0) proves nothing on either side",
+        r6.code == 0 && jint(jget(row6, "baseline"), "proven") == 0,
+        clip(r6.combined, 140))
+
+    # a for-range loop re-proves on the IR (the elems route)
+    let rl: RunResult = rev([loop_test(), "--json"])
+    let dl: JsonValue = parse_json(rl.out)
+    let rowl: JsonValue = jget(jget(jget(dl, "functions"), "sum_block"), "bnd@12")
+    chk(acc, "the const-range loop's bounds claim replays through the IR",
+        rl.code == 0 && jstr(rowl, "class") == "replayed", clip(rl.combined, 140))
+}
+
+# ----------------------------------------------------------------------------
+# 5. the law
+# ----------------------------------------------------------------------------
+fn sec5(acc: Acc, driver: str, proof_path: str) -> void uses IO, Fs, Proc {
+    section("5. the law")
+
+    # 5a. the whole positive corpus replays OK
+    let mut corpus: list[str] = []
+    let dirs: list[str] = ["examples", "tests/ok", "benchmarks"]
+    let mut di: int = 0
+    while di < dirs.len() {
+        let entries: list[str] = fs_read_dir(dirs.get(di))
+        let mut ei: int = 0
+        while ei < entries.len() {
+            let e: str = entries.get(ei)
+            if e.ends_with(".hls") {
+                corpus.push(path_join3(dirs.get(di), e))
+            }
+            ei = ei + 1
+        }
+        di = di + 1
+    }
+    let mut ok_count: int = 0
+    let mut refusals: int = 0
+    let mut fails: list[str] = []
+    let mut fi: int = 0
+    while fi < corpus.len() {
+        let r: RunResult = rev([corpus.get(fi)])
+        if r.code == 0 {
+            ok_count = ok_count + 1
+        } else if r.combined.contains("compile error") {
+            refusals = refusals + 1
+        } else {
+            fails.push(corpus.get(fi))
+        }
+        fi = fi + 1
+    }
+    chk(acc, "every replayable corpus file replays OK ("
+            + ok_count.to_str() + " ok, " + refusals.to_str()
+            + " clean refusals, " + fails.len().to_str() + " failures)",
+        fails.len() == 0, "see the failure lines below")
+    let mut k: int = 0
+    while k < fails.len() && k < 3 {
+        fail_msg(acc, "corpus failure: " + fails.get(k) + " — "
+            + clip(last_nonempty(rev([fails.get(k)]).combined), 100))
+        k = k + 1
+    }
+
+    # 5b. the class table on the canonical demo
+    let r7: RunResult = rev([elide(), "--json"])
+    let d7: JsonValue = parse_json(r7.out)
+    chk(acc, "feat_proof_elide: 6 proven claims, all discharged",
+        r7.code == 0 && jstr(d7, "verdict") == "REPLAY-OK"
+            && jint(jget(d7, "baseline"), "proven") == 6, clip(r7.combined, 140))
+    chk(acc, "the replayed class carries the discharged elisions",
+        jint(jget(d7, "counts"), "replayed") >= 4, "")
+
+    # 5c. the tool is deterministic
+    let ra: RunResult = rev([elide(), "--json"])
+    let rb: RunResult = rev([elide(), "--json"])
+    chk(acc, "re-runs are byte-identical (canonical JSON)",
+        ra.code == 0 && rb.code == 0 && ra.out == rb.out, "")
+
+    # 5d. the forged-annotation vector FAILS (the audit has teeth end
+    # to end — a hand-built IR with x*2 annotated)
+    let rf: RunResult = run_capture("python3", [driver, "forge"])
+    chk(acc, "the forged x*2 annotation is caught by the audit",
+        rf.code == 0 && flag(rf.out, "n=") == 1 && flag(rf.out, "certified=") == 0,
+        clip(rf.combined, 140))
+
+    # 5e. the broken-IR vector FAILS
+    let rd: RunResult = run_capture("python3", [driver, "dangle"])
+    chk(acc, "a dangling operand is caught as broken-ir",
+        rd.code == 0 && flag(rd.out, "dangling=") == 1, clip(rd.combined, 140))
+
+    # 5f. the law table end to end
+    let r8: RunResult = rev([proof_path, "--json"])
+    let d8: JsonValue = parse_json(r8.out)
+    let row8: JsonValue = jget(jget(jget(d8, "functions"), "mix"), "div@7")
+    chk(acc, "mix's div claim lands in the replayed class",
+        r8.code == 0 && jstr(d8, "verdict") == "REPLAY-OK"
+            && jstr(row8, "class") == "replayed", clip(r8.combined, 140))
+}
+
+# ----------------------------------------------------------------------------
+# 6. the refusals
+# ----------------------------------------------------------------------------
+fn sec6(acc: Acc) -> void uses IO, Fs, Proc {
+    section("6. the refusals")
+    # (a) a type error refuses with exit 1 and no traceback
+    let bad_src: str = write_src(acc, "bad.hls",
+        "fn main() -> int { return \"x\" + 1 }\n")
+    let p: RunResult = rev([bad_src])
+    chk(acc, "a type error refuses cleanly (exit 1, no traceback)",
+        p.code == 1 && p.err.contains("compile error")
+            && !p.err.contains("Traceback"), clip(p.combined, 120))
+
+    # (b) a missing file refuses
+    let p2: RunResult = rev([path_join3(acc.scratch_base, "missing.hls")])
+    chk(acc, "a missing file refuses (exit 1)",
+        p2.code == 1 && p2.err.contains("cannot open"), clip(p2.combined, 120))
+
+    # (c) a usage error exits 2
+    let p3: RunResult = rev([])
+    chk(acc, "no arguments is a usage error (exit 2)", p3.code == 2, "")
+    let p4: RunResult = rev(["--frobnicate", "x.hls"])
+    chk(acc, "an unknown flag is a usage error (exit 2)", p4.code == 2, "")
+
+    # (d) tests/fail programs refuse (a sample)
+    let entries: list[str] = fs_read_dir("tests/fail")
+    let sorted_entries: list[str] = sort_strs(entries)
+    let mut sample: list[str] = []
+    let mut i: int = 0
+    while i < sorted_entries.len() && sample.len() < 12 {
+        sample.push(sorted_entries.get(i))
+        i = i + 1
+    }
+    let mut refused: int = 0
+    let mut si: int = 0
+    while si < sample.len() {
+        let pr: RunResult = rev([path_join3("tests/fail", sample.get(si))])
+        if pr.code == 1 && !pr.err.contains("Traceback") {
+            refused = refused + 1
+        }
+        si = si + 1
+    }
+    chk(acc, "the negative-test sample refuses cleanly ("
+            + refused.to_str() + "/" + sample.len().to_str() + ")",
+        refused == sample.len(), "")
+}
+
+# ----------------------------------------------------------------------------
+# 7. the demos
+# ----------------------------------------------------------------------------
+fn sec7(acc: Acc) -> void uses IO, Fs, Proc {
+    section("7. the demos")
+    let p: RunResult = boot(acc, [demo()])
+    chk(acc, "the demo runs in the interpreter",
+        p.code == 0 && p.out.contains("law proven"), clip(p.combined, 90))
+    let p2: RunResult = boot(acc, [ok_test()])
+    chk(acc, "the ok-test runs in the interpreter",
+        p2.code == 0 && p2.out.starts_with("stage108 reverify:"),
+        clip(p2.combined, 90))
+    if p.code == 0 && p2.code == 0 {
+        let r1: RunResult = rev([demo()])
+        let r2: RunResult = rev([ok_test()])
+        chk(acc, "the tool replays both demos OK",
+            r1.code == 0 && r2.code == 0, clip(r1.combined, 90))
+        let rr1: RunResult = rev([demo(), "--json"])
+        let rr2: RunResult = rev([ok_test(), "--json"])
+        chk(acc, "the json verdicts agree",
+            rr1.code == 0 && rr2.code == 0
+                && verdict_of(rr1) == "REPLAY-OK"
+                && verdict_of(rr2) == "REPLAY-OK", clip(rr1.combined, 90))
+    }
+
+    if file_exists("bin/hlc") {
+        let n1: str = scratch(acc, "demo")
+        let n2: str = scratch(acc, "oktest")
+        let c1: RunResult = run_capture("bin/hlc", [demo(), n1 + ".c"])
+        let c2: RunResult = run_capture("bin/hlc", [ok_test(), n2 + ".c"])
+        if c1.code != 0 || c2.code != 0 {
+            bad(acc, "native compilation of the demos failed",
+                clip(c1.combined, 90) + " | " + clip(c2.combined, 90))
+        } else {
+            let g1: RunResult = run_capture("gcc",
+                ["-O2", "-o", n1, n1 + ".c", "-lm", "-pthread"])
+            let g2: RunResult = run_capture("gcc",
+                ["-O2", "-o", n2, n2 + ".c", "-lm", "-pthread"])
+            if g1.code == 0 && g2.code == 0 {
+                let b1: RunResult = run_capture(n1, [])
+                let b2: RunResult = run_capture(n2, [])
+                chk(acc, "the demo agrees byte for byte with the native binary",
+                    b1.code == 0 && b1.out == p.out,
+                    "interp=" + clip(p.out, 40) + " nat=" + clip(b1.out, 40))
+                chk(acc, "the ok-test agrees byte for byte with the native binary",
+                    b2.code == 0 && b2.out == p2.out,
+                    "interp=" + clip(p2.out, 40) + " nat=" + clip(b2.out, 40))
+            }
+        }
+    } else {
+        println("  [note] bin/hlc not built — the native half of section 7 "
+            + "is skipped (the gate stays hermetic)")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 8. the report
+# ----------------------------------------------------------------------------
+fn sec8(acc: Acc) -> void uses IO, Fs, Proc {
+    section("8. the report")
+    let ra: RunResult = rev([elide(), "--json"])
+    let d: JsonValue = parse_json(ra.out)
+    chk(acc, "the report schema is pinned",
+        jstr(d, "schema") == "hls-reverify-report/v1"
+            && jstr(d, "tool") == "hls-reverify"
+            && jstr(d, "tool_version") == "0.127.0-alpha", "")
+    let keys: list[str] = ["schema", "tool", "tool_version", "entry", "lto",
+        "verdict", "baseline", "replay", "counts", "findings", "failures",
+        "functions"]
+    let mut all_keys: bool = true
+    let mut i: int = 0
+    while i < keys.len() {
+        if !json_object_has(d, keys.get(i)) {
+            all_keys = false
+        }
+        i = i + 1
+    }
+    chk(acc, "the report carries every section", all_keys, "")
+    let out_dir: str = scratch(acc, "reports")
+    let p: RunResult = rev([ok_test(), "--out", out_dir])
+    let report_file: str = path_join3(out_dir,
+        "hls-reverify-feat_stage108_reverify.report.json")
+    chk(acc, "--out writes the versioned report file",
+        p.code == 0 && file_exists(report_file), clip(p.combined, 90))
+    let on_disk: JsonValue = parse_json(read_or(report_file, ""))
+    chk(acc, "the written report parses and agrees",
+        jstr(on_disk, "verdict") == "REPLAY-OK", "")
+    let rt: RunResult = rev([ok_test()])
+    chk(acc, "the text report renders",
+        rt.code == 0 && grep_count(rt.out, "verdict:") == 1, clip(rt.out, 90))
+}
+
+# ----------------------------------------------------------------------------
+# 9. the tools
+# ----------------------------------------------------------------------------
+fn sec9(acc: Acc) -> void uses IO, Fs, Proc {
+    section("9. the tools")
+    let files: list[str] = [demo(), ok_test()]
+    let mut i: int = 0
+    while i < files.len() {
+        let f: str = files.get(i)
+        let original: str = read_file(f)
+        let p1f: str = scratch(acc, "fmt1.hls")
+        write_file(p1f, original)
+        run_quiet("./bin/hlfmt", ["-w", p1f])
+        let p2f: str = scratch(acc, "fmt2.hls")
+        write_file(p2f, read_file(p1f))
+        run_quiet("./bin/hlfmt", ["-w", p2f])
+        let once: str = read_file(p1f)
+        let twice: str = read_file(p2f)
+        chk(acc, "hlfmt: stable formatting on " + f, once == twice, "")
+        chk(acc, "hlfmt: the committed " + f + " is already formatted",
+            once == original, "")
+        i = i + 1
+    }
+    let mut j: int = 0
+    while j < files.len() {
+        let l: RunResult = run_capture("python3",
+            ["tools/hllint.py", files.get(j)])
+        chk(acc, "hllint: no findings on " + files.get(j), l.code == 0,
+            clip(l.combined, 90))
+        j = j + 1
+    }
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let acc: Acc = acc_new("reverify")
+    let driver: str = write_src(acc, "driver_rev.py", driver_src())
+    let proof_path: str = write_src(acc, "proof.hls", src_proof())
+    sec1(acc, driver)
+    sec2(acc, driver)
+    sec3(acc, driver, proof_path)
+    sec4(acc, driver, proof_path)
+    sec5(acc, driver, proof_path)
+    sec6(acc)
+    sec7(acc)
+    sec8(acc)
+    sec9(acc)
+    return finish(acc, "Stage 108 -- memory-safety re-verification under -O fast (proof replay)")
+}

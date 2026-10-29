@@ -1,0 +1,685 @@
+# ============================================================================
+# tests/acc/xdiff_acceptance.hls — Stage 133 acceptance gate, in Halis
+# (the Halis twin of tests/xdiff_acceptance.py; same eight sections,
+# same assertions, same needles — the harness is tests/acc/harness.hls
+# and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make xdiff-acceptance` (which compiles this file and runs
+# it from the repo root).
+#
+# The battery drove the REAL suite CLI (python3 tools/hls-xdiff.py) for
+# everything but section 2, where it loaded the tool with importlib and
+# called canonical_channel() in process; the gate asks that one question
+# through a small python3 driver it writes into its scratch world (the
+# module stays the subject; the vectors and the comparisons live here).
+# The ledger surgery of section 5 (filter / append / rewrite a states
+# entry) runs here too, over std.json — the tool never writes its
+# ledger, and neither does anything else.
+#
+#  1. the convention   — exit codes 0/1/2, refusals name the rule,
+#                        selftest green, the --json report keys
+#  2. the normalizer   — the channel's 17 vectors + the changed-token
+#                        flags (canonical_channel via the driver)
+#  3. the three-backend match — exact bytes on ints_corners, the float
+#                        channel normalized (and only normalized)
+#  4. the halt law     — panic-equal, halt-gap (exit 7 named), the
+#                        unledgered alarm
+#  5. the ledger law   — six sanctioned findings; missing entry rings,
+#                        bogus entry STALE, moved states MISMATCH,
+#                        --update-ledger drafts without writing
+#  6. the purity gate  — named exclusions, the census bulk, --list and
+#                        an honest --all
+#  7. the llvm leg     — static, validated, honestly labelled
+#  8. the corpus       — the fixture hlfmt/hllint/boot/native-clean and
+#     showcase          byte-identical; the full --core run green with
+#                        every verdict class and three executing backends
+#
+# The battery's timeout=900 wrappers have no Halis equivalent (no
+# per-child alarm); every child here is the xdiff tool, boot.py, hlc,
+# gcc or the gate's own python3 driver. The --core sweep legitimately
+# runs for minutes.
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.json"
+import "std.result"
+import "std.env"
+
+# ----------------------------------------------------------------------------
+# The battery's [PASS]/[FAIL] grammar.
+# ----------------------------------------------------------------------------
+
+fn ok(acc: Acc, label: str) -> void uses IO {
+    acc.pass = acc.pass + 1
+    println("  [PASS] " + label)
+}
+
+fn bad(acc: Acc, label: str, detail: str) -> void uses IO {
+    acc.fail = acc.fail + 1
+    if detail == "" {
+        println("  [FAIL] " + label)
+    } else {
+        println("  [FAIL] " + label + ": " + detail)
+    }
+}
+
+# chk(acc, label, cond, detail) — the battery's check() with the
+# harness's argument order (label, condition, detail).
+fn chk(acc: Acc, label: str, cond: bool, detail: str) -> bool uses IO {
+    if cond {
+        ok(acc, label)
+    } else {
+        bad(acc, label, detail)
+    }
+    return cond
+}
+
+# ----------------------------------------------------------------------------
+# The suite CLI, as the battery addresses it.
+# ----------------------------------------------------------------------------
+
+fn run_xdiff(args: list[str]) -> RunResult uses Proc {
+    let argv: list[str] = ["tools/hls-xdiff.py"]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    return run_capture("python3", argv)
+}
+
+fn file_run(path: str, extra: list[str]) -> RunResult uses Proc {
+    let args: list[str] = ["--file", path]
+    let mut i: int = 0
+    while i < extra.len() {
+        args.push(extra.get(i))
+        i = i + 1
+    }
+    return run_xdiff(args)
+}
+
+fn fixture(name: str) -> str {
+    return "tests/xdiff/" + name + ".hls"
+}
+
+# ----------------------------------------------------------------------------
+# JSON report accessors (safe shapes: a missing key fails the check,
+# it never panics the gate).
+# ----------------------------------------------------------------------------
+
+fn jint_or(v: JsonValue, k: str, fallback: int) -> int {
+    let f: JsonValue = json_object_get(v, k)
+    if json_is_int(f) {
+        return json_int_value(f)
+    }
+    return fallback
+}
+
+fn jstr_or(v: JsonValue, k: str, fallback: str) -> str {
+    let f: JsonValue = json_object_get(v, k)
+    if json_is_str(f) {
+        return json_str_value(f)
+    }
+    return fallback
+}
+
+# first_token(s) — the battery's .strip().split()[0] on the census line.
+fn first_token(s: str) -> str {
+    let t: str = s.trim()
+    let sp: int = t.find(" ")
+    if sp < 0 {
+        return t
+    }
+    return t.slice(0, sp)
+}
+
+# ----------------------------------------------------------------------------
+# The python3 driver: section 2's front door to the tool's own
+# canonical_channel (loaded by path exactly the way the battery loads
+# it). `canon A B` prints the canonical form and the changed-token flag
+# of both sides; the vectors and the verdicts stay in the gate.
+# ----------------------------------------------------------------------------
+
+fn driver_src() -> str {
+    return "import importlib.util, sys\n" +
+        "spec = importlib.util.spec_from_file_location('hls_xdiff', 'tools/hls-xdiff.py')\n" +
+        "xd = importlib.util.module_from_spec(spec)\n" +
+        "spec.loader.exec_module(xd)\n" +
+        "a, b = sys.argv[2], sys.argv[3]\n" +
+        "ca, cha = xd.canonical_channel(a)\n" +
+        "cb, chb = xd.canonical_channel(b)\n" +
+        "print('ca=%s' % ca)\n" +
+        "print('cb=%s' % cb)\n" +
+        "print('cha=%d' % int(cha))\n" +
+        "print('chb=%d' % int(chb))\n"
+}
+
+# value_after(out, prefix) — the remainder of the first line that
+# starts with the prefix.
+fn value_after(out: str, prefix: str) -> str {
+    let lines: list[str] = out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).starts_with(prefix) {
+            return lines.get(i).slice(prefix.len(), lines.get(i).len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn flag(out: str, prefix: str) -> int {
+    let v: str = value_after(out, prefix)
+    if v == "" {
+        return -1
+    }
+    return v.to_int()
+}
+
+# ----------------------------------------------------------------------------
+# 1. the convention — exit codes 0/1/2, refusals name the rule
+# ----------------------------------------------------------------------------
+fn sec1(acc: Acc) -> void uses IO, Fs, Proc {
+    section("1. the convention — exit codes 0/1/2, refusals name the rule")
+    let r: RunResult = run_xdiff(["selftest"])
+    chk(acc, "selftest exits 0", r.code == 0, clip(r.err, 120))
+    chk(acc, "selftest: all normalizer + verdict + ledger vectors green",
+        r.out.contains("green") && !r.out.contains("[FAIL]"), "")
+
+    let r2: RunResult = run_xdiff(["--backends", "interp,nope", "--file",
+                                   fixture("xdiff_ints_corners")])
+    chk(acc, "unknown backend exits 2", r2.code == 2, "")
+    chk(acc, "the refusal names the unknown backend",
+        r2.err.contains("unknown backend") && r2.err.contains("nope"), clip(r2.err, 120))
+
+    let r3: RunResult = run_xdiff(["--file", "tests/ok/no_such_program.hls"])
+    chk(acc, "missing program exits 2", r3.code == 2, "")
+    chk(acc, "the refusal names the missing path",
+        r3.err.contains("no such program"), clip(r3.err, 120))
+
+    let r4: RunResult = run_xdiff(["--backends", "native,wasm", "--file",
+                                   fixture("xdiff_ints_corners")])
+    chk(acc, "native without the reference leg exits 2", r4.code == 2, "")
+    chk(acc, "the refusal names the reference-leg law",
+        r4.err.contains("reference"), clip(r4.err, 120))
+
+    let r5: RunResult = file_run(fixture("xdiff_ints_corners"),
+        ["--json", "/tmp/hls-xdiff-acc.json"])
+    if chk(acc, "a green --file run exits 0", r5.code == 0, clip(r5.err, 120)) {
+        let rep: JsonValue = json_parse(read_file("/tmp/hls-xdiff-acc.json"))
+        let keys: list[str] = ["schema", "backends", "programs", "summary", "ledger"]
+        let mut i: int = 0
+        while i < keys.len() {
+            chk(acc, "json report carries '" + keys.get(i) + "'",
+                json_object_has(rep, keys.get(i)), "")
+            i = i + 1
+        }
+        let progs: JsonValue = json_object_get(rep, "programs")
+        if json_is_array(progs) && progs.arr.len() > 0 {
+            let prog: JsonValue = progs.arr.get(0)
+            let pkeys: list[str] = ["name", "verdict", "signature", "legs"]
+            let mut j: int = 0
+            while j < pkeys.len() {
+                chk(acc, "program entry carries '" + pkeys.get(j) + "'",
+                    json_object_has(prog, pkeys.get(j)), "")
+                j = j + 1
+            }
+        } else {
+            bad(acc, "program entry carries 'name'", "no programs array")
+        }
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 2. the normalizer — the channel's vectors, via the driver
+# ----------------------------------------------------------------------------
+fn sec2(acc: Acc, driver: str) -> void uses IO, Proc {
+    section("2. the normalizer — the channel's vectors, in process")
+    let va: list[str] = ["0.750000", "1.500000", "0.123457",
+        "123456789012345680.000000", "0.000000", "0.000010",
+        "1000000000000000000000.000000", "-0.000000",
+        "nan", "-nan", "inf", "-inf", "1.10", "9007199254740993",
+        "0.750001", "abc", "v1.2.3"]
+    let vb: list[str] = ["0.75", "1.5", "0.12345678901",
+        "123456789012345680.0", "1e-7", "1e-5",
+        "1e+21", "0.0",
+        "NaN", "nan", "Infinity", "-Infinity", "1.1", "9007199254740994",
+        "0.75", "abd", "v1.2.4"]
+    let vexpect: list[bool] = [true, true, true,
+        true, true, true,
+        true, true,
+        true, true, true, true, false, false,
+        false, false, false]
+    let mut norm_bad: str = ""
+    let mut n_bad: int = 0
+    let mut i: int = 0
+    while i < va.len() {
+        let r: RunResult = run_capture("python3",
+            [driver, "canon", va.get(i), vb.get(i)])
+        let ca: str = value_after(r.out, "ca=")
+        let cb: str = value_after(r.out, "cb=")
+        if (ca == cb) != vexpect.get(i) {
+            n_bad = n_bad + 1
+            if n_bad <= 3 {
+                norm_bad = norm_bad + "(" + va.get(i) + " vs " + vb.get(i)
+                    + ": " + ca + " | " + cb + ") "
+            }
+        }
+        i = i + 1
+    }
+    chk(acc, "17 channel vectors green", n_bad == 0, clip(norm_bad, 120))
+
+    let rc: RunResult = run_capture("python3",
+        [driver, "canon", "x=0.750000", "x=0.75"])
+    chk(acc, "the channel reports WHEN it changed a token (normalized vs exact)",
+        flag(rc.out, "cha=") == 1, "")
+    chk(acc, "a short form passes through unrewritten",
+        flag(rc.out, "chb=") == 0, "")
+}
+
+# ----------------------------------------------------------------------------
+# 3. the three-backend match — bytes, not stories
+# ----------------------------------------------------------------------------
+fn sec3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("3. the three-backend match — bytes, not stories")
+    let r: RunResult = file_run(fixture("xdiff_ints_corners"),
+        ["--json", "/tmp/hls-xdiff-acc.json"])
+    if chk(acc, "xdiff_ints_corners green on all legs", r.code == 0,
+           clip(r.err, 120)) {
+        let rep: JsonValue = json_parse(read_file("/tmp/hls-xdiff-acc.json"))
+        let prog: JsonValue = json_object_get(rep, "programs").arr.get(0)
+        let verdict: str = jstr_or(prog, "verdict", "?")
+        chk(acc, "integer corners are EXACT (byte-identical)",
+            verdict == "exact", verdict)
+        let legs: JsonValue = json_object_get(prog, "legs")
+        let di: str = jstr_or(json_object_get(legs, "interp"),
+                              "out_sha256_16", "")
+        let dn: str = jstr_or(json_object_get(legs, "native"),
+                              "out_sha256_16", "")
+        let dw: str = jstr_or(json_object_get(legs, "wasm"),
+                              "out_sha256_16", "")
+        chk(acc, "interp == native == wasm on the RAW digest (" + di + ")",
+            di != "" && di == dn && dn == dw,
+            "interp=" + di + " native=" + dn + " wasm=" + dw)
+    }
+
+    let r2: RunResult = file_run(fixture("xdiff_floats_channel"),
+        ["--json", "/tmp/hls-xdiff-acc.json"])
+    if chk(acc, "xdiff_floats_channel green", r2.code == 0, clip(r2.err, 120)) {
+        let rep: JsonValue = json_parse(read_file("/tmp/hls-xdiff-acc.json"))
+        let prog: JsonValue = json_object_get(rep, "programs").arr.get(0)
+        let verdict: str = jstr_or(prog, "verdict", "?")
+        chk(acc, "the float channel is NORMALIZED (not exact, not divergence)",
+            verdict == "normalized", verdict)
+        let legs: JsonValue = json_object_get(prog, "legs")
+        let raw_i: str = jstr_or(json_object_get(legs, "interp"),
+                                 "out_sha256_16", "")
+        let raw_w: str = jstr_or(json_object_get(legs, "wasm"),
+                                 "out_sha256_16", "")
+        let can_i: str = jstr_or(json_object_get(legs, "interp"),
+                                 "out_canonical_sha256_16", "")
+        let can_w: str = jstr_or(json_object_get(legs, "wasm"),
+                                 "out_canonical_sha256_16", "")
+        chk(acc, "raw digests DIFFER (the channel did real work)",
+            raw_i != raw_w, "")
+        chk(acc, "canonical digests AGREE (same doubles, one channel)",
+            can_i == can_w && can_i != "", "")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 4. the halt law — panic-equal, halt-gap, the alarm
+# ----------------------------------------------------------------------------
+fn line_verdict(out: str, name: str) -> str {
+    let lines: list[str] = out.split("\n")
+    let mut verdict: str = "missing"
+    let mut i: int = 0
+    while i < lines.len() {
+        let l: str = lines.get(i)
+        if l.contains(name) && l.contains("panic-equal") {
+            verdict = "panic-equal"
+        } else {
+            if l.contains(name) && l.contains("halt-gap") {
+                verdict = "halt-gap"
+            }
+        }
+        i = i + 1
+    }
+    return verdict
+}
+
+fn sec4(acc: Acc, scratch: str) -> void uses IO, Fs, Proc {
+    section("4. the halt law — panic-equal, halt-gap, the alarm")
+    let names: list[str] = ["xdiff_panic_div_zero", "xdiff_panic_overflow"]
+    let mut i: int = 0
+    while i < names.len() {
+        let name: str = names.get(i)
+        let r: RunResult = file_run(fixture(name), [])
+        let verdict: str = line_verdict(r.out, name)
+        chk(acc, name + " is panic-equal",
+            r.code == 0 && verdict == "panic-equal",
+            "exit=" + r.code.to_str() + " verdict=" + verdict)
+        i = i + 1
+    }
+
+    let r2: RunResult = file_run(fixture("xdiff_exit_halt"), [])
+    chk(acc, "xdiff_exit_halt is halt-gap (the wasm alpha's trap convention)",
+        r2.code == 0 && r2.out.contains("halt-gap"), "")
+    chk(acc, "the halt-gap names the unpropagated code",
+        r2.out.contains("exit 7"), clip(r2.out, 400))
+
+    # A program that traps on wasm while the interpreter runs clean
+    # rings — unledgered, exit 1, the divergence named.
+    let tp: str = scratch + "/trap_prog.hls"
+    write_file(tp, "fn main() uses IO {\n" +
+        "    println(\"clean on interp\")\n" +
+        "    let v: float = \"3.5\".to_float()\n" +
+        "    println(\"never reached on wasm\")\n" +
+        "}\n")
+    let r3: RunResult = file_run(tp, ["--backends", "interp,wasm",
+                                      "--ledger", scratch + "/empty.json"])
+    chk(acc, "an unledgered divergence rings (exit 1)", r3.code == 1, "")
+    chk(acc, "the alarm names the program and the verdict",
+        r3.out.contains("divergence") && r3.out.contains("trap_prog"),
+        clip(r3.out, 300))
+}
+
+# ----------------------------------------------------------------------------
+# 5. the ledger law — sanctioned, and the negative space
+# ----------------------------------------------------------------------------
+fn ledger_states_ok() -> JsonValue {
+    return json_object(["interp", "native", "wasm"],
+        [json_str("ok"), json_str("ok"), json_str("ok")])
+}
+
+# with_waivers(rep, kept) — the ledger object with its waivers replaced
+# (the surgery is a pure rebuild: the tool never writes its ledger, and
+# neither does the gate write the real one).
+fn with_waivers(rep: JsonValue, kept: list[JsonValue]) -> JsonValue {
+    let mut keys: list[str] = []
+    let mut vals: list[JsonValue] = []
+    let mut i: int = 0
+    while i < rep.obj_keys.len() {
+        if rep.obj_keys.get(i) == "waivers" {
+            keys.push("waivers")
+            vals.push(json_array(kept))
+        } else {
+            keys.push(rep.obj_keys.get(i))
+            vals.push(rep.obj_vals.get(i))
+        }
+        i = i + 1
+    }
+    return json_object(keys, vals)
+}
+
+fn sec5(acc: Acc, scratch: str) -> void uses IO, Fs, Proc {
+    section("5. the ledger law — sanctioned, and the negative space")
+    let files: list[str] = ["feat_deep_scan7_to_float",
+        "feat_deep_scan27_nested_generic", "feat_stage31_tail",
+        "feat_deep_scan6_lexer", "feat_stage98_refine_panic",
+        "panic_str_bounds"]
+    let classes: list[str] = ["wasm-halt-unimplemented",
+        "wasm-invalid-module", "wasm-invalid-module", "wasm-bad-value",
+        "wasm-missing-check", "wasm-missing-check"]
+    let mut i: int = 0
+    while i < files.len() {
+        let r: RunResult = file_run("tests/ok/" + files.get(i) + ".hls", [])
+        chk(acc, files.get(i) + " sanctioned as " + classes.get(i),
+            r.code == 0 && r.out.contains(classes.get(i))
+                && r.out.contains("sanctioned"),
+            "exit=" + r.code.to_str() + " out=" + clip(r.out, 160))
+        i = i + 1
+    }
+
+    let real: JsonValue = json_parse(read_file("tests/xdiff/ledger.json"))
+    let waivers: JsonValue = json_object_get(real, "waivers")
+
+    # (a) the entry MISSING: the same divergence becomes a regression
+    let mut kept: list[JsonValue] = []
+    let mut wi: int = 0
+    while wi < waivers.arr.len() {
+        let w: JsonValue = waivers.arr.get(wi)
+        if jstr_or(w, "file", "") != "panic_str_bounds" {
+            kept.push(w)
+        }
+        wi = wi + 1
+    }
+    let trim_path: str = scratch + "/trimmed.json"
+    write_file(trim_path, json_stringify(with_waivers(real, kept)))
+    let r1: RunResult = file_run("tests/ok/panic_str_bounds.hls",
+        ["--ledger", trim_path])
+    chk(acc, "a missing entry turns the divergence into an unledgered alarm",
+        r1.code == 1 && r1.out.contains("divergence"), "")
+
+    # (b) a BOGUS entry on a clean program: the two-way law rings STALE
+    let mut bogus_list: list[JsonValue] = []
+    let mut bi: int = 0
+    while bi < waivers.arr.len() {
+        bogus_list.push(waivers.arr.get(bi))
+        bi = bi + 1
+    }
+    bogus_list.push(json_object(["file", "class", "culprit", "states", "diagnosis"],
+        [json_str("feat_contract_basic"), json_str("wasm-bad-value"),
+         json_str("wasm"), ledger_states_ok(),
+         json_str("a bogus entry the two-way law must catch")]))
+    let bogus_path: str = scratch + "/bogus.json"
+    write_file(bogus_path, json_stringify(with_waivers(real, bogus_list)))
+    let r2: RunResult = file_run("tests/ok/feat_contract_basic.hls",
+        ["--ledger", bogus_path])
+    chk(acc, "a bogus entry on a clean program rings STALE (two-way)",
+        r2.code == 1 && r2.out.contains("stale"), "")
+
+    # (c) the states MOVED: the entry no longer describes reality
+    let mut moved_list: list[JsonValue] = []
+    let mut mi: int = 0
+    while mi < waivers.arr.len() {
+        let w: JsonValue = waivers.arr.get(mi)
+        if jstr_or(w, "file", "") == "feat_deep_scan7_to_float" {
+            let mut keys: list[str] = []
+            let mut vals: list[JsonValue] = []
+            let mut ki: int = 0
+            while ki < w.obj_keys.len() {
+                if w.obj_keys.get(ki) == "states" {
+                    keys.push("states")
+                    vals.push(ledger_states_ok())
+                } else {
+                    keys.push(w.obj_keys.get(ki))
+                    vals.push(w.obj_vals.get(ki))
+                }
+                ki = ki + 1
+            }
+            moved_list.push(json_object(keys, vals))
+        } else {
+            moved_list.push(w)
+        }
+        mi = mi + 1
+    }
+    let moved_path: str = scratch + "/moved.json"
+    write_file(moved_path, json_stringify(with_waivers(real, moved_list)))
+    let r3: RunResult = file_run("tests/ok/feat_deep_scan7_to_float.hls",
+        ["--ledger", moved_path])
+    chk(acc, "an entry whose states moved rings MISMATCH (re-diagnose)",
+        r3.code == 1 && r3.out.contains("mismatch"), "")
+
+    # (d) --update-ledger drafts without writing
+    let r4: RunResult = file_run(scratch + "/trap_prog.hls",
+        ["--backends", "interp,wasm", "--ledger", scratch + "/empty.json",
+         "--update-ledger"])
+    chk(acc, "--update-ledger drafts the diverging set",
+        r4.code == 1 && r4.out.contains("draft entries")
+            && r4.out.contains("\"file\": \"trap_prog\""), "")
+    chk(acc, "the tool never writes the ledger itself",
+        !file_exists("tests/xdiff/empty.json"), "")
+}
+
+# ----------------------------------------------------------------------------
+# 6. the purity gate — named exclusions, and an honest --all
+# ----------------------------------------------------------------------------
+fn sec6(acc: Acc) -> void uses IO, Proc {
+    section("6. the purity gate — named exclusions, and an honest --all")
+    let r: RunResult = run_xdiff(["--discover"])
+    chk(acc, "the census runs", r.code == 0, "")
+    chk(acc, "std.http is excluded BY NAME (output depends on the world)",
+        r.out.contains("std.http") && r.out.contains("feat_stage38_http"), "")
+    chk(acc, "the crate mode is excluded by name",
+        r.out.contains("#![freestanding]"), "")
+    chk(acc, "panic fixtures are pure enough to sit at the table",
+        !r.out.contains("panic_divzero"), "")
+    let fxs: list[str] = ["xdiff_ints_corners", "xdiff_floats_channel",
+        "xdiff_control_flow", "xdiff_exit_halt"]
+    let mut i: int = 0
+    while i < fxs.len() {
+        chk(acc, fxs.get(i) + " passes the gate", !r.out.contains(fxs.get(i)), "")
+        i = i + 1
+    }
+
+    let r2: RunResult = run_xdiff(["--discover"])
+    let n_elig: int = first_token(
+        value_after(r2.out, "purity census:").split("eligible").get(0)).to_int()
+    chk(acc, "the gated corpus keeps the bulk of tests/ok (" + n_elig.to_str() + ")",
+        n_elig > 100, "")
+
+    let r3: RunResult = run_xdiff(["--list"])
+    chk(acc, "the gated corpus does not contain the http program",
+        r3.code == 0 && !r3.out.contains("feat_stage38_http"), "")
+    let r4: RunResult = run_xdiff(["--all", "--list"])
+    chk(acc, "--all lifts the gate: the world-dependent program re-enters the corpus",
+        r4.code == 0 && r4.out.contains("feat_stage38_http"), "")
+}
+
+# ----------------------------------------------------------------------------
+# 7. the llvm leg — static, validated, honestly labelled
+# ----------------------------------------------------------------------------
+fn sec7(acc: Acc) -> void uses IO, Fs, Proc {
+    section("7. the llvm leg — static, validated, honestly labelled")
+    let r: RunResult = file_run(fixture("xdiff_control_flow"),
+        ["--json", "/tmp/hls-xdiff-acc.json"])
+    if chk(acc, "xdiff_control_flow green", r.code == 0, clip(r.err, 120)) {
+        let rep: JsonValue = json_parse(read_file("/tmp/hls-xdiff-acc.json"))
+        let prog: JsonValue = json_object_get(rep, "programs").arr.get(0)
+        let llvm: JsonValue = json_object_get(json_object_get(prog, "legs"), "llvm")
+        let status: str = jstr_or(llvm, "status", "?")
+        let notes: str = jstr_or(llvm, "notes", "")
+        chk(acc, "the llvm leg is VALIDATED (static)", status == "validated",
+            "status=" + status)
+        chk(acc, "the IR passed the structural validator",
+            notes.contains("IR valid"), "")
+        chk(acc, "llvm never contributes an executing verdict",
+            status != "ok" && status != "halted", "")
+    }
+    chk(acc, "the report says 'static — validated, not executed' in those words",
+        r.out.contains("static — validated, not executed"), "")
+}
+
+# ----------------------------------------------------------------------------
+# 8. the corpus showcase — the fixture, then the full core
+# ----------------------------------------------------------------------------
+fn sec8(acc: Acc, scratch: str) -> void uses IO, Fs, Proc, Clock, Conc {
+    section("8. the corpus showcase — the fixture, then the full core")
+    let ok_f: str = "tests/ok/feat_stage133_xdiff.hls"
+
+    let f: RunResult = run_capture("./bin/hlfmt", ["--check", ok_f])
+    chk(acc, "the fixture is hlfmt-canonical", f.code == 0, "")
+    let l: RunResult = run_capture("python3", ["tools/hllint.py", ok_f])
+    chk(acc, "the fixture is hllint-clean",
+        l.code == 0 && l.out.contains("no warnings"), clip(l.out, 200))
+    let c: RunResult = boot_check(acc, ok_f)
+    chk(acc, "the fixture boots through the real checker", c.code == 0,
+        clip(c.err, 200))
+    let b: RunResult = boot(acc, [ok_f])
+    let interp_out: str = b.out
+    chk(acc, "the fixture runs green on the interpreter",
+        b.code == 0 && b.out.contains("cross-impl suite OK"), "")
+
+    let cfile: str = scratch + "/f.c"
+    let binfile: str = scratch + "/f.bin"
+    let h: RunResult = run_capture("./bin/hlc", [ok_f, cfile])
+    if chk(acc, "the native compiler takes the fixture", h.code == 0, "") {
+        run_capture("gcc", ["-O2", "-o", binfile, cfile, "-lm", "-pthread"])
+        # The battery ran the binary with LC_ALL=C; set it for this one
+        # child and put the environment back the way it was.
+        env_set_var("LC_ALL", "C")
+        let p2: RunResult = run_capture(binfile, [])
+        env_unset_var("LC_ALL")
+        chk(acc, "the native build is byte-identical to the interpreter",
+            p2.code == 0 && p2.out == interp_out, "")
+    }
+
+    # The full core run: every verdict class, three executing backends.
+    let r: RunResult = run_xdiff(["--core", "--json", "/tmp/hls-xdiff-core.json"])
+    if chk(acc, "the --core run is GREEN (exit 0)", r.code == 0,
+           clip(r.out, 400)) {
+        let rep: JsonValue = json_parse(read_file("/tmp/hls-xdiff-core.json"))
+        let s: JsonValue = json_object_get(rep, "summary")
+        let n_exact: int = jint_or(s, "exact", 0)
+        let n_panic: int = jint_or(s, "panic-equal", 0)
+        let n_norm: int = jint_or(s, "normalized", 0)
+        let n_gap: int = jint_or(s, "halt-gap", 0)
+        let n_div: int = jint_or(s, "divergence", 0)
+        let n_err: int = jint_or(s, "error", 0)
+        chk(acc, "exact verdicts present (" + n_exact.to_str() + ")",
+            n_exact >= 15, "")
+        chk(acc, "panic-equal verdicts present (" + n_panic.to_str() + ")",
+            n_panic >= 10, "")
+        chk(acc, "normalized verdicts present (" + n_norm.to_str() + ")",
+            n_norm >= 1, "")
+        chk(acc, "halt-gap verdicts present (" + n_gap.to_str() + ")",
+            n_gap >= 1, "")
+        chk(acc, "the six ledgered findings stay visible (div=" + n_div.to_str()
+            + ", err=" + n_err.to_str() + ")",
+            n_div >= 4 && n_err >= 2, "")
+        let progs: JsonValue = json_object_get(rep, "programs")
+        let mut sanctioned: int = 0
+        let mut has_interp: bool = false
+        let mut has_native: bool = false
+        let mut has_wasm: bool = false
+        let mut pi: int = 0
+        while pi < progs.arr.len() {
+            let p: JsonValue = progs.arr.get(pi)
+            let led: JsonValue = json_object_get(p, "ledger")
+            if json_is_object(led) &&
+               jstr_or(led, "status", "") == "sanctioned" {
+                sanctioned = sanctioned + 1
+            }
+            let legs: JsonValue = json_object_get(p, "legs")
+            let mut li: int = 0
+            while li < legs.obj_keys.len() {
+                let st: str = jstr_or(legs.obj_vals.get(li), "status", "")
+                if st == "ok" || st == "halted" {
+                    let bn: str = legs.obj_keys.get(li)
+                    if bn == "interp" {
+                        has_interp = true
+                    }
+                    if bn == "native" {
+                        has_native = true
+                    }
+                    if bn == "wasm" {
+                        has_wasm = true
+                    }
+                }
+                li = li + 1
+            }
+            pi = pi + 1
+        }
+        chk(acc, "every finding carries its sanctioned diagnosis ("
+            + sanctioned.to_str() + ")", sanctioned >= 6, "")
+        chk(acc, "three executing backends participated: interp, native, wasm",
+            has_interp && has_native && has_wasm, "")
+    }
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit, Clock, Conc {
+    let acc: Acc = acc_new("xdiff")
+    let scratch: str = acc.scratch_base
+    let driver: str = write_src(acc, "driver.py", driver_src())
+    sec1(acc)
+    sec2(acc, driver)
+    sec3(acc)
+    sec4(acc, scratch)
+    sec5(acc, scratch)
+    sec6(acc)
+    sec7(acc)
+    sec8(acc, scratch)
+    return finish(acc, "Stage 133 -- the cross-implementation differential suite (hls-xdiff)")
+}
