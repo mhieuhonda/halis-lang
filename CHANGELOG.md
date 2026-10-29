@@ -10,8 +10,97 @@ platform reach (19–34), stdlib expansion (35–52), CLI tooling (53–62),
 web applications (63–76), OS-development foundation (77–96), verification
 & supply chain (97–112), developer experience (113–124), performance &
 stability (125–140), and final stabilisation toward v1.0 (141–150).
+
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
+
+## [v1.0.0-rc.4] — Stage 149: the sign-off, the candidate signed
+- The roadmap's phrase is "v1.0 Release Candidate 4 (sign-off)", and
+  the sign-off is the one thing the candidate line still lacked: a
+  NAMED approval. Readiness says the tree is fit, declare cuts the
+  candidate, the gate defends the freeze, the record renders the
+  state — and none of them says who stood behind it. This release
+  ships the missing instrument (`bin/hls-rc signoff`, in the kit, in
+  Halis, compiled by the compiler it approves) and pins its laws: the
+  signer is named (`--by`, fail-closed — an anonymous approval is not
+  a signature, a blank one is a usage error), the signature judges a
+  CUT candidate (no anchor, nothing to sign), it lands once (a second
+  stroke over a live signature is refused — one signature per
+  candidate), it judges a committed tree (the tracked tree must be
+  clean beyond the anchor file itself — a signature is not cut on a
+  workbench), and it lands only where the world is green AT THE
+  SIGNING MOMENT: readiness re-derived, the freeze gate re-derived
+  over the live range — both refusing with their laws named. The
+  signature rides IN the anchor (`.hls-rc.json` grows a `signoff`
+  object, alphabetically between `sha` and `stage`), the record
+  speaks it (one line, the name and the day, only when the candidate
+  carries one — an unsigned record never claims an approval it does
+  not have), and `signoff --check` RE-DERIVES the verdict at every
+  gate: an unsigned candidate says so, a signature whose laws turned
+  red is refused with the law's name (the gate law on a feature past
+  the anchor, the record law on a drifted record), and the SAME
+  signature is green again once the world is restored — the signature
+  is not archived, it is re-earned.
+- **The round found the kit's own outputs carrying the disease the
+  RC2 round cured in the compiler.** `bin/hls-rc report --out
+  no-such-dir/RC.md` died with `panic: cannot write file` at exit 101
+  — the runtime panic code — for an error that never reached the
+  render: the destination was unreadable before a line was rendered.
+  `bin/hls-lts policy --out` carried the same defect, and both tools
+  panicked on a destination that was a DIRECTORY too. Both now refuse
+  the way the compiler learned to in RC2, and one step earlier: the
+  destination is judged BEFORE the world is read — an invocation
+  error names its path (`error: cannot write file <path> (the
+  directory does not exist)`, and `(a directory sits there)` when a
+  directory occupies it) and exits 2, on the record, on the policy,
+  and without spending a render to find out. `--check` writes
+  nothing, so it judges no destination.
+- **The acceptance gate.** `make rc4-acceptance` — six sections, 56
+  checks: the destination law (the record and the policy refusing an
+  unwritable destination with its name at exit 2, never a panic, the
+  writable path still rendering), the signature law (the name law,
+  the anchor law, the tree law, the landing in the anchor, the once
+  law — each refused with its words), the witness law (unsigned says
+  so, the signed JSON parses with its nine named laws, the gate law
+  voids on a feature past the anchor, the record law voids on a
+  hand-edited record, the same signature re-earned when the world is
+  restored), the record law (the unsigned render carries no sign-off
+  line, the signed render gains exactly one, the render diff IS that
+  line, the drift check holds the record to the anchored state), the
+  real-tree pre-flight (readiness, gate, drift, the markers one
+  voice, the record speaking its stage's own phrase off the live
+  roadmap — and `signoff --check` pinned DYNAMICALLY: green on a
+  signed anchor, the unsigned refusal on an unsigned one, both legal
+  states of the line), and the corpus showcase.
+- **The corpus showcase.** `tests/ok/feat_stage149_rc4.hls` pins the
+  sign-off's laws in pure HLS: the signature law (the decision table
+  in the kit's own order — name, anchor, once, tree, readiness, gate
+  — with the name law a usage error and the rest named refusals), the
+  green law (the six readiness laws conjunctive — one red law speaks
+  for the whole verdict), the order law (the choreography is an
+  ordered machine — docs, declare, signoff, record, release, witness
+  — the one idempotent step being the record render, deterministic
+  per state), the witness law (the check re-derives: the SAME
+  signature changes its verdict when the world moves under it), the
+  refusal taxonomy (0/1/2/101, and the destination law's rule: an
+  unwritable output is exit 2, never 101), and the anchor's shape
+  (the signature's field sits between sha and stage, present only
+  when the candidate is signed) — hlfmt-canonical, hllint-clean,
+  byte-identical on the interpreter and natively.
+- **The record:** ROADMAP Stage 149 ticks; the README tour grows the
+  `rc4-acceptance` line; the version markers move together to
+  1.0.0-rc.4 — the changelog heading, the snapshot manifest
+  (manifest-only: the emitted C did not move this round), the editor
+  manifest. The freeze, the guarantee ledger and the snapshot fixed
+  point did not move — `make freeze-verify` / `make
+  guarantee-report` / `make snapshot-verify` say so on this very
+  tree. Stage 146's, 147's and 148's own gates still pass untouched:
+  `make rc-acceptance`, `make rc2-acceptance`, `make rc3-acceptance`,
+  green — the successor inherits the kit that certified its
+  predecessor. The candidate signs off with this release: the anchor
+  carries the signature, the record speaks it, and
+  `make rc-signoff-check` re-derives it — the last approval before
+  the LTS release cut the road has been walking toward.
 
 ## [v1.0.0-rc.3] — Stage 148: the final dry-run, the release day rehearsed
 - The roadmap's phrase is "v1.0 Release Candidate 3 (final dry-run)",

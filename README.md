@@ -398,6 +398,32 @@ make rc3-acceptance           # Stage 148 gate: the final dry-run
                                # both laws — the morning after
                                # rehearsed with it: the backport,
                                # v1.0.1, the whole road green)
+bin/hls-rc signoff --by NAME  # Stage 149: the sign-off — the LAST
+                               # approval a candidate takes, cut
+                               # into the anchor with its signer's
+                               # name on it; the tree must be green
+                               # AT THE SIGNING MOMENT (readiness
+                               # and the freeze gate re-derived,
+                               # the tracked tree clean beyond the
+                               # anchor), one signature per
+                               # candidate; signoff --check
+                               # RE-DERIVES the verdict at every
+                               # gate — the signature is not
+                               # archived, it is re-earned
+make rc4-acceptance           # Stage 149 gate: the sign-off
+                               # (the destination law — the
+                               # record and the policy refuse an
+                               # unwritable destination with its
+                               # name at exit 2, never a panic —
+                               # the signature law refused law by
+                               # law, the witness re-deriving the
+                               # verdict and voiding it on a
+                               # feature past the anchor or a
+                               # drifted record, the render
+                               # speaking the signature exactly
+                               # once, the pre-flight pinning
+                               # signoff --check dynamically, the
+                               # corpus showcase)
 python3 tools/hls-xdiff.py     # Stage 133: the cross-impl
                                # differential table — the SAME
                                # program through the interpreter,

@@ -224,7 +224,7 @@ remains green.
 | 146 | v1.0 Release Candidate 1 (feature freeze) | ✅ | (done in v1.0.0-rc.1) |
 | 147 | v1.0 Release Candidate 2 (bug-fix only) | ✅ | (done in v1.0.0-rc.2) |
 | 148 | v1.0 Release Candidate 3 (final dry-run) | ✅ | (done in v1.0.0-rc.3) |
-| 149 | v1.0 Release Candidate 4 (sign-off) | ⬜ | 2 weeks |
+| 149 | v1.0 Release Candidate 4 (sign-off) | ✅ | (done in v1.0.0-rc.4) |
 | 150 | **HLS v1.0 — LTS release** | ⬜ | 2 weeks |
 
 > **Note on Stage 19 (originally "Documentation, book, playground"):**
