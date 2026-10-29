@@ -1,0 +1,729 @@
+# ============================================================================
+# tests/acc/wasm_pack_acceptance.hls — Stage 76 acceptance gate, in Halis
+# (the Halis twin of tests/wasm_pack_acceptance.py; same ten sections,
+# same assertions, same needles — the harness is tests/acc/harness.hls
+# and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make wasm-pack-acceptance` (which compiles this file and
+# runs it from the repo root).
+#
+# The battery imported tools/hlwasm_pack.py's part modules directly for
+# the import surface, the npm name/version rules, the demo source scan
+# and the TypeScript mapping, and called pack()/unpack()/publish_command()
+# in process; the gate asks the same questions through the tool's own
+# front doors: `python3 tools/hlwasm_pack.py <subcommand>` for the CLI
+# and a small python3 driver it writes into its scratch world for the
+# part-module probes (the module stays the subject; every comparison
+# against the battery's vectors runs here, in the gate).
+#
+# NOTE ON THE TOOLCHAIN: this environment has no clang/wasm-ld/wasmtime
+# — and needs none. The battery (and this gate) exercise the packaging
+# and validation layers only: the Stage 23 hlwasm emitter synthesises
+# the .wasm bytes in process, so build/pack/check/publish are fully
+# exercisable with no external wasm tooling. Like the battery, the gate
+# has no skips.
+#
+#  1. Import surface (facade + 10 part modules)
+#  2. CLI surface (--version banner, subcommands, build flags)
+#  3. Name/version validation (npm rules)
+#  4. Source scan (demo publish surface: fns, params, struct, enum,
+#     js imports, exported set)
+#  5. TypeScript mapping (halis -> ts vectors + the rendered d.ts)
+#  6. Build (bundler target -> publish-ready pkg/): files, wasm magic,
+#     size cap, package.json fields, manifest sha256, js markers
+#  7. All five pack targets (bundler/web/nodejs/deno/no-modules):
+#     build + per-target markers + CLI validate
+#  8. Pack (tarball members, reproducible bytes, unpack round-trip,
+#     traversal defence)
+#  9. Check (good pkg passes; missing-wasm and tampered-js pkgs fail
+#     with actionable messages; CLI exit codes)
+# 10. Publish dry-run (no network) + new scaffolding
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.json"
+import "std.sha256"
+import "std.result"
+
+# ----------------------------------------------------------------------------
+# The gate's constants (the battery's paths).
+# ----------------------------------------------------------------------------
+
+fn demo() -> str {
+    return "examples/wasm_pack_demo.hls"
+}
+
+fn run_pack(args: list[str]) -> RunResult uses Proc {
+    let argv: list[str] = ["tools/hlwasm_pack.py"]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    return run_capture("python3", argv)
+}
+
+# tail(text, n) — the battery's `s.strip()[-n:]` detail style.
+fn tail(text: str, n: int) -> str {
+    let t: str = text.trim()
+    if t.len() <= n {
+        return t
+    }
+    return t.slice(t.len() - n, t.len())
+}
+
+# line_with_prefix(out, prefix) — some line starts with the prefix
+# (the driver's per-item lines: "fn pack_add params=2 ...", "exp main").
+fn line_with_prefix(out: str, prefix: str) -> bool {
+    let lines: list[str] = out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).starts_with(prefix) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# contains_line(out, line) — an exact member line (tar members, exported
+# names), not a loose substring.
+fn contains_line(out: str, want: str) -> bool {
+    let lines: list[str] = out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i) == want {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# flag(out, prefix) — the int on the first "<prefix><int>" line the
+# driver printed (-1 when the line is absent: the probe never ran).
+fn flag(out: str, prefix: str) -> int {
+    let lines: list[str] = out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).starts_with(prefix) {
+            return lines.get(i).slice(prefix.len(), lines.get(i).len()).to_int()
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# value_after(out, prefix) — the remainder of the first line that starts
+# with the prefix (the driver prints one value per line).
+fn value_after(out: str, prefix: str) -> str {
+    let lines: list[str] = out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).starts_with(prefix) {
+            return lines.get(i).slice(prefix.len(), lines.get(i).len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# jstr_or(v, k, fallback) — a JSON object field as str ("" when absent
+# or of another kind: the gate never panics on a shape it did not
+# expect, it fails the check instead).
+fn jstr_or(v: JsonValue, k: str, fallback: str) -> str {
+    let f: JsonValue = json_object_get(v, k)
+    if json_is_str(f) {
+        return json_str_value(f)
+    }
+    return fallback
+}
+
+fn jint_or(v: JsonValue, k: str, fallback: int) -> int {
+    let f: JsonValue = json_object_get(v, k)
+    if json_is_int(f) {
+        return json_int_value(f)
+    }
+    return fallback
+}
+
+# ----------------------------------------------------------------------------
+# The python3 driver: the front door to the part modules — `surface`
+# (imports), `validate` (npm name/version rules over the battery's
+# vectors, fed on stdin), `scan` (the demo's publish surface), `ts`
+# (the TypeScript mapping + the rendered d.ts), `unpack` / `evil`
+# (the tarball round-trip and the traversal defence), `publish_command`
+# (the dry-run command shape). Values print; the comparisons stay here.
+# ----------------------------------------------------------------------------
+
+fn driver_src() -> str {
+    return "import io, json, os, sys, tarfile\n" +
+        "sys.path.insert(0, 'tools')\n" +
+        "sys.path.insert(0, 'tools/hlwasm_pack_parts')\n" +
+        "cmd = sys.argv[1]\n" +
+        "if cmd == 'surface':\n" +
+        "    import hlwasm_pack\n" +
+        "    print('has_main=%d' % int(hasattr(hlwasm_pack, 'main')))\n" +
+        "    for m in ('hwp_common', 'hwp_manifest', 'hwp_scan', 'hwp_types',\n" +
+        "              'hwp_glue', 'hwp_build', 'hwp_pack', 'hwp_publish',\n" +
+        "              'hwp_validate', 'hwp_cli'):\n" +
+        "        try:\n" +
+        "            __import__(m)\n" +
+        "            print('%s=1' % m)\n" +
+        "        except Exception:\n" +
+        "            print('%s=0' % m)\n" +
+        "elif cmd == 'validate':\n" +
+        "    from hwp_manifest import is_valid_name, is_valid_version\n" +
+        "    d = json.load(sys.stdin)\n" +
+        "    for i, n in enumerate(d['good_names']):\n" +
+        "        print('gname %d=%d' % (i, int(is_valid_name(n))))\n" +
+        "    for i, n in enumerate(d['bad_names']):\n" +
+        "        print('bname %d=%d' % (i, int(is_valid_name(n))))\n" +
+        "    for i, v in enumerate(d['good_versions']):\n" +
+        "        print('gver %d=%d' % (i, int(is_valid_version(v))))\n" +
+        "    for i, v in enumerate(d['bad_versions']):\n" +
+        "        print('bver %d=%d' % (i, int(is_valid_version(v))))\n" +
+        "elif cmd == 'scan':\n" +
+        "    from hwp_scan import scan_file, exported_functions\n" +
+        "    surface = scan_file('examples/wasm_pack_demo.hls')\n" +
+        "    for f in surface['functions']:\n" +
+        "        print('fn %s params=%d returns=%s'\n" +
+        "              % (f['name'], len(f['params']), f['returns']))\n" +
+        "    for s in surface['structs']:\n" +
+        "        print('struct %s fields=%d' % (s['name'], len(s['fields'])))\n" +
+        "    for e in surface['enums']:\n" +
+        "        print('enum %s variants=%d' % (e['name'], len(e['variants'])))\n" +
+        "    jsffi = scan_file('std/jsffi.hls')\n" +
+        "    print('js_imports=%d' % len(jsffi['js_imports']))\n" +
+        "    for n in exported_functions(surface):\n" +
+        "        print('exp %s' % n['name'])\n" +
+        "elif cmd == 'ts':\n" +
+        "    from hwp_types import halis_to_ts, render_dts\n" +
+        "    from hwp_scan import scan_file\n" +
+        "    d = json.load(sys.stdin)\n" +
+        "    for t in d['types']:\n" +
+        "        print('ts %s => %s' % (t, halis_to_ts(t)))\n" +
+        "    dts = render_dts(scan_file('examples/wasm_pack_demo.hls'),\n" +
+        "                     'wasm-pack-demo')\n" +
+        "    print('dts-begin')\n" +
+        "    print(dts)\n" +
+        "    print('dts-end')\n" +
+        "elif cmd == 'unpack':\n" +
+        "    from hwp_pack import unpack\n" +
+        "    extracted = unpack(sys.argv[2], sys.argv[3])\n" +
+        "    print('extracted=%d' % len(extracted))\n" +
+        "elif cmd == 'evil':\n" +
+        "    from hwp_pack import unpack\n" +
+        "    evil, dest = sys.argv[2], sys.argv[3]\n" +
+        "    with tarfile.open(evil, mode='w:gz') as tf:\n" +
+        "        for arcname in ('../../evil.txt', '/abs.txt', 'package/ok.txt'):\n" +
+        "            data = b'x'\n" +
+        "            ti = tarfile.TarInfo(name=arcname)\n" +
+        "            ti.size = len(data)\n" +
+        "            tf.addfile(ti, io.BytesIO(data))\n" +
+        "    try:\n" +
+        "        unpack(evil, dest)\n" +
+        "        print('raised=0')\n" +
+        "    except ValueError:\n" +
+        "        print('raised=1')\n" +
+        "elif cmd == 'publish_command':\n" +
+        "    from hwp_publish import publish_command\n" +
+        "    pc = publish_command(sys.argv[2],\n" +
+        "                         registry='https://r.example.com/npm/',\n" +
+        "                         access='restricted', tag='beta')\n" +
+        "    for c in pc:\n" +
+        "        print(c)\n"
+}
+
+# ----------------------------------------------------------------------------
+# 1. Import surface
+# ----------------------------------------------------------------------------
+fn sec1(acc: Acc, driver: str) -> void uses IO, Proc {
+    section("1. Import surface (facade + 10 part modules)")
+    let r: RunResult = run_capture("python3", [driver, "surface"])
+    check(acc, "driver ran", r.code == 0, clip(r.combined, 80))
+    check(acc, "hlwasm_pack.main present", flag(r.out, "has_main=") == 1, "")
+    let mods: list[str] = ["hwp_common", "hwp_manifest", "hwp_scan",
+        "hwp_types", "hwp_glue", "hwp_build", "hwp_pack", "hwp_publish",
+        "hwp_validate", "hwp_cli"]
+    let mut i: int = 0
+    while i < mods.len() {
+        let m: str = mods.get(i)
+        check(acc, m + " importable", flag(r.out, m + "=") == 1, "")
+        i = i + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 2. CLI surface
+# ----------------------------------------------------------------------------
+fn sec2(acc: Acc) -> void uses IO, Proc {
+    section("2. CLI surface (--version, subcommands)")
+    let rv: RunResult = run_pack(["--version"])
+    check(acc, "--version prints the banner",
+        rv.code == 0 && rv.out.contains("hls-wasm-pack v0.95.0-alpha"),
+        clip(rv.out, 60))
+    let rh: RunResult = run_pack(["--help"])
+    let subs: list[str] = ["new", "build", "pack", "publish", "check", "test"]
+    let mut i: int = 0
+    while i < subs.len() {
+        check(acc, "--help lists '" + subs.get(i) + "'",
+            rh.out.contains(subs.get(i)), "")
+        i = i + 1
+    }
+    let rb: RunResult = run_pack(["build", "--help"])
+    let flags: list[str] = ["--target", "--name", "--version", "--wasm-opt",
+                            "--opt-level", "--scope"]
+    let mut j: int = 0
+    while j < flags.len() {
+        check(acc, "build --help lists '" + flags.get(j) + "'",
+            rb.out.contains(flags.get(j)), "")
+        j = j + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 3. Name/version validation
+# ----------------------------------------------------------------------------
+fn good_names_json() -> str {
+    return "[\"my-lib\", \"wasm-pack-demo\", \"@myorg/my-lib\", \"a.b_c~d-e\", \"x\"]"
+}
+
+fn bad_names_json() -> str {
+    return "[\"\", \"UPPER\", \"has space\", \"../escape\", \"@scope\", " +
+        "\"@scope/\", \"a/b/c\", \"-lead\", \".lead\", \"node_modules\", " +
+        "\"back\\\\slash\"]"
+}
+
+fn good_versions_json() -> str {
+    return "[\"0.1.0\", \"0.95.0-alpha\", \"1.2.3+build\", \"10.20.30\"]"
+}
+
+fn bad_versions_json() -> str {
+    return "[\"\", \"1.2\", \"v1.2.3\", \"1.02.3\", \"1.2.3-\"]"
+}
+
+fn sec3(acc: Acc, driver: str) -> void uses IO, Proc {
+    section("3. Name/version validation (npm rules)")
+    let feed: str = "{\"good_names\": " + good_names_json() +
+        ", \"bad_names\": " + bad_names_json() +
+        ", \"good_versions\": " + good_versions_json() +
+        ", \"bad_versions\": " + bad_versions_json() + "}"
+    let r: RunResult = run_feed("python3", [driver, "validate"], feed)
+    check(acc, "validate driver ran", r.code == 0, clip(r.combined, 80))
+    let goods: list[str] = ["my-lib", "wasm-pack-demo", "@myorg/my-lib",
+                            "a.b_c~d-e", "x"]
+    let mut i: int = 0
+    while i < goods.len() {
+        check(acc, "name '" + goods.get(i) + "' valid",
+            flag(r.out, "gname " + i.to_str() + "=") == 1, "")
+        i = i + 1
+    }
+    let bads: list[str] = ["", "UPPER", "has space", "../escape", "@scope",
+        "@scope/", "a/b/c", "-lead", ".lead", "node_modules", "back\\\\slash"]
+    let mut j: int = 0
+    while j < bads.len() {
+        check(acc, "name '" + bads.get(j) + "' rejected",
+            flag(r.out, "bname " + j.to_str() + "=") == 0, "")
+        j = j + 1
+    }
+    let goods_v: list[str] = ["0.1.0", "0.95.0-alpha", "1.2.3+build", "10.20.30"]
+    let mut k: int = 0
+    while k < goods_v.len() {
+        check(acc, "version '" + goods_v.get(k) + "' valid",
+            flag(r.out, "gver " + k.to_str() + "=") == 1, "")
+        k = k + 1
+    }
+    let bads_v: list[str] = ["", "1.2", "v1.2.3", "1.02.3", "1.2.3-"]
+    let mut l: int = 0
+    while l < bads_v.len() {
+        check(acc, "version '" + bads_v.get(l) + "' rejected",
+            flag(r.out, "bver " + l.to_str() + "=") == 0, "")
+        l = l + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 4. Source scan
+# ----------------------------------------------------------------------------
+fn sec4(acc: Acc, driver: str) -> void uses IO, Proc {
+    section("4. Source scan (demo publish surface)")
+    let r: RunResult = run_capture("python3", [driver, "scan"])
+    check(acc, "scan driver ran", r.code == 0, clip(r.combined, 80))
+    let wants: list[str] = ["pack_add", "pack_greet", "pack_axis_name",
+                            "pack_sum_to", "main", "jsffi_on_callback"]
+    let mut i: int = 0
+    while i < wants.len() {
+        check(acc, "scanned fn " + wants.get(i),
+            line_with_prefix(r.out, "fn " + wants.get(i) + " "), "")
+        i = i + 1
+    }
+    check(acc, "params of pack_add",
+        r.out.contains("fn pack_add params=2 returns=int"), "")
+    check(acc, "struct Vec2 scanned",
+        r.out.contains("struct Vec2 fields=5"), "")
+    check(acc, "enum Axis scanned",
+        r.out.contains("enum Axis variants=3"), "")
+    let n_js: int = flag(r.out, "js_imports=")
+    check(acc, "extern js imports scanned", n_js >= 2,
+        n_js.to_str() + " imports")
+    check(acc, "main excluded from exports", !contains_line(r.out, "exp main"), "")
+    check(acc, "jsffi_on_callback excluded from exports",
+        !contains_line(r.out, "exp jsffi_on_callback"), "")
+    check(acc, "pack_add exported", contains_line(r.out, "exp pack_add"), "")
+}
+
+# ----------------------------------------------------------------------------
+# 5. TypeScript mapping
+# ----------------------------------------------------------------------------
+fn ts_types_json() -> str {
+    return "[\"int\", \"float\", \"bool\", \"str\", \"void\", \"list[int]\", " +
+        "\"map[str, int]\", \"tainted[str]\", \"Option[int]\", " +
+        "\"Result[int, str]\", \"Vec2\", \"list[map[str, list[bool]]]\", " +
+        "\"bogus with spaces\"]"
+}
+
+fn ts_wants() -> list[str] {
+    return ["number", "number", "boolean", "string", "void",
+        "Array<number>", "Record<string, number>", "string",
+        "number | null", "number", "Vec2",
+        "Array<Record<string, Array<boolean>>>", "unknown"]
+}
+
+fn sec5(acc: Acc, driver: str) -> void uses IO, Proc {
+    section("5. TypeScript mapping (halis -> ts)")
+    let feed: str = "{\"types\": " + ts_types_json() + "}"
+    let r: RunResult = run_feed("python3", [driver, "ts"], feed)
+    check(acc, "ts driver ran", r.code == 0, clip(r.combined, 80))
+    let types: list[str] = ["int", "float", "bool", "str", "void",
+        "list[int]", "map[str, int]", "tainted[str]", "Option[int]",
+        "Result[int, str]", "Vec2", "list[map[str, list[bool]]]",
+        "bogus with spaces"]
+    let wants: list[str] = ts_wants()
+    let mut i: int = 0
+    while i < types.len() {
+        let got: str = value_after(r.out, "ts " + types.get(i) + " => ")
+        check(acc, "ts(" + types.get(i) + ") == " + wants.get(i),
+            got == wants.get(i), got)
+        i = i + 1
+    }
+    # The rendered d.ts for the demo package.
+    let b: int = r.out.find("dts-begin\n")
+    let e: int = r.out.find("dts-end")
+    let dts: str = r.out.slice(b + 10, e)
+    let needles: list[str] = [
+        "export function pack_add(a: number, b: number): number;",
+        "export function pack_greet(name: string): string;",
+        "export interface Vec2 {",
+        "export type Axis = \"X\" | \"Y\" | \"Both\";",
+        "HalisInstance",
+        "export default function init"]
+    let mut j: int = 0
+    while j < needles.len() {
+        let nd: str = needles.get(j)
+        let mut shown: str = nd
+        if shown.len() > 45 {
+            shown = shown.slice(0, 45)
+        }
+        check(acc, "d.ts contains '" + shown + "'", dts.contains(nd), "")
+        j = j + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 6. Build (bundler)
+# ----------------------------------------------------------------------------
+fn wasm_magic_ok(data: str) -> bool {
+    return data.len() >= 8
+        && data.byte_at(0) == 0 && data.byte_at(1) == 97
+        && data.byte_at(2) == 115 && data.byte_at(3) == 109
+        && data.byte_at(4) == 1 && data.byte_at(5) == 0
+        && data.byte_at(6) == 0 && data.byte_at(7) == 0
+}
+
+fn sec6(acc: Acc, driver: str, build_pkg: str) -> void uses IO, Fs, Proc {
+    section("6. Build (bundler target -> publish-ready pkg/)")
+    let r: RunResult = run_pack(["build", demo(), "--out", build_pkg,
+        "--target", "bundler", "--name", "wasm-pack-demo",
+        "--version", "0.95.0-alpha"])
+    check(acc, "build exits 0", r.code == 0, tail(r.err, 120))
+    let files: list[str] = ["wasm-pack-demo.wasm", "wasm-pack-demo.js",
+        "wasm-pack-demo.d.ts", "package.json", "README.md",
+        ".pack-manifest.json"]
+    let mut i: int = 0
+    while i < files.len() {
+        check(acc, "pkg/" + files.get(i) + " written",
+            file_exists(build_pkg + "/" + files.get(i)), "")
+        i = i + 1
+    }
+    let wasm: str = read_file(build_pkg + "/wasm-pack-demo.wasm")
+    check(acc, "wasm magic + version 1", wasm_magic_ok(wasm), "")
+    check(acc, "wasm < 100 KB (publish-ready)", wasm.len() < 102400,
+        wasm.len().to_str() + " bytes")
+    let pkg: JsonValue = json_parse(read_file(build_pkg + "/package.json"))
+    check(acc, "package.json name",
+        jstr_or(pkg, "name", "") == "wasm-pack-demo", "")
+    check(acc, "package.json version",
+        jstr_or(pkg, "version", "") == "0.95.0-alpha", "")
+    check(acc, "package.json sideEffects false",
+        json_is_bool(json_object_get(pkg, "sideEffects")) &&
+        !json_bool_value(json_object_get(pkg, "sideEffects")), "")
+    check(acc, "package.json module/main/types",
+        json_object_has(pkg, "module") && json_object_has(pkg, "main")
+        && json_object_has(pkg, "types"), "")
+    let manifest: JsonValue = json_parse(
+        read_file(build_pkg + "/.pack-manifest.json"))
+    check(acc, "manifest packVersion == 1",
+        jint_or(manifest, "packVersion", -1) == 1, "")
+    check(acc, "manifest target == bundler",
+        jstr_or(manifest, "target", "") == "bundler", "")
+    let files_v: JsonValue = json_object_get(manifest, "files")
+    let mut bad_file: str = ""
+    let mut li: int = 0
+    while li < files_v.obj_keys.len() {
+        let fname: str = files_v.obj_keys.get(li)
+        let meta: JsonValue = files_v.obj_vals.get(li)
+        let digest: str = sha256_hex(read_file(build_pkg + "/" + fname))
+        if digest != jstr_or(meta, "sha256", "?") {
+            bad_file = fname
+            li = files_v.obj_keys.len()
+        }
+        li = li + 1
+    }
+    if bad_file != "" {
+        check(acc, "sha256(" + bad_file + ")", false, "mismatch")
+    } else {
+        check(acc, "manifest sha256 of every file", true,
+            files_v.obj_keys.len().to_str() + " files")
+    }
+    let js: str = read_file(build_pkg + "/wasm-pack-demo.js")
+    check(acc, "bundler js marker", js.contains("hls-wasm-pack target: bundler"), "")
+    check(acc, "bundler js ESM export", js.contains("export default init"), "")
+}
+
+# ----------------------------------------------------------------------------
+# 7. All five targets
+# ----------------------------------------------------------------------------
+fn sec7(acc: Acc) -> void uses IO, Fs, Proc {
+    section("7. All five pack targets (build + validate)")
+    let targets: list[str] = ["bundler", "web", "nodejs", "deno", "no-modules"]
+    let markers: list[str] = ["hls-wasm-pack target: bundler",
+        "hls-wasm-pack target: web", "hls-wasm-pack target: nodejs",
+        "hls-wasm-pack target: deno", "hls-wasm-pack target: no-modules"]
+    let mut i: int = 0
+    while i < targets.len() {
+        let target: str = targets.get(i)
+        let out: str = acc.scratch_base + "/tgt_" + target + "/pkg"
+        let r: RunResult = run_pack(["build", demo(), "--out", out,
+            "--target", target, "--name", "wdemo", "--version", "0.1.0"])
+        if !check(acc, "build [" + target + "] exits 0", r.code == 0,
+                  tail(r.err, 100)) {
+            i = i + 1
+            continue
+        }
+        check(acc, "pkg [" + target + "] has .wasm+.js+.d.ts",
+            file_exists(out + "/wdemo.wasm") &&
+            file_exists(out + "/wdemo.js") &&
+            file_exists(out + "/wdemo.d.ts"), "")
+        check(acc, "js [" + target + "] marker",
+            read_file(out + "/wdemo.js").contains(markers.get(i)), "")
+        if target == "deno" {
+            check(acc, "deno.json hint written",
+                file_exists(out + "/deno.json"), "")
+        }
+        if target == "nodejs" {
+            check(acc, "nodejs js CJS entry",
+                read_file(out + "/wdemo.js").contains("module.exports"), "")
+        }
+        if target == "no-modules" {
+            check(acc, "no-modules js global",
+                read_file(out + "/wdemo.js").contains("HalisPack"), "")
+        }
+        let v: RunResult = run_pack(["check", out])
+        check(acc, "validate [" + target + "] passes", v.code == 0, "")
+        i = i + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 8. Pack tarball
+# ----------------------------------------------------------------------------
+fn sec8(acc: Acc, driver: str, build_pkg: str) -> void uses IO, Fs, Proc {
+    section("8. Pack (tarball + round-trip + traversal defence)")
+    let tgz: str = acc.scratch_base + "/wpack-0.95.0-alpha.tgz"
+    let r: RunResult = run_pack(["pack", "--pkg", build_pkg, "--tgz", tgz])
+    check(acc, "pack returns the tarball path",
+        r.code == 0 && file_exists(tgz),
+        read_file(tgz).len().to_str() + " bytes")
+    let t: RunResult = run_capture("tar", ["-tzf", tgz])
+    let members: list[str] = t.out.split("\n")
+    let mut n_members: int = 0
+    let mut all_under: bool = true
+    let mut has_wasm: bool = false
+    let mut has_js: bool = false
+    let mut has_pkgjson: bool = false
+    let mut mi: int = 0
+    while mi < members.len() {
+        let m: str = members.get(mi).trim()
+        if m != "" {
+            n_members = n_members + 1
+            if !m.starts_with("package/") {
+                all_under = false
+            }
+            if m.ends_with(".wasm") {
+                has_wasm = true
+            }
+            if m.ends_with(".js") {
+                has_js = true
+            }
+            if m == "package/package.json" {
+                has_pkgjson = true
+            }
+        }
+        mi = mi + 1
+    }
+    check(acc, "members under package/", all_under,
+        n_members.to_str() + " members")
+    check(acc, "tarball holds .wasm+.js+.d.ts+package.json",
+        has_wasm && has_js && has_pkgjson, "")
+    # Reproducible bytes: pack twice -> identical sha256.
+    let tgz2: str = acc.scratch_base + "/wpack2.tgz"
+    run_pack(["pack", "--pkg", build_pkg, "--tgz", tgz2])
+    check(acc, "reproducible tarball bytes",
+        sha256_hex(read_file(tgz)) == sha256_hex(read_file(tgz2)), "")
+    # Unpack round-trip.
+    let dest: str = acc.scratch_base + "/unpacked"
+    let u: RunResult = run_capture("python3", [driver, "unpack", tgz, dest])
+    check(acc, "unpack extracts every member",
+        u.code == 0 && flag(u.out, "extracted=") == n_members,
+        clip(u.combined, 80))
+    let upkg: JsonValue = json_parse(read_file(dest + "/package/package.json"))
+    check(acc, "unpacked package.json parses",
+        jstr_or(upkg, "name", "") == "wasm-pack-demo", "")
+    # Traversal defence: a hostile tarball is rejected, never written.
+    let evil: str = acc.scratch_base + "/evil.tgz"
+    let eo: RunResult = run_capture("python3",
+        [driver, "evil", evil, acc.scratch_base + "/evil_out"])
+    check(acc, "hostile tarball rejected", flag(eo.out, "raised=") == 1,
+        clip(eo.combined, 80))
+    check(acc, "no escape file written",
+        !file_exists(acc.scratch_base + "/evil.txt"), "")
+}
+
+# ----------------------------------------------------------------------------
+# 9. Check (good vs broken)
+# ----------------------------------------------------------------------------
+fn sec9(acc: Acc, build_pkg: str) -> void uses IO, Fs, Proc {
+    section("9. Check (good pkg passes, broken pkg fails cleanly)")
+    let ok: RunResult = run_pack(["check", build_pkg])
+    check(acc, "good pkg validates", ok.code == 0, first_line(ok.out))
+    # Broken 1: wasm removed.
+    let broken: str = acc.scratch_base + "/broken"
+    sh("cp -r '" + shell_quote(build_pkg) + "' '" + shell_quote(broken) + "'")
+    sh("rm -f '" + shell_quote(broken) + "'/*.wasm")
+    let b1: RunResult = run_pack(["check", broken])
+    check(acc, "missing wasm fails", b1.code == 1, "")
+    check(acc, "missing wasm message actionable",
+        fail_line_mentions(b1.out, "wasm"), "")
+    # Broken 2: tampered js (hash mismatch).
+    let broken2: str = acc.scratch_base + "/broken2"
+    sh("cp -r '" + shell_quote(build_pkg) + "' '" + shell_quote(broken2) + "'")
+    let js_path: str = broken2 + "/wasm-pack-demo.js"
+    write_file(js_path, read_or(js_path, "") + "\n// tampered\n")
+    let b2: RunResult = run_pack(["check", broken2])
+    check(acc, "tampered js fails (sha256)", b2.code == 1, "")
+    check(acc, "tamper message actionable",
+        fail_line_mentions(b2.out, "sha256"), "")
+    # CLI surface.
+    let cg: RunResult = run_pack(["check", build_pkg])
+    check(acc, "CLI check exits 0 on good pkg", cg.code == 0, "")
+    let cb: RunResult = run_pack(["check", broken])
+    check(acc, "CLI check exits 1 on broken pkg", cb.code == 1, "")
+}
+
+# fail_line_mentions(out, word) — any "FAIL:" diagnostic line mentioning
+# the word (case-insensitive), the battery's actionable-message test.
+fn fail_line_mentions(out: str, word: str) -> bool {
+    let lines: list[str] = out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let l: str = lines.get(i)
+        if l.contains("FAIL:") && str_contains(str_to_lower_ascii(l), word) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# ----------------------------------------------------------------------------
+# 10. Publish dry-run + new
+# ----------------------------------------------------------------------------
+fn sec10(acc: Acc, driver: str, build_pkg: str) -> void uses IO, Fs, Proc {
+    section("10. Publish dry-run (no network) + new scaffolding")
+    let tgz: str = acc.scratch_base + "/wpack-0.95.0-alpha.tgz"
+    run_pack(["pack", "--pkg", build_pkg, "--tgz", tgz])
+    let r: RunResult = run_pack(["publish", tgz, "--tag", "next"])
+    check(acc, "publish dry-run exits 0", r.code == 0,
+        tail(r.err + r.out, 100))
+    check(acc, "dry-run prints the npm command",
+        (r.err + r.out).contains("npm publish") &&
+        (r.err + r.out).contains("--tag next"), "")
+    let ra: RunResult = run_pack(["publish", tgz, "--access", "bogus"])
+    check(acc, "bad access rejected", ra.code != 0, "")
+    let rm: RunResult = run_pack(["publish", acc.scratch_base + "/missing.tgz"])
+    check(acc, "missing tarball rejected", rm.code != 0, "")
+    let pc: RunResult = run_capture("python3", [driver, "publish_command", tgz])
+    let lines: list[str] = pc.out.split("\n")
+    # The driver prints one command element per line; the last split
+    # element is the "" after the final newline.
+    let mut n: int = lines.len()
+    if n > 0 && lines.get(n - 1) == "" {
+        n = n - 1
+    }
+    let mut shape: bool = pc.code == 0 && n >= 3
+    if shape {
+        shape = lines.get(0) == "npm" && lines.get(1) == "publish"
+        let mut has_reg: bool = false
+        let mut li: int = 0
+        while li < n {
+            if lines.get(li) == "--registry" {
+                has_reg = true
+            }
+            li = li + 1
+        }
+        shape = shape && has_reg
+        shape = shape && lines.get(n - 1) == "https://r.example.com/npm"
+    }
+    check(acc, "publish command shape", shape,
+        clip(str_join(lines, " "), 90))
+    # new scaffolding.
+    let dest: str = acc.scratch_base + "/my-lib"
+    let rn: RunResult = run_pack(["new", "my-lib", "--scope", "@myorg",
+                                  "--dir", dest])
+    check(acc, "new exits 0", rn.code == 0, tail(rn.err, 80))
+    check(acc, "new writes main.hls", file_exists(dest + "/my-lib.hls"), "")
+    check(acc, "new writes hls.pack.toml",
+        file_exists(dest + "/hls.pack.toml"), "")
+    check(acc, "new writes README.md", file_exists(dest + "/README.md"), "")
+    let rb: RunResult = run_pack(["new", "BAD NAME!"])
+    check(acc, "new rejects a bad name", rb.code != 0, "")
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let acc: Acc = acc_new("wasm_pack")
+    let driver: str = write_src(acc, "driver.py", driver_src())
+    sec1(acc, driver)
+    sec2(acc)
+    sec3(acc, driver)
+    sec4(acc, driver)
+    sec5(acc, driver)
+    let build_pkg: str = acc.scratch_base + "/build/pkg"
+    sec6(acc, driver, build_pkg)
+    sec7(acc)
+    sec8(acc, driver, build_pkg)
+    sec9(acc, build_pkg)
+    sec10(acc, driver, build_pkg)
+    return finish(acc, "Stage 76 -- hls-wasm-pack (publish-ready wasm + JS glue)")
+}

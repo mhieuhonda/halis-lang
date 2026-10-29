@@ -1,0 +1,870 @@
+# ============================================================================
+# tests/acc/bench_acceptance.hls — Stage 124 acceptance gate, in Halis
+# (the Halis twin of tests/bench_acceptance.py; same eight sections,
+# same assertions, same needles — the harness is tests/acc/harness.hls
+# and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make bench-acceptance` (which compiles this file and runs
+# it from the repo root).
+#
+# Every leg drives the REAL runner CLI (python3 tools/hls-bench.py)
+# the way a user does; the report needles, exit-code matrix, baseline
+# refusals and the change block's wording matrix are pinned verbatim.
+# The battery imported tools/hls-bench.py (importlib) for the
+# statistics unit checks, the record byte-stability rewrite, the
+# hand-crafted baseline records and the float comparisons the report
+# prints (medians, bootstrap CIs, throughput) — Halis has no floats,
+# so those legs run as tiny python drivers in the gate's scratch that
+# evaluate EXACTLY the battery's expressions and print CHECK lines the
+# gate asserts under the battery's own names (the repro-gate pattern:
+# the front door a native binary has). The baseline crafting is data
+# setup, not assertion; every CLI leg stays on the tool's command line.
+#
+# The gate cleans up after itself exactly like the battery: the
+# scratch world and the runner's .hlbench store beside the suite are
+# removed at the end.
+#
+#  1. the convention  — --list markers, main/stray-units/params/
+#     & discovery      wrong-return refusals with the fix, the
+#                      <no-benches> skip, --grep selection
+#  2. the driver &    — the fixed-plan report (time/thrpt/harness
+#     the protocol      lines), the exact sample plan via --json,
+#                      the protocol look-alike refusal, print noise,
+#                      no temp drivers left beside the suite
+#  3. the statistics  — quantile/median/MAD hand-computed; the Tukey
+#                      four cells; bootstrap determinism/collapse/
+#                      bracket; the slope identity; Welch p; fmt_time
+#  4. the report      — --save lands in .hlbench/<stem>/; a 100x
+#                      baseline regresses, a 1000x one improves, an
+#                      honest re-run does not; p against the 5% level;
+#                      the record is byte-stable under rewrite
+#  5. the baselines   — missing baseline exit 2 before measuring; a
+#                      corrupt record fails naming the file; a
+#                      cross-backend record refused; compare-then-
+#                      overwrite of one name
+#  6. exit codes &    — a panicking bench fails decoded; mark_skip
+#     the CLI matrix    is a skip; no suites is exit 2; --json payload
+#                      (tool/backend, the four benches, median-in-CI,
+#                      raw samples, skip detail, throughput pairing);
+#                      -j 2 covers the full set
+#  7. the differential— one fixed plan, two backends: same (bench,
+#                      iters) sequence, native decisively faster, the
+#                      ok fixture byte-identical across backends
+#  8. the corpus      — fixture + lib canonical, lints clean,
+#     hygiene           checker-green, the lib has no main, no runner
+#                      litter anywhere
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.json"
+import "std.result"
+
+# ----------------------------------------------------------------------------
+# The gate's constants (the battery's).
+# ----------------------------------------------------------------------------
+
+fn fixture() -> str {
+    return "tests/ok/feat_stage124_bench.hls"
+}
+
+fn lib() -> str {
+    return "tests/bench_libs/arith_bench.hls"
+}
+
+fn lib_dir() -> str {
+    return "tests/bench_libs"
+}
+
+fn bench_hlc(acc: Acc) -> str {
+    return path_join3(acc.root, "bin/hlc")
+}
+
+fn native_ready(acc: Acc) -> bool uses Proc, Fs {
+    return file_exists(bench_hlc(acc)) && which("gcc")
+}
+
+# SIMPLE_BENCH — the battery's minimal suite.
+fn simple_bench() -> str {
+    return "# a minimal suite\n"
+        + "fn bench_tiny() {\n"
+        + "    let mut i: int = 0\n"
+        + "    while i < 20 {\n"
+        + "        i = i + 1\n"
+        + "    }\n"
+        + "}\n"
+}
+
+# ----------------------------------------------------------------------------
+# JSON accessors — null-safe, so a failed leg FAILs instead of crashing.
+# ----------------------------------------------------------------------------
+
+fn parse_json(text: str) -> JsonValue {
+    let rr: Result[JsonValue, str] = json_parse_result(text)
+    if result_is_ok(rr) {
+        return result_unwrap(rr)
+    }
+    return json_null()
+}
+
+fn jstr(v: JsonValue, key: str) -> str {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_str(x) {
+        return json_str_value(x)
+    }
+    return ""
+}
+
+fn jint(v: JsonValue, key: str) -> int {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_int(x) {
+        return json_int_value(x)
+    }
+    return 0
+}
+
+fn jarr(v: JsonValue, key: str) -> list[JsonValue] {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_array(x) {
+        return x.arr
+    }
+    let empty: list[JsonValue] = []
+    return empty
+}
+
+fn el_int(v: JsonValue) -> int {
+    if json_is_int(v) {
+        return json_int_value(v)
+    }
+    return -1
+}
+
+# ----------------------------------------------------------------------------
+# Small helpers.
+# ----------------------------------------------------------------------------
+
+fn run_tool(acc: Acc, args: list[str]) -> RunResult uses Proc {
+    let argv: list[str] = [path_join3(acc.root, "tools/hls-bench.py")]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    return run_capture("python3", argv)
+}
+
+# first_line_with(text, needle) — Python's next((l for l in lines if
+# needle in l), "").
+fn first_line_with(text: str, needle: str) -> str {
+    let lines: list[str] = text.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).contains(needle) {
+            return lines.get(i)
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn dir_names(path: str) -> list[str] uses Proc {
+    let r: RunResult = run_capture("ls", ["-A", path])
+    if r.code != 0 {
+        let empty: list[str] = []
+        return empty
+    }
+    let names: list[str] = []
+    let lines: list[str] = r.out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i) != "" {
+            names.push(lines.get(i))
+        }
+        i = i + 1
+    }
+    return names
+}
+
+fn rel_to_root(acc: Acc, path: str) -> str {
+    if acc.root != "" && path.starts_with(acc.root + "/") {
+        return path.slice(acc.root.len() + 1, path.len())
+    }
+    return path
+}
+
+fn driver_check(acc: Acc, r: RunResult, key: str, name: str) -> void uses IO {
+    let lines: list[str] = r.out.split("\n")
+    let prefix: str = "CHECK " + key + " "
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).starts_with(prefix) {
+            let v: str = lines.get(i).slice(prefix.len(), lines.get(i).len()).trim()
+            check(acc, name, v == "1", "")
+            return
+        }
+        i = i + 1
+    }
+    check(acc, name, false, "driver produced no CHECK " + key
+        + " line: " + clip(r.combined, 100))
+}
+
+# ----------------------------------------------------------------------------
+# The python drivers (the battery's importlib legs, printed as CHECKs).
+# ----------------------------------------------------------------------------
+
+# The statistics unit checks — the battery's hand-computed values.
+fn bench_stats_driver(acc: Acc) -> str uses Fs, Proc {
+    return write_src(acc, "bench_stats.py",
+        "import importlib.util as ilu, os, sys\n"
+        + "ROOT = sys.argv[1]\n"
+        + "spec = ilu.spec_from_file_location(\"hls_bench_gate\", "
+        + "os.path.join(ROOT, \"tools\", \"hls-bench.py\"))\n"
+        + "m = ilu.module_from_spec(spec)\n"
+        + "sys.modules[\"hls_bench_gate\"] = m\n"
+        + "spec.loader.exec_module(m)\n"
+        + "def b(x):\n"
+        + "    return \"1\" if x else \"0\"\n"
+        + "xs = [3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0, 5.0, 3.0]\n"
+        + "s = sorted(xs)\n"
+        + "print(\"CHECK q50 \" + b(m.quantile(s, 0.5) == 3.5))\n"
+        + "print(\"CHECK median \" + b(m.median(xs) == 3.5))\n"
+        + "print(\"CHECK q25 \" + b(abs(m.quantile(s, 0.25) - 2.25) < 1e-12))\n"
+        + "print(\"CHECK mad \" + b(abs(m.mad(xs) - 1.5) < 1e-12))\n"
+        + "crafted = [-100.0, -15.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, "
+        + "8.0, 9.0, 20.0, 100.0]\n"
+        + "o = m.classify_outliers(crafted)\n"
+        + "print(\"CHECK low_severe \" + b(o[\"low_severe\"] == 1))\n"
+        + "print(\"CHECK low_mild \" + b(o[\"low_mild\"] == 1))\n"
+        + "print(\"CHECK high_cells \" + b(o[\"high_mild\"] == 1 and "
+        + "o[\"high_severe\"] == 1))\n"
+        + "clean = [float(i) for i in range(1, 13)]\n"
+        + "o2 = m.classify_outliers(clean)\n"
+        + "print(\"CHECK no_outliers \" + b(sum(o2.values()) == 0))\n"
+        + "const = [7.0] * 20\n"
+        + "lo, hi = m.bootstrap_ci(const, m.median, seed=42)\n"
+        + "print(\"CHECK collapse \" + b(lo == hi == 7.0))\n"
+        + "xs2 = [float(i * i) for i in range(1, 31)]\n"
+        + "lo1, hi1 = m.bootstrap_ci(xs2, m.median, seed=1234)\n"
+        + "lo2, hi2 = m.bootstrap_ci(xs2, m.median, seed=1234)\n"
+        + "print(\"CHECK seeded \" + b(lo1 == lo2 and hi1 == hi2))\n"
+        + "print(\"CHECK brackets \" + b(lo1 <= m.median(xs2) <= hi1))\n"
+        + "samples = [(10, 1000), (20, 1500), (5, 700)]\n"
+        + "slope = sum(el for (_i, el) in samples) / "
+        + "float(sum(i for (i, _e) in samples))\n"
+        + "thr_lo, thr_hi = m.bootstrap_ci_slope(samples, 100, seed=1)\n"
+        + "print(\"CHECK thr_ordered \" + b(0.0 < thr_lo <= thr_hi))\n"
+        + "print(\"CHECK slope \" + b(abs(slope - (3200 / 35.0)) < 1e-12))\n"
+        + "print(\"CHECK none_units \" + b(m.bootstrap_ci_slope(samples, None, "
+        + "seed=1) is None))\n"
+        + "same = [10.0 + (i % 3) for i in range(12)]\n"
+        + "p_same = m.welch_p(same, list(same))\n"
+        + "print(\"CHECK p_same \" + b(p_same > 0.05))\n"
+        + "a = [10.0, 10.2, 9.8, 10.1, 9.9, 10.05, 9.95, 10.15]\n"
+        + "c = [20.0, 20.2, 19.8, 20.1, 19.9, 20.05, 19.95, 20.15]\n"
+        + "p_diff = m.welch_p(a, c)\n"
+        + "print(\"CHECK p_diff \" + b(p_diff < 0.001))\n"
+        + "p_tiny = m.welch_p([1.0, 2.0], [3.0, 4.0])\n"
+        + "print(\"CHECK p_tiny \" + b(0.0 <= p_tiny <= 1.0))\n"
+        + "print(\"CHECK ft_ns \" + b(m.fmt_time(500.0) == \"500 ns\"))\n"
+        + "print(\"CHECK ft_us \" + b(m.fmt_time(1234.0).endswith(\"\\u00b5s\")))\n"
+        + "print(\"CHECK ft_ms \" + b(m.fmt_time(1.5e6).endswith(\"ms\")))\n"
+        + "print(\"CHECK ft_s \" + b(m.fmt_time(2.0e9).endswith(\"s\")))\n")
+}
+
+# The baseline crafter — the battery's dict(base) surgery with float
+# math (data setup for the change matrix).
+fn bench_craft_driver(acc: Acc) -> str uses Fs, Proc {
+    return write_src(acc, "bench_craft.py",
+        "import json, os, sys\n"
+        + "mode = sys.argv[1]\n"
+        + "bpath, bdir = sys.argv[2], sys.argv[3]\n"
+        + "base = json.load(open(bpath))\n"
+        + "if mode == \"slowfast\":\n"
+        + "    slow = dict(base)\n"
+        + "    slow[\"estimates_ns\"] = [max(base[\"estimates_ns\"]) * 0.01] * 4\n"
+        + "    json.dump(slow, open(os.path.join(bdir, "
+        + "\"bench_loop_sum.slowreg.json\"), \"w\"))\n"
+        + "    huge = dict(base)\n"
+        + "    huge[\"estimates_ns\"] = [max(base[\"estimates_ns\"]) * 1000.0] * 4\n"
+        + "    json.dump(huge, open(os.path.join(bdir, "
+        + "\"bench_loop_sum.fastimp.json\"), \"w\"))\n"
+        + "elif mode == \"nat\":\n"
+        + "    nat = dict(base)\n"
+        + "    nat[\"backend\"] = \"native\"\n"
+        + "    json.dump(nat, open(os.path.join(bdir, "
+        + "\"bench_loop_sum.nat.json\"), \"w\"))\n"
+        + "print(\"CRAFT \" + mode + \" done\")\n")
+}
+
+# The record byte-stability rewrite — load_baseline + save_baseline.
+fn bench_rewrite_driver(acc: Acc) -> str uses Fs, Proc {
+    return write_src(acc, "bench_rewrite.py",
+        "import importlib.util as ilu, os, sys\n"
+        + "ROOT = sys.argv[1]\n"
+        + "spec = ilu.spec_from_file_location(\"hls_bench_gate\", "
+        + "os.path.join(ROOT, \"tools\", \"hls-bench.py\"))\n"
+        + "m = ilu.module_from_spec(spec)\n"
+        + "sys.modules[\"hls_bench_gate\"] = m\n"
+        + "spec.loader.exec_module(m)\n"
+        + "bpath, out = sys.argv[2], sys.argv[3]\n"
+        + "obj = m.load_baseline(bpath)\n"
+        + "m.save_baseline(out, obj[\"backend\"], obj[\"bench\"], "
+        + "obj[\"units\"], [tuple(x) for x in obj[\"samples\"]], "
+        + "obj[\"estimates_ns\"])\n"
+        + "print(\"REWRITE done\")\n")
+}
+
+# The report's float assertions (median inside its CI; throughput
+# appears exactly when units are declared).
+fn bench_json_driver(acc: Acc) -> str uses Fs, Proc {
+    return write_src(acc, "bench_json.py",
+        "import json, sys\n"
+        + "doc = json.load(open(sys.argv[1]))\n"
+        + "benches = {b[\"name\"]: b for b in doc[\"files\"][0][\"benches\"]}\n"
+        + "loop = benches[\"bench_loop_sum\"]\n"
+        + "est = loop[\"estimates_ns_per_iter\"]\n"
+        + "def b(x):\n"
+        + "    return \"1\" if x else \"0\"\n"
+        + "print(\"CHECK median_in_ci \" + b(est[\"median_ci\"][0] <= "
+        + "est[\"median\"] <= est[\"median_ci\"][1]))\n"
+        + "print(\"CHECK throughput \" + b(loop[\"throughput_units_per_s\"] "
+        + "> 0.0 and benches[\"bench_no_units\"][\"throughput_units_per_s\"] "
+        + "is None))\n")
+}
+
+# The differential's float assertion (native decisively faster).
+fn bench_diff_driver(acc: Acc) -> str uses Fs, Proc {
+    return write_src(acc, "bench_diff.py",
+        "import json, sys\n"
+        + "di = json.load(open(sys.argv[1]))\n"
+        + "dn = json.load(open(sys.argv[2]))\n"
+        + "bi = {b[\"name\"]: b for b in di[\"files\"][0][\"benches\"]}\n"
+        + "bn = {b[\"name\"]: b for b in dn[\"files\"][0][\"benches\"]}\n"
+        + "mi = bi[\"bench_loop_sum\"][\"estimates_ns_per_iter\"][\"median\"]\n"
+        + "mn = bn[\"bench_loop_sum\"][\"estimates_ns_per_iter\"][\"median\"]\n"
+        + "def b(x):\n"
+        + "    return \"1\" if x else \"0\"\n"
+        + "print(\"CHECK native20 \" + b(mn * 20.0 < mi))\n")
+}
+
+# ----------------------------------------------------------------------------
+# 1. the convention & discovery: suites, units, refusals
+# ----------------------------------------------------------------------------
+fn sec1(acc: Acc) -> void uses IO, Fs, Proc {
+    section("1. the convention & discovery: suites, units, refusals")
+    # --list shows the bench set and the units markers.
+    let out: RunResult = run_tool(acc, ["--list", lib()])
+    check(acc, "--list exits 0", out.code == 0, clip(out.combined, 80))
+    check(acc, "--list marks the bench that declares units",
+        out.out.contains("bench_loop_sum*") && !out.out.contains("units_loop_sum"),
+        "")
+    check(acc, "--list leaves the units-less bench unmarked",
+        out.out.contains("bench_no_units")
+            && !out.out.contains("bench_no_units*"), "")
+    check(acc, "--list shows the marked-skip bench",
+        out.out.contains("bench_skipped"), "")
+    check(acc, "the suite imports std.bench (the skip helper resolves)",
+        read_or(lib(), "").contains("std.bench"), "")
+
+    # A suite with main is refused, by name, with the fix.
+    let p: str = write_src(acc, "has_main.hls",
+        simple_bench() + "\nfn main() {\n}\n")
+    let r: RunResult = run_tool(acc, ["--fixed-iters", "10", "--samples", "2", p])
+    check(acc, "a suite with main fails the run (rc 1)", r.code == 1, "")
+    check(acc, "the main refusal names the rule (the runner is their main)",
+        r.out.contains("bench suite defines main"), "")
+
+    # A stray units fn is a file-level failure; the other bench still runs.
+    let p2: str = write_src(acc, "stray.hls",
+        simple_bench() + "\nfn units_orphan() -> int {\n    return 1\n}\n")
+    let r2: RunResult = run_tool(acc, ["--fixed-iters", "10", "--samples", "2", p2])
+    check(acc, "a stray units fn fails the run", r2.code == 1, "")
+    check(acc, "the stray refusal names the orphan and the convention",
+        r2.out.contains("stray units fn 'units_orphan'"), "")
+
+    # A units fn with parameters / the wrong declared return fails THE BENCH.
+    let p3: str = write_src(acc, "units_params.hls",
+        simple_bench() + "\nfn units_tiny(n: int) -> int {\n    return n\n}\n")
+    let r3: RunResult = run_tool(acc, ["--fixed-iters", "10", "--samples", "2", p3])
+    check(acc, "a units fn with parameters fails the bench with the fix",
+        r3.code == 1
+            && r3.out.contains("units fn 'units_tiny' must take no parameters"),
+        "")
+
+    let p4: str = write_src(acc, "units_ret.hls",
+        simple_bench() + "\nfn units_tiny() -> str {\n    return \"twenty\"\n}\n")
+    let r4: RunResult = run_tool(acc, ["--fixed-iters", "10", "--samples", "2", p4])
+    check(acc, "a units fn returning str fails the bench naming both types",
+        r4.code == 1 && r4.out.contains("must return int")
+            && r4.out.contains("'str'"), "")
+
+    # A benchmark with parameters fails before anything runs.
+    let p5: str = write_src(acc, "bench_params.hls",
+        "fn bench_args(n: int) {\n    let mut i: int = 0\n"
+        + "    while i < n {\n        i = i + 1\n    }\n}\n")
+    let r5: RunResult = run_tool(acc, ["--fixed-iters", "10", "--samples", "2", p5])
+    check(acc, "a benchmark with parameters fails with the arity in the message",
+        r5.code == 1 && r5.out.contains("takes 1 parameter(s)"), "")
+
+    # A file with no bench_* is a skip, not a failure.
+    let p6: str = write_src(acc, "no_benches.hls",
+        "fn helper(n: int) -> int {\n    return n * 2\n}\n")
+    let r6: RunResult = run_tool(acc, ["--fixed-iters", "10", "--samples", "2", p6])
+    check(acc, "a bench-less file is a <no-benches> skip (rc 0)",
+        r6.code == 0 && r6.out.contains("<no-benches>")
+            && r6.out.contains("no bench_* functions"), "")
+
+    # --grep selects; a grep matching nothing is a skip.
+    let r7: RunResult = run_tool(acc, ["--fixed-iters", "10", "--samples", "2",
+        "--grep", "loop_sum", lib()])
+    check(acc, "--grep selects only the matching benches",
+        r7.code == 0 && r7.out.contains("bench_loop_sum")
+            && !r7.out.contains("bench_str_grow"), "")
+    let r8: RunResult = run_tool(acc, ["--fixed-iters", "10", "--samples", "2",
+        "--grep", "no-such-bench", lib()])
+    check(acc, "a grep matching nothing is a <no-benches> skip, never an error",
+        r8.code == 0 && r8.out.contains("<no-benches>"), "")
+}
+
+# ----------------------------------------------------------------------------
+# 2. the driver & the protocol: records, noise, hygiene
+# ----------------------------------------------------------------------------
+fn sec2(acc: Acc) -> void uses IO, Fs, Proc {
+    section("2. the driver & the protocol: records, noise, hygiene")
+    # Fixed plan: the units record, N samples at the fixed iters, the
+    # harness record — all parsed from the real driver's stdout.
+    let out: RunResult = run_tool(acc, ["--fixed-iters", "123", "--samples", "4",
+        "--grep", "loop_sum", lib()])
+    check(acc, "a fixed-plan run of the units bench exits 0", out.code == 0,
+        clip(out.combined, 80))
+    let time_line: str = first_line_with(out.out, "time:")
+    let thrpt_line: str = first_line_with(out.out, "thrpt:")
+    let harness_line: str = first_line_with(out.out, "harness:")
+    check(acc, "the report carries the time bracket", time_line != "", "")
+    check(acc, "the units bench reports throughput in units/s",
+        thrpt_line != "" && thrpt_line.contains("units/s"), "")
+    check(acc, "the report carries the harness calibration line",
+        harness_line != "" && harness_line.contains("harness:"), "")
+
+    # The raw protocol: recover the driver's records by running the
+    # tool with --json (the samples ride in the payload).
+    let jp: str = scratch(acc, "proto.json")
+    run_tool(acc, ["--fixed-iters", "123", "--samples", "4",
+        "--grep", "loop_sum", lib(), "--json", jp])
+    let doc: JsonValue = parse_json(read_or(jp, ""))
+    let files: list[JsonValue] = jarr(doc, "files")
+    let benches: list[JsonValue] = jarr(files.get(0), "benches")
+    let samples: list[JsonValue] = jarr(benches.get(0), "raw_samples")
+    check(acc, "the plan's sample count is exact (4)", samples.len() == 4,
+        samples.len().to_str())
+    let mut iters_ok: bool = true
+    let mut elapsed_ok: bool = true
+    let mut i: int = 0
+    while i < samples.len() {
+        let pair: list[JsonValue] = samples.get(i).arr
+        if el_int(pair.get(0)) != 123 {
+            iters_ok = false
+        }
+        if el_int(pair.get(1)) <= 0 {
+            elapsed_ok = false
+        }
+        i = i + 1
+    }
+    check(acc, "every fixed-plan sample ran exactly 123 iterations", iters_ok, "")
+    check(acc, "every sample's elapsed time is positive (the clock advanced)",
+        elapsed_ok, "")
+    check(acc, "the units record reached the report (100 units per iteration)",
+        el_int(json_object_get(benches.get(0), "units")) == 100, "")
+
+    # A protocol look-alike is a loud failure, not a dropped record.
+    let p: str = write_src(acc, "lookalike.hls",
+        "fn bench_look() uses IO {\n"
+        + "    println(\"__HLBENCH__ 5 5 5\")\n"
+        + "    let mut i: int = 0\n    while i < 5 {\n"
+        + "        i = i + 1\n    }\n}\n")
+    let r: RunResult = run_tool(acc, ["--fixed-iters", "10", "--samples", "2", p])
+    check(acc, "a protocol look-alike fails the bench loudly",
+        r.code == 1 && r.out.contains("protocol error"), "")
+
+    # Ordinary print noise is skipped; the measurement survives.
+    let p2: str = write_src(acc, "noise.hls",
+        "fn bench_talks() uses IO {\n"
+        + "    println(\"step 1 done\")\n"
+        + "    let mut i: int = 0\n    while i < 20 {\n"
+        + "        i = i + 1\n    }\n}\n")
+    let r2: RunResult = run_tool(acc, ["--fixed-iters", "10", "--samples", "2", p2])
+    check(acc, "a bench that prints still measures cleanly",
+        r2.code == 0 && r2.out.contains("bench_talks")
+            && r2.out.contains("time:"), "")
+
+    # Temp hygiene: no dot-drivers left beside the suite after a run.
+    let leftovers: list[str] = dir_names(lib_dir())
+    let mut litter: bool = false
+    let mut i2: int = 0
+    while i2 < leftovers.len() {
+        if leftovers.get(i2).starts_with(".hlbench-") {
+            litter = true
+        }
+        i2 = i2 + 1
+    }
+    check(acc, "no temp drivers are left beside the suite", !litter, "")
+}
+
+# ----------------------------------------------------------------------------
+# 3. the statistics: quantiles, outliers, bootstrap, Welch
+# ----------------------------------------------------------------------------
+fn sec3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("3. the statistics: quantiles, outliers, bootstrap, Welch")
+    let ds: RunResult = run_capture("python3", [bench_stats_driver(acc), acc.root])
+    driver_check(acc, ds, "q50", "quantile .5 of the even vector is 3.5")
+    driver_check(acc, ds, "median", "median matches the hand computation")
+    driver_check(acc, ds, "q25", "quantile .25 interpolates linearly (2.25)")
+    driver_check(acc, ds, "mad",
+        "median absolute deviation matches (1.5: |x-3.5| median)")
+    driver_check(acc, ds, "low_severe", "one low severe outlier (-100)")
+    driver_check(acc, ds, "low_mild", "one low mild outlier (-15)")
+    driver_check(acc, ds, "high_cells",
+        "one high mild (20) and one high severe (100)")
+    driver_check(acc, ds, "no_outliers",
+        "an arithmetic progression has no outliers at all")
+    driver_check(acc, ds, "collapse",
+        "a constant vector's CI collapses to the point")
+    driver_check(acc, ds, "seeded",
+        "the bootstrap is seeded: same seed, same interval")
+    driver_check(acc, ds, "brackets",
+        "the bootstrap interval brackets the point estimate")
+    driver_check(acc, ds, "thr_ordered",
+        "the throughput bootstrap returns an ordered interval")
+    driver_check(acc, ds, "slope",
+        "the slope estimate is total-elapsed over total-iters")
+    driver_check(acc, ds, "none_units",
+        "a units-less bench has no throughput interval (None, by design)")
+    driver_check(acc, ds, "p_same", "identical distributions are not significant")
+    driver_check(acc, ds, "p_diff",
+        "a 10-unit separation at unit scale is decisive (p < 0.001)")
+    driver_check(acc, ds, "p_tiny",
+        "tiny samples fall back to a bounded p instead of crashing")
+    driver_check(acc, ds, "ft_ns", "500 ns stays in ns")
+    driver_check(acc, ds, "ft_us", "1234 ns moves to micros")
+    driver_check(acc, ds, "ft_ms", "1.5 ms stays in ms")
+    driver_check(acc, ds, "ft_s", "2 s stays in seconds")
+}
+
+# ----------------------------------------------------------------------------
+# 4. the report: criterion's layout and the change matrix
+# ----------------------------------------------------------------------------
+fn sec4(acc: Acc) -> void uses IO, Fs, Proc {
+    section("4. the report: criterion's layout and the change matrix")
+    # Regressed / improved via crafted baselines on the real CLI.
+    let out: RunResult = run_tool(acc, ["--fixed-iters", "100", "--samples", "4",
+        "--grep", "loop_sum", lib(), "--save", "real"])
+    check(acc, "--save records the baseline", out.code == 0,
+        clip(out.combined, 120))
+    let bdir: str = path_join3(path_join3(lib_dir(), ".hlbench"), "arith_bench")
+    let bpath: str = path_join3(bdir, "bench_loop_sum.real.json")
+    check(acc, "the baseline file lands in .hlbench/<stem>/",
+        file_exists(bpath), "")
+
+    # The crafted 100x / 1000x baselines (the battery's dict surgery,
+    # float math included, via the driver).
+    run_capture("python3", [bench_craft_driver(acc), "slowfast", bpath, bdir])
+
+    let out2: RunResult = run_tool(acc, ["--fixed-iters", "100", "--samples", "4",
+        "--grep", "loop_sum", lib(), "--baseline", "slowreg"])
+    check(acc, "a 100x-faster baseline reads as a regression",
+        out2.code == 0 && out2.out.contains("Performance has regressed."),
+        clip(out2.combined, 120))
+    check(acc, "the change line prints p against the 5% level, criterion-style",
+        out2.out.contains("(p = 0.00 < 5.00%)"), "")
+    check(acc, "the change bracket carries three percentages",
+        out2.out.contains("change:") && str_count(out2.out, "%") >= 3, "")
+
+    let out3: RunResult = run_tool(acc, ["--fixed-iters", "100", "--samples", "4",
+        "--grep", "loop_sum", lib(), "--baseline", "fastimp"])
+    check(acc, "a 1000x-slower baseline reads as an improvement",
+        out3.code == 0 && out3.out.contains("Performance has improved."),
+        clip(out3.combined, 120))
+
+    let out4: RunResult = run_tool(acc, ["--fixed-iters", "100", "--samples", "4",
+        "--grep", "loop_sum", lib(), "--baseline", "real"])
+    check(acc, "comparing against the same-machine baseline passes",
+        out4.code == 0, clip(out4.combined, 120))
+    check(acc, "an honest re-run is no-change or within-noise, never regressed",
+        out4.out.contains("No change in performance detected.")
+            || out4.out.contains("Change within noise threshold."), "")
+
+    # Byte-stability of the record: re-saving the loaded record rewrites
+    # the same bytes.
+    let rewrite: str = scratch(acc, "rewrite.json")
+    run_capture("python3",
+        [bench_rewrite_driver(acc), acc.root, bpath, rewrite])
+    let original: str = read_or(bpath, "")
+    let rewritten: str = read_or(rewrite, "")
+    check(acc, "the record is byte-stable under rewrite",
+        original != "" && original == rewritten, "")
+}
+
+# ----------------------------------------------------------------------------
+# 5. the baselines: refusal, corruption, cross-backend
+# ----------------------------------------------------------------------------
+fn sec5(acc: Acc) -> void uses IO, Fs, Proc {
+    section("5. the baselines: refusal, corruption, cross-backend")
+    # A missing baseline is refused BEFORE any measurement (exit 2).
+    let out: RunResult = run_tool(acc, ["--fixed-iters", "100", "--samples", "4",
+        lib(), "--baseline", "never-recorded"])
+    check(acc, "an unrecorded baseline is a usage error (exit 2)",
+        out.code == 2, "")
+    check(acc, "the refusal names the baseline and the recording flag",
+        out.err.contains("does not exist") && out.err.contains("--save"), "")
+
+    # A corrupt baseline is a failing result naming the file (exit 1).
+    let bdir: str = path_join3(path_join3(lib_dir(), ".hlbench"), "arith_bench")
+    write_file(path_join3(bdir, "bench_loop_sum.corrupt.json"),
+        "this is not json")
+    let out2: RunResult = run_tool(acc, ["--fixed-iters", "100", "--samples", "4",
+        "--grep", "loop_sum", lib(), "--baseline", "corrupt"])
+    check(acc, "a corrupt baseline fails the bench naming the file",
+        out2.code == 1 && out2.out.contains("is corrupt"), "")
+
+    # A baseline from the OTHER backend cannot serve this run.
+    let bpath: str = path_join3(bdir, "bench_loop_sum.real.json")
+    run_capture("python3", [bench_craft_driver(acc), "nat", bpath, bdir])
+    let out3: RunResult = run_tool(acc, ["--fixed-iters", "100", "--samples", "4",
+        "--grep", "loop_sum", lib(), "--baseline", "nat"])
+    check(acc, "a cross-backend baseline is refused with the reason",
+        out3.code == 1 && out3.out.contains("different instruments"), "")
+
+    # --save and --baseline of one name: compare happens first, then the
+    # overwrite (the run passes and the file is fresh).
+    let out4: RunResult = run_tool(acc, ["--fixed-iters", "100", "--samples", "4",
+        "--grep", "loop_sum", lib(), "--baseline", "real", "--save", "real"])
+    check(acc, "--baseline + --save of one name compares then overwrites",
+        out4.code == 0 && out4.out.contains("time:"), "")
+    let fresh: JsonValue = parse_json(read_or(bpath, ""))
+    check(acc, "the overwritten record is the new run's",
+        jstr(fresh, "backend") == "interpreter", "")
+}
+
+# ----------------------------------------------------------------------------
+# 6. exit codes & the CLI matrix: rc, --json, parallelism
+# ----------------------------------------------------------------------------
+fn sec6(acc: Acc) -> void uses IO, Fs, Proc {
+    section("6. exit codes & the CLI matrix: rc, --json, parallelism")
+    # A panicking bench fails the run (exit 1) with the panic decoded.
+    let p: str = write_src(acc, "panic.hls",
+        "fn bench_boom() {\n    panic(\"the bridge is out\")\n}\n")
+    let r: RunResult = run_tool(acc, ["--fixed-iters", "10", "--samples", "2", p])
+    check(acc, "a panicking bench fails with the decoded panic message",
+        r.code == 1 && r.out.contains("the bridge is out"), "")
+
+    # A skipped bench never fails the run.
+    let p2: str = write_src(acc, "skipper.hls",
+        "import \"std.bench\"\n\nfn bench_later() {\n"
+        + "    mark_skip(\"not on this host\")\n}\n")
+    let r2: RunResult = run_tool(acc, ["--fixed-iters", "10", "--samples", "2", p2])
+    check(acc, "a mark_skip bench is a skip with its reason, rc stays 0",
+        r2.code == 0 && r2.out.contains("not on this host")
+            && r2.out.contains("0 bench measured, 1 skip, 0 fail"), "")
+
+    # No suites at all is a usage error (exit 2).
+    let missing: str = scratch(acc, "missing.hls")
+    let r3: RunResult = run_tool(acc, [missing])
+    check(acc, "no discoverable suites is exit 2 with the reason on stderr",
+        r3.code == 2 && r3.err.contains("no .hls suite files found"), "")
+
+    # --json parses and carries the full payload.
+    let jpath: str = scratch(acc, "report.json")
+    run_tool(acc, ["--fixed-iters", "100", "--samples", "4",
+        lib(), "--json", jpath])
+    let doc: JsonValue = parse_json(read_or(jpath, ""))
+    check(acc, "the json document names the tool and the backend",
+        jstr(doc, "tool") == "hls-bench"
+            && jstr(doc, "backend") == "interpreter", "")
+    let benches: list[JsonValue] = jarr(jarr(doc, "files").get(0), "benches")
+    let names: list[str] = ["bench_loop_sum", "bench_str_grow",
+        "bench_no_units", "bench_skipped"]
+    let mut all_names: bool = benches.len() == 4
+    let mut k: int = 0
+    let mut loop_idx: int = -1
+    let mut skip_idx: int = -1
+    while k < benches.len() {
+        let bn: str = jstr(benches.get(k), "name")
+        if !str_contains(str_join(names, "|"), bn) {
+            all_names = false
+        }
+        if bn == "bench_loop_sum" {
+            loop_idx = k
+        }
+        if bn == "bench_skipped" {
+            skip_idx = k
+        }
+        k = k + 1
+    }
+    check(acc, "the json document covers every bench in the suite", all_names,
+        "")
+    check(acc, "the json carries the raw (iters, elapsed) samples",
+        loop_idx >= 0
+            && jarr(benches.get(loop_idx), "raw_samples").len() == 4, "")
+    let sk: JsonValue = benches.get(skip_idx)
+    check(acc, "the json records the skip with its reason",
+        jstr(sk, "status") == "skip"
+            && jstr(sk, "detail").contains("wired this bench to skip"), "")
+    # The float assertions of the report (median inside its CI; the
+    # throughput pairing) run through the driver.
+    let dj: RunResult = run_capture("python3", [bench_json_driver(acc), jpath])
+    driver_check(acc, dj, "median_in_ci",
+        "the median sits inside its own bootstrap interval")
+    driver_check(acc, dj, "throughput",
+        "throughput appears exactly when units are declared")
+
+    # -j 2 covers the same bench set as -j 1 (the pool changes nothing).
+    let rj2: RunResult = run_tool(acc, ["-j", "2", "--fixed-iters", "50",
+        "--samples", "2", lib()])
+    check(acc, "a -j 2 run measures the full bench set",
+        rj2.code == 0 && rj2.out.contains("bench_loop_sum")
+            && rj2.out.contains("bench_no_units"), "")
+}
+
+# ----------------------------------------------------------------------------
+# 7. the differential: one plan, two backends
+# ----------------------------------------------------------------------------
+fn sec7(acc: Acc) -> void uses IO, Fs, Proc {
+    section("7. the differential: one plan, two backends")
+    if !native_ready(acc) {
+        println("  [SKIP] native half (bin/hlc or gcc missing)")
+        return
+    }
+    # The fixed plan is the same (bench, iters) sequence on both
+    # backends; only the clock readings differ, as they must.
+    let ji: str = scratch(acc, "plan_i.json")
+    let jn: str = scratch(acc, "plan_n.json")
+    let ri: RunResult = run_tool(acc, ["--fixed-iters", "60", "--samples", "3",
+        lib(), "--json", ji])
+    let rn: RunResult = run_tool(acc, ["--native", "--fixed-iters", "60",
+        "--samples", "3", lib(), "--json", jn])
+    check(acc, "both backends run the fixed plan clean",
+        ri.code == 0 && rn.code == 0, clip(ri.combined, 80)
+        + " / " + clip(rn.combined, 80))
+    let di: JsonValue = parse_json(read_or(ji, ""))
+    let dn: JsonValue = parse_json(read_or(jn, ""))
+    let bi: list[JsonValue] = jarr(jarr(di, "files").get(0), "benches")
+    let bn: list[JsonValue] = jarr(jarr(dn, "files").get(0), "benches")
+    let mut loop_i: int = -1
+    let mut k: int = 0
+    while k < bi.len() {
+        if jstr(bi.get(k), "name") == "bench_loop_sum" {
+            loop_i = k
+        }
+        k = k + 1
+    }
+    let mut loop_n: int = -1
+    let mut m: int = 0
+    while m < bn.len() {
+        if jstr(bn.get(m), "name") == "bench_loop_sum" {
+            loop_n = m
+        }
+        m = m + 1
+    }
+    let plan_i: list[JsonValue] = jarr(bi.get(loop_i), "raw_samples")
+    let plan_n: list[JsonValue] = jarr(bn.get(loop_n), "raw_samples")
+    let mut plan_ok: bool = plan_i.len() == 3 && plan_n.len() == 3
+    let mut native_clock: bool = true
+    let mut i: int = 0
+    while i < 3 {
+        if el_int(plan_i.get(i).arr.get(0)) != 60
+            || el_int(plan_n.get(i).arr.get(0)) != 60 {
+            plan_ok = false
+        }
+        if el_int(plan_n.get(i).arr.get(1)) <= 0 {
+            native_clock = false
+        }
+        i = i + 1
+    }
+    check(acc, "the (bench, iters) plan is IDENTICAL across backends",
+        plan_ok, "")
+    check(acc, "the native samples' clocks advanced too", native_clock, "")
+    check(acc, "the units record is the same on both backends",
+        el_int(json_object_get(bi.get(loop_i), "units")) == 100
+            && el_int(json_object_get(bn.get(loop_n), "units")) == 100, "")
+
+    # Native is decisively faster on the same bench (the interpreter is
+    # ~4 orders of magnitude slower; 20x is the honest floor).
+    let dd: RunResult = run_capture("python3", [bench_diff_driver(acc), ji, jn])
+    driver_check(acc, dd, "native20",
+        "native median is >20x faster than the interpreter median")
+
+    # The ok fixture: interpreter and native byte-identical.
+    let irun: RunResult = boot(acc, [fixture()])
+    let cpath: str = scratch(acc, "fixture.c")
+    let bpath_n: str = scratch(acc, "fixture.bin")
+    run_capture(bench_hlc(acc), [fixture(), cpath])
+    run_capture("gcc", ["-O2", "-o", bpath_n, cpath, "-lm", "-pthread"])
+    let nrun: RunResult = run_capture(bpath_n, [])
+    check(acc, "the fixture's output is byte-identical across backends",
+        irun.out == nrun.out && irun.out != "", "")
+}
+
+# ----------------------------------------------------------------------------
+# 8. corpus hygiene: canonical form, checks, no litter
+# ----------------------------------------------------------------------------
+fn sec8(acc: Acc) -> void uses IO, Fs, Proc {
+    section("8. corpus hygiene: canonical form, checks, no litter")
+    let pf: RunResult = run_capture("./bin/hlfmt", ["-c", fixture()])
+    check(acc, "the fixture is hlfmt-canonical",
+        pf.out.contains("already formatted"), clip(pf.out, 60))
+    let pl: RunResult = run_capture("./bin/hlfmt", ["-c", lib()])
+    check(acc, "the bench lib is hlfmt-canonical",
+        pl.out.contains("already formatted"), clip(pl.out, 60))
+    let plint: RunResult = run_capture("python3",
+        [path_join3(acc.root, "tools/hllint.py"), fixture()])
+    check(acc, "the fixture is hllint-clean",
+        plint.out.contains("no warnings"), clip(plint.out, 60))
+    let pb: RunResult = boot_check(acc, fixture())
+    check(acc, "the fixture boots through the real checker",
+        pb.out.contains("OK: types and effects valid"), clip(pb.combined, 60))
+
+    # The lib has no main (the runner is its program) — the real loader
+    # accepts it only through the probe (a suite is a module, and the
+    # runner's probe is what gives the checker a main).
+    let lib_src: str = read_or(lib(), "")
+    check(acc, "the bench lib defines no main (a suite is a library)",
+        lib_src != "" && !lib_src.contains("fn main"), "")
+
+    # No runner litter anywhere: no dot-drivers, and the gate's own
+    # .hlbench scratch is removed.
+    let mut litter: int = 0
+    let dirs: list[str] = [lib_dir(), acc.scratch_base, "tests"]
+    let mut d: int = 0
+    while d < dirs.len() {
+        let entries: list[str] = dir_names(dirs.get(d))
+        let mut e: int = 0
+        while e < entries.len() {
+            let nm: str = entries.get(e)
+            if nm.starts_with(".hlbench-") && nm.ends_with(".hls") {
+                litter = litter + 1
+            }
+            e = e + 1
+        }
+        d = d + 1
+    }
+    check(acc, "no temp drivers survive anywhere the gate ran", litter == 0,
+        litter.to_str())
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let acc: Acc = acc_new("bench")
+    sec1(acc)
+    sec2(acc)
+    sec3(acc)
+    sec4(acc)
+    sec5(acc)
+    sec6(acc)
+    sec7(acc)
+    sec8(acc)
+    # The battery's cleanup: rmtree(TMP) and the runner's .hlbench
+    # store beside the suite.
+    rmrf(acc.scratch_base)
+    rmrf(path_join3(lib_dir(), ".hlbench"))
+    return finish(acc, "Stage 124 -- hls-bench, the criterion-style "
+        + "micro-benchmark runner")
+}

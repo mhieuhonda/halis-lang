@@ -1,0 +1,822 @@
+# ============================================================================
+# tests/acc/serve_acceptance.hls — Stage 75 acceptance gate, in Halis
+# (the Halis twin of tests/serve_acceptance.py; same ten sections,
+# same assertions, same needles — the harness is tests/acc/harness.hls
+# and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make serve-acceptance` (which compiles this file and runs
+# it from the repo root).
+#
+# The battery imported tools/hlserve.py's part modules for sections
+# 1-8 and ran make_server() in process with threads for 9-10. The gate
+# asks the same questions through the tool's front doors:
+#
+#   * sections 1-4 and 6-8 via a small python3 driver written into the
+#     scratch world (build_arg_parser, load_config_file,
+#     ws_handshake_response / ws_encode_frame, parse_diagnostics,
+#     inject_overlay, find_proxy_for_path — the module stays the
+#     subject; every comparison against the battery's vectors runs
+#     here, in the gate);
+#   * sections 5, 9 and 10 spawn REAL `python3 tools/hlserve.py`
+#     servers on free localhost ports exactly the way the battery's
+#     end-to-end legs do: wait for the port, drive HTTP / a raw
+#     WebSocket handshake over it, then terminate every child by pid
+#     (SIGTERM, then SIGKILL as the backstop) before the gate moves on.
+#     Each server runs with cwd = its own scratch dir, so the watcher
+#     sees only the gate's own files.
+#
+# The battery's FileWatcher leg (watch a.hls, expect the change to
+# fire, expect the right file named) maps onto the real server's
+# watcher: the seeded file must NOT fire, then the rewrite must show up
+# as "recompiling (changed: a.hls)" in the server's log. The battery's
+# hand-injected last_error_message ("boom: missing semicolon") maps
+# onto the CLI flow's own failure: break the input, the watcher
+# recompiles, fails, and / serves the banner with that error message.
+#
+#  1. Import surface (Stage 24 compat) — hlserve facade + 10 modules
+#  2. CLI parser — the typical invocation's parsed values
+#  3. Config file (hls.serve.toml / .json) + proxy-spec parsing
+#  4. WebSocket handshake + frames (RFC 6455 vector, frame bytes)
+#  5. FileWatcher fires on mtime change (real server, real recompile)
+#  6. CompileResult diagnostic parsing + overlay dict shape
+#  7. Overlay injection (snippet before </body>, disabled = unchanged,
+#     status banner)
+#  8. Proxy rule longest-prefix lookup
+#  9. End-to-end HTTP (real server): /, /out.wasm, /static, SPA
+#     fallback, /source, gzip, failed-compile banner
+# 10. End-to-end WebSocket handshake (101, accept key, hello frame)
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.base64"
+import "std.result"
+
+# ----------------------------------------------------------------------------
+# The battery's check grammar (names verbatim, [OK]/[FAIL] flags).
+# ----------------------------------------------------------------------------
+
+fn chk(acc: Acc, name: str, okc: bool, detail: str) -> bool uses IO {
+    return check(acc, name, okc, detail)
+}
+
+# ----------------------------------------------------------------------------
+# Process plumbing: free ports, spawn, wait-for-port, kill by pid.
+# ----------------------------------------------------------------------------
+
+struct HttpResp {
+    status: int,
+    ctype: str,
+    cenc: str,
+    body: str
+}
+
+fn free_port() -> int uses Proc {
+    let r: RunResult = run_capture("python3", ["-c",
+        "import socket; s = socket.socket(); s.bind(('127.0.0.1', 0)); "
+        + "port = s.getsockname()[1]; s.close(); print(port)"])
+    let lines: list[str] = r.out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let t: str = lines.get(i).trim()
+        if t != "" {
+            return t.to_int()
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn wait_port_script() -> str {
+    return "import socket, sys, time\n" +
+        "host = '127.0.0.1'\n" +
+        "port = int(sys.argv[1])\n" +
+        "deadline = time.time() + 5.0\n" +
+        "up = False\n" +
+        "while time.time() < deadline:\n" +
+        "    try:\n" +
+        "        socket.create_connection((host, port), timeout=0.5).close()\n" +
+        "        up = True\n" +
+        "        break\n" +
+        "    except OSError:\n" +
+        "        time.sleep(0.1)\n" +
+        "print('up' if up else 'down')\n" +
+        "sys.exit(0 if up else 1)\n"
+}
+
+# wait_port(port) — the battery's create_connection poll loop, 5s
+# deadline, as a child so the gate never blocks on it.
+fn wait_port(port: int) -> bool uses Proc {
+    let r: RunResult = run_capture("python3",
+        ["-c", wait_port_script(), port.to_str()])
+    return r.code == 0 && r.out.contains("up")
+}
+
+# spawn_server(acc, dir, port, args) — the real tool, backgrounded in
+# its own scratch dir (so it watches only the gate's own files), stdio
+# into dir/log.txt, pid into dir/pid.
+fn spawn_server(acc: Acc, dir: str, port: int, args: list[str]) -> bool uses Fs, Proc {
+    let log: str = dir + "/log.txt"
+    let pidf: str = dir + "/pid"
+    let mut cmd: str = "cd '" + shell_quote(dir) + "' && nohup python3 "
+        + shell_quote(path_join3(acc.root, "tools/hlserve.py"))
+        + " --listen 127.0.0.1:" + port.to_str()
+    let mut i: int = 0
+    while i < args.len() {
+        cmd = cmd + " " + shell_quote(args.get(i))
+        i = i + 1
+    }
+    cmd = cmd + " > '" + shell_quote(log) + "' 2>&1 & echo $! > '"
+        + shell_quote(pidf) + "'"
+    sh(cmd)
+    return file_exists(pidf)
+}
+
+# kill_server(dir) — SIGTERM by pid, wait for it to be gone, SIGKILL
+# backstop. Every spawned server goes through this before its section
+# returns (the gate never leaves a child behind).
+fn kill_server(dir: str) -> void uses Fs, Proc, Clock, Conc {
+    let pf: str = dir + "/pid"
+    if !file_exists(pf) {
+        return
+    }
+    let pid: str = read_file(pf).trim()
+    if pid == "" {
+        return
+    }
+    sh("kill '" + shell_quote(pid) + "' 2>/dev/null")
+    let mut i: int = 0
+    while i < 20 {
+        if sh("kill -0 '" + shell_quote(pid) + "' 2>/dev/null") != 0 {
+            return
+        }
+        thread_sleep_ms(200)
+        i = i + 1
+    }
+    sh("kill -9 '" + shell_quote(pid) + "' 2>/dev/null")
+}
+
+# ----------------------------------------------------------------------------
+# Parsing helpers (the driver prints one value per line).
+# ----------------------------------------------------------------------------
+
+fn value_after(out: str, prefix: str) -> str {
+    let lines: list[str] = out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).starts_with(prefix) {
+            return lines.get(i).slice(prefix.len(), lines.get(i).len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn flag(out: str, prefix: str) -> int {
+    let v: str = value_after(out, prefix)
+    if v == "" {
+        return -1
+    }
+    return v.to_int()
+}
+
+fn nth_value(out: str, prefix: str, n: int) -> str {
+    let lines: list[str] = out.split("\n")
+    let mut seen: int = 0
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).starts_with(prefix) {
+            if seen == n {
+                return lines.get(i).slice(prefix.len(), lines.get(i).len())
+            }
+            seen = seen + 1
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# http_get(fetch, url, hname, hval) — the battery's
+# urllib.request.urlopen: status / Content-Type / Content-Encoding and
+# the exact body bytes (base64 over the pipe, decoded here).
+fn http_get(fetch: str, url: str, hname: str, hval: str) -> HttpResp uses Proc {
+    let args: list[str] = [fetch, url]
+    if hname != "" {
+        args.push(hname)
+        args.push(hval)
+    }
+    let r: RunResult = run_capture("python3", args)
+    let cenc: str = value_after(r.out, "cenc=")
+    return HttpResp {
+        status: flag(r.out, "status="),
+        ctype: value_after(r.out, "ctype="),
+        cenc: cenc,
+        body: base64_decode(value_after(r.out, "b64="))
+    }
+}
+
+# ----------------------------------------------------------------------------
+# The drivers written into the scratch world.
+# ----------------------------------------------------------------------------
+
+# probe.py — the part-module front door for sections 1-4 and 6-8.
+fn probe_src() -> str {
+    return "import base64, json, struct, sys\n" +
+        "sys.path.insert(0, 'tools')\n" +
+        "sys.path.insert(0, 'tools/hlserve_parts')\n" +
+        "cmd = sys.argv[1]\n" +
+        "if cmd == 'imports':\n" +
+        "    import hlserve\n" +
+        "    for n in ('main', 'compile_bundle', 'FileWatcher', 'EventBus',\n" +
+        "              'DevHTTPHandler', 'DevServer'):\n" +
+        "        print('has %s=%d' % (n, int(hasattr(hlserve, n))))\n" +
+        "    import hlserve_cli, hlserve_common, hlserve_config\n" +
+        "    import hlserve_watcher, hlserve_compiler, hlserve_hmr\n" +
+        "    import hlserve_overlay, hlserve_proxy, hlserve_tls\n" +
+        "    import hlserve_server\n" +
+        "    for m in ('hlserve_cli', 'hlserve_common', 'hlserve_config',\n" +
+        "              'hlserve_watcher', 'hlserve_compiler', 'hlserve_hmr',\n" +
+        "              'hlserve_overlay', 'hlserve_proxy', 'hlserve_tls',\n" +
+        "              'hlserve_server'):\n" +
+        "        print('mod %s=1' % m)\n" +
+        "elif cmd == 'parse_args':\n" +
+        "    import hlserve_cli\n" +
+        "    ap = hlserve_cli.build_arg_parser()\n" +
+        "    args = ap.parse_args(['--input', 'examples/hello.hls',\n" +
+        "                          '--port', '3000', '--open',\n" +
+        "                          '--proxy', '/api=http://localhost:3001'])\n" +
+        "    print('input=%s' % args.input)\n" +
+        "    print('port=%d' % args.port)\n" +
+        "    print('open=%d' % int(args.open))\n" +
+        "    print('proxy=%s' % (args.proxy,))\n" +
+        "elif cmd == 'config':\n" +
+        "    from hlserve_config import (load_config_file,\n" +
+        "                                config_dict_to_serve_config)\n" +
+        "    cfg = config_dict_to_serve_config(load_config_file(sys.argv[2]))\n" +
+        "    print('cfg_input=%s' % cfg.input)\n" +
+        "    print('cfg_port=%d' % cfg.port)\n" +
+        "    print('cfg_open=%d' % int(cfg.open))\n" +
+        "    print('cfg_https=%d' % int(cfg.https))\n" +
+        "    print('cfg_watch=%s' % ','.join(cfg.watch_dirs))\n" +
+        "    print('cfg_debounce=%d' % cfg.debounce_ms)\n" +
+        "    print('cfg_nproxy=%d' % len(cfg.proxies))\n" +
+        "    if cfg.proxies:\n" +
+        "        print('cfg_proxy0=%s=%s' % (cfg.proxies[0].prefix,\n" +
+        "                                    cfg.proxies[0].target))\n" +
+        "elif cmd == 'proxy_spec':\n" +
+        "    from hlserve_config import (parse_proxy_spec, parse_proxy_specs,\n" +
+        "                                ProxyRule)\n" +
+        "    rule = parse_proxy_spec('/api=http://localhost:3001')\n" +
+        "    print('prefix=%s' % rule.prefix)\n" +
+        "    print('target=%s' % rule.target)\n" +
+        "    rules = parse_proxy_specs(['/a=http://x:1', '/b=http://y:2'])\n" +
+        "    print('nspecs=%d' % len(rules))\n" +
+        "    try:\n" +
+        "        parse_proxy_spec('no-equals-sign')\n" +
+        "        print('malformed=0')\n" +
+        "    except ValueError:\n" +
+        "        print('malformed=1')\n" +
+        "    try:\n" +
+        "        ProxyRule(prefix='/x', target='bad-no-scheme')\n" +
+        "        print('scheme=0')\n" +
+        "    except ValueError:\n" +
+        "        print('scheme=1')\n" +
+        "elif cmd == 'ws_unit':\n" +
+        "    import hlserve_hmr as hmr\n" +
+        "    resp = hmr.ws_handshake_response('dGhlIHNhbXBsZSBub25jZQ==')\n" +
+        "    print(resp.decode('ascii'), end='')\n" +
+        "    print('ws-unit-end')\n" +
+        "    frame = hmr.ws_encode_frame(b'hello', opcode=hmr.OP_TEXT)\n" +
+        "    print('frame0=%d' % frame[0])\n" +
+        "    print('frame1=%d' % frame[1])\n" +
+        "    print('fpayload=%s' % frame[2:7].decode('ascii'))\n" +
+        "    long_payload = b'x' * 200\n" +
+        "    long_frame = hmr.ws_encode_frame(long_payload, opcode=hmr.OP_TEXT)\n" +
+        "    print('longb1=%d' % long_frame[1])\n" +
+        "    print('longext=%d' % struct.unpack('>H', long_frame[2:4])[0])\n" +
+        "elif cmd == 'diag':\n" +
+        "    from hlserve_compiler import parse_diagnostics, CompileError\n" +
+        "    sample = ('examples/foo.hls:12:5: error: undefined variable `x`\\n'\n" +
+        "              'examples/foo.hls:13:1: warning: unused import\\n'\n" +
+        "              'examples/foo.hls:14: note: see previous declaration\\n'\n" +
+        "              'wrote out.wasm (1234 bytes)\\n'\n" +
+        "              'random line with no file:line\\n')\n" +
+        "    diags = parse_diagnostics(sample)\n" +
+        "    print('ndiag=%d' % len(diags))\n" +
+        "    for d in diags:\n" +
+        "        print('diag=%s|%s|%d|%d|%s'\n" +
+        "              % (d.severity, d.file, d.line, d.col, d.message))\n" +
+        "    d = CompileError('error', 'f.hls', 7, 3, 'boom').to_overlay_dict()\n" +
+        "    print('odict=' + json.dumps(d))\n" +
+        "elif cmd == 'overlay':\n" +
+        "    from hlserve_overlay import (inject_overlay,\n" +
+        "                                 inject_status_banner, OVERLAY_SNIPPET)\n" +
+        "    html = (b'<!DOCTYPE html><html><head></head><body><p>hi</p>'\n" +
+        "            b'</body></html>')\n" +
+        "    print('hin=' + base64.b64encode(html).decode('ascii'))\n" +
+        "    out = inject_overlay(html, overlay_enabled=True)\n" +
+        "    print('o1=' + base64.b64encode(out).decode('ascii'))\n" +
+        "    out2 = inject_overlay(html, overlay_enabled=False)\n" +
+        "    print('o2=' + base64.b64encode(out2).decode('ascii'))\n" +
+        "    out3 = inject_status_banner(html, 'compile failed')\n" +
+        "    print('o3=' + base64.b64encode(out3).decode('ascii'))\n" +
+        "    print('snip=' + OVERLAY_SNIPPET.encode('utf-8')[:50]\n" +
+        "          .decode('latin1'))\n" +
+        "elif cmd == 'proxy_lookup':\n" +
+        "    from hlserve_config import ProxyRule\n" +
+        "    from hlserve_proxy import find_proxy_for_path\n" +
+        "    rules = [ProxyRule(prefix='/api', target='http://a:1'),\n" +
+        "             ProxyRule(prefix='/api/v2', target='http://b:2'),\n" +
+        "             ProxyRule(prefix='/ws', target='http://c:3')]\n" +
+        "    for p in ('/api/v2/users', '/api/users', '/nope', '/api'):\n" +
+        "        r = find_proxy_for_path(p, rules)\n" +
+        "        print('m %s=%s' % (p, r.target if r is not None else 'None'))\n"
+}
+
+# fetch.py — the battery's urllib client: status + headers + the exact
+# body bytes.
+fn fetch_src() -> str {
+    return "import base64, sys, urllib.error, urllib.request\n" +
+        "url = sys.argv[1]\n" +
+        "headers = {}\n" +
+        "for i in range(2, len(sys.argv) - 1, 2):\n" +
+        "    headers[sys.argv[i]] = sys.argv[i + 1]\n" +
+        "req = urllib.request.Request(url, headers=headers)\n" +
+        "try:\n" +
+        "    with urllib.request.urlopen(req, timeout=5) as r:\n" +
+        "        body = r.read()\n" +
+        "        print('status=%d' % r.status)\n" +
+        "        print('ctype=%s' % r.headers.get('Content-Type', '-'))\n" +
+        "        print('cenc=%s' % r.headers.get('Content-Encoding', '-'))\n" +
+        "        print('b64=%s' % base64.b64encode(body).decode('ascii'))\n" +
+        "except urllib.error.HTTPError as e:\n" +
+        "    body = e.read()\n" +
+        "    print('status=%d' % e.code)\n" +
+        "    print('ctype=%s' % e.headers.get('Content-Type', '-'))\n" +
+        "    print('cenc=%s' % e.headers.get('Content-Encoding', '-'))\n" +
+        "    print('b64=%s' % base64.b64encode(body).decode('ascii'))\n"
+}
+
+# ws.py — the battery's raw-socket handshake + hello-frame read. The
+# client key is the RFC 6455 spec's own example vector, whose expected
+# Sec-WebSocket-Accept the gate knows verbatim (section 4 asserts the
+# same constant).
+fn ws_src() -> str {
+    return "import json, socket, sys\n" +
+        "host, port = '127.0.0.1', int(sys.argv[1])\n" +
+        "key = 'dGhlIHNhbXBsZSBub25jZQ=='\n" +
+        "hs = ('GET /ws HTTP/1.1\\r\\nHost: 127.0.0.1:%d\\r\\n'\n" +
+        "      'Upgrade: websocket\\r\\nConnection: Upgrade\\r\\n'\n" +
+        "      'Sec-WebSocket-Key: %s\\r\\nSec-WebSocket-Version: 13\\r\\n'\n" +
+        "      '\\r\\n' % (port, key)).encode('ascii')\n" +
+        "s = socket.create_connection((host, port), timeout=5)\n" +
+        "s.sendall(hs)\n" +
+        "buf = b''\n" +
+        "while b'\\r\\n\\r\\n' not in buf:\n" +
+        "    c = s.recv(4096)\n" +
+        "    if not c:\n" +
+        "        break\n" +
+        "    buf += c\n" +
+        "lines = buf.split(b'\\r\\n')\n" +
+        "print('status=%s' % lines[0].decode('latin1'))\n" +
+        "acc_line = '-'\n" +
+        "for ln in lines:\n" +
+        "    if ln.startswith(b'Sec-WebSocket-Accept:'):\n" +
+        "        acc_line = ln.decode('latin1').split(': ', 1)[1]\n" +
+        "print('accept=%s' % acc_line)\n" +
+        "leftover = buf.split(b'\\r\\n\\r\\n', 1)[1] if b'\\r\\n\\r\\n' in buf else b''\n" +
+        "s.settimeout(3.0)\n" +
+        "buffer = bytearray(leftover)\n" +
+        "def rx(n):\n" +
+        "    while len(buffer) < n:\n" +
+        "        c = s.recv(max(n - len(buffer), 4096))\n" +
+        "        if not c:\n" +
+        "            break\n" +
+        "        buffer.extend(c)\n" +
+        "    out = bytes(buffer[:n])\n" +
+        "    del buffer[:n]\n" +
+        "    return out\n" +
+        "hdr = rx(2)\n" +
+        "if len(hdr) >= 2:\n" +
+        "    b0, b1 = hdr[0], hdr[1]\n" +
+        "    fin = 1 if b0 & 0x80 else 0\n" +
+        "    opcode = b0 & 0x0F\n" +
+        "    plen = b1 & 0x7F\n" +
+        "    if plen == 126:\n" +
+        "        plen = int.from_bytes(rx(2), 'big')\n" +
+        "    elif plen == 127:\n" +
+        "        plen = int.from_bytes(rx(8), 'big')\n" +
+        "    payload = rx(plen)\n" +
+        "    print('frame=present')\n" +
+        "    print('b0=%d' % b0)\n" +
+        "    print('fin=%d' % fin)\n" +
+        "    print('opcode=%d' % opcode)\n" +
+        "    try:\n" +
+        "        msg = json.loads(payload.decode('utf-8'))\n" +
+        "        print('hello_type=%s' % msg.get('type', '-'))\n" +
+        "        v = msg.get('version')\n" +
+        "        print('hello_version=%s' % (v if isinstance(v, int) else 'none'))\n" +
+        "        print('hello_server=%s' % msg.get('server', '-'))\n" +
+        "    except Exception:\n" +
+        "        print('hello_type=parse-error')\n" +
+        "else:\n" +
+        "    print('frame=absent')\n" +
+        "s.close()\n"
+}
+
+# ----------------------------------------------------------------------------
+# 1. Import surface
+# ----------------------------------------------------------------------------
+fn sec1(acc: Acc, probe: str) -> void uses IO, Proc {
+    section("1. Import surface (Stage 24 compat)")
+    let r: RunResult = run_capture("python3", [probe, "imports"])
+    chk(acc, "probe ran", r.code == 0, clip(r.combined, 80))
+    let names: list[str] = ["main", "compile_bundle", "FileWatcher",
+                            "EventBus", "DevHTTPHandler", "DevServer"]
+    let mut i: int = 0
+    while i < names.len() {
+        chk(acc, "hlserve." + names.get(i) + " present",
+            flag(r.out, "has " + names.get(i) + "=") == 1, "")
+        i = i + 1
+    }
+    let mods: list[str] = ["hlserve_cli", "hlserve_common", "hlserve_config",
+        "hlserve_watcher", "hlserve_compiler", "hlserve_hmr",
+        "hlserve_overlay", "hlserve_proxy", "hlserve_tls", "hlserve_server"]
+    let mut j: int = 0
+    while j < mods.len() {
+        chk(acc, "module " + mods.get(j) + " importable",
+            flag(r.out, "mod " + mods.get(j) + "=") == 1, "")
+        j = j + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 2. CLI parser
+# ----------------------------------------------------------------------------
+fn sec2(acc: Acc, probe: str) -> void uses IO, Proc {
+    section("2. CLI parser")
+    let r: RunResult = run_capture("python3", [probe, "parse_args"])
+    chk(acc, "probe ran", r.code == 0, clip(r.combined, 80))
+    chk(acc, "--input parsed",
+        value_after(r.out, "input=") == "examples/hello.hls", "")
+    chk(acc, "--port parsed", flag(r.out, "port=") == 3000, "")
+    chk(acc, "--open parsed", flag(r.out, "open=") == 1, "")
+    chk(acc, "--proxy list parsed",
+        value_after(r.out, "proxy=") == "['/api=http://localhost:3001']", "")
+}
+
+# ----------------------------------------------------------------------------
+# 3. Config file (hls.serve.toml / .json)
+# ----------------------------------------------------------------------------
+fn toml_config() -> str {
+    return "input = \"examples/my.hls\"\n" +
+        "port = 4000\n" +
+        "open = true\n" +
+        "https = false\n" +
+        "history_fallback = true\n" +
+        "compress = true\n" +
+        "\n" +
+        "[watch]\n" +
+        "dirs = [\"src\", \"std\"]\n" +
+        "debounce_ms = 300\n" +
+        "\n" +
+        "[[proxy]]\n" +
+        "path = \"/api\"\n" +
+        "target = \"http://localhost:3001\"\n"
+}
+
+fn json_config() -> str {
+    return "{\"input\": \"x.hls\", \"port\": 5000, \"open\": true, " +
+        "\"watch\": {\"dirs\": [\"a\", \"b\"], \"debounce_ms\": 250}, " +
+        "\"proxy\": [{\"path\": \"/api\", \"target\": \"http://x:1\"}]}"
+}
+
+fn sec3(acc: Acc, probe: str) -> void uses IO, Fs, Proc {
+    section("3. Config file (hls.serve.toml / .json)")
+    let toml_path: str = acc.scratch_base + "/hls.serve.toml"
+    write_file(toml_path, toml_config())
+    let rt: RunResult = run_capture("python3", [probe, "config", toml_path])
+    chk(acc, "config driver ran", rt.code == 0, clip(rt.combined, 80))
+    chk(acc, "TOML input parsed",
+        value_after(rt.out, "cfg_input=") == "examples/my.hls", "")
+    chk(acc, "TOML port parsed", flag(rt.out, "cfg_port=") == 4000, "")
+    chk(acc, "TOML open parsed", flag(rt.out, "cfg_open=") == 1, "")
+    chk(acc, "TOML https parsed", flag(rt.out, "cfg_https=") == 0, "")
+    chk(acc, "TOML watch dirs parsed",
+        value_after(rt.out, "cfg_watch=") == "src,std", "")
+    chk(acc, "TOML debounce parsed", flag(rt.out, "cfg_debounce=") == 300, "")
+    chk(acc, "TOML proxy parsed",
+        flag(rt.out, "cfg_nproxy=") == 1
+        && value_after(rt.out, "cfg_proxy0=") == "/api=http://localhost:3001", "")
+    let json_path: str = acc.scratch_base + "/hls.serve.json"
+    write_file(json_path, json_config())
+    let rj: RunResult = run_capture("python3", [probe, "config", json_path])
+    chk(acc, "JSON input parsed",
+        value_after(rj.out, "cfg_input=") == "x.hls", "")
+    chk(acc, "JSON port parsed", flag(rj.out, "cfg_port=") == 5000, "")
+    chk(acc, "JSON watch dirs parsed",
+        value_after(rj.out, "cfg_watch=") == "a,b", "")
+    chk(acc, "JSON proxy parsed", flag(rj.out, "cfg_nproxy=") == 1, "")
+    # Proxy spec parsing.
+    let rp: RunResult = run_capture("python3", [probe, "proxy_spec"])
+    chk(acc, "probe ran", rp.code == 0, clip(rp.combined, 80))
+    chk(acc, "parse_proxy_spec prefix",
+        value_after(rp.out, "prefix=") == "/api", "")
+    chk(acc, "parse_proxy_spec target",
+        value_after(rp.out, "target=") == "http://localhost:3001", "")
+    chk(acc, "parse_proxy_specs count", flag(rp.out, "nspecs=") == 2, "")
+    chk(acc, "malformed spec raises", flag(rp.out, "malformed=") == 1, "")
+    chk(acc, "ProxyRule scheme check", flag(rp.out, "scheme=") == 1, "")
+}
+
+# ----------------------------------------------------------------------------
+# 4. WebSocket handshake + frames
+# ----------------------------------------------------------------------------
+fn sec4(acc: Acc, probe: str) -> void uses IO, Proc {
+    section("4. WebSocket handshake + frames")
+    let r: RunResult = run_capture("python3", [probe, "ws_unit"])
+    chk(acc, "probe ran", r.code == 0, clip(r.combined, 80))
+    # The RFC 6455 spec's example: client key "dGhlIHNhbXBsZSBub25jZQ=="
+    # must produce accept "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=".
+    # FIN=1... The CRLF needs chr(13): Halis has no \r escape.
+    let crlf: str = chr(13) + "\n"
+    chk(acc, "handshake response starts with 101",
+        r.out.starts_with("HTTP/1.1 101 Switching Protocols" + crlf), "")
+    chk(acc, "handshake contains Sec-WebSocket-Accept header",
+        r.out.contains("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+            + crlf),
+        "")
+    # FIN=1, opcode=1 => first byte = 0x81
+    chk(acc, "frame first byte", flag(r.out, "frame0=") == 129, "")
+    # Length 5, no mask => second byte = 0x05
+    chk(acc, "frame length byte", flag(r.out, "frame1=") == 5, "")
+    chk(acc, "frame payload", value_after(r.out, "fpayload=") == "hello", "")
+    # Longer payload (>125 bytes) uses 16-bit length.
+    chk(acc, "long frame length encoding", flag(r.out, "longb1=") == 126, "")
+    chk(acc, "long frame extended length", flag(r.out, "longext=") == 200, "")
+}
+
+# ----------------------------------------------------------------------------
+# 5. FileWatcher fires on mtime change (real server lifecycle)
+# ----------------------------------------------------------------------------
+fn sec5(acc: Acc, watch_dir: str) -> void uses IO, Fs, Proc, Clock, Conc {
+    section("5. FileWatcher fires on mtime change")
+    let port: int = free_port()
+    write_file(watch_dir + "/a.hls", "fn main() -> int { return 0 }\n")
+    let args: list[str] = ["--input", watch_dir + "/a.hls",
+        "--bundle", watch_dir + "/out", "--debounce-ms", "80", "--no-color"]
+    spawn_server(acc, watch_dir, port, args)
+    chk(acc, "watch server spawned", wait_port(port), "")
+    # Let the watcher seed its mtime table (the battery sleeps 0.3s).
+    thread_sleep_ms(1000)
+    let log: str = watch_dir + "/log.txt"
+    let log1: str = read_or(log, "")
+    chk(acc, "no events on seeded file", !log1.contains("recompiling"), "")
+    # Modify the file and touch the mtime forward (writing may not
+    # always advance it within the same mtime resolution).
+    write_file(watch_dir + "/a.hls", "fn main() -> int { return 1 }\n")
+    run_capture("python3", ["-c",
+        "import os, sys, time; os.utime(sys.argv[1], (time.time() + 5, time.time() + 5))",
+        watch_dir + "/a.hls"])
+    let mut log2: str = ""
+    let mut i: int = 0
+    while i < 20 {
+        log2 = read_or(log, "")
+        if log2.contains("recompiling") {
+            i = 100
+        } else {
+            thread_sleep_ms(400)
+            i = i + 1
+        }
+    }
+    kill_server(watch_dir)
+    chk(acc, "watcher fired on change", log2.contains("recompiling"), "")
+    chk(acc, "watcher reported the right file",
+        log2.contains("changed: a.hls"), "")
+}
+
+# ----------------------------------------------------------------------------
+# 6. CompileResult diagnostic parsing
+# ----------------------------------------------------------------------------
+fn sec6(acc: Acc, probe: str) -> void uses IO, Proc {
+    section("6. CompileResult diagnostic parsing")
+    let r: RunResult = run_capture("python3", [probe, "diag"])
+    chk(acc, "probe ran", r.code == 0, clip(r.combined, 80))
+    chk(acc, "parsed 3 diagnostics", flag(r.out, "ndiag=") == 3,
+        "got " + flag(r.out, "ndiag=").to_str())
+    chk(acc, "first is error",
+        nth_value(r.out, "diag=", 0)
+            == "error|examples/foo.hls|12|5|undefined variable `x`", "")
+    chk(acc, "second is warning",
+        nth_value(r.out, "diag=", 1)
+            == "warning|examples/foo.hls|13|1|unused import", "")
+    chk(acc, "third is note",
+        nth_value(r.out, "diag=", 2)
+            == "note|examples/foo.hls|14|0|see previous declaration", "")
+    chk(acc, "overlay dict shape",
+        value_after(r.out, "odict=")
+            == "{\"severity\": \"error\", \"file\": \"f.hls\", \"line\": 7, "
+               + "\"col\": 3, \"message\": \"boom\"}", "")
+}
+
+# ----------------------------------------------------------------------------
+# 7. Overlay injection
+# ----------------------------------------------------------------------------
+fn sec7(acc: Acc, probe: str) -> void uses IO, Proc {
+    section("7. Overlay injection")
+    let r: RunResult = run_capture("python3", [probe, "overlay"])
+    chk(acc, "probe ran", r.code == 0, clip(r.combined, 80))
+    let html_b64: str = value_after(r.out, "hin=")
+    let o1: str = base64_decode(value_after(r.out, "o1="))
+    let o2_b64: str = value_after(r.out, "o2=")
+    let o3: str = base64_decode(value_after(r.out, "o3="))
+    let snip: str = value_after(r.out, "snip=")
+    chk(acc, "overlay injected before </body>", o1.contains(snip), "")
+    chk(acc, "</body> preserved", o1.contains("</body></html>"), "")
+    chk(acc, "overlay disabled leaves html unchanged", o2_b64 == html_b64, "")
+    chk(acc, "status banner injected", o3.contains("[hls-serve] compile failed"),
+        "")
+}
+
+# ----------------------------------------------------------------------------
+# 8. Proxy rule lookup
+# ----------------------------------------------------------------------------
+fn sec8(acc: Acc, probe: str) -> void uses IO, Proc {
+    section("8. Proxy rule longest-prefix lookup")
+    let r: RunResult = run_capture("python3", [probe, "proxy_lookup"])
+    chk(acc, "probe ran", r.code == 0, clip(r.combined, 80))
+    chk(acc, "longest prefix wins",
+        value_after(r.out, "m /api/v2/users=") == "http://b:2", "")
+    chk(acc, "shorter prefix matches",
+        value_after(r.out, "m /api/users=") == "http://a:1", "")
+    chk(acc, "no match returns None",
+        value_after(r.out, "m /nope=") == "None", "")
+    chk(acc, "exact prefix match",
+        value_after(r.out, "m /api=") == "http://a:1", "")
+}
+
+# ----------------------------------------------------------------------------
+# 9. End-to-end HTTP (real server)
+# ----------------------------------------------------------------------------
+fn sec9(acc: Acc, e2e_dir: str, fetch: str) -> void uses IO, Fs, Proc, Clock, Conc {
+    section("9. End-to-end HTTP (real server)")
+    let port: int = free_port()
+    # The battery's fake bundle (HTML + wasm + js), source file and
+    # public dir. The CLI's initial compile writes its own bundle
+    # first; the fixtures go over it once the port is up (the watcher
+    # only fires on .hls files, so the fixture overwrite stays put).
+    write_file(e2e_dir + "/app.hls", "fn main() -> int { return 0 }\n")
+    let args: list[str] = ["--input", e2e_dir + "/app.hls",
+        "--bundle", e2e_dir + "/out", "--public-dir", e2e_dir + "/public",
+        "--history-fallback", "--compress", "--overlay", "--no-color"]
+    spawn_server(acc, e2e_dir, port, args)
+    let up: bool = wait_port(port)
+    chk(acc, "e2e server came up", up, "")
+    if up {
+        write_file(e2e_dir + "/out.html",
+            "<!DOCTYPE html><html><head></head><body><p>hi</p></body></html>")
+        # wasm magic + version, as raw bytes (Halis has no \x00 escape;
+        # the child writes the battery's exact 8 bytes).
+        run_capture("python3", ["-c",
+            "import sys; open(sys.argv[1], 'wb').write(b'\\x00asm\\x01\\x00\\x00\\x00')",
+            e2e_dir + "/out.wasm"])
+        write_file(e2e_dir + "/out.js", "// glue\n")
+        let pub_dir: str = e2e_dir + "/public"
+        sh("mkdir -p '" + shell_quote(pub_dir) + "'")
+        write_file(pub_dir + "/logo.svg", "<svg></svg>")
+        let base: str = "http://127.0.0.1:" + port.to_str()
+        # (a) Index HTML — overlay injected.
+        let ra: HttpResp = http_get(fetch, base + "/", "", "")
+        chk(acc, "GET / returns 200", ra.status == 200,
+            "status=" + ra.status.to_str())
+        chk(acc, "GET / injects overlay",
+            ra.body.contains("hlserve-hmr-client"), "")
+        chk(acc, "GET / serves bundle HTML",
+            ra.body.contains("<body><p>hi</p>"), "")
+        # (b) Bundle wasm file.
+        let rb: HttpResp = http_get(fetch, base + "/out.wasm", "", "")
+        chk(acc, "GET /out.wasm returns wasm magic",
+            rb.body.len() >= 4 && rb.body.byte_at(0) == 0
+                && rb.body.byte_at(1) == 97 && rb.body.byte_at(2) == 115
+                && rb.body.byte_at(3) == 109, "")
+        chk(acc, "Content-Type for wasm", rb.ctype == "application/wasm",
+            rb.ctype)
+        # (c) Public static asset.
+        let rc: HttpResp = http_get(fetch, base + "/static/logo.svg", "", "")
+        chk(acc, "GET /static/logo.svg serves from public dir",
+            rc.body == "<svg></svg>", "")
+        chk(acc, "Content-Type for svg", rc.ctype == "image/svg+xml", rc.ctype)
+        # (d) SPA history fallback.
+        let rd: HttpResp = http_get(fetch, base + "/some/deep/route", "", "")
+        chk(acc, "GET /some/deep/route falls back to index.html",
+            rd.body.contains("<body><p>hi</p>"), "")
+        # (e) Source view.
+        let re: HttpResp = http_get(fetch, base + "/source", "", "")
+        chk(acc, "GET /source serves HLS source",
+            re.body.contains("fn main"), "")
+        # (f) Gzip compression (need Accept-Encoding: gzip).
+        let rf: HttpResp = http_get(fetch, base + "/", "Accept-Encoding", "gzip")
+        chk(acc, "gzip Content-Encoding on small body",
+            rf.cenc == "-" || rf.cenc == "gzip", "cenc=" + rf.cenc)
+        # (g) Status banner on failed compile: break the source, the
+        # watcher's recompile fails, / serves the banner with the
+        # compiler's message (the battery injected the message by hand;
+        # the CLI flow earns it from its own compile).
+        write_file(e2e_dir + "/app.hls", "fn main() -> int { return 1 + }\n")
+        let log: str = e2e_dir + "/log.txt"
+        let mut failed: bool = false
+        let mut i: int = 0
+        while i < 25 {
+            if read_or(log, "").contains("compile FAILED") {
+                failed = true
+                i = 100
+            } else {
+                thread_sleep_ms(400)
+                i = i + 1
+            }
+        }
+        let rg: HttpResp = http_get(fetch, base + "/", "", "")
+        let mut banner_detail: str = "recompile-failed=no"
+        if failed {
+            banner_detail = "recompile-failed=yes"
+        }
+        chk(acc, "failed compile banner injected", failed
+            && rg.body.contains("[hls-serve] compile raised: HLError: "
+                + "expected expression but got '}' (line 1:31)"),
+            banner_detail)
+    }
+    kill_server(e2e_dir)
+}
+
+# ----------------------------------------------------------------------------
+# 10. End-to-end WebSocket handshake
+# ----------------------------------------------------------------------------
+fn sec10(acc: Acc, ws_dir: str, wsc: str) -> void uses IO, Fs, Proc, Clock, Conc {
+    section("10. End-to-end WebSocket handshake")
+    let port: int = free_port()
+    write_file(ws_dir + "/out.html",
+        "<!DOCTYPE html><html><body></body></html>")
+    write_file(ws_dir + "/x.hls", "fn main() -> int { return 0 }\n")
+    let args: list[str] = ["--input", ws_dir + "/x.hls",
+        "--bundle", ws_dir + "/out", "--no-color"]
+    spawn_server(acc, ws_dir, port, args)
+    let up: bool = wait_port(port)
+    chk(acc, "ws server came up", up, "")
+    if up {
+        let r: RunResult = run_capture("python3", [wsc, port.to_str()])
+        let status: str = value_after(r.out, "status=")
+        let accept: str = value_after(r.out, "accept=")
+        chk(acc, "handshake returns 101",
+            status.starts_with("HTTP/1.1 101")
+                || status.starts_with("HTTP/1.0 101"),
+            "got: " + clip(status, 80))
+        # The client key is the RFC 6455 spec's example vector, so the
+        # expected accept is the constant the spec documents.
+        chk(acc, "Sec-WebSocket-Accept correct",
+            accept == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=",
+            "expected: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+        if value_after(r.out, "frame=") == "present" {
+            chk(acc, "hello frame opcode=text",
+                flag(r.out, "opcode=") == 1, "")
+            chk(acc, "hello frame FIN=1", flag(r.out, "fin=") == 1, "")
+            chk(acc, "hello frame JSON type=hello",
+                value_after(r.out, "hello_type=") == "hello", "")
+            chk(acc, "hello frame version field",
+                value_after(r.out, "hello_version=") != "", "")
+            chk(acc, "hello frame server field",
+                value_after(r.out, "hello_server=").contains("hls-serve"), "")
+        } else {
+            chk(acc, "received hello frame header", false,
+                "got no frame header")
+        }
+    }
+    kill_server(ws_dir)
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit, Clock, Conc {
+    let acc: Acc = acc_new("serve")
+    println("hls-serve Stage 75 acceptance smoke test")
+    let probe: str = write_src(acc, "probe.py", probe_src())
+    let fetch: str = write_src(acc, "fetch.py", fetch_src())
+    let wsc: str = write_src(acc, "ws.py", ws_src())
+    let watch_dir: str = scratch(acc, "watch")
+    let e2e_dir: str = scratch(acc, "e2e")
+    let ws_dir: str = scratch(acc, "ws")
+    # scratch() creates the parent; each server home needs itself too.
+    mkdirs(watch_dir)
+    mkdirs(e2e_dir)
+    mkdirs(ws_dir)
+    sec1(acc, probe)
+    sec2(acc, probe)
+    sec3(acc, probe)
+    sec4(acc, probe)
+    sec5(acc, watch_dir)
+    sec6(acc, probe)
+    sec7(acc, probe)
+    sec8(acc, probe)
+    sec9(acc, e2e_dir, fetch)
+    sec10(acc, ws_dir, wsc)
+    # Belt and braces: no spawned server outlives the gate.
+    sh("pkill -f 'acc-scratch/serve' 2>/dev/null")
+    return finish(acc, "Stage 75 — hls-serve (webpack-dev-server equivalent)")
+}

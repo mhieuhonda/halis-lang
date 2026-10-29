@@ -1,0 +1,987 @@
+# ============================================================================
+# tests/acc/perf_acceptance.hls — Stage 136 acceptance gate, in Halis
+# (the Halis twin of tests/perf_acceptance.py; same eight sections,
+# same assertions, same needles — the harness is tests/acc/harness.hls
+# and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make perf-acceptance` (which compiles this file and runs it
+# from the repo root).
+#
+# Eight sections over the REAL hls-perf CLI, the REAL hls-bench runner
+# (section 2's `record` measures the tracked suite through it), the
+# REAL history ledger and the REAL native compiler — the same
+# instruments the battery drove. The battery's synthetic reports are
+# rebuilt here byte-for-byte in schema (raw (iters, elapsed) pairs the
+# report import recomputes estimates from), with the scaled samples
+# carried as their exact integer medians (+40% / -40% / +2% — the
+# classification law reads the medians, not the digits).
+#
+#  1. the convention  — hls-perf exits 0 verified / 1 named violation /
+#     2 usage; a bare invocation and an unknown command are usage
+#     errors; history/gate/dashboard on a missing or empty ledger are
+#     named errors, never silent renders
+#  2. the record law  — `record` runs the REAL bench suite through the
+#     REAL runner and appends exactly one entry pinned to `git
+#     rev-parse HEAD` (backend, suite digest, plan, env fingerprint, 5
+#     benches with >= 2 positive samples each); the ledger is
+#     append-only (the bytes before are a byte prefix of the bytes
+#     after); a record without git and without --commit is refused
+#     (GIT_CEILING_DIRECTORIES stops the walk, as in the battery); a
+#     bad --commit sha is a usage error; a work tree with tracked
+#     modifications is REFUSED — proven on a throwaway clone
+#  3. the floor law   — the report import refuses a bench with fewer
+#     than 2 samples, non-positive estimates, a FAILED bench, zero
+#     measured benches, a foreign report, an unknown backend — every
+#     refusal naming its bench
+#  4. the classification law — identical samples classify no-change,
+#     +40% regressed (exit 1, named), -40% improved, a significant
+#     +2% shift inside the 5% band within-noise; a bench that appears
+#     is new, one that disappears is vanished and fails the gate by
+#     name
+#  5. the gate law    — a regressed bench fails the gate naming it; a
+#     written sanction flips it loud-but-green; a sanction without a
+#     reason is refused; an unknown bench is refused naming the known
+#     ones; --baseline resolves a prefix, refuses an unknown one and
+#     an ambiguous one; interpreter vs native are different
+#     instruments; a changed suite digest refuses comparison;
+#     --threshold moves the band
+#  6. the determinism law — two dashboards of one ledger are
+#     byte-identical; --stamp changes ONLY the Generated line; the
+#     document embeds the sha256 of the ledger bytes and the newest
+#     commit; the verdict table rows are sorted; a constant trend
+#     renders the mid band; a first-record ledger renders with an n/a
+#     verdict instead of crashing
+#  7. the ledger law  — a corrupt line, an unknown entry type, a
+#     record without its commit pin, a record without a suite digest
+#     and a sanction without a written reason are all NAMED refusals
+#     naming the line; history --bench filters records and sanctions
+#     alike
+#  8. the corpus      — tests/ok/feat_stage136_perf.hls is
+#     showcase        hlfmt-canonical, hllint-clean, boots through
+#     the real checker, runs green on the interpreter and matches
+#     natively byte for byte
+#
+# The battery's timeout=900 wrappers have no Halis equivalent (no
+# per-child alarm); every child here is python3, hls-perf, hls-bench,
+# boot.py, git, bin/hlc, gcc or the harness's own one-liners. The gate
+# reuses the battery's scratch discipline: every ledger, report and
+# dashboard lives under tests/.acc-scratch/perf/, wiped at acc_new.
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.json"
+import "std.result"
+import "std.env"
+import "std.sha256"
+
+# ----------------------------------------------------------------------------
+# Fixed constants (the battery's ROOT-relative world).
+# ----------------------------------------------------------------------------
+
+fn suite_path() -> str {
+    return "benchmarks/regression_watch.hls"
+}
+
+fn showcase_path() -> str {
+    return "tests/ok/feat_stage136_perf.hls"
+}
+
+fn showcase_out() -> str {
+    return "stage 136: hls-perf\n"
+        + "  PERF OK: 5 benches tracked, classified, sanctioned, "
+        + "pinned\n"
+}
+
+fn missing_a() -> str {
+    return "!acc-missing!"
+}
+
+# ----------------------------------------------------------------------------
+# Small helpers.
+# ----------------------------------------------------------------------------
+
+# perf(args) — the REAL ledger CLI. The battery kept stdout and stderr
+# separate (subprocess.PIPE x2); every needle below reads r.out or
+# r.err exactly where the battery read it.
+fn perf(args: list[str]) -> RunResult uses Proc {
+    let argv: list[str] = ["tools/hls-perf.py"]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    return run_capture("python3", argv)
+}
+
+fn native_ok() -> bool uses Fs, Proc {
+    return file_exists("bin/hlc") && which("gcc")
+}
+
+fn chk(acc: Acc, cond: bool, msg: str) -> bool uses IO {
+    return check(acc, msg, cond, "")
+}
+
+fn hist_path(acc: Acc, name: str) -> str {
+    return path_join3(acc.scratch_base, name + ".jsonl")
+}
+
+# jparse(text) — JSON or the null value (never a panic in the gate).
+fn jparse(text: str) -> JsonValue {
+    let rr: Result[JsonValue, str] = json_parse_result(text)
+    if result_is_ok(rr) {
+        return result_unwrap(rr)
+    }
+    return json_null()
+}
+
+fn jstr_of(v: JsonValue, key: str) -> str {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_str(x) {
+        return json_str_value(x)
+    }
+    return ""
+}
+
+fn jint_of(v: JsonValue, key: str) -> int {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_int(x) {
+        return json_int_value(x)
+    }
+    return -1
+}
+
+fn jfval_of(v: JsonValue, key: str) -> float {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_float(x) {
+        return json_float_value(x)
+    }
+    # p and point_pct are written by json.dumps as floats (1.0, 0.0);
+    # any other shape simply reads as 0.0 and fails the law below.
+    return 0.0
+}
+
+# sha40(n) — the battery's "%040x" % n commit pins.
+fn sha40(n: int) -> str {
+    let digits: str = "0123456789abcdef"
+    let mut v: int = n
+    let mut out: str = ""
+    if v == 0 {
+        out = "0"
+    }
+    while v > 0 {
+        let d: int = v - (v / 16) * 16
+        out = digits.slice(d, d + 1) + out
+        v = v / 16
+    }
+    return str_pad_left(out, 40, "0")
+}
+
+# ----------------------------------------------------------------------------
+# Synthetic hls-bench reports — the schema the runner writes, filled
+# with controlled samples. samples are ns/iter values; the report
+# carries them as raw (iters, elapsed) pairs, exactly as the runner
+# writes them (elapsed = 400 * v under the fixed-iter plan).
+# ----------------------------------------------------------------------------
+
+fn base_samples() -> list[int] {
+    return [1000, 1001, 1000, 999, 1000, 1001, 1000, 999, 1000, 1000]
+}
+
+fn reg_samples() -> list[int] {
+    return [1400, 1401, 1400, 1399, 1400, 1401, 1400, 1399, 1400, 1400]
+}
+
+fn imp_samples() -> list[int] {
+    return [600, 601, 600, 599, 600, 601, 600, 599, 600, 600]
+}
+
+fn wn_samples() -> list[int] {
+    return [1020, 1021, 1020, 1019, 1020, 1021, 1020, 1019, 1020, 1020]
+}
+
+fn samples_json(ns: list[int]) -> str {
+    let parts: list[str] = []
+    let mut i: int = 0
+    while i < ns.len() {
+        parts.push("[400, " + (400 * ns.get(i)).to_str() + "]")
+        i = i + 1
+    }
+    return "[" + str_join(parts, ", ") + "]"
+}
+
+fn bench_json(name: str, med: str, ns: list[int], with_samples: bool) -> str {
+    let mut b: str = "{\"name\": \"" + name + "\", \"status\": \"ok\", "
+        + "\"units\": 400, \"samples_count\": " + ns.len().to_str()
+        + ", \"estimates_ns_per_iter\": {\"median\": " + med + "}"
+    if with_samples {
+        b = b + ", \"samples\": " + samples_json(ns)
+    }
+    return b + "}"
+}
+
+fn skipbench_json(name: str, detail: str) -> str {
+    return "{\"name\": \"" + name + "\", \"status\": \"skip\", "
+        + "\"detail\": \"" + detail + "\"}"
+}
+
+fn failbench_json(name: str, detail: str) -> str {
+    return "{\"name\": \"" + name + "\", \"status\": \"fail\", "
+        + "\"detail\": \"" + detail + "\"}"
+}
+
+fn report_json(backend: str, benches: str) -> str {
+    return "{\"tool\": \"hls-bench\", \"version\": \"0.142.0\", "
+        + "\"backend\": \"" + backend + "\", "
+        + "\"plan\": {\"mode\": \"fixed\", \"samples\": 10, \"iters\": 400}, "
+        + "\"noise_pct\": 5.0, "
+        + "\"files\": [{\"file\": \"" + suite_path()
+        + "\", \"benches\": [" + benches + "]}]}"
+}
+
+fn foreign_report_json() -> str {
+    return "{\"tool\": \"not-bench\", \"backend\": \"interpreter\", "
+        + "\"files\": []}"
+}
+
+fn gpu_report_json() -> str {
+    return "{\"tool\": \"hls-bench\", \"backend\": \"gpu\", "
+        + "\"files\": [{\"file\": \"" + suite_path() + "\", \"benches\": []}]}"
+}
+
+# record_from(report_text, history, commit, extra) — the battery's
+# import path: file the report, record it under an explicit commit.
+fn record_from(acc: Acc, report_text: str, history: str, commit: str,
+               extra: list[str]) -> RunResult uses Fs, Proc {
+    let rp: str = scratch(acc, "in.json")
+    write_file(rp, report_text + "\n")
+    let args: list[str] = ["record", "--from-report", rp, "--commit", commit,
+                           "--history", history]
+    let mut i: int = 0
+    while i < extra.len() {
+        args.push(extra.get(i))
+        i = i + 1
+    }
+    return perf(args)
+}
+
+# ----------------------------------------------------------------------------
+# 1. the convention
+# ----------------------------------------------------------------------------
+fn sec1(acc: Acc) -> void uses IO, Fs, Proc {
+    section("1. the convention")
+
+    let p: RunResult = perf([])
+    chk(acc, p.code == 2, "a bare invocation is usage error 2")
+
+    let p2: RunResult = perf(["warp"])
+    chk(acc, p2.code == 2, "an unknown command is usage error 2")
+
+    let p3: RunResult = perf(["history", "--history", hist_path(acc, "absent")])
+    chk(acc, p3.code == 2 && p3.err.contains("does not exist"),
+        "history over a missing ledger is a named usage error")
+
+    let p4: RunResult = perf(["gate", "--history", hist_path(acc, "absent")])
+    chk(acc, p4.code == 2 && p4.err.contains("does not exist"),
+        "gate over a missing ledger is a named usage error")
+
+    let p5: RunResult = perf(["dashboard", "--history",
+                              hist_path(acc, "absent"),
+                              "--out", scratch(acc, "x.md")])
+    chk(acc, p5.code == 2 && p5.err.contains("does not exist"),
+        "dashboard over a missing ledger is a named usage error")
+
+    let p6: RunResult = perf(["dashboard", "--out", scratch(acc, "x.md")])
+    chk(acc, p6.code == 2,
+        "a dashboard without --out is usage error 2")
+
+    let empty: str = hist_path(acc, "empty")
+    write_file(empty, "")
+    let p7: RunResult = perf(["gate", "--history", empty])
+    chk(acc, p7.code == 2 && p7.err.contains("no records"),
+        "gate over an empty ledger refuses, named")
+    let p8: RunResult = perf(["dashboard", "--history", empty,
+                              "--out", scratch(acc, "never.md")])
+    chk(acc, p8.code == 2 && p8.err.contains("no records")
+        && !file_exists(scratch(acc, "never.md")),
+        "dashboard over an empty ledger refuses and writes nothing")
+}
+
+# ----------------------------------------------------------------------------
+# 2. the record law
+# ----------------------------------------------------------------------------
+fn sec2(acc: Acc) -> void uses IO, Fs, Proc {
+    section("2. the record law")
+
+    let h: str = hist_path(acc, "real")
+    let p: RunResult = perf(["record", "--history", h,
+                             "--samples", "5", "--fixed-iters", "100"])
+    check(acc, "record runs the real suite through the real runner",
+        p.code == 0 && p.out.contains("recorded"), clip(p.combined, 100))
+    let pg: RunResult = run_capture("git", ["rev-parse", "HEAD"])
+    let head: str = pg.out.trim()
+    check(acc, "the record is pinned to the live HEAD",
+        p.out.contains("recorded " + head.slice(0, 10)),
+        clip(p.combined, 100))
+
+    let ph: RunResult = perf(["history", "--history", h, "--json"])
+    let entries: JsonValue = jparse(ph.out)
+    let mut nrecs: int = 0
+    let mut rec_idx: int = -1
+    if json_is_array(entries) {
+        let mut i: int = 0
+        while i < entries.arr.len() {
+            let e: JsonValue = entries.arr.get(i)
+            if jstr_of(e, "type") == "record" {
+                nrecs = nrecs + 1
+                if rec_idx < 0 {
+                    rec_idx = i
+                }
+            }
+            i = i + 1
+        }
+    }
+    chk(acc, nrecs == 1, "exactly one record was appended")
+    let r: JsonValue = entries.arr.get(rec_idx)
+    chk(acc, jstr_of(r, "commit") == head,
+        "the record carries the live HEAD sha")
+    chk(acc, jstr_of(r, "backend") == "interpreter",
+        "the backend is the interpreter instrument")
+    chk(acc, jstr_of(r, "suite_digest") == sha256_hex(read_file(suite_path())),
+        "the suite digest is the sha256 of the tracked suite")
+    let plan: JsonValue = json_object_get(r, "plan")
+    chk(acc, jstr_of(plan, "mode") == "fixed" && jint_of(plan, "samples") == 5
+        && jint_of(plan, "iters") == 100,
+        "the measurement plan is pinned in the record")
+    let benches: JsonValue = json_object_get(r, "benches")
+    chk(acc, json_is_object(benches) && benches.obj_keys.len() == 5,
+        "all 5 tracked benches measured")
+    let mut floor_ok: bool = json_is_object(benches)
+        && benches.obj_vals.len() == 5
+    let mut bi: int = 0
+    while bi < benches.obj_vals.len() {
+        let b: JsonValue = benches.obj_vals.get(bi)
+        let est: JsonValue = json_object_get(b, "estimates_ns")
+        if !json_is_array(est) || est.arr.len() < 2 {
+            floor_ok = false
+        } else {
+            let mut si: int = 0
+            while si < est.arr.len() {
+                let x: JsonValue = est.arr.get(si)
+                if json_is_int(x) {
+                    if json_int_value(x) <= 0 {
+                        floor_ok = false
+                    }
+                } else if json_is_float(x) {
+                    if !(json_float_value(x) > 0.0) {
+                        floor_ok = false
+                    }
+                } else {
+                    floor_ok = false
+                }
+                si = si + 1
+            }
+        }
+        bi = bi + 1
+    }
+    chk(acc, floor_ok, "every bench carries >= 2 positive samples")
+    let env_v: JsonValue = json_object_get(r, "env")
+    chk(acc, json_is_object(env_v) && json_object_has(env_v, "python")
+        && json_object_has(env_v, "cc"),
+        "the env fingerprint is recorded")
+
+    let before: str = read_file(h)
+    let p2: RunResult = perf(["record", "--history", h,
+                              "--samples", "5", "--fixed-iters", "100"])
+    let after: str = read_file(h)
+    chk(acc, p2.code == 0 && after.len() >= before.len()
+        && after.slice(0, before.len()) == before,
+        "the ledger is append-only: the bytes before are a prefix of "
+        + "the bytes after")
+
+    let rp: str = scratch(acc, "pin.json")
+    write_file(rp, report_json("interpreter",
+        bench_json("bench_watched", "1000.0", base_samples(), true)) + "\n")
+    let nogit: str = scratch(acc, "nogit")
+    mkdirs(nogit)
+    # GIT_CEILING_DIRECTORIES stops git's upward walk at the gate dir:
+    # inside `nogit` there is no repository, exactly as in a bare CI
+    # checkout. (The battery passed env= to the child; the Halis env is
+    # process-global, so the var is set here and unset right after.)
+    env_set_var("GIT_CEILING_DIRECTORIES", acc.scratch_base)
+    let p3: RunResult = perf(["record", "--from-report", rp, "--root", nogit,
+                              "--history", hist_path(acc, "pin")])
+    env_unset_var("GIT_CEILING_DIRECTORIES")
+    chk(acc, p3.code == 2 && p3.err.contains("not a git work tree"),
+        "a record without git and without --commit is refused")
+
+    let p4: RunResult = perf(["record", "--from-report", rp, "--commit", "xyz",
+                              "--history", hist_path(acc, "pin")])
+    chk(acc, p4.code == 2 && p4.err.contains("40-hex"),
+        "a bad --commit sha is a usage error")
+
+    let clone: str = scratch(acc, "clone")
+    rmrf(clone)
+    let c: RunResult = run_capture("git", ["clone", "-q", acc.root, clone])
+    if c.code != 0 {
+        check(acc, "git clone for the dirty-tree law",
+            false, clip(c.err, 120))
+    } else {
+        write_file(clone + "/README.md",
+                   read_file(clone + "/README.md") + "\n# dirt\n")
+        let p5: RunResult = perf(["record", "--root", clone,
+                                  "--history", hist_path(acc, "dirty")])
+        chk(acc, p5.code == 1 && p5.err.contains("tracked modifications"),
+            "a work tree with tracked modifications is refused — a "
+            + "per-commit record pins a clean commit")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 3. the floor law
+# ----------------------------------------------------------------------------
+fn sec3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("3. the floor law")
+
+    let h: str = hist_path(acc, "floor")
+
+    # (report, rc, needle, label) — the battery's eight controlled
+    # reports, each refused at the import floor.
+    let p1: RunResult = record_from(acc,
+        report_json("interpreter", bench_json("bench_watched", "1000.0",
+            [1000], true)), h, sha40(1), [])
+    check(acc, "a one-sample bench is refused (named)",
+        p1.code == 1 && p1.err.contains("samples"), clip(p1.err, 100))
+
+    let p2: RunResult = record_from(acc,
+        report_json("interpreter", bench_json("bench_watched", "0.0",
+            [], true)), h, sha40(2), [])
+    check(acc, "a zero-sample bench is refused (named)",
+        p2.code == 1 && p2.err.contains("samples"), clip(p2.err, 100))
+
+    let p3: RunResult = record_from(acc,
+        report_json("interpreter", bench_json("bench_watched", "1001.0",
+            [1000, 1002, 0, 1001], true)), h, sha40(3), [])
+    check(acc, "a zero estimate is refused (named)",
+        p3.code == 1 && p3.err.contains("non-positive"), clip(p3.err, 100))
+
+    let p4: RunResult = record_from(acc,
+        report_json("interpreter", bench_json("bench_watched", "1001.0",
+            [1000, 1002, -5, 1001], true)), h, sha40(4), [])
+    check(acc, "a negative estimate is refused (named)",
+        p4.code == 1 && p4.err.contains("non-positive"), clip(p4.err, 100))
+
+    let p5: RunResult = record_from(acc,
+        report_json("interpreter", skipbench_json("bench_watched", "no")),
+        h, sha40(5), [])
+    check(acc, "a report with zero measured benches is refused (named)",
+        p5.code == 2 && p5.err.contains("no measured benches"),
+        clip(p5.err, 100))
+
+    let p6: RunResult = record_from(acc,
+        report_json("interpreter", failbench_json("bench_watched", "boom")),
+        h, sha40(6), [])
+    check(acc, "a FAILED bench fails the record (named)",
+        p6.code == 1 && p6.err.contains("failed"), clip(p6.err, 100))
+
+    let p7: RunResult = record_from(acc, foreign_report_json(), h,
+                                    sha40(7), [])
+    check(acc, "a foreign report is refused (named)",
+        p7.code == 2 && p7.err.contains("not an hls-bench report"),
+        clip(p7.err, 100))
+
+    let p8: RunResult = record_from(acc, gpu_report_json(), h, sha40(8), [])
+    check(acc, "an unknown backend is refused (named)",
+        p8.code == 2 && p8.err.contains("backend"), clip(p8.err, 100))
+
+    # A report whose bench carries a median but no raw samples still
+    # cannot slip past the floor: the median alone is one number, not
+    # a distribution.
+    let p9: RunResult = record_from(acc,
+        report_json("interpreter", bench_json("bench_watched", "1000.0",
+            base_samples(), false)), h, sha40(99), [])
+    check(acc, "a median without raw samples is not a distribution — "
+        + "refused",
+        p9.code == 1 && p9.err.contains("samples"), clip(p9.err, 100))
+}
+
+# ----------------------------------------------------------------------------
+# 4. the classification law
+# ----------------------------------------------------------------------------
+fn cls_case(acc: Acc, name: str, med_base: str, med_cur: str,
+            cur_ns: list[int], klass: str, want_rc: int) -> void
+        uses IO, Fs, Proc {
+    let h: str = hist_path(acc, "cls-" + name)
+    let r1: RunResult = record_from(acc,
+        report_json("interpreter",
+            bench_json("bench_watched", med_base, base_samples(), true)),
+        h, sha40(1), [])
+    let r2: RunResult = record_from(acc,
+        report_json("interpreter",
+            bench_json("bench_watched", med_cur, cur_ns, true)),
+        h, sha40(2), [])
+    if r1.code != 0 || r2.code != 0 {
+        check(acc, name + ": both records filed",
+            false, clip(r1.err, 80) + " / " + clip(r2.err, 80))
+        return
+    }
+    let jp: str = scratch(acc, name + ".verdict.json")
+    let p: RunResult = perf(["gate", "--history", h, "--json", jp])
+    let v: JsonValue = jparse(read_or(jp, missing_a()))
+    let row: JsonValue = json_object_get(v, "benches").arr.get(0)
+    chk(acc, jstr_of(row, "class") == klass,
+        name + " samples classify " + klass)
+    chk(acc, p.code == want_rc, name + ": gate exit " + want_rc.to_str())
+    if klass == "regressed" {
+        chk(acc, p.out.contains("GATE FAIL")
+            && p.out.contains("bench_watched"),
+            "a regression is named, not summarised")
+    }
+    if klass == "no-change" {
+        let point: float = jfval_of(row, "point_pct")
+        let pv: float = jfval_of(row, "p")
+        chk(acc, point < 0.000000001 && point > 0.0 - 0.000000001
+            && pv >= 0.05,
+            "identical samples: point 0%%, p not significant")
+    }
+}
+
+fn sec4(acc: Acc) -> void uses IO, Fs, Proc {
+    section("4. the classification law")
+
+    # Four single-bench ledgers, each one baseline + one case record:
+    # the gate classifies the pair and only the pair.
+    cls_case(acc, "identical", "1000.0", "1000.0", base_samples(),
+             "no-change", 0)
+    cls_case(acc, "regressed", "1000.0", "1400.0", reg_samples(),
+             "regressed", 1)
+    cls_case(acc, "improved", "1000.0", "600.0", imp_samples(),
+             "improved", 0)
+    cls_case(acc, "within-noise", "1000.0", "1020.0", wn_samples(),
+             "within-noise", 0)
+
+    # new / vanished — the rename law: a bench that appears is new
+    # (reported, never failed), one that disappears is vanished and
+    # fails BY NAME (silently losing a bench would hide regressions).
+    let h: str = hist_path(acc, "cls-vanish")
+    record_from(acc,
+        report_json("interpreter",
+            bench_json("bench_watched", "1000.0", base_samples(), true)
+            + ", " + bench_json("bench_other", "1000.0", base_samples(),
+                                true)),
+        h, sha40(1), [])
+    record_from(acc,
+        report_json("interpreter",
+            bench_json("bench_watched", "1000.0", base_samples(), true)
+            + ", " + bench_json("bench_third", "1000.0", base_samples(),
+                                true)),
+        h, sha40(2), [])
+    let jp: str = scratch(acc, "vanish.verdict.json")
+    let p: RunResult = perf(["gate", "--history", h, "--json", jp])
+    let v: JsonValue = jparse(read_or(jp, missing_a()))
+    let rows: JsonValue = json_object_get(v, "benches")
+    let mut classes: str = ""
+    let mut i: int = 0
+    while i < rows.arr.len() {
+        let row: JsonValue = rows.arr.get(i)
+        if i > 0 {
+            classes = classes + " "
+        }
+        classes = classes + jstr_of(row, "bench") + ":"
+            + jstr_of(row, "class")
+        i = i + 1
+    }
+    chk(acc, classes == "bench_other:vanished bench_third:new "
+            + "bench_watched:no-change",
+        "the rename law: new is reported, vanished fails")
+    chk(acc, p.code == 1 && p.out.contains("bench_other"),
+        "a vanished bench fails the gate by name")
+}
+
+# ----------------------------------------------------------------------------
+# 5. the gate law
+# ----------------------------------------------------------------------------
+fn sec5(acc: Acc) -> void uses IO, Fs, Proc {
+    section("5. the gate law")
+
+    # The regressed ledger from section 4's law, replayed with its
+    # sanctions.
+    let h: str = hist_path(acc, "gate")
+    record_from(acc,
+        report_json("interpreter",
+            bench_json("bench_watched", "1000.0", base_samples(), true)),
+        h, sha40(1), [])
+    record_from(acc,
+        report_json("interpreter",
+            bench_json("bench_watched", "1400.0", reg_samples(), true)),
+        h, sha40(2), [])
+    let p: RunResult = perf(["gate", "--history", h])
+    chk(acc, p.code == 1 && p.out.contains("bench_watched"),
+        "an unsanctioned regression fails the gate, named")
+
+    let p2: RunResult = perf(["sanction", "bench_nope", "--reason", "x",
+                              "--history", h])
+    chk(acc, p2.code == 2 && p2.err.contains("unknown bench")
+        && p2.err.contains("bench_watched"),
+        "a sanction for an unknown bench is refused naming the known ones")
+
+    let p3: RunResult = perf(["sanction", "bench_watched", "--history", h])
+    chk(acc, p3.code == 2 && p3.err.contains("reason"),
+        "a sanction without a written reason is refused")
+
+    let p4: RunResult = perf(["sanction", "bench_watched", "--reason",
+                              "switched to a correct algorithm; the "
+                              + "constant factor was the price",
+                              "--history", h])
+    chk(acc, p4.code == 0, "the sanction is filed")
+
+    let jp: str = scratch(acc, "gate.verdict.json")
+    let p5: RunResult = perf(["gate", "--history", h, "--json", jp])
+    let v: JsonValue = jparse(read_or(jp, missing_a()))
+    chk(acc, p5.code == 0 && jstr_of(v, "verdict") == "pass",
+        "a sanctioned regression is loud but green")
+    let sanc: JsonValue = json_object_get(v, "sanctioned")
+    chk(acc, json_is_array(sanc) && sanc.arr.len() == 1
+        && json_str_value(sanc.arr.get(0)) == "bench_watched",
+        "the verdict carries the sanctioned bench")
+    chk(acc, p5.out.contains("sanctioned")
+        && p5.out.contains("correct algorithm"),
+        "the gate output carries the written reason")
+
+    # --baseline: prefix resolution, unknown, ambiguous.
+    let p6: RunResult = perf(["gate", "--history", h, "--baseline",
+                              "deadbeef"])
+    chk(acc, p6.code == 2 && p6.err.contains("no record carries"),
+        "an unknown --baseline prefix is a named usage error")
+
+    let h_amb: str = hist_path(acc, "ambiguous")
+    record_from(acc,
+        report_json("interpreter",
+            bench_json("bench_watched", "1000.0", base_samples(), true)),
+        h_amb, sha40(7), [])
+    record_from(acc,
+        report_json("interpreter",
+            bench_json("bench_watched", "1000.0", base_samples(), true)),
+        h_amb, sha40(7), [])
+    let p7: RunResult = perf(["gate", "--history", h_amb,
+                              "--baseline", sha40(7)])
+    chk(acc, p7.code == 2 && p7.err.contains("ambiguous"),
+        "an ambiguous commit prefix is refused")
+
+    let p8: RunResult = perf(["gate", "--history", h_amb,
+                              "--baseline", sha40(7).slice(0, 12)])
+    chk(acc, p8.code == 2 && p8.err.contains("ambiguous"),
+        "prefix resolution is by prefix, and ambiguity is found there too")
+
+    # The instrument law: interpreter and native are different
+    # instruments; the ledger never compares across backends.
+    let h_inst: str = hist_path(acc, "instrument")
+    record_from(acc,
+        report_json("interpreter",
+            bench_json("bench_watched", "1000.0", base_samples(), true)),
+        h_inst, sha40(1), [])
+    record_from(acc,
+        report_json("native",
+            bench_json("bench_watched", "1000.0", base_samples(), true)),
+        h_inst, sha40(3), [])
+    let p9: RunResult = perf(["gate", "--history", h_inst])
+    chk(acc, p9.code == 2
+        && p9.err.contains("no earlier record of the same instrument"),
+        "a native record with no native baseline refuses by default")
+    let p10: RunResult = perf(["gate", "--history", h_inst,
+                               "--baseline", sha40(1)])
+    chk(acc, p10.code == 1 && p10.err.contains("different instruments"),
+        "an explicit cross-backend baseline is refused, named")
+
+    # The suite law: a changed suite digest refuses comparison.
+    let h_suite: str = hist_path(acc, "suite")
+    record_from(acc,
+        report_json("interpreter",
+            bench_json("bench_watched", "1000.0", base_samples(), true)),
+        h_suite, sha40(1), [])
+    record_from(acc,
+        report_json("interpreter",
+            bench_json("bench_watched", "1000.0", base_samples(), true)),
+        h_suite, sha40(2), ["--suite", "benchmarks/sieve.hls"])
+    let p11: RunResult = perf(["gate", "--history", h_suite,
+                               "--baseline", sha40(1)])
+    chk(acc, p11.code == 1 && p11.err.contains("suite changed"),
+        "a changed suite digest refuses comparison — re-baseline, "
+        + "do not compare")
+
+    # --threshold moves the band: +40% inside a 60% band is within.
+    let h_t: str = hist_path(acc, "threshold")
+    record_from(acc,
+        report_json("interpreter",
+            bench_json("bench_watched", "1000.0", base_samples(), true)),
+        h_t, sha40(1), [])
+    record_from(acc,
+        report_json("interpreter",
+            bench_json("bench_watched", "1400.0", reg_samples(), true)),
+        h_t, sha40(2), [])
+    let p12: RunResult = perf(["gate", "--history", h_t,
+                               "--threshold", "60"])
+    chk(acc, p12.code == 0 && p12.out.contains("within-noise"),
+        "--threshold moves the noise band")
+}
+
+# ----------------------------------------------------------------------------
+# 6. the determinism law
+# ----------------------------------------------------------------------------
+
+# nonempty_lines(doc) — the battery's `if ln` filter.
+fn nonempty_lines(doc: str) -> str {
+    let lines: list[str] = doc.split("\n")
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i) != "" {
+            out.push(lines.get(i))
+        }
+        i = i + 1
+    }
+    return str_join(out, "\n")
+}
+
+# without_generated(doc) — the same filter, minus the stamp line.
+fn without_generated(doc: str) -> str {
+    let lines: list[str] = doc.split("\n")
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < lines.len() {
+        let ln: str = lines.get(i)
+        if ln != "" && !ln.starts_with("- Generated: ") {
+            out.push(ln)
+        }
+        i = i + 1
+    }
+    return str_join(out, "\n")
+}
+
+fn sec6(acc: Acc) -> void uses IO, Fs, Proc {
+    section("6. the determinism law")
+
+    let h: str = hist_path(acc, "gate")
+    let d1: str = scratch(acc, "dash1.md")
+    let d2: str = scratch(acc, "dash2.md")
+    let p1: RunResult = perf(["dashboard", "--history", h, "--out", d1])
+    chk(acc, p1.code == 0 && file_exists(d1), "the dashboard renders")
+    perf(["dashboard", "--history", h, "--out", d2])
+    let doc1: str = read_file(d1)
+    let doc2: str = read_file(d2)
+    chk(acc, doc1 == doc2,
+        "two dashboards of one ledger are byte-identical")
+
+    let digest: str = sha256_hex(read_file(h))
+    chk(acc, doc1.contains("sha256 `" + digest + "`"),
+        "the document embeds the sha256 of the ledger bytes")
+    chk(acc, doc1.contains("`" + sha40(2) + "`"),
+        "the newest record's commit is embedded")
+
+    let d3: str = scratch(acc, "dash3.md")
+    perf(["dashboard", "--history", h, "--out", d3, "--stamp"])
+    let doc3: str = read_file(d3)
+    chk(acc, nonempty_lines(doc1) == without_generated(doc3)
+        && doc3.contains("- Generated: "),
+        "--stamp changes ONLY the Generated line")
+
+    # The verdict table rows are sorted by bench name.
+    let jp: str = scratch(acc, "dash.json")
+    perf(["dashboard", "--history", h, "--out", d1, "--json", jp])
+    let v: JsonValue = jparse(read_or(jp, missing_a()))
+    let rows: JsonValue = json_object_get(v, "benches")
+    let mut sorted_rows: bool = json_is_array(rows)
+    let mut prev: str = ""
+    let mut i: int = 0
+    while i < rows.arr.len() {
+        let name: str = jstr_of(rows.arr.get(i), "bench")
+        if i > 0 && !(prev < name) {
+            sorted_rows = false
+        }
+        prev = name
+        i = i + 1
+    }
+    chk(acc, sorted_rows, "the verdict rows are sorted")
+    chk(acc, jstr_of(v, "verdict") == "pass",
+        "the sanctioned ledger gates pass")
+
+    # A constant trend renders the mid band, not a wall.
+    let h_flat: str = hist_path(acc, "flat")
+    record_from(acc,
+        report_json("interpreter",
+            bench_json("bench_watched", "1000.0", base_samples(), true)),
+        h_flat, sha40(1), [])
+    record_from(acc,
+        report_json("interpreter",
+            bench_json("bench_watched", "1000.0", base_samples(), true)),
+        h_flat, sha40(2), [])
+    perf(["dashboard", "--history", h_flat,
+          "--out", scratch(acc, "flat.md")])
+    let flat: str = read_file(scratch(acc, "flat.md"))
+    chk(acc, flat.contains("▄") && !flat.contains("█"),
+        "a constant trend renders mid bands — no fake wall")
+
+    # The first record of an instrument renders with an n/a verdict.
+    let h_one: str = hist_path(acc, "first")
+    record_from(acc,
+        report_json("interpreter",
+            bench_json("bench_watched", "1000.0", base_samples(), true)),
+        h_one, sha40(1), [])
+    let pf: RunResult = perf(["dashboard", "--history", h_one,
+                              "--out", scratch(acc, "first.md")])
+    let first: str = read_file(scratch(acc, "first.md"))
+    chk(acc, pf.code == 0 && first.contains("n/a")
+        && first.contains("No comparison yet"),
+        "a first-record dashboard renders with an n/a verdict")
+}
+
+# ----------------------------------------------------------------------------
+# 7. the ledger law
+# ----------------------------------------------------------------------------
+
+# corrupt_entry(h, line, needle, label) — append the line, then the
+# reader must refuse LOUDLY, naming it.
+fn corrupt_entry(acc: Acc, h: str, line: str, needle: str, label: str)
+        -> void uses IO, Fs, Proc {
+    write_file(h, read_file(h) + line)
+    let p: RunResult = perf(["history", "--history", h])
+    check(acc, label, p.code == 1 && p.err.contains(needle),
+        clip(p.err, 110))
+}
+
+fn sec7(acc: Acc) -> void uses IO, Fs, Proc {
+    section("7. the ledger law")
+
+    let h: str = hist_path(acc, "corrupt")
+    record_from(acc,
+        report_json("interpreter",
+            bench_json("bench_watched", "1000.0", base_samples(), true)),
+        h, sha40(1), [])
+    corrupt_entry(acc, h, "this is not json\n", "line 2 is corrupt",
+        "a corrupt line is a named error naming the line")
+
+    let h2: str = hist_path(acc, "badtype")
+    record_from(acc,
+        report_json("interpreter",
+            bench_json("bench_watched", "1000.0", base_samples(), true)),
+        h2, sha40(1), [])
+    corrupt_entry(acc, h2, "{\"type\": \"quantum\"}\n", "unknown type",
+        "an unknown entry type is a named error")
+
+    let h3: str = hist_path(acc, "nopin")
+    record_from(acc,
+        report_json("interpreter",
+            bench_json("bench_watched", "1000.0", base_samples(), true)),
+        h3, sha40(1), [])
+    corrupt_entry(acc, h3,
+        "{\"type\": \"record\", \"commit\": \"cafe\", "
+        + "\"backend\": \"interpreter\", \"suite_digest\": \""
+        + sha256_hex(read_file(suite_path()))
+        + "\", \"benches\": {\"b\": {\"estimates_ns\": [1, 2]}}}\n",
+        "commit pin",
+        "a record without a 40-hex commit pin is a named error")
+
+    let h4: str = hist_path(acc, "nodigest")
+    record_from(acc,
+        report_json("interpreter",
+            bench_json("bench_watched", "1000.0", base_samples(), true)),
+        h4, sha40(1), [])
+    corrupt_entry(acc, h4,
+        "{\"type\": \"record\", \"commit\": \"" + sha40(5)
+        + "\", \"backend\": \"interpreter\", "
+        + "\"benches\": {\"b\": {\"estimates_ns\": [1, 2]}}}\n",
+        "suite digest",
+        "a record without a suite digest is a named error")
+
+    let h5: str = hist_path(acc, "noreason")
+    record_from(acc,
+        report_json("interpreter",
+            bench_json("bench_watched", "1000.0", base_samples(), true)),
+        h5, sha40(1), [])
+    corrupt_entry(acc, h5,
+        "{\"type\": \"sanction\", \"bench\": \"bench_watched\"}\n",
+        "reason",
+        "a sanction without a written reason is a named error")
+
+    # history --bench filters records and sanctions alike.
+    let h6: str = hist_path(acc, "filter")
+    record_from(acc,
+        report_json("interpreter",
+            bench_json("bench_watched", "1000.0", base_samples(), true)),
+        h6, sha40(1), [])
+    record_from(acc,
+        report_json("interpreter",
+            bench_json("bench_other", "1000.0", base_samples(), true)),
+        h6, sha40(2), [])
+    perf(["sanction", "bench_watched", "--reason", "later", "--history", h6])
+    let p: RunResult = perf(["history", "--history", h6, "--bench",
+                             "bench_watched", "--json"])
+    let entries: JsonValue = jparse(p.out)
+    chk(acc, json_is_array(entries) && entries.arr.len() == 2
+        && jstr_of(entries.arr.get(0), "type") == "record"
+        && jstr_of(entries.arr.get(1), "type") == "sanction",
+        "history --bench keeps exactly the entries that touch the bench "
+        + "(records and sanctions)")
+}
+
+# ----------------------------------------------------------------------------
+# 8. the corpus showcase
+# ----------------------------------------------------------------------------
+fn sec8(acc: Acc) -> void uses IO, Fs, Proc {
+    section("8. the corpus showcase")
+
+    let show: str = showcase_path()
+    let pc: RunResult = boot(acc, ["--check", show])
+    chk(acc, pc.code == 0,
+        "the showcase boots through the real checker")
+
+    let pr: RunResult = boot(acc, [show])
+    chk(acc, pr.code == 0 && pr.out == showcase_out(),
+        "the showcase runs green on the interpreter, exact output")
+
+    let pf: RunResult = run_capture("./bin/hlfmt", ["--check", show])
+    chk(acc, pf.code == 0, "the showcase is hlfmt-canonical")
+
+    let lint_argv: list[str] = ["tools/hllint.py", show]
+    let pl: RunResult = run_capture("python3", lint_argv)
+    chk(acc, pl.code == 0 && pl.combined.contains("no warnings"),
+        "the showcase is hllint-clean")
+
+    if native_ok() {
+        let c_path: str = scratch(acc, "showcase.c")
+        let bin_path: str = scratch(acc, "showcase_bin")
+        let r1: RunResult = run_capture("./bin/hlc", [show, c_path])
+        if r1.code != 0 {
+            check(acc, "hlc compiled the showcase",
+                false, clip(r1.combined, 120))
+        } else {
+            let r2: RunResult = run_capture("gcc",
+                ["-O2", "-o", bin_path, c_path, "-lm", "-pthread"])
+            if r2.code != 0 {
+                check(acc, "gcc compiled the showcase",
+                    false, clip(r2.combined, 120))
+            } else {
+                let rn: RunResult = run_capture(bin_path, [])
+                chk(acc, rn.code == 0 && rn.out == showcase_out(),
+                    "the showcase matches natively, byte for byte")
+            }
+        }
+    } else {
+        println("  (bin/hlc or cc not available — native differential "
+            + "skipped, interpreter legs ran)")
+    }
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let acc: Acc = acc_new("perf")
+    sec1(acc)
+    sec2(acc)
+    sec3(acc)
+    sec4(acc)
+    sec5(acc)
+    sec6(acc)
+    sec7(acc)
+    sec8(acc)
+    return finish(acc, "Stage 136 -- hls-perf, the per-commit "
+        + "performance dashboard")
+}

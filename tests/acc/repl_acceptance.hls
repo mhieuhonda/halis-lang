@@ -1,0 +1,624 @@
+# ============================================================================
+# tests/acc/repl_acceptance.hls — Stage 123 acceptance gate, in Halis
+# (the Halis twin of tests/repl_acceptance.py; same eight sections,
+# same assertions, same needles — the harness is tests/acc/harness.hls
+# and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make repl-acceptance` (which compiles this file and runs it
+# from the repo root).
+#
+# Every session is the REAL REPL subprocess (python3 tools/hls-repl.py)
+# driven through a pipe: the harness's run_feed writes the lines, closes
+# stdin, and drains stdout+stderr — the same interface the old battery's
+# subprocess.run(input=...) drove.
+#
+#  1. the session     — expressions evaluate and print `= <value>`; lets
+#     is a program      and assignments persist; the checker's rejections
+#                       never touch the session; a redefinition is refused;
+#                       one line can carry several statements
+#  2. definitions     — multi-line fn/struct/impl/generic at the prompt,
+#     at the prompt     std./core. imports, forward reference refused
+#  3. nothing is      — a committed println prints ONCE; state advances;
+#     re-run             rand_int marches forward; a write_file once is
+#                       visible to later reads and written exactly once
+#  4. :type           — the checker's own annotation, and its error path
+#  5. :effects        — pure / IO / Fs / the (new: ...) delta / the honest
+#                       "none beyond the session's"; :audit shows the
+#                       session block; a user fn missing an effect is
+#                       reported, never repaired
+#  6. the session     — :audit's table shape, :env's bindings and moved
+#     commands           marks, :load (module file, main refusal, missing
+#                       file), :reset, unknown commands, :help
+#  7. panics and      — input-relative and fn-relative panic lines, the
+#     refusals           rollback, exit/return refused, __repl_ reserved
+#  8. the corpus      — the fixture is hlfmt-canonical, hllint-clean,
+#     and parity         boot --check green; native output is
+#                       byte-identical; the canonical session's transcript
+#                       IS the fixture's output, twice, byte for byte
+#
+# The battery's per-leg timeout=120 has no Halis equivalent (no per-child
+# alarm); every child here is the REPL, boot.py, hlfmt, hllint or gcc.
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+
+# ----------------------------------------------------------------------------
+# The gate's fixtures.
+# ----------------------------------------------------------------------------
+
+fn fixture_path() -> str {
+    return "tests/ok/feat_stage123_repl.hls"
+}
+
+fn lib_path() -> str {
+    return "tests/repl_libs/session_lib.hls"
+}
+
+# run_session(lines) — the battery's run_session: join the lines with
+# newlines, one trailing newline, feed to the real REPL through a pipe.
+fn run_session(lines: list[str]) -> RunResult uses Proc {
+    let mut data: str = ""
+    let mut i: int = 0
+    while i < lines.len() {
+        if i > 0 {
+            data = data + "\n"
+        }
+        data = data + lines.get(i)
+        i = i + 1
+    }
+    data = data + "\n"
+    let args: list[str] = ["tools/hls-repl.py"]
+    return run_feed("python3", args, data)
+}
+
+# has_line(out, want) — the battery's `want in out.splitlines()`:
+# an EXACT line membership test.
+fn has_line(out: str, want: str) -> bool {
+    let lines: list[str] = out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i) == want {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# count_line(out, want) — the battery's `out.splitlines().count(want)`.
+fn count_line(out: str, want: str) -> int {
+    let lines: list[str] = out.split("\n")
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i) == want {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+# is_digits(s) — Python's str.isdigit for ASCII output: non-empty and
+# every byte 0-9.
+fn is_digits(s: str) -> bool {
+    if s.len() == 0 {
+        return false
+    }
+    let mut i: int = 0
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        if b < 48 || b > 57 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# chk(acc, cond, msg) — the battery's check(): the [PASS]/[FAIL] grammar.
+fn chk(acc: Acc, cond: bool, msg: str) -> void uses IO {
+    if cond {
+        pass_msg(acc, msg)
+    } else {
+        fail_msg(acc, msg)
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 1. the session is a program: state, rejections, red lines
+# ----------------------------------------------------------------------------
+
+fn sec1(acc: Acc) -> void uses IO, Proc {
+    section("Section 1 — the session is a program: state, rejections, red lines")
+    let lines: list[str] = ["1 + 2", "2.5 * 4.0", "1 < 2",
+        "\"halis\" + \" \" + \"repl\"", "[10, 20, 30]",
+        "let mut x: int = 6", "x * 7", "x = x + 1", "x"]
+    let r: RunResult = run_session(lines)
+    let out: str = r.out
+    chk(acc, r.code == 0, "clean session exits 0")
+    chk(acc, has_line(out, "= 3"), "integer expression prints = 3")
+    chk(acc, has_line(out, "= 10.0"), "float expression prints = 10.0")
+    chk(acc, has_line(out, "= true"), "bool prints the HLS literal")
+    chk(acc, has_line(out, "= \"halis repl\""), "strings print quoted")
+    chk(acc, has_line(out, "= [10, 20, 30] (len=3)"), "lists print with length")
+    chk(acc, has_line(out, "= 42"), "let persists into the next expression")
+    chk(acc, has_line(out, "= 7"), "assignment rewrites the binding")
+    chk(acc, r.err == "", "no stderr noise")
+
+    let l2: list[str] = ["let mut n: int = 5", "n = \"five\"", "n + 1"]
+    let r2: RunResult = run_session(l2)
+    chk(acc, r2.out.contains("error: type mismatch"), "type mismatch is refused")
+    chk(acc, has_line(r2.out, "= 6"), "the rejected input left n untouched")
+
+    let l3: list[str] = ["let x: int = 6", "x = 7"]
+    let r3: RunResult = run_session(l3)
+    chk(acc, r3.out.contains("cannot reassign immutable variable"),
+        "immutable bindings are enforced across inputs")
+
+    let l4: list[str] = ["let v: int = 1", "let v: int = 2"]
+    let r4: RunResult = run_session(l4)
+    chk(acc, r4.out.contains("error:") && r4.out.contains("v"),
+        "shadowing a session binding is refused")
+
+    let l5: list[str] = ["ghost"]
+    let r5: RunResult = run_session(l5)
+    chk(acc, r5.out.contains("error: variable does not exist: ghost"),
+        "unknown variables are refused by name")
+
+    let l6: list[str] = ["let a: int = 1 let b: int = 2", "a + b"]
+    let r6: RunResult = run_session(l6)
+    chk(acc, has_line(r6.out, "= 3"), "one line can carry several statements")
+
+    let l7: list[str] = ["fn f() -> int { return 1 }", "fn f() -> int { return 2 }"]
+    let r7: RunResult = run_session(l7)
+    chk(acc, r7.out.contains("duplicate function name: f"),
+        "redefining a fn is refused (the session is one program)")
+}
+
+# ----------------------------------------------------------------------------
+# 2. definitions at the prompt: multi-line, imports, generics
+# ----------------------------------------------------------------------------
+
+fn sec2(acc: Acc) -> void uses IO, Proc {
+    section("Section 2 — definitions at the prompt: multi-line, imports, generics")
+    let l1: list[str] = ["fn fact(n: int) -> int {",
+        "  if n <= 1 { return 1 }",
+        "  return n * fact(n - 1)",
+        "}",
+        "fact(10)"]
+    let r1: RunResult = run_session(l1)
+    chk(acc, has_line(r1.out, "= 3628800"),
+        "a multi-line fn defines silently and calls")
+
+    let l2: list[str] = ["import \"std.str\"", "str(42) + \"!\""]
+    let r2: RunResult = run_session(l2)
+    chk(acc, has_line(r2.out, "= \"42!\""),
+        "std imports resolve at the prompt")
+
+    let l3: list[str] = ["import \"core.option\"", "Option.Some(9)"]
+    let r3: RunResult = run_session(l3)
+    chk(acc, has_line(r3.out, "= Option.Some(9)"), "core imports and enum display")
+
+    let l4: list[str] = ["struct P { x: int, y: int }",
+        "impl P {",
+        "  fn norm2(self: P) -> int { return self.x * self.x + self.y * self.y }",
+        "}",
+        "let p: P = P { x: 2, y: 3 }",
+        "p.norm2()",
+        "p.y"]
+    let r4: RunResult = run_session(l4)
+    chk(acc, has_line(r4.out, "= 13"), "struct + impl method evaluate")
+    chk(acc, has_line(r4.out, "= 3"), "field access evaluates")
+
+    let l5: list[str] = ["fn last_of[T](xs: list[T]) -> T {",
+        "  return xs[xs.len() - 1]",
+        "}",
+        "last_of([3, 1, 4])",
+        "last_of([\"a\", \"b\", \"c\"])"]
+    let r5: RunResult = run_session(l5)
+    chk(acc, has_line(r5.out, "= 4"), "generic fn, int instantiation")
+    chk(acc, has_line(r5.out, "= \"c\""), "generic fn, str instantiation")
+
+    let l6: list[str] = ["later(1)", "fn later(n: int) -> int { return n }"]
+    let r6: RunResult = run_session(l6)
+    chk(acc, r6.out.contains("error: function does not exist: later"),
+        "forward reference is honestly refused (definitions bind, not time-travel)")
+    let l7: list[str] = ["fn later(n: int) -> int { return n }", "later(1)"]
+    let r7: RunResult = run_session(l7)
+    chk(acc, has_line(r7.out, "= 1"), "the same fn works once defined")
+}
+
+# ----------------------------------------------------------------------------
+# 3. nothing is ever re-run behind your back
+# ----------------------------------------------------------------------------
+
+fn sec3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 3 — nothing is ever re-run behind your back")
+    let l1: list[str] = ["println(\"once\")", "1 + 1", "2 + 2"]
+    let r1: RunResult = run_session(l1)
+    chk(acc, count_line(r1.out, "once") == 1, "a committed println is NOT replayed")
+
+    let l2: list[str] = ["let mut c: int = 0", "c = c + 1", "c = c + 1", "c"]
+    let r2: RunResult = run_session(l2)
+    chk(acc, has_line(r2.out, "= 2"), "state advances across inputs")
+
+    let l3: list[str] = ["rand_seed(7)", "rand_int(1000)", "rand_int(1000)"]
+    let r3: RunResult = run_session(l3)
+    let rlines: list[str] = r3.out.split("\n")
+    let vals: list[str] = []
+    let mut i: int = 0
+    while i < rlines.len() {
+        let l: str = rlines.get(i)
+        if l.starts_with("= ") && is_digits(l.slice(2, l.len())) {
+            vals.push(l)
+        }
+        i = i + 1
+    }
+    chk(acc, vals.len() == 2 && vals.get(0) != vals.get(1),
+        "the RNG marches forward (two draws differ, same session)")
+
+    let probe: str = scratch(acc, "fs/probe.txt")
+    let l4: list[str] = ["write_file(\"" + probe + "\", \"written once\")",
+        "read_file(\"" + probe + "\")",
+        "read_file(\"" + probe + "\")"]
+    let r4: RunResult = run_session(l4)
+    chk(acc, has_line(r4.out, "= \"written once\""),
+        "a write_file once is visible to later reads")
+    chk(acc, read_file(probe) == "written once",
+        "and the file holds exactly one write")
+}
+
+# ----------------------------------------------------------------------------
+# 4. :type reads the checker's annotation
+# ----------------------------------------------------------------------------
+
+fn sec4(acc: Acc) -> void uses IO, Proc {
+    section("Section 4 — :type reads the checker's annotation")
+    let l1: list[str] = [":type 1 + 2", ":type 2.5", ":type \"s\"", ":type true",
+        ":type [1, 2]", ":type 1.0 > 0.5"]
+    let r1: RunResult = run_session(l1)
+    chk(acc, has_line(r1.out, ": int"), ":type int")
+    chk(acc, has_line(r1.out, ": float"), ":type float")
+    chk(acc, has_line(r1.out, ": str"), ":type str")
+    chk(acc, has_line(r1.out, ": bool"), ":type bool")
+    chk(acc, has_line(r1.out, ": list[int]"), ":type list[int]")
+
+    let l2: list[str] = ["let m: map[str, int] = map_new()", ":type m",
+        "fn id[T](x: T) -> T { return x }",
+        ":type id([1])", ":type id(\"s\")"]
+    let r2: RunResult = run_session(l2)
+    chk(acc, has_line(r2.out, ": map[str, int]"), ":type map[str, int]")
+    chk(acc, has_line(r2.out, ": list[int]"), ":type pins a generic instantiation")
+    chk(acc, has_line(r2.out, ": str"), ":type re-instantiates per call site")
+
+    let l3: list[str] = ["struct P { x: int, y: int }",
+        "impl P { fn n2(self: P) -> int { return 4 } }",
+        "let p: P = P { x: 1, y: 1 }",
+        ":type p.x", ":type p.n2()", ":type println(\"x\")"]
+    let r3: RunResult = run_session(l3)
+    chk(acc, has_line(r3.out, ": int"), ":type through a field and a method")
+
+    let l4: list[str] = [":type nope + 1"]
+    let r4: RunResult = run_session(l4)
+    chk(acc, r4.out.contains("error: variable does not exist: nope"),
+        ":type surfaces the checker's refusal")
+
+    let l5: list[str] = [":type"]
+    let r5: RunResult = run_session(l5)
+    chk(acc, r5.out.contains("error: :type expects an expression"),
+        ":type without an argument is refused")
+}
+
+# ----------------------------------------------------------------------------
+# 5. :effects reads the fixpoint, relative to the session
+# ----------------------------------------------------------------------------
+
+fn sec5(acc: Acc) -> void uses IO, Proc {
+    section("Section 5 — :effects reads the fixpoint, relative to the session")
+    let l1: list[str] = [":effects 1 + 2"]
+    let r1: RunResult = run_session(l1)
+    chk(acc, has_line(r1.out, "effects: (none - pure)"),
+        "a pure expression is named pure")
+
+    let l2: list[str] = [":effects println(\"x\")"]
+    let r2: RunResult = run_session(l2)
+    chk(acc, has_line(r2.out, "effects: IO"), "println needs IO")
+
+    let l3: list[str] = [":effects read_file(\"f\")"]
+    let r3: RunResult = run_session(l3)
+    chk(acc, has_line(r3.out, "effects: Fs"), "read_file needs Fs (fresh session)")
+
+    let l4: list[str] = ["println(\"committed\")", ":effects read_file(\"f\")"]
+    let r4: RunResult = run_session(l4)
+    chk(acc, has_line(r4.out, "effects: Fs, IO (new: Fs)"),
+        "the delta names what the expression ADDS")
+
+    let l5: list[str] = ["println(\"committed\")", ":effects print(\"y\")"]
+    let r5: RunResult = run_session(l5)
+    chk(acc, has_line(r5.out, "effects: none beyond the session's (IO)"),
+        "an expression needing nothing new says so honestly")
+
+    let l6: list[str] = [":effects rand_int(3)"]
+    let r6: RunResult = run_session(l6)
+    chk(acc, has_line(r6.out, "effects: Rand"), "Rand is its own family")
+
+    let l7: list[str] = ["fn leaky() -> int uses IO {",
+        "  println(\"leak\")",
+        "  return 1",
+        "}",
+        ":audit"]
+    let r7: RunResult = run_session(l7)
+    chk(acc, r7.out.contains("main") && r7.out.contains("leaky")
+        && r7.out.contains("OK"),
+        ":audit shows the session block and the user fn")
+    chk(acc, r7.out.contains("uses IO") || r7.out.contains("IO"),
+        "the declared capability is visible")
+
+    let l8: list[str] = ["fn leaky() -> int {",
+        "  println(\"leak\")",
+        "  return 1",
+        "}"]
+    let r8: RunResult = run_session(l8)
+    chk(acc, r8.out.contains("error: function 'leaky' calls 'println' which requires effect 'IO'"),
+        "a USER fn missing an effect is reported, never auto-repaired")
+}
+
+# ----------------------------------------------------------------------------
+# 6. the session commands
+# ----------------------------------------------------------------------------
+
+fn sec6(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 6 — the session commands")
+    let l1: list[str] = ["fn twice(n: int) -> int { return n * 2 }",
+        "fn noisy() -> int uses IO {",
+        "  println(\"n\")",
+        "  return 1",
+        "}",
+        ":audit"]
+    let r1: RunResult = run_session(l1)
+    chk(acc, r1.out.contains("function") && r1.out.contains("declared")
+        && r1.out.contains("computed") && r1.out.contains("status"),
+        ":audit prints boot.py's exact table shape")
+    chk(acc, r1.out.contains("twice") && r1.out.contains("noisy")
+        && r1.out.contains("main"),
+        ":audit names every session fn")
+    chk(acc, r1.out.contains("3 functions: 0 declared pure, 1 declared with effects"),
+        ":audit's summary counts the session program's fns")
+
+    let l2: list[str] = ["let a: int = 7",
+        "let mut names: list[str] = [\"ada\"]",
+        ":env"]
+    let r2: RunResult = run_session(l2)
+    chk(acc, r2.out.contains("a: int = 7"), ":env shows declared type and value")
+    chk(acc, r2.out.contains("names: mut list[str] = [\"ada\"] (len=1)"),
+        ":env marks mut and renders lists")
+
+    let l3: list[str] = ["let a: list[int] = [1]", "let b: list[int] = take(a)",
+        ":env", "a"]
+    let r3: RunResult = run_session(l3)
+    chk(acc, r3.out.contains("b: list[int] = [1] (len=1)"),
+        ":env shows the take'd binding")
+    chk(acc, r3.out.contains("use of moved value: a"),
+        "while the checker holds a as moved (static ownership)")
+
+    let l4: list[str] = [":env"]
+    let r4: RunResult = run_session(l4)
+    chk(acc, has_line(r4.out, "session bindings: (none)"),
+        ":env on a fresh session says none")
+
+    let l5: list[str] = [":load " + lib_path(), "square(9)", "shout(\"hls\")",
+        "let mtr: Meter = Meter { reading: 100 }", "mtr.advance(42).reading"]
+    let r5: RunResult = run_session(l5)
+    chk(acc, r5.out.contains("loaded") && r5.out.contains("session_lib.hls"),
+        ":load reports the load")
+    chk(acc, has_line(r5.out, "= 81"), "the loaded fn is callable")
+    chk(acc, has_line(r5.out, "= \"HLS!\""), "the loaded std-using fn works")
+    chk(acc, has_line(r5.out, "= 142"), "the loaded struct + method work")
+
+    let main_file: str = write_src(acc, "with_main.hls",
+        "fn main() -> int { return 0 }\n")
+    let l6: list[str] = [":load " + main_file]
+    let r6: RunResult = run_session(l6)
+    chk(acc, r6.out.contains("refuses files that define main"),
+        ":load refuses files that define main")
+
+    let l7: list[str] = [":load /nonexistent/never.hls"]
+    let r7: RunResult = run_session(l7)
+    chk(acc, r7.out.contains("error: cannot read"), ":load reports a missing file")
+
+    let l8: list[str] = ["let k: int = 5", ":reset", ":env", "k"]
+    let r8: RunResult = run_session(l8)
+    chk(acc, has_line(r8.out, "session cleared"), ":reset announces itself")
+    chk(acc, has_line(r8.out, "session bindings: (none)"), ":reset clears bindings")
+    chk(acc, r8.out.contains("error: variable does not exist: k"),
+        ":reset really cleared (k is unknown)")
+
+    let l9: list[str] = [":frobnicate"]
+    let r9: RunResult = run_session(l9)
+    chk(acc, r9.out.contains("error: unknown command ':frobnicate' (try :help)"),
+        "unknown commands are refused by name")
+
+    let l10: list[str] = [":help"]
+    let r10: RunResult = run_session(l10)
+    chk(acc, r10.out.contains(":type <expr>") && r10.out.contains(":effects <expr>")
+        && r10.out.contains(":audit") && r10.out.contains(":env")
+        && r10.out.contains(":load <file.hls>") && r10.out.contains(":reset")
+        && r10.out.contains(":quit"),
+        ":help lists every command")
+}
+
+# ----------------------------------------------------------------------------
+# 7. panics and refusals, and the session survives them
+# ----------------------------------------------------------------------------
+
+fn sec7(acc: Acc) -> void uses IO, Proc {
+    section("Section 7 — panics and refusals, and the session survives them")
+    let l1: list[str] = ["1 / 0", "let survivor: int = 1", "survivor"]
+    let r1: RunResult = run_session(l1)
+    chk(acc, has_line(r1.out, "panic: division by zero (at line 1)"),
+        "an expression panic reports input-relative")
+    chk(acc, has_line(r1.out, "= 1"), "the session continues after a panic")
+
+    let l2: list[str] = ["let dead: int = 1 / 0", "dead"]
+    let r2: RunResult = run_session(l2)
+    chk(acc, has_line(r2.out, "panic: division by zero (at line 1)"),
+        "a statement panic reports and commits nothing")
+    chk(acc, r2.out.contains("error: variable does not exist: dead"),
+        "the panicked binding stays unknown (rollback is real)")
+
+    let l3: list[str] = ["fn boom(n: int) -> int {",
+        "  return n / 0",
+        "}",
+        "boom(3)"]
+    let r3: RunResult = run_session(l3)
+    chk(acc, has_line(r3.out, "panic: division by zero (at line 2)"),
+        "a panic inside a called fn reports the fn-relative line")
+
+    let l4: list[str] = ["exit(0)"]
+    let r4: RunResult = run_session(l4)
+    chk(acc, r4.out.contains("exit(0) is refused at the prompt"),
+        "exit is refused (the session is not a process)")
+
+    let l5: list[str] = ["fn fine() -> int { return 1 }", "return 5", "fine()"]
+    let r5: RunResult = run_session(l5)
+    chk(acc, r5.out.contains("error:") && r5.out.contains("return"),
+        "return is refused with the reason")
+    chk(acc, has_line(r5.out, "= 1"), "and the session carries on")
+
+    let l6: list[str] = ["__repl_value"]
+    let r6: RunResult = run_session(l6)
+    chk(acc, r6.out.contains("reserved by the REPL"), "the __repl_ prefix is reserved")
+
+    let l7: list[str] = ["let __repl_x: int = 1"]
+    let r7: RunResult = run_session(l7)
+    chk(acc, r7.out.contains("reserved by the REPL"), "binding __repl_* is refused too")
+
+    let l8: list[str] = ["fn main() -> int { return 0 }"]
+    let r8: RunResult = run_session(l8)
+    chk(acc, r8.out.contains("duplicate function name: main")
+        && r8.out.contains("session block"),
+        "redefining main names the session block")
+}
+
+# ----------------------------------------------------------------------------
+# 8. the corpus, transcript parity and determinism
+# ----------------------------------------------------------------------------
+
+fn canonical_session() -> list[str] {
+    return [
+        "import \"std.str\"",
+        "struct Acc { total: int, count: int }",
+        "enum Op { Add(int), Sub(int), Mul(int) }",
+        "impl Acc {",
+        "    fn push(self: Acc, v: int) -> Acc {",
+        "        return Acc { total: self.total + v, count: self.count + 1 }",
+        "    }",
+        "    fn mean(self: Acc) -> int {",
+        "        return self.total / self.count",
+        "    }",
+        "}",
+        "fn apply(acc: Acc, op: Op) -> Acc {",
+        "    return match op {",
+        "        Op.Add(v) => acc.push(v),",
+        "        Op.Sub(v) => acc.push(0 - v),",
+        "        Op.Mul(v) => acc.push(acc.total * v)",
+        "    }",
+        "}",
+        "fn last_of[T](xs: list[T]) -> T {",
+        "    return xs[xs.len() - 1]",
+        "}",
+        "fn op_name(op: Op) -> str {",
+        "    return match op {",
+        "        Op.Add(_) => \"add\",",
+        "        Op.Sub(_) => \"sub\",",
+        "        Op.Mul(_) => \"mul\"",
+        "    }",
+        "}",
+        "let a: Acc = Acc { total: 0, count: 0 }",
+        "let a2: Acc = apply(a, Op.Add(10))",
+        "let a3: Acc = apply(a2, Op.Add(32))",
+        "a3",
+        "a3.mean()",
+        "apply(a3, Op.Sub(2)).total",
+        "op_name(Op.Add(1))",
+        "op_name(Op.Mul(5))",
+        "op_name(Op.Sub(9))",
+        "\"repl\" + \".\" + \"hls\"",
+        "1 < 2",
+        "[7, 8]",
+        "last_of([3, 1, 4, 1, 5])",
+        "last_of([\"x\", \"y\", \"z\"])",
+        ":quit",
+    ]
+}
+
+fn sec8(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 8 — the corpus, transcript parity and determinism")
+    let fx: str = fixture_path()
+    let fixture_src: str = read_file(fx)
+    chk(acc, fixture_src.contains("fn main() uses IO"),
+        "the fixture's main carries the grown session capability")
+
+    let rf: RunResult = boot(acc, [fx])
+    let fixture_out: str = rf.out
+    chk(acc, rf.code == 0, "the fixture runs on the interpreter")
+    chk(acc, has_line(fixture_out, "= Acc { total: 42, count: 2 }"),
+        "the fixture prints the transcript's struct line")
+
+    let rc: RunResult = boot_check(acc, fx)
+    chk(acc, rc.code == 0 && rc.out.contains("OK: types and effects valid"),
+        "boot --check is green on the fixture")
+
+    let fm: RunResult = run_capture("./bin/hlfmt", ["-c", fx])
+    chk(acc, fm.out.contains("already formatted"),
+        "the fixture is an hlfmt fixed point")
+
+    let li: RunResult = run_capture("python3", ["tools/hllint.py", fx])
+    chk(acc, li.out.contains("no warnings"), "the fixture is hllint-clean")
+
+    if file_exists("bin/hlc") {
+        let out_c: str = scratch(acc, "s123.c")
+        let out_bin: str = scratch(acc, "s123")
+        let hc: RunResult = run_capture("./bin/hlc", [fx, out_c])
+        if hc.code != 0 {
+            fail_msg(acc, "native compile failed: " + clip(hc.err, 200))
+        } else {
+            let g: RunResult = run_capture("gcc",
+                ["-O2", "-o", out_bin, out_c, "-lm", "-pthread"])
+            if g.code != 0 {
+                fail_msg(acc, "gcc failed: " + clip(g.err, 200))
+            } else {
+                let nat: RunResult = run_capture(out_bin, [])
+                chk(acc, nat.out == fixture_out,
+                    "native output is byte-identical with the interpreter's")
+            }
+        }
+    } else {
+        println("  [SKIP] native parity (bin/hlc not built)")
+    }
+
+    # the canonical session's transcript equals the fixture's output, and a
+    # second run is byte-identical (deterministic piped transcripts)
+    let canon: list[str] = canonical_session()
+    let s1: RunResult = run_session(canon)
+    let s2: RunResult = run_session(canon)
+    chk(acc, s1.code == 0 && s2.code == 0, "the canonical session exits clean, twice")
+    chk(acc, s1.out == s2.out, "the piped transcript is deterministic")
+    chk(acc, s1.out == fixture_out,
+        "the canonical session's transcript IS the fixture's output")
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let acc: Acc = acc_new("repl")
+    sec1(acc)
+    sec2(acc)
+    sec3(acc)
+    sec4(acc)
+    sec5(acc)
+    sec6(acc)
+    sec7(acc)
+    sec8(acc)
+    return finish(acc, "Stage 123 -- hls-repl (the interactive REPL)")
+}

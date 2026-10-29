@@ -1,0 +1,911 @@
+# ============================================================================
+# tests/acc/rss_acceptance.hls — Stage 125 acceptance gate, in Halis
+# (the Halis twin of tests/rss_acceptance.py; same eight sections, same
+# assertions, same needles — the harness is tests/acc/harness.hls and
+# the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make rss-acceptance` (which compiles this file and runs it
+# from the repo root).
+#
+# The battery imported tools/hls-rss.py with importlib for the
+# statistics numerics and the interposer-report parser; the gate asks
+# the same questions through a small python3 driver it writes into its
+# scratch world (the module stays the subject; the comparisons against
+# hand-computed values run here). The malloc-balance instrument is the
+# repo's own tools/rss_parts/malloc_balance_wrap.c, linked exactly the
+# way the battery links it (-Wl,--wrap=malloc/calloc/realloc/free).
+#
+#  1. the convention  — a workload is an ordinary program; the plan is
+#     & the refusals    driven through argv[1]; markers must parse and
+#                       advance; protocol violations fail loudly (exit
+#                       1); usage failures exit 2
+#  2. the sampler     — a cooperative run observes exactly the
+#     & the protocol    requested markers; cycle-aligned points pair
+#                       marker indices with resident pages; a
+#                       marker-less program is analysed against time
+#  3. the statistics  — Theil-Sen against hand-computed data; the
+#                       seeded bootstrap's byte-determinism and its
+#                       collapse on constant data; decimation; the
+#                       verdict lattice
+#  4. the interposer  — the fresh-result builtins balance (LIVE a
+#     & the census      small constant, mallocs linear); cwd_get's
+#                       libc buffers are FOREIGN_FREE; the retained
+#                       probe moves LIVE by exactly the payload count
+#  5. the report      — the layout needles; --json parses and carries
+#                       the trace, the config, both instruments and
+#                       the verdict
+#  6. the two-run     — the churn lib's exact-free property; an
+#     comparison        argv-ignoring workload gets the honest
+#                       retained skip; --no-malloc-count
+#  7. the differential— the fixture is byte-identical interpreter vs
+#     & the leak matrix native; churn and server STABLE, the canary
+#                       LEAK with both instruments; the hoisting-cycle
+#                       regression compiles, runs and leaks nothing
+#  8. the corpus      — hlfmt-canonical fixture and workloads,
+#     hygiene           hllint-clean fixture, checker green, no gate
+#                       litter survives
+#
+# The battery's timeout=600 wrappers have no Halis equivalent (no
+# per-child alarm); every child here is the verifier, a compiler, cc,
+# boot.py or the gate's own probes.
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.json"
+import "std.result"
+import "std.option"
+
+# ----------------------------------------------------------------------------
+# The gate's fixtures.
+# ----------------------------------------------------------------------------
+
+fn fixture_path() -> str {
+    return "tests/ok/feat_stage125_rss.hls"
+}
+
+fn churn_path() -> str {
+    return "tests/rss_libs/churn_rss.hls"
+}
+
+fn server_path() -> str {
+    return "tests/rss_libs/server_rss.hls"
+}
+
+fn canary_path() -> str {
+    return "tests/rss_libs/leak_canary.hls"
+}
+
+fn wrap_path() -> str {
+    return "tools/rss_parts/malloc_balance_wrap.c"
+}
+
+fn rss_run(args: list[str]) -> RunResult uses Proc {
+    let argv: list[str] = ["tools/hls-rss.py"]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    return run_capture("python3", argv)
+}
+
+fn chk(acc: Acc, cond: bool, msg: str) -> void uses IO {
+    if cond {
+        pass_msg(acc, msg)
+    } else {
+        fail_msg(acc, msg)
+    }
+}
+
+fn native_ok() -> bool uses Fs, Proc {
+    return file_exists("bin/hlc") && which("gcc")
+}
+
+# interpose_build(acc, hls_path, bin_path) — the battery's interpose_run
+# build step: hlc to C, then cc with the balance interposer and the
+# --wrap recipe. Returns false when either leg fails.
+fn interpose_build(acc: Acc, hls_path: str, bin_path: str) -> bool uses IO, Fs, Proc {
+    let c_path: str = scratch(acc, basename(bin_path) + ".c")
+    let r: RunResult = run_capture("./bin/hlc", [hls_path, c_path])
+    if r.code != 0 {
+        return false
+    }
+    let g: RunResult = run_capture("gcc", ["-O2", "-o", bin_path, c_path,
+        wrap_path(), "-lm", "-pthread",
+        "-Wl,--wrap=malloc", "-Wl,--wrap=calloc",
+        "-Wl,--wrap=realloc", "-Wl,--wrap=free"])
+    return g.code == 0
+}
+
+# rss_counter(err, key) — the HL_RSS_<KEY>=<n> counter from the
+# interposer's stderr report (-1 when absent; the battery's counters
+# are all non-negative).
+fn rss_counter(err: str, key: str) -> int {
+    let prefix: str = "HL_RSS_" + key + "="
+    let lines: list[str] = err.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let l: str = lines.get(i)
+        if l.starts_with(prefix) {
+            return l.slice(prefix.len(), l.len()).to_int()
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# line_value(out, prefix) — the remainder of the first line that starts
+# with the prefix (the driver prints one value per line).
+fn line_value(out: str, prefix: str) -> str {
+    let lines: list[str] = out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).starts_with(prefix) {
+            return lines.get(i).slice(prefix.len(), lines.get(i).len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# jnum(v) — a JSON number as a float (int or float kind), else -1.0.
+fn jnum(v: JsonValue) -> float {
+    if json_is_int(v) {
+        return json_int_value(v).to_float()
+    }
+    if json_is_float(v) {
+        return json_float_value(v)
+    }
+    return -1.0
+}
+
+fn jint(v: JsonValue, k: str) -> int {
+    return json_int_value(json_object_get(v, k))
+}
+
+fn jstr(v: JsonValue, k: str) -> str {
+    return json_str_value(json_object_get(v, k))
+}
+
+# ----------------------------------------------------------------------------
+# The python3 driver: the front door to tools/hls-rss.py's own module —
+# `numerics` runs the Theil-Sen/bootstrap/decimation/quantile probes,
+# `verdicts` runs the slope classifier and the composer, and
+# `parse_interposer <file>` parses an HL_RSS_* report. Values print;
+# the comparisons stay on the Halis side (float tolerances evaluate in
+# the driver where Halis has no float parsing — they print 0/1 flags).
+# ----------------------------------------------------------------------------
+
+fn mod_driver_src() -> str {
+    return "import importlib.util, sys\n" +
+        "spec = importlib.util.spec_from_file_location(\"hls_rss_mod\", \"tools/hls-rss.py\")\n" +
+        "mod = importlib.util.module_from_spec(spec)\n" +
+        "spec.loader.exec_module(mod)\n" +
+        "cmd = sys.argv[1]\n" +
+        "if cmd == \"numerics\":\n" +
+        "    slope, pairs = mod.theil_sen([(0, 0), (1, 1), (2, 2), (10, 1)])\n" +
+        "    print(\"ts_slope_ok=%d\" % (abs(slope - 0.55) < 1e-12))\n" +
+        "    print(\"ts_pairs=%d\" % pairs)\n" +
+        "    print(\"ts_line_ok=%d\" % (mod.theil_sen([(i, 2 * i) for i in range(10)])[0] == 2.0))\n" +
+        "    try:\n" +
+        "        mod.theil_sen([(5, 1)])\n" +
+        "        print(\"ts_single=0\")\n" +
+        "    except mod.VerifyError:\n" +
+        "        print(\"ts_single=1\")\n" +
+        "    pts = [(i, 1.0 + (i % 7) * 0.01) for i in range(40)]\n" +
+        "    a1 = mod.bootstrap_ci_slope(pts, 200, mod._seed(\"churn_rss\"))\n" +
+        "    a2 = mod.bootstrap_ci_slope(pts, 200, mod._seed(\"churn_rss\"))\n" +
+        "    print(\"boot_a1=%r\" % (a1,))\n" +
+        "    print(\"boot_a2=%r\" % (a2,))\n" +
+        "    flat = [(i, 5.0) for i in range(30)]\n" +
+        "    lo, hi = mod.bootstrap_ci_slope(flat, 200, 7)\n" +
+        "    print(\"flat_ok=%d\" % (abs(lo) < 1e-9 and abs(hi) < 1e-9))\n" +
+        "    few = mod.decimate([(i, i) for i in range(3000)])\n" +
+        "    print(\"dec_len=%d\" % len(few))\n" +
+        "    print(\"dec_first=%d\" % few[0][0])\n" +
+        "    print(\"dec_last=%d\" % few[-1][0])\n" +
+        "    print(\"dec_small=%d\" % (mod.decimate([(1, 1), (2, 2)]) == [(1, 1), (2, 2)]))\n" +
+        "    xs = sorted([3.0, 1.0, 2.0, 4.0, 5.0])\n" +
+        "    print(\"q50=%d\" % (mod.quantile(xs, 0.5) == 3.0))\n" +
+        "    print(\"q25=%d\" % (abs(mod.quantile(xs, 0.25) - 2.0) < 1e-12))\n" +
+        "elif cmd == \"verdicts\":\n" +
+        "    class T:\n" +
+        "        def __init__(self, points, timeline=None):\n" +
+        "            self.cycle_points = points\n" +
+        "            self.timeline = timeline or []\n" +
+        "            self.protocol_error = None\n" +
+        "            self.markers = [c for c, _t, _p in points]\n" +
+        "    cfg = {\"threshold\": 0.25, \"threshold_time\": 2.0}\n" +
+        "    t_stable = mod.analyse_slope(T([(c, 100, 100) for c in range(40)]),\n" +
+        "                                 10, dict(cfg, bootstrap=200), \"s\")\n" +
+        "    print(\"stable_v=\" + str(t_stable[\"verdict\"]))\n" +
+        "    rising = [(c, 100, 100 + 3 * c) for c in range(40)]\n" +
+        "    t_leak = mod.analyse_slope(T(rising), 10, dict(cfg, bootstrap=200), \"s\")\n" +
+        "    print(\"leak_v=\" + str(t_leak[\"verdict\"]))\n" +
+        "    tiny = [(c, 100, 100 + 0.01 * c) for c in range(40)]\n" +
+        "    t_slow = mod.analyse_slope(T(tiny), 10, dict(cfg, bootstrap=200), \"s\")\n" +
+        "    print(\"slow_v=\" + str(t_slow[\"verdict\"]))\n" +
+        "    print(\"comp1=\" + mod.compose_verdict([{\"verdict\": mod.STABLE},\n" +
+        "                                           {\"verdict\": mod.STABLE}]))\n" +
+        "    print(\"comp2=\" + mod.compose_verdict([{\"verdict\": mod.STABLE},\n" +
+        "                                           {\"verdict\": mod.LEAK}]))\n" +
+        "    print(\"comp3=\" + mod.compose_verdict([{\"verdict\": mod.STABLE},\n" +
+        "                                           {\"verdict\": mod.INCONCLUSIVE}]))\n" +
+        "elif cmd == \"parse_interposer\":\n" +
+        "    data = open(sys.argv[2], \"rb\").read()\n" +
+        "    c = mod.parse_interposer(data)\n" +
+        "    print(\"NONE\" if c is None else \"OK LIVE=%d\" % c[\"LIVE\"])\n"
+}
+
+# The census workload — the battery's CENSUS probe, verbatim: every
+# fresh-result builtin the Stage 125 expr_fresh fix registered, driven
+# 2000 times under the interposer.
+fn census_src() -> str {
+    return "import \"std.taint\"\n" +
+        "\n" +
+        "fn main() -> int uses IO, Proc {\n" +
+        "    let a: list[str] = args()\n" +
+        "    let mut mode: int = 0\n" +
+        "    if a.len() > 1 {\n" +
+        "        mode = a.get(1).to_int()\n" +
+        "    }\n" +
+        "    let mut checksum: int = 0\n" +
+        "    let mut i: int = 0\n" +
+        "    let n: int = 2000\n" +
+        "    while i < n {\n" +
+        "        if mode == 0 {\n" +
+        "            let j: str = join([\"alpha\", \"beta\"], \"-\")\n" +
+        "            checksum = checksum + j.len()\n" +
+        "        } else if mode == 1 {\n" +
+        "            let p: str = env_get(\"PATH\")\n" +
+        "            checksum = checksum + p.len()\n" +
+        "        } else if mode == 2 {\n" +
+        "            let d: str = cwd_get()\n" +
+        "            checksum = checksum + d.len()\n" +
+        "        } else if mode == 3 {\n" +
+        "            let h: str = sys_hostname()\n" +
+        "            checksum = checksum + h.len()\n" +
+        "        } else if mode == 4 {\n" +
+        "            let xs: list[str] = fs_read_dir(\".\")\n" +
+        "            checksum = checksum + xs.len()\n" +
+        "        } else if mode == 5 {\n" +
+        "            let l: tainted[str] = read_line()\n" +
+        "            checksum = checksum + taint_check_len(l)\n" +
+        "        }\n" +
+        "        i = i + 1\n" +
+        "    }\n" +
+        "    println(\"checksum=\" + checksum.to_str())\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+# The retained shape: an in-scope exit(0) freezes the scope, and LIVE
+# moves by exactly the payload count.
+fn hold_src() -> str {
+    return "fn main() -> int uses IO {\n" +
+        "    let a: list[str] = args()\n" +
+        "    let mut keep: int = 3\n" +
+        "    if a.len() > 1 {\n" +
+        "        keep = a.get(1).to_int()\n" +
+        "    }\n" +
+        "    let held: list[str] = []\n" +
+        "    let mut i: int = 0\n" +
+        "    while i < keep {\n" +
+        "        held.push(\"payload-\" + i.to_str())\n" +
+        "        i = i + 1\n" +
+        "    }\n" +
+        "    println(\"held=\" + held.len().to_str())\n" +
+        "    exit(0)\n" +
+        "    return 0\n" +
+        "}\n"
+}
+
+# ----------------------------------------------------------------------------
+# 1. the convention and the refusal matrix
+# ----------------------------------------------------------------------------
+
+fn sec1(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 1 — the convention and the refusal matrix")
+    let p1: RunResult = rss_run(["--cycles", "4", "no-such-file.hls"])
+    chk(acc, p1.code == 2 && p1.err.contains("no such workload"),
+        "a missing workload is a usage failure (exit 2)")
+    let p2: RunResult = rss_run(["--cycles", "4", "README.md"])
+    chk(acc, p2.code == 2 && p2.err.contains("must be a .hls program"),
+        "a non-.hls argument is a usage failure (exit 2)")
+
+    let bads: list[list[str]] = [
+        ["--cycles", "2", "x.hls"],
+        ["--interval", "0.5", "x.hls"],
+        ["--bootstrap", "10", "x.hls"],
+        ["--warmup", "0", "--cycles", "10", "x.hls"],
+    ]
+    let whys: list[str] = [
+        "cycles < 3",
+        "interval < 1 ms",
+        "bootstrap < 100",
+        "warmup < 1",
+    ]
+    let mut i: int = 0
+    while i < bads.len() {
+        let p: RunResult = rss_run(bads.get(i))
+        chk(acc, p.code == 2, "bad option (" + whys.get(i) + ") refused with exit 2")
+        i = i + 1
+    }
+
+    # A malformed marker: the record line must parse exactly.
+    let malformed: str = write_src(acc, "malformed.hls",
+        "fn main() -> int uses IO {\n" +
+        "    println(\"__HLRSS_CYCLE__ soon\")\n" +
+        "    return 0\n" +
+        "}\n")
+    let p3: RunResult = rss_run(["--cycles", "5", malformed])
+    chk(acc, p3.code == 1 && p3.err.contains("malformed cycle marker"),
+        "a malformed marker is a loud protocol failure (exit 1)")
+
+    # A look-alike: a line CONTAINING the stem that is not a record.
+    let lookalike: str = write_src(acc, "lookalike.hls",
+        "fn main() -> int uses IO {\n" +
+        "    println(\"the magic prefix is __HLRSS_X__ (do not print this)\")\n" +
+        "    return 0\n" +
+        "}\n")
+    let p4: RunResult = rss_run(["--cycles", "5", lookalike])
+    chk(acc, p4.code == 1 && p4.err.contains("reserved stem"),
+        "a protocol look-alike corrupts the stream and fails loudly")
+
+    # A non-advancing marker: indices must strictly increase.
+    let rewind: str = write_src(acc, "rewind.hls",
+        "fn main() -> int uses IO {\n" +
+        "    println(\"__HLRSS_CYCLE__ 0\")\n" +
+        "    println(\"__HLRSS_CYCLE__ 0\")\n" +
+        "    return 0\n" +
+        "}\n")
+    let p5: RunResult = rss_run(["--cycles", "5", rewind])
+    chk(acc, p5.code == 1 && p5.err.contains("does not advance"),
+        "a non-advancing marker is a protocol failure")
+
+    # Ordinary output survives: noise lines are captured, never fatal.
+    let noisy: str = write_src(acc, "noisy.hls",
+        "fn main() -> int uses IO {\n" +
+        "    let mut i: int = 0\n" +
+        "    while i < 9 {\n" +
+        "        println(\"worker \" + i.to_str() + \" says things\")\n" +
+        "        println(\"__HLRSS_CYCLE__ \" + i.to_str())\n" +
+        "        i = i + 1\n" +
+        "    }\n" +
+        "    return 0\n" +
+        "}\n")
+    let p6: RunResult = rss_run(["--cycles", "6", "--warmup", "3", noisy])
+    chk(acc, (p6.code == 0 || p6.code == 1)
+        && !p6.err.contains("protocol error"),
+        "a workload that talks between markers measures cleanly")
+}
+
+# ----------------------------------------------------------------------------
+# 2. the sampler and the protocol shape
+# ----------------------------------------------------------------------------
+
+fn sec2(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 2 — the sampler and the protocol shape")
+    let fx_json: str = scratch(acc, "fx.json")
+    let p: RunResult = rss_run(["--cycles", "30", "--warmup", "10",
+        "--bootstrap", "200", "--json", fx_json, fixture_path()])
+    chk(acc, p.code == 0, "the fixture certifies STABLE through the CLI")
+    let blob: JsonValue = json_parse(read_or(fx_json, ""))
+    let run_a: JsonValue = json_object_get(blob, "run_a")
+    chk(acc, json_is_int(json_object_get(run_a, "observed_markers"))
+        && jint(run_a, "observed_markers") == 40,
+        "a cooperative run observes exactly the requested 40 markers")
+    let cps: JsonValue = json_object_get(run_a, "cycle_points")
+    let mut points_ok: bool = json_is_array(cps) && cps.arr.len() >= 8
+    let mut i: int = 0
+    while points_ok && i < cps.arr.len() {
+        let c: JsonValue = cps.arr.get(i)
+        let pages: JsonValue = c.arr.get(2)
+        if json_is_int(pages) {
+            if json_int_value(pages) <= 0 {
+                points_ok = false
+            }
+        } else if json_is_float(pages) {
+            if json_float_value(pages) <= 0.0 {
+                points_ok = false
+            }
+        } else {
+            points_ok = false
+        }
+        i = i + 1
+    }
+    chk(acc, points_ok,
+        "cycle-aligned points exist and every page count is positive "
+            + "(zombie and pre-exec reads never enter the trace)")
+    let mut advance_ok: bool = json_is_array(cps) && cps.arr.len() >= 2
+    i = 0
+    while advance_ok && i < cps.arr.len() - 1 {
+        if json_int_value(cps.arr.get(i).arr.get(0))
+            >= json_int_value(cps.arr.get(i + 1).arr.get(0)) {
+            advance_ok = false
+        }
+        i = i + 1
+    }
+    chk(acc, advance_ok, "the marker indices in the trace strictly advance")
+    let run_b: JsonValue = json_object_get(blob, "run_b")
+    chk(acc, json_is_int(json_object_get(run_b, "observed_markers"))
+        && jint(run_b, "observed_markers") == 10,
+        "run B (warmup-only) observed exactly its 10 markers")
+    chk(acc, json_object_has(blob, "retained")
+        && !json_is_null(json_object_get(blob, "retained")),
+        "the retained instrument ran (both runs cooperative)")
+
+    # A program that prints no markers: the time-based fallback, labelled.
+    let quiet: str = write_src(acc, "quiet.hls",
+        "fn main() -> int uses IO {\n" +
+        "    let mut i: int = 0\n" +
+        "    let mut acc: int = 0\n" +
+        "    while i < 400000 {\n" +
+        "        let s: str = \"x\" + i.to_str()\n" +
+        "        acc = acc + s.len()\n" +
+        "        i = i + 1\n" +
+        "    }\n" +
+        "    println(\"acc=\" + acc.to_str())\n" +
+        "    return 0\n" +
+        "}\n")
+    let p2: RunResult = rss_run(["--cycles", "30", quiet])
+    chk(acc, p2.out.contains("none (time-based analysis)"),
+        "a marker-less program is analysed against time and says so")
+}
+
+# ----------------------------------------------------------------------------
+# 3. the statistics against hand-computed values
+# ----------------------------------------------------------------------------
+
+fn sec3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 3 — the statistics against hand-computed values")
+    let driver: str = write_src(acc, "rss_mod_driver.py", mod_driver_src())
+    let out: str = run_capture("python3", [driver, "numerics"]).out
+
+    # Theil-Sen: for (0,0), (1,1), (2,2), (10,1) the pairwise slopes are
+    # 1,1,0.1,1,0.1,0.1 -> median 0.55 = (0.1+1)/2.
+    chk(acc, out.contains("ts_slope_ok=1") && line_value(out, "ts_pairs=") == "6",
+        "theil-sen matches the hand-computed median of pairwise slopes")
+    chk(acc, out.contains("ts_line_ok=1"), "a perfect line's theil-sen slope is exact")
+    chk(acc, out.contains("ts_single=1"),
+        "theil-sen refuses data with no distinct-x pairs")
+
+    # The bootstrap: same seed -> same interval, byte for byte (the two
+    # printed intervals must be identical strings).
+    let a1: str = line_value(out, "boot_a1=")
+    let a2: str = line_value(out, "boot_a2=")
+    chk(acc, a1 != "" && a1 == a2, "the seeded bootstrap is byte-deterministic")
+    chk(acc, out.contains("flat_ok=1"),
+        "constant data collapses the CI to the point (no slope)")
+
+    # Decimation: cap respected, endpoints kept.
+    chk(acc, line_value(out, "dec_len=").to_int() <= 500
+        && line_value(out, "dec_first=") == "0"
+        && line_value(out, "dec_last=") == "2999",
+        "decimation caps the fit and keeps both endpoints")
+    chk(acc, out.contains("dec_small=1"), "small traces pass decimation untouched")
+
+    # Quantile on sorted data (linear interpolation).
+    chk(acc, out.contains("q50=1"), "the median quantile interpolates")
+    chk(acc, out.contains("q25=1"), "the lower quartile interpolates")
+
+    # The verdict lattice (the slope classifier's contract).
+    let vout: str = run_capture("python3", [driver, "verdicts"]).out
+    chk(acc, line_value(vout, "stable_v=") == "stable",
+        "a flat trace certifies STABLE")
+    chk(acc, line_value(vout, "leak_v=") == "leak",
+        "a +3 page/cycle trace is LEAK (CI above the threshold)")
+    chk(acc, line_value(vout, "slow_v=") == "stable",
+        "a +0.01 page/cycle trace is within the default threshold")
+    chk(acc, line_value(vout, "comp1=") == "stable",
+        "a clean sheet composes STABLE")
+    chk(acc, line_value(vout, "comp2=") == "leak", "any leak composes LEAK")
+    chk(acc, line_value(vout, "comp3=") == "inconclusive",
+        "an unresolved question composes INCONCLUSIVE")
+}
+
+# base_lookup(names, lives, name) — the battery's base dict lookup.
+fn base_lookup(names: list[str], lives: list[int], name: str) -> int {
+    let mut i: int = 0
+    while i < names.len() {
+        if names.get(i) == name {
+            return lives.get(i)
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# ----------------------------------------------------------------------------
+# 4. the interposer and the fresh-builtin census
+# ----------------------------------------------------------------------------
+
+fn sec4(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 4 — the interposer and the fresh-builtin census")
+    let driver: str = write_src(acc, "rss_mod_driver.py", mod_driver_src())
+
+    # The verifier's report parser: no report, a corrupt line, and a
+    # report whose LIVE identity does not close are all refused.
+    let empty_r: str = write_src(acc, "ip_empty.bin", "")
+    chk(acc, run_capture("python3",
+            [driver, "parse_interposer", empty_r]).out.trim() == "NONE",
+        "no report is no counters (refused, not zeroed)")
+    let corrupt: str = write_src(acc, "ip_corrupt.bin", "HL_RSS_MALLOC=x\n")
+    chk(acc, run_capture("python3",
+            [driver, "parse_interposer", corrupt]).out.trim() == "NONE",
+        "a corrupt report line is refused")
+    let broken: str = write_src(acc, "ip_broken.bin",
+        "HL_RSS_MALLOC=1\nHL_RSS_CALLOC=0\n" +
+        "HL_RSS_REALLOC=0\nHL_RSS_REALLOC_NULL=0\nHL_RSS_REALLOC_ZERO=0\n" +
+        "HL_RSS_FREE=1\nHL_RSS_FOREIGN_FREE=0\nHL_RSS_LIVE=5\n" +
+        "HL_RSS_OVERFLOW=0\n")
+    chk(acc, run_capture("python3",
+            [driver, "parse_interposer", broken]).out.trim() == "NONE",
+        "a report whose LIVE identity does not close is refused")
+
+    if !native_ok() {
+        println("  [SKIP] native half (bin/hlc or gcc missing)")
+        return
+    }
+
+    # The census: every fresh-result builtin the Stage 125 expr_fresh
+    # fix registered must BALANCE under the interposer — LIVE
+    # independent of the call count, mallocs growing linearly with it.
+    let census: str = write_src(acc, "census.hls", census_src())
+    let census_bin: str = scratch(acc, "census.bin")
+    if !interpose_build(acc, census, census_bin) {
+        chk(acc, false, "the census probe builds under the interposer")
+        return
+    }
+    let modes: list[str] = ["join", "env_get", "cwd_get", "sys_hostname",
+        "fs_read_dir", "read_line"]
+    let mut base_names: list[str] = []
+    let mut base_lives: list[int] = []
+    let mut balanced: bool = true
+    let mut m: int = 0
+    while m < modes.len() {
+        let arg: str = m.to_str()
+        let r1: RunResult = run_capture(census_bin, [arg])
+        let r2: RunResult = run_capture(census_bin, [arg])
+        let live1: int = rss_counter(r1.err, "LIVE")
+        let live2: int = rss_counter(r2.err, "LIVE")
+        if live1 < 0 || live1 != live2 || live1 > 32 {
+            balanced = false
+            fail_msg(acc, "census " + modes.get(m) + ": LIVE "
+                + live1.to_str() + "/" + live2.to_str()
+                + " (expected a small constant)")
+        } else {
+            base_names.push(modes.get(m))
+            base_lives.push(live1)
+        }
+        m = m + 1
+    }
+    # the battery's detail: ", ".join("%s=%d" % kv for kv in sorted(...))
+    let order: list[str] = ["cwd_get", "env_get", "fs_read_dir", "join",
+        "read_line", "sys_hostname"]
+    let mut detail: str = ""
+    let mut oi: int = 0
+    while oi < order.len() {
+        let mut mi: int = 0
+        while mi < base_names.len() {
+            if base_names.get(mi) == order.get(oi) {
+                if detail != "" {
+                    detail = detail + ", "
+                }
+                detail = detail + order.get(oi) + "="
+                    + base_lives.get(mi).to_str()
+            }
+            mi = mi + 1
+        }
+        oi = oi + 1
+    }
+    chk(acc, balanced && base_names.len() == 6,
+        "every fresh-result builtin balances: LIVE is a small "
+            + "constant across runs (" + detail + ")")
+
+    let c_join: RunResult = run_capture(census_bin, ["0"])
+    chk(acc, rss_counter(c_join.err, "MALLOC") > 1000,
+        "the census really churned (thousands of tracked mallocs)")
+    # cwd_get hands libc's getcwd buffer back to free(): a FOREIGN
+    # free, not a misbalance (the counting-only draft read LIVE=-1994
+    # here).
+    let c_cwd: RunResult = run_capture(census_bin, ["2"])
+    chk(acc, rss_counter(c_cwd.err, "FOREIGN_FREE") == 2000
+        && rss_counter(c_cwd.err, "LIVE") == base_lookup(base_names,
+            base_lives, "cwd_get"),
+        "cwd_get's libc buffers are FOREIGN_FREE, not a misbalance ("
+            + rss_counter(c_cwd.err, "FOREIGN_FREE").to_str()
+            + " foreign frees)")
+    chk(acc, rss_counter(c_join.err, "OVERFLOW") == 0,
+        "the tracking table never overflowed")
+
+    # The retained shape: an in-scope exit(0) freezes the scope, and
+    # LIVE moves by exactly the payload count.
+    let hold: str = write_src(acc, "hold.hls", hold_src())
+    let hold_bin: str = scratch(acc, "hold.bin")
+    if !interpose_build(acc, hold, hold_bin) {
+        chk(acc, false, "the retained probe builds under the interposer")
+        return
+    }
+    let h_small: RunResult = run_capture(hold_bin, ["3"])
+    let h_big: RunResult = run_capture(hold_bin, ["53"])
+    let d_live: int = rss_counter(h_big.err, "LIVE")
+        - rss_counter(h_small.err, "LIVE")
+    chk(acc, d_live == 100,
+        "an in-scope exit(0) holds exactly its payloads at exit (LIVE "
+            + "delta " + d_live.to_str() + " for 50 more payloads — two "
+            + "heap blocks per str: the hl_str and its data)")
+}
+
+# ----------------------------------------------------------------------------
+# 5. the report layout and the JSON payload
+# ----------------------------------------------------------------------------
+
+fn sec5(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 5 — the report layout and the JSON payload")
+    let p: RunResult = rss_run(["--cycles", "20", "--warmup", "5",
+        "--bootstrap", "200", churn_path()])
+    let needles: list[str] = [
+        "hls-rss 0.143.0-alpha",
+        "plan: warmup 5 + measured 20 cycles",
+        "timeline (external sampler, /proc/<pid>/statm)",
+        "slope:",
+        "threshold:",
+        "retained (two-run, malloc interposer)",
+        "live delta:",
+        "RSS STABLE",
+    ]
+    let whys: list[str] = [
+        "the header names the tool and version",
+        "the plan line",
+        "the timeline block",
+        "the slope line",
+        "the threshold line",
+        "the retained block",
+        "the live delta line",
+        "the composed verdict",
+    ]
+    let mut i: int = 0
+    while i < needles.len() {
+        chk(acc, p.out.contains(needles.get(i)), whys.get(i))
+        i = i + 1
+    }
+    chk(acc, p.code == 0, "the churn lib certifies STABLE (exit 0)")
+
+    let jp: str = scratch(acc, "churn.json")
+    rss_run(["--cycles", "20", "--warmup", "5", "--bootstrap", "200",
+        "--json", jp, churn_path()])
+    let blob: JsonValue = json_parse(read_or(jp, ""))
+    chk(acc, jstr(blob, "verdict") == "stable" && jstr(blob, "tool") == "hls-rss",
+        "the JSON payload carries the tool and the composed verdict")
+    let slope_v: JsonValue = json_object_get(blob, "slope")
+    let ci: JsonValue = json_object_get(slope_v, "ci")
+    let lo: float = jnum(ci.arr.get(0))
+    let s: float = jnum(json_object_get(slope_v, "slope"))
+    let hi: float = jnum(ci.arr.get(1))
+    chk(acc, (lo <= s && s <= hi) || s == 0.0,
+        "the slope sits inside its own CI (or is exactly zero)")
+    let timeline: JsonValue = json_object_get(json_object_get(blob, "run_a"),
+        "timeline")
+    chk(acc, json_is_array(timeline) && timeline.arr.len() > 0,
+        "the raw ticker trace ships in the payload")
+    chk(acc, jint(json_object_get(blob, "retained"), "live_delta") == 0,
+        "the payload carries the exact-free live delta (0)")
+    chk(acc, jint(json_object_get(blob, "config"), "cycles") == 20
+        && jint(json_object_get(blob, "config"), "warmup") == 5,
+        "the payload echoes the plan it ran")
+}
+
+# ----------------------------------------------------------------------------
+# 6. the two-run comparison and the honest skips
+# ----------------------------------------------------------------------------
+
+fn sec6(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 6 — the two-run comparison and the honest skips")
+    let p: RunResult = rss_run(["--cycles", "20", "--warmup", "5",
+        "--bootstrap", "200", churn_path()])
+    chk(acc, p.out.contains("live delta:        0 objects (slack 0)"),
+        "the churn lib's two runs hold the same live set (delta 0)")
+    chk(acc, p.out.contains("the retained set is independent of the work volume"),
+        "the retained verdict states the exact-free property")
+
+    # A workload that ignores argv[1]: the retained instrument skips
+    # itself, honestly, and the timeline stands alone.
+    let fixedcyc: str = write_src(acc, "fixedcyc.hls",
+        "fn main() -> int uses IO {\n" +
+        "    let mut i: int = 0\n" +
+        "    while i < 24 {\n" +
+        "        let s: str = \"tick-\" + i.to_str()\n" +
+        "        println(s)\n" +
+        "        println(\"__HLRSS_CYCLE__ \" + i.to_str())\n" +
+        "        i = i + 1\n" +
+        "    }\n" +
+        "    return 0\n" +
+        "}\n")
+    let p2: RunResult = rss_run(["--cycles", "40", "--warmup", "8", fixedcyc])
+    chk(acc, p2.out.contains("does not follow the argv[1] cycle convention"),
+        "an argv-ignoring workload gets the honest retained skip")
+    chk(acc, p2.code == 0 || p2.code == 1,
+        "the run itself is judged by its timeline alone")
+
+    # --no-malloc-count: the instrument is off, the skip says why.
+    let p3: RunResult = rss_run(["--cycles", "20", "--warmup", "5",
+        "--bootstrap", "200", "--no-malloc-count", churn_path()])
+    chk(acc, p3.out.contains("skipped") && p3.out.contains("RSS STABLE"),
+        "--no-malloc-count skips the balance and the timeline certifies "
+            + "alone")
+}
+
+# ----------------------------------------------------------------------------
+# 7. the differential and the leak matrix
+# ----------------------------------------------------------------------------
+
+fn sec7(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 7 — the differential and the leak matrix")
+    if !native_ok() {
+        println("  [SKIP] native half (bin/hlc or gcc missing)")
+        return
+    }
+    let fx: str = fixture_path()
+    let a: RunResult = boot_run([fx])
+    let fc: str = scratch(acc, "fixture.c")
+    let fb: str = scratch(acc, "fixture.bin")
+    let r: RunResult = run_capture("./bin/hlc", [fx, fc])
+    let r2: RunResult = run_capture("gcc", ["-O2", "-o", fb, fc, "-lm", "-pthread"])
+    if r.code == 0 && r2.code == 0 {
+        let b: RunResult = run_capture(fb, [])
+        chk(acc, b.out == a.out && b.code == a.code,
+            "the ok fixture is byte-identical on interpreter and native")
+    } else {
+        chk(acc, false, "the fixture compiles natively")
+    }
+
+    # The leak matrix: churn STABLE, server STABLE, canary LEAK with
+    # BOTH instruments firing.
+    let p: RunResult = rss_run(["--cycles", "20", "--warmup", "5",
+        "--bootstrap", "200", server_path()])
+    chk(acc, p.code == 0 && p.out.contains("RSS STABLE"),
+        "the server lib (json parse + stringify per request) "
+            + "certifies STABLE")
+    let p2: RunResult = rss_run(["--cycles", "40", "--warmup", "10",
+        "--bootstrap", "200", canary_path()])
+    let both: bool = p2.out.contains("slope CI entirely above the threshold")
+        && p2.out.contains("more live objects at exit")
+    chk(acc, p2.code == 1 && p2.out.contains("RSS LEAK") && both,
+        "the canary earns LEAK with both instruments firing")
+
+    # The hoisting-cycle regression: the Stage 121 corpus shape (a
+    # match inside a concat inside a call argument) — infinite mutual
+    # recursion between hoist_all and gen_expr at Stage 124 and every
+    # earlier release; fixed in Stage 125's two-phase hoist_all.
+    # Compile, run, and balance-check it.
+    let mc: str = write_src(acc, "matchconcat.hls",
+        "enum Kind {\n" +
+        "    Food(int),\n" +
+        "    Tool(int)\n" +
+        "}\n" +
+        "\n" +
+        "fn main() uses IO {\n" +
+        "    let k: Kind = Kind.Food(1)\n" +
+        "    println(\"kind \" +\n" +
+        "    match k {\n" +
+        "        Kind.Food(_) => \"food\",\n" +
+        "        Kind.Tool(_) => \"tool\"\n" +
+        "    })\n" +
+        "    return\n" +
+        "}\n")
+    let mcc: str = scratch(acc, "mc.c")
+    let mcb: str = scratch(acc, "mc.bin")
+    let rm: RunResult = run_capture("./bin/hlc", [mc, mcc])
+    if rm.code == 0 {
+        let rm2: RunResult = run_capture("gcc", ["-O2", "-o", mcb, mcc,
+            wrap_path(), "-lm", "-pthread",
+            "-Wl,--wrap=malloc", "-Wl,--wrap=calloc",
+            "-Wl,--wrap=realloc", "-Wl,--wrap=free"])
+        if rm2.code == 0 {
+            let rr: RunResult = run_capture(mcb, [])
+            let cnt: RunResult = run_capture(mcb, [])
+            let live: int = rss_counter(cnt.err, "LIVE")
+            let live_s: str = live.to_str()
+            chk(acc, rr.out.trim() == "kind food",
+                "the match-in-concat program runs and prints its answer")
+            chk(acc, live >= 0 && live <= 32,
+                "the match-in-concat program leaks nothing (LIVE="
+                    + live_s + ")")
+        } else {
+            chk(acc, false, "the match-in-concat program links")
+        }
+    } else {
+        chk(acc, false, "the match-in-concat program compiles (the "
+            + "hoisting-cycle fix)")
+    }
+}
+
+fn boot_run(args: list[str]) -> RunResult uses Proc {
+    let argv: list[str] = ["tools/hlinterp/boot.py"]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    return run_capture("python3", argv)
+}
+
+# ----------------------------------------------------------------------------
+# 8. corpus hygiene
+# ----------------------------------------------------------------------------
+
+fn collect_litter(dir: str) -> list[str] uses Fs {
+    let out: list[str] = []
+    let entries: list[str] = fs_read_dir(dir)
+    let mut i: int = 0
+    while i < entries.len() {
+        let f: str = basename(entries.get(i))
+        if f.starts_with("hlrss-") || f.starts_with("_gate_s125_") {
+            out.push(f)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn sec8(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 8 — corpus hygiene")
+    let files: list[str] = [fixture_path(), churn_path(), server_path(),
+        canary_path()]
+    let mut i: int = 0
+    while i < files.len() {
+        let p: RunResult = run_capture("./bin/hlfmt", ["-c", files.get(i)])
+        chk(acc, p.out.contains("already formatted"),
+            basename(files.get(i)) + " is hlfmt-canonical")
+        i = i + 1
+    }
+    let li: RunResult = run_capture("python3", ["tools/hllint.py", fixture_path()])
+    chk(acc, li.out.contains("no warnings"), "the fixture is hllint-clean")
+    let bc: RunResult = boot_run(["--check", fixture_path()])
+    chk(acc, bc.out.contains("OK: types and effects valid"),
+        "the fixture boots through the real checker")
+
+    let litter1: list[str] = collect_litter("tests")
+    let litter2: list[str] = collect_litter("tests/rss_libs")
+    let mut names: list[str] = []
+    let mut k: int = 0
+    while k < litter1.len() {
+        names.push(litter1.get(k))
+        k = k + 1
+    }
+    k = 0
+    while k < litter2.len() {
+        names.push(litter2.get(k))
+        k = k + 1
+    }
+    let mut joined: str = ""
+    k = 0
+    while k < names.len() {
+        if joined != "" {
+            joined = joined + ", "
+        }
+        joined = joined + names.get(k)
+        k = k + 1
+    }
+    let mut detail: str = joined
+    if detail == "" {
+        detail = "clean"
+    }
+    chk(acc, names.len() == 0,
+        "no gate temp files survive anywhere (" + detail + ")")
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let acc: Acc = acc_new("rss")
+    sec1(acc)
+    sec2(acc)
+    sec3(acc)
+    sec4(acc)
+    sec5(acc)
+    sec6(acc)
+    sec7(acc)
+    sec8(acc)
+    return finish(acc, "Stage 125 -- hls-rss (the RSS-stability verifier)")
+}
