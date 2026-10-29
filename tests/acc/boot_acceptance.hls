@@ -1,0 +1,1101 @@
+# ============================================================================
+# tests/acc/boot_acceptance.hls — Stage 85 acceptance gate, in Halis
+# (the Halis twin of tests/boot_acceptance.py; same seven sections,
+# same assertions, same needles — the harness is tests/acc/harness.hls
+# and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make boot-acceptance` (which compiles this file to
+# bin/acc-boot and runs it from the repo root).
+#
+# The old battery wrote its probes into a temp dir one level under
+# tests/ and pointed `#![link_script]` at "../../link.ld"; this gate's
+# scratch tree sits deeper (tests/.acc-scratch/boot/), so the crates
+# it writes name the shipped script by its absolute repo path — the
+# same script, the same placement law (the pattern link_acceptance
+# established). Everything else is 1:1.
+#
+#  1. crate attributes + guards — `#![boot_header]` parses, takes a bare
+#                                protocol identifier, is entry-file-only,
+#                                requires `#![freestanding]`, appears at
+#                                most once, and every fail program is
+#                                rejected with the SAME diagnostic by BOTH
+#                                compilers
+#  2. core/boot.hls             — the module's enums / structs / surface,
+#                                its `core.*`-only imports, and no
+#                                effects
+#  3. the emitted header        — the Multiboot2 magic, the 40-byte
+#                                length and the checksum are in the
+#                                emitted C; the Limine delimiters and
+#                                request IDs are there; `used` is on the
+#                                blob (so --gc-sections cannot drop the
+#                                bytes a firmware scans for)
+#  4. the LINKED image          — `objdump` shows the header in
+#                                `.multiboot_header` / `.limine_requests`
+#                                after a real `-T link.ld` link, and the
+#                                bytes are the ones the spec says
+#  5. the Stage 84 integration  — a linker script that does not KEEP the
+#                                header section is a COMPILE error
+#                                (the failure this stage exists to stop)
+#  6. behaviour probes          — the protocol model: the checksum rule,
+#                                tag walking, both wire encodings of the
+#                                memory map, reclaimability, the
+#                                physical-memory-manager questions, the
+#                                framebuffer, and the boot report
+#  7. the demos + tools         — boot_demo runs identically on the
+#                                interpreter and natively, boot_kernel
+#                                links as a freestanding image,
+#                                hlfmt/hllint are clean, and `--audit`
+#                                reports the header on both front-ends
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.regex"
+
+# ----------------------------------------------------------------------------
+# The gate's data.
+# ----------------------------------------------------------------------------
+
+struct FailP {
+    name: str,
+    needle: str,
+    desc: str
+}
+
+struct PanicP {
+    name: str,
+    needle: str,
+    desc: str
+}
+
+struct ProbeP {
+    name: str,
+    body: str,
+    desc: str
+}
+
+struct HlcRun {
+    code: int,
+    out: str
+}
+
+struct Img {
+    ok: bool,
+    path: str,
+    err: str
+}
+
+fn ok_test() -> str {
+    return "tests/ok/feat_stage85_boot.hls"
+}
+
+fn demo() -> str {
+    return "examples/boot_demo.hls"
+}
+
+fn kernel() -> str {
+    return "examples/boot_kernel.hls"
+}
+
+fn core_boot() -> str {
+    return "core/boot.hls"
+}
+
+fn fail_programs() -> list[FailP] {
+    return [
+        FailP { name: "fail_stage85_boot_protocol", needle: "unknown boot protocol",
+                desc: "an unknown protocol name" },
+        FailP { name: "fail_stage85_boot_notident", needle: "expects a protocol name",
+                desc: "a string instead of an identifier" },
+        FailP { name: "fail_stage85_boot_hosted", needle: "requires #![freestanding]",
+                desc: "a boot header in a hosted crate" },
+        FailP { name: "fail_stage85_boot_dup", needle: "duplicate crate attribute",
+                desc: "two #[boot_header] declarations" },
+        FailP { name: "fail_stage85_boot_unplaced", needle: "does not place",
+                desc: "a linker script that drops the header section" },
+    ]
+}
+
+fn panic_programs() -> list[PanicP] {
+    return [
+        PanicP { name: "panic_stage85_memregion", needle: "mem_region_new: length must be >= 0",
+                 desc: "a negative-length region" },
+        PanicP { name: "panic_stage85_fbpitch", needle: "pitch is narrower than one line of pixels",
+                 desc: "a framebuffer pitch below one line" },
+        PanicP { name: "panic_stage85_fbsize", needle: "width and height must be positive",
+                 desc: "a zero-size framebuffer" },
+        PanicP { name: "panic_stage85_findusable", needle: "mem_find_usable: min_len must be positive",
+                 desc: "a zero-size usable-memory request" },
+    ]
+}
+
+fn probe_bodies() -> list[ProbeP] {
+    return [
+        ProbeP {
+            name: "checksum",
+            body: "\n" +
+                  "import \"core.boot\"\n" +
+                  "import \"core.section\"\n" +
+                  "fn main() -> int {\n" +
+                  "    # The spec's rule: the four header fields sum to zero, modulo 2^32.\n" +
+                  "    if mb2_checksum(mb2_magic(), 0, 40) != 397258498 { return 1 }\n" +
+                  "    if mb2_sum32(mb2_magic(), 0, 40, mb2_checksum(mb2_magic(), 0, 40)) != 0 { return 2 }\n" +
+                  "    if mb2_field32(-1) != 4294967295 { return 3 }\n" +
+                  "    if mb2_field32(4294967296) != 0 { return 4 }\n" +
+                  "    if mb2_header_ok(mb2_magic(), 0, 24, mb2_checksum(mb2_magic(), 0, 24)) != true { return 5 }\n" +
+                  "    if mb2_header_ok(mb2_magic(), 0, 24, 0) != false { return 6 }\n" +
+                  "    if mb2_header_ok(mb2_magic() + 1, 0, 24, 0) != false { return 7 }\n" +
+                  "    return 0\n" +
+                  "}\n",
+            desc: "the Multiboot2 checksum rule, in 32-bit arithmetic"
+        },
+        ProbeP {
+            name: "headers",
+            body: "\n" +
+                  "import \"core.boot\"\n" +
+                  "fn main() -> int {\n" +
+                  "    let h: Mb2Header = mb2_header_new([])\n" +
+                  "    if h.length != 24 { return 1 }\n" +
+                  "    if !mb2_header_well_formed(h) { return 2 }\n" +
+                  "    if mb2_tag_present(h, mb2_tag_module()) { return 3 }\n" +
+                  "    if mb2_tag_at(h, mb2_tag_end(), 0) != 0 { return 4 }\n" +
+                  "    let mut tags: list[MbTag] = []\n" +
+                  "    tags.push(mb_tag_new(mb2_tag_cmdline(), [65, 0]))\n" +
+                  "    let h2: Mb2Header = mb2_header_new(tags)\n" +
+                  "    if !mb2_header_well_formed(h2) { return 5 }\n" +
+                  "    if mb2_tag_count(h2, mb2_tag_cmdline()) != 1 { return 6 }\n" +
+                  "    if mb_tag_payload_ok(MbTag{tag_type: 4, size: 4, payload: []}) { return 7 }\n" +
+                  "    return 0\n" +
+                  "}\n",
+            desc: "header construction, the mandatory end tag, and tag lookup"
+        },
+        ProbeP {
+            name: "memmap-encodings",
+            body: "\n" +
+                  "import \"core.boot\"\n" +
+                  "fn main() -> int {\n" +
+                  "    # E820 numbers usable as 1; Limine numbers it 0. One model, two\n" +
+                  "    # wire encodings.\n" +
+                  "    if mem_kind_id(mem_kind_from_e820(1)) != mem_kind_id(mem_kind_from_limine(0)) { return 1 }\n" +
+                  "    if mem_kind_id(mem_kind_from_e820(2)) != mem_kind_id(mem_kind_from_limine(1)) { return 2 }\n" +
+                  "    if mem_kind_id(mem_kind_from_e820(5)) != mem_kind_id(mem_kind_from_limine(4)) { return 3 }\n" +
+                  "    if mem_kind_id(mem_kind_from_limine(5)) != mem_kind_id(MemKind.BootloaderReclaimable) { return 4 }\n" +
+                  "    if mem_kind_id(mem_kind_from_e820(6)) != mem_kind_id(MemKind.Unknown) { return 5 }\n" +
+                  "    if mem_kind_code_e820(MemKind.Framebuffer) != -1 { return 6 }\n" +
+                  "    return 0\n" +
+                  "}\n",
+            desc: "E820 and Limine wire encodings land in one model"
+        },
+        ProbeP {
+            name: "reclaim",
+            body: "\n" +
+                  "import \"core.boot\"\n" +
+                  "fn main() -> int {\n" +
+                  "    # The loader's scratch is reclaimable but NOT usable now: taking it\n" +
+                  "    # on day one overwrites the page tables the kernel is running on.\n" +
+                  "    if !mem_kind_reclaimable(MemKind.BootloaderReclaimable) { return 1 }\n" +
+                  "    if mem_kind_usable_now(MemKind.BootloaderReclaimable) { return 2 }\n" +
+                  "    if !mem_kind_reclaimable(MemKind.AcpiReclaimable) { return 3 }\n" +
+                  "    if mem_kind_reclaimable(MemKind.AcpiNvs) { return 4 }\n" +
+                  "    if mem_kind_reclaimable(MemKind.BadMemory) { return 5 }\n" +
+                  "    if mem_kind_reclaimable(MemKind.Unknown) { return 6 }\n" +
+                  "    if !mem_kind_usable_now(MemKind.Usable) { return 7 }\n" +
+                  "    return 0\n" +
+                  "}\n",
+            desc: "reclaimability is ordered, and an unknown type is never free"
+        },
+        ProbeP {
+            name: "pmm",
+            body: "\n" +
+                  "import \"core.boot\"\n" +
+                  "fn main() -> int {\n" +
+                  "    let mut rs: list[MemRegion] = []\n" +
+                  "    rs.push(mem_region_new(0, 4096, MemKind.Reserved))\n" +
+                  "    rs.push(mem_region_new(4096, 65536, MemKind.Usable))\n" +
+                  "    rs.push(mem_region_new(1048576, 1048576, MemKind.Usable))\n" +
+                  "    rs.push(mem_region_new(4194304, 8192, MemKind.BootloaderReclaimable))\n" +
+                  "    if mem_usable_bytes(rs) != 1114112 { return 1 }\n" +
+                  "    if mem_reclaimable_bytes(rs) != 1122304 { return 2 }\n" +
+                  "    if mem_largest_usable(rs) != 1048576 { return 3 }\n" +
+                  "    if mem_count_usable(rs) != 2 { return 4 }\n" +
+                  "    if mem_find_usable(rs, 65536, 4096) != 4096 { return 5 }\n" +
+                  "    if mem_find_usable(rs, 65537, 4096) != 1048576 { return 6 }\n" +
+                  "    if mem_find_usable(rs, 1099511627776, 4096) != -1 { return 7 }\n" +
+                  "    if mem_contains(rs, 1048676) != 2 { return 8 }\n" +
+                  "    if mem_contains(rs, 1000000) != -1 { return 9 }\n" +
+                  "    return 0\n" +
+                  "}\n",
+            desc: "the day-one questions: totals, the largest region, first frame"
+        },
+        ProbeP {
+            name: "consistency",
+            body: "\n" +
+                  "import \"core.boot\"\n" +
+                  "fn main() -> int {\n" +
+                  "    let mut rs: list[MemRegion] = []\n" +
+                  "    rs.push(mem_region_new(0, 4096, MemKind.Reserved))\n" +
+                  "    rs.push(mem_region_new(4096, 65536, MemKind.Usable))\n" +
+                  "    rs.push(mem_region_new(1048576, 1048576, MemKind.Usable))\n" +
+                  "    if !mem_sorted(rs) { return 1 }\n" +
+                  "    if !mem_no_overlaps(rs) { return 2 }\n" +
+                  "    let mut sh: list[MemRegion] = []\n" +
+                  "    sh.push(rs.get(2))\n" +
+                  "    sh.push(rs.get(0))\n" +
+                  "    if mem_sorted(sh) { return 3 }\n" +
+                  "    if !mem_sorted(mem_sort(sh)) { return 4 }\n" +
+                  "    let mut clash: list[MemRegion] = []\n" +
+                  "    clash.push(mem_region_new(4096, 8192, MemKind.Usable))\n" +
+                  "    clash.push(mem_region_new(4096 + 4096, 8192, MemKind.Usable))\n" +
+                  "    if mem_no_overlaps(clash) { return 5 }\n" +
+                  "    let mut mixed: list[MemRegion] = []\n" +
+                  "    mixed.push(mem_region_new(4096, 8192, MemKind.Usable))\n" +
+                  "    mixed.push(mem_region_new(4096 + 4096, 8192, MemKind.Framebuffer))\n" +
+                  "    if !mem_no_overlaps(mixed) { return 6 }\n" +
+                  "    return 0\n" +
+                  "}\n",
+            desc: "a map that is unsorted or double-counts is reported, not used"
+        },
+        ProbeP {
+            name: "framebuffer",
+            body: "\n" +
+                  "import \"core.boot\"\n" +
+                  "fn main() -> int {\n" +
+                  "    let fb: Framebuffer = fb_new(1073741824, 640, 480, 4096, 32, FbKind.Rgb)\n" +
+                  "    if fb_size(fb) != 4096 * 480 { return 1 }\n" +
+                  "    if fb_min_pitch(fb) != 2560 { return 2 }\n" +
+                  "    if !fb_geometry_ok(fb) { return 3 }\n" +
+                  "    # firmware data goes through fb_raw, so a parser never panics\n" +
+                  "    if fb_geometry_ok(fb_raw(0, 640, 480, 4096, 32, FbKind.Rgb)) { return 4 }\n" +
+                  "    if fb_geometry_ok(fb_raw(1073741824, 640, 480, 2048, 32, FbKind.Rgb)) { return 5 }\n" +
+                  "    if fb_geometry_ok(fb_raw(1073741824, 640, 480, 4096, 15, FbKind.Rgb)) { return 6 }\n" +
+                  "    return 0\n" +
+                  "}\n",
+            desc: "the pitch is the firmware's, and a bad mode is a value to reject"
+        },
+        ProbeP {
+            name: "limine-ids",
+            body: "\n" +
+                  "import \"core.boot\"\n" +
+                  "import \"core.section\"\n" +
+                  "fn main() -> int {\n" +
+                  "    let m: list[int] = limine_id_memmap()\n" +
+                  "    if m.len() != 4 { return 1 }\n" +
+                  "    # IDs are unsigned 64-bit words; in an int they arrive negative for\n" +
+                  "    # more than half of them, so hex64 must render the pattern.\n" +
+                  "    if hex64(m.get(3)) != \"0xe304acdfc50c3c62\" { return 2 }\n" +
+                  "    if hex64(m.get(2)) != \"0x67cf3d9d378a806f\" { return 3 }\n" +
+                  "    if !limine_id_is(m, limine_id_memmap()) { return 4 }\n" +
+                  "    if limine_id_is([m.get(0), m.get(1), m.get(2), 0], limine_id_memmap()) { return 5 }\n" +
+                  "    if limine_id_name(limine_id_rsdp()) != \"rsdp\" { return 6 }\n" +
+                  "    if limine_id_name([1, 2, 3, 4]) != \"\" { return 7 }\n" +
+                  "    let rev: list[int] = limine_base_revision(3)\n" +
+                  "    rev.set(2, 0)\n" +
+                  "    if !limine_base_revision_honoured(rev) { return 8 }\n" +
+                  "    if limine_base_revision_honoured(limine_base_revision(3)) { return 9 }\n" +
+                  "    return 0\n" +
+                  "}\n",
+            desc: "request IDs are compared exactly and rendered unsigned"
+        },
+        ProbeP {
+            name: "report",
+            body: "\n" +
+                  "import \"core.boot\"\n" +
+                  "fn main() -> int {\n" +
+                  "    let mut rs: list[MemRegion] = []\n" +
+                  "    rs.push(mem_region_new(0, 4096, MemKind.Reserved))\n" +
+                  "    rs.push(mem_region_new(4096, 65536, MemKind.Usable))\n" +
+                  "    let fb: Framebuffer = fb_new(1073741824, 640, 480, 4096, 32, FbKind.Rgb)\n" +
+                  "    let r: str = boot_report(\"limine\", rs, fb, true)\n" +
+                  "    if r.find(\"1 usable region\") < 0 { return 1 }\n" +
+                  "    if r.find(\"640x480\") < 0 { return 2 }\n" +
+                  "    if boot_report(\"limine\", rs, fb, false).find(\"framebuffer: none\") < 0 { return 3 }\n" +
+                  "    let mut none: list[MemRegion] = []\n" +
+                  "    none.push(mem_region_new(0, 4096, MemKind.Reserved))\n" +
+                  "    if boot_report(\"limine\", none, fb, true).find(\"no usable memory\") < 0 { return 4 }\n" +
+                  "    return 0\n" +
+                  "}\n",
+            desc: "the boot report names the protocol and warns about a bad map"
+        },
+    ]
+}
+
+fn core_fns() -> list[str] {
+    return ["mb2_magic", "mb2_checksum", "mb2_header_ok",
+            "mb2_header_well_formed", "mb2_tag_at", "mb2_tag_name",
+            "limine_id_memmap", "limine_id_framebuffer", "limine_id_rsdp",
+            "limine_id_hhdm", "limine_id_end", "limine_id_start",
+            "limine_base_revision", "limine_base_revision_honoured",
+            "limine_id_is", "limine_features_unique",
+            "mem_kind_from_e820", "mem_kind_from_limine",
+            "mem_kind_reclaimable", "mem_kind_usable_now",
+            "mem_usable_bytes", "mem_reclaimable_bytes",
+            "mem_largest_usable", "mem_find_usable", "mem_sorted",
+            "mem_sort", "mem_no_overlaps", "mem_contains",
+            "mem_report", "fb_new", "fb_raw", "fb_geometry_ok",
+            "fb_size", "fb_min_pitch", "fb_report", "boot_report"]
+}
+
+# ----------------------------------------------------------------------------
+# Shared legs.
+# ----------------------------------------------------------------------------
+
+# normalise(text) — strip the two front-ends' error-kind prefixes so the
+# MESSAGE and the line:col are what gets compared (the battery's own
+# normalise(): `^panic: ` then `^[a-z ]*error: `).
+fn normalise(text: str) -> str {
+    let mut out: str = text.trim()
+    if out.starts_with("panic: ") {
+        out = out.slice(7, out.len())
+    }
+    let idx: int = out.find("error: ")
+    if idx >= 0 {
+        let mut plain: bool = true
+        let mut i: int = 0
+        while i < idx {
+            let b: int = out.byte_at(i)
+            if !((b >= 97 && b <= 122) || b == 32) {
+                plain = false
+            }
+            i = i + 1
+        }
+        if plain {
+            out = out.slice(idx + 7, out.len())
+        }
+    }
+    return out
+}
+
+fn decl_word(src: str, kw: str, name: str) -> bool {
+    let rr: Result[Regex, str] = regex_compile(kw + "\\s+" + name + "\\b")
+    if result_is_err(rr) {
+        return false
+    }
+    let re: Regex = result_unwrap(rr)
+    return regex_is_match(re, src)
+}
+
+# import_paths(src) — every `^import "..."` in source order (the
+# battery's re.findall with re.M: the import keyword at column 0).
+fn import_paths(src: str) -> list[str] {
+    let out: list[str] = []
+    let lines: list[str] = src.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i)
+        if line.starts_with("import \"") {
+            let tail: str = line.slice(8, line.len())
+            let end: int = tail.find("\"")
+            if end > 0 {
+                out.push(tail.slice(0, end))
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# is_comment_line(l) — the battery filters `l.lstrip().startswith("#")`.
+fn is_comment_line(l: str) -> bool {
+    let mut i: int = 0
+    while i < l.len() {
+        let b: int = l.byte_at(i)
+        if b == 32 || b == 9 {
+            i = i + 1
+        } else {
+            return b == 35
+        }
+    }
+    return false
+}
+
+# hlc_run(acc, src) — compile + link + run a HOSTED Halis program;
+# code is -1 when a build step failed (the battery's None), out is
+# stdout+stderr of the run (or the build output that failed).
+fn hlc_run(acc: Acc, src: str) -> HlcRun uses Fs, Proc {
+    let hr: HlcRun = HlcRun { code: -1, out: "" }
+    let c: str = scratch(acc, basename(src) + ".c")
+    let exe: str = scratch(acc, basename(src) + ".bin")
+    let r: RunResult = run_capture("./bin/hlc", [src, c])
+    if r.code != 0 {
+        hr.out = r.combined
+        return hr
+    }
+    let g: RunResult = run_capture("gcc", ["-O2", "-o", exe, c, "-lm", "-pthread"])
+    if g.code != 0 {
+        hr.out = g.err
+        return hr
+    }
+    let nat: RunResult = run_capture(exe, [])
+    hr.code = nat.code
+    hr.out = nat.combined
+    return hr
+}
+
+# link_freestanding(acc, src, out, script) — compile a freestanding image
+# and link it the way a bootloader would see it: no libc, no PIE,
+# --gc-sections, the repo's script.
+fn link_freestanding(acc: Acc, src: str, out: str, script: str) -> Img uses Fs, Proc {
+    let im: Img = Img { ok: false, path: "", err: "" }
+    let c: str = out + ".c"
+    let r: RunResult = run_capture("./bin/hlc", [src, c])
+    if r.code != 0 {
+        im.err = r.combined
+        return im
+    }
+    let g: RunResult = run_capture("gcc", ["-O2", "-ffreestanding", "-nostdlib",
+        "-fno-pie", "-no-pie", "-ffunction-sections", "-fno-stack-protector",
+        "-T", script, "-o", out, c])
+    if g.code != 0 {
+        im.err = g.err
+        return im
+    }
+    im.ok = true
+    im.path = out
+    return im
+}
+
+# swap_first_no_std(text) — the battery's re.sub(r"(?m)^#!\[no_std\]$",
+# "#![freestanding]", count=1): the first line that is EXACTLY
+# `#![no_std]` becomes `#![freestanding]`.
+fn swap_first_no_std(text: str) -> str {
+    let lines: list[str] = text.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i) == "#![no_std]" {
+            lines.set(i, "#![freestanding]")
+            break
+        }
+        i = i + 1
+    }
+    return join(lines, "\n")
+}
+
+# strip_stage85_block(script) — the battery's
+# re.sub(r"    /\* Stage 85.*?KEEP\(\*\(\.limine_requests\)\)\n    \}\n\n",
+#        "", script, flags=re.S)
+# reproduced as the scan it is: from the first `    /* Stage 85` through
+# the `.limine_requests` KEEP and its closing brace (both Stage 85 header
+# sections sit under that one comment, so the cut removes BOTH — that is
+# exactly why the probe crate then "does not place").
+fn find_from(s: str, needle: str, from: int) -> int {
+    if from < 0 || from > s.len() {
+        return -1
+    }
+    let n: int = needle.len()
+    let mut i: int = from
+    while i + n <= s.len() {
+        if s.slice(i, i + n) == needle {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn strip_stage85_block(script: str) -> str {
+    let start: int = script.find("    /* Stage 85")
+    if start < 0 {
+        return script
+    }
+    let keep: str = "KEEP(*(.limine_requests))"
+    let mid: int = find_from(script, keep, start)
+    if mid < 0 {
+        return script
+    }
+    let tail: str = "\n    }\n\n"
+    let t: int = find_from(script, tail, mid)
+    if t < 0 {
+        return script
+    }
+    return script.slice(0, start) + script.slice(t + tail.len(), script.len())
+}
+
+# ----------------------------------------------------------------------------
+# 1. crate attributes + guards
+# ----------------------------------------------------------------------------
+
+fn sec1(acc: Acc) -> void uses IO, Fs, Proc {
+    section("1. crate attributes + guards")
+    # `#![boot_header]` accepted and reported by BOTH front-ends.
+    let rb: RunResult = boot(acc, ["--audit", kernel()])
+    if rb.code == 0 && rb.out.contains("Boot header: limine") {
+        pass_msg(acc, "boot: #![boot_header] accepted and reported (boot)")
+    } else {
+        fail_msg(acc, "boot: #![boot_header] not accepted (boot): "
+            + clip(rb.combined, 120))
+    }
+    let rh: RunResult = run_capture("./bin/hlc", ["--audit", kernel()])
+    if rh.code == 0 && rh.out.contains("Boot header: limine") {
+        pass_msg(acc, "boot: #![boot_header] accepted and reported (hlc)")
+    } else {
+        fail_msg(acc, "boot: #![boot_header] not accepted (hlc): "
+            + clip(rh.combined, 120))
+    }
+    # Every fail program: rejected by boot with its diagnostic, and the
+    # SAME normalised diagnostic out of hlc (compiler parity).
+    let fails: list[FailP] = fail_programs()
+    let mut i: int = 0
+    while i < fails.len() {
+        let f: FailP = fails.get(i)
+        let path: str = "tests/fail/" + f.name + ".hls"
+        if !file_exists(path) {
+            fail_msg(acc, "boot: " + path + " missing")
+        } else {
+            let rb2: RunResult = boot_check(acc, path)
+            if rb2.code != 1 {
+                fail_msg(acc, "boot: " + f.name + " not rejected by boot")
+            } else {
+                let rh2: RunResult = run_capture("./bin/hlc", ["--audit", path])
+                if rh2.code == 0 {
+                    fail_msg(acc, "boot: " + f.name + " accepted by hlc (parity)")
+                } else {
+                    let a: str = normalise(rb2.combined)
+                    let b: str = normalise(rh2.combined)
+                    if !a.contains(f.needle) {
+                        fail_msg(acc, "boot: " + f.name
+                            + " rejected without its diagnostic (" + f.desc + ")")
+                    } else if a != b {
+                        fail_msg(acc, "boot: " + f.name + " diagnostics differ:\n"
+                            + "     boot: " + a + "\n     hlc:  " + b)
+                    } else {
+                        pass_msg(acc, "boot: " + f.name
+                            + " rejected by both compilers (" + f.desc + ")")
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    # A crate attribute is an entry-file property, like `#![freestanding]`.
+    let _dep: str = write_src(acc, "bootdep.hls",
+        "#![boot_header(limine)]\n\nfn helper() -> int {\n    return 0\n}\n")
+    let entry: str = write_src(acc, "bootentry.hls",
+        "import \"./bootdep.hls\"\n\nfn main() -> int {\n    return helper()\n}\n")
+    let r: RunResult = boot_check(acc, entry)
+    if r.code == 1 && r.combined.contains("only allowed in the entry file") {
+        pass_msg(acc, "boot: #![boot_header] is entry-file-only")
+    } else {
+        fail_msg(acc, "boot: #![boot_header] in a dependency not rejected: "
+            + clip(r.combined, 120))
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 2. core/boot.hls
+# ----------------------------------------------------------------------------
+
+fn sec2(acc: Acc) -> void uses IO, Fs, Proc {
+    section("2. core/boot.hls")
+    if file_exists(core_boot()) {
+    let src: str = read_file(core_boot())
+    let enums: list[str] = ["MemKind", "FbKind"]
+    let mut i: int = 0
+    while i < enums.len() {
+        let e: str = enums.get(i)
+        if decl_word(src, "enum", e) {
+            pass_msg(acc, "boot: core.boot declares enum " + e)
+        } else {
+            fail_msg(acc, "boot: core.boot missing enum " + e)
+        }
+        i = i + 1
+    }
+    let structs: list[str] = ["MbTag", "Mb2Header", "LimineFeature", "MemRegion",
+                              "Framebuffer"]
+    let mut j: int = 0
+    while j < structs.len() {
+        let s: str = structs.get(j)
+        if decl_word(src, "struct", s) {
+            pass_msg(acc, "boot: core.boot declares struct " + s)
+        } else {
+            fail_msg(acc, "boot: core.boot missing struct " + s)
+        }
+        j = j + 1
+    }
+    let imports: list[str] = import_paths(src)
+    let mut imports_ok: bool = imports.len() == 3
+    let want_imports: list[str] = ["core.option", "core.result", "core.section"]
+    if imports_ok {
+        let mut k: int = 0
+        while k < 3 {
+            if imports.get(k) != want_imports.get(k) {
+                imports_ok = false
+            }
+            k = k + 1
+        }
+    }
+    if imports_ok {
+        pass_msg(acc, "boot: core.boot imports only core.* (freestanding-safe)")
+    } else {
+        fail_msg(acc, "boot: core.boot imports [" + str_join(imports, ", ") + "]")
+    }
+    # Look at declarations only — the module's comments discuss effects
+    # and externs in prose, and a comment is not a declaration.
+    let ru: Result[Regex, str] = regex_compile("^fn.*\\buses\\b")
+    let re: Result[Regex, str] = regex_compile("^\\s*extern\\b")
+    let mut has_uses: bool = false
+    let mut has_extern: bool = false
+    if result_is_ok(ru) && result_is_ok(re) {
+        let reu: Regex = result_unwrap(ru)
+        let rex: Regex = result_unwrap(re)
+        let lines: list[str] = src.split("\n")
+        let mut li: int = 0
+        while li < lines.len() {
+            let l: str = lines.get(li)
+            if !is_comment_line(l) {
+                if regex_is_match(reu, l) {
+                    has_uses = true
+                }
+                if regex_is_match(rex, l) {
+                    has_extern = true
+                }
+            }
+            li = li + 1
+        }
+    }
+    if !has_uses && !has_extern {
+        pass_msg(acc, "boot: core.boot declares no effects and no externs")
+    } else {
+        fail_msg(acc, "boot: core.boot declares effects or externs")
+    }
+    let fns: list[str] = core_fns()
+    let mut fi: int = 0
+    while fi < fns.len() {
+        let f: str = fns.get(fi)
+        if decl_word(src, "fn", f) {
+            pass_msg(acc, "boot: core.boot exposes " + f)
+        } else {
+            fail_msg(acc, "boot: core.boot missing " + f)
+        }
+        fi = fi + 1
+    }
+    } else {
+        fail_msg(acc, "boot: core/boot.hls missing")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 3. the emitted header
+# ----------------------------------------------------------------------------
+
+fn sec3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("3. the emitted header")
+    let link: str = path_join3(acc.root, "link.ld")
+    let mb_src: str = write_src(acc, "mb.hls",
+        "#![freestanding]\n#![link_script(\"" + link + "\")]\n"
+            + "#![boot_header(multiboot2)]\n\nfn main() -> int {\n    return 0\n}\n")
+    let li_src: str = write_src(acc, "li.hls",
+        "#![freestanding]\n#![link_script(\"" + link + "\")]\n"
+            + "#![boot_header(limine)]\n\nfn main() -> int {\n    return 0\n}\n")
+    let tags: list[str] = ["multiboot2", "limine"]
+    let mut ti: int = 0
+    while ti < tags.len() {
+        let tag: str = tags.get(ti)
+        let mut want_sec: str = ".multiboot_header"
+        let mut src: str = mb_src
+        if tag == "limine" {
+            want_sec = ".limine_requests"
+            src = li_src
+        }
+        let c: str = scratch(acc, tag + ".c")
+        let r: RunResult = run_capture("./bin/hlc", [src, c])
+        if r.code != 0 {
+            fail_msg(acc, "boot: " + tag + " crate did not compile: " + clip(r.combined, 120))
+        } else {
+            let text: str = read_file(c)
+            if text.contains("section(\"" + want_sec + "\")") {
+                pass_msg(acc, "boot: the " + tag + " header is emitted into " + want_sec)
+            } else {
+                fail_msg(acc, "boot: the " + tag + " header is not in " + want_sec)
+            }
+            if text.contains(", used, aligned(8))") {
+                pass_msg(acc, "boot: the " + tag + " header blob is `used` and 8-aligned")
+            } else {
+                fail_msg(acc, "boot: the " + tag + " header blob is not used/aligned")
+            }
+        }
+        ti = ti + 1
+    }
+    # The Multiboot2 header's exact fields, then the spec's invariant
+    # recomputed from the emitted numbers.
+    let mb_c: str = scratch(acc, "multiboot2.c")
+    if file_exists(mb_c) {
+        let text: str = read_file(mb_c)
+        if text.len() > 0 {
+            let wants: list[str] = ["0xE85250D6u", "0u", "40u", "397258498u",
+                                    "{ 3u, 16u }", "{ 0u, 8u }"]
+            let whys: list[str] = ["the magic", "the i386 architecture",
+                                   "the 40-byte length", "the checksum",
+                                   "the module tag", "the end tag"]
+            let mut wi: int = 0
+            while wi < wants.len() {
+                let want: str = wants.get(wi)
+                let why: str = whys.get(wi)
+                if text.contains(want) {
+                    pass_msg(acc, "boot: the Multiboot2 header carries " + why
+                        + " (" + want + ")")
+                } else {
+                    fail_msg(acc, "boot: the Multiboot2 header is missing " + why
+                        + " (" + want + ")")
+                }
+                wi = wi + 1
+            }
+            let magic: int = 3897708758  # 0xE85250D6
+            let length: int = 40
+            if (magic + 0 + length + 397258498) % 4294967296 == 0 {
+                pass_msg(acc, "boot: the emitted header fields sum to zero (the spec's rule)")
+            } else {
+                fail_msg(acc, "boot: the emitted checksum does not satisfy the spec")
+            }
+        }
+    }
+    # The Limine request list's exact words.
+    let li_c: str = scratch(acc, "limine.c")
+    if file_exists(li_c) {
+        let text2: str = read_file(li_c)
+        let lits: list[str] = ["0xf6b8f4b39de7d1aeUL", "0xadc0e0531bb10d03UL",
+                               "0xc7b1dd30df4c8b88UL", "0x67cf3d9d378a806fUL",
+                               "0x9d5827dcd881dd75UL", "0xc5e77b6b397e7b43UL",
+                               "0x48dcf1cb8ad2b852UL", "0x224ef0460a8e8926UL"]
+        let whys2: list[str] = ["the start delimiter", "the end delimiter",
+                                "the common request magic", "the memory-map request",
+                                "the framebuffer request", "the RSDP request",
+                                "the HHDM request", "the stack-size request"]
+        let mut li: int = 0
+        while li < lits.len() {
+            let want: str = lits.get(li)
+            let why: str = whys2.get(li)
+            if text2.contains(want) {
+                pass_msg(acc, "boot: the Limine request list carries " + why)
+            } else {
+                fail_msg(acc, "boot: the Limine request list is missing " + why
+                    + " (" + want + ")")
+            }
+            li = li + 1
+        }
+        # The battery asserts this one only when it holds (no else).
+        if text2.contains("UL") && text2.contains("0xc7b1dd30df4c8b88") {
+            pass_msg(acc, "boot: Limine IDs are unsigned literals (half are above 2^63)")
+        }
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 4. the LINKED image
+# ----------------------------------------------------------------------------
+
+fn sec4(acc: Acc) -> void uses IO, Fs, Proc {
+    section("4. the LINKED image")
+    if which("objdump") {
+    let tags: list[str] = ["multiboot2", "limine"]
+    let secs: list[str] = [".multiboot_header", ".limine_requests"]
+    let magics: list[str] = ["d65052e8", "aed1e79d"]
+    let mut i: int = 0
+    while i < tags.len() {
+        let tag: str = tags.get(i)
+        let sec: str = secs.get(i)
+        let magic_bytes: str = magics.get(i)
+        let elf: str = scratch(acc, tag + ".elf")
+        let mut src: str = scratch(acc, "mb.hls")
+        if tag == "limine" {
+            src = scratch(acc, "li.hls")
+        }
+        let im: Img = link_freestanding(acc, src, elf, "link.ld")
+        if !im.ok {
+            fail_msg(acc, "boot: the " + tag + " image did not link: " + clip(im.err, 120))
+        } else {
+            let hdr: RunResult = run_capture("objdump", ["-h", elf])
+            let sre: Result[Regex, str] = regex_compile("\\s\\." + sec.slice(1, sec.len()) + "\\b")
+            let mut in_hdr: bool = false
+            if result_is_ok(sre) {
+                in_hdr = regex_is_match(result_unwrap(sre), hdr.out)
+            }
+            if in_hdr {
+                pass_msg(acc, "boot: the linked " + tag + " image has a " + sec + " section")
+            } else {
+                fail_msg(acc, "boot: the linked " + tag + " image has no " + sec)
+            }
+            let dump: RunResult = run_capture("objdump", ["-s", "-j", sec, elf])
+            if dump.out.contains(magic_bytes) {
+                pass_msg(acc, "boot: " + sec + " starts with the protocol's own bytes")
+            } else {
+                fail_msg(acc, "boot: " + sec + " does not start with " + magic_bytes)
+            }
+            # objdump's section table ends each line with the alignment as
+            # a power of two: 2**3 is 8 bytes.
+            let lines: list[str] = hdr.out.split("\n")
+            let mut line: str = ""
+            let mut li: int = 0
+            while li < lines.len() {
+                if lines.get(li).contains(sec) {
+                    line = lines.get(li)
+                    break
+                }
+                li = li + 1
+            }
+            if line.trim().ends_with("2**3") {
+                pass_msg(acc, "boot: " + sec + " is 8-byte aligned")
+            } else {
+                fail_msg(acc, "boot: " + sec + " is not 8-byte aligned ("
+                    + clip(line.trim(), 90) + ")")
+            }
+        }
+        i = i + 1
+    }
+    } else {
+        fail_msg(acc, "boot: objdump not available — cannot verify the linked image")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 5. the Stage 84 integration
+# ----------------------------------------------------------------------------
+
+fn sec5(acc: Acc) -> void uses IO, Fs, Proc {
+    section("5. the Stage 84 integration")
+    # The shipped link.ld must place BOTH header sections, or a
+    # `#![boot_header]` crate is a compile error. This is the check that
+    # turns "the bootloader refused to boot my kernel" into a build error.
+    let script: str = read_file("link.ld")
+    let secs: list[str] = [".multiboot_header", ".limine_requests"]
+    let mut si: int = 0
+    while si < secs.len() {
+        let sec: str = secs.get(si)
+        # The section must be NAMED and its input KEPT — a bare
+        # `*(.multiboot_header)` without a KEEP is exactly the silent
+        # failure the compiler now rejects.
+        let nre: Result[Regex, str] = regex_compile("^\\s*\\." + sec.slice(1, sec.len()) + "\\b")
+        let mut named: bool = false
+        if result_is_ok(nre) {
+            let ren: Regex = result_unwrap(nre)
+            let lines: list[str] = script.split("\n")
+            let mut li: int = 0
+            while li < lines.len() {
+                if regex_is_match(ren, lines.get(li)) {
+                    named = true
+                    break
+                }
+                li = li + 1
+            }
+        }
+        if named && script.contains("KEEP(*(" + sec + "))") {
+            pass_msg(acc, "boot: link.ld KEEPs " + sec)
+        } else {
+            fail_msg(acc, "boot: link.ld does not KEEP " + sec)
+        }
+        si = si + 1
+    }
+    # A script WITHOUT the header section is rejected at compile time.
+    let stripped: str = strip_stage85_block(script)
+    let _ld: str = write_src(acc, "no_boot.ld", stripped)
+    let probe: str = write_src(acc, "unplaced.hls",
+        "#![freestanding]\n#![link_script(\"no_boot.ld\")]\n"
+            + "#![boot_header(multiboot2)]\n\nfn main() -> int {\n    return 0\n}\n")
+    let rb: RunResult = boot_check(acc, probe)
+    let rh: RunResult = run_capture("./bin/hlc", ["--audit", probe])
+    if rb.code == 1 && rb.combined.contains("does not place")
+            && rh.code != 0 && rh.combined.contains("does not place") {
+        pass_msg(acc, "boot: a script that drops the header section is a compile error")
+    } else {
+        fail_msg(acc, "boot: an unplaced header was not rejected: " + clip(rb.combined, 120))
+    }
+    # ...and the same crate against the SHIPPED script is accepted.
+    let link: str = path_join3(acc.root, "link.ld")
+    let probe2: str = write_src(acc, "placed.hls",
+        "#![freestanding]\n#![link_script(\"" + link + "\")]\n"
+            + "#![boot_header(multiboot2)]\n"
+            + "#[section(\".text.extra\")]\nfn extra(x: int) -> int {\n    return x\n}\n\n"
+            + "fn main() -> int {\n    return extra(0)\n}\n")
+    let placed_c: str = scratch(acc, "placed.c")
+    let r: RunResult = run_capture("./bin/hlc", [probe2, placed_c])
+    if r.code == 0 {
+        pass_msg(acc, "boot: the same crate is accepted under the shipped link.ld")
+    } else {
+        fail_msg(acc, "boot: a placed header was rejected: " + clip(r.combined, 140))
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 6. behaviour probes
+# ----------------------------------------------------------------------------
+
+fn sec6(acc: Acc) -> void uses IO, Fs, Proc {
+    section("6. behaviour probes")
+    let probes: list[ProbeP] = probe_bodies()
+    let mut i: int = 0
+    while i < probes.len() {
+        let p: ProbeP = probes.get(i)
+        let path: str = write_src(acc, "probe_" + p.name + ".hls", p.body)
+        let r: RunResult = boot(acc, [path])
+        if r.code != 0 {
+            fail_msg(acc, "boot: probe " + p.name + " (interp) exit=" + r.code.to_str()
+                + " want=0 — " + clip(r.combined, 100))
+        } else {
+            let hr: HlcRun = hlc_run(acc, path)
+            if hr.code != 0 {
+                fail_msg(acc, "boot: probe " + p.name + " (native) exit=" + hr.code.to_str()
+                    + " want=0 — " + clip(hr.out, 100))
+            } else {
+                pass_msg(acc, "boot: " + p.name + " — " + p.desc)
+            }
+        }
+        i = i + 1
+    }
+    # The checked constructors must panic at RUN time (accepted by the
+    # checker, loud at boot).
+    let pans: list[PanicP] = panic_programs()
+    let mut j: int = 0
+    while j < pans.len() {
+        let pp: PanicP = pans.get(j)
+        let path: str = "tests/ok/" + pp.name + ".hls"
+        if !file_exists(path) {
+            fail_msg(acc, "boot: " + path + " missing")
+        } else {
+            let rc: RunResult = boot_check(acc, path)
+            if rc.code != 0 {
+                fail_msg(acc, "boot: " + pp.name + " must be ACCEPTED by the checker")
+            } else {
+                let rr: RunResult = boot(acc, [path])
+                if rr.code == 101 && rr.combined.contains(pp.needle) {
+                    pass_msg(acc, "boot: " + pp.name + " panics at run time (" + pp.desc + ")")
+                } else {
+                    fail_msg(acc, "boot: " + pp.name + " did not panic: exit="
+                        + rr.code.to_str())
+                }
+                let hr: HlcRun = hlc_run(acc, path)
+                if hr.code == 101 && hr.out.contains(pp.needle) {
+                    pass_msg(acc, "boot: " + pp.name + " panics natively too")
+                } else {
+                    fail_msg(acc, "boot: " + pp.name + " native exit=" + hr.code.to_str())
+                }
+            }
+        }
+        j = j + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 7. the demos + tools
+# ----------------------------------------------------------------------------
+
+fn sec7(acc: Acc) -> void uses IO, Fs, Proc {
+    section("7. the demos + tools")
+    let ri: RunResult = boot(acc, [ok_test()])
+    if ri.code == 0 {
+        pass_msg(acc, "boot: the ok-test is clean on the interpreter")
+    } else {
+        fail_msg(acc, "boot: ok-test interpreter exit=" + ri.code.to_str())
+    }
+    let hn: HlcRun = hlc_run(acc, ok_test())
+    if hn.code == 0 {
+        pass_msg(acc, "boot: the ok-test is clean natively")
+    } else {
+        fail_msg(acc, "boot: ok-test native exit=" + hn.code.to_str())
+    }
+    let fs_ok: str = write_src(acc, "ok_fs.hls", swap_first_no_std(read_file(ok_test())))
+    let fs_c: str = scratch(acc, "ok_fs.c")
+    let rc: RunResult = run_capture("./bin/hlc", [fs_ok, fs_c])
+    if rc.code == 0 {
+        let fsbin: str = scratch(acc, "ok_fs")
+        let g: RunResult = run_capture("gcc", ["-O2", "-ffreestanding", "-nostdlib",
+            "-ffunction-sections", "-fno-stack-protector", "-Wl,--gc-sections",
+            "-o", fsbin, fs_c])
+        let nat: RunResult = run_capture(fsbin, [])
+        if g.code == 0 && nat.code == 0 {
+            pass_msg(acc, "boot: the ok-test links -nostdlib and exits 0 (freestanding)")
+        } else {
+            fail_msg(acc, "boot: the freestanding ok-test failed: " + clip(g.err, 120))
+        }
+    } else {
+        fail_msg(acc, "boot: the ok-test did not compile as freestanding")
+    }
+    # boot_demo: identical output on the interpreter and natively.
+    let di: RunResult = boot(acc, [demo()])
+    let dn: HlcRun = hlc_run(acc, demo())
+    if di.code == 0 && dn.code == 0 && dn.out.contains("DEMO OK") {
+        pass_msg(acc, "boot: boot_demo runs on both, DEMO OK")
+    } else {
+        fail_msg(acc, "boot: boot_demo interp=" + di.code.to_str()
+            + " native=" + dn.code.to_str())
+    }
+    if di.out == dn.out {
+        pass_msg(acc, "boot: boot_demo output is byte-identical (differential)")
+    } else {
+        fail_msg(acc, "boot: boot_demo differs between interpreter and native")
+    }
+    # boot_kernel: the real freestanding image.
+    let elf: str = scratch(acc, "kernel.elf")
+    let im: Img = link_freestanding(acc, kernel(), elf, "link.ld")
+    if !im.ok {
+        fail_msg(acc, "boot: boot_kernel did not link: " + clip(im.err, 140))
+    } else {
+        let hdr: RunResult = run_capture("objdump", ["-h", elf])
+        if hdr.out.contains(".limine_requests") {
+            pass_msg(acc, "boot: the kernel image carries .limine_requests")
+        } else {
+            fail_msg(acc, "boot: the kernel image has no .limine_requests")
+        }
+        if read_or(elf + ".c", "").contains("void _start") {
+            pass_msg(acc, "boot: the kernel image enters at _start (no libc)")
+        } else {
+            fail_msg(acc, "boot: the kernel image has no _start")
+        }
+    }
+    # Tools.
+    let tool_files: list[str] = [ok_test(), demo(), kernel(), core_boot()]
+    let tool_labels: list[str] = ["hlfmt -c (ok-test)", "hlfmt -c (demo)",
+                                  "hlfmt -c (kernel)", "hlfmt -c (core)"]
+    let mut ti: int = 0
+    while ti < tool_files.len() {
+        let f: str = tool_files.get(ti)
+        let label: str = tool_labels.get(ti)
+        let r: RunResult = run_capture("./bin/hlfmt", ["-c", f])
+        if r.code == 0 {
+            pass_msg(acc, "boot: " + label)
+        } else {
+            fail_msg(acc, "boot: " + label + ": " + clip(r.combined, 140))
+        }
+        ti = ti + 1
+    }
+    let hl: RunResult = run_capture("python3", ["tools/hllint.py", ok_test()])
+    if hl.code == 0 {
+        pass_msg(acc, "boot: hllint (ok-test)")
+    } else {
+        fail_msg(acc, "boot: hllint (ok-test): " + clip(hl.combined, 140))
+    }
+    # --audit parity on the lines this stage adds.
+    let ab: RunResult = boot(acc, ["--audit", kernel()])
+    if ab.code == 0
+            && (ab.out + ab.err).contains("Boot header: limine (emitted into .limine_requests)") {
+        pass_msg(acc, "boot: --audit names the header and its section (boot)")
+    } else {
+        fail_msg(acc, "boot: --audit missing the boot header (boot): "
+            + clip(ab.combined, 140))
+    }
+    let ah: RunResult = run_capture("./bin/hlc", ["--audit", kernel()])
+    if ah.code == 0
+            && (ah.out + ah.err).contains("Boot header: limine (emitted into .limine_requests)") {
+        pass_msg(acc, "boot: --audit names the header and its section (hlc)")
+    } else {
+        fail_msg(acc, "boot: --audit missing the boot header (hlc): "
+            + clip(ah.combined, 140))
+    }
+    let mb_src: str = scratch(acc, "mb.hls")
+    let am: RunResult = run_capture("./bin/hlc", ["--audit", mb_src])
+    if am.out.contains("Boot header: multiboot2 (emitted into .multiboot_header)") {
+        pass_msg(acc, "boot: --audit names the Multiboot2 section too")
+    } else {
+        fail_msg(acc, "boot: --audit does not name the Multiboot2 section")
+    }
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let acc: Acc = acc_new("boot")
+    sec1(acc)
+    sec2(acc)
+    sec3(acc)
+    sec4(acc)
+    sec5(acc)
+    sec6(acc)
+    sec7(acc)
+    return finish(acc, "Stage 85 -- Multiboot2 + Limine boot protocol headers")
+}

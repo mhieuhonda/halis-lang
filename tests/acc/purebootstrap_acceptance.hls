@@ -1,0 +1,895 @@
+# ============================================================================
+# tests/acc/purebootstrap_acceptance.hls — Stage 143 acceptance gate, in Halis
+# (the Halis twin of tests/purebootstrap_acceptance.py; same nine sections,
+# same assertions, same needles — the harness is tests/acc/harness.hls and
+# the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make purebootstrap-acceptance` (which compiles this file to
+# bin/acc-purebootstrap and runs it from the repo root).
+#
+# The gate SPAWNS `make` as the test subject — the bootstrap lifecycle is
+# the thing under test. It builds disposable tree copies under
+# tests/.acc-scratch/pboot/ (Makefile + mk/ + src/ + core/ + std/ +
+# snapshot/ + tools/hls-snap.hls, deliberately WITHOUT tools/hlinterp/),
+# drives `make bootstrap` under a python-free PATH (env -i), and walks
+# the fixed point, the regen law, the manifest, the provenance and the
+# chain. A full run compiles the compiler many times; it takes minutes.
+#
+#  1. the no-python law    — bootstrap + snapshot-status + snapshot-verify
+#                            with no python3/python resolvable, on a tree
+#                            copy that does not carry the interpreter
+#  2. the fixed-point law  — hand-edited snapshot fails named; a semantic
+#                            source change fails; a comment-only change
+#                            does NOT (and the manifest names it)
+#  3. the regen law        — regen re-derives at the fixed point (1 round),
+#                            moves the bytes, refuses a no-op regen; a
+#                            release-heading refreshes the manifest ONLY;
+#                            the native kit refuses a missing snapshot
+#  4. the agreement law    — snapshot-prove on the real tree; the retired
+#                            --seed refuses by name
+#  5. the manifest law     — broken digest = TAMPERED, hand-edit =
+#                            TAMPERED, missing = NO-SNAPSHOT, and the
+#                            kit's manifest stays canonical/interchangeable
+#  6. the independence     — the purely-bootstrapped bin/hlc compiles and
+#     smoke                  runs fibonacci with interpreter-identical output
+#  7. the provenance law   — the gate's OWN import-closure walker equals
+#                            the manifest's; version pins RELEASES.md's
+#                            head; rounds sane; no absolute paths in the C
+#  8. the self-host law    — bin/hlc compiles tools/hls-snap.hls; the
+#                            emitted C carries no absolute path; the kit's
+#                            source names no interpreter invocation
+#  9. the chain law        — snapshot-chain: two ignitions, byte for byte;
+#                            path independence; hostile env; CC2 form; a
+#                            drifted tree is refused with the law named
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.regex"
+import "std.json"
+import "std.sha256"
+
+# ----------------------------------------------------------------------------
+# The gate's data.
+# ----------------------------------------------------------------------------
+
+fn needed_tools() -> list[str] {
+    return ["gcc", "cc", "make", "cmp", "diff", "mkdir", "cp", "rm", "cat",
+            "sh", "bash", "ld", "as"]
+}
+
+fn trunc(text: str, n: int) -> str {
+    if text.len() <= n {
+        return text
+    }
+    return text.slice(0, n)
+}
+
+# replace_once(s, old, new) — Python's s.replace(old, new, 1).
+fn replace_once(s: str, old: str, new: str) -> str {
+    let at: int = s.find(old)
+    if at < 0 {
+        return s
+    }
+    return s.slice(0, at) + new + s.slice(at + old.len(), s.len())
+}
+
+# find_from(text, needle, from) — text.find(needle) starting at `from`.
+fn find_from(text: str, needle: str, from: int) -> int {
+    if from >= text.len() {
+        return -1
+    }
+    let rel: int = text.slice(from, text.len()).find(needle)
+    if rel < 0 {
+        return -1
+    }
+    return from + rel
+}
+
+fn is_lower_hex(b: int) -> bool {
+    return (b >= 48 && b <= 57) || (b >= 97 && b <= 102)
+}
+
+fn is_digit(b: int) -> bool {
+    return b >= 48 && b <= 57
+}
+
+# chain_digest_of(text) — the battery's
+#   re.search(r"chain digest: ([0-9a-f]{16})\.\.\.", text).group(1)
+# as a byte-precise scan: exactly 16 lowercase hex digits followed by "...",
+# "" when absent.
+fn chain_digest_of(text: str) -> str {
+    let at: int = text.find("chain digest: ")
+    if at < 0 {
+        return ""
+    }
+    let start: int = at + "chain digest: ".len()
+    if start + 16 + 3 > text.len() {
+        return ""
+    }
+    let cand: str = text.slice(start, start + 16)
+    let mut i: int = 0
+    while i < 16 {
+        if !is_lower_hex(cand.byte_at(i)) {
+            return ""
+        }
+        i = i + 1
+    }
+    if text.slice(start + 16, start + 19) != "..." {
+        return ""
+    }
+    return cand
+}
+
+# sha256_file(path) — the battery's hashlib helper.
+fn sha256_file(path: str) -> str uses Fs {
+    return sha256_hex(read_file(path))
+}
+
+# ----------------------------------------------------------------------------
+# The disposable build trees.
+# ----------------------------------------------------------------------------
+
+# copy_tree(acc, tag) — everything the pure lifecycle needs, deliberately
+# WITHOUT the interpreter (tools/hlinterp/): the pure chain must not read it.
+fn copy_tree(acc: Acc, tag: str) -> str uses Proc {
+    let dst: str = scratch(acc, tag)
+    let r: str = acc.root
+    sh("cp -a '" + shell_quote(path_join3(r, "Makefile")) + "' '"
+        + shell_quote(dst) + "/'")
+    sh("cp -a '" + shell_quote(path_join3(r, "RELEASES.md")) + "' '"
+        + shell_quote(dst) + "/'")
+    sh("cp -a '" + shell_quote(path_join3(r, "mk")) + "' '"
+        + shell_quote(dst) + "/mk'")
+    sh("cp -a '" + shell_quote(path_join3(r, "src")) + "' '"
+        + shell_quote(dst) + "/src'")
+    sh("cp -a '" + shell_quote(path_join3(r, "core")) + "' '"
+        + shell_quote(dst) + "/core'")
+    sh("cp -a '" + shell_quote(path_join3(r, "std")) + "' '"
+        + shell_quote(dst) + "/std'")
+    sh("cp -a '" + shell_quote(path_join3(r, "snapshot")) + "' '"
+        + shell_quote(dst) + "/snapshot'")
+    sh("mkdir -p '" + shell_quote(path_join3(dst, "tools")) + "'")
+    sh("cp -a '" + shell_quote(path_join3(r, "tools/hls-snap.hls")) + "' '"
+        + shell_quote(path_join3(dst, "tools")) + "/'")
+    return dst
+}
+
+# nopy_dir(acc) — a PATH holding the C toolchain and coreutils — and
+# provably no python3 / python anywhere on it. Built once per run (the
+# battery caches it by directory, exactly like shutil.which's result).
+fn nopy_dir(acc: Acc) -> str uses IO, Fs, Proc, Exit {
+    let bin_dir: str = scratch(acc, "nopybin")
+    if !file_exists(bin_dir) {
+        mkdirs(bin_dir)
+    }
+    if !file_exists(path_join3(bin_dir, "make")) {
+        let names: list[str] = needed_tools()
+        let mut i: int = 0
+        while i < names.len() {
+            let name: str = names.get(i)
+            sh("ln -sf \"$(command -v '" + shell_quote(name)
+                + "' 2>/dev/null)\" '"
+                + shell_quote(path_join3(bin_dir, name)) + "' 2>/dev/null")
+            i = i + 1
+        }
+        # Silent stubs for the Makefile's parse-time probes.
+        write_file(path_join3(bin_dir, "curl-config"), "#!/bin/sh\nexit 1\n")
+        write_file(path_join3(bin_dir, "pkg-config"), "#!/bin/sh\nexit 1\n")
+        sh("chmod 755 '" + shell_quote(path_join3(bin_dir, "curl-config"))
+            + "' '" + shell_quote(path_join3(bin_dir, "pkg-config")) + "'")
+    }
+    let py3: str = path_join3(bin_dir, "python3")
+    let py: str = path_join3(bin_dir, "python")
+    if file_exists(py3) {
+        fail_msg(acc, "no-python PATH: python3 unexpectedly resolvable — the gate cannot prove the law")
+        exit(1)
+    }
+    if file_exists(py) {
+        fail_msg(acc, "no-python PATH: python unexpectedly resolvable — the gate cannot prove the law")
+        exit(1)
+    }
+    return bin_dir
+}
+
+# make_run(tree, argv_tail, env_prefix) — drive make inside a tree. The
+# python-free legs run `env -i PATH=... TMPDIR=... make ...`: the child
+# environment is EXACTLY the battery's {"PATH": bin_dir, "TMPDIR": TMP}.
+fn make_run(tree: str, tail: str, env_prefix: str) -> RunResult uses Proc {
+    let cmd: str = "cd '" + shell_quote(tree) + "' && " + env_prefix
+        + "make " + tail
+    return run_capture("sh", ["-c", cmd])
+}
+
+# make_bootstrap(tree, python_free) — the battery's make_bootstrap helper.
+fn make_bootstrap(acc: Acc, tree: str, python_free: bool) -> RunResult uses IO, Fs, Proc, Exit {
+    if python_free {
+        let bin: str = nopy_dir(acc)
+        let envp: str = "env -i PATH='" + shell_quote(bin) + "' TMPDIR='"
+            + shell_quote(acc.scratch_base) + "' "
+        return make_run(tree, "bootstrap", envp)
+    }
+    return make_run(tree, "bootstrap", "")
+}
+
+# snap(tree, cmd) — the make targets, the way every human drives the kit.
+fn snap(tree: str, cmd: str) -> RunResult uses Proc {
+    return make_run(tree, "snapshot-" + cmd, "")
+}
+
+# snap_bin(tree, args) — the built kit binary directly (for the flags the
+# make targets do not carry).
+fn snap_bin(tree: str, args: list[str]) -> RunResult uses Proc {
+    let mut cmd: str = "cd '" + shell_quote(tree) + "' && '"
+        + shell_quote(path_join3(tree, "bin/hls-snap")) + "'"
+    let mut i: int = 0
+    while i < args.len() {
+        cmd = cmd + " '" + shell_quote(args.get(i)) + "'"
+        i = i + 1
+    }
+    return run_capture("sh", ["-c", cmd])
+}
+
+# ----------------------------------------------------------------------------
+# 1. the no-python law
+# ----------------------------------------------------------------------------
+fn sec1(acc: Acc) -> void uses IO, Fs, Proc, Exit {
+    section("1. the no-python law")
+    let tree1: str = copy_tree(acc, "t1")
+    if file_exists(path_join3(tree1, "tools/hlinterp")) {
+        fail_msg(acc, "the build tree carries the interpreter — the gate cannot prove the build never reads it")
+    } else {
+        pass_msg(acc, "the build tree carries no interpreter at all")
+    }
+    let r: RunResult = make_bootstrap(acc, tree1, true)
+    if r.code == 0 && r.out.contains("pure-HLS fixed point holds") {
+        pass_msg(acc, "make bootstrap succeeds with no python3 and no python on PATH (cc + the committed snapshot only)")
+    } else {
+        fail_msg(acc, "no-python bootstrap failed (rc=" + r.code.to_str()
+            + "): " + trunc(r.combined, 400))
+    }
+    let r2: RunResult = snap(tree1, "status")
+    if r2.code == 0 && r2.out.contains("FRESH") {
+        pass_msg(acc, "make snapshot-status runs python-free (the self-hosted kit classifies the tree)")
+    } else {
+        fail_msg(acc, "no-python snapshot-status failed (rc=" + r2.code.to_str()
+            + "): " + trunc(r2.combined, 400))
+    }
+    let r3: RunResult = snap(tree1, "verify")
+    if r3.code == 0 && r3.out.contains("VERIFIED (deep)") {
+        pass_msg(acc, "make snapshot-verify --deep runs python-free: the kit builds the compiler from the snapshot and re-proves the fixed point")
+    } else {
+        fail_msg(acc, "no-python snapshot-verify failed (rc=" + r3.code.to_str()
+            + "): " + trunc(r3.combined, 400))
+    }
+    let r4: RunResult = make_bootstrap(acc, tree1, true)
+    let r5: RunResult = snap(tree1, "status")
+    let combined: str = r4.combined + r5.combined
+    let rr: Result[Regex, str] = regex_compile("python[0-9]?\\s+boot/boot\\.py")
+    let mut invokes: bool = combined.contains("Stage-0:")
+    if result_is_ok(rr) {
+        if regex_is_match(result_unwrap(rr), combined) {
+            invokes = true
+        }
+    }
+    if invokes {
+        fail_msg(acc, "the lifecycle invokes the interpreter — it is not pure")
+    } else {
+        pass_msg(acc, "the whole lifecycle (bootstrap + snapshot kit) invokes no interpreter")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 2. the fixed-point law
+# ----------------------------------------------------------------------------
+fn sec2(acc: Acc) -> void uses IO, Fs, Proc, Exit {
+    section("2. the fixed-point law")
+    # 2a. A hand-edited snapshot: flip a byte inside the header comment.
+    let snap_path: str = path_join3(acc.scratch_base, "t1/snapshot/hlc.c")
+    let orig: str = read_file(snap_path)
+    let tampered: str = replace_once(orig, "generated BY hlc", "generated BY hlx")
+    if tampered == orig {
+        fail_msg(acc, "assert: the tamper needle 'generated BY hlc' is missing from snapshot/hlc.c")
+        exit(1)
+    }
+    write_file(snap_path, tampered)
+    let r: RunResult = make_bootstrap(acc, acc.scratch_base + "/t1", true)
+    if r.code != 0 && r.out.contains("stale") && r.out.contains("hand-edited") {
+        pass_msg(acc, "a hand-edited snapshot fails the build with the named refusal")
+    } else {
+        fail_msg(acc, "the tampered snapshot did not fail loudly (rc=" + r.code.to_str() + ")")
+    }
+    write_file(snap_path, orig)
+
+    # 2b. A SEMANTIC source change: one byte inside a string literal.
+    let main_hls: str = path_join3(acc.scratch_base, "t1/src/hlc/main.hls")
+    let src_orig: str = read_file(main_hls)
+    let needle: str = "usage: hlc --audit <input.hls>"
+    if src_orig.contains(needle) {
+        write_file(main_hls, replace_once(src_orig, needle, needle + " "))
+        let r2: RunResult = make_bootstrap(acc, acc.scratch_base + "/t1", true)
+        if r2.code != 0 && r2.out.contains("differs from snapshot") {
+            pass_msg(acc, "a semantic source change fails the build (the snapshot is stale) — named, not guessed")
+        } else {
+            fail_msg(acc, "a semantic drift did not fail the build (rc=" + r2.code.to_str() + ")")
+        }
+        write_file(main_hls, src_orig)
+    } else {
+        fail_msg(acc, "the drift needle moved — update the gate to the current usage string in src/hlc/main.hls")
+    }
+
+    # 2c. A comment-only change: the build stays green (codegen is
+    # semantic, not textual) — the manifest names it instead (section 7).
+    let types_hls: str = path_join3(acc.scratch_base, "t1/src/hlc/types.hls")
+    let types_orig: str = read_file(types_hls)
+    write_file(types_hls, types_orig + "\n# gate: comment-only drift\n")
+    let r3: RunResult = make_bootstrap(acc, acc.scratch_base + "/t1", true)
+    if r3.code == 0 {
+        pass_msg(acc, "a comment-only change does NOT fail the build (no false wolf)")
+    } else {
+        fail_msg(acc, "a comment-only change failed the build — the fixed-point law cries wolf over text (rc=" + r3.code.to_str() + ")")
+    }
+    let r4: RunResult = snap(acc.scratch_base + "/t1", "status")
+    if r4.code != 0 && r4.out.contains("STALE-SOURCES") && r4.out.contains("types.hls") {
+        pass_msg(acc, "...and the manifest names it: STALE-SOURCES at src/hlc/types.hls")
+    } else {
+        fail_msg(acc, "the manifest did not name the comment-only drift: " + trunc(r4.combined, 300))
+    }
+    write_file(types_hls, types_orig)
+    let r5: RunResult = make_bootstrap(acc, acc.scratch_base + "/t1", true)
+    if r5.code == 0 {
+        pass_msg(acc, "the restored tree bootstraps green again")
+    } else {
+        fail_msg(acc, "the restored tree still fails (rc=" + r5.code.to_str() + ")")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 3. the regen law
+# ----------------------------------------------------------------------------
+fn sec3(acc: Acc) -> void uses IO, Fs, Proc, Exit {
+    section("3. the regen law")
+    let tree2: str = copy_tree(acc, "t2")
+    let main_hls: str = path_join3(tree2, "src/hlc/main.hls")
+    let src_orig: str = read_file(main_hls)
+    let needle: str = "usage: hlc --audit <input.hls>"
+    write_file(main_hls, replace_once(src_orig, needle, needle + " "))
+    let r: RunResult = snap(tree2, "regen")
+    if r.code == 0 && r.out.contains("REGENERATED") && r.out.contains("1 round") {
+        pass_msg(acc, "regen re-derives the drifted tree at the fixed point (1 round)")
+    } else {
+        fail_msg(acc, "regen on a drifted tree failed: " + trunc(r.combined, 400))
+    }
+    if read_file(path_join3(tree2, "snapshot/hlc.c")).contains(needle + " ") {
+        pass_msg(acc, "the changed bytes travelled into the snapshot")
+    } else {
+        fail_msg(acc, "the snapshot did not absorb the change")
+    }
+    let r2: RunResult = make_bootstrap(acc, tree2, true)
+    if r2.code == 0 {
+        pass_msg(acc, "the regenerated tree bootstraps green")
+    } else {
+        fail_msg(acc, "the regenerated tree still fails (rc=" + r2.code.to_str() + ")")
+    }
+    # The no-op law: the tree now matches — a second regen is noise.
+    # Through make the refusal surfaces as a nonzero exit (make's own
+    # contract); the tool's exact exit codes are pinned by the direct
+    # binary checks in section 5.
+    let r3: RunResult = snap(tree2, "regen")
+    if r3.code != 0 && r3.out.contains("no-op law") {
+        pass_msg(acc, "a regen on the matching tree is REFUSED (the no-op law)")
+    } else {
+        fail_msg(acc, "the no-op regen was not refused (rc=" + r3.code.to_str() + ")")
+    }
+
+    # The version law: a new release heading refreshes the manifest ONLY.
+    let tree2b: str = copy_tree(acc, "t2b")
+    let sha_before: str = sha256_file(path_join3(tree2b, "snapshot/hlc.c"))
+    let chlog: str = path_join3(tree2b, "RELEASES.md")
+    let head: str = read_file(chlog)
+    write_file(chlog, "## [v9.9.9-alpha] — gate: a heading move\n\n" + head)
+    let r4: RunResult = snap(tree2b, "regen")
+    let man: JsonValue = json_parse(read_file(path_join3(tree2b, "snapshot/MANIFEST.json")))
+    let sha_after: str = sha256_file(path_join3(tree2b, "snapshot/hlc.c"))
+    if r4.code == 0 && r4.out.contains("MANIFEST REFRESHED")
+        && json_str_value(json_object_get(man, "version")) == "v9.9.9-alpha"
+        && sha_after == sha_before {
+        pass_msg(acc, "a release-heading move refreshes the manifest ONLY (C unmoved)")
+    } else {
+        fail_msg(acc, "the version refresh misbehaved: " + trunc(r4.combined, 300))
+    }
+
+    # The seed law: the native path refuses to run without a snapshot.
+    let tree2c: str = copy_tree(acc, "t2c")
+    let rk: RunResult = make_run(tree2c, "bin/hls-snap", "")
+    if rk.code != 0 {
+        fail_msg(acc, "the kit does not build on a fresh tree (rc=" + rk.code.to_str()
+            + "): " + trunc(rk.combined, 300))
+    }
+    sh("rm -f '" + shell_quote(path_join3(tree2c, "snapshot/hlc.c")) + "'")
+    let args: list[str] = ["regen"]
+    let r5: RunResult = snap_bin(tree2c, args)
+    if r5.code == 1 && r5.out.contains("seed law") {
+        pass_msg(acc, "the native regen refuses when the snapshot is missing (the snapshot IS the seed now — the refusal names the restore)")
+    } else {
+        fail_msg(acc, "missing-snapshot regen not refused (rc=" + r5.code.to_str() + ")")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 4. the agreement law (two runtimes, one source — no interpreter anywhere)
+# ----------------------------------------------------------------------------
+fn sec4(acc: Acc) -> void uses IO, Fs, Proc {
+    section("4. the agreement law (two runtimes, one source — no interpreter anywhere)")
+    let r: RunResult = snap(acc.root, "prove")
+    if r.code == 0 && r.out.contains("PROVEN") && r.out.contains("freestanding") {
+        pass_msg(acc, "prove: the freestanding compiler re-derives the committed snapshot byte for byte — the second lineage, and the only one the tree carries")
+    } else {
+        fail_msg(acc, "prove (freestanding) failed: " + trunc(r.combined, 400))
+    }
+    # The retired flag refuses BY NAME — a silent no-op would hide the
+    # retirement (v0.164.0-alpha: the seed left, and with it the oracle
+    # lineage the flag used to invoke).
+    let args: list[str] = ["prove", "--seed"]
+    let r2: RunResult = snap_bin(acc.root, args)
+    if r2.code == 2 && r2.out.contains("retired") && r2.out.contains("v0.164.0-alpha") {
+        pass_msg(acc, "prove --seed REFUSES with the retirement named (exit 2, usage contract) — there is no oracle lineage anymore")
+    } else {
+        fail_msg(acc, "the retired --seed did not refuse by name (rc=" + r2.code.to_str()
+            + "): " + trunc(r2.combined, 300))
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 5. the manifest law
+# ----------------------------------------------------------------------------
+fn sec5(acc: Acc) -> void uses IO, Fs, Proc {
+    section("5. the manifest law")
+    let r: RunResult = snap(acc.root, "verify")
+    if r.code == 0 && r.out.contains("VERIFIED") {
+        pass_msg(acc, "verify: the document agrees with itself and with the world")
+    } else {
+        fail_msg(acc, "verify failed on the real tree: " + trunc(r.combined, 400))
+    }
+
+    let tree5: str = copy_tree(acc, "t5")
+    let man_path: str = path_join3(tree5, "snapshot/MANIFEST.json")
+    let man_text: str = read_file(man_path)
+    # Zero the recorded digest (the battery rewrites the manifest with
+    # json.dump; the targeted value edit hands the kit the same JSON).
+    let key_at: int = man_text.find("\"hlc_c_sha256\"")
+    let val_at: int = find_from(man_text, ": \"", key_at) + 3
+    let zeros: str = str_repeat("0", 64)
+    write_file(man_path, man_text.slice(0, val_at) + zeros
+        + man_text.slice(val_at + 64, man_text.len()))
+    let r2: RunResult = snap(tree5, "status")
+    if r2.code != 0 && r2.out.contains("TAMPERED") {
+        pass_msg(acc, "a snapshot that disagrees with its recorded digest is TAMPERED")
+    } else {
+        fail_msg(acc, "the digest disagreement was not named (rc=" + r2.code.to_str() + ")")
+    }
+    let sargs: list[str] = ["status"]
+    let r3: RunResult = snap_bin(tree5, sargs)
+    if r3.code == 1 {
+        pass_msg(acc, "...and the kit's own exit code is the named refusal (1, not 2)")
+    } else {
+        fail_msg(acc, "the kit's exit code contract broke (rc=" + r3.code.to_str() + ")")
+    }
+
+    let tree5b: str = copy_tree(acc, "t5b")
+    let c_path: str = path_join3(tree5b, "snapshot/hlc.c")
+    let body: str = read_file(c_path)
+    write_file(c_path, replace_once(body, "generated BY hlc", "generated BY hlx"))
+    let r4: RunResult = snap(tree5b, "status")
+    if r4.code != 0 && r4.out.contains("TAMPERED") {
+        pass_msg(acc, "a hand-edited snapshot is TAMPERED at status time (the fast path names it without compiling)")
+    } else {
+        fail_msg(acc, "the hand edit was not named TAMPERED (rc=" + r4.code.to_str() + ")")
+    }
+
+    let tree5c: str = copy_tree(acc, "t5c")
+    let rk: RunResult = make_run(tree5c, "bin/hls-snap", "")
+    sh("rm -f '" + shell_quote(path_join3(tree5c, "snapshot/hlc.c")) + "'")
+    let r5: RunResult = snap_bin(tree5c, sargs)
+    if r5.code == 1 && r5.out.contains("NO-SNAPSHOT") {
+        pass_msg(acc, "a missing snapshot is NO-SNAPSHOT (naming the restore-from-git advice — there is no interpreter to re-derive it)")
+    } else {
+        fail_msg(acc, "the missing snapshot was not named (rc=" + r5.code.to_str() + ")")
+    }
+
+    # The interchange law: the Halis kit writes the manifest byte for
+    # byte the way the Stage-142 Python kit wrote it (same canonical
+    # digest, same key order, same indent, same escapes) — the git
+    # history's manifests stay diff-able across the kit boundary.
+    let tree5d: str = copy_tree(acc, "t5d")
+    let chlog: str = path_join3(tree5d, "RELEASES.md")
+    let head: str = read_file(chlog)
+    write_file(chlog, "## [v9.8.7-alpha] — gate: interchange\n\n" + head)
+    let r6: RunResult = snap(tree5d, "regen")
+    let man2: JsonValue = json_parse(read_file(path_join3(tree5d, "snapshot/MANIFEST.json")))
+    let clo: JsonValue = json_object_get(man2, "closure")
+    # canon = json.dumps(closure, sort_keys=True, separators=(",", ":"))
+    let keys: list[str] = clo.obj_keys
+    let mut i: int = 1
+    while i < keys.len() {
+        let k: str = keys.get(i)
+        let mut j: int = i - 1
+        while j >= 0 && keys.get(j) > k {
+            let tmp: str = keys.get(j)
+            keys.set(j, keys.get(j + 1))
+            keys.set(j + 1, tmp)
+            j = j - 1
+        }
+        i = i + 1
+    }
+    let mut canon: str = "{"
+    let mut first: bool = true
+    let mut k2: int = 0
+    while k2 < keys.len() {
+        if !first {
+            canon = canon + ","
+        }
+        first = false
+        canon = canon + "\"" + keys.get(k2) + "\":\""
+            + json_str_value(json_object_get(clo, keys.get(k2))) + "\""
+        k2 = k2 + 1
+    }
+    canon = canon + "}"
+    if r6.code == 0
+        && json_str_value(json_object_get(man2, "version")) == "v9.8.7-alpha"
+        && sha256_hex(canon) == json_str_value(json_object_get(man2, "closure_digest")) {
+        pass_msg(acc, "the self-hosted kit's manifest is canonical (the closure digest recomputes, the fields agree with the Python rendering)")
+    } else {
+        fail_msg(acc, "the kit's manifest broke interchange: " + trunc(r6.combined, 300))
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 6. the independence smoke
+# ----------------------------------------------------------------------------
+fn sec6(acc: Acc) -> void uses IO, Fs, Proc, Exit {
+    section("6. the independence smoke")
+    let r: RunResult = make_bootstrap(acc, acc.root, false)
+    if r.code != 0 {
+        fail_msg(acc, "the real-tree bootstrap failed before the smoke: " + trunc(r.combined, 300))
+        return
+    }
+    let fib_c: str = scratch(acc, "fib.c")
+    let fib_bin: str = scratch(acc, "fib")
+    let r1: RunResult = run_capture("./bin/hlc", ["examples/fibonacci.hls", fib_c])
+    let gargs: list[str] = ["-O2", "-o", fib_bin, fib_c, "-lm", "-pthread"]
+    let r2: RunResult = run_capture("gcc", gargs)
+    let nat: RunResult = run_capture(fib_bin, [])
+    let iargs: list[str] = ["tools/hlinterp/boot.py", "examples/fibonacci.hls"]
+    let interp: RunResult = run_capture("python3", iargs)
+    if r1.code == 0 && r2.code == 0
+        && nat.out == interp.out && nat.code == interp.code {
+        pass_msg(acc, "the purely-bootstrapped hlc compiles + runs fibonacci with interpreter-identical output")
+    } else {
+        fail_msg(acc, "the smoke diverged (nat rc=" + nat.code.to_str()
+            + " interp rc=" + interp.code.to_str() + ")")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 7. the provenance law
+# ----------------------------------------------------------------------------
+fn sec7(acc: Acc) -> void uses IO, Fs {
+    section("7. the provenance law")
+    # The gate's OWN closure walker — never the tool's reader.
+    let entry: str = path_join3(acc.root, "src/hlc.hls")
+    let mut queue: list[str] = [entry]
+    let seen_paths: list[str] = []
+    let seen_digests: list[str] = []
+    let mut unresolvable: int = 0
+    while queue.len() > 0 {
+        let cur: str = queue.get(0)
+        let rest: list[str] = []
+        let mut qi: int = 1
+        while qi < queue.len() {
+            rest.push(queue.get(qi))
+            qi = qi + 1
+        }
+        queue = rest
+        let mut already: bool = false
+        let mut si: int = 0
+        while si < seen_paths.len() {
+            if seen_paths.get(si) == cur {
+                already = true
+            }
+            si = si + 1
+        }
+        if already {
+            continue
+        }
+        seen_paths.push(cur)
+        seen_digests.push(sha256_file(cur))
+        let src: str = read_file(cur)
+        let lines: list[str] = src.split("\n")
+        let mut li: int = 0
+        while li < lines.len() {
+            let line: str = lines.get(li)
+            # ^\s*import\s+"([^"]+)"
+            let mut b: int = 0
+            while b < line.len() && (line.byte_at(b) == 32 || line.byte_at(b) == 9) {
+                b = b + 1
+            }
+            let t: str = line.slice(b, line.len())
+            if t.starts_with("import") && t.len() > 6
+                && (t.byte_at(6) == 32 || t.byte_at(6) == 9) {
+                let mut w: int = 6
+                while w < t.len() && (t.byte_at(w) == 32 || t.byte_at(w) == 9) {
+                    w = w + 1
+                }
+                if w < t.len() && t.byte_at(w) == 34 {
+                    let tail: str = t.slice(w + 1, t.len())
+                    let end: int = tail.find("\"")
+                    if end > 0 {
+                        let imp: str = tail.slice(0, end)
+                        let mut cand: str = ""
+                        if imp.starts_with("std.") || imp.starts_with("core.") {
+                            let mut fam: str = "std"
+                            if imp.starts_with("core.") {
+                                fam = "core"
+                            }
+                            let rest2: str = str_replace(
+                                imp.slice(fam.len() + 1, imp.len()), ".", "/")
+                            cand = path_join3(acc.root,
+                                fam + "/" + rest2 + ".hls")
+                        } else {
+                            cand = path_join3(path_dir3(cur), imp)
+                        }
+                        if !file_exists(cand) {
+                            fail_msg(acc, "provenance: unresolvable import " + imp
+                                + " in " + cur)
+                            unresolvable = unresolvable + 1
+                        } else {
+                            let mut enq: bool = true
+                            let mut ei: int = 0
+                            while ei < seen_paths.len() {
+                                if seen_paths.get(ei) == cand {
+                                    enq = false
+                                }
+                                ei = ei + 1
+                            }
+                            let mut ei2: int = 0
+                            while ei2 < queue.len() {
+                                if queue.get(ei2) == cand {
+                                    enq = false
+                                }
+                                ei2 = ei2 + 1
+                            }
+                            if enq {
+                                queue.push(cand)
+                            }
+                        }
+                    }
+                }
+            }
+            li = li + 1
+        }
+    }
+    let man: JsonValue = json_parse(read_file(
+        path_join3(acc.root, "snapshot/MANIFEST.json")))
+    let clo: JsonValue = json_object_get(man, "closure")
+    let mut equal: bool = clo.obj_keys.len() == seen_paths.len()
+    let mut mi: int = 0
+    while mi < clo.obj_keys.len() {
+        let key: str = clo.obj_keys.get(mi)
+        let want: str = json_str_value(clo.obj_vals.get(mi))
+        let mut found: bool = false
+        let mut si2: int = 0
+        while si2 < seen_paths.len() {
+            if seen_paths.get(si2) == key {
+                found = true
+                if seen_digests.get(si2) != want {
+                    equal = false
+                }
+            }
+            si2 = si2 + 1
+        }
+        if !found {
+            equal = false
+        }
+        mi = mi + 1
+    }
+    if equal {
+        pass_msg(acc, "the manifest closure equals the gate's own derivation ("
+            + seen_paths.len().to_str() + " files)")
+    } else {
+        fail_msg(acc, "the manifest closure disagrees with the gate's walk (manifest "
+            + clo.obj_keys.len().to_str() + " vs gate "
+            + seen_paths.len().to_str() + " files)")
+    }
+
+    let mut head_ver: str = ""
+    let rel: str = read_file(path_join3(acc.root, "RELEASES.md"))
+    let rlines: list[str] = rel.split("\n")
+    let mut ri: int = 0
+    while ri < rlines.len() && head_ver == "" {
+        let line: str = rlines.get(ri)
+        # ^## \[(v[0-9][^\]\s]*)\]
+        if line.starts_with("## [") {
+            let close: int = line.find("]")
+            if close > 4 {
+                let inner: str = line.slice(4, close)
+                let mut clean: bool = inner.len() >= 2
+                    && inner.byte_at(0) == 118 && is_digit(inner.byte_at(1))
+                let mut ci: int = 0
+                while ci < inner.len() {
+                    let cb: int = inner.byte_at(ci)
+                    if cb == 32 || cb == 9 || cb == 10 || cb == 13 {
+                        clean = false
+                    }
+                    ci = ci + 1
+                }
+                if clean {
+                    head_ver = inner
+                }
+            }
+        }
+        ri = ri + 1
+    }
+    let man_ver: str = json_str_value(json_object_get(man, "version"))
+    if head_ver != "" && man_ver == head_ver {
+        pass_msg(acc, "the manifest pins the RELEASES.md head release (" + head_ver + ")")
+    } else {
+        fail_msg(acc, "the manifest version " + man_ver + " != RELEASES.md head "
+            + head_ver)
+    }
+
+    let rounds: int = json_int_value(json_object_get(man, "rounds"))
+    if rounds >= 1 && rounds <= 8 {
+        pass_msg(acc, "the recorded rounds are sane (rounds=" + rounds.to_str() + ")")
+    } else {
+        fail_msg(acc, "the manifest rounds are insane: " + rounds.to_str())
+    }
+
+    let snap_text: str = read_file(path_join3(acc.root, "snapshot/hlc.c"))
+    let leaks: list[str] = []
+    if snap_text.contains(acc.root) {
+        leaks.push(acc.root)
+    }
+    if snap_text.contains(acc.scratch_base) {
+        leaks.push(acc.scratch_base)
+    }
+    if snap_text.contains(path_join3(acc.root, "tests")) {
+        leaks.push(path_join3(acc.root, "tests"))
+    }
+    if leaks.len() == 0 {
+        pass_msg(acc, "the snapshot text carries no absolute path (the same C from any checkout directory)")
+    } else {
+        fail_msg(acc, "the snapshot leaks absolute paths: [" + str_join(leaks, ", ") + "]")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 8. the self-host law (the kit itself)
+# ----------------------------------------------------------------------------
+fn sec8(acc: Acc) -> void uses IO, Fs, Proc {
+    section("8. the self-host law (the kit itself)")
+    let kit_c: str = scratch(acc, "hls-snap-kit.c")
+    let r: RunResult = run_capture("./bin/hlc", ["tools/hls-snap.hls", kit_c])
+    if r.code != 0 {
+        fail_msg(acc, "the bootstrapped compiler cannot compile its own caretaker: "
+            + trunc(r.combined, 300))
+        return
+    }
+    pass_msg(acc, "bin/hlc (built from the snapshot) compiles tools/hls-snap.hls")
+    let kit_text: str = read_or(kit_c, "")
+    let leaks: list[str] = []
+    if kit_text.contains(acc.root) {
+        leaks.push(acc.root)
+    }
+    if kit_text.contains(acc.scratch_base) {
+        leaks.push(acc.scratch_base)
+    }
+    if leaks.len() == 0 {
+        pass_msg(acc, "the kit's emitted C carries no absolute path")
+    } else {
+        fail_msg(acc, "the kit's C leaks absolute paths: [" + str_join(leaks, ", ") + "]")
+    }
+    let kit_src: str = read_file(path_join3(acc.root, "tools/hls-snap.hls"))
+    if kit_src.contains("boot/boot.py") {
+        fail_msg(acc, "the kit's source still names an interpreter invocation")
+    } else {
+        pass_msg(acc, "the kit's source names no interpreter invocation at all — not even a refused one (--seed refuses as a retired flag)")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 9. the chain law (bit for bit, twice over)
+# ----------------------------------------------------------------------------
+fn sec9(acc: Acc) -> void uses IO, Fs, Proc, Exit {
+    section("9. the chain law (bit for bit, twice over)")
+    # 9a. The kit's own chain command on the REAL tree: two independent
+    #     ignitions, every hop byte-compared, one digest.
+    let r: RunResult = snap(acc.root, "chain")
+    let root_digest: str = chain_digest_of(r.out)
+    if r.code == 0 && r.out.contains("CHAIN PROVEN")
+        && r.out.contains("2 rounds, byte for byte identical")
+        && root_digest != "" {
+        pass_msg(acc, "make snapshot-chain: two independent ignitions, every hop byte-compared, one chain digest")
+    } else {
+        fail_msg(acc, "the chain command failed: " + trunc(r.combined, 400))
+    }
+
+    # 9b. Path independence: two full chains from two checkouts at
+    #     different filesystem paths. The emissions — not the binaries;
+    #     cc is free to link differently — must be byte-identical, and
+    #     the chain digest must not move.
+    let treeA: str = copy_tree(acc, "chainA")
+    let treeB: str = copy_tree(acc, "chainB")
+    let rA: RunResult = snap(treeA, "chain")
+    let rB: RunResult = snap(treeB, "chain")
+    let da: str = chain_digest_of(rA.out)
+    let db: str = chain_digest_of(rB.out)
+    let shaA: str = sha256_file(path_join3(treeA, "bin/hls-snap-chain-1.c"))
+    let shaB: str = sha256_file(path_join3(treeB, "bin/hls-snap-chain-1.c"))
+    let manA: JsonValue = json_parse(read_file(
+        path_join3(treeA, "snapshot/MANIFEST.json")))
+    let want_sha: str = json_str_value(json_object_get(manA, "hlc_c_sha256"))
+    if rA.code == 0 && rB.code == 0 && da != "" && da == db
+        && shaA == shaB && shaA == want_sha {
+        pass_msg(acc, "two checkouts at different paths: identical round-1 emission and identical chain digest")
+    } else {
+        fail_msg(acc, "path independence broke: digests " + da + " vs " + db)
+    }
+
+    # 9c. Environment hostility: TZ, LANG, LC_ALL and SOURCE_DATE_EPOCH
+    #     poisoned, on the python-free PATH — the digest must not move.
+    let bin: str = nopy_dir(acc)
+    let envp: str = "env -i PATH='" + shell_quote(bin) + "' TMPDIR='"
+        + shell_quote(acc.scratch_base) + "' TZ=Asia/Tokyo LANG=C.UTF-8"
+        + " LC_ALL=C SOURCE_DATE_EPOCH=1234567890 HOME=/nonexistent "
+    let rC: RunResult = make_run(treeB, "snapshot-chain", envp)
+    let dc: str = chain_digest_of(rC.out)
+    if rC.code == 0 && dc != "" && dc == db {
+        pass_msg(acc, "a hostile environment (TZ/LANG/LC_ALL/SOURCE_DATE_EPOCH, python-free PATH) does not move the chain digest")
+    } else {
+        fail_msg(acc, "the hostile-env chain failed or moved the digest: "
+            + trunc(rC.combined, 300))
+    }
+
+    # 9d. The cross-compiler form: a second cc in round two's slot must
+    #     land on the same digest. clang when the machine has it; cc
+    #     otherwise (the flag path proven here, the truly-different
+    #     compiler on CI's grid).
+    let mut cc2: str = "cc"
+    if which("clang") {
+        cc2 = "clang"
+    }
+    let rD: RunResult = make_run(treeA, "snapshot-chain CC2=" + cc2, "")
+    let dd: str = chain_digest_of(rD.out)
+    if rD.code == 0 && dd != "" && dd == da && rD.out.contains("slot one") {
+        pass_msg(acc, "the cross-compiler form (CC2=" + cc2 + ") lands on the same digest")
+    } else {
+        fail_msg(acc, "the cross-compiler chain failed: " + trunc(rD.combined, 300))
+    }
+
+    # 9e. The drifted-tree law: chain, like prove, refuses a drifted tree.
+    let types_hls: str = path_join3(treeA, "src/hlc/types.hls")
+    let types_orig: str = read_file(types_hls)
+    write_file(types_hls, types_orig + "\n# gate: chain drift probe\n")
+    let rE: RunResult = snap(treeA, "chain")
+    if rE.code != 0 && rE.out.contains("the drifted-tree law") {
+        pass_msg(acc, "chain refuses a drifted tree with the law named (a chain run from a tree the manifest does not describe is not a proof)")
+    } else {
+        fail_msg(acc, "the drifted-tree chain was not refused (rc=" + rE.code.to_str() + ")")
+    }
+    write_file(types_hls, types_orig)
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let acc: Acc = acc_new("pboot")
+    sec1(acc)
+    sec2(acc)
+    sec3(acc)
+    sec4(acc)
+    sec5(acc)
+    sec6(acc)
+    sec7(acc)
+    sec8(acc)
+    sec9(acc)
+    return finish(acc, "Stage 143 -- the bit-for-bit reproducible bootstrap chain")
+}
