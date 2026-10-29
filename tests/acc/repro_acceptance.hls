@@ -1,0 +1,925 @@
+# ============================================================================
+# tests/acc/repro_acceptance.hls — Stage 105 acceptance gate, in Halis
+# (the Halis twin of tests/repro_acceptance.py; same nine sections,
+# same assertions, same needles — the harness is tests/acc/harness.hls
+# and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make repro-acceptance` (which compiles this file and runs
+# it from the repo root).
+#
+# The battery imported tools/hls-repro.py as a module for three legs —
+# _engine_resolve, diagnose, load_source_tree/stage_source — and built
+# a tampered buildinfo with json.dumps; the gate drives the same module
+# through tiny python drivers (the front door a native binary has) and
+# keeps every CLI leg on the tool's own command line. The engine the
+# gate builds with is resolved the way _engine_resolve("auto") does:
+# native when bin/hlc exists, boot otherwise — every engine-conditional
+# assertion keys off that one value. The detached drift fixture lives
+# OUTSIDE the repo (/tmp) exactly as the battery insists — a tree
+# inside tests/ would be keyed repo-relative and stage as 'repo'.
+#
+#  1. the recipe     — the demo built twice in two isolated roots
+#                      under two profiles (locale, TZ, umask, hash
+#                      seed, root-path shape): byte-identical C,
+#                      byte-identical binary, the buildinfo pinned
+#                      (schema, engine, epoch policy, the matrix
+#                      recorded, the smoke consistent, every hash
+#                      over the real bytes)
+#  2. the diagnoser  — the STT_FILE lesson: the same C compiled under
+#                      two intermediate names differs in exactly one
+#                      byte, and diagnose() names the leak; a C with
+#                      a timestamp macro is named too
+#  3. the epoch      — --epoch wins, SOURCE_DATE_EPOCH next, the
+#                      tree digest derives otherwise (changed source,
+#                      changed epoch); the SBOM bridge: with the
+#                      repro epoch pinned, the Stage 104 documents
+#                      rebuild byte for byte
+#  4. the matrix     — three builds, three profiles, one verdict;
+#                      the staged root holds exactly the audit's
+#                      module set (hermetic, decoys excluded)
+#  5. the drift      — a detached fixture: a changed module moves the
+#                      tree digest and --verify refuses BEFORE
+#                      building; an engine mismatch refuses
+#  6. the verify     — a fresh verify returns the bytes (exit 0); a
+#                      tampered outputs hash refuses (exit 1)
+#  7. the package    — no lockfile, no release; a fresh lock releases
+#                      (versioned buildinfo, one "repro" record
+#                      chained, the chain still verifies); content
+#                      changed under the lock refuses WITHOUT
+#                      touching the log
+#  8. the demos      — the demo and the ok-test run; interpreter and
+#                      native agree byte for byte (native half only
+#                      when bin/hlc exists — hermetic)
+#  9. the tools      — hlfmt stable, hllint clean on the new entry
+#                      sources
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.json"
+import "std.result"
+import "std.env"
+import "std.sha256"
+
+# ----------------------------------------------------------------------------
+# The gate's constants (the battery's).
+# ----------------------------------------------------------------------------
+
+fn demo() -> str {
+    return "examples/repro_demo.hls"
+}
+
+fn ok_test() -> str {
+    return "tests/ok/feat_stage105_repro.hls"
+}
+
+fn log_main() -> str {
+    return ".hls-pkg-transparency.log"
+}
+
+fn log_lock() -> str {
+    return ".hls-pkg-transparency.log.lock"
+}
+
+# engine(acc) — hls_repro._engine_resolve("auto"): native when bin/hlc
+# exists, boot otherwise. Every engine-conditional leg keys off this.
+fn engine(acc: Acc) -> str uses Fs {
+    if file_exists(path_join3(acc.root, "bin/hlc")) {
+        return "native"
+    }
+    return "boot"
+}
+
+# ----------------------------------------------------------------------------
+# JSON accessors — null-safe, so a failed leg FAILs instead of crashing.
+# ----------------------------------------------------------------------------
+
+fn parse_json(text: str) -> JsonValue {
+    let rr: Result[JsonValue, str] = json_parse_result(text)
+    if result_is_ok(rr) {
+        return result_unwrap(rr)
+    }
+    return json_null()
+}
+
+fn jget(v: JsonValue, key: str) -> JsonValue {
+    return json_object_get(v, key)
+}
+
+fn jstr(v: JsonValue, key: str) -> str {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_str(x) {
+        return json_str_value(x)
+    }
+    return ""
+}
+
+fn jint(v: JsonValue, key: str) -> int {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_int(x) {
+        return json_int_value(x)
+    }
+    return 0
+}
+
+fn el_str(v: JsonValue) -> str {
+    if json_is_str(v) {
+        return json_str_value(v)
+    }
+    return ""
+}
+
+fn arr_at(v: JsonValue, i: int) -> JsonValue {
+    if json_is_array(v) && i >= 0 && i < v.arr.len() {
+        return v.arr.get(i)
+    }
+    return json_null()
+}
+
+# all_same(arr, field) — the battery's len({b[field] for b in builds}) == 1.
+fn all_same(arr: JsonValue, field: str) -> bool {
+    if !json_is_array(arr) || arr.arr.len() == 0 {
+        return false
+    }
+    let first: str = jstr(arr.arr.get(0), field)
+    let mut i: int = 1
+    while i < arr.arr.len() {
+        if jstr(arr.arr.get(i), field) != first {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn join_jstrs(v: JsonValue, sep: str) -> str {
+    let parts: list[str] = []
+    if json_is_array(v) {
+        let mut i: int = 0
+        while i < v.arr.len() {
+            parts.push(el_str(v.arr.get(i)))
+            i = i + 1
+        }
+    }
+    return str_join(parts, sep)
+}
+
+# ----------------------------------------------------------------------------
+# Small helpers.
+# ----------------------------------------------------------------------------
+
+fn sha_of(path: str) -> str uses Fs {
+    return sha256_hex(read_file(path))
+}
+
+fn last_line(path: str) -> str uses Fs {
+    let text: str = read_or(path, "")
+    let lines: list[str] = text.split("\n")
+    let mut i: int = lines.len() - 1
+    while i >= 0 {
+        let t: str = lines.get(i).trim()
+        if t != "" {
+            return t
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+fn dir_exists(path: str) -> bool uses Proc {
+    return sh("test -d '" + shell_quote(path) + "'") == 0
+}
+
+# cc_in(dir, args) — the battery's run([...], cwd=dir).
+fn cc_in(dir: str, args: list[str]) -> int uses Proc {
+    let home: str = cwd_get()
+    env_set_current_dir(dir)
+    let code: int = run_quiet("cc", args)
+    env_set_current_dir(home)
+    return code
+}
+
+# ----------------------------------------------------------------------------
+# The tools, as the battery addresses them.
+# ----------------------------------------------------------------------------
+
+fn run_repro(acc: Acc, args: list[str]) -> RunResult uses Proc {
+    let argv: list[str] = [path_join3(acc.root, "tools/hls-repro.py")]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    return run_capture("python3", argv)
+}
+
+fn run_sbom(acc: Acc, args: list[str]) -> RunResult uses Proc {
+    let argv: list[str] = [path_join3(acc.root, "tools/hls-sbom.py")]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    return run_capture("python3", argv)
+}
+
+fn run_pkg_in(acc: Acc, args: list[str], dir: str) -> int uses Proc {
+    let home: str = cwd_get()
+    env_set_current_dir(dir)
+    let argv: list[str] = [path_join3(acc.root, "tools/hls-pkg.py")]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    let code: int = run_quiet("python3", argv)
+    env_set_current_dir(home)
+    return code
+}
+
+# ----------------------------------------------------------------------------
+# 1. the recipe (two profiles, one verdict)
+# ----------------------------------------------------------------------------
+
+fn sec1(acc: Acc) -> void uses IO, Fs, Proc {
+    section("1. the recipe (two profiles, one verdict)")
+    let eng: str = engine(acc)
+    let p: RunResult = run_repro(acc, [demo(), "--builds", "2",
+    "--engine", eng, "--json"])
+    let bi: JsonValue = parse_json(p.out)
+    check(acc, "the demo reproduces across two profiles (exit 0)",
+    p.code == 0, clip(p.combined, 120))
+    check(acc, "the buildinfo names the schema, the tool and the release",
+    jstr(bi, "schema") == "hls-buildinfo/v1" && jstr(bi, "tool") == "hls-repro"
+    && jstr(bi, "tool_version") == "0.124.0-alpha", "")
+    check(acc, "source mode, repo layout, the entry named as the audit keys it",
+    jstr(bi, "mode") == "source" && jstr(bi, "engine") == eng
+    && jstr(jget(bi, "tree"), "entry") == demo()
+    && jstr(jget(bi, "tree"), "layout") == "repo", "")
+    let epoch_v: int = jint(jget(bi, "epoch"), "value")
+    check(acc, "the epoch is derived (content, not clock) and in the sane range",
+    jstr(jget(bi, "epoch"), "source") == "derived"
+    && epoch_v >= 0 && epoch_v < 2147483648, "")
+    let profiles: JsonValue = jget(jget(bi, "matrix"), "profiles")
+    check(acc, "the matrix records the profiles it exercised",
+    json_is_array(profiles) && profiles.arr.len() == 2
+    && jstr(arr_at(profiles, 0), "name") == "baseline"
+    && jstr(arr_at(profiles, 1), "name") == "glibc-debian", "")
+    let prof1_env: JsonValue = jget(arr_at(profiles, 1), "env")
+    check(acc, "the profile deltas ride along (the claim is scoped, not vague)",
+    jstr(prof1_env, "TZ") == "Europe/Berlin"
+    && jstr(prof1_env, "PYTHONHASHSEED") == "1", "")
+    let builds: JsonValue = jget(bi, "builds")
+    check(acc, "byte-identical C and binary across the roots",
+    all_same(builds, "c_sha256") && all_same(builds, "binary_sha256"), "")
+    let outputs: JsonValue = jget(bi, "outputs")
+    check(acc, "the outputs section repeats the per-build hashes",
+    jstr(outputs, "c_sha256") == jstr(arr_at(builds, 0), "c_sha256")
+    && jstr(outputs, "binary_sha256")
+    == jstr(arr_at(builds, 0), "binary_sha256"), "")
+    check(acc, "the smoke is consistent: same exit, same stdout everywhere",
+    jstr(jget(bi, "smoke"), "status") == "consistent", "")
+    check(acc, "the toolchain section names hlc, cc and python",
+    jstr(jget(bi, "toolchain"), "hlc_fingerprint_sha256")
+    == sha_of("src/hlc.hls")
+    && json_object_has(jget(bi, "toolchain"), "cc")
+    && json_object_has(jget(bi, "toolchain"), "python"), "")
+    let mut sizes_ok: bool = json_is_array(builds) && builds.arr.len() > 0
+    let mut si: int = 0
+    while si < builds.arr.len() {
+        if jint(arr_at(builds, si), "binary_size") != jint(outputs, "binary_size") {
+            sizes_ok = false
+        }
+        si = si + 1
+    }
+    check(acc, "the binary size agrees with the hashes", sizes_ok, "")
+
+    # Text mode writes the buildinfo next to the entry; --out moves it.
+    let out_dir: str = scratch(acc, "out")
+    let p2: RunResult = run_repro(acc, [demo(), "--builds", "2",
+    "--engine", eng, "--out", out_dir])
+    let written_path: str = path_join3(out_dir, "hls-repro.buildinfo.json")
+    check(acc, "text mode writes the buildinfo (--out honoured)",
+    p2.code == 0 && file_exists(written_path), clip(p2.combined, 120))
+    check(acc, "the written buildinfo equals the --json report",
+    read_or(written_path, "").trim() == p.out.trim()
+    && p.out.trim() != "", "")
+}
+
+# ----------------------------------------------------------------------------
+# 2. the diagnoser (the STT_FILE lesson)
+# ----------------------------------------------------------------------------
+
+fn sec2(acc: Acc) -> void uses IO, Fs, Proc {
+    section("2. the diagnoser (the STT_FILE lesson)")
+    let diag_dir: str = scratch(acc, "diag")
+    mkdirs(path_join3(diag_dir, "one"))
+    mkdirs(path_join3(diag_dir, "two"))
+    let tiny_c: str = "int hl_probe(void) { return 42; }\n"
+    + "int main(void) { return hl_probe(); }\n"
+    write_file(path_join3(diag_dir, "one/a.c"), tiny_c)
+    write_file(path_join3(diag_dir, "two/b.c"), tiny_c)
+    # Same length, one letter apart: the exact shape of the one-byte
+    # STT_FILE divergence — the symbol table records the input NAME.
+    let cc1: int = cc_in(path_join3(diag_dir, "one"),
+    ["-O2", "-o", "hl_repro", "a.c", "-lm", "-pthread"])
+    let cc2: int = cc_in(path_join3(diag_dir, "two"),
+    ["-O2", "-o", "hl_repro", "b.c", "-lm", "-pthread"])
+    if cc1 != 0 {
+        fail_msg(acc, "the diagnoser fixture failed to compile (one)")
+    } else if cc2 != 0 {
+        fail_msg(acc, "the diagnoser fixture failed to compile (two)")
+    } else {
+        let one: str = path_join3(diag_dir, "one")
+        let two: str = path_join3(diag_dir, "two")
+        check(acc, "the fixture's two C files are byte-identical",
+        sha_of(path_join3(one, "a.c")) == sha_of(path_join3(two, "b.c")), "")
+        check(acc, "the binaries differ because the intermediate NAME differs",
+        sha_of(path_join3(one, "hl_repro"))
+        != sha_of(path_join3(two, "hl_repro")), "")
+        # The battery called hls_repro.diagnose in-process; the gate
+        # drives the same function through the module front door.
+        let driver: str = write_src(acc, "drivers/diag.py",
+        "import importlib.util as ilu, os, sys\n"
+        + "ROOT = sys.argv[1]\n"
+        + "spec = ilu.spec_from_file_location(\"hls_repro_mod\", "
+        + "os.path.join(ROOT, \"tools\", \"hls-repro.py\"))\n"
+        + "m = ilu.module_from_spec(spec)\n"
+        + "sys.modules[\"hls_repro_mod\"] = m\n"
+        + "spec.loader.exec_module(m)\n"
+        + "mode = sys.argv[2]\n"
+        + "if mode == \"stt\":\n"
+        + "    one, two = sys.argv[3], sys.argv[4]\n"
+        + "    findings = m.diagnose(\n"
+        + "        [{\"c_sha256\": \"x\", \"binary_sha256\": \"y\"}, "
+        + "{\"c_sha256\": \"x\", \"binary_sha256\": \"z\"}],\n"
+        + "        [os.path.join(one, \"a.c\"), os.path.join(two, \"b.c\")],\n"
+        + "        [os.path.join(one, \"hl_repro\"), os.path.join(two, \"hl_repro\")],\n"
+        + "        [one, two])\n"
+        + "elif mode == \"clock\":\n"
+        + "    clock_c = sys.argv[3]\n"
+        + "    findings = m.diagnose(\n"
+        + "        [{\"c_sha256\": \"a\", \"binary_sha256\": \"a\"}, "
+        + "{\"c_sha256\": \"b\", \"binary_sha256\": \"b\"}],\n"
+        + "        [clock_c, clock_c], [\"\", \"\"], [\"\", \"\"])\n"
+        + "for f in findings:\n"
+        + "    print(\"FINDING \" + f)\n")
+        let dst: RunResult = run_capture("python3",
+        [driver, acc.root, "stt", one, two])
+        let findings: list[str] = []
+        let flines: list[str] = dst.out.split("\n")
+        let mut fi: int = 0
+        while fi < flines.len() {
+            if flines.get(fi).starts_with("FINDING ") {
+                findings.push(flines.get(fi).slice(8, flines.get(fi).len()))
+            }
+            fi = fi + 1
+        }
+        let joined: str = str_join(findings, " | ")
+        let mut stt_named: bool = false
+        let mut one_byte: bool = false
+        let mut k: int = 0
+        while k < findings.len() {
+            if findings.get(k).contains("STT_FILE")
+            || findings.get(k).contains("FILE NAME") {
+                stt_named = true
+            }
+            if findings.get(k).contains("differ in 1 byte") {
+                one_byte = true
+            }
+            k = k + 1
+        }
+        check(acc, "the diagnoser names the symbol-table signature: " + joined,
+        stt_named, "")
+        check(acc, "the diagnoser counts the one differing byte", one_byte, "")
+
+        # A C that reads the wall clock cannot reproduce: named.
+        let clock_c: str = write_src(acc, "diag/clocky.c",
+        "const char *born = __DATE__ \" \" __TIME__;\n"
+        + "int main(void) { return born[0] ? 0 : 1; }\n")
+        let dst2: RunResult = run_capture("python3",
+        [driver, acc.root, "clock", clock_c])
+        let findings2: list[str] = []
+        let flines2: list[str] = dst2.out.split("\n")
+        let mut fi2: int = 0
+        while fi2 < flines2.len() {
+            if flines2.get(fi2).starts_with("FINDING ") {
+                findings2.push(flines2.get(fi2).slice(8, flines2.get(fi2).len()))
+            }
+            fi2 = fi2 + 1
+        }
+        let mut date_named: bool = false
+        let mut k2: int = 0
+        while k2 < findings2.len() {
+            if findings2.get(k2).contains("__DATE__") {
+                date_named = true
+            }
+            k2 = k2 + 1
+        }
+        check(acc, "the diagnoser names the timestamp macros in the C",
+        date_named, "")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 3. the epoch (content, not clock)
+# ----------------------------------------------------------------------------
+
+fn sec3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("3. the epoch (content, not clock)")
+    let eng: str = engine(acc)
+    let p1: RunResult = run_repro(acc, [demo(), "--builds", "2",
+    "--engine", eng, "--epoch", "1727800000", "--json"])
+    let e1: JsonValue = parse_json(p1.out)
+    check(acc, "--epoch wins and is recorded as the source",
+    p1.code == 0 && jstr(jget(e1, "epoch"), "source") == "--epoch"
+    && jint(jget(e1, "epoch"), "value") == 1727800000, "")
+    env_set_var("SOURCE_DATE_EPOCH", "1234567890")
+    let p2: RunResult = run_repro(acc, [demo(), "--builds", "2",
+    "--engine", eng, "--json"])
+    let e2: JsonValue = parse_json(p2.out)
+    check(acc, "the environment's SOURCE_DATE_EPOCH is honoured next",
+    jstr(jget(e2, "epoch"), "source") == "SOURCE_DATE_EPOCH"
+    && jint(jget(e2, "epoch"), "value") == 1234567890, "")
+    env_unset_var("SOURCE_DATE_EPOCH")
+    let p3: RunResult = run_repro(acc, [demo(), "--builds", "2",
+    "--engine", eng, "--json"])
+    let e3: JsonValue = parse_json(p3.out)
+    let derived: int = jint(jget(e3, "epoch"), "value")
+    check(acc, "no epoch named — the tree digest derives one",
+    jstr(jget(e3, "epoch"), "source") == "derived"
+    && derived >= 0 && derived < 2147483648, "")
+
+    # One flipped source byte moves the tree digest and the derived
+    # epoch with it.
+    let epoch_scratch: str = scratch(acc, "epoch")
+    mkdirs(epoch_scratch)
+    let demo_copy: str = path_join3(epoch_scratch, "repro_demo.hls")
+    write_file(demo_copy, read_file(demo()))
+    let scratch_roots: str = scratch(acc, "epoch_roots")
+    let p4: RunResult = run_repro(acc, [demo_copy, "--builds", "2",
+    "--engine", eng, "--scratch", scratch_roots, "--json"])
+    let e4: JsonValue = parse_json(p4.out)
+    write_file(demo_copy, read_or(demo_copy, "") + "\n# one byte more\n")
+    let p5: RunResult = run_repro(acc, [demo_copy, "--builds", "2",
+    "--engine", eng, "--scratch", scratch_roots, "--json"])
+    let e5: JsonValue = parse_json(p5.out)
+    check(acc, "one flipped byte moves the tree digest and the derived epoch",
+    jint(jget(e4, "epoch"), "value") != jint(jget(e5, "epoch"), "value")
+    && jstr(jget(e4, "tree"), "digest")
+    != jstr(jget(e5, "tree"), "digest"), "")
+
+    # The Stage 104 bridge: with the repro epoch pinned, the SBOM
+    # documents rebuild byte for byte — a release's SBOM can be
+    # REBUILT, not just re-emitted.
+    env_set_var("SOURCE_DATE_EPOCH", derived.to_str())
+    let sa: RunResult = run_sbom(acc, [demo(), "--format", "cdx", "--stdout"])
+    let sb: RunResult = run_sbom(acc, [demo(), "--format", "cdx", "--stdout"])
+    check(acc, "the SBOM bridge: byte-identical documents under the repro epoch",
+    sa.code == 0 && sa.out == sb.out
+    && sb.out.trim().starts_with("{"), "")
+    env_unset_var("SOURCE_DATE_EPOCH")
+}
+
+# ----------------------------------------------------------------------------
+# 4. the matrix (three builds, one verdict)
+# ----------------------------------------------------------------------------
+
+fn sec4(acc: Acc) -> void uses IO, Fs, Proc {
+    section("4. the matrix (three builds, one verdict)")
+    let eng: str = engine(acc)
+    let p: RunResult = run_repro(acc, [demo(), "--builds", "3",
+    "--engine", eng, "--json"])
+    let m3: JsonValue = parse_json(p.out)
+    check(acc, "three builds agree (exit 0)", p.code == 0,
+    clip(p.combined, 120))
+    let profiles: JsonValue = jget(jget(m3, "matrix"), "profiles")
+    let prof_names: list[str] = []
+    if json_is_array(profiles) {
+        let mut i: int = 0
+        while i < profiles.arr.len() {
+            prof_names.push(jstr(profiles.arr.get(i), "name"))
+            i = i + 1
+        }
+    }
+    let names_joined: str = str_join(prof_names, ", ")
+    check(acc, "the rotation walks the profile list in order: " + names_joined,
+    prof_names.len() == 3 && prof_names.get(0) == "baseline"
+    && prof_names.get(1) == "glibc-debian"
+    && prof_names.get(2) == "musl-alpine", "")
+    # the umask set across the profiles, distinct-counted
+    let mut distinct: int = 0
+    let seen: list[str] = []
+    if json_is_array(profiles) {
+        let mut i2: int = 0
+        while i2 < profiles.arr.len() {
+            let u: str = jstr(profiles.arr.get(i2), "umask")
+            let mut known: bool = false
+            let mut k: int = 0
+            while k < seen.len() {
+                if seen.get(k) == u {
+                    known = true
+                }
+                k = k + 1
+            }
+            if !known {
+                seen.push(u)
+                distinct = distinct + 1
+            }
+            i2 = i2 + 1
+        }
+    }
+    check(acc, "the umask varies across the matrix (and never matters)",
+    distinct >= 2, "")
+    check(acc, "three environments, one binary hash",
+    all_same(jget(m3, "builds"), "binary_sha256"), "")
+
+    # The staging is hermetic: a build root holds exactly the audit's
+    # module set — the demo tree is the entry + std.str, nothing else.
+    # The battery called load_source_tree + stage_source in-process;
+    # the gate drives the same functions through the module front door
+    # and compares the two file sets itself.
+    let stage_root: str = scratch(acc, "stage")
+    mkdirs(stage_root)
+    let driver: str = write_src(acc, "drivers/stage.py",
+    "import importlib.util as ilu, os, sys\n"
+    + "ROOT = sys.argv[1]\n"
+    + "spec = ilu.spec_from_file_location(\"hls_repro_mod\", "
+    + "os.path.join(ROOT, \"tools\", \"hls-repro.py\"))\n"
+    + "m = ilu.module_from_spec(spec)\n"
+    + "sys.modules[\"hls_repro_mod\"] = m\n"
+    + "spec.loader.exec_module(m)\n"
+    + "stage_root, entry = sys.argv[2], sys.argv[3]\n"
+    + "tree = m.load_source_tree(entry)\n"
+    + "staged_entry = m.stage_source(stage_root, tree)\n"
+    + "staged = []\n"
+    + "for dirpath, _, filenames in os.walk(stage_root):\n"
+    + "    for fn in filenames:\n"
+    + "        staged.append(os.path.relpath(os.path.join(dirpath, fn), "
+    + "stage_root).replace(os.sep, \"/\"))\n"
+    + "audit = sorted({tree[\"rel\"][mod[\"key\"]] "
+    + "for mod in tree[\"report\"][\"modules\"]})\n"
+    + "print(\"ENTRY \" + staged_entry)\n"
+    + "print(\"=== staged\")\n"
+    + "for s in sorted(staged):\n"
+    + "    print(s)\n"
+    + "print(\"=== audit\")\n"
+    + "for a in audit:\n"
+    + "    print(a)\n")
+    let st: RunResult = run_capture("python3",
+    [driver, acc.root, stage_root, path_join3(acc.root, demo())])
+    let st_lines: list[str] = st.out.split("\n")
+    let mut staged_entry: str = ""
+    let staged_files: list[str] = []
+    let audit_files: list[str] = []
+    let mut mode: str = ""
+    let mut li: int = 0
+    while li < st_lines.len() {
+        let line: str = st_lines.get(li)
+        if line.starts_with("ENTRY ") {
+            staged_entry = line.slice(6, line.len())
+        } else if line == "=== staged" {
+            mode = "staged"
+        } else if line == "=== audit" {
+            mode = "audit"
+        } else if line.trim() != "" && mode == "staged" {
+            staged_files.push(line)
+        } else if line.trim() != "" && mode == "audit" {
+            audit_files.push(line)
+        }
+        li = li + 1
+    }
+    # set equality, both ways
+    let mut sets_ok: bool = staged_files.len() == audit_files.len()
+    && staged_files.len() > 0
+    if sets_ok {
+        let mut i3: int = 0
+        while i3 < staged_files.len() && sets_ok {
+            let mut found: bool = false
+            let mut j: int = 0
+            while j < audit_files.len() {
+                if audit_files.get(j) == staged_files.get(i3) {
+                    found = true
+                }
+                j = j + 1
+            }
+            if !found {
+                sets_ok = false
+            }
+            i3 = i3 + 1
+        }
+        let mut i4: int = 0
+        while i4 < audit_files.len() && sets_ok {
+            let mut found2: bool = false
+            let mut j2: int = 0
+            while j2 < staged_files.len() {
+                if staged_files.get(j2) == audit_files.get(i4) {
+                    found2 = true
+                }
+                j2 = j2 + 1
+            }
+            if !found2 {
+                sets_ok = false
+            }
+            i4 = i4 + 1
+        }
+    }
+    check(acc, "the staged root is exactly the audit's module set", sets_ok, "")
+    check(acc, "the entry stages at its own key", staged_entry == demo(), "")
+}
+
+# ----------------------------------------------------------------------------
+# 5. the drift (refuses before it builds)
+# ----------------------------------------------------------------------------
+
+fn sec5(acc: Acc) -> void uses IO, Fs, Proc {
+    section("5. the drift (refuses before it builds)")
+    let eng: str = engine(acc)
+    # The detached fixture MUST live outside the repo — a tree inside
+    # tests/ would be keyed repo-relative and stage as 'repo' layout.
+    let det: str = "/tmp/_gate_s105_det_hls"
+    rmrf(det)
+    mkdirs(path_join3(det, "lib"))
+    let helper: str = path_join3(det, "lib/helper.hls")
+    write_file(helper, "fn twice(x: int) -> int {\n    return x * 2\n}\n")
+    let det_entry: str = path_join3(det, "myprog.hls")
+    write_file(det_entry, "import \"lib/helper.hls\"\n\n"
+    + "fn main() -> int uses IO {\n"
+    + "    println(\"detached \" + twice(21).to_str())\n"
+    + "    return 0\n}\n")
+    let p: RunResult = run_repro(acc, [det_entry, "--builds", "2",
+    "--engine", eng, "--json"])
+    let dbi: JsonValue = parse_json(p.out)
+    check(acc, "a detached tree stages relative to the entry and says so",
+    p.code == 0 && jstr(jget(dbi, "tree"), "layout") == "detached"
+    && jstr(jget(dbi, "tree"), "entry") == "myprog.hls",
+    clip(p.combined, 120))
+    let det_bi: str = path_join3(det, "hls-repro.buildinfo.json")
+    let p2: RunResult = run_repro(acc, [det_entry, "--builds", "2",
+    "--engine", eng])
+    check(acc, "the detached run writes its buildinfo next to the entry",
+    p2.code == 0 && file_exists(det_bi), "")
+
+    write_file(helper, read_or(helper, "")
+    + "\nfn extra() -> int {\n    return 7\n}\n")
+    let p3: RunResult = run_repro(acc, ["--verify", det_bi, "--in", det])
+    check(acc, "a changed module refuses the verify BEFORE anything is built",
+    p3.code == 1 && p3.err.contains("input drift")
+    && p3.err.contains("digest"), clip(p3.err, 160))
+    check(acc, "the refusal is a refusal, not a mismatch (no evidence dir)",
+    !p3.err.contains("build roots are kept"), "")
+
+    # Restore the fixture tree and verify the happy path in section 6.
+    write_file(helper, "fn twice(x: int) -> int {\n    return x * 2\n}\n")
+}
+
+# ----------------------------------------------------------------------------
+# 6. the verify (the cross-environment answer)
+# ----------------------------------------------------------------------------
+
+fn sec6(acc: Acc) -> void uses IO, Fs, Proc {
+    section("6. the verify (the cross-environment answer)")
+    let eng: str = engine(acc)
+    let det: str = "/tmp/_gate_s105_det_hls"
+    let det_bi: str = path_join3(det, "hls-repro.buildinfo.json")
+    let p: RunResult = run_repro(acc, ["--verify", det_bi, "--in", det])
+    check(acc, "a fresh verify reproduces the bytes (exit 0)",
+    p.code == 0 && p.out.contains("verified"), clip(p.combined, 120))
+
+    if eng == "native" {
+        let p2: RunResult = run_repro(acc, ["--verify", det_bi, "--in", det,
+        "--engine", "boot"])
+        check(acc, "an engine mismatch refuses (fail-closed)",
+        p2.code == 1 && p2.err.contains("engine mismatch"),
+        clip(p2.err, 120))
+    } else {
+        println("  [note] engine is boot — the native-mismatch refusal "
+        + "needs bin/hlc (skipped)")
+    }
+    # A tampered outputs hash refuses (exit 1). The battery built the
+    # tampered document with json.dumps().replace(); the gate drives
+    # the same construction through a python one-liner of a driver.
+    let bi_doc: JsonValue = parse_json(read_or(det_bi, ""))
+    let good_hash: str = jstr(jget(bi_doc, "outputs"), "binary_sha256")
+    let tampered: str = scratch(acc, "tampered.buildinfo.json")
+    let driver: str = write_src(acc, "drivers/tamper.py",
+    "import json, sys\n"
+    + "good = json.load(open(sys.argv[1]))\n"
+    + "s = json.dumps(good).replace(sys.argv[2], \"0\" * 64)\n"
+    + "open(sys.argv[3], \"w\").write(s)\n")
+    run_quiet("python3", [driver, det_bi, good_hash, tampered])
+    let p3: RunResult = run_repro(acc, ["--verify", tampered, "--in", det])
+    check(acc, "a tampered outputs hash refuses (exit 1)",
+    p3.code == 1 && p3.err.contains("did not reproduce"),
+    clip(p3.err, 120))
+    let badjson: str = write_src(acc, "notabi.json",
+    "{\"schema\": \"some-other/v9\"}")
+    let p4: RunResult = run_repro(acc, ["--verify", badjson])
+    check(acc, "a foreign document refuses outright",
+    p4.code == 1 && p4.err.contains("not a"), clip(p4.err, 120))
+}
+
+# ----------------------------------------------------------------------------
+# 7. the package (the release gate)
+# ----------------------------------------------------------------------------
+
+fn sec7(acc: Acc) -> void uses IO, Fs, Proc {
+    section("7. the package (the release gate)")
+    let eng: str = engine(acc)
+    let rel_root: str = scratch(acc, "rel_app")
+    mkdirs(rel_root)
+    let dep_dir: str = path_join3(acc.root, "tests/_gate_s105_dep")
+    rmrf(dep_dir)
+    mkdirs(dep_dir)
+    write_file(path_join3(dep_dir, "hls-pkg.toml"),
+    "[package]\nname = \"rel_dep\"\nversion = \"0.1.0\"\n")
+    let dep_file: str = path_join3(dep_dir, "main.hls")
+    write_file(dep_file, "fn sz() -> int uses Fs {\n    return fs_size(\"a\")\n}\n")
+    write_file(path_join3(rel_root, "hls-pkg.toml"),
+    "[package]\nname = \"rel_app\"\nversion = \"2.3.4\"\n\n"
+    + "[dependencies]\nrel_dep = { path = \"tests/_gate_s105_dep/main.hls\" }\n\n"
+    + "[effects]\nallowed = [\"IO\", \"Fs\"]\n")
+    write_file(path_join3(rel_root, "main.hls"),
+    "fn main() -> int uses IO {\n    println(\"x\")\n    return 0\n}\n")
+
+    let had_log: bool = file_exists(log_main())
+    let had_lock_file: bool = file_exists(log_lock())
+
+    # No lockfile, no release.
+    let p: RunResult = run_repro(acc, ["--pkg", rel_root, "--release",
+    "--engine", eng])
+    check(acc, "--release without a lockfile refuses (exit 1, says what to do)",
+    p.code == 1 && p.err.contains("no lockfile")
+    && p.err.contains("hls-pkg lock"), clip(p.err, 120))
+    check(acc, "the refused release wrote nothing",
+    !file_exists(path_join3(rel_root,
+    "hls-repro-rel_app-2.3.4.buildinfo.json")), "")
+
+    # A fresh lock releases: the versioned buildinfo + a chained record.
+    let lp: int = run_pkg_in(acc, ["lock"], rel_root)
+    check(acc, "hls-pkg lock pins the release fixture", lp == 0, "")
+    let log_lines_before: int = count_lines(read_or(log_main(), ""))
+
+    let p2: RunResult = run_repro(acc, ["--pkg", rel_root, "--release",
+    "--engine", eng])
+    check(acc, "the locked tree releases (exit 0)", p2.code == 0,
+    clip(p2.combined, 120))
+    let bi_out: str = path_join3(rel_root,
+    "hls-repro-rel_app-2.3.4.buildinfo.json")
+    check(acc, "the release writes hls-repro-<name>-<version>.buildinfo.json",
+    file_exists(bi_out), "")
+    let rel_bi: JsonValue = parse_json(read_or(bi_out, ""))
+    check(acc, "the package buildinfo names the package and its entry",
+    jstr(rel_bi, "mode") == "package"
+    && jstr(jget(rel_bi, "tree"), "name") == "rel_app"
+    && jstr(jget(rel_bi, "tree"), "version") == "2.3.4"
+    && jstr(jget(rel_bi, "tree"), "entry") == "main.hls", "")
+    let inputs: JsonValue = jget(jget(rel_bi, "tree"), "inputs")
+    let mut has_dep_input: bool = false
+    if json_is_array(inputs) {
+        let mut i: int = 0
+        while i < inputs.arr.len() {
+            if jstr(inputs.arr.get(i), "key").starts_with("dep:") {
+                has_dep_input = true
+            }
+            i = i + 1
+        }
+    }
+    check(acc, "the dep units are inputs, hashed as the lock hashes them",
+    has_dep_input, "")
+    check(acc, "the packaged artifact smokes consistently too",
+    jstr(jget(rel_bi, "smoke"), "status") == "consistent", "")
+    let bi_sha: str = sha_of(bi_out)
+
+    let n_lines: int = count_lines(read_or(log_main(), ""))
+    check(acc, "one record appended to the transparency log",
+    n_lines == log_lines_before + 1, "")
+    let rec: JsonValue = parse_json(last_line(log_main()))
+    check(acc, "the record chains the tree, C, binary and buildinfo hashes",
+    jstr(rec, "kind") == "repro" && jstr(rec, "name") == "rel_app"
+    && jstr(rec, "version") == "2.3.4"
+    && jstr(rec, "c_sha256") == jstr(jget(rel_bi, "outputs"), "c_sha256")
+    && jstr(rec, "binary_sha256")
+    == jstr(jget(rel_bi, "outputs"), "binary_sha256")
+    && jstr(rec, "buildinfo_sha256") == bi_sha, "")
+    let vp: int = run_pkg_in(acc, ["log", "--verify"], acc.root)
+    check(acc, "the transparency chain still verifies", vp == 0, "")
+
+    # Content changed under the lock — drift refuses, the log is
+    # untouched.
+    write_file(dep_file, read_or(dep_file, "")
+    + "\nfn helper() -> int uses Rand {\n    return rand_int(9)\n}\n")
+    let p3: RunResult = run_repro(acc, ["--pkg", rel_root, "--release",
+    "--engine", eng])
+    let lines_after: int = count_lines(read_or(log_main(), ""))
+    check(acc, "content changed under the lock — the release refuses (exit 1)",
+    p3.code == 1 && p3.err.contains("drift"), clip(p3.err, 120))
+    check(acc, "the refused release appended NOTHING to the log",
+    lines_after == log_lines_before + 1, "")
+
+    # Gate scratch hygiene: the log the lock wrote is not left behind
+    # for the commit.
+    if !had_log && file_exists(log_main()) {
+        rmrf(log_main())
+    }
+    if !had_lock_file && file_exists(log_lock()) {
+        rmrf(log_lock())
+    }
+    if dir_exists(".hls-pkg-cache") {
+        sh("rmdir '.hls-pkg-cache' >/dev/null 2>&1")
+    }
+    rmrf(dep_dir)
+    rmrf("/tmp/_gate_s105_det_hls")
+}
+
+# ----------------------------------------------------------------------------
+# 8. the demos
+# ----------------------------------------------------------------------------
+
+fn sec8(acc: Acc) -> void uses IO, Fs, Proc {
+    section("8. the demos")
+    let p1: RunResult = boot(acc, [demo()])
+    check(acc, "the demo runs (interpreter)",
+    p1.code == 0 && p1.out.contains("checks passed: 4"), "")
+    let p2: RunResult = boot(acc, [ok_test()])
+    check(acc, "the ok-test runs (interpreter)",
+    p2.code == 0 && p2.out.contains("checks passed: 5"), "")
+
+    let hlc: str = path_join3(acc.root, "bin/hlc")
+    if file_exists(hlc) {
+        let c1: str = scratch(acc, "demo_native.c")
+        let c2: str = scratch(acc, "ok_native.c")
+        let b1: str = scratch(acc, "demo_native")
+        let b2: str = scratch(acc, "ok_native")
+        let h1: RunResult = run_capture(hlc, [demo(), c1])
+        let cc1: RunResult = run_capture("cc", ["-O2", "-o", b1, c1, "-lm", "-pthread"])
+        let h2: RunResult = run_capture(hlc, [ok_test(), c2])
+        let cc2: RunResult = run_capture("cc", ["-O2", "-o", b2, c2, "-lm", "-pthread"])
+        let ok1: bool = h1.code == 0 && cc1.code == 0
+        let ok2: bool = h2.code == 0 && cc2.code == 0
+        if ok1 && ok2 {
+            let n1: RunResult = run_capture(b1, [])
+            check(acc, "the demo agrees byte for byte with the native binary",
+            n1.code == 0 && n1.out == p1.out, "")
+            let n2: RunResult = run_capture(b2, [])
+            check(acc, "the ok-test agrees byte for byte with the native binary",
+            n2.code == 0 && n2.out == p2.out, "")
+        } else {
+            fail_msg(acc, "native compilation of the demos failed")
+        }
+    } else {
+        println("  [note] bin/hlc not built — the native half of section 8 "
+        + "is skipped (the gate stays hermetic)")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 9. the tools
+# ----------------------------------------------------------------------------
+
+fn sec9(acc: Acc) -> void uses IO, Fs, Proc {
+    section("9. the tools")
+    let files: list[str] = [demo(), ok_test()]
+    let mut fi: int = 0
+    while fi < files.len() {
+        let f: str = files.get(fi)
+        let original: str = read_file(f)
+        let p1f: str = scratch(acc, "fmt1.hls")
+        let p2f: str = scratch(acc, "fmt2.hls")
+        write_file(p1f, original)
+        run_quiet("./bin/hlfmt", ["-w", p1f])
+        cp(p1f, p2f)
+        run_quiet("./bin/hlfmt", ["-w", p2f])
+        let once: str = read_file(p1f)
+        let twice: str = read_file(p2f)
+        check(acc, "hlfmt: stable formatting on " + f, once == twice, "")
+        fi = fi + 1
+    }
+    let l1: RunResult = run_capture("python3",
+    [path_join3(acc.root, "tools/hllint.py"), demo()])
+    let l2: RunResult = run_capture("python3",
+    [path_join3(acc.root, "tools/hllint.py"), ok_test()])
+    if l1.code == 0 && l2.code == 0 {
+        pass_msg(acc, "hllint: no findings on the demo or the ok-test")
+    } else {
+        fail_msg(acc, "hllint: findings on the new sources")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Fs, Proc, Exit {
+    let acc: Acc = acc_new("repro")
+    sec1(acc)
+    sec2(acc)
+    sec3(acc)
+    sec4(acc)
+    sec5(acc)
+    sec6(acc)
+    sec7(acc)
+    sec8(acc)
+    sec9(acc)
+    return finish(acc, "Stage 105 -- hls-repro, the reproducible-build verification")
+}

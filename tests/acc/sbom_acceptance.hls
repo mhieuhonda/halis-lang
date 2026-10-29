@@ -1,0 +1,1029 @@
+# ============================================================================
+# tests/acc/sbom_acceptance.hls — Stage 104 acceptance gate, in Halis
+# (the Halis twin of tests/sbom_acceptance.py; same eight sections,
+# same assertions, same needles — the harness is tests/acc/harness.hls
+# and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make sbom-acceptance` (which compiles this file and runs it
+# from the repo root).
+#
+# The battery drove the Python tools in-process where it could (import
+# hpkg_cmds for the directory hash, json.loads over tool stdout); the
+# gate drives the same tools the same way from a native binary —
+# python3 children for hls-sbom / hls-audit / hls-pkg, and one tiny
+# python driver where the battery reached into hpkg_cmds's module
+# internals (the directory hash, section 4). Per-child environments
+# (SOURCE_DATE_EPOCH) are set/unset with std.env around each spawn,
+# the way the battery passed env= to one subprocess.
+#
+#  1. the engine        — the CycloneDX document for the demo tree,
+#                         pinned: bomFormat, specVersion 1.5, the
+#                         content-derived serialNumber, the metadata
+#                         component (the entry, application, hashed),
+#                         the three file components (toolchain versioned
+#                         with the compiler, workspace not), every
+#                         SHA-256 over the real bytes, the effect split
+#                         as properties, and the dependency graph
+#  2. the SPDX          — the same tree in SPDX-2.3: CC0-1.0, DESCRIBES
+#                         + DEPENDS_ON from the SAME edges, the same
+#                         hashes (the two documents cannot disagree),
+#                         APPLICATION/LIBRARY purposes, NOASSERTION
+#                         where the tool genuinely does not know
+#  3. determinism       — same tree, same SOURCE_DATE_EPOCH ->
+#                         byte-identical documents; the serial and the
+#                         namespace are content-addressed: one flipped
+#                         byte in a component moves both
+#  4. the package tree  — package mode on the in-tree demo: the root
+#                         application with a purl, the two libraries
+#                         (a diamond is ONE component, two edges), the
+#                         directory hashes hls-pkg itself computes, the
+#                         deep package's effect surface in its
+#                         properties
+#  5. the lock          — the release gate: no lockfile, no release;
+#                         a fresh lock releases (versioned documents
+#                         written, the SBOM's own hashes chained into
+#                         the transparency log, the chain still
+#                         verifies); content changed under the lock is
+#                         drift and refuses WITHOUT touching the log
+#  6. the parity        — the SBOM's effect properties equal
+#                         hls-audit's per-module surfaces on the same
+#                         tree (the two tools share one walker; the
+#                         gate proves it end to end)
+#  7. the demos         — the demo and the ok-test run; interpreter
+#                         and native agree byte for byte (native half
+#                         only when bin/hlc exists — hermetic)
+#  8. the tools         — hlfmt stable, hllint clean on the new entry
+#                         sources
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.json"
+import "std.result"
+import "std.env"
+import "std.sha256"
+
+# ----------------------------------------------------------------------------
+# The gate's constants (the battery's).
+# ----------------------------------------------------------------------------
+
+fn demo() -> str {
+    return "examples/sbom_demo.hls"
+}
+
+fn pkg_demo() -> str {
+    return "examples/pkg_audit_demo"
+}
+
+fn ok_test() -> str {
+    return "tests/ok/feat_stage104_sbom.hls"
+}
+
+fn dep_a() -> str {
+    return "examples/sbom_libs/dep_a.hls"
+}
+
+fn dep_b() -> str {
+    return "examples/sbom_libs/dep_b.hls"
+}
+
+fn log_main() -> str {
+    return ".hls-pkg-transparency.log"
+}
+
+fn log_lock() -> str {
+    return ".hls-pkg-transparency.log.lock"
+}
+
+# ----------------------------------------------------------------------------
+# JSON accessors — the battery's dict/get idioms, null-safe end to end
+# (a leg whose tool run failed must FAIL, never crash the gate).
+# ----------------------------------------------------------------------------
+
+fn parse_json(text: str) -> JsonValue {
+    let rr: Result[JsonValue, str] = json_parse_result(text)
+    if result_is_ok(rr) {
+        return result_unwrap(rr)
+    }
+    return json_null()
+}
+
+fn jget(v: JsonValue, key: str) -> JsonValue {
+    return json_object_get(v, key)
+}
+
+fn jstr(v: JsonValue, key: str) -> str {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_str(x) {
+        return json_str_value(x)
+    }
+    return ""
+}
+
+fn jint(v: JsonValue, key: str) -> int {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_int(x) {
+        return json_int_value(x)
+    }
+    return 0
+}
+
+# el_str(v) — a JSON string ELEMENT of an array, "" when it is not one.
+fn el_str(v: JsonValue) -> str {
+    if json_is_str(v) {
+        return json_str_value(v)
+    }
+    return ""
+}
+
+# arr_at(v, i) — element i of a JSON array, null when out of range.
+fn arr_at(v: JsonValue, i: int) -> JsonValue {
+    if json_is_array(v) && i >= 0 && i < v.arr.len() {
+        return v.arr.get(i)
+    }
+    return json_null()
+}
+
+# hash0(comp) — comp["hashes"][0]["content"], "" when absent.
+fn hash0(comp: JsonValue) -> str {
+    return jstr(arr_at(jget(comp, "hashes"), 0), "content")
+}
+
+# join_jstrs(v, sep) — the battery's ", ".join(list-of-strings).
+fn join_jstrs(v: JsonValue, sep: str) -> str {
+    let parts: list[str] = []
+    if json_is_array(v) {
+        let mut i: int = 0
+        while i < v.arr.len() {
+            parts.push(el_str(v.arr.get(i)))
+            i = i + 1
+        }
+    }
+    return str_join(parts, sep)
+}
+
+# props_get(comp, name) — the battery's props_of(): a CycloneDX
+# document's properties are an ARRAY of {name, value}.
+fn props_get(comp: JsonValue, name: str) -> str {
+    let props: JsonValue = jget(comp, "properties")
+    if !json_is_array(props) {
+        return ""
+    }
+    let mut i: int = 0
+    while i < props.arr.len() {
+        let pr: JsonValue = props.arr.get(i)
+        if jstr(pr, "name") == name {
+            return jstr(pr, "value")
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# props_obj_get(comp, name) — the --json report renders properties as
+# an OBJECT (name -> value); the battery reads it with .get(name, "").
+fn props_obj_get(comp: JsonValue, name: str) -> str {
+    let props: JsonValue = jget(comp, "properties")
+    if !json_is_object(props) {
+        return ""
+    }
+    return jstr(props, name)
+}
+
+# find_by_str(arr, field, want) — the battery's {c["name"]: c} lookups.
+fn find_by_str(arr: JsonValue, field: str, want: str) -> JsonValue {
+    if json_is_array(arr) {
+        let mut i: int = 0
+        while i < arr.arr.len() {
+            let el: JsonValue = arr.arr.get(i)
+            if jstr(el, field) == want {
+                return el
+            }
+            i = i + 1
+        }
+    }
+    return json_null()
+}
+
+# find_dep(deps, ref) — the deps map keyed by bom-ref.
+fn find_dep(deps: JsonValue, ref: str) -> JsonValue {
+    return find_by_str(deps, "ref", ref)
+}
+
+# ----------------------------------------------------------------------------
+# Small text helpers.
+# ----------------------------------------------------------------------------
+
+fn sha_of(path: str) -> str uses Fs {
+    return sha256_hex(read_file(path))
+}
+
+fn count_sub(text: str, needle: str) -> int {
+    let mut n: int = 0
+    let mut rest: str = text
+    let mut at: int = rest.find(needle)
+    while at >= 0 {
+        n = n + 1
+        rest = rest.slice(at + needle.len(), rest.len())
+        at = rest.find(needle)
+    }
+    return n
+}
+
+fn strip_prefix(s: str, prefix: str) -> str {
+    if s.starts_with(prefix) {
+        return s.slice(prefix.len(), s.len())
+    }
+    return s
+}
+
+fn strip_dashes(s: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < s.len() {
+        if s.byte_at(i) != 45 {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn root_rel(acc: Acc, p: str) -> str {
+    let prefix: str = acc.root + "/"
+    if p.starts_with(prefix) {
+        return p.slice(prefix.len(), p.len())
+    }
+    return p
+}
+
+# spdx_id_of(name) — the tool's SPDXID sanitizer: [^A-Za-z0-9.-] -> "-".
+fn spdx_id_of(name: str) -> str {
+    let mut out: str = "SPDXRef-Package-"
+    let mut i: int = 0
+    while i < name.len() {
+        let b: int = name.byte_at(i)
+        if(b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+        || (b >= 48 && b <= 57) || b == 46 || b == 45 {
+            out = out + name.slice(i, i + 1)
+        } else {
+            out = out + "-"
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ref_name(ref) — "hls:module:<name>" / "hls:pkg:<name>" -> <name>
+# (the battery's ref.split(":", 2)[-1]).
+fn ref_name(ref: str) -> str {
+    let mut colons: int = 0
+    let mut i: int = 0
+    while i < ref.len() {
+        if ref.byte_at(i) == 58 {
+            colons = colons + 1
+            if colons == 2 {
+                return ref.slice(i + 1, ref.len())
+            }
+        }
+        i = i + 1
+    }
+    return ref
+}
+
+fn last_line(path: str) -> str uses Fs {
+    let text: str = read_or(path, "")
+    let lines: list[str] = text.split("\n")
+    let mut i: int = lines.len() - 1
+    while i >= 0 {
+        let t: str = lines.get(i).trim()
+        if t != "" {
+            return t
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+fn dir_exists(path: str) -> bool uses Proc {
+    return sh("test -d '" + shell_quote(path) + "'") == 0
+}
+
+# ----------------------------------------------------------------------------
+# The tools, as the battery addresses them.
+# ----------------------------------------------------------------------------
+
+fn run_tool(acc: Acc, tool: str, args: list[str]) -> RunResult uses Proc {
+    let argv: list[str] = [path_join3(acc.root, "tools/" + tool)]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    return run_capture("python3", argv)
+}
+
+fn run_sbom(acc: Acc, args: list[str]) -> RunResult uses Proc {
+    return run_tool(acc, "hls-sbom.py", args)
+}
+
+fn run_audit(acc: Acc, args: list[str]) -> RunResult uses Proc {
+    return run_tool(acc, "hls-audit.py", args)
+}
+
+# run_pkg_in(args, dir) — the battery's run(PKG + args, cwd=dir).
+fn run_pkg_in(acc: Acc, args: list[str], dir: str) -> int uses Proc {
+    let home: str = cwd_get()
+    env_set_current_dir(dir)
+    let argv: list[str] = [path_join3(acc.root, "tools/hls-pkg.py")]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    let code: int = run_quiet("python3", argv)
+    env_set_current_dir(home)
+    return code
+}
+
+fn cdx_doc(acc: Acc, extra: list[str]) -> RunResult uses Proc {
+    let args: list[str] = []
+    let mut i: int = 0
+    while i < extra.len() {
+        args.push(extra.get(i))
+        i = i + 1
+    }
+    args.push("--format")
+    args.push("cdx")
+    args.push("--stdout")
+    return run_sbom(acc, args)
+}
+
+fn spdx_doc(acc: Acc, extra: list[str]) -> RunResult uses Proc {
+    let args: list[str] = []
+    let mut i: int = 0
+    while i < extra.len() {
+        args.push(extra.get(i))
+        i = i + 1
+    }
+    args.push("--format")
+    args.push("spdx")
+    args.push("--stdout")
+    return run_sbom(acc, args)
+}
+
+# ----------------------------------------------------------------------------
+# 1. the engine (CycloneDX, source mode)
+# ----------------------------------------------------------------------------
+
+fn sec1(acc: Acc) -> void uses IO, Fs, Proc {
+    section("1. the engine (CycloneDX, source mode)")
+    let p: RunResult = cdx_doc(acc, [demo()])
+    let cdx: JsonValue = parse_json(p.out)
+    check(acc, "the demo produces a CycloneDX document (exit 0)",
+    p.spawned && p.code == 0, clip(p.combined, 120))
+    check(acc, "bomFormat CycloneDX, specVersion 1.5, version 1",
+    jstr(cdx, "bomFormat") == "CycloneDX"
+    && jstr(cdx, "specVersion") == "1.5" && jint(cdx, "version") == 1, "")
+    let serial: str = jstr(cdx, "serialNumber")
+    check(acc, "the serialNumber is a content-derived UUID",
+    serial.starts_with("urn:uuid:") && serial.len() == 9 + 36, "")
+    let tool0: JsonValue = arr_at(jget(jget(cdx, "metadata"), "tools"), 0)
+    check(acc, "the tool is named (who made this document)",
+    jstr(tool0, "name") == "hls-sbom"
+    && jstr(tool0, "vendor") == "halis-lang", "")
+    let root: JsonValue = jget(jget(cdx, "metadata"), "component")
+    check(acc, "the metadata component is the entry (application)",
+    jstr(root, "type") == "application" && jstr(root, "name") == demo(), "")
+    check(acc, "the root's hash is over the entry's real bytes",
+    hash0(root) == sha_of(demo()), "")
+    check(acc, "the root's properties carry the audit's intrinsic/surface split",
+    props_get(root, "hls:effects:intrinsic") == "IO"
+    && props_get(root, "hls:effects:surface") == "Clock, Fs, IO, Net", "")
+    let comps: JsonValue = jget(cdx, "components")
+    let comp_std: JsonValue = find_by_str(comps, "name", "std/str.hls")
+    let comp_a: JsonValue = find_by_str(comps, "name", dep_a())
+    let comp_b: JsonValue = find_by_str(comps, "name", dep_b())
+    check(acc, "three components underneath the root",
+    json_is_array(comps) && comps.arr.len() == 3, "")
+    let mut all_files: bool = json_is_array(comps) && comps.arr.len() > 0
+    let mut ci: int = 0
+    while ci < comps.arr.len() {
+        if jstr(comps.arr.get(ci), "type") != "file" {
+            all_files = false
+        }
+        ci = ci + 1
+    }
+    check(acc, "every module is a file component", all_files, "")
+    check(acc, "toolchain components are versioned with the compiler; "
+    + "workspace modules carry their own bytes",
+    jstr(comp_std, "version") == "0.123.0-alpha"
+    && !json_object_has(comp_b, "version"), "")
+    check(acc, "the classification rides along as hls:kind",
+    props_get(comp_std, "hls:kind") == "toolchain"
+    && props_get(comp_b, "hls:kind") == "workspace", "")
+    check(acc, "dep_b's properties name Clock + Fs as intrinsic",
+    props_get(comp_b, "hls:effects:intrinsic") == "Clock, Fs", "")
+    check(acc, "dep_a introduces Net (the localhost lookup)",
+    props_get(comp_a, "hls:effects:intrinsic") == "Net", "")
+    # every component hash is over the component's real bytes
+    let mut bad_hash: str = ""
+    if json_is_array(comps) {
+        let mut hi: int = 0
+        while hi < comps.arr.len() {
+            let c: JsonValue = comps.arr.get(hi)
+            if hash0(c) != sha_of(jstr(c, "name")) {
+                bad_hash = jstr(c, "name")
+                hi = comps.arr.len()
+            }
+            hi = hi + 1
+        }
+    }
+    if bad_hash == "" {
+        pass_msg(acc, "every component hash is over the component's real bytes")
+    } else {
+        fail_msg(acc, "component hash over the real bytes: " + bad_hash)
+    }
+    let deps: JsonValue = jget(cdx, "dependencies")
+    let root_kids: JsonValue = jget(find_dep(deps, "hls:module:" + demo()), "dependsOn")
+    check(acc, "the root depends on dep_a and the toolchain module",
+    json_is_array(root_kids) && root_kids.arr.len() == 2
+    && el_str(arr_at(root_kids, 0)) == "hls:module:" + dep_a()
+    && el_str(arr_at(root_kids, 1)) == "hls:module:std/str.hls", "")
+    let a_kids: JsonValue = jget(find_dep(deps, "hls:module:" + dep_a()), "dependsOn")
+    check(acc, "dep_a depends on dep_b and the toolchain module",
+    json_is_array(a_kids) && a_kids.arr.len() == 2
+    && el_str(arr_at(a_kids, 0)) == "hls:module:" + dep_b()
+    && el_str(arr_at(a_kids, 1)) == "hls:module:std/str.hls", "")
+    let b_kids: JsonValue = jget(find_dep(deps, "hls:module:" + dep_b()), "dependsOn")
+    let std_kids: JsonValue = jget(find_dep(deps, "hls:module:std/str.hls"), "dependsOn")
+    check(acc, "the graph is the import tree, leaf to root",
+    json_is_array(b_kids) && b_kids.arr.len() == 1
+    && el_str(arr_at(b_kids, 0)) == "hls:module:std/str.hls"
+    && json_is_array(std_kids) && std_kids.arr.len() == 0, "")
+}
+
+# ----------------------------------------------------------------------------
+# 2. the SPDX document (same tree, same truth)
+# ----------------------------------------------------------------------------
+
+fn sec2(acc: Acc) -> void uses IO, Fs, Proc {
+    section("2. the SPDX document (same tree, same truth)")
+    let p: RunResult = spdx_doc(acc, [demo()])
+    let spdx: JsonValue = parse_json(p.out)
+    check(acc, "the demo produces an SPDX document (exit 0)",
+    p.spawned && p.code == 0, clip(p.combined, 120))
+    check(acc, "SPDX-2.3 under CC0-1.0 (the document itself is open)",
+    jstr(spdx, "spdxVersion") == "SPDX-2.3"
+    && jstr(spdx, "dataLicense") == "CC0-1.0", "")
+    check(acc, "the document element is SPDXRef-DOCUMENT",
+    jstr(spdx, "SPDXID") == "SPDXRef-DOCUMENT", "")
+    let creators: JsonValue = jget(jget(spdx, "creationInfo"), "creators")
+    let mut creator_ok: bool = false
+    if json_is_array(creators) {
+        let mut i: int = 0
+        while i < creators.arr.len() {
+            if el_str(creators.arr.get(i)) == "Tool: hls-sbom-0.123.0-alpha" {
+                creator_ok = true
+            }
+            i = i + 1
+        }
+    }
+    check(acc, "the creator names the tool AND its version", creator_ok, "")
+    let pkgs: JsonValue = jget(spdx, "packages")
+    let pkg_root: JsonValue = find_by_str(pkgs, "name", demo())
+    let pkg_std: JsonValue = find_by_str(pkgs, "name", "std/str.hls")
+    let pkg_b: JsonValue = find_by_str(pkgs, "name", dep_b())
+    check(acc, "four packages: the root + three parts",
+    json_is_array(pkgs) && pkgs.arr.len() == 4, "")
+    check(acc, "the root is APPLICATION, the parts are LIBRARY",
+    jstr(pkg_root, "primaryPackagePurpose") == "APPLICATION"
+    && jstr(pkg_std, "primaryPackagePurpose") == "LIBRARY", "")
+    let mut all_noassert_dl: bool = json_is_array(pkgs) && pkgs.arr.len() > 0
+    let mut all_noassert_lic: bool = all_noassert_dl
+    let mut pi: int = 0
+    while pi < pkgs.arr.len() {
+        let x: JsonValue = pkgs.arr.get(pi)
+        if jstr(x, "downloadLocation") != "NOASSERTION" {
+            all_noassert_dl = false
+        }
+        if jstr(x, "licenseConcluded") != "NOASSERTION" {
+            all_noassert_lic = false
+        }
+        pi = pi + 1
+    }
+    check(acc, "downloadLocation is NOASSERTION (the tool does not invent URLs)",
+    all_noassert_dl, "")
+    check(acc, "licenseConcluded is NOASSERTION (no guesses in a legal field)",
+    all_noassert_lic, "")
+    check(acc, "SPDX checksums are over the same real bytes",
+    jstr(arr_at(jget(pkg_b, "checksums"), 0), "checksumValue")
+    == sha_of(dep_b()), "")
+    let rels: JsonValue = jget(spdx, "relationships")
+    let mut describes: int = 0
+    let mut describes_ok: bool = false
+    let mut depends: int = 0
+    let dep_srcs: list[str] = []
+    let dep_kids: list[str] = []
+    if json_is_array(rels) {
+        let mut ri: int = 0
+        while ri < rels.arr.len() {
+            let r: JsonValue = rels.arr.get(ri)
+            if jstr(r, "relationshipType") == "DESCRIBES" {
+                describes = describes + 1
+                if jstr(r, "relatedSpdxElement") == jstr(pkg_root, "SPDXID") {
+                    describes_ok = true
+                }
+            }
+            if jstr(r, "relationshipType") == "DEPENDS_ON" {
+                depends = depends + 1
+                dep_srcs.push(jstr(r, "spdxElementId"))
+                dep_kids.push(jstr(r, "relatedSpdxElement"))
+            }
+            ri = ri + 1
+        }
+    }
+    check(acc, "the document DESCRIBES the root", describes == 1 && describes_ok, "")
+    # the CycloneDX edge count, from the SAME dependency list
+    let deps: JsonValue = jget(parse_json(cdx_doc(acc, [demo()]).out), "dependencies")
+    let mut cdx_edges: int = 0
+    if json_is_array(deps) {
+        let mut di: int = 0
+        while di < deps.arr.len() {
+            let d: JsonValue = deps.arr.get(di)
+            if json_is_array(jget(d, "dependsOn")) {
+                cdx_edges = cdx_edges + jget(d, "dependsOn").arr.len()
+            }
+            di = di + 1
+        }
+    }
+    check(acc, "the DEPENDS_ON count matches the CycloneDX edge count",
+    depends == cdx_edges, "")
+    check(acc, "the two documents render the SAME edge set",
+    depends == cdx_edges, "")
+    # every CycloneDX edge has its SPDX twin (by element id) — both ways
+    let mut twins_ok: bool = json_is_array(deps) && depends == cdx_edges
+    if twins_ok {
+        let mut di2: int = 0
+        while di2 < deps.arr.len() && twins_ok {
+            let d: JsonValue = deps.arr.get(di2)
+            let src_id: str = spdx_id_of(ref_name(jstr(d, "ref")))
+            if json_is_array(jget(d, "dependsOn")) {
+                let mut ki: int = 0
+                while ki < jget(d, "dependsOn").arr.len() {
+                    let kid_id: str = spdx_id_of(ref_name(
+                    el_str(jget(d, "dependsOn").arr.get(ki))))
+                    let mut found: bool = false
+                    let mut si: int = 0
+                    while si < dep_srcs.len() {
+                        if dep_srcs.get(si) == src_id && dep_kids.get(si) == kid_id {
+                            found = true
+                            si = dep_srcs.len()
+                        }
+                        si = si + 1
+                    }
+                    if !found {
+                        twins_ok = false
+                    }
+                    ki = ki + 1
+                }
+            }
+            di2 = di2 + 1
+        }
+        let mut si2: int = 0
+        while si2 < dep_srcs.len() && twins_ok {
+            let mut found2: bool = false
+            let mut di3: int = 0
+            while di3 < deps.arr.len() && !found2 {
+                let d3: JsonValue = deps.arr.get(di3)
+                if spdx_id_of(ref_name(jstr(d3, "ref"))) == dep_srcs.get(si2)
+                && json_is_array(jget(d3, "dependsOn")) {
+                    let mut ki3: int = 0
+                    while ki3 < jget(d3, "dependsOn").arr.len() {
+                        if spdx_id_of(ref_name(el_str(
+                        jget(d3, "dependsOn").arr.get(ki3))))
+                        == dep_kids.get(si2) {
+                            found2 = true
+                        }
+                        ki3 = ki3 + 1
+                    }
+                }
+                di3 = di3 + 1
+            }
+            if !found2 {
+                twins_ok = false
+            }
+            si2 = si2 + 1
+        }
+    }
+    check(acc, "every CycloneDX edge has its SPDX twin (by element id)",
+    twins_ok, "")
+}
+
+# ----------------------------------------------------------------------------
+# 3. determinism (content-addressed documents)
+# ----------------------------------------------------------------------------
+
+fn sec3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("3. determinism (content-addressed documents)")
+    let det: str = scratch(acc, "det")
+    mkdirs(path_join3(det, "sbom_libs"))
+    cp(demo(), path_join3(det, "sbom_demo.hls"))
+    cp(dep_a(), path_join3(det, "sbom_libs/dep_a.hls"))
+    cp(dep_b(), path_join3(det, "sbom_libs/dep_b.hls"))
+    let scratch_entry: str = path_join3(det, "sbom_demo.hls")
+    env_set_var("SOURCE_DATE_EPOCH", "1727800000")
+    let a: RunResult = run_sbom(acc, [scratch_entry, "--format", "cdx", "--stdout"])
+    let b: RunResult = run_sbom(acc, [scratch_entry, "--format", "cdx", "--stdout"])
+    check(acc, "same tree, same SOURCE_DATE_EPOCH — byte-identical CycloneDX",
+    a.code == 0 && b.code == 0 && a.out == b.out, "")
+    let a2: RunResult = run_sbom(acc, [scratch_entry, "--format", "spdx", "--stdout"])
+    let b2: RunResult = run_sbom(acc, [scratch_entry, "--format", "spdx", "--stdout"])
+    check(acc, "same tree, same SOURCE_DATE_EPOCH — byte-identical SPDX",
+    a2.out == b2.out, "")
+    let r1: JsonValue = parse_json(run_sbom(acc, [scratch_entry, "--json"]).out)
+    let serial: str = jstr(jget(r1, "documents"), "serial_number")
+    check(acc, "the report names the serial", serial.starts_with("urn:uuid:"), "")
+    let hexd: str = strip_dashes(strip_prefix(serial, "urn:uuid:"))
+    let digest: str = jstr(r1, "digest")
+    let mut shaped: bool = hexd.len() == 32 && digest.len() == 64
+    if shaped {
+        let mut i: int = 0
+        while i < 32 {
+            if i != 12 && i != 16 {
+                if hexd.slice(i, i + 1) != digest.slice(i, i + 1) {
+                    shaped = false
+                }
+            }
+            i = i + 1
+        }
+        if hexd.slice(12, 13) != "4" {
+            shaped = false
+        }
+        let v: str = hexd.slice(16, 17)
+        if v != "8" && v != "9" && v != "a" && v != "b" {
+            shaped = false
+        }
+    }
+    check(acc, "the serial is the digest, shaped (version + variant nibbles)",
+    shaped, "")
+    # One flipped byte in one component moves the digest — the document
+    # is addressed by what it lists.
+    let dep_copy: str = path_join3(det, "sbom_libs/dep_b.hls")
+    write_file(dep_copy, read_or(dep_copy, "") + "\n# one byte more\n")
+    let r2: JsonValue = parse_json(run_sbom(acc, [scratch_entry, "--json"]).out)
+    check(acc, "one changed component moves the serial (content-addressed)",
+    jstr(r2, "digest") != digest
+    && jstr(jget(r2, "documents"), "serial_number") != serial, "")
+    # Without SOURCE_DATE_EPOCH the timestamp is honest wall time and
+    # the serial still holds (it never depended on the clock).
+    env_unset_var("SOURCE_DATE_EPOCH")
+    let r3: JsonValue = parse_json(run_sbom(acc, [scratch_entry, "--json"]).out)
+    check(acc, "the serial survives a changing clock",
+    jstr(jget(r3, "documents"), "serial_number")
+    == jstr(jget(r2, "documents"), "serial_number"), "")
+}
+
+# ----------------------------------------------------------------------------
+# 4. the package tree (package mode)
+# ----------------------------------------------------------------------------
+
+fn sec4(acc: Acc) -> void uses IO, Fs, Proc {
+    section("4. the package tree (package mode)")
+    let p: RunResult = cdx_doc(acc, ["--pkg", pkg_demo()])
+    let pcdx: JsonValue = parse_json(p.out)
+    check(acc, "the package demo produces a document (exit 0)",
+    p.spawned && p.code == 0, clip(p.combined, 120))
+    let proot: JsonValue = jget(jget(pcdx, "metadata"), "component")
+    check(acc, "the root is the manifest's package, versioned from the manifest",
+    jstr(proot, "type") == "application"
+    && jstr(proot, "name") == "pkg_audit_demo"
+    && jstr(proot, "version") == "0.1.0", "")
+    check(acc, "the root carries a purl (generic type, halis namespace)",
+    jstr(proot, "purl") == "pkg:generic/halis/pkg_audit_demo@0.1.0", "")
+    let pcomps: JsonValue = jget(pcdx, "components")
+    let comp_a: JsonValue = find_by_str(pcomps, "name", "audit_lib_a")
+    let comp_b: JsonValue = find_by_str(pcomps, "name", "audit_lib_b")
+    check(acc, "the diamond is ONE component per package (two paths, one part)",
+    json_is_array(pcomps) && pcomps.arr.len() == 2
+    && json_is_object(comp_a) && json_is_object(comp_b), "")
+    let mut all_libs: bool = json_is_array(pcomps) && pcomps.arr.len() > 0
+    let mut li: int = 0
+    while li < pcomps.arr.len() {
+        if jstr(pcomps.arr.get(li), "type") != "library" {
+            all_libs = false
+        }
+        li = li + 1
+    }
+    check(acc, "dependencies are library components", all_libs, "")
+    check(acc, "the deep package's depth and effect surface ride along",
+    props_get(comp_b, "hls:depth") == "2"
+    && props_get(comp_b, "hls:effects:surface") == "Clock, Fs", "")
+    check(acc, "the middle package sits at depth 1",
+    props_get(comp_a, "hls:depth") == "1", "")
+    let pdeps: JsonValue = jget(pcdx, "dependencies")
+    let pd_root: JsonValue = jget(find_dep(pdeps, "hls:pkg:pkg_audit_demo"), "dependsOn")
+    let pd_a: JsonValue = jget(find_dep(pdeps, "hls:pkg:audit_lib_a"), "dependsOn")
+    let pd_b: JsonValue = jget(find_dep(pdeps, "hls:pkg:audit_lib_b"), "dependsOn")
+    check(acc, "the package graph is the manifest tree",
+    json_is_array(pd_root) && pd_root.arr.len() == 1
+    && el_str(arr_at(pd_root, 0)) == "hls:pkg:audit_lib_a"
+    && json_is_array(pd_a) && pd_a.arr.len() == 1
+    && el_str(arr_at(pd_a, 0)) == "hls:pkg:audit_lib_b"
+    && json_is_array(pd_b) && pd_b.arr.len() == 0, "")
+    # The hashes are hls-pkg's own directory hashes — the same bytes
+    # the lockfile would pin. The battery imported hpkg_cmds's
+    # _sha256_directory; the gate asks the same module through a
+    # python driver (the front door a native binary has).
+    let driver: str = write_src(acc, "drivers/dirhash.py",
+    "import sys, os\n"
+    + "ROOT = sys.argv[1]\n"
+    + "sys.path.insert(0, os.path.join(ROOT, \"tools\", \"hpkg_parts\"))\n"
+    + "from hpkg_cmds import _sha256_directory\n"
+    + "for d in sys.argv[2:]:\n"
+    + "    print(\"DIRHASH %s %s\" % (d, _sha256_directory(os.path.join(ROOT, d))))\n")
+    let dh: RunResult = run_capture("python3", [driver, acc.root,
+    "examples/pkg_audit_libs/audit_lib_a",
+    "examples/pkg_audit_libs/audit_lib_b"])
+    let mut hash_a: str = ""
+    let mut hash_b: str = ""
+    let dh_lines: list[str] = dh.out.split("\n")
+    let mut dhi: int = 0
+    while dhi < dh_lines.len() {
+        let parts: list[str] = dh_lines.get(dhi).split(" ")
+        if parts.len() == 3 && parts.get(0) == "DIRHASH" {
+            if parts.get(1) == "examples/pkg_audit_libs/audit_lib_a" {
+                hash_a = parts.get(2)
+            }
+            if parts.get(1) == "examples/pkg_audit_libs/audit_lib_b" {
+                hash_b = parts.get(2)
+            }
+        }
+        dhi = dhi + 1
+    }
+    let mut hash_ok: bool = hash_a != "" && hash_b != ""
+    if hash_ok {
+        hash_ok = hash0(comp_a) == hash_a && hash0(comp_b) == hash_b
+    }
+    if hash_ok {
+        pass_msg(acc, "package component hashes are hls-pkg's own directory hashes")
+    } else {
+        fail_msg(acc, "package component hash is not hls-pkg's directory hash")
+    }
+    let pspdx: JsonValue = parse_json(spdx_doc(acc, ["--pkg", pkg_demo()]).out)
+    let spkg_b: JsonValue = find_by_str(jget(pspdx, "packages"), "name", "audit_lib_b")
+    check(acc, "SPDX and CycloneDX agree on the package hash byte for byte",
+    jstr(arr_at(jget(spkg_b, "checksums"), 0), "checksumValue")
+    == hash0(comp_b) && hash0(comp_b) != "", "")
+    check(acc, "three SPDX packages (root + the two libraries)",
+    json_is_array(jget(pspdx, "packages"))
+    && jget(pspdx, "packages").arr.len() == 3, "")
+}
+
+# ----------------------------------------------------------------------------
+# 5. the lock (the release gate)
+# ----------------------------------------------------------------------------
+
+fn sec5(acc: Acc) -> void uses IO, Fs, Proc {
+    section("5. the lock (the release gate)")
+    let rel_root: str = scratch(acc, "rel_app")
+    let dep_dir: str = scratch(acc, "rel_dep")
+    mkdirs(rel_root)
+    mkdirs(dep_dir)
+    write_file(path_join3(dep_dir, "hls-pkg.toml"),
+    "[package]\nname = \"rel_dep\"\nversion = \"0.1.0\"\n")
+    let dep_file: str = path_join3(dep_dir, "main.hls")
+    write_file(dep_file, "fn sz() -> int uses Fs {\n    return fs_size(\"a\")\n}\n")
+    write_file(path_join3(rel_root, "hls-pkg.toml"),
+    "[package]\nname = \"rel_app\"\nversion = \"2.3.4\"\n\n"
+    + "[dependencies]\nrel_dep = { path = \"" + root_rel(acc, dep_file)
+    + "\" }\n\n"
+    + "[effects]\nallowed = [\"IO\", \"Fs\"]\n")
+    write_file(path_join3(rel_root, "main.hls"),
+    "fn main() -> int uses IO {\n    println(\"x\")\n    return 0\n}\n")
+
+    let had_log: bool = file_exists(log_main())
+    let had_lock_file: bool = file_exists(log_lock())
+
+    # No lockfile, no release.
+    let p: RunResult = run_sbom(acc, ["--pkg", rel_root, "--release"])
+    check(acc, "--release without a lockfile refuses (exit 1, says what to do)",
+    p.code == 1 && p.err.contains("no lockfile")
+    && p.err.contains("hls-pkg lock"), clip(p.err, 120))
+    check(acc, "the refused release wrote nothing",
+    !file_exists(path_join3(rel_root, "hls-sbom-rel_app-2.3.4.cdx.json")), "")
+
+    # A fresh lock releases: versioned documents + a chained log record.
+    let lp: int = run_pkg_in(acc, ["lock"], rel_root)
+    check(acc, "hls-pkg lock pins the release fixture", lp == 0, "")
+    let lock_doc: JsonValue = parse_json(
+    read_or(path_join3(rel_root, "hls-pkg.lock"), ""))
+    let locked_sha: str = jstr(find_by_str(jget(lock_doc, "packages"),
+    "name", "rel_dep"), "sha256")
+    let log_lines_before: int = count_lines(read_or(log_main(), ""))
+
+    let p2: RunResult = run_sbom(acc, ["--pkg", rel_root, "--release"])
+    check(acc, "the locked tree releases (exit 0)", p2.code == 0,
+    clip(p2.combined, 120))
+    let cdx_out: str = path_join3(rel_root, "hls-sbom-rel_app-2.3.4.cdx.json")
+    let spdx_out: str = path_join3(rel_root, "hls-sbom-rel_app-2.3.4.spdx.json")
+    check(acc, "the release writes hls-sbom-<name>-<version>.{cdx,spdx}.json",
+    file_exists(cdx_out) && file_exists(spdx_out), "")
+    let rel_cdx: JsonValue = parse_json(read_or(cdx_out, ""))
+    let released_hash: str = hash0(find_by_str(jget(rel_cdx, "components"),
+    "name", "rel_dep"))
+    check(acc, "the released hash IS the lockfile's hash (byte for byte)",
+    released_hash != "" && locked_sha != "" && released_hash == locked_sha, "")
+    let doc_sha: str = sha_of(cdx_out)
+
+    let n_lines: int = count_lines(read_or(log_main(), ""))
+    check(acc, "one record appended to the transparency log",
+    n_lines == log_lines_before + 1, "")
+    let rec: JsonValue = parse_json(last_line(log_main()))
+    check(acc, "the record chains the SBOM documents' own hashes",
+    jstr(rec, "kind") == "sbom" && jstr(rec, "name") == "rel_app"
+    && jstr(rec, "version") == "2.3.4"
+    && jstr(rec, "cdx_sha256") == doc_sha
+    && jstr(rec, "spdx_sha256") == sha_of(spdx_out), "")
+    let vp: int = run_pkg_in(acc, ["log", "--verify"], acc.root)
+    check(acc, "the transparency chain still verifies", vp == 0, "")
+
+    # Content changed under the lock — drift refuses, the log is untouched.
+    write_file(dep_file, read_or(dep_file, "")
+    + "\nfn helper() -> int uses Rand {\n    return rand_int(0, 9)\n}\n")
+    let p3: RunResult = run_sbom(acc, ["--pkg", rel_root, "--release"])
+    let lines_after: int = count_lines(read_or(log_main(), ""))
+    check(acc, "content changed under the lock — the release refuses (exit 1)",
+    p3.code == 1 && p3.err.contains("drift"), clip(p3.err, 120))
+    check(acc, "the refused release appended NOTHING to the log",
+    lines_after == log_lines_before + 1, "")
+
+    # Gate scratch hygiene: the log the lock wrote is not left behind
+    # for the commit.
+    if !had_log && file_exists(log_main()) {
+        rmrf(log_main())
+    }
+    if !had_lock_file && file_exists(log_lock()) {
+        rmrf(log_lock())
+    }
+    if dir_exists(".hls-pkg-cache") {
+        sh("rmdir '.hls-pkg-cache' >/dev/null 2>&1")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 6. the parity (one walker, two reports)
+# ----------------------------------------------------------------------------
+
+fn sec6(acc: Acc) -> void uses IO, Fs, Proc {
+    section("6. the parity (one walker, two reports)")
+    let sb: JsonValue = parse_json(run_sbom(acc, [demo(), "--json"]).out)
+    let au: JsonValue = parse_json(run_audit(acc, [demo(), "--json"]).out)
+    let cdx_once: JsonValue = parse_json(cdx_doc(acc, [demo()]).out)
+    let sb_comps: JsonValue = jget(sb, "components")
+    let sb_root_name: str = jstr(jget(sb, "root"), "name")
+    let root_props_surf: str = props_get(
+    jget(jget(cdx_once, "metadata"), "component"), "hls:effects:surface")
+    let au_modules: JsonValue = jget(au, "modules")
+    # the battery's sb_surf / au_surf maps, walked together
+    let mut mismatch: str = ""
+    if json_is_array(au_modules) {
+        let mut mi: int = 0
+        while mi < au_modules.arr.len() {
+            let m: JsonValue = au_modules.arr.get(mi)
+            let key: str = jstr(m, "key")
+            let au_surf: str = join_jstrs(jget(m, "surface"), ", ")
+            let mut sb_surf: str = ""
+            if key == sb_root_name {
+                sb_surf = root_props_surf
+            } else {
+                sb_surf = props_obj_get(find_by_str(sb_comps, "name", key),
+                "hls:effects:surface")
+            }
+            if sb_surf != au_surf {
+                mismatch = mismatch + " " + key
+            }
+            mi = mi + 1
+        }
+    }
+    if mismatch == "" {
+        pass_msg(acc, "every module's surface property equals hls-audit's surface")
+    } else {
+        fail_msg(acc, "surface mismatch between the tools:" + mismatch)
+    }
+    # the SBOM renders the audit's edge count — the battery compares
+    # len(sb["dependencies"]) with len(au["edges"]): one dependency
+    # ENTRY per module that has edges
+    let au_edges: JsonValue = jget(au, "edges")
+    let mut au_edge_keys: int = 0
+    if json_is_object(au_edges) {
+        au_edge_keys = au_edges.obj_keys.len()
+    }
+    check(acc, "the SBOM renders the audit's edge count",
+    json_is_array(jget(sb, "dependencies"))
+    && jget(sb, "dependencies").arr.len() > 0
+    && jget(sb, "dependencies").arr.len() == au_edge_keys, "")
+    check(acc, "the root's surface property is the audit's program surface",
+    root_props_surf == join_jstrs(jget(au, "program_surface"), ", "), "")
+
+    let psb: JsonValue = parse_json(run_sbom(acc, ["--pkg", pkg_demo(), "--json"]).out)
+    let pau: JsonValue = parse_json(run_audit(acc, ["--pkg", pkg_demo(), "--json"]).out)
+    let lib_b_au: str = join_jstrs(
+    jget(find_by_str(jget(pau, "packages"), "name", "audit_lib_b"), "surface"),
+    ", ")
+    check(acc, "package mode: the deep surface matches the audit's own report",
+    jstr(jget(psb, "root"), "name") == jstr(jget(pau, "root"), "name")
+    && props_obj_get(find_by_str(jget(psb, "components"), "name",
+    "audit_lib_b"), "hls:effects:surface") == lib_b_au
+    && lib_b_au != "", "")
+}
+
+# ----------------------------------------------------------------------------
+# 7. the demos
+# ----------------------------------------------------------------------------
+
+fn sec7(acc: Acc) -> void uses IO, Fs, Proc {
+    section("7. the demos")
+    let p1: RunResult = boot(acc, [demo()])
+    check(acc, "the demo runs (interpreter)",
+    p1.code == 0 && p1.out.contains("bill of materials for one small release"), "")
+    let p2: RunResult = boot(acc, [ok_test()])
+    check(acc, "the ok-test runs (interpreter)",
+    p2.code == 0 && p2.out.contains("checks passed: 6"), "")
+    let hlc: str = path_join3(acc.root, "bin/hlc")
+    if file_exists(hlc) {
+        let c1: str = scratch(acc, "demo_native.c")
+        let c2: str = scratch(acc, "ok_native.c")
+        let b1: str = scratch(acc, "demo_native")
+        let b2: str = scratch(acc, "ok_native")
+        let h1: RunResult = run_capture(hlc, [demo(), c1])
+        let cc1: RunResult = run_capture("cc", ["-O2", "-o", b1, c1, "-lm", "-pthread"])
+        let h2: RunResult = run_capture(hlc, [ok_test(), c2])
+        let cc2: RunResult = run_capture("cc", ["-O2", "-o", b2, c2, "-lm", "-pthread"])
+        let ok1: bool = h1.code == 0 && cc1.code == 0
+        let ok2: bool = h2.code == 0 && cc2.code == 0
+        if ok1 && ok2 {
+            let n1: RunResult = run_capture(b1, [])
+            check(acc, "the demo agrees byte for byte with the native binary",
+            n1.code == 0 && n1.out == p1.out, "")
+            let n2: RunResult = run_capture(b2, [])
+            check(acc, "the ok-test agrees byte for byte with the native binary",
+            n2.code == 0 && n2.out == p2.out, "")
+        } else {
+            fail_msg(acc, "native compilation of the demos failed")
+        }
+    } else {
+        println("  [note] bin/hlc not built — the native half of section 7 "
+        + "is skipped (the gate stays hermetic)")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 8. the tools
+# ----------------------------------------------------------------------------
+
+fn sec8(acc: Acc) -> void uses IO, Fs, Proc {
+    section("8. the tools")
+    let files: list[str] = [demo(), ok_test(), dep_a(), dep_b()]
+    let mut fi: int = 0
+    while fi < files.len() {
+        let f: str = files.get(fi)
+        let original: str = read_file(f)
+        let p1f: str = scratch(acc, "fmt1.hls")
+        let p2f: str = scratch(acc, "fmt2.hls")
+        write_file(p1f, original)
+        run_quiet("./bin/hlfmt", ["-w", p1f])
+        cp(p1f, p2f)
+        run_quiet("./bin/hlfmt", ["-w", p2f])
+        let once: str = read_file(p1f)
+        let twice: str = read_file(p2f)
+        check(acc, "hlfmt: stable formatting on " + f, once == twice, "")
+        fi = fi + 1
+    }
+    let l1: RunResult = run_capture("python3",
+    [path_join3(acc.root, "tools/hllint.py"), demo()])
+    let l2: RunResult = run_capture("python3",
+    [path_join3(acc.root, "tools/hllint.py"), ok_test()])
+    if l1.code == 0 && l2.code == 0 {
+        pass_msg(acc, "hllint: no findings on the demo or the ok-test")
+    } else {
+        fail_msg(acc, "hllint: findings on the new sources")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Fs, Proc, Exit {
+    let acc: Acc = acc_new("sbom")
+    sec1(acc)
+    sec2(acc)
+    sec3(acc)
+    sec4(acc)
+    sec5(acc)
+    sec6(acc)
+    sec7(acc)
+    sec8(acc)
+    return finish(acc, "Stage 104 -- hls-sbom, the CycloneDX + SPDX bill of materials")
+}

@@ -1,0 +1,781 @@
+# ============================================================================
+# tests/acc/audit_acceptance.hls — Stage 103 acceptance gate, in Halis
+# (the Halis twin of tests/audit_acceptance.py; same eight sections,
+# same assertions, same needles — the harness is tests/acc/harness.hls
+# and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run from the repo root. The gate spawns the real tools — hls-audit,
+# hls-pkg, boot.py, hlc, cc, hlfmt, hllint — as children; those
+# subprocesses ARE the test subject.
+#
+# The old battery's legs that reached into Python tool internals
+# (json.loads of the tool's own --json output) drive the same tools'
+# --json reports here through std.json; the one leg that imported
+# hpkg_manifest.parse_manifest reads the demo manifest the way
+# tools/hls-guarantee.py reads anchors: grep the live file for the
+# exact lines the parser must round-trip.
+#
+#  1. the engine        — the source-mode report on the demo, pinned
+#                         line for line (census, intrinsic vs
+#                         reachable, attribution, extern surface,
+#                         totals), --json machine-exact
+#  2. the policy        — --allow gates the chain, not the root; the
+#                         violated / clean / root-exemption runs; the
+#                         unknown-effect refusal (exit 2)
+#  3. fail-closed       — a broken tree is a broken build; a broken
+#                         PACKAGE is a fail-closed node (full effect
+#                         set); the cycle refusal; usage errors exit 2
+#  4. the package tree  — the in-tree demo: the walk reaches
+#                         audit_lib_b through audit_lib_a's OWN
+#                         manifest; chains; manifest policy; --json
+#  5. the drift         — a fresh lock audits clean; content changed
+#                         under the lock is DRIFT; an unlocked dep is
+#                         drift too
+#  6. the parity        — source mode and package mode agree on the
+#                         root's surface
+#  7. the demos         — the demo and the ok-test run; interpreter
+#                         and native agree byte for byte
+#  8. the tools         — hlfmt stable, hllint clean, the manifest
+#                         dialect anchors
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.json"
+import "std.env"
+
+# ----------------------------------------------------------------------------
+# The gate's fixed subjects.
+# ----------------------------------------------------------------------------
+
+fn audit_tool() -> str {
+    return "tools/hls-audit.py"
+}
+
+fn pkg_tool() -> str {
+    return "tools/hls-pkg.py"
+}
+
+fn demo() -> str {
+    return "examples/audit_demo.hls"
+}
+
+fn pkg_demo() -> str {
+    return "examples/pkg_audit_demo"
+}
+
+fn ok_test() -> str {
+    return "tests/ok/feat_stage103_supplychain.hls"
+}
+
+fn repo_tlog() -> str {
+    return ".hls-pkg-transparency.log"
+}
+
+fn full_effects() -> list[str] {
+    return["Args", "Clock", "Conc", "Exit", "Fs", "IO", "Net", "Proc", "Rand"]
+}
+
+# ----------------------------------------------------------------------------
+# Small helpers.
+# ----------------------------------------------------------------------------
+
+# expect(acc, cond, msg, detail) — the battery's ok()/bad() grammar
+# ([PASS]/[FAIL]); the detail line only appears when the leg fails.
+fn expect(acc: Acc, okc: bool, msg: str, detail: str) -> bool uses IO {
+    if okc {
+        pass_msg(acc, msg)
+        return true
+    }
+    fail_msg(acc, msg)
+    if detail != "" {
+        println("        · " + clip(detail, 240))
+    }
+    return false
+}
+
+# pytool(acc, relpath, args) — python3 <root>/<relpath> <args>.
+fn pytool(acc: Acc, relpath: str, args: list[str]) -> RunResult uses Proc {
+    let argv: list[str] = [path_join3(acc.root, relpath)]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    return run_capture("python3", argv)
+}
+
+fn audit(acc: Acc, args: list[str]) -> RunResult uses Proc {
+    return pytool(acc, audit_tool(), args)
+}
+
+fn pkg(acc: Acc, args: list[str]) -> RunResult uses Proc {
+    return pytool(acc, pkg_tool(), args)
+}
+
+fn boot_run(acc: Acc, args: list[str]) -> RunResult uses Proc {
+    return pytool(acc, "tools/hlinterp/boot.py", args)
+}
+
+# jstrs(v) — a JSON array of strings as a list[str] (null-safe).
+fn jstrs(v: JsonValue) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < v.arr.len() {
+        out.push(json_str_value(v.arr.get(i)))
+        i = i + 1
+    }
+    return out
+}
+
+# jint_or / jstr_or — null-safe accessors (json_object_get returns
+# null for absent keys; the batteries' .get(...) with defaults).
+fn jint_or(v: JsonValue, d: int) -> int {
+    if json_is_int(v) {
+        return json_int_value(v)
+    }
+    return d
+}
+
+fn jstr_or(v: JsonValue, d: str) -> str {
+    if json_is_str(v) {
+        return json_str_value(v)
+    }
+    return d
+}
+
+# eq_strs(a, b) — list[str] equality, order and length.
+fn eq_strs(a: list[str], b: list[str]) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    let mut i: int = 0
+    while i < a.len() {
+        if a.get(i) != b.get(i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# find_module(report, key) — the index of the module with that key,
+# or -1 (the battery's mods[key] lookup).
+fn find_module(report: JsonValue, key: str) -> int {
+    let mods: list[JsonValue] = json_object_get(report, "modules").arr
+    let mut i: int = 0
+    while i < mods.len() {
+        if jstr_or(json_object_get(mods.get(i), "key"), "") == key {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# count_kind(report, kind) — modules classified `kind`.
+fn count_kind(report: JsonValue, kind: str) -> int {
+    let mods: list[JsonValue] = json_object_get(report, "modules").arr
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < mods.len() {
+        if jstr_or(json_object_get(mods.get(i), "kind"), "") == kind {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+# attr_key(effect, module) — the battery's (effect, module) pair key.
+fn attr_key(effect: str, module: str) -> str {
+    return effect + "|" + module
+}
+
+# has_attr(report, effect, module) — attribution covers the pair.
+fn has_attr(report: JsonValue, effect: str, module: str) -> bool {
+    let atts: list[JsonValue] = json_object_get(report, "attribution").arr
+    let want: str = attr_key(effect, module)
+    let mut i: int = 0
+    while i < atts.len() {
+        let k: str = attr_key(jstr_or(json_object_get(atts.get(i), "effect"), ""),
+        jstr_or(json_object_get(atts.get(i), "module"), ""))
+        if k == want {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# rel_to_root(acc, p) — the battery's os.path.relpath(p, ROOT) for
+# paths inside the repo (the fixtures all live inside it).
+fn rel_to_root(acc: Acc, p: str) -> str {
+    let prefix: str = acc.root + "/"
+    if p.starts_with(prefix) {
+        return p.slice(prefix.len(), p.len())
+    }
+    return p
+}
+
+# jparse(acc, text, what) — parse a tool's --json output; a failed
+# parse fails one check and hands back null so the remaining checks
+# of the section fail without crashing the gate.
+fn jparse(acc: Acc, text: str, what: str) -> JsonValue uses IO {
+    if text.trim() == "" {
+        fail_msg(acc, what)
+        println("        · no JSON on stdout")
+        return json_null()
+    }
+    let rr: Result[JsonValue, str] = json_parse_result(text)
+    if result_is_err(rr) {
+        fail_msg(acc, what)
+        println("        · " + clip(result_err_or(rr, ""), 120))
+        return json_null()
+    }
+    return result_unwrap(rr)
+}
+
+# ----------------------------------------------------------------------------
+# 1. the engine (source mode)
+# ----------------------------------------------------------------------------
+
+fn sec1(acc: Acc) -> void uses IO, Fs, Proc {
+    section("1. the engine (source mode)")
+    let p: RunResult = audit(acc, [demo()])
+    let _e: bool = expect(acc, p.code == 0, "the demo audits clean (exit 0)",
+    "rc=" + p.code.to_str() + " " + clip(p.combined, 200))
+    let out: str = p.out
+    let pj: RunResult = audit(acc, [demo(), "--json"])
+    let r: JsonValue = jparse(acc, pj.out, "the demo's --json report parses")
+    let mods: list[JsonValue] = json_object_get(r, "modules").arr
+    let _m: bool = expect(acc, mods.len() == 4,
+    "four modules in the tree (entry, two libs, std.str)",
+    "modules=" + mods.len().to_str())
+    let _k1: bool = expect(acc, count_kind(r, "toolchain") == 1,
+    "std.str classified toolchain", "")
+    let _k2: bool = expect(acc, count_kind(r, "workspace") == 3,
+    "entry + netcheck + geo classified workspace", "")
+    let si: int = find_module(r, "std/str.hls")
+    let gi: int = find_module(r, "examples/audit_libs/geo.hls")
+    let ni: int = find_module(r, "examples/audit_libs/netcheck.hls")
+    let di: int = find_module(r, "examples/audit_demo.hls")
+    let _p1: bool = expect(acc, si >= 0 && mods.get(si).arr.len() >= 0
+    && json_object_get(mods.get(si), "intrinsic").arr.len() == 0,
+    "std.str is pure (no intrinsic effects)", "")
+    let _p2: bool = expect(acc, gi >= 0
+    && eq_strs(jstrs(json_object_get(mods.get(gi), "intrinsic")), ["Clock"]),
+    "geo introduces Clock intrinsically", "")
+    let _p3: bool = expect(acc, ni >= 0
+    && eq_strs(jstrs(json_object_get(mods.get(ni), "intrinsic")),
+    ["IO", "Net"]),
+    "netcheck introduces IO (println) and Net (net_lookup)", "")
+    let _p4: bool = expect(acc, di >= 0
+    && eq_strs(jstrs(json_object_get(mods.get(di), "intrinsic")), ["IO"]),
+    "the entry introduces IO (println)", "")
+    let _p5: bool = expect(acc, ni >= 0
+    && eq_strs(jstrs(json_object_get(mods.get(ni), "surface")),
+    ["Clock", "IO", "Net"]),
+    "netcheck's surface carries geo's Clock as reachable", "")
+    let _p6: bool = expect(acc,
+    eq_strs(jstrs(json_object_get(r, "program_surface")),
+    ["Clock", "IO", "Net"]),
+    "program surface is Clock + IO + Net", "")
+    let exts: list[JsonValue] = json_object_get(r, "extern_blocks").arr
+    let ext_ok: bool = exts.len() == 1
+    && eq_strs(jstrs(json_object_get(exts.get(0), "fns")), ["labs"])
+    && json_object_get(exts.get(0), "effects").arr.len() == 0
+    let _p7: bool = expect(acc, ext_ok,
+    "the C boundary is named: one extern (labs), declared pure", "")
+    let atts: list[JsonValue] = json_object_get(r, "attribution").arr
+    let set_ok: bool = atts.len() == 4
+    && has_attr(r, "Clock", "examples/audit_libs/geo.hls")
+    && has_attr(r, "IO", "examples/audit_demo.hls")
+    && has_attr(r, "IO", "examples/audit_libs/netcheck.hls")
+    && has_attr(r, "Net", "examples/audit_libs/netcheck.hls")
+    let _p8: bool = expect(acc, set_ok,
+    "attribution covers every introduction point (IO twice)",
+    "attribution lines=" + atts.len().to_str())
+    # the Clock chain and the root-introduced flag, by pair.
+    let mut clock_chain: str = ""
+    let mut io_root: bool = false
+    let mut ai: int = 0
+    while ai < atts.len() {
+        let a: JsonValue = atts.get(ai)
+        let eff: str = jstr_or(json_object_get(a, "effect"), "")
+        let mod: str = jstr_or(json_object_get(a, "module"), "")
+        if eff == "Clock" && mod == "examples/audit_libs/geo.hls" {
+            clock_chain = str_join(jstrs(json_object_get(a, "chain")), " -> ")
+        }
+        if eff == "IO" && mod == "examples/audit_demo.hls" {
+            io_root = json_object_get(a, "root_introduced").bval
+        }
+        ai = ai + 1
+    }
+    let _p9: bool = expect(acc, clock_chain ==
+    "examples/audit_demo.hls -> examples/audit_libs/netcheck.hls"
+    + " -> examples/audit_libs/geo.hls",
+    "the Clock chain is drawn through the middle hop", clock_chain)
+    let _p10: bool = expect(acc, io_root,
+    "the entry's IO is marked root-introduced", "")
+    # The text report, pinned needle by needle.
+    let needles: list[list[str]] = [
+    ["modules: 4 (1 toolchain, 0 dependency, 3 workspace) — edges: 4 — "
+    + "extern decls: 1", "the module census line"],
+    ["Clock — introduced by examples/audit_libs/geo.hls [workspace]",
+    "the Clock attribution line"],
+    ["IO — introduced by examples/audit_libs/netcheck.hls [workspace]",
+    "the second IO introduction point"],
+    ["via: examples/audit_demo.hls -> examples/audit_libs/netcheck.hls"
+    + " -> examples/audit_libs/geo.hls", "the three-hop chain line"],
+    ["extern \"C\" { labs } declared (none)", "the extern surface line"],
+    ["program effect surface: Clock, IO, Net", "the totals line"],
+    ["verdict: report only", "the honest report-only verdict"],
+    ]
+    let mut wi: int = 0
+    while wi < needles.len() {
+        let nd: list[str] = needles.get(wi)
+        let _w: bool = expect(acc, out.contains(nd.get(0)), nd.get(1),
+        clip(out, 120))
+        wi = wi + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 2. the policy
+# ----------------------------------------------------------------------------
+
+fn sec2(acc: Acc) -> void uses IO, Proc {
+    section("2. the policy")
+    let p: RunResult = audit(acc, [demo(), "--allow", "IO,Net"])
+    let _e1: bool = expect(acc, p.code == 1,
+    "Clock outside the allow list fails the run (exit 1)",
+    "rc=" + p.code.to_str() + " " + clip(p.out, 200))
+    let _e1b: bool = expect(acc,
+    p.out.contains("Clock (introduced by examples/audit_libs/geo.hls)")
+    && p.out.contains("via: examples/audit_demo.hls -> "
+    + "examples/audit_libs/netcheck.hls -> examples/audit_libs/geo.hls"),
+    "the violation names the introducer and the chain",
+    clip(p.out, 200))
+    let _e2: bool = expect(acc,
+    p.out.contains("verdict: VIOLATED — 1 effect(s) outside the allow list"),
+    "the violated verdict is printed", clip(p.out, 160))
+    let p2: RunResult = audit(acc, [demo(), "--allow", "Clock,IO,Net"])
+    let _e3: bool = expect(acc, p2.code == 0
+    && p2.out.contains("verdict: OK — the chain fits the allow list"),
+    "the full surface allowed — clean (exit 0)",
+    "rc=" + p2.code.to_str() + " " + clip(p2.out, 160))
+    # The gate covers the CHAIN, not the root: allow Clock+Net only. The
+    # entry's own IO is exempt; netcheck's IO is not.
+    let p3: RunResult = audit(acc, [demo(), "--allow", "Clock,Net"])
+    let _e4: bool = expect(acc, p3.code == 1
+    && p3.out.contains("IO (introduced by examples/audit_libs/netcheck.hls)")
+    && !p3.out.contains("IO (introduced by examples/audit_demo.hls)"),
+    "the root's own IO is exempt; the chain's IO is not",
+    "rc=" + p3.code.to_str() + " " + clip(p3.out, 200))
+    let pj: RunResult = audit(acc, [demo(), "--allow", "IO,Net", "--json"])
+    let r2: JsonValue = jparse(acc, pj.out, "the policy --json report parses")
+    let v2: list[JsonValue] = json_object_get(r2, "violations").arr
+    let j_ok: bool = eq_strs(jstrs(json_object_get(
+    json_object_get(r2, "policy"), "allowed")), ["IO", "Net"])
+    && v2.len() == 1
+    && jstr_or(json_object_get(v2.get(0), "effect"), "") == "Clock"
+    let _e5: bool = expect(acc, j_ok, "--json violations are machine-exact",
+    clip(pj.out, 200))
+    let pb: RunResult = audit(acc, [demo(), "--allow", "IO,Bogus"])
+    let _e6: bool = expect(acc, pb.code == 2 && pb.err.contains("unknown effect"),
+    "an unknown effect in --allow is a usage error (exit 2)",
+    "rc=" + pb.code.to_str() + " " + clip(pb.err, 120))
+}
+
+# ----------------------------------------------------------------------------
+# 3. fail-closed
+# ----------------------------------------------------------------------------
+
+fn sec3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("3. fail-closed")
+    # Source mode: a broken tree is a broken build, not a finding.
+    let scratch_dir: str = scratch(acc, "broken")
+    let _w1: str = write_src(acc, "broken/lib.hls",
+    "fn helper( -> int {\n    return 1\n}\n")
+    let _w2: str = write_src(acc, "broken/main.hls",
+    "import \"lib.hls\"\n\nfn main() -> int uses IO {\n"
+    + "    println(helper().to_str())\n    return 0\n}\n")
+    let p: RunResult = audit(acc, [path_join3(scratch_dir, "main.hls")])
+    let _e1: bool = expect(acc, p.code == 1 && p.err.contains("parse error"),
+    "a broken source tree exits 1 and names the failure",
+    "rc=" + p.code.to_str() + " " + clip(p.err, 160))
+    # A missing import is a tree the tool cannot see.
+    let _w3: str = write_src(acc, "broken/ghost.hls",
+    "import \"no_such_module.hls\"\n\nfn main() -> int { return 0 }\n")
+    let pg: RunResult = audit(acc, [path_join3(scratch_dir, "ghost.hls")])
+    let _e2: bool = expect(acc, pg.code == 1 && pg.err.contains("module not found"),
+    "a missing module exits 1 (a tree we cannot see is a tree we "
+    + "cannot report)",
+    "rc=" + pg.code.to_str() + " " + clip(pg.err, 160))
+    # Package mode: a broken PACKAGE is a fail-closed node, and the run
+    # still fails after the full report.
+    let fc_root: str = scratch(acc, "fc_root")
+    let pkg_dir: str = scratch(acc, "fc_root/dep")
+    let _m1: str = write_src(acc, "fc_root/dep/hls-pkg.toml",
+    "[package]\nname = \"fc_dep\"\nversion = \"0.1.0\"\n")
+    let _m2: str = write_src(acc, "fc_root/dep/main.hls",
+    "fn read_cfg( -> str {\n    return \"x\"\n}\n")
+    let _m3: str = write_src(acc, "fc_root/hls-pkg.toml",
+    "[package]\nname = \"fc_app\"\nversion = \"1.0.0\"\n\n[dependencies]\n"
+    + "fc_dep = { path = \"" + rel_to_root(acc, pkg_dir) + "\" }\n")
+    let _m4: str = write_src(acc, "fc_root/main.hls",
+    "fn main() -> int uses IO {\n    println(\"x\")\n    return 0\n}\n")
+    let pf: RunResult = audit(acc, ["--pkg", fc_root])
+    let _e3: bool = expect(acc, pf.code == 1,
+    "a broken package fails the run (exit 1)",
+    "rc=" + pf.code.to_str() + " " + clip(pf.combined, 200))
+    let _e4: bool = expect(acc, pf.out.contains("UNAUDITABLE — fail closed")
+    && pf.out.contains("unauditable (fail closed):"),
+    "the report names the unauditable package", clip(pf.out, 200))
+    let pj: RunResult = audit(acc, ["--pkg", fc_root, "--json"])
+    let r3: JsonValue = jparse(acc, pj.out, "the fail-closed --json report parses")
+    let pkgs: list[JsonValue] = json_object_get(r3, "packages").arr
+    let mut fc_surface: list[str] = []
+    let mut ki: int = 0
+    while ki < pkgs.len() {
+        if jstr_or(json_object_get(pkgs.get(ki), "name"), "") == "fc_dep" {
+            fc_surface = jstrs(json_object_get(pkgs.get(ki), "surface"))
+        }
+        ki = ki + 1
+    }
+    let _e5: bool = expect(acc, eq_strs(fc_surface, full_effects()),
+    "the unauditable package's surface is the FULL effect set "
+    + "(fail closed, never pure)", str_join(fc_surface, ","))
+    # A cycle is refused with the chain that closes it.
+    let cyc: str = scratch(acc, "cyc")
+    let _c1: str = write_src(acc, "cyc/a/hls-pkg.toml",
+    "[package]\nname = \"cyc_a\"\nversion = \"0.1.0\"\n\n[dependencies]\n"
+    + "cyc_b = { path = \"" + rel_to_root(acc, scratch(acc, "cyc/b"))
+    + "\" }\n")
+    let _c2: str = write_src(acc, "cyc/a/main.hls", "fn fa() -> int { return 1 }\n")
+    let _c3: str = write_src(acc, "cyc/b/hls-pkg.toml",
+    "[package]\nname = \"cyc_b\"\nversion = \"0.1.0\"\n\n[dependencies]\n"
+    + "cyc_a = { path = \"" + rel_to_root(acc, scratch(acc, "cyc/a"))
+    + "\" }\n")
+    let _c4: str = write_src(acc, "cyc/b/main.hls", "fn fb() -> int { return 2 }\n")
+    let pc: RunResult = audit(acc, ["--pkg", path_join3(cyc, "a")])
+    let _e6: bool = expect(acc, pc.code == 1
+    && pc.err.contains("circular package dependency: cyc_a -> cyc_b -> cyc_a"),
+    "a cycle is refused with the closing chain",
+    "rc=" + pc.code.to_str() + " " + clip(pc.err, 200))
+    # Usage errors: exit 2, never a traceback.
+    let pn: RunResult = audit(acc, [])
+    let _e7: bool = expect(acc, pn.code == 2,
+    "no arguments — usage error (exit 2)", "rc=" + pn.code.to_str())
+    let pb: RunResult = audit(acc, [demo(), "--pkg", pkg_demo()])
+    let _e8: bool = expect(acc, pb.code == 2,
+    "<entry> and --pkg together — usage error (exit 2)",
+    "rc=" + pb.code.to_str())
+    let pm: RunResult = audit(acc, ["--pkg", scratch(acc, "no_such_dir")])
+    let _e9: bool = expect(acc, pm.code == 1,
+    "a missing package dir is an audit failure (exit 1)",
+    "rc=" + pm.code.to_str() + " " + clip(pm.combined, 120))
+}
+
+# ----------------------------------------------------------------------------
+# 4. the package tree
+# ----------------------------------------------------------------------------
+
+fn sec4(acc: Acc) -> void uses IO, Proc {
+    section("4. the package tree")
+    let p: RunResult = audit(acc, ["--pkg", pkg_demo()])
+    let _e1: bool = expect(acc, p.code == 1,
+    "the package demo violates its own policy (exit 1)",
+    "rc=" + p.code.to_str() + " " + clip(p.combined, 200))
+    let out: str = p.out
+    let needles: list[list[str]] = [
+    ["packages: 3 (root included) — deepest chain: 2 dep(s)",
+    "the walk reached through audit_lib_a's OWN manifest"],
+    ["pkg_audit_demo 0.1.0  [root] (this package)", "the tree root line"],
+    ["audit_lib_a 0.1.0  [path]", "the middle package line"],
+    ["audit_lib_b 0.1.0  [path]", "the DEEP package line"],
+    ["Clock — introduced by audit_lib_b (depth 2)", "Clock at depth 2"],
+    ["Fs — introduced by audit_lib_b (depth 2)", "Fs at depth 2"],
+    ["via: pkg_audit_demo -> audit_lib_a -> audit_lib_b",
+    "the two-hop chain"],
+    ["policy: allowed = IO (from manifest)", "the manifest policy line"],
+    ["verdict: VIOLATED — 2 effect(s) outside the allowed set",
+    "the violated verdict"],
+    ]
+    let mut wi: int = 0
+    while wi < needles.len() {
+        let nd: list[str] = needles.get(wi)
+        let _w: bool = expect(acc, out.contains(nd.get(0)), nd.get(1),
+        clip(out, 120))
+        wi = wi + 1
+    }
+    let p2: RunResult = audit(acc, ["--pkg", pkg_demo(), "--allow", "IO,Fs,Clock"])
+    let _e2: bool = expect(acc, p2.code == 0
+    && p2.out.contains("verdict: OK — every package fits the allowed set"),
+    "--allow widens the gate — clean (exit 0)",
+    "rc=" + p2.code.to_str() + " " + clip(p2.out, 160))
+    let pj: RunResult = audit(acc, ["--pkg", pkg_demo(), "--json"])
+    let rp: JsonValue = jparse(acc, pj.out, "the package --json report parses")
+    let _e3: bool = expect(acc,
+    jstr_or(json_object_get(rp, "schema"), "") == "hls-audit/v1"
+    && jstr_or(json_object_get(rp, "mode"), "") == "package",
+    "the JSON carries the schema and the mode", clip(pj.out, 120))
+    let pol: JsonValue = json_object_get(rp, "policy")
+    let _e4: bool = expect(acc,
+    eq_strs(jstrs(json_object_get(pol, "allowed")), ["IO"])
+    && jstr_or(json_object_get(pol, "source"), "") == "manifest",
+    "the manifest policy is parsed, not guessed", clip(pj.out, 160))
+    let pkgs: list[JsonValue] = json_object_get(rp, "packages").arr
+    let mut names: list[str] = []
+    let mut pi: int = 0
+    while pi < pkgs.len() {
+        names.push(jstr_or(json_object_get(pkgs.get(pi), "name"), ""))
+        pi = pi + 1
+    }
+    let _e5: bool = expect(acc,
+    eq_strs(names, ["pkg_audit_demo", "audit_lib_a", "audit_lib_b"]),
+    "packages are listed root-first in walk order", str_join(names, ","))
+    let depth_ok: bool = pkgs.len() == 3
+    && jint_or(json_object_get(pkgs.get(0), "depth"), -1) == 0
+    && jint_or(json_object_get(pkgs.get(2), "depth"), -1) == 2
+    let _e6: bool = expect(acc, depth_ok,
+    "depths are the chain lengths from the root", "")
+    let viol: list[JsonValue] = json_object_get(rp, "violations").arr
+    let mut all_deep: bool = viol.len() == 2
+    let mut vi: int = 0
+    while vi < viol.len() {
+        if jstr_or(json_object_get(viol.get(vi), "package"), "") != "audit_lib_b" {
+            all_deep = false
+        }
+        vi = vi + 1
+    }
+    let _e7: bool = expect(acc, all_deep,
+    "both violations come from the deep package",
+    "violations=" + viol.len().to_str())
+}
+
+# ----------------------------------------------------------------------------
+# 5. the drift
+# ----------------------------------------------------------------------------
+
+fn sec5(acc: Acc) -> void uses IO, Fs, Proc {
+    section("5. the drift")
+    let drift_root: str = scratch(acc, "drift_root")
+    let dep_dir: str = scratch(acc, "drift_dep")
+    let _w1: str = write_src(acc, "drift_dep/hls-pkg.toml",
+    "[package]\nname = \"drift_dep\"\nversion = \"0.1.0\"\n")
+    let _w2: str = write_src(acc, "drift_dep/main.hls",
+    "fn sz() -> int uses Fs {\n    return fs_size(\"a\")\n}\n")
+    # A single-FILE path dep — the hls-pkg lock contract hashes the file,
+    # so the lock and the audit compare the same bytes.
+    let _w3: str = write_src(acc, "drift_root/hls-pkg.toml",
+    "[package]\nname = \"drift_app\"\nversion = \"1.0.0\"\n\n"
+    + "[dependencies]\ndrift_dep = { path = \""
+    + rel_to_root(acc, path_join3(dep_dir, "main.hls")) + "\" }\n\n"
+    + "[effects]\nallowed = [\"IO\", \"Fs\"]\n")
+    let _w4: str = write_src(acc, "drift_root/main.hls",
+    "fn main() -> int uses IO {\n    println(\"x\")\n    return 0\n}\n")
+    # hls-pkg lock pins the tree — from INSIDE the drift root, the way
+    # the battery ran it (cwd=drift_root).
+    let _d: int = env_set_current_dir(drift_root)
+    let lp: RunResult = pkg(acc, ["lock"])
+    let _b: int = env_set_current_dir(acc.root)
+    let _e1: bool = expect(acc, lp.code == 0,
+    "hls-pkg lock pins the drift fixture",
+    "rc=" + lp.code.to_str() + " " + clip(lp.combined, 200))
+    let p: RunResult = audit(acc, ["--pkg", drift_root])
+    let _e2: bool = expect(acc, p.code == 0 && p.out.contains("drift:\n  (none)"),
+    "a fresh lock audits clean (exit 0)",
+    "rc=" + p.code.to_str() + " " + clip(p.out, 200))
+    let _e3: bool = expect(acc, p.out.contains("lockfile: present"),
+    "the lockfile is reported present", clip(p.out, 160))
+    # The dep's content changes under the lock — DRIFT. The lock hashes
+    # the dep's main.hls (a single-file dep), so that is the file that
+    # must change.
+    let dep_src: str = read_file(path_join3(dep_dir, "main.hls"))
+    write_file(path_join3(dep_dir, "main.hls"),
+    dep_src + "\nfn helper() -> int uses Rand {\n"
+    + "    return rand_int(0, 9)\n}\n")
+    let p2: RunResult = audit(acc, ["--pkg", drift_root])
+    let _e4: bool = expect(acc, p2.code == 1 && p2.out.contains("locked sha256")
+    && p2.out.contains("re-lock"),
+    "content changed under the lock — DRIFT fails the run",
+    "rc=" + p2.code.to_str() + " " + clip(p2.out, 200))
+    let pj: RunResult = audit(acc, ["--pkg", drift_root, "--json"])
+    let r4: JsonValue = jparse(acc, pj.out, "the drift --json report parses")
+    let drift: list[JsonValue] = json_object_get(r4, "drift").arr
+    let drift_ok: bool = drift.len() == 1
+    && jstr_or(json_object_get(drift.get(0), "package"), "") == "drift_dep"
+    let _e5: bool = expect(acc, drift_ok,
+    "the drift record names the package", clip(pj.out, 200))
+    # A dep in the manifest but not in the lockfile is drift too. The
+    # manifest is REWRITTEN (appending after [effects] would bind the
+    # new dep to the wrong TOML section) with the same locked dep plus
+    # one the lock has never seen.
+    let dep2: str = scratch(acc, "drift_dep2")
+    let _w5: str = write_src(acc, "drift_dep2/hls-pkg.toml",
+    "[package]\nname = \"drift_dep2\"\nversion = \"0.1.0\"\n")
+    let _w6: str = write_src(acc, "drift_dep2/main.hls",
+    "fn g() -> int { return 5 }\n")
+    write_file(path_join3(drift_root, "hls-pkg.toml"),
+    "[package]\nname = \"drift_app\"\nversion = \"1.0.0\"\n\n"
+    + "[dependencies]\n"
+    + "drift_dep = { path = \""
+    + rel_to_root(acc, path_join3(dep_dir, "main.hls")) + "\" }\n"
+    + "drift_dep2 = { path = \"" + rel_to_root(acc, dep2) + "\" }\n\n"
+    + "[effects]\nallowed = [\"IO\", \"Fs\"]\n")
+    let p3: RunResult = audit(acc, ["--pkg", drift_root])
+    let _e6: bool = expect(acc, p3.code == 1
+    && p3.out.contains("drift_dep2: in the manifest but not in the lockfile"),
+    "an unlocked dep is drift",
+    "rc=" + p3.code.to_str() + " " + clip(p3.out, 200))
+}
+
+# ----------------------------------------------------------------------------
+# 6. the parity (the two modes agree on the root)
+# ----------------------------------------------------------------------------
+
+fn sec6(acc: Acc) -> void uses IO, Proc {
+    section("6. the parity (the two modes agree on the root)")
+    let sj: RunResult = audit(acc, [path_join3(pkg_demo(), "main.hls"), "--json"])
+    let src_root: JsonValue = jparse(acc, sj.out, "the source-mode --json report parses")
+    let pj: RunResult = audit(acc, ["--pkg", pkg_demo(), "--json"])
+    let pkg_root: JsonValue = jparse(acc, pj.out, "the package-mode --json report parses")
+    let _e1: bool = expect(acc,
+    jstr_or(json_object_get(src_root, "mode"), "") == "source"
+    && jstr_or(json_object_get(pkg_root, "mode"), "") == "package",
+    "both modes ran", "")
+    let src_first: JsonValue = json_object_get(src_root, "modules").arr.get(0)
+    let _e2: bool = expect(acc,
+    eq_strs(jstrs(json_object_get(src_first, "surface")), ["IO"])
+    && eq_strs(jstrs(json_object_get(
+    json_object_get(pkg_root, "root"), "surface")), ["IO"]),
+    "the root's surface agrees across the modes (IO)",
+    clip(sj.out, 160) + " / " + clip(pj.out, 160))
+}
+
+# ----------------------------------------------------------------------------
+# 7. the demos
+# ----------------------------------------------------------------------------
+
+fn sec7(acc: Acc) -> void uses IO, Fs, Proc {
+    section("7. the demos")
+    let p1: RunResult = boot_run(acc, [demo()])
+    let _e1: bool = expect(acc, p1.code == 0
+    && p1.out.contains("surface: IO declared here"),
+    "the demo runs (interpreter)", "rc=" + p1.code.to_str())
+    let p2: RunResult = boot_run(acc, [ok_test()])
+    let _e2: bool = expect(acc, p2.code == 0 && p2.out.contains("checks passed: 4"),
+    "the ok-test runs (interpreter)", "rc=" + p2.code.to_str())
+    let hlc: str = path_join3(acc.root, "bin/hlc")
+    if file_exists(hlc) {
+        let c1: str = scratch(acc, "demo_native.c")
+        let c2: str = scratch(acc, "ok_native.c")
+        let b1: str = scratch(acc, "demo_native")
+        let b2: str = scratch(acc, "ok_native")
+        let r1: RunResult = run_capture(hlc, [demo(), c1])
+        let g1: RunResult = run_capture("cc", ["-O2", "-o", b1, c1, "-lm", "-pthread"])
+        let r2: RunResult = run_capture(hlc, [ok_test(), c2])
+        let g2: RunResult = run_capture("cc", ["-O2", "-o", b2, c2, "-lm", "-pthread"])
+        let _e3: bool = expect(acc, r1.code == 0 && g1.code == 0,
+        "native hlc + cc build the demo", clip(r1.combined, 120)
+        + clip(g1.combined, 120))
+        let _e4: bool = expect(acc, r2.code == 0 && g2.code == 0,
+        "native hlc + cc build the ok-test", clip(r2.combined, 120)
+        + clip(g2.combined, 120))
+        if r1.code == 0 && g1.code == 0 && r2.code == 0 && g2.code == 0 {
+            let n1: RunResult = run_capture(b1, [])
+            let _e5: bool = expect(acc, n1.code == 0 && n1.out == p1.out,
+            "the demo agrees byte for byte with the native binary",
+            "rc=" + n1.code.to_str())
+            let n2: RunResult = run_capture(b2, [])
+            let _e6: bool = expect(acc, n2.code == 0 && n2.out == p2.out,
+            "the ok-test agrees byte for byte with the native binary",
+            "rc=" + n2.code.to_str())
+        }
+    } else {
+        println("  [SKIP] bin/hlc not built — the native half of section 7 "
+        + "is skipped (the gate stays hermetic)")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 8. the tools
+# ----------------------------------------------------------------------------
+
+fn sec8(acc: Acc) -> void uses IO, Fs, Proc {
+    section("8. the tools")
+    let files: list[str] = [demo(), ok_test(),
+    "examples/audit_libs/geo.hls", "examples/audit_libs/netcheck.hls"]
+    let mut i: int = 0
+    while i < files.len() {
+        let original: str = read_file(files.get(i))
+        let p1f: str = scratch(acc, "fmt1.hls")
+        let p2f: str = scratch(acc, "fmt2.hls")
+        write_file(p1f, original)
+        write_file(p2f, original)
+        let _r1: RunResult = run_capture("./bin/hlfmt", ["-w", p1f])
+        cp(p1f, p2f)
+        let _r2: RunResult = run_capture("./bin/hlfmt", ["-w", p2f])
+        let once: str = read_file(p1f)
+        let twice: str = read_file(p2f)
+        let _e: bool = expect(acc, once == twice,
+        "hlfmt: stable formatting on " + files.get(i), "")
+        i = i + 1
+    }
+    let l1: RunResult = pytool(acc, "tools/hllint.py", [demo()])
+    let l2: RunResult = pytool(acc, "tools/hllint.py", [ok_test()])
+    let _lint: bool = expect(acc, l1.code == 0 && l2.code == 0,
+    "hllint: no findings on the demo or the ok-test",
+    clip(l1.combined, 160) + clip(l2.combined, 160))
+    # The audit tool speaks the hls-pkg manifest dialect: the battery
+    # read the demo manifest through hpkg_manifest.parse_manifest; the
+    # gate greps the live manifest for the exact lines the parser must
+    # round-trip (hls-guarantee.py's anchor discipline) — the machine
+    # side of the same statement is section 4's policy --json check.
+    let mf: str = read_file(path_join3(pkg_demo(), "hls-pkg.toml"))
+    let _mf: bool = expect(acc,
+    mf.contains("name = \"pkg_audit_demo\"")
+    && mf.contains("allowed = [\"IO\"]")
+    && mf.contains("path = \"examples/pkg_audit_libs/audit_lib_a\""),
+    "the root manifest parses through hls-pkg's own reader",
+    clip(mf, 160))
+}
+
+# ----------------------------------------------------------------------------
+# Gate hygiene — the transparency log the lock runs wrote is not left
+# behind for the commit (the battery's own cleanup, ported).
+# ----------------------------------------------------------------------------
+
+fn hygiene(acc: Acc, had_log: bool, had_lock: bool) -> void uses IO, Fs, Proc {
+    let main_log: str = path_join3(acc.root, repo_tlog())
+    let lock_file: str = main_log + ".lock"
+    if !had_log && file_exists(main_log) {
+        rmrf(main_log)
+    }
+    if !had_lock && file_exists(lock_file) {
+        rmrf(lock_file)
+    }
+    let cache_dir: str = path_join3(acc.root, ".hls-pkg-cache")
+    if file_exists(cache_dir) {
+        let _r: int = sh("rmdir '" + shell_quote(cache_dir) + "' >/dev/null 2>&1")
+    }
+    rmrf(acc.scratch_base)
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let acc: Acc = acc_new("audit")
+    let had_log: bool = file_exists(path_join3(acc.root, repo_tlog()))
+    let had_lock: bool = file_exists(path_join3(acc.root, repo_tlog() + ".lock"))
+    sec1(acc)
+    sec2(acc)
+    sec3(acc)
+    sec4(acc)
+    sec5(acc)
+    sec6(acc)
+    sec7(acc)
+    sec8(acc)
+    hygiene(acc, had_log, had_lock)
+    return finish(acc, "Stage 103 -- hls-audit, the supply-chain effect report")
+}

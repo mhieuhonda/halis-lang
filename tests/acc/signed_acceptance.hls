@@ -1,0 +1,1043 @@
+# ============================================================================
+# tests/acc/signed_acceptance.hls — Stage 106 acceptance gate, in Halis
+# (the Halis twin of tests/signed_acceptance.py; same nine sections,
+# same assertions, same needles — the harness is tests/acc/harness.hls
+# and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make sign-acceptance` (which compiles this file and runs
+# it from the repo root).
+#
+# The battery imported the hlsign_parts modules in-process (the RFC
+# vectors, the box round trip, verify_signatures, the canonical
+# statement bytes); the gate drives the SAME module functions through
+# one tiny python driver (the front door a native binary has) and
+# keeps every keygen/sign/verify/release leg on the CLI's own command
+# line. The per-call passphrase (HLS_SIGN_PASSWORD) is set/unset with
+# std.env around each spawn, the way the battery passed env= to one
+# subprocess. Key-file parsing the battery got from fmt.read_public /
+# unb64 is redone here over std.base64 + std.sha256 — the minisign
+# blob is Ed(2) + id(8) + pk(32), and the key id is sha256(pk)[:8].
+#
+#  1. the primitives — the RFC 8032 vectors (the exact signature
+#                      bytes, deterministic), the RFC 8439 vectors,
+#                      the CLI selftest, the PBKDF2 known answers
+#  2. the keys        — keygen writes both files, the minisign public
+#                      blob (Ed + id + pk, 56 chars), the self-derived
+#                      key id, the 0600 secret, the box round trip,
+#                      the wrong passphrase refused, overwrite refused
+#  3. the signature   — the four-line minisign file, 88-char lines,
+#                      verify ok, tampered payload / comment / key
+#                      refuse, missing pieces refuse, the raw-hex
+#                      anchor works, re-signing is byte-identical
+#  4. the contract    — the primitives layer and the CLI agree; the
+#                      global signature really covers the trusted
+#                      comment; an empty payload signs and verifies
+#  5. the statement   — every field pinned, canonical bytes,
+#                      deterministic over an unchanged tree, and the
+#                      content digest is hls-pkg publish's own number
+#  6. the release     — no lockfile, no release; a fresh lock
+#                      releases (versioned files, one "sign" record);
+#                      verify-release fresh / wrong key / tampered
+#                      statement / tampered content / tampered
+#                      lockfile; drift refuses BEFORE signing
+#  7. the ledger      — the chain still verifies; a refused release
+#                      appended nothing
+#  8. the demos       — the demo and the ok-test run; interpreter and
+#                      native agree byte for byte (native half only
+#                      when bin/hlc exists — hermetic)
+#  9. the tools       — hlfmt stable, hllint clean on the new entry
+#                      sources
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.json"
+import "std.result"
+import "std.env"
+import "std.base64"
+import "std.sha256"
+
+# ----------------------------------------------------------------------------
+# The gate's constants (the battery's).
+# ----------------------------------------------------------------------------
+
+fn demo() -> str {
+    return "examples/signed_demo.hls"
+}
+
+fn ok_test() -> str {
+    return "tests/ok/feat_stage106_signed.hls"
+}
+
+fn pw_var() -> str {
+    return "HLS_SIGN_PASSWORD"
+}
+
+fn gate_pw() -> str {
+    return "gate-passphrase-106"
+}
+
+fn log_main() -> str {
+    return ".hls-pkg-transparency.log"
+}
+
+fn log_lock() -> str {
+    return ".hls-pkg-transparency.log.lock"
+}
+
+# ----------------------------------------------------------------------------
+# JSON accessors — null-safe, so a failed leg FAILs instead of crashing.
+# ----------------------------------------------------------------------------
+
+fn parse_json(text: str) -> JsonValue {
+    let rr: Result[JsonValue, str] = json_parse_result(text)
+    if result_is_ok(rr) {
+        return result_unwrap(rr)
+    }
+    return json_null()
+}
+
+fn jget(v: JsonValue, key: str) -> JsonValue {
+    return json_object_get(v, key)
+}
+
+fn jstr(v: JsonValue, key: str) -> str {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_str(x) {
+        return json_str_value(x)
+    }
+    return ""
+}
+
+fn jint(v: JsonValue, key: str) -> int {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_int(x) {
+        return json_int_value(x)
+    }
+    return 0
+}
+
+fn el_str(v: JsonValue) -> str {
+    if json_is_str(v) {
+        return json_str_value(v)
+    }
+    return ""
+}
+
+fn arr_at(v: JsonValue, i: int) -> JsonValue {
+    if json_is_array(v) && i >= 0 && i < v.arr.len() {
+        return v.arr.get(i)
+    }
+    return json_null()
+}
+
+# ----------------------------------------------------------------------------
+# Small text helpers.
+# ----------------------------------------------------------------------------
+
+fn sha_of(path: str) -> str uses Fs {
+    return sha256_hex(read_file(path))
+}
+
+# hex_of(s) — the bytes of s as lowercase hex (the battery's
+# bytes.hex() over blob slices and public keys).
+fn hex_of(s: str) -> str {
+    let digits: str = "0123456789abcdef"
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        out = out + digits.slice(b / 16, b / 16 + 1)
+        + digits.slice(b % 16, b % 16 + 1)
+        i = i + 1
+    }
+    return out
+}
+
+# dec_of(s) — a digit string to int (0 for anything else).
+fn dec_of(s: str) -> int {
+    if s.len() == 0 || s.len() > 9 {
+        return 0
+    }
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        if b < 48 || b > 57 {
+            return 0
+        }
+        n = n * 10 + (b - 48)
+        i = i + 1
+    }
+    return n
+}
+
+# file_lines(path) — the battery's read().splitlines(): no trailing "".
+fn file_lines(path: str) -> list[str] uses Fs {
+    let lines: list[str] = read_or(path, "").split("\n")
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < lines.len() {
+        if !(i == lines.len() - 1 && lines.get(i) == "") {
+            out.push(lines.get(i))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn last_line(path: str) -> str uses Fs {
+    let text: str = read_or(path, "")
+    let lines: list[str] = text.split("\n")
+    let mut i: int = lines.len() - 1
+    while i >= 0 {
+        let t: str = lines.get(i).trim()
+        if t != "" {
+            return t
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+fn log_records(path: str) -> list[str] uses Fs {
+    let lines: list[str] = read_or(path, "").split("\n")
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < lines.len() {
+        let t: str = lines.get(i).trim()
+        if t != "" {
+            out.push(t)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn dir_exists(path: str) -> bool uses Proc {
+    return sh("test -d '" + shell_quote(path) + "'") == 0
+}
+
+# file_mode(path) — the battery's stat.S_IMODE(os.stat(p).st_mode),
+# through stat(1); "" when stat fails.
+fn file_mode(acc: Acc, path: str) -> str uses Fs, Proc {
+    let out: str = scratch(acc, "mode.txt")
+    sh("stat -c %a '" + shell_quote(path) + "' > '"
+    + shell_quote(out) + "' 2>/dev/null")
+    return read_or(out, "").trim()
+}
+
+# labeled_value(out, label) — the value after a driver's "LABEL " line.
+fn labeled_value(out: str, label: str) -> str {
+    let lines: list[str] = out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).starts_with(label) {
+            return lines.get(i).slice(label.len(), lines.get(i).len()).trim()
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# ----------------------------------------------------------------------------
+# The key-file reading the battery got from hlsign_format. The pub
+# file is minisign's two-line layout; the blob is base64 of
+# "Ed" (2) || key id (8) || public key (32).
+# ----------------------------------------------------------------------------
+
+# pub_blob(pub_path) — the decoded second line.
+fn pub_blob(pub_path: str) -> str uses Fs {
+    let lines: list[str] = file_lines(pub_path)
+    if lines.len() >= 2 {
+        return base64_decode(lines.get(1))
+    }
+    return ""
+}
+
+# pub_public_of(pub_path) — the raw 32-byte public key.
+fn pub_public_of(pub_path: str) -> str uses Fs {
+    let blob: str = pub_blob(pub_path)
+    if blob.len() == 42 {
+        return blob.slice(10, 42)
+    }
+    return ""
+}
+
+# key_id_hex_of(pub_path) — fmt.key_id_hex(read_public(p)[0]):
+# sha256(public)[:8], hex — 16 characters.
+fn key_id_hex_of(pub_path: str) -> str uses Fs {
+    let public: str = pub_public_of(pub_path)
+    if public == "" {
+        return ""
+    }
+    return sha256_hex(public).slice(0, 16)
+}
+
+# minisig_keyid(sig_path) — read_signature's keyid: the token after
+# "key" in the untrusted comment.
+fn minisig_keyid(sig_path: str) -> str uses Fs {
+    let lines: list[str] = file_lines(sig_path)
+    if lines.len() < 4 {
+        return ""
+    }
+    let untrusted: str = lines.get(0).slice(18, lines.get(0).len())
+    let at: int = untrusted.find("key")
+    if at < 0 {
+        return ""
+    }
+    let rest: str = untrusted.slice(at + 3, untrusted.len()).trim()
+    let sp: int = rest.find(" ")
+    if sp >= 0 {
+        return rest.slice(0, sp)
+    }
+    return rest
+}
+
+# minisig_trusted(sig_path) — read_signature's trusted comment: the
+# text after "trusted comment: ".
+fn minisig_trusted(sig_path: str) -> str uses Fs {
+    let lines: list[str] = file_lines(sig_path)
+    if lines.len() < 4 {
+        return ""
+    }
+    return lines.get(2).slice(17, lines.get(2).len())
+}
+
+# ----------------------------------------------------------------------------
+# The tools, as the battery addresses them.
+# ----------------------------------------------------------------------------
+
+fn run_sign(acc: Acc, args: list[str]) -> RunResult uses Proc {
+    let argv: list[str] = [path_join3(acc.root, "tools/hls-sign.py")]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    return run_capture("python3", argv)
+}
+
+# sign_cmd(acc, args) — the battery's sign(*extra): every signing run
+# carries the passphrase in the environment, per child.
+fn sign_cmd(acc: Acc, args: list[str]) -> RunResult uses Proc {
+    env_set_var(pw_var(), gate_pw())
+    let r: RunResult = run_sign(acc, args)
+    env_unset_var(pw_var())
+    return r
+}
+
+fn sign_env_pw(acc: Acc, pw: str, args: list[str]) -> RunResult uses Proc {
+    env_set_var(pw_var(), pw)
+    let r: RunResult = run_sign(acc, args)
+    env_unset_var(pw_var())
+    return r
+}
+
+fn run_pkg_in(acc: Acc, args: list[str], dir: str) -> int uses Proc {
+    let home: str = cwd_get()
+    env_set_current_dir(dir)
+    let argv: list[str] = [path_join3(acc.root, "tools/hls-pkg.py")]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    let code: int = run_quiet("python3", argv)
+    env_set_current_dir(home)
+    return code
+}
+
+# sign_driver(acc) — the battery's in-process primitives, through the
+# module front door a native binary has. One driver, four modes.
+fn sign_driver(acc: Acc) -> str uses Fs, Proc {
+    return write_src(acc, "drivers/signkit.py",
+    "import sys, os\n"
+    + "ROOT = sys.argv[1]\n"
+    + "sys.path.insert(0, os.path.join(ROOT, \"tools\"))\n"
+    + "from hlsign_parts import hlsign_ed25519 as ed\n"
+    + "from hlsign_parts import hlsign_aead as aead\n"
+    + "from hlsign_parts import hlsign_format as fmt\n"
+    + "mode = sys.argv[2]\n"
+    + "if mode == \"vectors\":\n"
+    + "    e_names = ed.selftest()\n"
+    + "    print(\"E %d|%s\" % (len(e_names), \"|\".join(e_names)))\n"
+    + "    a_names = aead.selftest()\n"
+    + "    print(\"A %d|%s\" % (len(a_names), \"|\".join(a_names)))\n"
+    + "    seed1 = bytes.fromhex("
+    + "\"9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60\")\n"
+    + "    pk1 = bytes.fromhex("
+    + "\"d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a\")\n"
+    + "    sig1_want = bytes.fromhex(\n"
+    + "        \"e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155\"\n"
+    + "        \"5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b\")\n"
+    + "    print(\"SIG1 \" + ed.sign(seed1, b\"\").hex())\n"
+    + "    print(\"VER1 %d\" % (1 if ed.verify(pk1, b\"\", sig1_want) else 0))\n"
+    + "    print(\"DET %d\" % (1 if ed.sign(seed1, b\"\") == ed.sign(seed1, b\"\") else 0))\n"
+    + "    print(\"KDF1 \" + aead.kdf_key(\"password\", b\"salt\", 1).hex())\n"
+    + "    print(\"KDF4096 \" + aead.kdf_key(\"password\", b\"salt\", 4096).hex())\n"
+    + "elif mode == \"roundtrip\":\n"
+    + "    seed_rd, public_rd, _kid, _c = fmt.read_secret(sys.argv[3], sys.argv[4])\n"
+    + "    want = fmt.read_public(sys.argv[5])[0]\n"
+    + "    ok = ed.public_from_seed(seed_rd) == want and public_rd == want\n"
+    + "    print(\"RT %d %s\" % (1 if ok else 0, public_rd.hex()))\n"
+    + "elif mode == \"contract\":\n"
+    + "    public, _kid, _c = fmt.read_public(sys.argv[3])\n"
+    + "    payload = open(sys.argv[4], \"rb\").read()\n"
+    + "    raw2, glob2, _kid2, trusted2 = fmt.read_signature(sys.argv[5])\n"
+    + "    print(\"VS %d\" % (1 if fmt.verify_signatures("
+    + "public, payload, raw2, glob2, trusted2) else 0))\n"
+    + "    print(\"GLOBOK %d\" % (1 if not ed.verify(public, payload, glob2) else 0))\n"
+    + "elif mode == \"canonical\":\n"
+    + "    import json\n"
+    + "    st_path = sys.argv[3]\n"
+    + "    statement = json.load(open(st_path))\n"
+    + "    text = open(st_path).read()\n"
+    + "    print(\"CANON %d\" % (1 if (json.dumps("
+    + "statement, indent=2, sort_keys=True) + \"\\n\") == text else 0))\n")
+}
+
+# ----------------------------------------------------------------------------
+# 1. the primitives (the RFCs' own numbers)
+# ----------------------------------------------------------------------------
+
+fn sec1(acc: Acc) -> void uses IO, Fs, Proc {
+    section("1. the primitives (the RFCs' own numbers)")
+    let driver: str = sign_driver(acc)
+    let vec: RunResult = run_capture("python3", [driver, acc.root, "vectors"])
+    let e_line: str = labeled_value(vec.out, "E ")
+    let a_line: str = labeled_value(vec.out, "A ")
+    let e_parts: list[str] = e_line.split("|")
+    let a_parts: list[str] = a_line.split("|")
+    let e_count: int = dec_of(e_parts.get(0))
+    let a_count: int = dec_of(a_parts.get(0))
+    # every Ed25519 selftest name is an RFC vector, the keypair or a refusal
+    let mut names_ok: bool = e_count == 6
+    let mut ni: int = 1
+    while ni < e_parts.len() {
+        let n: str = e_parts.get(ni)
+        if !(n.contains("RFC 8032") || n.contains("keypair")
+        || n.contains("refusal")) {
+            names_ok = false
+        }
+        ni = ni + 1
+    }
+    check(acc, "the Ed25519 module passes the RFC 8032 vectors and the refusals",
+    names_ok, "")
+    check(acc, "the AEAD module passes the RFC 8439 vectors", a_count == 4, "")
+
+    # TEST 1's exact signature bytes — RFC 8032 section 7.1, verbatim.
+    check(acc, "TEST 1 signs to the RFC's exact bytes (deterministic)",
+    labeled_value(vec.out, "SIG1 ")
+    == "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155"
+    + "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+    "")
+    check(acc, "TEST 1 verifies against the RFC's public key",
+    labeled_value(vec.out, "VER1 ") == "1", "")
+    check(acc, "signing is deterministic: same seed, same bytes, same signature",
+    labeled_value(vec.out, "DET ") == "1", "")
+
+    # The CLI selftest is the same vectors through the tool's front door.
+    let selftest: RunResult = run_sign(acc, ["selftest"])
+    check(acc, "the CLI selftest reports all ten vector groups (exit 0)",
+    selftest.code == 0 && count_sub(selftest.out, "  ok: ") == 10
+    && selftest.out.contains("RFC 8032 vector 4")
+    && selftest.out.contains("RFC 8439 AEAD"), "")
+
+    # The KDF is PBKDF2-HMAC-SHA256 — pinned to the standard vectors.
+    check(acc, "PBKDF2 c=1 matches the standard vector",
+    labeled_value(vec.out, "KDF1 ")
+    == "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b",
+    "")
+    check(acc, "PBKDF2 c=4096 matches the standard vector",
+    labeled_value(vec.out, "KDF4096 ")
+    == "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a",
+    "")
+}
+
+fn count_sub(text: str, needle: str) -> int {
+    let mut n: int = 0
+    let mut rest: str = text
+    let mut at: int = rest.find(needle)
+    while at >= 0 {
+        n = n + 1
+        rest = rest.slice(at + needle.len(), rest.len())
+        at = rest.find(needle)
+    }
+    return n
+}
+
+# ----------------------------------------------------------------------------
+# 2. the keys (minisign public, honest secret)
+# ----------------------------------------------------------------------------
+
+fn sec2(acc: Acc) -> void uses IO, Fs, Proc {
+    section("2. the keys (minisign public, honest secret)")
+    let key_dir: str = scratch(acc, "keys")
+    mkdirs(key_dir)
+    let k_secret: str = path_join3(key_dir, "hls-sign.key")
+    let k_pub: str = path_join3(key_dir, "hls-sign.pub")
+    let p: RunResult = sign_cmd(acc, ["keygen", "-f", k_secret, "-p", k_pub,
+    "-c", "gate fixture", "--password-env", pw_var(), "--iterations", "1000"])
+    check(acc, "keygen writes the secret and the public key (exit 0)",
+    p.code == 0 && file_exists(k_secret) && file_exists(k_pub),
+    clip(p.combined, 120))
+    check(acc, "keygen names the key id and the 0600 mode",
+    p.out.contains("key id:") && p.out.contains("0600"), "")
+
+    let pub_lines: list[str] = file_lines(k_pub)
+    let mut pub_line0: str = ""
+    let mut pub_line1: str = ""
+    if pub_lines.len() >= 1 {
+        pub_line0 = pub_lines.get(0)
+    }
+    if pub_lines.len() >= 2 {
+        pub_line1 = pub_lines.get(1)
+    }
+    check(acc, "the public key file is minisign's two-line layout",
+    pub_lines.len() == 2
+    && pub_line0.starts_with("untrusted comment: minisign public key"),
+    "")
+    let blob: str = base64_decode(pub_line1)
+    check(acc, "the blob is Ed(2) + id(8) + pk(32) — 56 base64 characters",
+    blob.len() == 42 && blob.byte_at(0) == 69 && blob.byte_at(1) == 100
+    && pub_line1.len() == 56, "")
+    let public: str = blob.slice(10, 42)
+    check(acc, "the key id inside the blob is self-derived (sha256(pk)[:8])",
+    hex_of(blob.slice(2, 10)) == sha256_hex(public).slice(0, 16)
+    && public != "", "")
+    check(acc, "the key id is sixteen hex characters",
+    public != "" && sha256_hex(public).slice(0, 16).len() == 16, "")
+
+    check(acc, "the secret key file is 0600",
+    file_mode(acc, k_secret) == "600", "")
+
+    # the box round-trips: the seed derives the very public key
+    # keygen wrote (the battery called read_secret + public_from_seed
+    # in-process; the gate drives the same functions through the
+    # module front door)
+    let driver: str = sign_driver(acc)
+    let rt: RunResult = run_capture("python3",
+    [driver, acc.root, "roundtrip", k_secret, gate_pw(), k_pub])
+    check(acc, "the box round-trips: the seed derives the very public key "
+    + "keygen wrote",
+    labeled_value(rt.out, "RT ").starts_with("1 ")
+    && labeled_value(rt.out, "RT ").slice(2, labeled_value(rt.out, "RT ").len())
+    == hex_of(public), "")
+
+    let wrong: RunResult = sign_env_pw(acc, "not-the-passphrase",
+    ["sign", k_pub, "-s", k_secret])
+    check(acc, "the wrong passphrase refuses (exit 1, the AEAD says so)",
+    wrong.code == 1 && wrong.err.contains("cannot be opened"),
+    clip(wrong.err, 120))
+    let secret_text: str = read_or(k_secret, "")
+    let secret_lines: list[str] = secret_text.split("\n")
+    let mut no_plaintext: bool = !secret_text.contains(hex_of(public))
+    if secret_lines.len() >= 2 {
+        no_plaintext = no_plaintext && !secret_lines.get(1).contains("gate fixture")
+    }
+    check(acc, "the secret file carries no plaintext key material",
+    no_plaintext, "")
+
+    let p2: RunResult = sign_cmd(acc, ["keygen", "-f", k_secret, "-p", k_pub,
+    "--iterations", "1000"])
+    check(acc, "keygen refuses to overwrite a key without --force",
+    p2.code == 1 && p2.err.contains("does not overwrite"),
+    clip(p2.err, 120))
+}
+
+# ----------------------------------------------------------------------------
+# 3. the signature (the minisign discipline)
+# ----------------------------------------------------------------------------
+
+fn sec3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("3. the signature (the minisign discipline)")
+    let key_dir: str = scratch(acc, "keys")
+    let k_secret: str = path_join3(key_dir, "hls-sign.key")
+    let k_pub: str = path_join3(key_dir, "hls-sign.pub")
+    let public: str = pub_public_of(k_pub)
+    let sig_dir: str = scratch(acc, "sigs")
+    mkdirs(sig_dir)
+    let payload: str = path_join3(sig_dir, "payload.txt")
+    write_file(payload, "the release the name goes behind\n")
+    let p: RunResult = sign_cmd(acc, ["sign", payload, "-s", k_secret,
+    "--trusted-comment", "timestamp:0\tfile:payload.txt"])
+    check(acc, "sign writes the detached signature (exit 0)",
+    p.code == 0 && file_exists(payload + ".minisig"),
+    clip(p.combined, 120))
+
+    let sig_lines: list[str] = file_lines(payload + ".minisig")
+    let mut sig_l0: str = ""
+    let mut sig_l1: str = ""
+    let mut sig_l3: str = ""
+    if sig_lines.len() >= 1 {
+        sig_l0 = sig_lines.get(0)
+    }
+    if sig_lines.len() >= 4 {
+        sig_l1 = sig_lines.get(1)
+        sig_l3 = sig_lines.get(3)
+    }
+    check(acc, "the signature file is minisign's four-line contract",
+    sig_lines.len() == 4
+    && sig_l0.starts_with(
+    "untrusted comment: signature from hls-sign key "), "")
+    check(acc, "both signature lines are 88 base64 characters (Ed + sig64)",
+    sig_l1.len() == 88 && sig_l3.len() == 88, "")
+    check(acc, "the untrusted comment names the signing key id",
+    minisig_keyid(payload + ".minisig")
+    == sha256_hex(public).slice(0, 16) && public != "", "")
+    check(acc, "the trusted comment rides through signed",
+    minisig_trusted(payload + ".minisig") == "timestamp:0\tfile:payload.txt", "")
+
+    let v: RunResult = sign_cmd(acc, ["verify", payload, "-p", k_pub])
+    check(acc, "the signature verifies (exit 0)",
+    v.code == 0 && v.out.contains("verified"), clip(v.combined, 120))
+
+    write_file(payload, read_or(payload, "") + "one flipped line\n")
+    let v2: RunResult = sign_cmd(acc, ["verify", payload, "-p", k_pub])
+    check(acc, "a tampered payload refuses (exit 1)",
+    v2.code == 1 && v2.err.contains("does NOT verify"),
+    clip(v2.err, 120))
+    write_file(payload, "the release the name goes behind\n")
+
+    let sig_path: str = payload + ".minisig"
+    let orig_sig_text: str = read_file(sig_path)
+    let at: int = orig_sig_text.find("timestamp:0\tfile:payload.txt")
+    if at >= 0 {
+        write_file(sig_path, orig_sig_text.slice(0, at)
+        + "timestamp:99\tfile:payload.txt"
+        + orig_sig_text.slice(at + 28, orig_sig_text.len()))
+    }
+    let v3: RunResult = sign_cmd(acc, ["verify", payload, "-p", k_pub])
+    check(acc, "a rewritten trusted comment refuses (the global signature holds)",
+    v3.code == 1, "")
+    write_file(sig_path, orig_sig_text)
+
+    let k2_secret: str = path_join3(key_dir, "second.key")
+    let k2_pub: str = path_join3(key_dir, "second.pub")
+    sign_cmd(acc, ["keygen", "-f", k2_secret, "-p", k2_pub,
+    "--password-env", pw_var(), "--iterations", "1000"])
+    let v4: RunResult = sign_cmd(acc, ["verify", payload, "-p", k2_pub])
+    check(acc, "another key refuses the signature (a trust anchor is not a vibe)",
+    v4.code == 1 && v4.err.contains("does NOT verify"), "")
+
+    let v5: RunResult = sign_cmd(acc, ["verify", payload, sig_path,
+    "-P", hex_of(public)])
+    check(acc, "the raw-hex anchor (-P) verifies the same signature",
+    v5.code == 0, "")
+    let v6: RunResult = sign_cmd(acc, ["verify", payload, sig_path,
+    "-P", "abababababababababababababababababababababababababababababababab"])
+    check(acc, "a wrong raw-hex anchor refuses", v6.code == 1, "")
+    let v7: RunResult = sign_cmd(acc, ["verify", payload,
+    path_join3(sig_dir, "missing.minisig"), "-p", k_pub])
+    check(acc, "a missing signature file refuses",
+    v7.code == 1 && v7.err.contains("no signature"), "")
+    let v8: RunResult = sign_cmd(acc, ["verify",
+    path_join3(sig_dir, "missing.txt"), "-p", k_pub])
+    check(acc, "a missing payload refuses",
+    v8.code == 1 && v8.err.contains("no such file"), "")
+
+    let p9: RunResult = sign_cmd(acc, ["sign", payload, "-s", k_secret,
+    "--trusted-comment", "timestamp:0\tfile:payload.txt"])
+    check(acc, "re-signing the same bytes is byte-identical (determinism)",
+    p9.code == 0 && read_file(sig_path) == orig_sig_text, "")
+}
+
+# ----------------------------------------------------------------------------
+# 4. the contract (the layers agree)
+# ----------------------------------------------------------------------------
+
+fn sec4(acc: Acc) -> void uses IO, Fs, Proc {
+    section("4. the contract (the layers agree)")
+    let key_dir: str = scratch(acc, "keys")
+    let k_pub: str = path_join3(key_dir, "hls-sign.pub")
+    let sig_dir: str = scratch(acc, "sigs")
+    let payload: str = path_join3(sig_dir, "payload.txt")
+    let driver: str = sign_driver(acc)
+    let ct: RunResult = run_capture("python3",
+    [driver, acc.root, "contract", k_pub, payload, payload + ".minisig"])
+    check(acc, "the primitives layer verifies what the CLI verified",
+    labeled_value(ct.out, "VS ") == "1", "")
+    check(acc, "the global signature is NOT a second payload signature — it "
+    + "covers the comment",
+    labeled_value(ct.out, "GLOBOK ") == "1", "")
+    let empty_payload: str = path_join3(sig_dir, "empty.bin")
+    write_file(empty_payload, "")
+    let k_secret: str = path_join3(key_dir, "hls-sign.key")
+    sign_cmd(acc, ["sign", empty_payload, "-s", k_secret,
+    "--trusted-comment", "timestamp:0\tfile:empty.bin"])
+    let v: RunResult = sign_cmd(acc, ["verify", empty_payload,
+    "-p", k_pub])
+    check(acc, "an empty payload signs and verifies", v.code == 0, "")
+}
+
+# ----------------------------------------------------------------------------
+# 5. the statement (the deterministic claim)
+# ----------------------------------------------------------------------------
+
+fn sec5(acc: Acc) -> void uses IO, Fs, Proc {
+    section("5. the statement (the deterministic claim)")
+    let tmp: str = acc.scratch_base
+    let rel_root: str = scratch(acc, "rel_app")
+    mkdirs(rel_root)
+    write_file(path_join3(rel_root, "hls-pkg.toml"),
+    "[package]\nname = \"rel_app\"\nversion = \"2.3.4\"\n\n"
+    + "[dependencies]\nrel_dep = { path = \"tests/_gate_s106_dep/main.hls\" }"
+    + "\n\n[effects]\nallowed = [\"IO\", \"Fs\"]\n")
+    write_file(path_join3(rel_root, "main.hls"),
+    "fn main() -> int uses IO {\n    println(\"x\")\n    return 0\n}\n")
+    let dep_dir: str = path_join3(acc.root, "tests/_gate_s106_dep")
+    rmrf(dep_dir)
+    mkdirs(dep_dir)
+    write_file(path_join3(dep_dir, "hls-pkg.toml"),
+    "[package]\nname = \"rel_dep\"\nversion = \"0.1.0\"\n")
+    write_file(path_join3(dep_dir, "main.hls"),
+    "fn sz() -> int uses Fs {\n    return fs_size(\"a\")\n}\n")
+
+    let rel_key: str = path_join3(tmp, "rel.key")
+    let rel_pub: str = path_join3(tmp, "rel.pub")
+    sign_cmd(acc, ["keygen", "-f", rel_key, "-p", rel_pub, "-c", "release key",
+    "--password-env", pw_var(), "--iterations", "1000"])
+
+    # No lockfile, no release — the gate refuses before anything is built.
+    let had_log: bool = file_exists(log_main())
+    let had_lock_file: bool = file_exists(log_lock())
+    let before: int = count_lines(read_or(log_main(), ""))
+    let p: RunResult = sign_cmd(acc, ["release", rel_root, "--key", rel_key])
+    check(acc, "no lockfile, no release (exit 1, says what to do)",
+    p.code == 1 && p.err.contains("hls-pkg lock")
+    && p.err.contains("pinned content"), clip(p.err, 160))
+    check(acc, "the refused release wrote nothing anywhere",
+    count_lines(read_or(log_main(), "")) == before
+    && !file_exists(path_join3(rel_root,
+    "hls-sign-rel_app-2.3.4.release.json")), "")
+
+    let lp: int = run_pkg_in(acc, ["lock"], rel_root)
+    check(acc, "hls-pkg lock pins the release fixture", lp == 0, "")
+
+    let rel_args: list[str] = ["release", rel_root, "--key", rel_key,
+    "--trusted-comment", "timestamp:0", "--json"]
+    let p2: RunResult = sign_cmd(acc, rel_args)
+    let report: JsonValue = parse_json(p2.out)
+    check(acc, "the locked tree releases (exit 0, the report names the schema)",
+    p2.code == 0 && jstr(report, "schema") == "hls-sign-release/v1",
+    clip(p2.combined, 160))
+    let st_path: str = path_join3(rel_root, "hls-sign-rel_app-2.3.4.release.json")
+    let sig_path: str = path_join3(rel_root, "hls-sign-rel_app-2.3.4.minisig")
+    check(acc, "the versioned statement + signature land in the package",
+    file_exists(st_path) && file_exists(sig_path), "")
+
+    let statement: JsonValue = parse_json(read_or(st_path, ""))
+    check(acc, "the statement pins every contract field",
+    jstr(statement, "schema") == "hls-release-statement/v1"
+    && jstr(statement, "kind") == "halis-package-release"
+    && jstr(statement, "name") == "rel_app"
+    && jstr(statement, "version") == "2.3.4"
+    && jstr(statement, "algorithm") == "ed25519"
+    && jstr(statement, "tool") == "hls-sign"
+    && jstr(statement, "tool_version") == "0.125.0-alpha", "")
+    check(acc, "the digest walked the tree and the key id names the signer",
+    jint(statement, "files") == 1
+    && jstr(statement, "key_id") == key_id_hex_of(rel_pub), "")
+    check(acc, "the lockfile's own bytes are pinned in the statement",
+    jstr(statement, "lockfile_sha256")
+    == sha_of(path_join3(rel_root, "hls-pkg.lock")), "")
+    let text: str = read_file(st_path)
+    # the statement bytes are canonical (the battery compared against
+    # json.dumps(indent=2, sort_keys=True) + "\n" — the same
+    # construction through the driver)
+    let driver: str = sign_driver(acc)
+    let cn: RunResult = run_capture("python3",
+    [driver, acc.root, "canonical", st_path])
+    check(acc, "the statement bytes are canonical (sorted keys, trailing newline)",
+    labeled_value(cn.out, "CANON ") == "1" && text.len() > 0, "")
+
+    # The deterministic claim: the same tree, the same trusted comment —
+    # the same statement bytes. (The signature too: RFC 8032 signing is
+    # deterministic, the comment is pinned, so the whole file repeats.)
+    let p3: RunResult = sign_cmd(acc, ["release", rel_root, "--key", rel_key,
+    "--trusted-comment", "timestamp:0"])
+    check(acc, "re-releasing the unchanged tree re-writes the same statement",
+    p3.code == 0 && read_file(st_path) == text, "")
+    let sig_after: str = read_file(sig_path)
+    let p4: RunResult = sign_cmd(acc, ["release", rel_root, "--key", rel_key,
+    "--trusted-comment", "timestamp:0"])
+    check(acc, "re-releasing re-writes the same signature bytes",
+    p4.code == 0 && read_file(sig_path) == sig_after, "")
+
+    # One definition of the digest: hls-pkg publish's own record must
+    # carry the SAME content hash the statement signed.
+    let pp: int = run_pkg_in(acc, ["publish"], rel_root)
+    check(acc, "hls-pkg publish records the same package", pp == 0, "")
+    let recs: list[str] = log_records(log_main())
+    let mut pub_sha: str = ""
+    if recs.len() >= 2 {
+        let last1: JsonValue = parse_json(recs.get(recs.len() - 1))
+        let last2: JsonValue = parse_json(recs.get(recs.len() - 2))
+        if jstr(last1, "kind") == "publish" {
+            pub_sha = jstr(last1, "sha256")
+        }
+        if jstr(last2, "kind") == "publish" {
+            pub_sha = jstr(last2, "sha256")
+        }
+        let mut is_sign: bool = jstr(last1, "kind") == "sign"
+        if jstr(last2, "kind") == "sign" {
+            is_sign = true
+        }
+        if !is_sign {
+            pub_sha = ""
+        }
+    }
+    check(acc, "the signed content_sha256 IS the publish digest (one definition)",
+    pub_sha != "" && pub_sha == jstr(statement, "content_sha256"), "")
+
+    # the gate remembers these for sections 6 and 7 — including the
+    # log-hygiene facts the battery carried in locals
+    let mut had_log_s: str = "0"
+    if had_log {
+        had_log_s = "1"
+    }
+    let mut had_lock_s: str = "0"
+    if had_lock_file {
+        had_lock_s = "1"
+    }
+    write_file(scratch(acc, "state.txt"),
+    "st=" + st_path + "\nsig=" + sig_path + "\nrel=" + rel_root
+    + "\npub=" + rel_pub + "\nkey=" + rel_key
+    + "\ncontent=" + jstr(statement, "content_sha256")
+    + "\nkeyid=" + jstr(statement, "key_id")
+    + "\nhadlog=" + had_log_s + "\nhadlock=" + had_lock_s + "\n")
+}
+
+# ----------------------------------------------------------------------------
+# 6. the release (verify-release, the counterparty)
+# ----------------------------------------------------------------------------
+
+fn state_of(acc: Acc, name: str) -> str uses Fs, Proc {
+    let lines: list[str] = read_or(scratch(acc, "state.txt"), "").split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i)
+        if line.starts_with(name + "=") {
+            return line.slice(name.len() + 1, line.len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn sec6(acc: Acc) -> void uses IO, Fs, Proc {
+    section("6. the release (verify-release, the counterparty)")
+    let rel_root: str = state_of(acc, "rel")
+    let rel_pub: str = state_of(acc, "pub")
+    let st_path: str = state_of(acc, "st")
+    let key_dir: str = scratch(acc, "keys")
+    let k2_pub: str = path_join3(key_dir, "second.pub")
+
+    let p: RunResult = sign_cmd(acc, ["verify-release", rel_root, "-p", rel_pub,
+    "--json"])
+    let vr: JsonValue = parse_json(p.out)
+    check(acc, "verify-release: the tree IS the signed bytes (exit 0)",
+    p.code == 0 && json_is_bool(jget(vr, "verified"))
+    && json_bool_value(jget(vr, "verified"))
+    && jstr(jget(vr, "statement"), "name") == "rel_app",
+    clip(p.combined, 160))
+    let p2: RunResult = sign_cmd(acc, ["verify-release", rel_root, "-p", k2_pub])
+    check(acc, "verify-release with another key refuses",
+    p2.code == 1 && p2.err.contains("does not verify"), "")
+
+    let orig_st: str = read_file(st_path)
+    let at: int = orig_st.find("\"files\": 1")
+    if at >= 0 {
+        write_file(st_path, orig_st.slice(0, at) + "\"files\": 2"
+        + orig_st.slice(at + 10, orig_st.len()))
+    }
+    let p3: RunResult = sign_cmd(acc, ["verify-release", rel_root, "-p", rel_pub])
+    check(acc, "a tampered statement refuses (the signature covers the bytes)",
+    p3.code == 1 && p3.err.contains("does not verify"), "")
+    write_file(st_path, orig_st)
+
+    let main_hls: str = path_join3(rel_root, "main.hls")
+    write_file(main_hls, read_or(main_hls, "")
+    + "\nfn extra() -> int {\n    return 7\n}\n")
+    let p4: RunResult = sign_cmd(acc, ["verify-release", rel_root, "-p", rel_pub])
+    check(acc, "content changed after signing refuses (drift, named)",
+    p4.code == 1 && p4.err.contains("tree is not what the release describes"),
+    "")
+    write_file(main_hls, "fn main() -> int uses IO {\n    println(\"x\")\n"
+    + "    return 0\n}\n")
+
+    let lock_path: str = path_join3(rel_root, "hls-pkg.lock")
+    let lock_orig: str = read_file(lock_path)
+    write_file(lock_path, lock_orig + " ")
+    let p5: RunResult = sign_cmd(acc, ["verify-release", rel_root, "-p", rel_pub])
+    check(acc, "a changed lockfile refuses (the release names its lock)",
+    p5.code == 1 && p5.err.contains("lockfile is not the one"), "")
+    write_file(lock_path, lock_orig)
+    let p6: RunResult = sign_cmd(acc, ["verify-release", rel_root, "-p", rel_pub])
+    check(acc, "the pinned lockfile bytes restored — the release verifies again",
+    p6.code == 0, "")
+}
+
+# ----------------------------------------------------------------------------
+# 7. the ledger (the chain covers the name)
+# ----------------------------------------------------------------------------
+
+fn sec7(acc: Acc) -> void uses IO, Fs, Proc {
+    section("7. the ledger (the chain covers the name)")
+    let st_path: str = state_of(acc, "st")
+    let sig_path: str = state_of(acc, "sig")
+    let rel_root: str = state_of(acc, "rel")
+    let rel_pub: str = state_of(acc, "pub")
+    let rel_key: str = state_of(acc, "key")
+    let content_sha: str = state_of(acc, "content")
+    let keyid: str = state_of(acc, "keyid")
+    let had_log: bool = state_of(acc, "hadlog") == "1"
+    let had_lock_file: bool = state_of(acc, "hadlock") == "1"
+    let dep_dir: str = path_join3(acc.root, "tests/_gate_s106_dep")
+
+    # the last sign record in the ledger
+    let recs: list[str] = log_records(log_main())
+    let mut rec: JsonValue = json_null()
+    let mut i: int = recs.len() - 1
+    while i >= 0 {
+        let r: JsonValue = parse_json(recs.get(i))
+        if jstr(r, "kind") == "sign" {
+            rec = r
+            i = -1
+        }
+        i = i - 1
+    }
+    check(acc, "the sign record chains content, statement and signature hashes",
+    jstr(rec, "name") == "rel_app" && jstr(rec, "version") == "2.3.4"
+    && jstr(rec, "key_id") == keyid && keyid != ""
+    && jstr(rec, "content_sha256") == content_sha && content_sha != ""
+    && jstr(rec, "statement_sha256") == sha_of(st_path)
+    && jstr(rec, "sig_sha256") == sha_of(sig_path), "")
+    let vp: int = run_pkg_in(acc, ["log", "--verify"], acc.root)
+    check(acc, "the transparency chain still verifies", vp == 0, "")
+
+    # Drift refuses BEFORE signing and appends nothing.
+    let lines_before_drift: int = count_lines(read_or(log_main(), ""))
+    let dep_main: str = path_join3(dep_dir, "main.hls")
+    write_file(dep_main, read_or(dep_main, "")
+    + "\nfn helper() -> int uses Rand {\n    return rand_int(9)\n}\n")
+    let p: RunResult = sign_cmd(acc, ["release", rel_root, "--key", rel_key])
+    check(acc, "content changed under the lock — the release refuses (exit 1)",
+    p.code == 1 && p.err.contains("drift"), clip(p.err, 160))
+    check(acc, "the refused release appended NOTHING to the log",
+    count_lines(read_or(log_main(), "")) == lines_before_drift, "")
+    let p2: RunResult = sign_cmd(acc, ["verify-release", rel_root, "-p", rel_pub])
+    check(acc, "the drifted tree no longer verifies (the release's own audit "
+    + "runs on the verify side too)",
+    p2.code == 1 && p2.err.contains("drift"), "")
+    let p3: RunResult = sign_cmd(acc, ["release", rel_root,
+    "--key", path_join3(acc.scratch_base, "no.key")])
+    check(acc, "a release without a key refuses (a claim needs a name)",
+    p3.code == 1 && p3.err.contains("no secret key"), "")
+
+    # Gate scratch hygiene: the log the fixtures wrote is not left
+    # behind for the commit.
+    if !had_log && file_exists(log_main()) {
+        rmrf(log_main())
+    }
+    if !had_lock_file && file_exists(log_lock()) {
+        rmrf(log_lock())
+    }
+    if dir_exists(".hls-pkg-cache") {
+        sh("rmdir '.hls-pkg-cache' >/dev/null 2>&1")
+    }
+    rmrf(dep_dir)
+}
+
+# ----------------------------------------------------------------------------
+# 8. the demos
+# ----------------------------------------------------------------------------
+
+fn sec8(acc: Acc) -> void uses IO, Fs, Proc {
+    section("8. the demos")
+    let p1: RunResult = boot(acc, [demo()])
+    check(acc, "the demo runs (interpreter)",
+    p1.code == 0 && p1.out.contains("checks passed: 5"), "")
+    let p2: RunResult = boot(acc, [ok_test()])
+    check(acc, "the ok-test runs (interpreter)",
+    p2.code == 0 && p2.out.contains("checks passed: 5"), "")
+
+    let hlc: str = path_join3(acc.root, "bin/hlc")
+    if file_exists(hlc) {
+        let c1: str = scratch(acc, "demo_native.c")
+        let c2: str = scratch(acc, "ok_native.c")
+        let b1: str = scratch(acc, "demo_native")
+        let b2: str = scratch(acc, "ok_native")
+        let h1: RunResult = run_capture(hlc, [demo(), c1])
+        let cc1: RunResult = run_capture("cc", ["-O2", "-o", b1, c1, "-lm", "-pthread"])
+        let h2: RunResult = run_capture(hlc, [ok_test(), c2])
+        let cc2: RunResult = run_capture("cc", ["-O2", "-o", b2, c2, "-lm", "-pthread"])
+        let ok1: bool = h1.code == 0 && cc1.code == 0
+        let ok2: bool = h2.code == 0 && cc2.code == 0
+        if ok1 && ok2 {
+            let n1: RunResult = run_capture(b1, [])
+            check(acc, "the demo agrees byte for byte with the native binary",
+            n1.code == 0 && n1.out == p1.out, "")
+            let n2: RunResult = run_capture(b2, [])
+            check(acc, "the ok-test agrees byte for byte with the native binary",
+            n2.code == 0 && n2.out == p2.out, "")
+        } else {
+            fail_msg(acc, "native compilation of the demos failed")
+        }
+    } else {
+        println("  [note] bin/hlc not built — the native half of section 8 "
+        + "is skipped (the gate stays hermetic)")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 9. the tools
+# ----------------------------------------------------------------------------
+
+fn sec9(acc: Acc) -> void uses IO, Fs, Proc {
+    section("9. the tools")
+    let files: list[str] = [demo(), ok_test()]
+    let mut fi: int = 0
+    while fi < files.len() {
+        let f: str = files.get(fi)
+        let original: str = read_file(f)
+        let p1f: str = scratch(acc, "fmt1.hls")
+        let p2f: str = scratch(acc, "fmt2.hls")
+        write_file(p1f, original)
+        run_quiet("./bin/hlfmt", ["-w", p1f])
+        cp(p1f, p2f)
+        run_quiet("./bin/hlfmt", ["-w", p2f])
+        let once: str = read_file(p1f)
+        let twice: str = read_file(p2f)
+        check(acc, "hlfmt: stable formatting on " + f, once == twice, "")
+        fi = fi + 1
+    }
+    let l1: RunResult = run_capture("python3",
+    [path_join3(acc.root, "tools/hllint.py"), demo()])
+    let l2: RunResult = run_capture("python3",
+    [path_join3(acc.root, "tools/hllint.py"), ok_test()])
+    if l1.code == 0 && l2.code == 0 {
+        pass_msg(acc, "hllint: no findings on the demo or the ok-test")
+    } else {
+        fail_msg(acc, "hllint: findings on the new sources")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Fs, Proc, Exit {
+    let acc: Acc = acc_new("signed")
+    sec1(acc)
+    sec2(acc)
+    sec3(acc)
+    sec4(acc)
+    sec5(acc)
+    sec6(acc)
+    sec7(acc)
+    sec8(acc)
+    sec9(acc)
+    return finish(acc, "Stage 106 -- hls-sign, the signed packages")
+}

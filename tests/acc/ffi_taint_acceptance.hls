@@ -1,0 +1,569 @@
+# ============================================================================
+# tests/acc/ffi_taint_acceptance.hls — Stage 109 acceptance gate, in Halis
+# (the Halis twin of tests/ffi_taint_acceptance.py; same seven sections,
+# same assertions, same needles — the harness is tests/acc/harness.hls
+# and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run from the repo root. The gate spawns the real tools — boot.py,
+# bin/hlc, hlprove.py, hlfmt, hllint, gcc — as children; those
+# subprocesses ARE the test subject.
+#
+#  1. the parser       — a valid marking parses and runs (boot); the
+#                        placement rule (the two names on a normal fn
+#                        are named, not "unknown"), the extern-block
+#                        mini-grammar refusals (unknown attr, duplicate
+#                        source, empty sink list, duplicate sink name),
+#                        word for word, in both front-ends where a
+#                        binary is available
+#  2. the checker      — #[taint_source] wraps the call result
+#                        (tainted[str] at the call site), the dedicated
+#                        #[taint_sink] diagnostic, the void-source
+#                        refusal, the unknown-sink-name refusal, and
+#                        the blanket Stage 15 rule still standing on an
+#                        unmarked extern — boot AND native hlc agree
+#  3. the runtime      — the ok test through the interpreter: the
+#                        wrapper-dict representation flows through the
+#                        pure queries, the concat, the sanitizer and
+#                        the hatch, and the output is pinned
+#  4. the census       — the --audit FFI block is word-for-word
+#                        identical between boot and the self-hosted
+#                        compiler, on a marked AND an unmarked program
+#  5. the report       — hlprove --taint: the demo's pinned lines
+#                        (census, provenance, the sanitised cut, the
+#                        accepted-risk sink flow, the total) and the
+#                        sink-flow program; analysis-only (exit 0)
+#  6. the demos        — examples/ffi_taint_demo.hls runs; the demo and
+#                        the ok-test agree with the interpreter
+#                        (native half only when bin/hlc exists — the
+#                        gate stays hermetic)
+#  7. the tools        — hlfmt stable, hllint clean on the new sources
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+
+# ----------------------------------------------------------------------------
+# The gate's fixed subjects.
+# ----------------------------------------------------------------------------
+
+fn demo() -> str {
+    return "examples/ffi_taint_demo.hls"
+}
+
+fn ok_test() -> str {
+    return "tests/ok/feat_stage109_ffi_taint.hls"
+}
+
+fn hlc_bin(acc: Acc) -> str {
+    return path_join3(acc.root, "bin/hlc")
+}
+
+fn has_hlc(acc: Acc) -> bool uses Fs {
+    return file_exists(hlc_bin(acc))
+}
+
+# ----------------------------------------------------------------------------
+# Small helpers.
+# ----------------------------------------------------------------------------
+
+fn expect(acc: Acc, okc: bool, msg: str, detail: str) -> bool uses IO {
+    if okc {
+        pass_msg(acc, msg)
+        return true
+    }
+    fail_msg(acc, msg)
+    if detail != "" {
+        println("        · " + clip(detail, 240))
+    }
+    return false
+}
+
+fn pytool(acc: Acc, relpath: str, args: list[str]) -> RunResult uses Proc {
+    let argv: list[str] = [path_join3(acc.root, relpath)]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    return run_capture("python3", argv)
+}
+
+fn boot_run(acc: Acc, args: list[str]) -> RunResult uses Proc {
+    return pytool(acc, "tools/hlinterp/boot.py", args)
+}
+
+fn prove(acc: Acc, path: str) -> RunResult uses Proc {
+    return pytool(acc, "tools/hlprove.py", [path, "--taint"])
+}
+
+# hlc_check_err(acc, path) — the native compile attempt; the C goes to
+# a scratch throwaway (the battery's TMP/<base>.nat.c).
+fn hlc_check_err(acc: Acc, path: str) -> RunResult uses Fs, Proc {
+    let out_c: str = scratch(acc, "nat/" + stem(path) + ".nat.c")
+    return run_capture(hlc_bin(acc), [path, out_c])
+}
+
+# ffi_block(text) — the Stage 109 census block: the header line plus
+# the rows indented four spaces (six-space sub-rows are skipped).
+fn ffi_block(text: str) -> str {
+    let lines: list[str] = text.split("\n")
+    let mut out: list[str] = []
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).starts_with("  FFI taint marking (Stage 109):") {
+            out.push(lines.get(i))
+            let mut j: int = i + 1
+            while j < lines.len() {
+                let l2: str = lines.get(j)
+                if !l2.starts_with("    ") {
+                    break
+                }
+                if !l2.starts_with("      ") {
+                    out.push(l2)
+                }
+                j = j + 1
+            }
+            return str_join(out, "\n")
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# ----------------------------------------------------------------------------
+# 1. the parser
+# ----------------------------------------------------------------------------
+
+fn sec1(acc: Acc) -> void uses IO, Fs, Proc {
+    section("1. the parser")
+    # A valid marking parses and RUNS (the interpreter's wrapper-dict
+    # path is exercised for real in section 3 — here, just the parse).
+    let p0: RunResult = boot_run(acc, [ok_test()])
+    let _e0: bool = expect(acc, p0.code == 0,
+    "the ok test parses and runs (boot)",
+    "rc=" + p0.code.to_str() + " " + clip(p0.combined, 160))
+    # The placement rule: the two names on a NORMAL fn are named, not
+    # buried in "unknown attribute".
+    let f: str = write_src(acc, "p_onfn.hls",
+    "#[taint_source]\n" +
+    "fn f() -> int uses IO { return 1 }\n" +
+    "fn main() -> int uses IO {\n" +
+    "    let x: int = f()\n" +
+    "    let _y: int = x\n" +
+    "    return 0\n" +
+    "}\n")
+    let r: RunResult = boot_check(acc, f)
+    let _e1: bool = expect(acc, r.code == 1
+    && r.err.contains("is an extern-block attribute")
+    && r.err.contains("extern \"C\""),
+    "boot: #[taint_source] on a normal fn names the placement rule",
+    "rc=" + r.code.to_str() + " " + clip(r.err, 200))
+    if has_hlc(acc) {
+        let r2: RunResult = hlc_check_err(acc, f)
+        let _e2: bool = expect(acc, r2.code != 0
+        && r2.err.contains("is an extern-block attribute"),
+        "native: the same placement refusal",
+        "rc=" + r2.code.to_str() + " " + clip(r2.err, 200))
+    }
+    # Unknown extern-block attribute — the codegen attrs belong to the C
+    # side and cannot annotate a declaration.
+    let f2: str = write_src(acc, "p_unknown.hls",
+    "extern \"C\" {\n" +
+    "    #[hot]\n" +
+    "    fn dirname(p: str) -> str uses IO\n" +
+    "}\n" +
+    "fn main() -> int uses IO {\n" +
+    "    let d: str = dirname(\"x/y\")\n" +
+    "    println(d.len().to_str())\n" +
+    "    return 0\n" +
+    "}\n")
+    let r3: RunResult = boot_check(acc, f2)
+    let _e3: bool = expect(acc, r3.code == 1
+    && r3.err.contains("unknown extern-block attribute 'hot'"),
+    "boot: #[hot] inside an extern block is refused by name",
+    "rc=" + r3.code.to_str() + " " + clip(r3.err, 200))
+    # Duplicate taint_source.
+    let f3: str = write_src(acc, "p_dupsrc.hls",
+    "extern \"C\" {\n" +
+    "    #[taint_source]\n" +
+    "    #[taint_source]\n" +
+    "    fn dirname(p: str) -> str uses IO\n" +
+    "}\n" +
+    "fn main() -> int uses IO {\n" +
+    "    let d: tainted[str] = dirname(\"x/y\")\n" +
+    "    let s: str = taint_unwrap(d)\n" +
+    "    println(s.len().to_str())\n" +
+    "    return 0\n" +
+    "}\n")
+    let r4: RunResult = boot_check(acc, f3)
+    let _e4: bool = expect(acc, r4.code == 1
+    && r4.err.contains("taint_source attribute appears more than once"),
+    "boot: duplicate #[taint_source] on one extern is refused",
+    "rc=" + r4.code.to_str() + " " + clip(r4.err, 200))
+    # Empty sink list — a sink that sinks nothing hides its hazard.
+    let f4: str = write_src(acc, "p_emptysink.hls",
+    "extern \"C\" {\n" +
+    "    #[taint_sink()]\n" +
+    "    fn system(cmd: str) -> int uses IO\n" +
+    "}\n" +
+    "fn main() -> int uses IO {\n" +
+    "    let rc: int = system(\"ls\")\n" +
+    "    println(rc.to_str())\n" +
+    "    return 0\n" +
+    "}\n")
+    let r5: RunResult = boot_check(acc, f4)
+    let _e5: bool = expect(acc, r5.code == 1
+    && r5.err.contains("#[taint_sink(...)] needs at least one parameter name"),
+    "boot: an empty #[taint_sink(...)] list is refused",
+    "rc=" + r5.code.to_str() + " " + clip(r5.err, 200))
+    # Duplicate name in one sink list.
+    let f5: str = write_src(acc, "p_dupsink.hls",
+    "extern \"C\" {\n" +
+    "    #[taint_sink(buf, buf)]\n" +
+    "    fn readinto(fd: int, buf: str) -> int uses IO\n" +
+    "}\n" +
+    "fn main() -> int uses IO {\n" +
+    "    let rc: int = readinto(0, \"x\")\n" +
+    "    println(rc.to_str())\n" +
+    "    return 0\n" +
+    "}\n")
+    let r6: RunResult = boot_check(acc, f5)
+    let _e6: bool = expect(acc, r6.code == 1
+    && r6.err.contains("'buf' appears more than once"),
+    "boot: a duplicate name in #[taint_sink(...)] is refused",
+    "rc=" + r6.code.to_str() + " " + clip(r6.err, 200))
+}
+
+# ----------------------------------------------------------------------------
+# 2. the checker
+# ----------------------------------------------------------------------------
+
+fn sec2(acc: Acc) -> void uses IO, Fs, Proc {
+    section("2. the checker")
+    # The wrap: the marked call site's result is tainted[str] — assigning
+    # it to a plain str is a type error that NAMES the tainted type.
+    let f: str = write_src(acc, "c_wrap.hls",
+    "extern \"C\" {\n" +
+    "    #[taint_source]\n" +
+    "    fn dirname(p: str) -> str uses IO\n" +
+    "}\n" +
+    "fn main() -> int uses IO {\n" +
+    "    let d: str = dirname(\"x/y\")\n" +
+    "    println(d)\n" +
+    "    return 0\n" +
+    "}\n")
+    let r: RunResult = boot_check(acc, f)
+    let _e1: bool = expect(acc, r.code == 1
+    && r.err.contains("declared str but got tainted[str]"),
+    "boot: the #[taint_source] call result is typed tainted[str]",
+    "rc=" + r.code.to_str() + " " + clip(r.err, 200))
+    if has_hlc(acc) {
+        let r2: RunResult = hlc_check_err(acc, f)
+        let _e2: bool = expect(acc, r2.code != 0
+        && r2.err.contains("tainted[str]"),
+        "native: the wrap is typed the same way",
+        "rc=" + r2.code.to_str() + " " + clip(r2.err, 200))
+    }
+    # The dedicated sink diagnostic.
+    let fs: str = "tests/fail/fail_stage109_ffi_sink.hls"
+    let r3: RunResult = boot_check(acc, fs)
+    let _e3: bool = expect(acc, r3.code == 1
+    && r3.err.contains("taint-sink violation: extern 'system' argument 1 ('cmd')")
+    && r3.err.contains("declared #[taint_sink(...)]"),
+    "boot: a #[taint_sink] parameter gets the dedicated diagnostic",
+    "rc=" + r3.code.to_str() + " " + clip(r3.err, 200))
+    if has_hlc(acc) {
+        let r4: RunResult = hlc_check_err(acc, fs)
+        let _e4: bool = expect(acc, r4.code != 0
+        && r4.err.contains("declared #[taint_sink(...)]"),
+        "native: the same sink diagnostic",
+        "rc=" + r4.code.to_str() + " " + clip(r4.err, 200))
+    }
+    # Void source.
+    let fv: str = "tests/fail/fail_stage109_ffi_source_void.hls"
+    let r5: RunResult = boot_check(acc, fv)
+    let _e5: bool = expect(acc, r5.code == 1
+    && r5.err.contains("#[taint_source] on 'notify' is meaningless"),
+    "boot: #[taint_source] on a void extern is refused",
+    "rc=" + r5.code.to_str() + " " + clip(r5.err, 200))
+    if has_hlc(acc) {
+        let r6: RunResult = hlc_check_err(acc, fv)
+        let _e6: bool = expect(acc, r6.code != 0
+        && r6.err.contains("is meaningless"),
+        "native: the same void-source refusal",
+        "rc=" + r6.code.to_str() + " " + clip(r6.err, 200))
+    }
+    # Unknown sink name.
+    let fb: str = "tests/fail/fail_stage109_ffi_sink_badname.hls"
+    let r7: RunResult = boot_check(acc, fb)
+    let _e7: bool = expect(acc, r7.code == 1
+    && r7.err.contains("names 'comand' which is not a parameter"),
+    "boot: a typo'd #[taint_sink] name is refused",
+    "rc=" + r7.code.to_str() + " " + clip(r7.err, 200))
+    if has_hlc(acc) {
+        let r8: RunResult = hlc_check_err(acc, fb)
+        let _e8: bool = expect(acc, r8.code != 0
+        && r8.err.contains("which is not a parameter"),
+        "native: the same unknown-name refusal",
+        "rc=" + r8.code.to_str() + " " + clip(r8.err, 200))
+    }
+    # The blanket Stage 15 rule still stands on an UNMARKED extern.
+    let fb2: str = write_src(acc, "c_blanket.hls",
+    "extern \"C\" {\n" +
+    "    fn puts(s: str) -> int uses IO\n" +
+    "}\n" +
+    "fn main() -> int uses Args, IO {\n" +
+    "    let argv: list[tainted[str]] = tainted_args()\n" +
+    "    let rc: int = puts(argv.get(0))\n" +
+    "    println(rc.to_str())\n" +
+    "    return 0\n" +
+    "}\n")
+    let r9: RunResult = boot_check(acc, fb2)
+    let _e9: bool = expect(acc, r9.code == 1
+    && r9.err.contains("passing tainted data across the FFI boundary is forbidden"),
+    "boot: an unmarked extern still rejects tainted arguments "
+    + "(Stage 15 rule intact)",
+    "rc=" + r9.code.to_str() + " " + clip(r9.err, 200))
+}
+
+# ----------------------------------------------------------------------------
+# 3. the runtime
+# ----------------------------------------------------------------------------
+
+fn sec3(acc: Acc) -> void uses IO, Proc {
+    section("3. the runtime")
+    let p: RunResult = boot_run(acc, [ok_test()])
+    let _e1: bool = expect(acc, p.code == 0, "the ok test runs (interpreter)",
+    "rc=" + p.code.to_str() + " " + clip(p.combined, 160))
+    let _e2: bool = expect(acc,
+    p.out == "byte: 65\nbyte2: 65\nclean: project/bin/tool.hls\n",
+    "the ok test's pinned output (FFI source, hatch, propagation, "
+    + "sanitizer)", clip(p.out, 160))
+}
+
+# ----------------------------------------------------------------------------
+# 4. the census
+# ----------------------------------------------------------------------------
+
+fn sec4(acc: Acc) -> void uses IO, Fs, Proc {
+    section("4. the census")
+    let marked: str = ok_test()
+    let pb: RunResult = boot_run(acc, ["--audit", marked])
+    let b_text: str = pb.out
+    let _e1: bool = expect(acc, b_text.contains("FFI taint marking (Stage 109):"),
+    "boot --audit prints the Stage 109 census", clip(pb.combined, 160))
+    let _e2: bool = expect(acc, b_text.contains("    - toupper: -> int"),
+    "the census names the #[taint_source] extern with its return type",
+    clip(b_text, 200))
+    if has_hlc(acc) {
+        let out_c: str = scratch(acc, "a.c")
+        let ph: RunResult = run_capture(hlc_bin(acc),
+        ["--audit", marked, out_c])
+        let h_block: str = ffi_block(ph.out)
+        let b_block: str = ffi_block(b_text)
+        let _e3: bool = expect(acc, h_block == b_block && b_block != "",
+        "the census is word-for-word identical between the front-ends",
+        "boot: [" + clip(b_block, 120) + "] native: ["
+        + clip(h_block, 120) + "]")
+    }
+    # A sink-marked program lists the sink row.
+    let f: str = write_src(acc, "census_sink.hls",
+    "extern \"C\" {\n" +
+    "    #[taint_sink(cmd)]\n" +
+    "    fn system(cmd: str) -> int uses IO\n" +
+    "}\n" +
+    "fn main() -> int uses IO {\n" +
+    "    let rc: int = system(\"ls\")\n" +
+    "    println(rc.to_str())\n" +
+    "    return 0\n" +
+    "}\n")
+    let p2: RunResult = boot_run(acc, ["--audit", f])
+    let _e4: bool = expect(acc,
+    p2.out.contains("    #[taint_sink(...)] externs (declared sinks): 1")
+    && p2.out.contains("    - system: cmd"),
+    "the census lists a #[taint_sink(...)] extern with its params",
+    clip(p2.out, 200))
+}
+
+# ----------------------------------------------------------------------------
+# 5. the report
+# ----------------------------------------------------------------------------
+
+fn sec5(acc: Acc) -> void uses IO, Fs, Proc {
+    section("5. the report")
+    let p: RunResult = prove(acc, demo())
+    let _e1: bool = expect(acc, p.code == 0,
+    "hlprove --taint is analysis-only (exit 0)",
+    "rc=" + p.code.to_str() + " " + clip(p.combined, 160))
+    let out: str = p.out
+    let pins: list[str] = [
+    "dirname(p: str) -> str  [SOURCE #[taint_source]",
+    "boundary census: 1 source(s), 0 sink(s), 0 unmarked",
+    "SOURCE — `dirname(\"...\")` (from ffi:dirname)",
+    "SANITISED — `sanitize_path(raw)` (from ffi:dirname)",
+    "UNWRAP — `taint_unwrap(raw)` (from ffi:dirname)",
+    "SINK-REACH — `println((\"...\" + raw_dir))` (from ffi:dirname)",
+    "untrusted params (by propagation): dir",
+    "FFI TAINT TOTAL: 1 source sites, 4 unwrap escapes, "
+    + "1 sink-reaching flows, 1 sanitised cuts",
+    ]
+    let mut i: int = 0
+    while i < pins.len() {
+        let _e: bool = expect(acc, out.contains(pins.get(i)),
+        "the report pins: " + pins.get(i), clip(out, 160))
+        i = i + 1
+    }
+    # The sink-flow program: the declared sink catches the escaped data,
+    # and the extern return stops the propagation (rc is clean).
+    let f: str = write_src(acc, "r_sinkflow.hls",
+    "import \"std.sanitize\"\n" +
+    "import \"std.taint\"\n" +
+    "\n" +
+    "extern \"C\" {\n" +
+    "    #[taint_source]\n" +
+    "    fn getenv(name: str) -> str uses IO\n" +
+    "    #[taint_sink(cmd)]\n" +
+    "    fn system(cmd: str) -> int uses IO\n" +
+    "}\n" +
+    "\n" +
+    "fn main() -> int uses Args, IO {\n" +
+    "    let raw: tainted[str] = getenv(\"USER_CONFIG\")\n" +
+    "    let argv: list[tainted[str]] = tainted_args()\n" +
+    "    let dir: str = taint_unwrap(raw)\n" +
+    "    let risky: str = taint_unwrap(argv.get(1))\n" +
+    "    let rc: int = system(risky)\n" +
+    "    println(\"rc: \" + rc.to_str())\n" +
+    "    return 0\n" +
+    "}\n")
+    let p2: RunResult = prove(acc, f)
+    let _e2: bool = expect(acc, p2.code == 0,
+    "the sink-flow report runs clean (exit 0)",
+    "rc=" + p2.code.to_str() + " " + clip(p2.combined, 160))
+    let out2: str = p2.out
+    let _e3: bool = expect(acc,
+    out2.contains("getenv(name: str) -> str  [SOURCE #[taint_source]")
+    && out2.contains("system(cmd: str) -> int  [SINK #[taint_sink(cmd)]]"),
+    "the report censuses both markings", clip(out2, 200))
+    let _e4: bool = expect(acc,
+    out2.contains("SINK-REACH — `system(risky)` (from builtin:tainted_args)"),
+    "the report names the accepted-risk flow into the declared sink",
+    clip(out2, 200))
+    let _e5: bool = expect(acc,
+    !out2.contains("SINK-REACH — `println((\"...\" + rc.to_str()))`"),
+    "an extern's return is NOT untrusted (argument provenance "
+    + "stops at the boundary)", "")
+    # A program with no externs says so, in one line.
+    let f2: str = write_src(acc, "r_noext.hls",
+    "fn main() -> int uses IO {\n" +
+    "    println(\"plain\")\n" +
+    "    return 0\n" +
+    "}\n")
+    let p3: RunResult = prove(acc, f2)
+    let _e6: bool = expect(acc, p3.code == 0
+    && p3.out.contains("(no extern declarations — no FFI boundary to audit)"),
+    "a program without externs gets the one-line note",
+    "rc=" + p3.code.to_str() + " " + clip(p3.out, 160))
+}
+
+# ----------------------------------------------------------------------------
+# 6. the demos
+# ----------------------------------------------------------------------------
+
+fn sec6(acc: Acc) -> void uses IO, Fs, Proc {
+    section("6. the demos")
+    let p: RunResult = boot_run(acc, [demo()])
+    let _e1: bool = expect(acc, p.code == 0, "the demo runs (interpreter)",
+    "rc=" + p.code.to_str() + " " + clip(p.combined, 160))
+    let _e2: bool = expect(acc,
+    p.out == "dirname: 11\nconfig path len: 20\nclean dir: project/bin\n"
+    + "raw dir (unwrapped): project/bin\n",
+    "the demo's pinned output (propagation through a user fn)",
+    clip(p.out, 160))
+    if has_hlc(acc) {
+        let srcs: list[str] = [demo(), ok_test()]
+        let mut built_ok: bool = true
+        let ok_bin: str = scratch(acc, "demo_feat_stage109_ffi_taint.bin")
+        let mut si: int = 0
+        while si < srcs.len() {
+            let src: str = srcs.get(si)
+            let base: str = stem(src)
+            let out_c: str = scratch(acc, "demo_" + base + ".c")
+            let out_b: str = scratch(acc, "demo_" + base + ".bin")
+            let c: RunResult = run_capture(hlc_bin(acc), [src, out_c])
+            let g: RunResult = run_capture("gcc",
+            ["-O2", "-o", out_b, out_c, "-lm", "-pthread"])
+            let _eb: bool = expect(acc, c.code == 0 && g.code == 0,
+            "native hlc + gcc build " + base
+            + " (the forward declaration conflicts with no included header)",
+            clip(c.combined, 120) + clip(g.combined, 120))
+            if c.code != 0 || g.code != 0 {
+                built_ok = false
+            }
+            si = si + 1
+        }
+        # The toupper ok test RUNS natively too — int ABI, no str
+        # marshalling on the boundary (the documented str-arg
+        # limitation stays out).
+        if built_ok {
+            let r: RunResult = run_capture(ok_bin, [])
+            let _er: bool = expect(acc, r.code == 0
+            && r.out == "byte: 65\nbyte2: 65\nclean: project/bin/tool.hls\n",
+            "the ok test's FFI source runs natively and matches the "
+            + "interpreter byte for byte",
+            "rc=" + r.code.to_str() + " " + clip(r.out, 160))
+        }
+    } else {
+        println("  [SKIP] bin/hlc not built — the native half of section 6 "
+        + "is skipped (the gate stays hermetic)")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 7. the tools
+# ----------------------------------------------------------------------------
+
+fn sec7(acc: Acc) -> void uses IO, Fs, Proc {
+    section("7. the tools")
+    let srcs: list[str] = [demo(), ok_test()]
+    let mut i: int = 0
+    while i < srcs.len() {
+        let src: str = srcs.get(i)
+        let base: str = basename(src)
+        let f1: str = scratch(acc, "fmt1_" + base)
+        let f2: str = scratch(acc, "fmt2_" + base)
+        let content: str = read_file(src)
+        write_file(f1, content)
+        write_file(f2, content)
+        # f1 is formatted once; f2 twice. Formatting must be a fixed
+        # point: once == twice.
+        let _r1: RunResult = run_capture("./bin/hlfmt", ["-w", f1])
+        let _r2: RunResult = run_capture("./bin/hlfmt", ["-w", f2])
+        let _r3: RunResult = run_capture("./bin/hlfmt", ["-w", f2])
+        let once: str = read_file(f1)
+        let twice: str = read_file(f2)
+        let _e: bool = expect(acc, once == twice,
+        "hlfmt: stable formatting on " + base, "")
+        i = i + 1
+    }
+    let l1: RunResult = pytool(acc, "tools/hllint.py", [demo()])
+    let l2: RunResult = pytool(acc, "tools/hllint.py", [ok_test()])
+    let _lint: bool = expect(acc, l1.code == 0 && l2.code == 0,
+    "hllint: no findings on the demo or the ok-test",
+    clip(l1.combined, 160) + clip(l2.combined, 160))
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let acc: Acc = acc_new("ffi_taint")
+    sec1(acc)
+    sec2(acc)
+    sec3(acc)
+    sec4(acc)
+    sec5(acc)
+    sec6(acc)
+    sec7(acc)
+    # the battery removed its scratch tree at exit; acc_new wipes it on
+    # the next run either way.
+    rmrf(acc.scratch_base)
+    return finish(acc,
+    "Stage 109 -- taint-tracking through FFI boundaries")
+}
