@@ -192,7 +192,7 @@ def _section_1():
     check(p.returncode == 2 and "unknown rule id: nosuch" in p.stdout,
           "an unknown --skip id is exit 2, named")
 
-    p = run(TOOL + [os.path.join(ROOT, "CHANGELOG.md")])
+    p = run(TOOL + [os.path.join(ROOT, "README.md")])
     check(p.returncode == 2 and "not a .hls file" in p.stdout,
           "a non-.hls file is exit 2, named")
 

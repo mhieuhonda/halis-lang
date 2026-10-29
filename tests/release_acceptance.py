@@ -47,13 +47,14 @@ release judged where it lands, at both legal states of the line:
                        the windows become the clock, the kit retires
                        on both laws, the line idempotent, a second
                        line refused;
-  5. the docs law   — the release speaks: the changelog's head
-     law               section is the v1.0.0 entry naming Stage 150,
-                       the roadmap's last row is ticked with the
-                       release wearing its own phrase, the README
-                       tour carries the gate and the clock, and
-                       LTS.md still matches its render — the promise
-                       and the clock are the same numbers;
+  5. the docs law   — the release speaks: the release record's
+     law               head section is the v1.0.0 entry naming the
+                       LTS release, the journey docs retired with
+                       the release (the roadmap and the changelog
+                       became RELEASES.md), the README carries the
+                       gate and the clock, and LTS.md still matches
+                       its render — the promise and the clock are
+                       the same numbers;
   6. the corpus     — tests/ok/feat_stage150_release.hls is hlfmt-
      showcase          canonical, hllint-clean, boots through the
                        real checker, runs green on the interpreter
@@ -194,10 +195,17 @@ def add_years(day, n):
 
 
 def head_version():
-    with open(os.path.join(ROOT, "CHANGELOG.md")) as f:
-        for line in f:
-            if line.startswith("## [v"):
-                return line[line.find("[v") + 2:line.find("]")]
+    """The head release of the tree's record — RELEASES.md since
+    v1.0.0 retired the changelog; the old CHANGELOG.md remains a
+    fallback so an eve-shaped tree still reads."""
+    for doc in ("RELEASES.md", "CHANGELOG.md"):
+        path = os.path.join(ROOT, doc)
+        if not os.path.isfile(path):
+            continue
+        with open(path) as f:
+            for line in f:
+                if line.startswith("## [v"):
+                    return line[line.find("[v") + 2:line.find("]")]
     return ""
 
 
@@ -296,36 +304,49 @@ def main():
               "of the line)")
         check(not has(ROOT, ".hls-lts.json") or state == "released",
               "the line declaration only exists after the release")
-        # the roadmap parses to exactly 150 rows, numbered 1..150 in
-        # order, the closed prefix contiguous
-        rows = roadmap_rows()
-        check(len(rows) == 150,
-              "the roadmap parses to exactly 150 stage rows (%d)"
-              % len(rows))
-        nums = [r["num"] for r in rows]
-        check(nums == list(range(1, 151)),
-              "the rows are numbered 1..150 in order")
-        closed = [r for r in rows if not r["open"]]
-        open_rows = [r for r in rows if r["open"]]
-        if state == "eve":
-            check(len(open_rows) == 1
-                  and open_rows[0]["num"] == 150,
-                  "the eve roadmap: 149 closed, the tail is Stage 150")
-            check(len(closed) == 149,
-                  "149 stages closed on the eve (%d)" % len(closed))
-        else:
-            check(len(open_rows) == 0,
-                  "the released roadmap: every stage ticked (nothing "
-                  "left to candidate for)")
-            check(len(closed) == 150,
-                  "150 stages closed (%d)" % len(closed))
-            row150 = rows[149]
-            check("LTS release" in row150["title"],
-                  "Stage 150's row keeps its own phrase (%s)"
-                  % row150["title"])
-            check("v1.0.0" in row150["effort"],
-                  "Stage 150's row names its release (%s)"
-                  % row150["effort"])
+        # the road retired with the release: the roadmap and the
+        # changelog left the tree, and RELEASES.md carries the record.
+        # On an eve-shaped tree the old documents still read.
+        if state == "released":
+            check(not has(ROOT, "ROADMAP.md"),
+                  "the roadmap retired with the release (the road is "
+                  "kept, the diary is not)")
+            check(not has(ROOT, "CHANGELOG.md"),
+                  "the changelog retired with the release (the record "
+                  "lives in RELEASES.md)")
+            check(has(ROOT, "RELEASES.md"),
+                  "the release record travels (RELEASES.md)")
+        if has(ROOT, "ROADMAP.md"):
+            # the stage table, parsed the way the kit reads it — 150
+            # rows numbered 1..150, the closed prefix contiguous
+            rows = roadmap_rows()
+            check(len(rows) == 150,
+                  "the roadmap parses to exactly 150 stage rows (%d)"
+                  % len(rows))
+            nums = [r["num"] for r in rows]
+            check(nums == list(range(1, 151)),
+                  "the rows are numbered 1..150 in order")
+            closed = [r for r in rows if not r["open"]]
+            open_rows = [r for r in rows if r["open"]]
+            if state == "eve":
+                check(len(open_rows) == 1
+                      and open_rows[0]["num"] == 150,
+                      "the eve roadmap: 149 closed, the tail is Stage 150")
+                check(len(closed) == 149,
+                      "149 stages closed on the eve (%d)" % len(closed))
+            else:
+                check(len(open_rows) == 0,
+                      "the released roadmap: every stage ticked (nothing "
+                      "left to candidate for)")
+                check(len(closed) == 150,
+                      "150 stages closed (%d)" % len(closed))
+                row150 = rows[149]
+                check("LTS release" in row150["title"],
+                      "Stage 150's row keeps its own phrase (%s)"
+                      % row150["title"])
+                check("v1.0.0" in row150["effort"],
+                      "Stage 150's row names its release (%s)"
+                      % row150["effort"])
         # the three markers speak with one voice
         head_v = head_version()
         man_v = json.load(open(os.path.join(
@@ -546,23 +567,23 @@ def main():
     header("5. the docs law — the release speaks where the road "
            "wrote")
     if state == "released":
-        with open(os.path.join(ROOT, "CHANGELOG.md")) as f:
+        with open(os.path.join(ROOT, "RELEASES.md")) as f:
             head_line = ""
             for line in f:
                 if line.startswith("## [v"):
                     head_line = line.strip()
                     break
         check("[v1.0.0]" in head_line
-              and "Stage 150" in head_line
               and "LTS release" in head_line,
-              "the changelog's head section is the release's own (%s)"
-              % head_line)
-        rows = roadmap_rows()
-        check("✅" in rows[149]["status"],
-              "the roadmap's last row is ticked")
-        check("HLS v1.0" in rows[149]["title"],
-              "the last row keeps the roadmap's own phrase (%s)"
-              % rows[149]["title"])
+              "the release record's head section is the release's "
+              "own (%s)" % head_line)
+        if has(ROOT, "ROADMAP.md"):
+            rows = roadmap_rows()
+            check("✅" in rows[149]["status"],
+                  "the roadmap's last row is ticked")
+            check("HLS v1.0" in rows[149]["title"],
+                  "the last row keeps the roadmap's own phrase (%s)"
+                  % rows[149]["title"])
         with open(os.path.join(ROOT, "README.md")) as f:
             readme = f.read()
         check("make release-acceptance" in readme,
@@ -573,7 +594,7 @@ def main():
               "the README speaks the line the release opened")
     else:
         check(head_version() == "1.0.0-rc.4",
-              "on the eve the changelog's head is still the "
+              "on the eve the record's head is still the "
               "candidate's")
         with open(os.path.join(ROOT, "README.md")) as f:
             readme = f.read()

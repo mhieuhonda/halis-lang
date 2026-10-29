@@ -293,7 +293,7 @@ def main():
         check(r.returncode == 0,
               "the gate over the live range names only BUGFIX and CHORE")
     head_v = ""
-    with open(os.path.join(ROOT, "CHANGELOG.md")) as f:
+    with open(os.path.join(ROOT, "RELEASES.md")) as f:
         for line in f:
             if line.startswith("## [v"):
                 # the tool's convention: the heading's version without

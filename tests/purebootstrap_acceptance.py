@@ -55,7 +55,8 @@ Nine sections:
   7. the provenance law   — the gate re-derives the import closure
                             with its OWN walker and demands it equal
                             the manifest's, the version pins the
-                            CHANGELOG head, the rounds are sane, and
+                            release record's head, the rounds are
+                            sane, and
                             the snapshot text carries no absolute
                             paths (the same C from any checkout dir)
   8. the self-host law    — the kit's own build is pure: bin/hlc
@@ -131,12 +132,13 @@ def sha256_file(path):
 def copy_tree(tag):
     """A disposable build tree: everything the pure lifecycle needs —
     Makefile + mk/ + src/ + core/ + std/ + snapshot/ + the kit +
-    CHANGELOG for the version law. Deliberately WITHOUT the
-    interpreter (tools/hlinterp/): the pure chain must not read it."""
+    the release record for the version law. Deliberately WITHOUT
+    the interpreter (tools/hlinterp/): the pure chain must not
+    read it."""
     dst = os.path.join(TMP, tag)
     os.makedirs(dst)
     shutil.copy2(os.path.join(ROOT, "Makefile"), dst)
-    shutil.copy2(os.path.join(ROOT, "CHANGELOG.md"), dst)
+    shutil.copy2(os.path.join(ROOT, "RELEASES.md"), dst)
     shutil.copytree(os.path.join(ROOT, "mk"), os.path.join(dst, "mk"))
     shutil.copytree(os.path.join(ROOT, "src"), os.path.join(dst, "src"))
     shutil.copytree(os.path.join(ROOT, "core"), os.path.join(dst, "core"))
@@ -331,7 +333,7 @@ else:
 # The version law: a new release heading refreshes the manifest ONLY.
 tree2b = copy_tree("t2b")
 sha_before = sha256_file(os.path.join(tree2b, "snapshot", "hlc.c"))
-chlog = os.path.join(tree2b, "CHANGELOG.md")
+chlog = os.path.join(tree2b, "RELEASES.md")
 head = open(chlog, "r", encoding="utf-8").read()
 open(chlog, "w", encoding="utf-8").write(
     "## [v9.9.9-alpha] — gate: a heading move\n\n" + head)
@@ -432,7 +434,7 @@ else:
 # history's manifests stay diff-able across the kit boundary.
 tree5d = copy_tree("t5d")
 man_before = open(os.path.join(tree5d, "snapshot", "MANIFEST.json")).read()
-chlog = os.path.join(tree5d, "CHANGELOG.md")
+chlog = os.path.join(tree5d, "RELEASES.md")
 head = open(chlog, "r", encoding="utf-8").read()
 open(chlog, "w", encoding="utf-8").write(
     "## [v9.8.7-alpha] — gate: interchange\n\n" + head)
@@ -512,15 +514,15 @@ else:
         % (len(man["closure"]), len(gate_closure)))
 
 head_ver = None
-for line in open(os.path.join(ROOT, "CHANGELOG.md"), encoding="utf-8"):
+for line in open(os.path.join(ROOT, "RELEASES.md"), encoding="utf-8"):
     m = re.match(r"^## \[(v[0-9][^\]\s]*)\]", line)
     if m:
         head_ver = m.group(1)
         break
 if head_ver and man["version"] == head_ver:
-    ok("the manifest pins the CHANGELOG head release (%s)" % head_ver)
+    ok("the manifest pins the RELEASES.md head release (%s)" % head_ver)
 else:
-    bad("the manifest version %s != CHANGELOG head %s"
+    bad("the manifest version %s != RELEASES.md head %s"
         % (man.get("version"), head_ver))
 
 if 1 <= int(man.get("rounds", 0)) <= 8:

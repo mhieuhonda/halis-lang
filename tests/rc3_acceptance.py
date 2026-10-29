@@ -375,7 +375,7 @@ def main():
               "the committed record matches the render (drift refused)")
 
     head_v = ""
-    with open(os.path.join(ROOT, "CHANGELOG.md")) as f:
+    with open(os.path.join(ROOT, "RELEASES.md")) as f:
         for line in f:
             if line.startswith("## [v"):
                 head_v = line[line.find("[v") + 2:line.find("]")]
