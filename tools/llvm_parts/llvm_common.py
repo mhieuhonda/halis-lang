@@ -42,8 +42,7 @@ Design:
 Constructs that the alpha backend does not support yet — struct literals,
 struct field access, enum literals, `match`, `?`, and calls to USER-DEFINED
 struct methods — raise a clean HLError ("not yet supported by --emit llvm")
-instead of silently emitting invalid IR. See ROADMAP.md "Remaining work for
-Stage 12".
+instead of silently emitting invalid IR. See SPEC.md §21.4 "Limitations".
 
 Multi-target support:
   - The default target is the host triple (queried from `llvm-config`).
@@ -376,12 +375,12 @@ def _taint_inner(t: str) -> str:
 
 def _unsupported(what: str, node: Dict):
     """Raise a clean compile error for constructs the alpha LLVM backend
-    does not support yet (ROADMAP Stage 12 'Remaining work'). Silently
+    does not support yet (SPEC.md §21.4 "Limitations"). Silently
     emitting invalid IR is worse than a clear error."""
     line = node.get("line", 0) if isinstance(node, dict) else 0
     raise HLError(
-        "%s is not yet supported by --emit llvm (Stage 12-alpha subset; "
-        "see ROADMAP.md 'Remaining work for Stage 12'). The C backend "
+        "%s is not yet supported by --emit llvm (alpha subset; "
+        "see SPEC.md section 21.4 'Limitations'). The C backend "
         "(-C / hlc.hls) supports it." % what, line, 0)
 
 

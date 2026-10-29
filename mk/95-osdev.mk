@@ -165,7 +165,7 @@ link-acceptance: $(BIN)/acc-link
 # ============================================================================
 # These stages give the LANGUAGE the capabilities OS developers need.
 # The Halis project itself does not write an OS; these features let
-# users do so (ROADMAP.md "STAGES 77-96").
+# users do so (the OS-development foundation, SPEC.md sections 31-44).
 #
 # Stage 77 (v0.96.0-alpha): `#![freestanding]` mode (no libc, no OS
 # calls, std disabled, entry `_start`).
@@ -227,7 +227,7 @@ link-acceptance: $(BIN)/acc-link
 # without threads — see SPEC section 44.
 # ============================================================================
 
-# Stage 93 (v0.112.0-alpha): the bare-metal triples — roadmap rows
+# The bare-metal triples — the OS-development rows
 # 93-95 (`target x86_64-unknown-none`, `target aarch64-unknown-none`,
 # `target riscv64-unknown-none`). The compiler takes `--target TRIPLE`
 # (implies #![freestanding], enforces the integer-only discipline),
