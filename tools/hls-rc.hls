@@ -53,6 +53,20 @@
 #                 readiness, and --check re-derives the committed copy
 #                 and refuses drift, naming the regenerate command.
 #
+#   signoff    — the LAST approval (Stage 149, v1.0.0-rc.4): the
+#                 candidate's signature, written into the anchor. The
+#                 signer is NAMED (--by, fail-closed — an anonymous
+#                 approval is not a signature), the tree must be green
+#                 AT THE SIGNING MOMENT (readiness re-derived, the
+#                 freeze gate re-derived over the live range, the
+#                 tracked tree clean beyond the anchor itself), and
+#                 one signature per candidate — a signature is not
+#                 overwritten. `signoff --check` RE-DERIVES the
+#                 verdict at every gate: an unsigned candidate says
+#                 so, a signature whose laws turned red is refused,
+#                 and the record must still speak the anchored state.
+#                 The signature is not archived; it is re-earned.
+#
 # The freeze DIGEST's arithmetic stays in the tool that owns it
 # (hls-freeze re-derives the surface live; `make freeze-verify`).
 # This kit pins the document's IDENTITY — its fields, its commit's
@@ -63,6 +77,7 @@
 #   bin/hls-rc declare --tag v1.0.0-rc.1 [--at DAY] [--root DIR]
 #   bin/hls-rc gate [--range A..B] [--json] [--root DIR]
 #   bin/hls-rc report [--out RC.md | --check] [--root DIR]
+#   bin/hls-rc signoff --by NAME [--at DAY] [--check] [--root DIR]
 #
 # Exit codes: 0 the law held; 1 a named refusal; 2 usage error.
 # Every refusal names the RULE, not just the fact.
@@ -1826,18 +1841,25 @@ struct Anchor {
     stage: int,
     freeze_digest: str,
     next: str,
+    so_by: str,
+    so_day: str,
     detail: str
 }
 
 fn bad_anchor(detail: str) -> Anchor {
     return Anchor {
         present: false, tag: "", sha: "", day: "", stage: 0,
-        freeze_digest: "", next: "", detail: detail
+        freeze_digest: "", next: "", so_by: "", so_day: "",
+        detail: detail
     }
 }
 
 # load_anchor(root) — the anchor parsed; absent is a normal state
-# (present: false, detail names it).
+# (present: false, detail names it). The signoff object (Stage 149) is
+# optional; a signature that names no signer or no day is a CORRUPT
+# signature, and a corrupt signature is not a signature — the anchor
+# refuses to load rather than let a broken approval pass for a live
+# one.
 fn load_anchor(root: str) -> Anchor uses Fs {
     let path: str = path_join2(root, anchor_file())
     if !file_exists(path) {
@@ -1883,21 +1905,45 @@ fn load_anchor(root: str) -> Anchor uses Fs {
     && json_object_get(data, "next").kind == "str" {
         next = json_str_value(json_object_get(data, "next"))
     }
+    let mut so_by: str = ""
+    let mut so_day: str = ""
+    if json_object_has(data, "signoff") {
+        let so: JsonValue = json_object_get(data, "signoff")
+        if so.kind == "object" {
+            if json_object_has(so, "by")
+            && json_object_get(so, "by").kind == "str" {
+                so_by = json_str_value(json_object_get(so, "by"))
+            }
+            if json_object_has(so, "day")
+            && json_object_get(so, "day").kind == "str" {
+                so_day = json_str_value(json_object_get(so, "day"))
+            }
+        }
+        if so_by.len() == 0 || !parse_day(so_day).ok {
+            return bad_anchor(anchor_file() + " carries a signoff that "
+            + "names no signer or no day — a broken approval is not "
+            + "a signature")
+        }
+    }
     if tag.len() == 0 || sha.len() != 40 || day.len() != 10 {
         return bad_anchor(anchor_file() + " is missing its tag, sha or "
         + "day — the anchor cannot name the candidate")
     }
     return Anchor {
         present: true, tag: tag, sha: sha, day: day, stage: stage,
-        freeze_digest: digest, next: next,
+        freeze_digest: digest, next: next, so_by: so_by,
+        so_day: so_day,
         detail: "the candidate " + tag + " anchored at " + sha
     }
 }
 
 # write_anchor(root, ...) — the anchor file, rendered with a fixed
 # field order (the file is committed; its bytes are the release's).
+# The signoff object (Stage 149) rides between sha and stage —
+# alphabetical, like every other field — and only when the signature
+# exists: an unsigned anchor renders exactly the bytes declare wrote.
 fn write_anchor(root: str, tag: str, sha: str, day: str, stage: int,
-freeze_digest: str, next: str) -> void uses Fs {
+freeze_digest: str, next: str, so_by: str, so_day: str) -> void uses Fs {
     let mut out: str = "{\n"
     out = out + "  \"day\": " + json_quote(day) + ",\n"
     out = out + "  \"freeze_digest\": " + json_quote(freeze_digest)
@@ -1905,6 +1951,12 @@ freeze_digest: str, next: str) -> void uses Fs {
     out = out + "  \"kit\": " + json_quote(kit_version()) + ",\n"
     out = out + "  \"next\": " + json_quote(next) + ",\n"
     out = out + "  \"sha\": " + json_quote(sha) + ",\n"
+    if so_by.len() > 0 {
+        out = out + "  \"signoff\": {\n"
+        out = out + "    \"by\": " + json_quote(so_by) + ",\n"
+        out = out + "    \"day\": " + json_quote(so_day) + "\n"
+        out = out + "  },\n"
+    }
     out = out + "  \"stage\": " + stage.to_str() + ",\n"
     out = out + "  \"tag\": " + json_quote(tag) + "\n"
     out = out + "}\n"
@@ -2185,7 +2237,7 @@ fn cmd_declare(argv: list[str]) -> int uses IO, Fs, Proc {
         next = "v1.0.0-rc." + (rt.n + 1).to_str()
     }
     write_anchor(root, tag, sha, day_iso(day), rt.stage, fz.digest,
-    next)
+    next, "", "")
     println("declare: " + tag + " anchored — Stage "
     + rt.stage.to_str() + " closes with this candidate")
     println("  commit: " + sha)
@@ -2204,8 +2256,52 @@ fn tree_word() -> str {
 
 # ----------------------------------------------------------------------------
 # gate — the feature-freeze law: every commit in the range classified,
-# violations named sha by sha.
+# violations named sha by sha. The walk itself is shared with the
+# signoff (Stage 149): the signature stands on the same gate.
 # ----------------------------------------------------------------------------
+
+struct GateWalk {
+    total: int,
+    fixes: int,
+    chores: int,
+    marked: int,
+    violations: list[str]
+}
+
+# gate_walk(root, base, head) — the freeze judged over a range; the
+# violations collected as rendered blocks (two lines each), the counts
+# riding beside them.
+fn gate_walk(root: str, base: str, head: str) -> GateWalk uses Proc {
+    let shas: list[str] = commits(root, base, head)
+    let mut w: GateWalk = GateWalk {
+        total: shas.len(), fixes: 0, chores: 0, marked: 0,
+        violations: []
+    }
+    let mut i: int = 0
+    while i < shas.len() {
+        let c: Cls = classify_commit(root, shas.get(i))
+        if c.cls == "BUGFIX" {
+            w.fixes = w.fixes + 1
+            if c.security {
+                w.marked = w.marked + 1
+            }
+        } else if c.cls == "CHORE" {
+            w.chores = w.chores + 1
+        } else {
+            let mut why: str = c.reason
+            let mut k: int = 1
+            while k < c.reasons.len() {
+                why = why + "; " + c.reasons.get(k)
+                k = k + 1
+            }
+            w.violations.push("  VIOLATION: " + safe_prefix(c.sha, 12)
+            + " " + c.subject + "\n    " + c.cls + ": " + why)
+        }
+        i = i + 1
+    }
+    return w
+}
+
 fn cmd_gate(argv: list[str]) -> int uses IO, Fs, Proc {
     let root: str = root_arg(argv)
     let range: str = flag_value(argv, "--range", "")
@@ -2239,37 +2335,14 @@ fn cmd_gate(argv: list[str]) -> int uses IO, Fs, Proc {
         }
     }
 
-    let shas: list[str] = commits(root, base, head)
-    let mut fixes: int = 0
-    let mut chores: int = 0
-    let mut marked: int = 0
-    let mut violations: int = 0
-    let mut i: int = 0
-    while i < shas.len() {
-        let c: Cls = classify_commit(root, shas.get(i))
-        if c.cls == "BUGFIX" {
-            fixes = fixes + 1
-            if c.security {
-                marked = marked + 1
-            }
-        } else if c.cls == "CHORE" {
-            chores = chores + 1
-        } else {
-            violations = violations + 1
-            let mut why: str = c.reason
-            let mut k: int = 1
-            while k < c.reasons.len() {
-                why = why + "; " + c.reasons.get(k)
-                k = k + 1
-            }
-            println("  VIOLATION: " + safe_prefix(c.sha, 12) + " "
-            + c.subject)
-            println("    " + c.cls + ": " + why)
+    let w: GateWalk = gate_walk(root, base, head)
+    if w.violations.len() > 0 {
+        let mut i: int = 0
+        while i < w.violations.len() {
+            println(w.violations.get(i))
+            i = i + 1
         }
-        i = i + 1
-    }
-    if violations > 0 {
-        println("gate: REFUSED — " + violations.to_str()
+        println("gate: REFUSED — " + w.violations.len().to_str()
         + " commit(s) outside the freeze between "
         + safe_prefix(base, 12) + " and " + head)
         println("  the candidate line takes BUGFIX and CHORE only; "
@@ -2277,10 +2350,10 @@ fn cmd_gate(argv: list[str]) -> int uses IO, Fs, Proc {
         + "past the freeze is a roadmap amendment, not a commit)")
         return 1
     }
-    println("gate: " + shas.len().to_str() + " commit(s) since "
+    println("gate: " + w.total.to_str() + " commit(s) since "
     + safe_prefix(base, 12) + ", all inside the freeze (BUGFIX "
-    + fixes.to_str() + ", CHORE " + chores.to_str()
-    + ", Security-marked " + marked.to_str() + ")")
+    + w.fixes.to_str() + ", CHORE " + w.chores.to_str()
+    + ", Security-marked " + w.marked.to_str() + ")")
     return 0
 }
 
@@ -2349,6 +2422,15 @@ fn render_report(root: str) -> str uses Fs, Proc {
         out.push("- the successor: " + anchor.next + " — the next step of "
         + "the road below, cut the same way this one was: the roadmap "
         + "row ticked, the markers agreeing, the gate green")
+    }
+    # the sign-off (Stage 149): the record speaks the signature only
+    # when the candidate carries one — an unsigned record never claims
+    # an approval it does not have.
+    if anchor.so_by.len() > 0 {
+        out.push("- the sign-off: **" + anchor.so_by + "**, "
+        + anchor.so_day + " — the candidate carries its signer's "
+        + "approval; `bin/hls-rc signoff --check` re-derives it at "
+        + "every gate")
     }
     out.push("")
     out.push("## The readiness the tag stands on")
@@ -2486,6 +2568,295 @@ fn cmd_report(argv: list[str]) -> int uses IO, Fs, Proc {
 }
 
 # ============================================================================
+# signoff — the LAST approval (Stage 149, v1.0.0-rc.4). The signing
+# act writes the signature INTO the anchor; the check re-derives it.
+# A signature is not archived, it is re-earned: every law it stood on
+# is judged again, on the tree that stands here now.
+# ============================================================================
+
+# dirty_tracked(root) — every tracked path carrying uncommitted
+# changes (untracked files never block a signing — the anchor itself
+# is written after declare and is untracked until the release commit;
+# the anchor path is exempt — the signing writes exactly it and
+# nothing else).
+fn dirty_tracked(root: str) -> list[str] uses Proc {
+    let p: GitOut = git_run(root, ["status", "--porcelain", "-uno"])
+    let out: list[str] = []
+    let lines: list[str] = p.out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = strip_ends(lines.get(i))
+        if line.len() > 3 {
+            let path: str = line.slice(3, line.len())
+            if path != anchor_file() {
+                out.push(path)
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# signoff_check_laws(root, anchor) — the verdict the signature stands
+# on, re-derived: the signature itself, the six readiness laws, the
+# freeze gate over the live range, the record still speaking the
+# anchored state.
+fn signoff_check_laws(root: str, anchor: Anchor) -> list[Law]
+uses Fs, Proc {
+    let laws: list[Law] = []
+
+    # 1. the signature law
+    if anchor.so_by.len() > 0 {
+        laws.push(Law {
+            name: "the signature law",
+            ok: true,
+            detail: "the candidate carries " + anchor.so_by
+            + "'s signature, cut " + anchor.so_day
+        })
+    } else {
+        laws.push(Law {
+            name: "the signature law",
+            ok: false,
+            detail: "no signature in the anchor — the candidate is "
+            + "unsigned (bin/hls-rc signoff --by NAME)"
+        })
+    }
+
+    # 2..7. the readiness laws, re-derived now
+    let r: Readiness = check_readiness(root)
+    let mut i: int = 0
+    while i < r.laws.len() {
+        laws.push(r.laws.get(i))
+        i = i + 1
+    }
+
+    # 8. the gate law — the freeze over anchor..HEAD, judged now
+    let w: GateWalk = gate_walk(root, anchor.sha, "HEAD")
+    if w.violations.len() == 0 {
+        laws.push(Law {
+            name: "the gate law",
+            ok: true,
+            detail: w.total.to_str() + " commit(s) since "
+            + safe_prefix(anchor.sha, 12) + ", all inside the freeze "
+            + "(BUGFIX " + w.fixes.to_str() + ", CHORE "
+            + w.chores.to_str() + ", Security-marked "
+            + w.marked.to_str() + ")"
+        })
+    } else {
+        laws.push(Law {
+            name: "the gate law",
+            ok: false,
+            detail: w.violations.len().to_str() + " commit(s) outside "
+            + "the freeze since " + safe_prefix(anchor.sha, 12)
+            + " — the signature does not cover them"
+        })
+    }
+
+    # 9. the record law — the committed record still speaks the
+    #     anchored state (the signature included, when it exists)
+    let rec_path: str = path_join2(root, rc_doc())
+    if !file_exists(rec_path) {
+        laws.push(Law {
+            name: "the record law",
+            ok: false,
+            detail: rc_doc() + " is not published here — the record "
+            + "is missing (regenerate with `bin/hls-rc report --out "
+            + rc_doc() + "`)"
+        })
+    } else if read_file(rec_path) != render_report(root) {
+        laws.push(Law {
+            name: "the record law",
+            ok: false,
+            detail: "the committed " + rc_doc() + " drifted from the "
+            + "render — the record must speak the anchored state "
+            + "(regenerate with `bin/hls-rc report --out "
+            + rc_doc() + "`)"
+        })
+    } else {
+        laws.push(Law {
+            name: "the record law",
+            ok: true,
+            detail: rc_doc() + " matches the render — the published "
+            + "record speaks this candidate's state"
+        })
+    }
+    return laws
+}
+
+fn cmd_signoff(argv: list[str]) -> int uses IO, Fs, Proc {
+    let root: str = root_arg(argv)
+    if has_flag(argv, "--check") {
+        return cmd_signoff_check(argv, root)
+    }
+
+    # the name law — a signature names its signer (fail-closed: a
+    # blank name is no name)
+    let who: str = strip_ends(flag_value(argv, "--by", ""))
+    if who.len() == 0 {
+        eprintln(usage_text())
+        eprintln("hls-rc: error: --by NAME is required — a signature "
+        + "names its signer; an anonymous approval is not a signature")
+        return 2
+    }
+
+    # the anchor law — the signature judges a cut candidate
+    let anchor: Anchor = load_anchor(root)
+    if !anchor.present {
+        return die("signoff: no anchor in this tree — the signature "
+        + "judges a candidate; cut one first (bin/hls-rc declare "
+        + "--tag v1.0.0-rc.N)")
+    }
+
+    # the once law — one signature per candidate; a signature is not
+    # overwritten (a re-cut candidate is a new signature, not a new
+    # stroke of the old one)
+    if anchor.so_by.len() > 0 {
+        return die("signoff: " + anchor.tag + " is already signed off "
+        + "by " + anchor.so_by + " (" + anchor.so_day + ") — one "
+        + "signature per candidate")
+    }
+
+    # the tree law — the tracked tree is clean beyond the anchor
+    # itself; a signature judges a committed state, not a workbench
+    let dirty: list[str] = dirty_tracked(root)
+    if dirty.len() > 0 {
+        let mut named: str = dirty.get(0)
+        let mut di: int = 1
+        while di < dirty.len() && di < 3 {
+            named = named + ", " + dirty.get(di)
+            di = di + 1
+        }
+        return die("signoff: the tracked tree is dirty beyond the "
+        + "anchor (" + named + ") — commit or stash; a signature "
+        + "judges a committed tree")
+    }
+
+    # the green law — readiness, re-derived at the signing moment
+    let r: Readiness = check_readiness(root)
+    let mut i: int = 0
+    let mut failed: bool = false
+    while i < r.laws.len() {
+        if !r.laws.get(i).ok {
+            failed = true
+            eprintln("hls-rc: NOT READY: " + r.laws.get(i).name + " — "
+            + r.laws.get(i).detail)
+        }
+        i = i + 1
+    }
+    if failed {
+        return die("signoff: the readiness laws above refuse the "
+        + "signature — a signature only lands on a green tree")
+    }
+
+    # the gate law — the freeze over anchor..HEAD, re-derived
+    let w: GateWalk = gate_walk(root, anchor.sha, "HEAD")
+    if w.violations.len() > 0 {
+        i = 0
+        while i < w.violations.len() {
+            println(w.violations.get(i))
+            i = i + 1
+        }
+        return die("signoff: the freeze gate refuses — the signature "
+        + "does not cover commits outside the freeze")
+    }
+
+    # the day — the committer day of HEAD, or --at pins it
+    let head: str = head_sha(root)
+    let day: Day = resolve_at(argv, root, head)
+    if !day.ok {
+        return die("signoff: the judged day is unreadable — pass "
+        + "--at YYYY-MM-DD or let the commit's committer day speak")
+    }
+    write_anchor(root, anchor.tag, anchor.sha, anchor.day,
+    anchor.stage, anchor.freeze_digest, anchor.next, who,
+    day_iso(day))
+    println("signoff: " + anchor.tag + " signed off by " + who
+    + " — the candidate carries its last approval")
+    println("  day:    " + day_iso(day) + " (the committer day; --at "
+    + "pins it)")
+    println("  commit: " + anchor.sha + " (the anchored candidate)")
+    println("re-render the record so it speaks the signature (`bin/"
+    + "hls-rc report --out " + rc_doc() + "`), then commit the anchor")
+    return 0
+}
+
+fn cmd_signoff_check(argv: list[str], root: str) -> int uses IO, Fs,
+Proc {
+    let anchor: Anchor = load_anchor(root)
+    if !anchor.present {
+        return die("signoff: no anchor in this tree — the check "
+        + "judges a cut candidate (bin/hls-rc declare --tag "
+        + "v1.0.0-rc.N)")
+    }
+    let laws: list[Law] = signoff_check_laws(root, anchor)
+    let mut all_ok: bool = true
+    let mut i: int = 0
+    while i < laws.len() {
+        if !laws.get(i).ok {
+            all_ok = false
+        }
+        i = i + 1
+    }
+    if has_flag(argv, "--json") {
+        let mut out: str = "{\"signed\": "
+        if anchor.so_by.len() > 0 {
+            out = out + "true"
+        } else {
+            out = out + "false"
+        }
+        out = out + ", \"tag\": " + json_quote(anchor.tag)
+        out = out + ", \"by\": " + json_quote(anchor.so_by)
+        out = out + ", \"day\": " + json_quote(anchor.so_day)
+        if all_ok {
+            out = out + ", \"ok\": true"
+        } else {
+            out = out + ", \"ok\": false"
+        }
+        out = out + ", \"laws\": ["
+        i = 0
+        while i < laws.len() {
+            let l: Law = laws.get(i)
+            if i > 0 {
+                out = out + ", "
+            }
+            out = out + "{\"law\": " + json_quote(l.name)
+            if l.ok {
+                out = out + ", \"ok\": true"
+            } else {
+                out = out + ", \"ok\": false"
+            }
+            out = out + ", \"detail\": " + json_quote(l.detail) + "}"
+            i = i + 1
+        }
+        out = out + "]}"
+        println(out)
+        if all_ok {
+            return 0
+        }
+        return 1
+    }
+    i = 0
+    while i < laws.len() {
+        let l: Law = laws.get(i)
+        if l.ok {
+            println("  ok: " + l.name + " — " + l.detail)
+        } else {
+            println("  REFUSED: " + l.name + " — " + l.detail)
+        }
+        i = i + 1
+    }
+    if all_ok {
+        println("signoff: the candidate " + anchor.tag
+        + " is signed off by " + anchor.so_by + " (" + anchor.so_day
+        + ") — every law re-derived green")
+        return 0
+    }
+    println("signoff: REFUSED — the laws above name what the "
+    + "signature no longer stands on")
+    return 1
+}
+
+# ============================================================================
 # Usage and dispatch.
 # ============================================================================
 
@@ -2493,7 +2864,8 @@ fn usage_text() -> str {
     return "usage: hls-rc readiness [--json] [--root DIR]\n"
     + "       hls-rc declare --tag v1.0.0-rc.N [--at DAY] [--root DIR]\n"
     + "       hls-rc gate [--range A..B] [--json] [--root DIR]\n"
-    + "       hls-rc report [--out RC.md | --check] [--root DIR]"
+    + "       hls-rc report [--out RC.md | --check] [--root DIR]\n"
+    + "       hls-rc signoff --by NAME [--at DAY] [--check] [--root DIR]"
 }
 
 fn known_flag(cmd: str, f: str) -> bool {
@@ -2509,6 +2881,9 @@ fn known_flag(cmd: str, f: str) -> bool {
     if cmd == "report" {
         return f == "--out" || f == "--check"
     }
+    if cmd == "signoff" {
+        return f == "--by" || f == "--at" || f == "--check"
+    }
     # fail-closed: a flag a command does not name is not known
     return false
 }
@@ -2522,7 +2897,7 @@ fn main() -> int uses IO, Fs, Proc, Args {
     let cmd: str = argv.get(1)
     # the argparse law: unknown flags are usage errors (exit 2)
     let value_flags: list[str] = ["--root", "--tag", "--at", "--out",
-    "--range"]
+    "--range", "--by"]
     let mut ai: int = 2
     while ai < argv.len() {
         let a: str = argv.get(ai)
@@ -2562,6 +2937,9 @@ fn main() -> int uses IO, Fs, Proc, Args {
     }
     if cmd == "report" {
         return cmd_report(argv)
+    }
+    if cmd == "signoff" {
+        return cmd_signoff(argv)
     }
     usage_error("unknown command " + cmd)
     return 2
