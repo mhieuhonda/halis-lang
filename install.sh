@@ -503,25 +503,46 @@ chmod 0755 "$STAGE_DIR/bin/"* || die "could not set the modes under bin/"
 
 # The uninstall record: every path this install creates, judged
 # before it is ever acted on. Removing an install touches nothing
-# else — not the prefix, not anything sharing it.
+# else — not the prefix, not anything sharing it. The record names
+# exactly what landed in bin/: the launcher or the bare binary (never
+# both), and the formatter under the name it carries on this OS.
 {
     printf '%s\n' "$SDK_ROOT"
-    printf '%s\n' "$PREFIX/bin/hlc"
-    printf '%s\n' "$PREFIX/bin/hlfmt"
-    if [ -n "$EXE" ]; then
-        printf '%s\n' "$PREFIX/bin/hlc.exe"
-        printf '%s\n' "$PREFIX/bin/hlfmt.exe"
+    if [ "$NO_WRAPPER" = 1 ]; then
+        printf '%s\n' "$PREFIX/bin/hlc$EXE"
+    else
+        printf '%s\n' "$PREFIX/bin/hlc"
     fi
+    printf '%s\n' "$PREFIX/bin/hlfmt$EXE"
 } > "$STAGE_DIR/.manifest"
 
 # A courtesy word before anything is replaced: a file on the way out
-# that no recorded install put there.
-for f in "$PREFIX/bin/hlc" "$PREFIX/bin/hlfmt"; do
+# that no recorded install put there. Both spellings of the compiler
+# are checked so a Windows upgrade (launcher in, hlc.exe out) is
+# named too — a path that does not exist says nothing.
+for f in "$PREFIX/bin/hlc" "$PREFIX/bin/hlc$EXE" "$PREFIX/bin/hlfmt$EXE"; do
     if [ -e "$f" ] \
        && { [ ! -f "$SDK_ROOT/.manifest" ] || ! grep -qxF "$f" "$SDK_ROOT/.manifest"; }; then
         warn "$f exists but no recorded Halis install put it there — it will be replaced"
     fi
 done
+
+# An upgrade that switches the compiler's spelling on Windows — the
+# launcher in, the bare hlc.exe out, or the reverse — removes the one
+# this install does not place, but only when the previous install's
+# own record claims the path. A file nobody recorded is never touched.
+if [ -n "$EXE" ]; then
+    if [ "$NO_WRAPPER" = 1 ]; then
+        OPPOSITE=$PREFIX/bin/hlc
+    else
+        OPPOSITE=$PREFIX/bin/hlc.exe
+    fi
+    if [ -e "$OPPOSITE" ] && [ -f "$SDK_ROOT/.manifest" ] \
+       && grep -qxF "$OPPOSITE" "$SDK_ROOT/.manifest"; then
+        rm -f "$OPPOSITE"
+        note "removed $OPPOSITE — it belonged to the previous install, and this one installs the other spelling"
+    fi
+fi
 
 # The swap: stage first, rename second — a failed install never
 # touches a working one, and the window is one rename wide.
@@ -706,9 +727,9 @@ grep -q 'int main' "$SMOKE/smoke.c" \
 
 # The formatter, twice: once to format, once to prove the output is
 # a fixed point — the formatter's own law, checked on the install.
-"$PREFIX/bin/hlfmt" "$SMOKE/smoke.hls" > "$SMOKE/smoke.fmt.hls" \
+"$PREFIX/bin/hlfmt$EXE" "$SMOKE/smoke.hls" > "$SMOKE/smoke.fmt.hls" \
     || die "the installed formatter does not run"
-"$PREFIX/bin/hlfmt" "$SMOKE/smoke.fmt.hls" > "$SMOKE/smoke.fmt2.hls" \
+"$PREFIX/bin/hlfmt$EXE" "$SMOKE/smoke.fmt.hls" > "$SMOKE/smoke.fmt2.hls" \
     || die "the formatter refused its own output — report this"
 cmp -s "$SMOKE/smoke.fmt.hls" "$SMOKE/smoke.fmt2.hls" \
     || die "the formatter is not idempotent over its own output — report this"
