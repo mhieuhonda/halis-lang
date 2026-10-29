@@ -230,9 +230,9 @@ serve:
 # real HTTP server (overlay / SPA fallback / public dir / source /
 # banner / gzip), and a real WebSocket handshake that round-trips the
 # hello JSON frame.
-serve-acceptance:
-	@echo "[Stage 75 acceptance] running tests/serve_acceptance.py..."
-	@$(PYTHON) tests/serve_acceptance.py
+serve-acceptance: $(BIN)/acc-serve
+	@echo "[Stage 75 acceptance] running tests/acc/serve_acceptance.hls..."
+	@$(BIN)/acc-serve
 	@echo "ACCEPTANCE OK: Stage 75 -- hls-serve (webpack-dev-server equivalent)"
 
 .PHONY: wasm-opt webapp webapp-acceptance serve serve-acceptance
@@ -348,9 +348,9 @@ wasm-pack-pack:
 # npm name/semver validation, source scan, TS mapping, bundler
 # build, all five targets, tarball pack + traversal defence, check
 # on good/broken pkgs, publish dry-run + scaffolding.
-wasm-pack-acceptance:
-	@echo "[Stage 76 acceptance] running tests/wasm_pack_acceptance.py..."
-	@$(PYTHON) tests/wasm_pack_acceptance.py
+wasm-pack-acceptance: $(BIN)/acc-wasm_pack
+	@echo "[Stage 76 acceptance] running tests/acc/wasm_pack_acceptance.hls..."
+	@$(BIN)/acc-wasm_pack
 	@echo "ACCEPTANCE OK: Stage 76 -- hls-wasm-pack (publish-ready wasm + JS glue)"
 
 .PHONY: wasm-pack wasm-pack-check wasm-pack-pack wasm-pack-acceptance

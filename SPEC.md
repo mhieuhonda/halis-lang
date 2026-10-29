@@ -6727,7 +6727,7 @@ can gate on the same fields the human report prints.
 
 `make supply F=<entry>` / `make supply-pkg D=<dir>` run the tool;
 `make supply-acceptance` runs the eight-section gate
-(`tests/audit_acceptance.py`, 71 checks):
+(`tests/acc/audit_acceptance.hls`, 71 checks):
 
 - **the engine** — the demo's report pinned line for line: the
   module census (4 modules — 1 toolchain, 3 workspace), the
@@ -6891,7 +6891,7 @@ documents' own hashes for CI consumption.
 
 `make sbom F=<entry>` / `make sbom-pkg D=<dir>` /
 `make sbom-release D=<dir>` run the tool; `make sbom-acceptance`
-runs the eight-section gate (`tests/sbom_acceptance.py`, 69 checks):
+runs the eight-section gate (`tests/acc/sbom_acceptance.hls`, 69 checks):
 
 - **the engine** — the demo's CycloneDX document pinned: bomFormat,
   specVersion 1.5, the content-derived serial, the metadata
@@ -7061,7 +7061,7 @@ refused verify; 2 for usage errors (no mode, several modes,
 `make repro-pkg D=<dir>` / `make repro-release D=<dir>` /
 `make repro-verify BINFO=<file> [IN=<root>]` run the tool;
 `make repro-acceptance` runs the nine-section gate
-(`tests/repro_acceptance.py`, 57 checks):
+(`tests/acc/repro_acceptance.hls`, 57 checks):
 
 - **the recipe** — two profiles, byte-identical C and binary, the
   buildinfo pinned field by field, the written file equal to the
@@ -7234,7 +7234,7 @@ prints the machine report.
 `make sign-release D=<dir> [OUT=...]` /
 `make sign-verify-release D=<dir> [PUB=...]` /
 `make sign-selftest` run the tool; `make sign-acceptance` runs the
-nine-section gate (`tests/signed_acceptance.py`, 68 checks):
+nine-section gate (`tests/acc/signed_acceptance.hls`, 68 checks):
 
 - **the primitives** — the RFC 8032 vectors with the exact signature
   bytes, determinism pinned, the RFC 8439 vectors through the
@@ -7557,7 +7557,7 @@ table and the seed mapping.
 `make reverify F=...` / `reverify-json F=...` / `reverify-lto F=...`
 / `reverify-report F=... OUT=...` / `reverify-selftest` /
 `reverify-acceptance` run the pipeline. The acceptance gate
-(`tests/reverify_acceptance.py`, nine sections, 44 checks):
+(`tests/acc/reverify_acceptance.hls`, nine sections, 44 checks):
 
 - **the one definition** — the replay's arithmetic IS `boot.proof`'s
   (function-identity pins); the certificate whitelist is pinned; the
@@ -7707,7 +7707,7 @@ the report is the map.
 ### 63.5. The gate
 
 `make ffi-taint F=...` prints the report; `ffi-taint-acceptance` runs
-`tests/ffi_taint_acceptance.py` (seven sections, 42 checks): the
+`tests/acc/ffi_taint_acceptance.hls` (seven sections, 42 checks): the
 parser batteries (the placement rule, the mini-grammar refusals), the
 checker rules (the wrap, the sink diagnostic, the void-source and
 unknown-name refusals, the blanket Stage 15 rule intact), the

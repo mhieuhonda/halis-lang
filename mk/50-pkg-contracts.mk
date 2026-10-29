@@ -130,40 +130,40 @@ prove-acceptance:
 # Stage 97 acceptance gate: the SMT-based loop-invariant inference.
 # Requires a decider — a z3 binary or the z3-solver python module (the
 # gate says which to install when neither exists).
-invariant-acceptance: $(BIN)/hlfmt $(BIN)/hlc
-	@echo "[Stage 97 acceptance] running tests/invariant_acceptance.py..."
-	@$(PYTHON) tests/invariant_acceptance.py
+invariant-acceptance: $(BIN)/acc-invariant $(BIN)/hlc
+	@echo "[Stage 97 acceptance] running tests/acc/invariant_acceptance.hls..."
+	@$(BIN)/acc-invariant
 
 # Stage 99 acceptance gate: the CVC5 SMT backend. Requires the cvc5
 # backend (a binary or pip install cvc5) AND the z3 backend — the whole
 # point of the stage is that the two agree on every verdict.
-cvc5-acceptance:
-	@echo "[Stage 99 acceptance] running tests/cvc5_acceptance.py..."
-	@$(PYTHON) tests/cvc5_acceptance.py
+cvc5-acceptance: $(BIN)/acc-cvc5
+	@echo "[Stage 99 acceptance] running tests/acc/cvc5_acceptance.hls..."
+	@$(BIN)/acc-cvc5
 
 # Stage 100 acceptance gate: the separation-logic fragment. Requires a
 # decider — a z3 binary or the z3-solver python module (the gate says
 # which to install when neither exists).
-shapes-acceptance: $(BIN)/hlfmt $(BIN)/hlc
-	@echo "[Stage 100 acceptance] running tests/shapes_acceptance.py..."
-	@$(PYTHON) tests/shapes_acceptance.py
+shapes-acceptance: $(BIN)/acc-shapes $(BIN)/hlc
+	@echo "[Stage 100 acceptance] running tests/acc/shapes_acceptance.hls..."
+	@$(BIN)/acc-shapes
 
 # Stage 101 acceptance gate: the side-channel analysis. Analysis-only
 # (no solver needed): the engine battery, the soundness flips, the
 # interprocedural chain, the CLI report, the demo parity, the audit
 # parity between the front-ends, the fail tests and the tools.
-sidechannel-acceptance: $(BIN)/hlfmt $(BIN)/hlc
-	@echo "[Stage 101 acceptance] running tests/sidechannel_acceptance.py..."
-	@$(PYTHON) tests/sidechannel_acceptance.py
+sidechannel-acceptance: $(BIN)/acc-sidechannel $(BIN)/hlc
+	@echo "[Stage 101 acceptance] running tests/acc/sidechannel_acceptance.hls..."
+	@$(BIN)/acc-sidechannel
 
 # Stage 102 acceptance gate: the constant-time verifier. No solver
 # needed: the verdict battery, the taint universes (an unrelated leak
 # cannot violate a claim), the chains, the CLI exits (0 verified,
 # 1 violated), the demo parity, the audit parity, the fail tests and
 # the tools.
-ct-acceptance: $(BIN)/hlfmt $(BIN)/hlc
-	@echo "[Stage 102 acceptance] running tests/consttime_acceptance.py..."
-	@$(PYTHON) tests/consttime_acceptance.py
+ct-acceptance: $(BIN)/acc-consttime $(BIN)/hlc
+	@echo "[Stage 102 acceptance] running tests/acc/consttime_acceptance.hls..."
+	@$(BIN)/acc-consttime
 
 # Stage 103 (v0.122.0-alpha): hls-audit, the transitive supply-chain
 # effect report. Source mode walks the import graph (toolchain /
@@ -184,9 +184,9 @@ supply-pkg:
 # policy, fail-closed, the package tree, drift, the mode parity, the
 # demos, the tools). Tool-only - no solver, no compiler needed; the
 # native half of the demo parity runs when bin/hlc exists.
-supply-acceptance: $(BIN)/hlfmt
-	@echo "[Stage 103 acceptance] running tests/audit_acceptance.py..."
-	@$(PYTHON) tests/audit_acceptance.py
+supply-acceptance: $(BIN)/acc-audit
+	@echo "[Stage 103 acceptance] running tests/acc/audit_acceptance.hls..."
+	@$(BIN)/acc-audit
 
 # The gate itself is Halis (tests/acc/refine_acceptance.hls, compiled
 # native by bin/hlc through the $(BIN)/acc-% pattern rule).
@@ -253,9 +253,9 @@ sbom-release:
 # gate with the transparency-log chaining, the audit parity, the
 # demos, the tools). Tool-only - no solver, no compiler needed; the
 # native half of the demo parity runs when bin/hlc exists.
-sbom-acceptance: $(BIN)/hlfmt
-	@echo "[Stage 104 acceptance] running tests/sbom_acceptance.py..."
-	@$(PYTHON) tests/sbom_acceptance.py
+sbom-acceptance: $(BIN)/acc-sbom
+	@echo "[Stage 104 acceptance] running tests/acc/sbom_acceptance.hls..."
+	@$(BIN)/acc-sbom
 
 # ============================================================================
 # Stage 105 (v0.124.0-alpha): hls-repro — reproducible-build
@@ -299,9 +299,9 @@ repro-verify:
 # tampered + drifted), the release gate with the transparency
 # chaining, the demos, the tools. Tool-only — no solver needed; the
 # engine half runs native when bin/hlc exists, boot otherwise.
-repro-acceptance: $(BIN)/hlfmt
-	@echo "[Stage 105 acceptance] running tests/repro_acceptance.py..."
-	@$(PYTHON) tests/repro_acceptance.py
+repro-acceptance: $(BIN)/acc-repro
+	@echo "[Stage 105 acceptance] running tests/acc/repro_acceptance.hls..."
+	@$(BIN)/acc-repro
 
 # ============================================================================
 # Stage 106 (v0.125.0-alpha): hls-sign — signed packages (minisign,
@@ -351,9 +351,9 @@ sign-selftest:
 # transparency chaining, the ledger, the demos, the tools). Tool-only
 # — no solver, no compiler needed; the native half of the demo parity
 # runs when bin/hlc exists.
-sign-acceptance: $(BIN)/hlfmt
-	@echo "[Stage 106 acceptance] running tests/signed_acceptance.py..."
-	@$(PYTHON) tests/signed_acceptance.py
+sign-acceptance: $(BIN)/acc-signed
+	@echo "[Stage 106 acceptance] running tests/acc/signed_acceptance.hls..."
+	@$(BIN)/acc-signed
 
 # ============================================================================
 # Stage 107 (v0.126.0-alpha): hls-tlog — transparency-log gossip
@@ -461,9 +461,9 @@ reverify-selftest:
 # over the whole positive corpus, the refusals, the demos, the
 # report, the tools). Tool-only — no solver needed; the native half
 # of the demo parity runs when bin/hlc exists.
-reverify-acceptance: $(BIN)/hlfmt
-	@echo "[Stage 108 acceptance] running tests/reverify_acceptance.py..."
-	@$(PYTHON) tests/reverify_acceptance.py
+reverify-acceptance: $(BIN)/acc-reverify
+	@echo "[Stage 108 acceptance] running tests/acc/reverify_acceptance.hls..."
+	@$(BIN)/acc-reverify
 
 # ============================================================================
 # Stage 109 (v0.128.0-alpha): taint-tracking through FFI boundaries
@@ -478,9 +478,9 @@ ffi-taint:
 # checker rules (source wrap, sink diagnostics, the well-formedness
 # refusals), the audit-parity census, the hlprove --taint report (pinned
 # lines), the demo + ok-test parity, the fail tests and the tools.
-ffi-taint-acceptance: $(BIN)/hlfmt $(BIN)/hlc
-	@echo "[Stage 109 acceptance] running tests/ffi_taint_acceptance.py..."
-	@$(PYTHON) tests/ffi_taint_acceptance.py
+ffi-taint-acceptance: $(BIN)/acc-ffi_taint $(BIN)/hlc
+	@echo "[Stage 109 acceptance] running tests/acc/ffi_taint_acceptance.hls..."
+	@$(BIN)/acc-ffi_taint
 
 # ============================================================================
 # Stage 111 (v0.130.0-alpha): capability token types — Cap[Net] as a
@@ -559,9 +559,9 @@ sandbox-selftest:
 # definition, the assembler, the policy, the derivation, the
 # enforcement — the kernel half, Linux + seccomp + cc, the shim,
 # the statement + ledger, the demos, the tools).
-sandbox-acceptance: $(BIN)/hlfmt
-	@echo "[Stage 110 acceptance] running tests/sandbox_acceptance.py..."
-	@$(PYTHON) tests/sandbox_acceptance.py
+sandbox-acceptance: $(BIN)/acc-sandbox
+	@echo "[Stage 110 acceptance] running tests/acc/sandbox_acceptance.hls..."
+	@$(BIN)/acc-sandbox
 
 # ============================================================================
 # Stage 112 (v0.131.0-alpha): hls-auditlog — audit-log signing,
@@ -606,6 +606,6 @@ auditlog-selftest:
 # refusals, the launcher, the checkpoint verdicts, the ledgers, the
 # demos, the tools). Tool-only — no solver, no kernel half needed;
 # the native half of the demo parity runs when bin/hlc exists.
-auditlog-acceptance: $(BIN)/hlfmt
-	@echo "[Stage 112 acceptance] running tests/auditlog_acceptance.py..."
-	@$(PYTHON) tests/auditlog_acceptance.py
+auditlog-acceptance: $(BIN)/acc-auditlog
+	@echo "[Stage 112 acceptance] running tests/acc/auditlog_acceptance.hls..."
+	@$(BIN)/acc-auditlog

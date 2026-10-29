@@ -135,9 +135,9 @@ rc-report-check: $(BIN)/hls-rc
 # diff gate re-classes), the report law (deterministic, drift
 # refused) — and the corpus showcase, the candidate laws as a
 # pure-HLS program.
-rc-acceptance: $(BIN)/hlfmt $(BIN)/hls-rc
-	@echo "[Stage 146 acceptance] running tests/rc_acceptance.py..."
-	@$(PYTHON) tests/rc_acceptance.py
+rc-acceptance: $(BIN)/acc-rc $(BIN)/hls-rc
+	@echo "[Stage 146 acceptance] running tests/acc/rc_acceptance.hls..."
+	@$(BIN)/acc-rc
 	@echo "ACCEPTANCE OK: Stage 146 -- v1.0 Release Candidate 1 (feature freeze)"
 
 # The Stage 147 acceptance gate: the bug-fix round. Five sections over
@@ -149,9 +149,9 @@ rc-acceptance: $(BIN)/hlfmt $(BIN)/hls-rc
 # choreography rehearsed end to end (rc.1 anchored, Stage 147 ticked,
 # the markers moved, rc.2 declared, the gate green across the range,
 # the record drift-checked) -- and the corpus showcase.
-rc2-acceptance: $(BIN)/hlfmt $(BIN)/hls-rc
-	@echo "[Stage 147 acceptance] running tests/rc2_acceptance.py..."
-	@$(PYTHON) tests/rc2_acceptance.py
+rc2-acceptance: $(BIN)/acc-rc2 $(BIN)/hls-rc
+	@echo "[Stage 147 acceptance] running tests/acc/rc2_acceptance.hls..."
+	@$(BIN)/acc-rc2
 	@echo "ACCEPTANCE OK: Stage 147 -- v1.0 Release Candidate 2 (bug-fix only)"
 
 # The Stage 148 acceptance gate: the final dry-run. Six sections over
@@ -168,9 +168,9 @@ rc2-acceptance: $(BIN)/hlfmt $(BIN)/hls-rc
 # laws, the line idempotent, a second line refused), the day after
 # (the fix, the backport with provenance, v1.0.1, the audit, the gate
 # green over the whole road) -- and the corpus showcase.
-rc3-acceptance: $(BIN)/hlfmt $(BIN)/hls-rc $(BIN)/hls-lts
-	@echo "[Stage 148 acceptance] running tests/rc3_acceptance.py..."
-	@$(PYTHON) tests/rc3_acceptance.py
+rc3-acceptance: $(BIN)/acc-rc3 $(BIN)/hls-rc $(BIN)/hls-lts
+	@echo "[Stage 148 acceptance] running tests/acc/rc3_acceptance.hls..."
+	@$(BIN)/acc-rc3
 	@echo "ACCEPTANCE OK: Stage 148 -- v1.0 Release Candidate 3 (final dry-run)"
 
 # The Stage 149 acceptance gate: the sign-off. Six sections over the
@@ -185,9 +185,9 @@ rc3-acceptance: $(BIN)/hlfmt $(BIN)/hls-rc $(BIN)/hls-lts
 # once, the diff is that one line), the real-tree pre-flight with the
 # signoff --check pinned dynamically (green on a signed anchor, the
 # unsigned refusal on an unsigned one) -- and the corpus showcase.
-rc4-acceptance: $(BIN)/hlfmt $(BIN)/hls-rc $(BIN)/hls-lts
-	@echo "[Stage 149 acceptance] running tests/rc4_acceptance.py..."
-	@$(PYTHON) tests/rc4_acceptance.py
+rc4-acceptance: $(BIN)/acc-rc4 $(BIN)/hls-rc $(BIN)/hls-lts
+	@echo "[Stage 149 acceptance] running tests/acc/rc4_acceptance.hls..."
+	@$(BIN)/acc-rc4
 	@echo "ACCEPTANCE OK: Stage 149 -- v1.0 Release Candidate 4 (sign-off)"
 
 # The Stage 150 acceptance gate: the release itself, judged where it
@@ -206,9 +206,9 @@ rc4-acceptance: $(BIN)/hlfmt $(BIN)/hls-rc $(BIN)/hls-lts
 # own, the roadmap's last row ticked with its phrase, the README
 # tour carrying the gate and the clock, LTS.md still matching its
 # render) -- and the corpus showcase.
-release-acceptance: $(BIN)/hlfmt $(BIN)/hls-rc $(BIN)/hls-lts
-	@echo "[Stage 150 acceptance] running tests/release_acceptance.py..."
-	@$(PYTHON) tests/release_acceptance.py
+release-acceptance: $(BIN)/acc-release $(BIN)/hls-rc $(BIN)/hls-lts
+	@echo "[Stage 150 acceptance] running tests/acc/release_acceptance.hls..."
+	@$(BIN)/acc-release
 	@echo "ACCEPTANCE OK: Stage 150 -- HLS v1.0 LTS release"
 
 # The Stage 149 verdict, on the live tree: the signature re-derived
@@ -332,9 +332,9 @@ bootstrap-nolibc:
 # Stage 92 acceptance: the flag + runtime shape, the full ladder, the
 # binary's honesty (no libc symbols), the parity with the hosted
 # compiler, a real no-libc program run, and the pinned gaps.
-xbootstrap-acceptance:
-	@echo "[Stage 92 acceptance] running tests/xbootstrap_acceptance.py..."
-	@$(PYTHON) tests/xbootstrap_acceptance.py
+xbootstrap-acceptance: $(BIN)/acc-xbootstrap
+	@echo "[Stage 92 acceptance] running tests/acc/xbootstrap_acceptance.hls..."
+	@$(BIN)/acc-xbootstrap
 	@echo "ACCEPTANCE OK: Stage 92 -- cross-bootstrappable build (Stage-0 -> freestanding hlc)"
 
 # Compile and run an HLS program: make run F=examples/hello.hls
@@ -403,9 +403,9 @@ lsp-check:
 # completion + LRU, the smoke + corpus). Protocol-level - the gate
 # drives the real server over stdio JSON-RPC; the native half of
 # the corpus parity runs when gcc exists.
-lsp-def-acceptance:
-	@echo "[Stage 113 acceptance] running tests/lsp_def_acceptance.py..."
-	@$(PYTHON) tests/lsp_def_acceptance.py
+lsp-def-acceptance: $(BIN)/acc-lsp_def
+	@echo "[Stage 113 acceptance] running tests/acc/lsp_def_acceptance.hls..."
+	@$(BIN)/acc-lsp_def
 
 # Stage 114 acceptance gate: the eight-section battery for inlay
 # hints (the call sites, the layer law, the guards, the match
@@ -453,16 +453,16 @@ fmt-config-acceptance: $(BIN)/acc-fmt_config
 # interpreter-vs-native differential before and after the fix, and the
 # corpus). The differential half compiles the stage's ok fixture on
 # bin/hlc and gcc, so the native build is a prerequisite.
-lint-fix-acceptance: $(BIN)/hlfmt bin/hlc
-	@echo "[Stage 118 acceptance] running tests/lint_fix_acceptance.py..."
-	@$(PYTHON) tests/lint_fix_acceptance.py
+lint-fix-acceptance: $(BIN)/acc-lint_fix bin/hlc
+	@echo "[Stage 118 acceptance] running tests/acc/lint_fix_acceptance.hls..."
+	@$(BIN)/acc-lint_fix
 
 # Stage 119 (v0.138.0-alpha): snapshot-testing acceptance gate.
 # The differential half compiles the stage's ok fixture on
 # bin/hlc and gcc, so the native build is a prerequisite.
-snapshot-acceptance: $(BIN)/hlfmt bin/hlc
-	@echo "[Stage 119 acceptance] running tests/snapshot_acceptance.py..."
-	@$(PYTHON) tests/snapshot_acceptance.py
+snapshot-acceptance: $(BIN)/acc-snapshot bin/hlc
+	@echo "[Stage 119 acceptance] running tests/acc/snapshot_acceptance.hls..."
+	@$(BIN)/acc-snapshot
 
 # Stage 120 (v0.139.0-alpha): parameterised (table-driven) testing
 # acceptance gate. The differential half compiles the stage's ok
@@ -487,9 +487,9 @@ dap-acceptance: $(BIN)/hlfmt
 # :reset), panics and refusals, and the corpus + transcript parity
 # (the canonical session's `=` lines are the fixture program's output,
 # natively byte-identical when bin/hlc + gcc exist).
-repl-acceptance: $(BIN)/hlfmt
-	@echo "[Stage 123 acceptance] running tests/repl_acceptance.py..."
-	@$(PYTHON) tests/repl_acceptance.py
+repl-acceptance: $(BIN)/acc-repl
+	@echo "[Stage 123 acceptance] running tests/acc/repl_acceptance.hls..."
+	@$(BIN)/acc-repl
 
 
 # Stage 124 (v0.142.0-alpha): the criterion-style benchmark runner
@@ -501,9 +501,9 @@ repl-acceptance: $(BIN)/hlfmt
 # the CLI matrix, the fixed-plan interpreter-vs-native differential,
 # and the corpus hygiene. The differential half compiles on bin/hlc
 # and gcc, so the native build is a prerequisite.
-bench-acceptance: $(BIN)/hlfmt bin/hlc
-	@echo "[Stage 124 acceptance] running tests/bench_acceptance.py..."
-	@$(PYTHON) tests/bench_acceptance.py
+bench-acceptance: $(BIN)/acc-bench bin/hlc
+	@echo "[Stage 124 acceptance] running tests/acc/bench_acceptance.hls..."
+	@$(BIN)/acc-bench
 
 
 # Stage 125 (v0.143.0-alpha): the RSS-stability verification gate.
@@ -522,9 +522,9 @@ bench-acceptance: $(BIN)/hlfmt bin/hlc
 # canary LEAK with both instruments firing, the match-in-concat
 # hoisting-cycle regression), and the corpus hygiene. The gate
 # compiles on bin/hlc and gcc, so the native build is a prerequisite.
-rss-acceptance: $(BIN)/hlfmt bin/hlc
-	@echo "[Stage 125 acceptance] running tests/rss_acceptance.py..."
-	@$(PYTHON) tests/rss_acceptance.py
+rss-acceptance: $(BIN)/acc-rss bin/hlc
+	@echo "[Stage 125 acceptance] running tests/acc/rss_acceptance.hls..."
+	@$(BIN)/acc-rss
 	@echo "ACCEPTANCE OK: Stage 125 -- GC-free runtime verification (RSS stability)"
 
 
@@ -544,9 +544,9 @@ rss-acceptance: $(BIN)/hlfmt bin/hlc
 # look-alikes), the report and the statistics against hand-computed
 # values, and the differential + corpus hygiene. The gate compiles on
 # bin/hlc and gcc, so the native build is a prerequisite.
-rt-acceptance: $(BIN)/hlfmt bin/hlc
-	@echo "[Stage 126 acceptance] running tests/rt_acceptance.py..."
-	@$(PYTHON) tests/rt_acceptance.py
+rt-acceptance: $(BIN)/acc-rt bin/hlc
+	@echo "[Stage 126 acceptance] running tests/acc/rt_acceptance.hls..."
+	@$(BIN)/acc-rt
 	@echo "ACCEPTANCE OK: Stage 126 -- soft-real-time mode (bounded allocation per cycle)"
 
 
@@ -570,9 +570,9 @@ rt-acceptance: $(BIN)/hlfmt bin/hlc
 # (stdout/trace/exit identical across backends for the whole fixture
 # set, hlfmt/hllint/checker green, no litter). The gate compiles on
 # bin/hlc and gcc, so the native build is a prerequisite.
-det-acceptance: $(BIN)/hlfmt bin/hlc
-	@echo "[Stage 127 acceptance] running tests/det_acceptance.py..."
-	@$(PYTHON) tests/det_acceptance.py
+det-acceptance: $(BIN)/acc-det bin/hlc
+	@echo "[Stage 127 acceptance] running tests/acc/det_acceptance.hls..."
+	@$(BIN)/acc-det
 	@echo "ACCEPTANCE OK: Stage 127 -- deterministic-scheduler option (testing concurrency)"
 
 
@@ -593,9 +593,9 @@ det-acceptance: $(BIN)/hlfmt bin/hlc
 # historical programs byte-identical across today's backends), and the
 # corpus hygiene (fmt/lint/checker green, no litter). The gate needs
 # bin/hlc + gcc, so the native build is a prerequisite.
-compat-acceptance: $(BIN)/hlfmt bin/hlc
-	@echo "[Stage 128 acceptance] running tests/compat_acceptance.py..."
-	@$(PYTHON) tests/compat_acceptance.py
+compat-acceptance: $(BIN)/acc-compat bin/hlc
+	@echo "[Stage 128 acceptance] running tests/acc/compat_acceptance.hls..."
+	@$(BIN)/acc-compat
 	@echo "ACCEPTANCE OK: Stage 128 -- backwards-compatibility test suite (every prior version's ok/)"
 
 
@@ -624,9 +624,9 @@ compat-acceptance: $(BIN)/hlfmt bin/hlc
 # exactly the pre-migration places, no .bak litter). The gate needs
 # bin/hlc + gcc for its native legs, so the native build is a
 # prerequisite.
-migrate-acceptance: $(BIN)/hlfmt bin/hlc
-	@echo "[Stage 129 acceptance] running tests/migrate_acceptance.py..."
-	@$(PYTHON) tests/migrate_acceptance.py
+migrate-acceptance: $(BIN)/acc-migrate bin/hlc
+	@echo "[Stage 129 acceptance] running tests/acc/migrate_acceptance.hls..."
+	@$(BIN)/acc-migrate
 	@echo "ACCEPTANCE OK: Stage 129 -- migration tooling (hls migrate)"
 
 # Stage 131 (v0.149.0-alpha): the semver-enforcement gate. Eight
@@ -742,9 +742,9 @@ lts-policy-acceptance: $(BIN)/hlfmt $(BIN)/hls-lts
 xdiff:
 	@$(PYTHON) tools/hls-xdiff.py --core
 
-xdiff-acceptance: $(BIN)/hlfmt bin/hlc
-	@echo "[Stage 133 acceptance] running tests/xdiff_acceptance.py..."
-	@$(PYTHON) tests/xdiff_acceptance.py
+xdiff-acceptance: $(BIN)/acc-xdiff bin/hlc
+	@echo "[Stage 133 acceptance] running tests/acc/xdiff_acceptance.hls..."
+	@$(BIN)/acc-xdiff
 	@echo "ACCEPTANCE OK: Stage 133 -- cross-impl differential suite (3+ backends)"
 
 # Stage 134 (v0.152.0-alpha): fuzz corpus seeding from real-world
@@ -760,9 +760,9 @@ xdiff-acceptance: $(BIN)/hlfmt bin/hlc
 fuzzseed:
 	@$(PYTHON) tools/hls-fuzzseed.py --limit 200 --mutate 1
 
-fuzzseed-acceptance: bin/hlc
-	@echo "[Stage 134 acceptance] running tests/fuzzseed_acceptance.py..."
-	@$(PYTHON) tests/fuzzseed_acceptance.py
+fuzzseed-acceptance: $(BIN)/acc-fuzzseed bin/hlc
+	@echo "[Stage 134 acceptance] running tests/acc/fuzzseed_acceptance.hls..."
+	@$(BIN)/acc-fuzzseed
 	@echo "ACCEPTANCE OK: Stage 134 -- fuzz corpus seeding from real-world packages"
 
 # Stage 135 (v0.153.0-alpha): the soundness guarantee ledger —
@@ -781,9 +781,9 @@ guarantee:
 guarantee-report:
 	@$(PYTHON) tools/hls-guarantee.py report --out SOUNDNESS.md
 
-guarantee-acceptance: $(BIN)/hlfmt bin/hlc
-	@echo "[Stage 135 acceptance] running tests/guarantee_acceptance.py..."
-	@$(PYTHON) tests/guarantee_acceptance.py
+guarantee-acceptance: $(BIN)/acc-guarantee bin/hlc
+	@echo "[Stage 135 acceptance] running tests/acc/guarantee_acceptance.hls..."
+	@$(BIN)/acc-guarantee
 	@echo "ACCEPTANCE OK: Stage 135 -- bug-bounty-eligible soundness guarantees documented"
 
 # Stage 136 (v0.154.0-alpha): the per-commit performance regression
@@ -812,9 +812,9 @@ perf-gate:
 perf-dashboard:
 	@$(PYTHON) tools/hls-perf.py dashboard --out PERFORMANCE.md
 
-perf-acceptance: $(BIN)/hlfmt bin/hlc
-	@echo "[Stage 136 acceptance] running tests/perf_acceptance.py..."
-	@$(PYTHON) tests/perf_acceptance.py
+perf-acceptance: $(BIN)/acc-perf bin/hlc
+	@echo "[Stage 136 acceptance] running tests/acc/perf_acceptance.hls..."
+	@$(BIN)/acc-perf
 	@echo "ACCEPTANCE OK: Stage 136 -- performance regression dashboard (per-commit)"
 
 # Stage 137 (v0.155.0-alpha): the memory regression dashboard, RSS
@@ -1029,9 +1029,9 @@ freeze-acceptance: $(BIN)/hlfmt bin/hlc
 # Stage 142 (v0.161.0-alpha): the pure-bootstrap acceptance gate.
 # Self-contained: it builds its own compilers on disposable copies of
 # the tree under a python-free PATH, so it takes no bin/hlc prerequisite.
-purebootstrap-acceptance:
-	@echo "[Stage 142 acceptance] running tests/purebootstrap_acceptance.py..."
-	@$(PYTHON) tests/purebootstrap_acceptance.py
+purebootstrap-acceptance: $(BIN)/acc-purebootstrap
+	@echo "[Stage 142 acceptance] running tests/acc/purebootstrap_acceptance.hls..."
+	@$(BIN)/acc-purebootstrap
 	@echo "ACCEPTANCE OK: Stage 142 -- pure-HLS bootstrap (no Python in the build)"
 
 
@@ -1094,9 +1094,9 @@ finalaudit-acceptance: $(BIN)/hlfmt bin/hlc
 # hygiene (fmt/canonical, checker green, the demo's two warnings, no
 # litter). The gate needs bin/hlc + gcc for the native legs, so the
 # native build is a prerequisite.
-deprecated-acceptance: $(BIN)/hlfmt bin/hlc
-	@echo "[Stage 130 acceptance] running tests/deprecated_acceptance.py..."
-	@$(PYTHON) tests/deprecated_acceptance.py
+deprecated-acceptance: $(BIN)/acc-deprecated bin/hlc
+	@echo "[Stage 130 acceptance] running tests/acc/deprecated_acceptance.hls..."
+	@$(BIN)/acc-deprecated
 	@echo "ACCEPTANCE OK: Stage 130 -- deprecation mechanism (@deprecated attribute + lint)"
 
 

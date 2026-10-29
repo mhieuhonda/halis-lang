@@ -137,9 +137,9 @@ idt-acceptance: $(BIN)/acc-idt
 # its section, really is 8-byte aligned, and really starts with the
 # protocol's own bytes), nine behaviour probes plus the four
 # checked-constructor panics, and the demos, the tools and `--audit`.
-boot-acceptance: $(BIN)/hlfmt
-	@echo "[Stage 85 acceptance] running tests/boot_acceptance.py..."
-	@$(PYTHON) tests/boot_acceptance.py
+boot-acceptance: $(BIN)/acc-boot
+	@echo "[Stage 85 acceptance] running tests/acc/boot_acceptance.hls..."
+	@$(BIN)/acc-boot
 	@echo "ACCEPTANCE OK: Stage 85 -- Multiboot2 + Limine boot protocol headers"
 
 # link-acceptance: the Stage 84 acceptance gate. Runs the 7-section
@@ -271,9 +271,9 @@ triple:
 # (ELF x86-64, zero undefined symbols, _start lowest at 0x100000, runs
 # with exit 42), hlcross --target driving the whole pipeline, the
 # linker-script shape, and the tools.
-triple-x86_64-acceptance: $(BIN)/hlfmt
-	@echo "[Stage 93 acceptance] running tests/triple_x86_64_acceptance.py..."
-	@$(PYTHON) tests/triple_x86_64_acceptance.py
+triple-x86_64-acceptance: $(BIN)/acc-triple_x86_64
+	@echo "[Stage 93 acceptance] running tests/acc/triple_x86_64_acceptance.hls..."
+	@$(BIN)/acc-triple_x86_64
 	@echo "ACCEPTANCE OK: Stage 93 -- target x86_64-unknown-none (bare-metal triple)"
 
 
@@ -286,9 +286,9 @@ triple-x86_64-acceptance: $(BIN)/hlfmt
 # image (ELF64 AArch64 at the QEMU virt DRAM base when a cross-linker
 # exists; the honest SKIP that keeps the C otherwise), the optional
 # QEMU virt boot (the PL011 banner), the script shape, and the tools.
-triple-aarch64-acceptance: $(BIN)/hlfmt
-	@echo "[Stage 94 acceptance] running tests/triple_aarch64_acceptance.py..."
-	@$(PYTHON) tests/triple_aarch64_acceptance.py
+triple-aarch64-acceptance: $(BIN)/acc-triple_aarch64
+	@echo "[Stage 94 acceptance] running tests/acc/triple_aarch64_acceptance.hls..."
+	@$(BIN)/acc-triple_aarch64
 	@echo "ACCEPTANCE OK: Stage 94 -- target aarch64-unknown-none (bare-metal ARM)"
 
 
@@ -305,9 +305,9 @@ triple-aarch64-acceptance: $(BIN)/hlfmt
 # finisher's exit code — the one triple whose bare-metal run has a
 # real exit status without semihosting), the script shape, and the
 # completed registry.
-triple-riscv64-acceptance: $(BIN)/hlfmt
-	@echo "[Stage 95 acceptance] running tests/triple_riscv64_acceptance.py..."
-	@$(PYTHON) tests/triple_riscv64_acceptance.py
+triple-riscv64-acceptance: $(BIN)/acc-triple_riscv64
+	@echo "[Stage 95 acceptance] running tests/acc/triple_riscv64_acceptance.hls..."
+	@$(BIN)/acc-triple_riscv64
 	@echo "ACCEPTANCE OK: Stage 95 -- target riscv64-unknown-none (bare-metal RISC-V)"
 
 
@@ -326,9 +326,9 @@ triple-riscv64-acceptance: $(BIN)/hlfmt
 # text, exit 42, the hosted hl_/usf_ symbols complete with the
 # text/bss classes agreeing with nm), hlcross --debug (the image keeps
 # .debug_info naming the .hls source), and the no-libc mode + tools.
-debuginfo-acceptance: $(BIN)/hlfmt
-	@echo "[Stage 96 acceptance] running tests/debuginfo_acceptance.py..."
-	@$(PYTHON) tests/debuginfo_acceptance.py
+debuginfo-acceptance: $(BIN)/acc-debuginfo
+	@echo "[Stage 96 acceptance] running tests/acc/debuginfo_acceptance.hls..."
+	@$(BIN)/acc-debuginfo
 	@echo "ACCEPTANCE OK: Stage 96 -- ELF symbol table + debug info (DWARF 5)"
 
 # freestanding: compile an HLS program to freestanding C + link with

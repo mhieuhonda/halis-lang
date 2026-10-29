@@ -18,7 +18,7 @@ Design notes:
 * ``PACK_FORMAT_VERSION`` is bumped if the on-disk layout of ``pkg/``
   changes (a stale ``pkg/`` from v1 must never validate as v2).
 * All sizes are measured in bytes; the acceptance gates live in
-  ``tests/wasm_pack_acceptance.py`` (``make wasm-pack-acceptance``).
+  ``tests/acc/wasm_pack_acceptance.hls`` (``make wasm-pack-acceptance``).
 """
 from __future__ import annotations
 

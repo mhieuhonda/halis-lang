@@ -24,7 +24,7 @@ for ff in tests/fail/fail_freestanding_*.hls; do
     # crate-attribute POSITION rule — its message ("crate-level
     # attribute must appear before any item") does not mention
     # "freestanding", so this loop rejected the rejected-program
-    # rejection. Align the needle with tests/freestanding_acceptance.py,
+    # rejection. Align the needle with tests/acc/freestanding_acceptance.hls,
     # which already EXPECTs "before any item" for this file.
     fs_needle="freestanding"
     if [ "$fs_name" = "fail_freestanding_late_attr" ]; then
