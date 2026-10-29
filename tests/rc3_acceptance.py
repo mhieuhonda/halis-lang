@@ -95,6 +95,24 @@ RELEASE_DAY = "2026-10-29"
 FREEZE_DIGEST = ("84d1068f80d62f3f741785ce2241b423fa5bd36b4e28e0a"
                  "872c6e772e4decaf6")
 
+
+def release_state():
+    """The candidate line's legal states, read off the real tree:
+    'eve' — the anchor stands, no line declared; 'released' — the
+    anchor retired with the release commit and the LTS line is
+    declared. Anything else is a half-cut release, and a half-cut
+    release is not a state. This gate rehearsed the release day;
+    after the release it must still run — the rehearsal becomes the
+    record.
+    """
+    anchor = os.path.exists(os.path.join(ROOT, ".hls-rc.json"))
+    line = os.path.exists(os.path.join(ROOT, ".hls-lts.json"))
+    if anchor and not line:
+        return "eve"
+    if line and not anchor:
+        return "released"
+    return "half-cut"
+
 # the candidate line's own phrases, straight off the roadmap's rows
 PHRASES = {
     1: "feature freeze",
@@ -334,14 +352,27 @@ def main():
     # ==================================================================
     header("2. the real-tree pre-flight — the tree may be a candidate")
     r = rc("readiness")
-    check(r.returncode == 0 and "READY" in r.stdout,
-          "the REAL tree is ready")
-    r = rc("gate")
-    check(r.returncode == 0,
-          "the gate over the live range names only BUGFIX and CHORE")
-    r = rc("report", "--check")
-    check(r.returncode == 0,
-          "the committed record matches the render (drift refused)")
+    if release_state() == "released":
+        check(r.returncode == 1 and "NOT READY: the roadmap law"
+              in r.stdout and "NOT READY: the lts law" in r.stdout,
+              "the REAL tree is released (readiness refuses on both "
+              "laws, named — the rehearsal's own retirement, come "
+              "true)")
+        r = rc("gate")
+        check(r.returncode == 1 and "no anchor" in r.stdout + r.stderr,
+              "the gate refuses on the missing anchor")
+        r = rc("report", "--check")
+        check(r.returncode == 1 and "no anchor" in r.stdout + r.stderr,
+              "the record refuses on the missing anchor")
+    else:
+        check(r.returncode == 0 and "READY" in r.stdout,
+              "the REAL tree is ready")
+        r = rc("gate")
+        check(r.returncode == 0,
+              "the gate over the live range names only BUGFIX and CHORE")
+        r = rc("report", "--check")
+        check(r.returncode == 0,
+              "the committed record matches the render (drift refused)")
 
     head_v = ""
     with open(os.path.join(ROOT, "CHANGELOG.md")) as f:
@@ -388,7 +419,9 @@ def main():
                 "Candidate " + atag[-1])[-1],
                 "a row without a phrase makes no identity claim")
     else:
-        check(True, "no anchor cut yet; the pre-flight stays green")
+        check(release_state() == "released",
+              "no anchor on the tree — and the line is declared (the "
+              "release, not a gap)")
 
     # ==================================================================
     header("3. the eve rehearsal — the last candidate, the real cut")

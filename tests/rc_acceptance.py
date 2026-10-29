@@ -104,6 +104,25 @@ GIT_ENV["GIT_AUTHOR_DATE"] = "2026-10-28T09:00:00+00:00"
 FREEZE_DIGEST = ("84d1068f80d62f3f741785ce2241b423fa5bd36b4e28e0a"
                  "872c6e772e4decaf6")
 
+
+def release_state():
+    """The candidate line's legal states, read off the real tree:
+    'eve' — the anchor stands, no line declared (the road still has
+    a Stage 150 to cut); 'released' — the anchor retired with the
+    release commit and the LTS line is declared. Anything else is a
+    half-cut release, and a half-cut release is not a state.
+    The RC4-era gates ran on the eve; after the release they must
+    still run — the kit inherits both ends of the line it certified.
+    """
+    anchor = os.path.exists(os.path.join(ROOT, ".hls-rc.json"))
+    line = os.path.exists(os.path.join(ROOT, ".hls-lts.json"))
+    if anchor and not line:
+        return "eve"
+    if line and not anchor:
+        return "released"
+    return "half-cut"
+
+
 PASS = 0
 FAIL = 0
 
@@ -232,23 +251,43 @@ def main():
           "a malformed range is a usage error naming the grammar")
 
     r = rc("readiness", "--json")
-    check(r.returncode == 0, "readiness --json on the real tree is green")
-    try:
-        data = json.loads(r.stdout)
-        check(data.get("ready") is True, "the verdict is ready:true")
-        check("head" in data and "first_open" in data,
-              "the verdict names the head version and first open stage")
-        check(isinstance(data.get("laws"), list) and len(data["laws"]) >= 6,
-              "the verdict carries the named laws (%d)"
-              % len(data.get("laws", [])))
-    except Exception as exc:
-        bad("readiness --json does not parse: %s" % exc)
+    if release_state() == "released":
+        check(r.returncode == 1,
+              "readiness --json on the released tree refuses (the "
+              "verdict the retirement names)")
+        try:
+            data = json.loads(r.stdout)
+            check(data.get("ready") is False,
+                  "the verdict is ready:false (the release happened)")
+        except Exception as exc:
+            bad("readiness --json does not parse: %s" % exc)
+    else:
+        check(r.returncode == 0,
+              "readiness --json on the real tree is green")
+        try:
+            data = json.loads(r.stdout)
+            check(data.get("ready") is True, "the verdict is ready:true")
+            check("head" in data and "first_open" in data,
+                  "the verdict names the head version and first open "
+                  "stage")
+            check(isinstance(data.get("laws"), list)
+                  and len(data["laws"]) >= 6,
+                  "the verdict carries the named laws (%d)"
+                  % len(data.get("laws", [])))
+        except Exception as exc:
+            bad("readiness --json does not parse: %s" % exc)
 
     # ==================================================================
     header("2. the readiness law — the checklist, one law at a time")
     r = rc("readiness")
-    check(r.returncode == 0 and "READY" in r.stdout,
-          "the REAL tree is ready (145 closed, the tail from 146)")
+    if release_state() == "released":
+        check(r.returncode == 1 and "NOT READY: the roadmap law"
+              in r.stdout and "NOT READY: the lts law" in r.stdout,
+              "the REAL tree is released (readiness refuses on both "
+              "laws, named)")
+    else:
+        check(r.returncode == 0 and "READY" in r.stdout,
+              "the REAL tree is ready (145 closed, the tail from 146)")
 
     repo = scratch_world("ready-ok")
     r = rc("readiness", "--root", repo)
@@ -464,10 +503,15 @@ def main():
 
     # ==================================================================
     header("8. the LTS handoff — the candidate opens no window")
-    check(not os.path.exists(os.path.join(ROOT, ".hls-lts.json")),
-          "no LTS line is declared on the real tree")
+    if release_state() == "released":
+        check(os.path.exists(os.path.join(ROOT, ".hls-lts.json")),
+              "the LTS line IS declared on the released tree (the "
+              "handoff this section watched for, happened)")
+    else:
+        check(not os.path.exists(os.path.join(ROOT, ".hls-lts.json")),
+              "no LTS line is declared on the real tree")
     check(os.path.isfile(os.path.join(ROOT, "LTS.md")),
-          "LTS.md stays the promise")
+          "LTS.md stays published")
     lts = open(os.path.join(ROOT, "LTS.md")).read()
     check("hls-lts init --tag v1.0.0" in lts,
           "the promise names the day it becomes the clock")
@@ -492,9 +536,14 @@ def main():
         check(r.returncode == 0,
               "the real tree's range since the anchor is inside the freeze")
     else:
-        r = rc("readiness")
-        check(r.returncode == 0,
-              "the anchor is not cut yet; readiness still green")
+        if release_state() == "released":
+            check(not os.path.exists(anchor_path),
+                  "the anchor retired with the release commit (the "
+                  "record is history now, not a law)")
+        else:
+            r = rc("readiness")
+            check(r.returncode == 0,
+                  "the anchor is not cut yet; readiness still green")
 
     # ==================================================================
     header("9. the corpus showcase — the laws as a pure-HLS program")
