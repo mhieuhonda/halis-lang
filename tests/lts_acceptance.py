@@ -181,16 +181,21 @@ def messages(repo, branch, base_sha):
 def _section_1():
     print("Section 1 — the convention")
 
-    p = lts(["status"])
+    # The no-policy refusals run against a scratch repo: the real tree
+    # declared its line with the v1.0.0 release, and the refusal this
+    # section pins belongs to a tree that has not.
+    nopolicy = make_repo("no-policy")
+
+    p = lts(["status", "--repo", nopolicy])
     check(p.returncode == 1 and "no LTS policy declared" in p.stdout
           and "init --tag v1.0.0" in p.stdout,
           "status without a policy refuses and names the init remedy")
 
-    p = lts(["backport", "HEAD"])
+    p = lts(["backport", "HEAD", "--repo", nopolicy])
     check(p.returncode == 1 and "no LTS policy declared" in p.stdout,
           "backport without a policy refuses, named")
 
-    p = lts(["audit"])
+    p = lts(["audit", "--repo", nopolicy])
     check(p.returncode == 1 and "no LTS policy declared" in p.stdout,
           "audit without a policy refuses, named")
 
