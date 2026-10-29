@@ -1,4 +1,4 @@
-# Contributor Covenant Code of Conduct
+# Code of Conduct — Halis (HLS)
 
 ## Our Pledge
 
@@ -38,8 +38,8 @@ Examples of unacceptable behavior include:
 
 ## Enforcement Responsibilities
 
-Community leaders are responsible for clarifying and enforcing our standards
-of acceptable behavior and will take appropriate and fair corrective action in
+Community leaders are responsible for clarifying and enforcing our standards of
+acceptable behavior and will take appropriate and fair corrective action in
 response to any behavior that they deem inappropriate, threatening, offensive,
 or harmful.
 
@@ -54,9 +54,13 @@ representative at an online or offline event.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the community leaders responsible for enforcement at the repository's
-issue tracker with the `conduct` label. All complaints will be reviewed and
-investigated promptly and fairly.
+reported to the community leaders responsible for enforcement by opening a
+**private** GitHub security advisory at
+<https://github.com/mhieuhonda/halis-lang/security/advisories/new>
+(marking it as a conduct report rather than a vulnerability), or by
+contacting the maintainer directly. Reports sent through either channel
+are reviewed and investigated promptly and fairly, and are never handled
+in public.
 
 All community leaders are obligated to respect the privacy and security of the
 reporter of any incident.
@@ -72,23 +76,23 @@ the consequences for any action they deem in violation of this Code of Conduct:
    temporary ban from the repository.
 3. **Temporary Ban** — A third violation results in a temporary ban from all
    community interaction for one week.
-4. **Permanent Ban** — A fourth violation, or any severe violation, results
-   in a permanent ban from the repository.
+4. **Permanent Ban** — A fourth violation, or any severe violation, results in
+   a permanent ban from the repository.
 
 ## Attribution
 
 This Code of Conduct is adapted from the [Contributor Covenant][homepage],
 version 2.1, available at
-<https://www.contributor-covenant.org/version/2/1/code_of_conduct.html>.
-
-[homepage]: https://www.contributor-covenant.org
+<https://www.contributor-covenant.org/version/2/1/code_of_conduct/>.
+Translations are available at
+<https://www.contributor-covenant.org/translations/>.
 
 Community Impact Guidelines were inspired by
 [Mozilla's code of conduct enforcement ladder][mozilla_coce].
 
-[mozilla_coce]: https://github.com/mozilla/diversity
-
 For answers to common questions about this code of conduct, see the
 [FAQ][faq].
 
+[homepage]: https://www.contributor-covenant.org
+[mozilla_coce]: https://github.com/mozilla/diversity
 [faq]: https://www.contributor-covenant.org/faq

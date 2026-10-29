@@ -1,38 +1,36 @@
-# Halis — VS Code Extension
+# Halis — VS Code extension
 
-The official VS Code extension for the Halis toolchain: it wires the
-`hls-lsp` language server, the `hlfmt` formatter, the `hllint` linter,
-and — since Stage 121 (v0.140.0-alpha) — the `hls-dap` debugger into
-VS Code.
+The official VS Code extension for the Halis toolchain. It wires the
+`hls-lsp` language server, the `hlfmt` formatter, the `hllint`
+linter and the `hls-dap` debugger into the editor.
 
 ## Features
 
-- **Language Server** — full LSP via `tools/hls-lsp.py`:
-  - hover (inferred types)
+- **Language server** — full LSP via `tools/hls-lsp.py`:
+  - hover with inferred types
   - go-to-definition (cross-file, follows imports)
-  - find references
-  - rename refactoring (across all open documents)
-  - document symbols (outline view)
-  - diagnostics (type + effects errors as you type)
-  - completion (keywords + builtins + identifiers)
-- **Formatter** — `Format File` command runs `hlfmt -w` on the active
-  document. Enable `halis.formatOnSave` to run on every save.
-- **Linter** — `Lint File` command runs `hllint --strict` and shows
-  the output in a `Halis Lint` channel.
-- **Debugger** (Stage 121) — debug a Halis program through the
-  Stage-0 interpreter via `tools/hls-dap.py` (Debug Adapter Protocol):
-  - breakpoints, verified against the real AST (a line without a
+  - find references, rename across open documents
+  - document symbols (outline)
+  - diagnostics — type and effects errors as you type
+  - completion for keywords, builtins and identifiers
+- **Formatter** — the `Format File` command runs `hlfmt -w` on the
+  active document; enable `halis.formatOnSave` to format on every
+  save.
+- **Linter** — the `Lint File` command runs `hllint --strict` and
+  shows the output in a dedicated channel; `halis.lintOnSave`
+  repeats it on save.
+- **Debugger** — debug a Halis program through the debug adapter
+  (`tools/hls-dap.py`, Debug Adapter Protocol over stdio):
+  - breakpoints verified against the real AST (a line without a
     statement snaps to the nearest one and says so)
   - step over / into / out, stop on entry, pause
-  - the variables view: locals with declared types, struct fields,
-    enum payloads, list elements
-  - a debug console that evaluates real expressions in the paused
-    frame (arithmetic, field chains, user fns, builtins)
-  - panics stop the program dead at the panic site with the real
-    message and stack (the `panics` exception filter, on by default)
+  - variables view: locals with declared types, struct fields, enum
+    payloads, list elements
+  - a debug console evaluating real expressions in the paused frame
+    (arithmetic, field chains, user functions, builtins)
+  - panics stop the program at the panic site with the real message
+    and stack (the `panics` exception filter, on by default)
   - spawned tasks appear as threads with their own stacks
-  - `Halis: Debug Program` command launches the active file (or picks
-    one from the workspace)
 
 ## Debugging
 
@@ -55,10 +53,9 @@ Add a launch configuration to `.vscode/launch.json`:
 ```
 
 Or run `Halis: Debug Program` from the command palette with a `.hls`
-file open. Launch snippets are offered by the editor (Insert Snippet
-in a launch.json). The adapter is launched automatically with the
-configured Python (`halis.pythonPath`); point `halis.debugAdapterPath`
-at a specific `hls-dap.py` to override auto-discovery.
+file open. The adapter is launched automatically with the configured
+Python (`halis.pythonPath`); point `halis.debugAdapterPath` at a
+specific `hls-dap.py` to override auto-discovery.
 
 ## Installation
 
@@ -67,17 +64,16 @@ To install locally for development:
 
 ```bash
 cd editors/vscode/halis
-# Install the vscode-languageclient npm dependency for LSP:
-npm install vscode-languageclient
-# Then in VS Code: Run "Extensions: Install from Location..."
+npm install vscode-languageclient   # the one LSP dependency
+# Then in VS Code: "Extensions: Install from Location..."
 # and pick the editors/vscode/halis folder.
 ```
 
-Alternatively, run the extension in the Extension Development Host:
+To run it in the Extension Development Host:
 
 1. Open the `editors/vscode/halis` folder in VS Code.
-2. Press `F5` (or `Run > Start Debugging`).
-3. A new VS Code window opens with the Halis extension loaded.
+2. Press `F5` (or *Run > Start Debugging*).
+3. A new window opens with the Halis extension loaded.
 
 ## Configuration
 
@@ -87,7 +83,7 @@ Alternatively, run the extension in the Extension Development Host:
 | `halis.debugAdapterPath` | `""` | Path to `hls-dap.py`. Empty = auto-discover. |
 | `halis.formatOnSave` | `false` | Run `hlfmt -w` on save. |
 | `halis.lintOnSave` | `true` | Run `hllint` on save. |
-| `halis.pythonPath` | `"python3"` | Python interpreter for the toolchain (LSP, formatter, linter, debug adapter). |
+| `halis.pythonPath` | `"python3"` | Interpreter for the toolchain (LSP, formatter, linter, debug adapter). |
 
 ## Auto-discovery
 
@@ -95,4 +91,4 @@ When a path setting is empty, the extension looks for:
 
 1. `<workspace>/tools/<tool>.py` (`hls-lsp.py`, `hlfmt.py`,
    `hllint.py`, `hls-dap.py`)
-2. the tool name on `PATH` (assumes the repo is installed system-wide)
+2. the tool name on `PATH` (for system-wide installs)
