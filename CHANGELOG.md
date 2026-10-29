@@ -14,6 +14,117 @@ stability (125–140), and final stabilisation toward v1.0 (141–150).
 Releases on `feature/community-extensions` carry non-roadmap upgrades:
 new stdlib modules, tooling, examples, and CI/CD improvements.
 
+## [v1.0.0] — Stage 150: HLS v1.0 — the LTS release, the road kept
+
+- The roadmap's phrase is "HLS v1.0 — LTS release", and this round
+  is the road's last stage doing exactly what it says: cutting the
+  release the four candidates rehearsed. The day ran the way Stage
+  148's dry-run walked it, on the real tree this time: the markers
+  moved to 1.0.0 (the changelog heading, the snapshot manifest, the
+  editor manifest — one voice), the anchor retired WITH the release
+  commit (RC.md stays as the last candidate's record — history now,
+  not a law), the tag was cut, and `hls-lts init --tag v1.0.0`
+  opened the line: the branch `release/1.0` stands where the tag
+  stands, `.hls-lts.json` records the declaration, and the windows
+  became the clock — 3 years of bug fixes through 2029-10-29, 5
+  years of security through 2031-10-29, counted from the release
+  day itself, the horizon day belonging to the phase it closes.
+  The RC kit retired, named: readiness refuses on BOTH laws (the
+  roadmap law — every stage ticked, nothing left to candidate for;
+  the lts law — a line is declared, and a candidate opens none),
+  the gate, the record and the witness refuse on the missing
+  anchor. Nothing panicked, nothing pretended — the kit that
+  certified the road closed its own office with the same
+  discipline it enforced on everyone else.
+- **The round's discovery: the candidate gates carried one
+  unguarded assumption — that the tree they run on still has a
+  candidate to be.** Every acceptance gate from Stage 146 on
+  asserted "the REAL tree is ready" unguarded, and the release
+  would have turned all four red on the morning after their own
+  verdict. They now read the line's state before they speak: the
+  eve (the anchor stands, no line declared — the assertions they
+  always made) and the release (every command refusing, NAMED —
+  readiness on both laws, gate and record and witness on the
+  missing anchor, the line declared where the hand-off section
+  watched for it). Both are legal states of the line; a half-cut
+  release — an anchor gone without a line, or a line under a live
+  anchor — is not a state, and the gates say so instead of
+  guessing. The successor inherits the kit that certified its
+  predecessor, past the end of the road: `make rc-acceptance`,
+  `make rc2-acceptance`, `make rc3-acceptance`, `make
+  rc4-acceptance` — green on the eve, green after the release, the
+  same laws speaking the right verdict for the state they find.
+- **The acceptance gate.** `make release-acceptance` — six
+  sections, 60 checks on the released tree (40 on the eve): the
+  state law (the tree is a legal state of the line; the roadmap
+  parses to exactly 150 rows the way the kit reads them — row
+  122's cancelled narrowness included — the closed prefix
+  contiguous, the three markers one voice), the retirement law
+  (green on the eve; after the release, every RC command refusing
+  with its law named), the line law (the declaration's shape —
+  base tag, branch, policy name, base sha the commit the tag
+  names, the branch standing at the release commit — the windows
+  re-derived from the base day by the same calendar law the tool
+  enforces, the release day active, the line idempotent, a second
+  base refused), the wrong turns and the cut on a scratch world (a
+  bare v1.0.0 is not a candidate, a pre-release is not a base, a
+  pre-1.0 tag is not a line, a tag that does not exist opens
+  nothing — then the whole choreography: markers, anchor retiring,
+  tag, line, windows, retirement, idempotency, one declaration),
+  the docs law (the changelog's head is the release's own entry,
+  the roadmap's last row ticked with its phrase, the README tour
+  carrying the gate and the clock, LTS.md still matching its
+  render), and the corpus showcase.
+- **The corpus showcase.** `tests/ok/feat_stage150_release.hls`
+  pins the release laws in pure HLS: the order law (the release
+  day as an ordered machine — eve, docs, tag, line, retired,
+  witness — one step at a time, the line init the one idempotent
+  step, the wrong orders named), the hand-off law (the boundary is
+  one artifact: rc.4's successor and the 1.0 line's base are the
+  same tag; before it the RC kit answers, after it the LTS kit
+  does, and the two never answer together), the retirement law (a
+  retired kit refuses NAMED — exit 1, never 0 pretending, never
+  101 crashing — and readiness's refusal names TWO laws, not
+  one), the window law (the clock in anniversaries, not day
+  counts — 2026-10-29 bug-fixed through 2029-10-29, secured
+  through 2031-10-29 — the February 29 birthday clamping to the
+  28th when the target year is not leap, the horizon day belonging
+  to the phase it closes, and what lands where: plain fixes in
+  active, marked fixes in security, nothing at all in eol), the
+  marker law (one voice in three mouths — the manifest wears the
+  `v`, the heading and the editor manifest do not — a disagreeing
+  mouth counted and named), and the line law (the init verdicts in
+  the order the day refused them, the declaration's shape, a patch
+  is never a base) — hlfmt-canonical, hllint-clean, byte-identical
+  on the interpreter and natively.
+- **The record:** ROADMAP Stage 150 ticks — the table closes at
+  the row the whole document walked toward; the README tour grows
+  the `release-acceptance` line and the clock beside it; the
+  version markers move together to 1.0.0 — the changelog heading,
+  the snapshot manifest (manifest-only: the emitted C did not move
+  this round), the editor manifest. The freeze did not move — the
+  surface travels at digest `84d1068f80d62f3f...`, anchored at
+  9dbed2e1138d since release 0.159.0-alpha, and `make
+  freeze-verify` says so on this very tree; the snapshot fixed
+  point did not move (`make snapshot-verify`); the guarantee
+  ledger did not move (`make guarantee-report`). Stages 146
+  through 149's own gates pass on the released tree — the kit
+  inherited both ends. LTS.md still matches its render (`make
+  lts-policy-verify`): the promise and the clock are the same
+  numbers, and the clock now runs.
+- **The road, kept.** One hundred and fifty stages, ten phases,
+  from a bootstrap seed to a compiler that proves its own
+  bootstrap byte for byte: the language, the toolchain and the
+  verification stack all in Halis, the three application families
+  the road promised (CLI, web, the OS-development foundation)
+  first-class from Stage 1 to this one. What comes after v1.0 is
+  not in any stage table: the LTS line `release/1.0` takes
+  backports with their provenance trailers and cuts patch releases
+  under the window law; the roadmap's own note stands — this
+  project builds the language OTHERS build operating systems with
+  — and the next version number belongs to semver, not to a stage
+  to tick.
+
 ## [v1.0.0-rc.4] — Stage 149: the sign-off, the candidate signed
 - The roadmap's phrase is "v1.0 Release Candidate 4 (sign-off)", and
   the sign-off is the one thing the candidate line still lacked: a

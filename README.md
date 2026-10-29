@@ -424,6 +424,26 @@ make rc4-acceptance           # Stage 149 gate: the sign-off
                                # once, the pre-flight pinning
                                # signoff --check dynamically, the
                                # corpus showcase)
+make release-acceptance       # Stage 150 gate: the release itself
+                               # (the state law — the tree a legal
+                               # state of the line: the eve, or the
+                               # release; a half-cut release is not
+                               # a state — the retirement law, the
+                               # RC kit green on the eve and every
+                               # command refusing NAMED after —
+                               # the line law, the windows read off
+                               # the base day, the line idempotent,
+                               # a second base refused — the wrong
+                               # turns and the cut rehearsed on a
+                               # scratch world — LTS.md still
+                               # matching its render, the corpus
+                               # showcase)
+bin/hls-lts status            # the line's clock — branch
+                               # release/1.0, the windows (3 years
+                               # of bug fixes, 5 of security,
+                               # counted from the base release's
+                               # day), the tags on the branch, the
+                               # audit verdict
 python3 tools/hls-xdiff.py     # Stage 133: the cross-impl
                                # differential table — the SAME
                                # program through the interpreter,
