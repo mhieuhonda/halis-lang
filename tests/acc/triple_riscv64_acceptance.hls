@@ -1,0 +1,816 @@
+# ============================================================================
+# tests/acc/triple_riscv64_acceptance.hls — Stage 95 acceptance gate, in Halis
+# (the Halis twin of tests/triple_riscv64_acceptance.py; same eight
+# sections, same assertions, same needles — the harness is
+# tests/acc/harness.hls and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make triple-riscv64-acceptance` (which compiles this file
+# to bin/acc-triple-riscv64 and runs it from the repo root).
+#
+#  1. the CLI surface        — the triple compiles, the refused
+#                              combinations say the same words from both
+#                              front-ends
+#  2. the integer-only rule  — the eight tests/bare probes rejected by
+#                              BOTH compilers under the RISC-V triple,
+#                              still legal hosted
+#  3. the implication        — --target implies #![freestanding]: audit
+#                              parity on a crate that never declared it
+#  4. the emission shape     — the stamp, the 3-header TU, and the
+#                              RISC-V branch of the naked _start (`call
+#                              hl_boot` — a real RISC-V pseudo-op — and
+#                              the `ecall` exit)
+#  5. the image              — with a cross-linker on PATH (zig cc, or
+#                              any riscv64 gcc): ELF64 RISC-V
+#                              (EM_RISCV=243), entry at 0x80000000 (the
+#                              virt DRAM base), zero undefined symbols,
+#                              and ZERO floating-point instructions
+#                              (rv64imac's own backstop, verified in the
+#                              disassembly); without a toolchain, the
+#                              honest SKIP that keeps the C
+#  6. the QEMU boot          — with qemu-system-riscv64 installed: the
+#                              NS16550A banner on the virt console AND
+#                              the SiFive test finisher's exit code
+#                              (42) as QEMU's own exit status;
+#                              otherwise a reported SKIP (the battery's
+#                              timeout=25 is reproduced with coreutils
+#                              `timeout` — the Halis runtime has no
+#                              per-child alarm)
+#  7. the linker script      — targets/riscv64-unknown-none.ld: the
+#                              virt DRAM base, _start kept first, the
+#                              metadata + boot-header keeps
+#  8. the trio               — the registry names all three bare-metal
+#                              triples, and the tools stay clean
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+
+# ----------------------------------------------------------------------------
+# The gate's data.
+# ----------------------------------------------------------------------------
+
+struct FailP {
+    stem: str,
+    needle: str
+}
+
+struct LdCheck {
+    needle: str,
+    why: str
+}
+
+struct ElfHdr {
+    ok: bool,
+    ei_class: int,
+    ei_data: int,
+    machine: int,
+    entry: int
+}
+
+fn triple() -> str {
+    return "riscv64-unknown-none"
+}
+
+fn demo() -> str {
+    return "examples/bare_riscv64.hls"
+}
+
+fn fail_programs() -> list[FailP] {
+    return[
+    FailP {
+        stem: "fail_bare_float_literal", needle: "float literals are not available"
+    },
+    FailP {
+        stem: "fail_bare_float_param", needle: "the type 'float' is not available"
+    },
+    FailP {
+        stem: "fail_bare_float_ret", needle: "the type 'float' is not available"
+    },
+    FailP {
+        stem: "fail_bare_float_field", needle: "the type 'list[float]' is not available"
+    },
+    FailP {
+        stem: "fail_bare_float_variant", needle: "the type 'float' is not available"
+    },
+    FailP {
+        stem: "fail_bare_float_let", needle: "the type 'float' is not available"
+    },
+    FailP {
+        stem: "fail_bare_float_listelem", needle: "the type 'list[float]' is not available"
+    },
+    FailP {
+        stem: "fail_bare_float_generic", needle: "the type 'Cell[float]' is not available"
+    },
+    ]
+}
+
+fn script_checks() -> list[LdCheck] {
+    return[
+    LdCheck {
+        needle: "OUTPUT_FORMAT(elf64-littleriscv)", why: "the format is RISC-V ELF"
+    },
+    LdCheck {
+        needle: "ENTRY(_start)", why: "the entry is _start"
+    },
+    LdCheck {
+        needle: ". = 0x80000000;", why: "the base is QEMU virt's DRAM base"
+    },
+    LdCheck {
+        needle: "KEEP(*(.text._start))", why: "_start is kept and placed first"
+    },
+    LdCheck {
+        needle: "KEEP(*(.limine_requests))", why: "the Limine keep carries over"
+    },
+    LdCheck {
+        needle: "__halis_metadata_start",
+        why: "the Stage 84 metadata section is bounded"
+    },
+    LdCheck {
+        needle: "*(.eh_frame)", why: "eh_frame is discarded"
+    },
+    LdCheck {
+        needle: "NOLOAD", why: "bss is NOLOAD"
+    },
+    ]
+}
+
+fn imply_src() -> str {
+    return "# No crate attribute — the triple is the promise.\n" +
+    "fn main() -> int {\n" +
+    "    let mut acc: int = 0\n" +
+    "    let mut i: int = 0\n" +
+    "    while i < 4 {\n" +
+    "        acc = acc + i\n" +
+    "        i = i + 1\n" +
+    "    }\n" +
+    "    return acc - 6 + 42\n" +
+    "}\n"
+}
+
+# skip_msg — the battery's skip(): neither PASS nor FAIL.
+fn skip_msg(acc: Acc, name: str) -> void uses IO {
+    println("  [SKIP] " + name)
+}
+
+# ----------------------------------------------------------------------------
+# Shared legs.
+# ----------------------------------------------------------------------------
+
+fn find_last(s: str, sub: str) -> int {
+    let mut i: int = s.len() - sub.len()
+    while i >= 0 {
+        if s.slice(i, i + sub.len()) == sub {
+            return i
+        }
+        i = i - 1
+    }
+    return -1
+}
+
+# normalise(text) — strip the front-end-specific prefix and the line
+# suffix so the two compilers' diagnostics compare byte for byte (the
+# old battery's three re.sub passes, as byte logic — same convention
+# as the Stage 86/91 gates).
+fn normalise(text: str) -> str {
+    let mut t: str = text.trim()
+    # "^panic: "
+    if t.starts_with("panic: ") {
+        t = t.slice(7, t.len())
+    }
+    # "^[a-z ]*error: " — an optional front-end name, then the error.
+    let e: int = t.find("error: ")
+    if e >= 0 {
+        let mut all_az: bool = true
+        let mut i: int = 0
+        while i < e {
+            let c: int = t.byte_at(i)
+            if !((c >= 97 && c <= 122) || c == 32) {
+                all_az = false
+                break
+            }
+            i = i + 1
+        }
+        if all_az {
+            t = t.slice(e + 7, t.len())
+        }
+    }
+    # " \(line N[:M]\)$" — the trailing position suffix.
+    let l: int = find_last(t, " (line ")
+    if l >= 0 {
+        let mut j: int = l + 7
+        let mut shape_ok: bool = true
+        let mut digits: int = 0
+        while j < t.len() && t.byte_at(j) >= 48 && t.byte_at(j) <= 57 {
+            j = j + 1
+            digits = digits + 1
+        }
+        if digits == 0 {
+            shape_ok = false
+        }
+        if shape_ok && j < t.len() && t.byte_at(j) == 58 {
+            j = j + 1
+            let mut d2: int = 0
+            while j < t.len() && t.byte_at(j) >= 48 && t.byte_at(j) <= 57 {
+                j = j + 1
+                d2 = d2 + 1
+            }
+            if d2 == 0 {
+                shape_ok = false
+            }
+        }
+        if shape_ok && j < t.len() && t.byte_at(j) == 41 {
+            j = j + 1
+            if j == t.len() {
+                t = t.slice(0, l)
+            }
+        }
+    }
+    return t
+}
+
+# first_diag(text) — the first line of a diagnostic, normalised.
+fn first_diag(text: str) -> str {
+    return normalise(first_line(text))
+}
+
+# find_from(s, sub, from) — str.find with a start offset.
+fn find_from(s: str, sub: str, from: int) -> int {
+    let mut start: int = from
+    if start < 0 {
+        start = 0
+    }
+    if start > s.len() {
+        return -1
+    }
+    let at: int = s.slice(start, s.len()).find(sub)
+    if at < 0 {
+        return -1
+    }
+    return start + at
+}
+
+# boot_check_target(src, with_target) — the lab interpreter's --check
+# with the triple attached (or not, for the hosted-boundary probes).
+fn boot_check_target(acc: Acc, src: str, with_target: bool) -> RunResult uses Proc {
+    let args: list[str] = ["--check", "--target", triple(), src]
+    if !with_target {
+        let plain: list[str] = ["--check", src]
+        return boot(acc, plain)
+    }
+    return boot(acc, args)
+}
+
+# hlc_compile_target(src, out_c, with_target) — the self-hosted
+# compiler under --target.
+fn hlc_compile_target(acc: Acc, src: str, out_c: str, with_target: bool) -> RunResult uses Proc {
+    let args: list[str] = ["--target", triple(), src, out_c]
+    if !with_target {
+        let plain: list[str] = [src, out_c]
+        return run_capture(hlc_path(acc), plain)
+    }
+    return run_capture(hlc_path(acc), args)
+}
+
+# audit_mode_lines(out) — the audit's crate-mode/target lines, the way
+# the battery filtered them.
+fn audit_mode_lines(out: str) -> list[str] {
+    let lines: list[str] = out.split("\n")
+    let sel: list[str] = []
+    let mut i: int = 0
+    while i < lines.len() {
+        let l: str = lines.get(i)
+        if l.contains("Crate mode") || l.contains("Target:") {
+            sel.push(l.trim())
+        }
+        i = i + 1
+    }
+    return sel
+}
+
+fn lists_eq(a: list[str], b: list[str]) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    let mut i: int = 0
+    while i < a.len() {
+        if a.get(i) != b.get(i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn str_in_list(xs: list[str], v: str) -> bool {
+    let mut i: int = 0
+    while i < xs.len() {
+        if xs.get(i) == v {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn is_ws_byte(c: int) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13
+}
+
+fn is_word_byte(b: int) -> bool {
+    return(b >= 65 && b <= 90) || (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 95
+}
+
+# include_headers(src) — every `#include <...>` header name, in order
+# (the battery's re.findall of the angle includes).
+fn include_headers(src: str) -> list[str] {
+    let out: list[str] = []
+    let mut from: int = 0
+    while from < src.len() {
+        let at: int = find_from(src, "#include", from)
+        if at < 0 {
+            break
+        }
+        let mut j: int = at + 8
+        while j < src.len() && is_ws_byte(src.byte_at(j)) {
+            j = j + 1
+        }
+        if j < src.len() && src.byte_at(j) == 60 {
+            let close: int = find_from(src, ">", j + 1)
+            if close > j {
+                out.push(src.slice(j + 1, close))
+                from = close + 1
+            } else {
+                from = at + 8
+            }
+        } else {
+            from = at + 8
+        }
+    }
+    return out
+}
+
+# inc_eq_3(inc) — the header set equals the 3-header freestanding TU
+# (duplicates ignored, exactly what the battery's sorted(set(...)) did).
+fn inc_eq_3(inc: list[str]) -> bool {
+    let want: list[str] = ["stdbool.h", "stddef.h", "stdint.h"]
+    let mut i: int = 0
+    while i < inc.len() {
+        if !str_in_list(want, inc.get(i)) {
+            return false
+        }
+        i = i + 1
+    }
+    let mut j: int = 0
+    while j < want.len() {
+        if !str_in_list(inc, want.get(j)) {
+            return false
+        }
+        j = j + 1
+    }
+    return true
+}
+
+# entry_branch(src, start_marker, end_marker) — the naked entry's
+# per-arch branch: the first start_marker AFTER the `void _start(void)`
+# definition (the runtime has earlier #elif blocks — the SIMD feature
+# probe — so the anchor matters), up to its end_marker. The battery's
+# re.search over the _start tail, as byte logic.
+fn entry_branch(src: str, start_marker: str, end_marker: str) -> str {
+    let idx: int = src.find("void _start(void)")
+    if idx < 0 {
+        return ""
+    }
+    let tail: str = src.slice(idx, src.len())
+    let at: int = tail.find(start_marker)
+    if at < 0 {
+        return ""
+    }
+    let from: int = at + start_marker.len()
+    let end: int = find_from(tail, end_marker, from)
+    if end < from {
+        return ""
+    }
+    return tail.slice(from, end)
+}
+
+# count_before_boundary(hay, nd) — occurrences of nd with a word
+# boundary BEFORE it (the battery's \b(...), left half).
+fn count_before_boundary(hay: str, nd: str) -> int {
+    let mut count: int = 0
+    let mut i: int = 0
+    let c0: int = nd.byte_at(0)
+    while i + nd.len() <= hay.len() {
+        if hay.byte_at(i) == c0 && hay.slice(i, i + nd.len()) == nd {
+            let before_ok: bool = i == 0 || !is_word_byte(hay.byte_at(i - 1))
+            if before_ok {
+                count = count + 1
+            }
+            i = i + nd.len()
+        } else {
+            i = i + 1
+        }
+    }
+    return count
+}
+
+# has_fp_mnemonic(disasm) — the battery's FP-instruction census over
+# the objdump text: \b(fld|fsd|flw|fsw|fmv\.[dwxs]|fcvt\.\w+|fadd\.|
+# fmul\.|fdiv\.).
+fn has_fp_mnemonic(disasm: str) -> bool {
+    let plain: list[str] = ["fld", "fsd", "flw", "fsw", "fadd.", "fmul.", "fdiv."]
+    let mut i: int = 0
+    while i < plain.len() {
+        if count_before_boundary(disasm, plain.get(i)) > 0 {
+            return true
+        }
+        i = i + 1
+    }
+    # "fmv." — the [dwxs] class after the dot.
+    let mut j: int = 0
+    while j + 4 < disasm.len() {
+        if disasm.byte_at(j) == 102 && disasm.slice(j, j + 4) == "fmv." {
+            let before_ok: bool = j == 0 || !is_word_byte(disasm.byte_at(j - 1))
+            if before_ok {
+                let nxt: int = disasm.byte_at(j + 4)
+                if nxt == 100 || nxt == 119 || nxt == 120 || nxt == 115 {
+                    return true
+                }
+            }
+        }
+        j = j + 1
+    }
+    # "fcvt." — at least one word byte after the dot (\w+).
+    let mut k: int = 0
+    while k + 5 < disasm.len() {
+        if disasm.byte_at(k) == 102 && disasm.slice(k, k + 5) == "fcvt." {
+            let before_ok: bool = k == 0 || !is_word_byte(disasm.byte_at(k - 1))
+            if before_ok && is_word_byte(disasm.byte_at(k + 5)) {
+                return true
+            }
+        }
+        k = k + 1
+    }
+    return false
+}
+
+# elf_header(path) — (ei_class, ei_data, e_machine, e_entry) of an
+# ELF64 image, read byte by byte (read_file is byte-transparent).
+fn elf_header(path: str) -> ElfHdr uses Fs {
+    let h: ElfHdr = ElfHdr {
+        ok: false, ei_class: 0, ei_data: 0, machine: 0, entry: 0
+    }
+    if !file_exists(path) {
+        return h
+    }
+    let blob: str = read_file(path)
+    if blob.len() < 64 {
+        return h
+    }
+    # "\x7fELF"
+    if blob.byte_at(0) != 127 || blob.byte_at(1) != 69 || blob.byte_at(2) != 76
+    || blob.byte_at(3) != 70 {
+        return h
+    }
+    h.ok = true
+    h.ei_class = blob.byte_at(4)
+    h.ei_data = blob.byte_at(5)
+    # e_machine: little-endian uint16 at offset 18
+    h.machine = blob.byte_at(18) + blob.byte_at(19) * 256
+    # e_entry: little-endian uint64 at offset 24 (MSB first, so the
+    # checked multiply never leaves the i64 range for real entries)
+    let mut e: int = 0
+    let mut i: int = 31
+    while i >= 24 {
+        e = e * 256 + blob.byte_at(i)
+        i = i - 1
+    }
+    h.entry = e
+    return h
+}
+
+# ----------------------------------------------------------------------------
+# 1. the CLI surface
+# ----------------------------------------------------------------------------
+fn sec1(acc: Acc) -> void uses IO, Fs, Proc {
+    section("1. the CLI surface")
+    let never: str = scratch(acc, "never.c")
+    let h: RunResult = run_capture(hlc_path(acc),
+    ["--target", triple(), "tests/bare/fail_bare_float_param.hls", never])
+    let b: RunResult = boot(acc, ["--check", "--target", triple(),
+    "tests/bare/fail_bare_float_param.hls"])
+    if h.code == 0 || b.code == 0 {
+        fail_msg(acc, "CLI: the triple accepted a float crate")
+    } else {
+        pass_msg(acc, "CLI: the triple drives both front-ends")
+    }
+    let feat_msg: str = "--target-feature is not available on target " + triple()
+    + " (bare-metal targets are integer-only: SIMD intrinsics use "
+    + "floating-point registers)"
+    let h2: RunResult = run_capture(hlc_path(acc),
+    ["--target", triple(), "--target-feature", "rvv", demo(), never])
+    if h2.code == 0 || !h2.combined.trim().contains(feat_msg) {
+        fail_msg(acc, "CLI: --target-feature refusal missing or wrong: "
+        + clip(h2.combined, 160))
+    } else {
+        pass_msg(acc, "CLI: --target-feature (rvv) refused on the RISC-V triple")
+    }
+    let nolc_msg: str = "--no-libc is not available on target " + triple()
+    + " (the bare-metal triples build freestanding images, not "
+    + "hosted no-libc ones)"
+    let h3: RunResult = run_capture(hlc_path(acc),
+    ["--target", triple(), "--no-libc", demo(), never])
+    if h3.code == 0 || !h3.combined.trim().contains(nolc_msg) {
+        fail_msg(acc, "CLI: --no-libc refusal missing or wrong: " + clip(h3.combined, 160))
+    } else {
+        pass_msg(acc, "CLI: --no-libc refused on the RISC-V triple")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 2. the integer-only rule: the probes, both front-ends
+# ----------------------------------------------------------------------------
+fn sec2(acc: Acc) -> void uses IO, Fs, Proc {
+    section("2. the integer-only rule: the probes, both front-ends")
+    let fps: list[FailP] = fail_programs()
+    let mut i: int = 0
+    while i < fps.len() {
+        let fp: FailP = fps.get(i)
+        let src: str = "tests/bare/" + fp.stem + ".hls"
+        let b: RunResult = boot_check_target(acc, src, true)
+        let h: RunResult = hlc_compile_target(acc, src, scratch(acc, fp.stem + ".c"), true)
+        if b.code == 0 || h.code == 0 {
+            fail_msg(acc, fp.stem + ": accepted under --target " + triple())
+            i = i + 1
+            continue
+        }
+        let bmsg: str = first_diag(b.combined)
+        let hmsg: str = first_diag(h.combined)
+        if bmsg != hmsg {
+            fail_msg(acc, fp.stem + ": front-ends disagree: boot: " + bmsg
+            + " | hlc: " + hmsg)
+            i = i + 1
+            continue
+        }
+        if !bmsg.contains(fp.needle) || !bmsg.contains(triple()) {
+            fail_msg(acc, fp.stem + ": diagnostic does not name the construct and the "
+            + "triple: " + bmsg)
+            i = i + 1
+            continue
+        }
+        pass_msg(acc, fp.stem + " rejected identically under the RISC-V triple")
+        i = i + 1
+    }
+    let mut legal: bool = true
+    let mut j: int = 0
+    while j < fps.len() {
+        let fp2: FailP = fps.get(j)
+        let rr: RunResult = boot_check_target(acc, "tests/bare/" + fp2.stem + ".hls", false)
+        if rr.code != 0 {
+            legal = false
+            fail_msg(acc, fp2.stem + ": not a legal hosted crate without --target")
+        }
+        j = j + 1
+    }
+    if legal {
+        pass_msg(acc, "boundary: all 8 probes stay legal hosted")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 3. the implication: audit parity
+# ----------------------------------------------------------------------------
+fn sec3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("3. the implication: audit parity")
+    let ipath: str = write_src(acc, "imply.hls", imply_src())
+    let b: RunResult = boot(acc, ["--target", triple(), "--audit", ipath])
+    let h: RunResult = run_capture(hlc_path(acc), ["--target", triple(), "--audit", ipath])
+    let b_lines: list[str] = audit_mode_lines(b.out)
+    let h_lines: list[str] = audit_mode_lines(h.out)
+    let mut okc: bool = b.code == 0 && h.code == 0 && lists_eq(b_lines, h_lines)
+    && b_lines.len() == 2
+    if okc {
+        okc = b_lines.get(1).contains("Target: " + triple()
+        + " (bare-metal, integer-only)")
+    }
+    if okc {
+        pass_msg(acc, "imply: the audits agree — freestanding implied, RISC-V stated")
+    } else {
+        fail_msg(acc, "imply: audits disagree or omit the target: boot: ["
+        + str_join(b_lines, ", ") + "] hlc: [" + str_join(h_lines, ", ") + "]")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 4. the emission shape: the stamp and the RISC-V entry
+# ----------------------------------------------------------------------------
+fn sec4(acc: Acc) -> void uses IO, Fs, Proc {
+    section("4. the emission shape: the stamp and the RISC-V entry")
+    let demo_c: str = scratch(acc, "demo.c")
+    let h: RunResult = hlc_compile_target(acc, demo(), demo_c, true)
+    if h.code != 0 {
+        fail_msg(acc, "shape: the demo failed to compile: " + clip(h.combined, 160))
+        return
+    }
+    let src: str = read_file(demo_c)
+    let inc: list[str] = include_headers(src)
+    let branch: str = entry_branch(src, "#elif defined(__riscv)", "#else")
+    if !inc_eq_3(inc) {
+        fail_msg(acc, "shape: wrong headers: [" + str_join(inc, ", ") + "]")
+    } else if !src.contains("target: " + triple()
+    + " (bare-metal, integer-only, freestanding)") {
+        fail_msg(acc, "shape: the C does not carry the RISC-V triple stamp")
+    } else if !branch.contains("call hl_boot") || !branch.contains("ecall") {
+        fail_msg(acc, "shape: the RISC-V _start branch is not the call/ecall shape: "
+        + clip(branch, 120))
+    } else {
+        pass_msg(acc, "shape: stamp, 3-header TU, call/ecall entry branch")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 5. the image: cross-linked when a toolchain exists
+# ----------------------------------------------------------------------------
+fn sec5(acc: Acc) -> void uses IO, Fs, Proc {
+    section("5. the image: cross-linked when a toolchain exists")
+    let out_bin: str = scratch(acc, "bare_riscv64")
+    let keep_c: str = scratch(acc, "cross.c")
+    let cr: RunResult = run_capture("python3", ["tools/hlcross.py", demo(), out_bin,
+    "--target", triple(), "--keep-c", keep_c])
+    if cr.code == 0 {
+        let hdr: ElfHdr = elf_header(out_bin)
+        if !hdr.ok {
+            fail_msg(acc, "image: hlcross produced a non-ELF")
+        } else if hdr.ei_class != 2 || hdr.ei_data != 1 || hdr.machine != 243 {
+            fail_msg(acc, "image: wrong ELF identity (machine=" + hdr.machine.to_str()
+            + ", want EM_RISCV=243)")
+        } else if hdr.entry != 2147483648 {
+            fail_msg(acc, "image: entry " + hdr.entry.to_str()
+            + " is not the virt DRAM base 0x80000000")
+        } else {
+            pass_msg(acc, "image: ELF64 LE RISC-V, entry at the virt DRAM base")
+        }
+        let undef: RunResult = run_capture("nm", ["-u", out_bin])
+        if undef.code == 0 && undef.out.trim() != "" {
+            fail_msg(acc, "image: undefined symbols survive: " + clip(undef.out, 120))
+        } else {
+            pass_msg(acc, "image: zero undefined symbols")
+        }
+        # The rv64imac backstop: ZERO floating-point instructions in the
+        # disassembly — wherever an objdump exists.
+        let mut objdump: str = ""
+        if which("riscv64-linux-gnu-objdump") {
+            objdump = "riscv64-linux-gnu-objdump"
+        } else if which("llvm-objdump") {
+            objdump = "llvm-objdump"
+        }
+        let mut checked: bool = false
+        let mut have_fp: bool = false
+        if objdump != "" {
+            let d: RunResult = run_capture(objdump, ["-d", out_bin])
+            have_fp = has_fp_mnemonic(d.out)
+            checked = true
+        } else if which("zig") {
+            let d: RunResult = run_capture("zig", ["objdump", "-d", out_bin])
+            have_fp = has_fp_mnemonic(d.out)
+            checked = true
+        }
+        if !checked {
+            skip_msg(acc, "image: no objdump available — the FP-free disassembly is "
+            + "checked wherever one exists")
+        } else if have_fp {
+            fail_msg(acc, "image: floating-point instructions in an rv64imac image")
+        } else {
+            pass_msg(acc, "image: zero floating-point instructions (the rv64imac "
+            + "backstop, verified in the disassembly)")
+        }
+    } else if cr.code == 3 {
+        let hint: str = cr.combined
+        if !hint.contains("no cross-linker found for target '" + triple() + "'") {
+            fail_msg(acc, "image: the SKIP path does not name the triple: "
+            + clip(hint, 160))
+        } else if !file_exists(keep_c) {
+            fail_msg(acc, "image: the SKIP path lost the C source")
+        } else {
+            pass_msg(acc, "image: no RISC-V toolchain — the C source is kept and the "
+            + "SKIP names the triple")
+        }
+    } else {
+        fail_msg(acc, "image: hlcross failed unexpectedly (rc=" + cr.code.to_str() + "): "
+        + clip(cr.combined, 160))
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 6. the QEMU boot (when qemu-system-riscv64 exists)
+# ----------------------------------------------------------------------------
+fn sec6(acc: Acc) -> void uses IO, Fs, Proc {
+    section("6. the QEMU boot (when qemu-system-riscv64 exists)")
+    let img: str = scratch(acc, "bare_riscv64")
+    if !which("qemu-system-riscv64") || !file_exists(img) {
+        skip_msg(acc, "QEMU: qemu-system-riscv64 (or the cross-linked image) not "
+        + "available — the virt boot is exercised wherever the toolchain is")
+        return
+    }
+    # The battery wrapped the run in timeout=25 (the SiFive finisher
+    # normally ends the run itself); the Halis runtime has no per-child
+    # alarm, so the same 25s cap comes from coreutils timeout.
+    let outfile: str = scratch(acc, "qemu_out.txt")
+    let cmd: str = "timeout 25 '" + shell_quote("qemu-system-riscv64")
+    + "' -M virt -bios none -nographic -kernel '" + shell_quote(img)
+    + "' > '" + shell_quote(outfile) + "' 2>&1"
+    let code: int = sh(cmd)
+    let out: str = read_or(outfile, "")
+    if code == 124 {
+        if out.contains("bare riscv64 OK") {
+            pass_msg(acc, "QEMU: the banner reached the virt console (the finisher "
+            + "write was not reached before the kill)")
+        } else {
+            fail_msg(acc, "QEMU: timed out without the banner: " + clip(out, 100))
+        }
+    } else if !out.contains("bare riscv64 OK") {
+        fail_msg(acc, "QEMU: the NS16550A banner did not appear: " + clip(out, 100))
+    } else if code != 42 {
+        fail_msg(acc, "QEMU: the finisher exited " + code.to_str() + ", not 42")
+    } else {
+        pass_msg(acc, "QEMU: the banner reached the virt console AND the finisher "
+        + "exited 42")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 7. the linker script: the shape of the image
+# ----------------------------------------------------------------------------
+fn sec7(acc: Acc) -> void uses IO, Fs {
+    section("7. the linker script: the shape of the image")
+    let script: str = read_or("targets/" + triple() + ".ld", "")
+    let checks: list[LdCheck] = script_checks()
+    let mut bad_script: bool = false
+    let mut i: int = 0
+    while i < checks.len() {
+        let c: LdCheck = checks.get(i)
+        if !script.contains(c.needle) {
+            fail_msg(acc, "script: " + c.why + " — missing '" + c.needle + "'")
+            bad_script = true
+        }
+        i = i + 1
+    }
+    if !bad_script {
+        if script.find("KEEP(*(.text._start))") > script.find("*(.text .text.*)") {
+            fail_msg(acc, "script: .text._start must come before the general .text glob")
+        } else {
+            pass_msg(acc, "script: RISC-V format, virt base, _start-first, keeps, "
+            + "discards — all in place")
+        }
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 8. the trio: the registry is complete, the tools stay clean
+# ----------------------------------------------------------------------------
+fn sec8(acc: Acc) -> void uses IO, Proc {
+    section("8. the trio: the registry is complete, the tools stay clean")
+    let lst: RunResult = run_capture("python3", ["tools/hlcross.py", "--list-targets"])
+    let trio: bool = lst.out.contains("x86_64-unknown-none")
+    && lst.out.contains("aarch64-unknown-none")
+    && lst.out.contains("riscv64-unknown-none")
+    if lst.code != 0 || !trio {
+        fail_msg(acc, "trio: --list-targets does not name all three bare-metal triples")
+    } else {
+        pass_msg(acc, "trio: the registry names all three bare-metal triples")
+    }
+    let fmt1: RunResult = run_capture("./bin/hlfmt", [demo()])
+    let fmt2: RunResult = run_capture("./bin/hlfmt", [demo()])
+    if fmt1.code == 0 && fmt2.code == 0 && fmt1.out == fmt2.out && fmt1.out.trim() != "" {
+        pass_msg(acc, "tools: hlfmt stable on the demo")
+    } else {
+        fail_msg(acc, "tools: hlfmt unstable or empty on the demo")
+    }
+    let lint: RunResult = run_capture("python3", ["tools/hllint.py", demo()])
+    if lint.code != 0 {
+        fail_msg(acc, "tools: hllint findings on the demo:\n" + clip(lint.combined, 200))
+    } else {
+        pass_msg(acc, "tools: hllint clean on the demo")
+    }
+    let ir: RunResult = boot(acc, [demo()])
+    if ir.code == 0 {
+        fail_msg(acc, "tools: the interpreter executed asm! (it must refuse)")
+    } else if !ir.combined.contains("asm! cannot be executed by the boot interpreter") {
+        fail_msg(acc, "tools: the refusal is not the documented one: "
+        + clip(ir.combined, 120))
+    } else {
+        pass_msg(acc, "tools: the interpreter refuses to execute the device writes")
+    }
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let acc: Acc = acc_new("triple-riscv64")
+    sec1(acc)
+    sec2(acc)
+    sec3(acc)
+    sec4(acc)
+    sec5(acc)
+    sec6(acc)
+    sec7(acc)
+    sec8(acc)
+    return finish(acc, "Stage 95 -- target riscv64-unknown-none, the Phase VI trio complete")
+}

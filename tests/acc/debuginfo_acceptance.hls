@@ -1,0 +1,942 @@
+# ============================================================================
+# tests/acc/debuginfo_acceptance.hls — Stage 96 acceptance gate, in Halis
+# (the Halis twin of tests/debuginfo_acceptance.py; same seven
+# sections, same assertions, same needles — the harness is
+# tests/acc/harness.hls and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make debuginfo-acceptance` (which compiles this file to
+# bin/acc-debuginfo and runs it from the repo root).
+#
+#  1. the CLI surface      — --debug refuses a stdout build (the #line
+#                            markers must name the generated C file),
+#                            --symbols demands a path, the usage names
+#                            both flags, and a flags run is DETERMINISTIC
+#                            (byte-identical C and manifest across runs)
+#  2. the line markers     — the C carries `#line` directives naming the
+#                            .hls source at the demo's fn and statement
+#                            lines, and hands the numbering back to the
+#                            generated C file between bodies; a build
+#                            WITHOUT --debug carries no markers at all
+#  3. the DWARF            — the C compiled with -g -gdwarf-5 produces
+#                            DWARF (CU version 5) whose decoded line
+#                            table names the .hls file, and addr2line
+#                            answers with the Halis file:line (wherever
+#                            binutils exists; an honest SKIP otherwise)
+#  4. the manifest shape   — every row is `<binding> <section> <symbol>
+#                            [<source>]`, the user functions carry their
+#                            file:line, and no junk names survive
+#  5. the image vs nm      — the freestanding x86-64 image (built the
+#                            Stage 93 way): every DEFINED symbol nm
+#                            reports is in the manifest (minus the
+#                            linker script's own symbols and GCC's
+#                            `.part.N` clones), the entry chain is
+#                            global text, and the image still exits 42;
+#                            the hosted image's hl_/usf_ symbols are
+#                            complete too, with the manifest's text/bss
+#                            classes agreeing with nm's letters
+#  6. the orchestrator     — hlcross --debug drives hlc --debug plus the
+#                            -g -gdwarf-5 link; the image carries
+#                            .debug_info naming the .hls source
+#  7. the no-libc mode     — the Stage 92 build accepts --debug and
+#                            --symbols too, and the tools stay clean on
+#                            the new sources
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.regex"
+
+# ----------------------------------------------------------------------------
+# The gate's data.
+# ----------------------------------------------------------------------------
+
+struct SymTable {
+    ok: bool,
+    names: list[str],
+    bindings: list[str],
+    letters: list[str]
+}
+
+struct Markers {
+    nums: list[int],
+    files: list[str]
+}
+
+struct LineWant {
+    line: int,
+    why: str
+}
+
+fn triple() -> str {
+    return "x86_64-unknown-none"
+}
+
+fn demo() -> str {
+    return "examples/dbg_demo.hls"
+}
+
+# The demo's pinned lines (dbg_demo.hls): three fns whose fn line and
+# statement lines the markers must name.
+fn demo_mix_line() -> int {
+    return 10
+}
+
+fn demo_gcd_line() -> int {
+    return 16
+}
+
+fn demo_main_line() -> int {
+    return 27
+}
+
+fn demo_mix_stmt() -> int {
+    return 12
+}
+
+fn line_wants() -> list[LineWant] {
+    return[
+    LineWant {
+        line: demo_mix_line(), why: "fn mix"
+    },
+    LineWant {
+        line: demo_mix_stmt(), why: "mix's second statement"
+    },
+    LineWant {
+        line: demo_gcd_line(), why: "fn gcd"
+    },
+    LineWant {
+        line: demo_main_line(), why: "fn main"
+    },
+    ]
+}
+
+# det1.sym — the determinism manifest section 1 writes and sections 4/5
+# read back (the battery's module-level TMP path).
+fn sym_path(acc: Acc) -> str uses Proc {
+    return scratch(acc, "det1.sym")
+}
+
+# skip_msg — the battery's skip(): neither PASS nor FAIL.
+fn skip_msg(acc: Acc, name: str) -> void uses IO {
+    println("  [SKIP] " + name)
+}
+
+# ----------------------------------------------------------------------------
+# Shared legs: text plumbing.
+# ----------------------------------------------------------------------------
+
+fn is_ws_byte(c: int) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13
+}
+
+fn is_word_byte(b: int) -> bool {
+    return(b >= 65 && b <= 90) || (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 95
+}
+
+fn upper_char(c: int) -> int {
+    if c >= 97 && c <= 122 {
+        return c - 32
+    }
+    return c
+}
+
+# split_ws(line) — the whitespace split Python's str.split() does
+# (runs of blanks collapse, no empty fields).
+fn split_ws(line: str) -> list[str] {
+    let out: list[str] = []
+    let mut cur: str = ""
+    let mut i: int = 0
+    while i < line.len() {
+        let c: int = line.byte_at(i)
+        if c == 32 || c == 9 {
+            if cur != "" {
+                out.push(cur)
+                cur = ""
+            }
+        } else {
+            cur = cur + line.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    if cur != "" {
+        out.push(cur)
+    }
+    return out
+}
+
+fn str_in_list(xs: list[str], v: str) -> bool {
+    let mut i: int = 0
+    while i < xs.len() {
+        if xs.get(i) == v {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn first_n(xs: list[str], n: int) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < xs.len() && i < n {
+        out.push(xs.get(i))
+        i = i + 1
+    }
+    return out
+}
+
+# is_ident(s) — the battery's ^[A-Za-z_][A-Za-z0-9_]*$ junk filter.
+fn is_ident(s: str) -> bool {
+    if s.len() == 0 {
+        return false
+    }
+    let c0: int = s.byte_at(0)
+    if !((c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122) || c0 == 95) {
+        return false
+    }
+    let mut i: int = 1
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if !((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# parse_int(s) — a plain digit run (the #line numbers).
+fn parse_int(s: str) -> int {
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < s.len() {
+        v = v * 10 + (s.byte_at(i) - 48)
+        i = i + 1
+    }
+    return v
+}
+
+# strip_quotes(lit) — Python's lit.strip('"').
+fn strip_quotes(lit: str) -> str {
+    let mut f: str = lit
+    while f.len() > 0 && f.byte_at(0) == 34 {
+        f = f.slice(1, f.len())
+    }
+    while f.len() > 0 && f.byte_at(f.len() - 1) == 34 {
+        f = f.slice(0, f.len() - 1)
+    }
+    return f
+}
+
+# collect_markers(src) — every `#line <num> <file>` directive in the C
+# (the battery's ^#line (\d+) (.+)$ over re.M), in order.
+fn collect_markers(src: str) -> Markers {
+    let m: Markers = Markers {
+        nums: [], files: []
+    }
+    let lines: list[str] = src.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i)
+        if line.starts_with("#line ") {
+            let mut p: int = 6
+            while p < line.len() && line.byte_at(p) >= 48 && line.byte_at(p) <= 57 {
+                p = p + 1
+            }
+            # \d+ then exactly one space then at least one more char.
+            if p > 6 && p + 1 < line.len() && line.byte_at(p) == 32 {
+                m.nums.push(parse_int(line.slice(6, p)))
+                m.files.push(strip_quotes(line.slice(p + 1, line.len())))
+            }
+        }
+        i = i + 1
+    }
+    return m
+}
+
+fn int_in_list(xs: list[int], v: int) -> bool {
+    let mut i: int = 0
+    while i < xs.len() {
+        if xs.get(i) == v {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# ----------------------------------------------------------------------------
+# Shared legs: the manifest and the symbol table.
+# ----------------------------------------------------------------------------
+
+# manifest_rows(path) — every non-blank, non-comment line, split into
+# whitespace fields.
+fn manifest_rows(path: str) -> list[list[str]] uses Fs {
+    let out: list[list[str]] = []
+    if !file_exists(path) {
+        return out
+    }
+    let lines: list[str] = read_file(path).split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let ln: str = lines.get(i)
+        if ln != "" && !ln.starts_with("#") {
+            out.push(split_ws(ln))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# manifest_symbol_names(path) — the symbol column, for membership checks.
+fn manifest_symbol_names(path: str) -> list[str] uses Fs {
+    let rows: list[list[str]] = manifest_rows(path)
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < rows.len() {
+        let r: list[str] = rows.get(i)
+        if r.len() >= 3 {
+            out.push(r.get(2))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn row_by_name(rows: list[list[str]], name: str) -> list[str] {
+    let mut found: list[str] = []
+    let mut i: int = 0
+    while i < rows.len() {
+        let r: list[str] = rows.get(i)
+        if r.len() >= 3 && r.get(2) == name {
+            found = r
+        }
+        i = i + 1
+    }
+    return found
+}
+
+# ld_script_symbols(path) — symbols the linker script assigns itself
+# (`sym = .;` etc.): the battery's per-line re.match, as byte logic.
+fn ld_script_symbols(path: str) -> list[str] uses Fs {
+    let out: list[str] = []
+    if !file_exists(path) {
+        return out
+    }
+    let lines: list[str] = read_file(path).split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let ln: str = lines.get(i)
+        let mut p: int = 0
+        while p < ln.len() && is_ws_byte(ln.byte_at(p)) {
+            p = p + 1
+        }
+        if p < ln.len() && is_word_byte(ln.byte_at(p)) && ln.byte_at(p) != 48
+        && !(ln.byte_at(p) >= 49 && ln.byte_at(p) <= 57) {
+            # name: [A-Za-z_][A-Za-z0-9_$]*
+            let start: int = p
+            while p < ln.len() {
+                let c: int = ln.byte_at(p)
+                if is_word_byte(c) || c == 36 {
+                    p = p + 1
+                } else {
+                    break
+                }
+            }
+            let name: str = ln.slice(start, p)
+            while p < ln.len() && (ln.byte_at(p) == 32 || ln.byte_at(p) == 9) {
+                p = p + 1
+            }
+            if p < ln.len() && ln.byte_at(p) == 61 {
+                out.push(name)
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# defined_nm_syms(binary) — the image's defined symbols (uppercase =
+# global, lowercase = local; 'u'/'U' excluded). Lines with exactly three
+# whitespace fields; the LAST row per name wins (dict semantics).
+fn defined_nm_syms(binary: str) -> SymTable uses Proc {
+    let t: SymTable = SymTable {
+        ok: false, names: [], bindings: [], letters: []
+    }
+    let r: RunResult = run_capture("nm", [binary])
+    if r.code != 0 {
+        return t
+    }
+    t.ok = true
+    let lines: list[str] = r.out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let parts: list[str] = split_ws(lines.get(i))
+        if parts.len() == 3 {
+            let letter: str = parts.get(1)
+            if letter != "U" && letter != "u" {
+                # binding = letter.upper() if letter.isupper() else letter.lower()
+                # — which is the letter itself, case preserved.
+                t.names.push(parts.get(2))
+                t.bindings.push(letter)
+                t.letters.push(letter)
+            }
+        }
+        i = i + 1
+    }
+    return t
+}
+
+fn sym_index(t: SymTable, name: str) -> int {
+    let mut found: int = -1
+    let mut i: int = 0
+    while i < t.names.len() {
+        if t.names.get(i) == name {
+            found = i
+        }
+        i = i + 1
+    }
+    return found
+}
+
+# ----------------------------------------------------------------------------
+# 1. the CLI surface: refusals, usage, determinism
+# ----------------------------------------------------------------------------
+fn sec1(acc: Acc) -> void uses IO, Fs, Proc {
+    section("1. the CLI surface: refusals, usage, determinism")
+    let r: RunResult = run_capture(hlc_path(acc), ["--debug", demo(), "-"])
+    if r.code == 0 {
+        fail_msg(acc, "cli: --debug accepted a stdout build")
+    } else if !r.combined.contains("--debug needs a file output path") {
+        fail_msg(acc, "cli: the stdout refusal is not the staged words: "
+        + clip(r.combined, 160))
+    } else {
+        pass_msg(acc, "cli: --debug refuses stdout (the markers must name the C file)")
+    }
+    let r2: RunResult = run_capture(hlc_path(acc), ["--symbols"])
+    if r2.code == 0 {
+        fail_msg(acc, "cli: --symbols accepted a missing path")
+    } else if !r2.combined.contains("--symbols expects a manifest path") {
+        fail_msg(acc, "cli: the --symbols refusal is not the staged words: "
+        + clip(r2.combined, 160))
+    } else {
+        pass_msg(acc, "cli: --symbols demands its path")
+    }
+    let r3: RunResult = run_capture(hlc_path(acc), [])
+    let usage: str = r3.combined
+    if usage.contains("--debug") && usage.contains("--symbols <manifest>") {
+        pass_msg(acc, "cli: the usage names --debug and --symbols")
+    } else {
+        fail_msg(acc, "cli: the usage does not name the new flags")
+    }
+    # Same output NAME in two directories: the #line resets name the
+    # output file's basename, so identical names are what byte-identity
+    # requires (the markers naming the file is the FEATURE).
+    let c1: str = scratch(acc, "det_a/out.c")
+    let c2: str = scratch(acc, "det_b/out.c")
+    let s1: str = scratch(acc, "det1.sym")
+    let s2: str = scratch(acc, "det2.sym")
+    let a: RunResult = run_capture(hlc_path(acc),
+    ["--debug", "--symbols", s1, demo(), c1])
+    let b: RunResult = run_capture(hlc_path(acc),
+    ["--debug", "--symbols", s2, demo(), c2])
+    if a.code != 0 || b.code != 0 {
+        fail_msg(acc, "cli: a flags run failed (rc=" + a.code.to_str() + "/"
+        + b.code.to_str() + ")")
+    } else if read_file(c1) != read_file(c2) {
+        fail_msg(acc, "cli: the --debug C is not deterministic across runs")
+    } else if read_file(s1) != read_file(s2) {
+        fail_msg(acc, "cli: the --symbols manifest is not deterministic across runs")
+    } else {
+        pass_msg(acc, "cli: --debug + --symbols are deterministic (C and manifest)")
+    }
+    let plain: str = scratch(acc, "plain.c")
+    run_capture(hlc_path(acc), [demo(), plain])
+    if !file_exists(plain) {
+        fail_msg(acc, "cli: the plain build produced no C at all")
+    } else {
+        let lines: list[str] = read_file(plain).split("\n")
+        let mut has_marker: bool = false
+        let mut i: int = 0
+        while i < lines.len() {
+            if lines.get(i).starts_with("#line ") {
+                has_marker = true
+            }
+            i = i + 1
+        }
+        if has_marker {
+            fail_msg(acc, "cli: a plain build carries #line markers")
+        } else {
+            pass_msg(acc, "cli: a build without --debug carries no markers (default unchanged)")
+        }
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 2. the line markers: the .hls lines in the C
+# ----------------------------------------------------------------------------
+fn sec2(acc: Acc) -> void uses IO, Fs, Proc {
+    section("2. the line markers: the .hls lines in the C")
+    let c_dbg: str = scratch(acc, "dbg.c")
+    run_capture(hlc_path(acc), ["--debug", demo(), c_dbg])
+    let src: str = read_or(c_dbg, "")
+    let mk: Markers = collect_markers(src)
+    if mk.nums.len() == 0 {
+        fail_msg(acc, "markers: no #line directives in the --debug C")
+        return
+    }
+    # named: the first .hls file each number maps to; resets: the
+    # markers handing the numbering back to the generated C file.
+    let named_nums: list[int] = []
+    let named_files: list[str] = []
+    let reset_nums: list[int] = []
+    let reset_files: list[str] = []
+    let mut i: int = 0
+    while i < mk.nums.len() {
+        let f: str = mk.files.get(i)
+        if f.ends_with(".hls") {
+            if !int_in_list(named_nums, mk.nums.get(i)) {
+                named_nums.push(mk.nums.get(i))
+                named_files.push(f)
+            }
+        } else {
+            reset_nums.push(mk.nums.get(i))
+            reset_files.push(f)
+        }
+        i = i + 1
+    }
+    let wants: list[LineWant] = line_wants()
+    let mut missing: list[str] = []
+    let mut w: int = 0
+    while w < wants.len() {
+        let lw: LineWant = wants.get(w)
+        if !int_in_list(named_nums, lw.line) {
+            missing.push(lw.why)
+        }
+        w = w + 1
+    }
+    let mut files_ok: bool = true
+    let mut fi: int = 0
+    while fi < named_files.len() {
+        if !named_files.get(fi).starts_with("examples/dbg_demo.hls") {
+            files_ok = false
+        }
+        fi = fi + 1
+    }
+    if missing.len() > 0 {
+        fail_msg(acc, "markers: missing " + str_join(missing, ", "))
+    } else if !files_ok {
+        fail_msg(acc, "markers: a marker names an unexpected file: ["
+        + str_join(named_files, ", ") + "]")
+    } else {
+        pass_msg(acc, "markers: fn lines (" + demo_mix_line().to_str() + "/"
+        + demo_gcd_line().to_str() + "/" + demo_main_line().to_str()
+        + ") and statement lines are mapped")
+    }
+    if reset_files.len() == 0 {
+        fail_msg(acc, "markers: the numbering is never handed back to the C file")
+    } else {
+        let base: str = basename(c_dbg)
+        let mut wrong_num: int = -1
+        let mut ri: int = 0
+        while ri < reset_files.len() {
+            if wrong_num < 0 && reset_files.get(ri) != base {
+                wrong_num = reset_nums.get(ri)
+            }
+            ri = ri + 1
+        }
+        if wrong_num >= 0 {
+            fail_msg(acc, "markers: a reset names " + wrong_num.to_str()
+            + ", not the generated C (" + base + ")")
+        } else {
+            pass_msg(acc, "markers: " + reset_files.len().to_str()
+            + " resets hand the numbering back to " + base)
+        }
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 3. the DWARF: version 5, the .hls lines, addr2line
+# ----------------------------------------------------------------------------
+fn sec3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("3. the DWARF: version 5, the .hls lines, addr2line")
+    let c_dbg: str = scratch(acc, "dbg.c")
+    let elf: str = scratch(acc, "dbg.elf")
+    let g: RunResult = run_capture("gcc", ["-O0", "-g", "-gdwarf-5", "-o", elf, c_dbg,
+    "-lm", "-pthread"])
+    if g.code != 0 {
+        fail_msg(acc, "dwarf: the -g -gdwarf-5 build failed: " + clip(g.err, 200))
+        return
+    }
+    if !which("readelf") {
+        skip_msg(acc, "readelf not found — the DWARF dump is not checked")
+        return
+    }
+    if !which("addr2line") {
+        skip_msg(acc, "addr2line not found — the file:line answer is not checked")
+        return
+    }
+    let info: RunResult = run_capture("readelf", ["--debug-dump=info", elf])
+    let vre: Result[Regex, str] = regex_compile("Version:\\s*5")
+    let mut version5: bool = false
+    if result_is_ok(vre) {
+        version5 = regex_is_match(result_unwrap(vre), info.out)
+    }
+    if !version5 {
+        fail_msg(acc, "dwarf: the CU header does not say version 5")
+    } else {
+        pass_msg(acc, "dwarf: the unit's DWARF version is 5")
+    }
+    let dec: RunResult = run_capture("readelf", ["--debug-dump=decodedline", elf])
+    let lre: Result[Regex, str] = regex_compile("dbg_demo\\.hls\\s+"
+    + demo_mix_line().to_str() + "\\b")
+    let mut line_hit: bool = false
+    if result_is_ok(lre) {
+        line_hit = regex_is_match(result_unwrap(lre), dec.out)
+    }
+    if !dec.out.contains("dbg_demo.hls") || !line_hit {
+        fail_msg(acc, "dwarf: the line table does not name dbg_demo.hls:"
+        + demo_mix_line().to_str())
+    } else {
+        pass_msg(acc, "dwarf: the line table names " + demo() + ":"
+        + demo_mix_line().to_str())
+    }
+    let addr: RunResult = run_capture("nm", [elf])
+    let mut hex_addr: str = ""
+    let lines: list[str] = addr.out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let parts: list[str] = split_ws(lines.get(i))
+        if parts.len() == 3 && parts.get(1) == "T" && parts.get(2) == "usf_gcd" {
+            hex_addr = parts.get(0)
+        }
+        i = i + 1
+    }
+    if hex_addr == "" {
+        fail_msg(acc, "dwarf: usf_gcd has no address at -O0")
+        return
+    }
+    let a2l: RunResult = run_capture("addr2line", ["-e", elf, "-f", "0x" + hex_addr])
+    if !a2l.out.contains("dbg_demo.hls:" + demo_gcd_line().to_str()) {
+        fail_msg(acc, "dwarf: addr2line answers " + clip(a2l.out, 80)
+        + ", want dbg_demo.hls:" + demo_gcd_line().to_str())
+    } else {
+        pass_msg(acc, "dwarf: addr2line answers " + demo() + ":"
+        + demo_gcd_line().to_str() + " for usf_gcd")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 4. the manifest shape: rows, sources, no junk
+# ----------------------------------------------------------------------------
+fn sec4(acc: Acc) -> void uses IO, Fs, Proc {
+    section("4. the manifest shape: rows, sources, no junk")
+    let spath: str = sym_path(acc)
+    let rows: list[list[str]] = manifest_rows(spath)
+    if rows.len() == 0 {
+        fail_msg(acc, "manifest: no rows")
+        return
+    }
+    let names: list[str] = []
+    let mut shape_ok: bool = true
+    let mut i: int = 0
+    while i < rows.len() {
+        let parts: list[str] = rows.get(i)
+        let bind_ok: bool = parts.len() >= 1
+        && (parts.get(0) == "global" || parts.get(0) == "static")
+        let sec_ok: bool = parts.len() >= 2
+        && (parts.get(1) == "text" || parts.get(1) == "rodata"
+        || parts.get(1) == "data" || parts.get(1) == "bss")
+        let name_ok: bool = parts.len() >= 3 && is_ident(parts.get(2))
+        if parts.len() != 3 && parts.len() != 4 {
+            shape_ok = false
+            fail_msg(acc, "manifest: a malformed row: [" + str_join(parts, " ") + "]")
+            break
+        }
+        if !bind_ok || !sec_ok || !name_ok {
+            shape_ok = false
+            fail_msg(acc, "manifest: a malformed row: [" + str_join(parts, " ") + "]")
+            break
+        }
+        names.push(parts.get(2))
+        i = i + 1
+    }
+    if shape_ok {
+        let mut dup: bool = false
+        let mut a: int = 0
+        while a < names.len() && !dup {
+            let mut b: int = a + 1
+            while b < names.len() {
+                if names.get(a) == names.get(b) {
+                    dup = true
+                }
+                b = b + 1
+            }
+            a = a + 1
+        }
+        if dup {
+            fail_msg(acc, "manifest: duplicate rows")
+        } else {
+            pass_msg(acc, "manifest: " + names.len().to_str()
+            + " rows, every one `<binding> <section> <symbol>`")
+        }
+    }
+    let wants: list[LineWant] = line_wants()
+    # The three user fns: usf_mix, usf_gcd, usf_main.
+    let src_ok_targets: list[str] = ["usf_mix", "usf_gcd", "usf_main"]
+    let want_lines: list[int] = [demo_mix_line(), demo_gcd_line(), demo_main_line()]
+    let mut src_ok: bool = true
+    let mut k: int = 0
+    while k < src_ok_targets.len() {
+        let cname: str = src_ok_targets.get(k)
+        let line: int = want_lines.get(k)
+        let row: list[str] = row_by_name(rows, cname)
+        if row.len() != 4
+        || !row.get(3).ends_with("dbg_demo.hls:" + line.to_str()) {
+            let mut rowtxt: str = "(missing)"
+            if row.len() > 0 {
+                rowtxt = "[" + str_join(row, " ") + "]"
+            }
+            fail_msg(acc, "manifest: " + cname + " does not carry " + demo() + ":"
+            + line.to_str() + " (row=" + rowtxt + ")")
+            src_ok = false
+        }
+        k = k + 1
+    }
+    if src_ok {
+        pass_msg(acc, "manifest: the user fns carry their Halis source (file:line)")
+    }
+    let main_row: list[str] = row_by_name(rows, "main")
+    if main_row.len() < 2 || main_row.get(0) != "global" || main_row.get(1) != "text" {
+        let mut rowtxt: str = "(missing)"
+        if main_row.len() > 0 {
+            rowtxt = "[" + str_join(main_row, " ") + "]"
+        }
+        fail_msg(acc, "manifest: main is not global text: " + rowtxt)
+    } else {
+        pass_msg(acc, "manifest: main is global text")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 5. the image vs nm: the manifest IS the symbol table
+# ----------------------------------------------------------------------------
+fn sec5(acc: Acc) -> void uses IO, Fs, Proc {
+    section("5. the image vs nm: the manifest IS the symbol table")
+    let c_dbg: str = scratch(acc, "dbg.c")
+    let bare_c: str = scratch(acc, "bare.c")
+    let bare: str = scratch(acc, "bare_x86_64")
+    let bare_sym: str = scratch(acc, "bare.sym")
+    run_capture(hlc_path(acc), ["--debug", "--symbols", bare_sym, "--target",
+    triple(), demo(), bare_c])
+    let g: RunResult = run_capture("gcc", ["-O2", "-mgeneral-regs-only",
+    "-ffreestanding", "-nostdlib", "-nostartfiles", "-fno-stack-protector",
+    "-fno-pie", "-no-pie", "-ffunction-sections",
+    "-Wl,--gc-sections,-T,targets/" + triple() + ".ld", "-o", bare, bare_c])
+    if g.code != 0 {
+        fail_msg(acc, "image: the Stage 93 link failed: " + clip(g.err, 200))
+        return
+    }
+    let nm_tab: SymTable = defined_nm_syms(bare)
+    if !nm_tab.ok {
+        fail_msg(acc, "image: nm failed")
+        return
+    }
+    let ld: list[str] = ld_script_symbols("targets/" + triple() + ".ld")
+    let bare_names: list[str] = manifest_symbol_names(bare_sym)
+    let mut missing: list[str] = []
+    let mut i: int = 0
+    while i < nm_tab.names.len() {
+        let n: str = nm_tab.names.get(i)
+        if !n.ends_with(".part.0") && !str_in_list(ld, n)
+        && !str_in_list(bare_names, n) {
+            missing.push(n)
+        }
+        i = i + 1
+    }
+    if missing.len() > 0 {
+        fail_msg(acc, "image: nm-defined symbols missing from the manifest: "
+        + str_join(first_n(missing, 5), ", "))
+    } else {
+        pass_msg(acc, "image: every defined symbol (" + nm_tab.names.len().to_str()
+        + ", minus the script's own and GCC's .part clones) is in the manifest")
+    }
+    let chain: list[str] = ["_start", "hl_boot", "usf_main", "main"]
+    let mut chain_ok: bool = true
+    let mut k: int = 0
+    while k < chain.len() {
+        let s: str = chain.get(k)
+        let idx: int = sym_index(nm_tab, s)
+        if idx >= 0 && nm_tab.letters.get(idx) != "T" {
+            fail_msg(acc, "image: " + s + " is " + nm_tab.letters.get(idx)
+            + ", not global text")
+            chain_ok = false
+        }
+        k = k + 1
+    }
+    if chain_ok {
+        pass_msg(acc, "image: the entry chain (_start, hl_boot, usf_main, main) "
+        + "is global text")
+    }
+    let rr: RunResult = run_capture(bare, [])
+    if rr.code != 42 {
+        fail_msg(acc, "image: the mapped build exits " + rr.code.to_str() + ", not 42")
+    } else {
+        pass_msg(acc, "image: the --debug --symbols build still runs and exits 42")
+    }
+    # The hosted image links the FULL runtime (--gc-sections keeps the
+    # unreached parts out of the freestanding one) — the strongest
+    # completeness check there is over the compiler-owned prefixes.
+    let full: str = scratch(acc, "dbg_full.elf")
+    let hf: RunResult = run_capture("gcc", ["-O2", "-o", full, c_dbg, "-lm", "-pthread"])
+    if hf.code != 0 {
+        fail_msg(acc, "image: the hosted link failed")
+        return
+    }
+    let nm2: SymTable = defined_nm_syms(full)
+    let man_names: list[str] = manifest_symbol_names(sym_path(acc))
+    let mut missing2: list[str] = []
+    let mut j: int = 0
+    while j < nm2.names.len() {
+        let n: str = nm2.names.get(j)
+        let bnd: str = nm2.bindings.get(j)
+        if(n.starts_with("usf_") || n.starts_with("hl_")
+        || (n == "main" && (bnd == "T" || bnd == "t")))
+        && !str_in_list(man_names, n) && !n.ends_with(".part.0") {
+            missing2.push(n)
+        }
+        j = j + 1
+    }
+    if missing2.len() > 0 {
+        fail_msg(acc, "image: hosted hl_/usf_ symbols missing from the manifest: "
+        + str_join(first_n(missing2, 5), ", "))
+    } else {
+        pass_msg(acc, "image: every hosted hl_/usf_/main symbol is in the manifest")
+    }
+    let mut cls_ok: bool = true
+    let rows: list[list[str]] = manifest_rows(sym_path(acc))
+    let mut ci: int = 0
+    while ci < rows.len() {
+        let parts: list[str] = rows.get(ci)
+        if parts.len() >= 3 {
+            let name: str = parts.get(2)
+            let sec: str = parts.get(1)
+            let idx: int = sym_index(nm2, name)
+            if idx >= 0 {
+                # inlined-away symbols are skipped — not hlc's call
+                let letter: str = nm2.letters.get(idx)
+                let up: int = upper_char(letter.byte_at(0))
+                if sec == "text" && up != 84 {
+                    cls_ok = false
+                    fail_msg(acc, "image: text row " + name + " is nm '" + letter + "'")
+                }
+                if sec == "bss" && up != 66 {
+                    cls_ok = false
+                    fail_msg(acc, "image: bss row " + name + " is nm '" + letter + "'")
+                }
+            }
+        }
+        ci = ci + 1
+    }
+    if cls_ok {
+        pass_msg(acc, "image: the manifest's text/bss classes agree with nm "
+        + "(wherever the symbol survived)")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 6. the orchestrator: hlcross --debug keeps the DWARF
+# ----------------------------------------------------------------------------
+fn sec6(acc: Acc) -> void uses IO, Fs, Proc {
+    section("6. the orchestrator: hlcross --debug keeps the DWARF")
+    let xb: str = scratch(acc, "cross_dbg")
+    let r: RunResult = run_capture("python3", ["tools/hlcross.py", "--debug",
+    "--target", triple(), demo(), xb, "--keep-c", scratch(acc, "cross_dbg.c")])
+    if r.code != 0 && r.code != 3 {
+        fail_msg(acc, "orchestrator: hlcross --debug failed: " + clip(r.combined, 200))
+    } else if r.code == 3 {
+        skip_msg(acc, "no linker for the triple — hlcross said so honestly")
+    } else if !which("readelf") {
+        skip_msg(acc, "readelf not found — the image's DWARF is not checked")
+    } else {
+        let info: RunResult = run_capture("readelf", ["-S", xb])
+        if !info.out.contains(".debug_info") {
+            fail_msg(acc, "orchestrator: the image has no .debug_info")
+        } else {
+            let dec: RunResult = run_capture("readelf", ["--debug-dump=decodedline", xb])
+            if !dec.out.contains("dbg_demo.hls") {
+                fail_msg(acc, "orchestrator: the image's line table does not name the "
+                + ".hls source")
+            } else {
+                pass_msg(acc, "orchestrator: hlcross --debug keeps DWARF naming the "
+                + ".hls source")
+            }
+        }
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 7. the no-libc mode and the tools
+# ----------------------------------------------------------------------------
+fn sec7(acc: Acc) -> void uses IO, Fs, Proc {
+    section("7. the no-libc mode and the tools")
+    let nc: str = scratch(acc, "nolibc.c")
+    let ns: str = scratch(acc, "nolibc.sym")
+    let r: RunResult = run_capture(hlc_path(acc),
+    ["--no-libc", "--debug", "--symbols", ns, demo(), nc])
+    if r.code != 0 {
+        fail_msg(acc, "no-libc: --debug --symbols refused on the Stage 92 mode: "
+        + clip(r.combined, 160))
+    } else if !file_exists(ns) {
+        fail_msg(acc, "no-libc: the manifest was not written")
+    } else {
+        let rows: list[list[str]] = manifest_rows(ns)
+        let mut has_start: bool = false
+        let mut i: int = 0
+        while i < rows.len() {
+            let parts: list[str] = rows.get(i)
+            if parts.len() >= 3 && parts.get(2) == "_start" {
+                has_start = true
+            }
+            i = i + 1
+        }
+        if !has_start {
+            fail_msg(acc, "no-libc: the crt0 _start is not in the manifest")
+        } else if !read_file(ns).contains("# target: hosted (no-libc runtime)") {
+            fail_msg(acc, "no-libc: the manifest does not name its mode")
+        } else {
+            pass_msg(acc, "no-libc: --debug --symbols work on the Stage 92 mode")
+        }
+    }
+    let brc: RunResult = boot(acc, ["--check", demo()])
+    if brc.code != 0 {
+        fail_msg(acc, "front-end: boot.py --check rejects the demo: "
+        + clip(brc.combined, 160))
+    } else {
+        pass_msg(acc, "front-end: the demo is an ordinary crate to the checker")
+    }
+    let fmt: RunResult = run_capture("./bin/hlfmt", [demo()])
+    if fmt.code != 0 || fmt.out.trim() == "" {
+        fail_msg(acc, "tools: hlfmt failed on the demo")
+    } else {
+        pass_msg(acc, "tools: hlfmt formats the demo")
+    }
+    let lint: RunResult = run_capture("python3", ["tools/hllint.py", demo()])
+    if lint.code != 0 {
+        fail_msg(acc, "tools: hllint findings on the demo:\n" + clip(lint.combined, 200))
+    } else {
+        pass_msg(acc, "tools: hllint clean on the demo")
+    }
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let acc: Acc = acc_new("debuginfo")
+    sec1(acc)
+    sec2(acc)
+    sec3(acc)
+    sec4(acc)
+    sec5(acc)
+    sec6(acc)
+    sec7(acc)
+    return finish(acc, "Stage 96 -- ELF symbol-table emission + debug-info (DWARF 5)")
+}
