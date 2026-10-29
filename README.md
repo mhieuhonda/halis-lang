@@ -1,27 +1,35 @@
 <div align="center">
 
-<img src="IMG_20260916_175951.jpg" alt="Halis logo" width="200">
+<img src="docs/halis-logo.jpg" alt="The Halis logo" width="190">
 
 # Halis
 
-**A high-security, self-hosting, native-compiled programming language**
+**A secure, self-hosting, native-first programming language.**
 
-`hlc` is written 100% in Halis itself. The compiler self-compiles,
-and two compilation passes produce **byte-identical** output.
+Safety is the default. Effects are declared. Nothing hides.
 
-[Specification](SPEC.md) · [150-stage roadmap](ROADMAP.md) · [Security](SECURITY.md)
+[![CI](https://github.com/mhieuhonda/halis-lang/actions/workflows/ci.yml/badge.svg)](https://github.com/mhieuhonda/halis-lang/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/badge/release-v1.0.0-375EAB)](https://github.com/mhieuhonda/halis-lang/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
+[Specification](SPEC.md) · [Releases](RELEASES.md) · [Security](SECURITY.md) · [Contributing](CONTRIBUTING.md) · [LTS policy](LTS.md)
 
 </div>
 
 ---
 
-## Why Halis?
+## Why Halis
 
-Halis (HLS) exists because of one belief: **safety is not optional, and
-performance is not the price of safety**.
+Halis exists because of one belief: **safety is not optional, and
+performance is not the price of safety.** A function without a
+`uses` clause is *guaranteed pure by the compiler* — not by
+convention, not by review, by construction. Every arithmetic
+operation is checked, every array access is bounds-checked, and the
+release binary is a native executable with no interpreter, no
+garbage collector and no runtime hiding underneath.
 
 ```hls
-# A function without 'uses IO' is GUARANTEED pure by the compiler
+# No `uses` clause: the compiler guarantees this function is pure.
 fn sum_squares(n: int) -> int {
     let mut total: int = 0
     let mut i: int = 0
@@ -32,866 +40,56 @@ fn sum_squares(n: int) -> int {
     return total
 }
 
+# I/O is a declared capability — remove `uses IO` and this will not compile.
 fn main() -> int uses IO {
     println("sum = " + sum_squares(100).to_str())
     return 0
 }
 ```
 
-Seven core guarantees of v0.35.0-alpha:
+Halis is written in Halis. The compiler is 100% self-hosted, and the
+bootstrap proves a fixed point on every build: the compiler built
+from the committed snapshot must re-derive that snapshot
+**byte for byte**.
 
-1. **I/O is a declared effect.** Forget `uses IO` while printing to the
-   screen? Compile error — even when the call is indirect through 5 function
-   layers.
-2. **Every operation is checked.** Integer overflow, divide-by-zero,
-   out-of-bounds array access — all halt safely, with no undefined behaviour.
-   v0.5 has no switch to disable checks.
-3. **No null. No uninitialised variables, no hidden state, no globals.**
-   Everything is explicit so it can be audited.
-4. **(Stage 8, complete) Memory safety without GC.** Use-after-move is a
-   compile error, `clone()` deep-copies every owned type, and the
-   generated runtime is reference-counted with **exact free at scope
-   exit** — a memory-stress program runs with a flat RSS (verified in CI
-   under a 256 MB address-space limit). No arena, no GC, no leaks.
-5. **(NEW in v0.5.0-alpha) Fine-grained effects & capabilities.** The
-   single `IO` effect is split into five capabilities — `IO`, `Fs`,
-   `Clock`, `Args`, `Exit` — each individually declared and statically
-   verified. `uses IO` remains as a backwards-compatible blanket alias.
-   A function with no `uses` clause is statically guaranteed pure.
-   See [SPEC.md section 9 & 17](SPEC.md).
-6. **(Stage 9-beta, v0.6.0-alpha) Explicit `pure` keyword + `--audit`
-   flag.** A function declared `pure` must have no `uses` and must
-   transitively call nothing effectful — enforced by the checker with
-   a witness edge in the error message. `hlc --audit` and
-   `boot.py --audit` print the full capability / effect tree of every
-   function in the program — declared vs computed, with a clear
-   OK/VIOLATION status per function. Useful for security review and
-   supply-chain audits.
-7. **(NEW in v0.7.0-alpha) Taint tracking.** The new built-in generic
-   type `tainted[T]` wraps any value as potentially-attacker-controlled.
-   The checker statically rejects passing a tainted value to a sink
-   (print, println, write_file, read_file, file_exists, exit) — the
-   user must sanitise first via the standard library
-   `sanitize_html` / `sanitize_path` / `sanitize_sql_identifier` /
-   `sanitize_sql_string` / `sanitize_command` / `sanitize_filename`
-   helpers, or use the explicit `taint_unwrap()` escape hatch.
-   `tainted_args()` returns the program's argv wrapped as
-   `list[tainted[str]]`, so every command-line input is tainted by
-   default. See [SPEC.md section 19](SPEC.md).
+## The guarantees
 
-## Self-hosting — proof, not promise
+1. **I/O is a declared effect.** Nine effects — `IO`, `Fs`, `Clock`,
+   `Args`, `Exit`, `Net`, `Rand`, `Proc`, `Conc` — are declared on
+   the function that needs them and verified through the whole call
+   graph. There is no escape through indirect calls.
+2. **Every operation is checked.** Integer overflow, division by
+   zero and out-of-bounds access halt safely. There is no switch
+   that disables the checks; the only way a check disappears is a
+   formal proof that it is dead.
+3. **No null. No uninitialised state, no globals, no hidden
+   anything.** Everything is explicit so that it can be audited.
+4. **Memory safety without a GC.** Use-after-move is a compile
+   error; `clone()` deep-copies; the runtime frees exactly at scope
+   exit. The memory-stress suite runs hundreds of thousands of
+   allocation rounds with a flat RSS, under a 256 MB address-space
+   limit in CI.
+5. **Data races are impossible by construction.** Values only cross
+   task boundaries through channels; sharing a variable with a task
+   outside a channel is a compile error.
+6. **Untrusted input is tainted by default.** `tainted[T]` values
+   cannot reach a sink — print, files, exit, DNS, subprocess —
+   until they pass through `std.sanitize` or an explicit untaint.
+7. **The whole program is auditable.** `hlc --audit` prints the
+   capability and taint-flow report of every function: declared vs
+   computed, with the violation named.
 
-```
-  snapshot/hlc.c  ── cc -O2 ──►  bin/hlc (native)  ── compiles ──►  src/hlc.hls
-  (the compiler's      │                                            │
-   own emission,        │            │                                │
-   COMMITTED in the     │            ▼                                ▼
-   tree — Stage 142)    └── hlc_regen.c ──── cmp snapshot = 0 bytes ──┘
-                              (the fixed-point law, every build)
+Each guarantee is pinned in a machine-checked ledger — fifteen
+soundness rows with their enforcement anchors and negative probes
+(`make guarantee-report`), and the scope is the published
+bug-bounty document.
 
-  bin/hlc  ── compiles ──►  tools/hls-snap.hls  ── cc ──►  bin/hls-snap
-  (the snapshot's own              (the kit — Stage 143)         │
-   compiler)                                                   ▼
-                                              status · verify · regen · prove · chain
-
-  (the Python seed is GONE — v0.164.0-alpha removed boot/ from the
-   tree entirely: the snapshot is the only seed, the freestanding
-   compiler is the proof's second lineage, and no law, target or
-   build path names an interpreter. The Python interpreter the lab
-   tooling still uses lives under tools/hlinterp/ as plain tooling —
-   off both paths, unreachable from any lifecycle above)
-```
-
-`make bootstrap` performs the fixed-point chain above — **no Python
-anywhere in it**: the seed is the committed C snapshot, the compiler's
-own emission for `src/hlc.hls`, content-addressed by
-`snapshot/MANIFEST.json` (every digest in that manifest computed by
-`std.sha256`, in Halis). The build proves the **fixed-point law**
-every time it runs: the compiler built from the snapshot must
-re-derive the snapshot byte for byte. A stale or hand-edited snapshot
-fails the build loudly (`make snapshot-regen` is the only legal
-mutation, and it moves the snapshot and its manifest together).
-Since v0.163.0-alpha the chain is also **reproducible on demand**:
-`make snapshot-chain` re-runs the whole bootstrap as two independent
-ignitions, byte-compares every hop (each round against the snapshot,
-round against round), and prints the chain digest — the one number
-two machines, two checkouts and two compilers must agree on
-(`CC2=clang` proves a different cc in slot one lands on the same
-bytes; the drifted tree is refused by name). From Stage 5 onwards,
-the language grows in itself — since Stage 143 the toolchain that
-guards that growth is written in it too, and the chain it grows on
-is bit-for-bit reproducible.
-
-## Quick start
-
-Requirements: gcc or clang. That is the whole list — the bootstrap is
-pure HLS since Stage 142 (v0.161.0-alpha), since Stage 143
-(v0.162.0-alpha) the whole snapshot lifecycle is too (the kit that
-classifies, verifies, regenerates and proves the snapshot,
-`tools/hls-snap.hls`, is written in Halis and compiled by `bin/hlc`
-itself), and since v0.163.0-alpha the chain is bit-for-bit
-reproducible on demand (`make snapshot-chain`, two independent
-ignitions, one digest). Python 3.8+ is OPTIONAL and lab-only: the
-interpreter under `tools/hlinterp/` drives the differential suites
-and the Python tooling (hlfmt, hllint, hltest, LSP) — nothing on
-any build, release or snapshot path reads it.
-
-```bash
-# 1. Run directly through the lab interpreter (optional — needs Python)
-python3 tools/hlinterp/boot.py examples/hello.hls
-
-# 2. Build the native compiler — pure HLS, no Python in the chain
-make bootstrap
-#    → bin/hlc  (the HLS compiler written in HLS, compiled native)
-#      from the committed C snapshot in ~20 s
-
-# 3. Compile your program to a native binary
-make run F=examples/primes.hls
-
-# 4. Run the full test suite (interpreter + native + differential +
-#    bootstrap determinism + LLVM IR + memory-stress RSS check + fmt +
-#    lint + proof/contracts). See CHANGELOG.md for the current count.
-make test
-
-# 5. Try the fine-grained effects (v0.7.0-alpha)
-python3 tools/hlinterp/boot.py examples/effects_demo.hls arg1 arg2
-
-# 6. Audit the capability / effect tree of a program
-make audit F=examples/effects_demo.hls
-
-# 7. Run the new taint tracking demo (v0.7.0-alpha)
-python3 tools/hlinterp/boot.py examples/taint_demo.hls "first arg" "/api/users"
-
-# 8. Run the Stage 10-beta demo (read_file_tainted + extended audit, v0.8.0-alpha)
-python3 tools/hlinterp/boot.py examples/taint_beta_demo.hls examples/data.txt
-
-# 9. Stage 11-alpha: print HLIR / optimiser stats (v0.9.0-alpha)
-python3 tools/hlinterp/boot.py --emit ir examples/optimize_demo.hls
-python3 tools/hlinterp/boot.py --opt-stats examples/optimize_demo.hls
-
-# 10. Stage 12-alpha: print LLVM IR (v0.10.0-alpha)
-python3 tools/hlinterp/boot.py --emit llvm examples/llvm_demo.hls
-python3 tools/hlinterp/boot.py --emit llvm --target aarch64-linux examples/llvm_demo.hls
-
-# 11. Stage 13-alpha: package manager (v0.11.0-alpha)
-python3 tools/hls-pkg.py init mypkg
-cd mypkg
-python3 ../tools/hls-pkg.py add std.str https://github.com/mhieuhonda/halis-lang.git std/str.hls
-python3 ../tools/hls-pkg.py lock    # resolves deps + enforces effect surface
-python3 ../tools/hls-pkg.py audit  # total effect report of dep tree
-python3 ../tools/hls-pkg.py verify # check SHA-256 hashes still match
-python3 ../tools/hls-pkg.py build  # compile main.hls
-
-# 12. Stage 14-alpha: tooling (v0.12.0-alpha)
-python3 tools/hlfmt.py examples/hello.hls            # format to stdout
-python3 tools/hlfmt.py -c examples/hello.hls          # check formatting
-python3 tools/hlfmt.py --print-config F               # resolved .hlfmt.toml
-python3 tools/hlfmt.py --config team.toml -w src/x.hls  # pin one config
-cp .hlfmt.toml.example .hlfmt.toml                    # team style file
-python3 tools/hllint.py examples/hello.hls            # lint
-python3 tools/hllint.py --list                        # list rules
-python3 tools/hllint.py --diff examples/hello.hls     # preview safe fixes
-python3 tools/hllint.py --fix examples/hello.hls      # apply safe fixes
-python3 tools/hltest.py -u tests/ok/feat_stage119_snapshot.hls  # record snapshots
-python3 tools/hltest.py tests/ok/feat_stage119_snapshot.hls     # verify them
-python3 tools/hltest.py tests/ok/feat_stage120_cases.hls        # table tests: one result per row
-python3 tools/hltest.py --grep "#boundary" tests/ok/feat_stage120_cases.hls  # select one row
-python3 tools/hls-lsp.py --check examples/hello.hls   # one-shot diagnostics
-make lsp-hints-acceptance      # Stage 114 gate: LSP inlay hints
-                               # (parameter names, match binding types)
-make lsp-refactor-acceptance   # Stage 115 gate: LSP refactor actions
-                               # (scope-aware rename, extract, inline)
-make fmt-comments-acceptance   # Stage 116 gate: hlfmt comment preservation
-                               # (attributes, re-indent, all positions)
-make fmt-config-acceptance     # Stage 117 gate: hlfmt team config file
-                               # (discovery, five knobs, strict grammar)
-make lint-fix-acceptance       # Stage 118 gate: hllint autofix mode
-                               # (scope renames, wraps, deletions, rollback)
-make snapshot-acceptance       # Stage 119 gate: hltest snapshot testing
-                               # (wire protocol, stores, diffs, prune)
-make cases-acceptance          # Stage 120 gate: hltest parameterised tests
-                               # (tables, per-row results, store keys, grep)
-python3 tools/hls-dap.py       # Stage 121: debug adapter (DAP over stdio —
-                               # VS Code talks to it via the extension)
-make dap-acceptance            # Stage 121 gate: VS Code debugger integration
-                               # (breakpoints, stepping, variables, panics)
-python3 tools/hls-repl.py      # Stage 123: interactive REPL (:type, :effects,
-                               # :audit, :env, :load — the session IS a program)
-make repl-acceptance           # Stage 123 gate: the REPL acceptance battery
-python3 tools/hls-bench.py benches/          # Stage 124: criterion-style micro-
-                               # benchmarks (bench_<name> fns, units_<name>
-                               # throughput, --save/--baseline comparisons,
-                               # --native for the compiled backend)
-make bench-acceptance          # Stage 124 gate: the benchmark runner battery
-python3 tools/hls-rss.py workload.hls    # Stage 125: RSS-stability
-                               # verifier (cycle markers + argv[1] plan,
-                               # Theil-Sen slope CI, two-run live balance
-                               # through the malloc interposer)
-make rss-acceptance           # Stage 125 gate: the RSS-stability battery
-                               # (churn/server STABLE, the leak canary
-                               # earns LEAK, the builtin balance census)
-python3 tools/hls-det.py examples/det_demo.hls   # Stage 127: certify a
-                               # concurrent program's interleaving (FIFO
-                               # baton rotation, N runs byte-identical,
-                               # interpreter parity, --trace names every
-                               # scheduling point)
-make det-acceptance           # Stage 127 gate: the determinism battery
-                               # (hand-computed policy traces, fairness,
-                               # deadlock parity, the honesty gates)
-python3 tools/hls-compat.py    # Stage 128: replay EVERY prior
-                               # version's ok corpus against today's
-                               # toolchain (170 release tags,
-                               # content-addressed, 24,591 instances ->
-                               # 326 unique programs; the ledger of
-                               # sanctioned drifts; --time-travel runs
-                               # a release's own interpreter beside
-                               # today's; --native adds the backend
-                               # differential; --update-ledger drafts)
-make compat-acceptance        # Stage 128 gate: the compatibility battery
-                               # (the census laws, the ledger discipline,
-                               # the regression alarm, the time-travel
-                               # witness, the native differential)
-python3 tools/hls-migrate.py   # Stage 129: upgrade a v0.34-era tree to
-    tests/migrate_tree         # today (six rules from the real, ledgered
-    --from v0.34.0-alpha       # breaking changes; the version gate fires
-    --to v1.0                  # exactly the four post-v0.34 rules; --apply
-                               # walks a file through history oldest-first,
-                               # backs up the original, and --verify runs
-                               # the checker on every rewritten file)
-make migrate-acceptance       # Stage 129 gate: the migration battery
-                               # (the plan census over the real bed, the
-                               # walk with backups and verify, the version
-                               # gate, idempotence, the honesty rules)
-python3 tools/hllint.py        # Stage 130: L013 deprecated-call — a call
-    examples/deprecated_demo.hls  # to a fn marked #[deprecated("why")]
-                               # quotes the message at every call site,
-                               # across imports; the compilers treat the
-                               # attribute as pure metadata (zero codegen)
-make deprecated-acceptance    # Stage 130 gate: the deprecation battery
-                               # (both front-ends refuse the bad forms,
-                               # zero codegen, the lint honesty rules, the
-                               # pinned corpus census)
-python3 tools/hls-pkg.py semver cmp 1.0.0-alpha 1.0.0   # Stage 131:
-                               # semantic-versioning enforcement —
-                               # spec-correct check/cmp/bump/sat, plus
-                               # `version = "^1.4"` requirements on
-                               # dependencies enforced by lock/verify,
-                               # and publish immutability (a version
-                               # already published with different
-                               # content is a refusal)
-make semver-acceptance        # Stage 131 gate: the semver battery
-                               # (grammar, precedence, the requirement
-                               # dialect, manifest enforcement over a
-                               # real git dep, publish immutability,
-                               # verify drift)
-bin/hls-lts classify HEAD              # Stage 132: the LTS branch
-                               # policy — backport-only after v1.0:
-                               # init declares the branch from a
-                               # >= 1.0.0 release tag, classify names
-                               # a commit's class (BUGFIX / FEATURE /
-                               # CHORE / UNKNOWN, fail-closed), backport
-                               # cherry-picks a BUGFIX with a
-                               # Backported-from: trailer and refuses
-                               # everything else, tag-patch cuts the
-                               # next patch release (no gaps, no
-                               # pre-releases, no empty releases),
-                               # audit judges the branch commit by
-                               # commit and tag by tag
-make lts-acceptance           # Stage 132 gate: the LTS battery
-                               # (the convention, the init law, the
-                               # classifier with its diff gate, the
-                               # backport law over real scratch git
-                               # repos, the tag law, the audit law,
-                               # the release train, the corpus
-                               # showcase)
-bin/hls-lts window --tag v1.0.0 --at 2029-06-15
-                               # Stage 145: the published support
-                               # windows — 3 years bug-fix, 5 years
-                               # security, counted from the base
-                               # release's committer day: the phase
-                               # (active / security / eol) at any
-                               # day, anniversaries with the
-                               # February-29 clamp, the horizon day
-                               # belonging to the phase it closes;
-                               # a `Security: <reason>` trailer
-                               # marks a fix for the security-only
-                               # years; backport refuses plain fixes
-                               # there and everything on a dead
-                               # line, tag-patch cuts no release
-                               # past end of life, audit judges
-                               # history by the day it landed
-cat LTS.md                    # the policy on paper — a render from
-                               # the tool's own constants, not a
-                               # second truth to edit around
-make lts-policy-verify        # re-derive the committed LTS.md
-                               # (a hand-edited policy is visible
-                               # as a diff; drift is a refusal)
-make lts-policy-acceptance    # Stage 145 gate: the window battery
-                               # (the calendar law, the phase
-                               # machine, the marking law, the
-                               # backport/tag/audit window gates,
-                               # the publication law — over scratch
-                               # repos with fabricated birthdays,
-                               # because a support window cannot
-                               # wait three years to be tested)
-bin/hls-rc readiness          # Stage 146: the release-candidate
-                               # kit — the machine-checked
-                               # checklist (roadmap closed through
-                               # 145 with the open set in the RC
-                               # tail, the Stage 141 freeze
-                               # anchored in this history, the
-                               # version markers speaking one
-                               # voice, the seed on board, LTS.md
-                               # published with no line declared)
-bin/hls-rc declare --tag v1.0.0-rc.1
-                               # cut the candidate ON PAPER: the
-                               # rc grammar (rc.1..rc.4 — a fifth
-                               # is a roadmap amendment), the
-                               # semver sort law over every tag
-                               # that exists, the stage law
-                               # (rc.N closes 145+N), the tree
-                               # clean; writes .hls-rc.json — the
-                               # anchor: tag, commit, day, freeze
-                               # digest, successor
-bin/hls-rc gate               # the feature freeze itself: every
-                               # commit since the anchor judged
-                               # with the LTS classifier's own
-                               # grammar — fixes and chores land,
-                               # features and strangers are named
-                               # sha by sha; a "fix" that grows
-                               # std/ surface is re-classed into
-                               # the FEATURE it really is
-cat RC.md                     # the candidate's record — a render
-                               # from the live tree, deterministic
-                               # per anchor, drift refused
-make rc-report-check          # re-derive the committed RC.md
-make rc-acceptance            # Stage 146 gate: the candidate
-                               # battery (the readiness laws one
-                               # refusal at a time, the tag
-                               # grammar shape by shape, the
-                               # anchor written and defended, the
-                               # freeze judging real commits in
-                               # scratch repos, the sort law, the
-                               # publication law)
-make rc2-acceptance           # Stage 147 gate: the bug-fix round
-                               # (the invocation refusals named
-                               # and exit-2 on both front-ends —
-                               # no panic on a path the user
-                               # typed — the broken pipe dying
-                               # quietly, the freeze still green
-                               # on the live tree, the successor
-                               # cut rehearsed end to end on a
-                               # scratch world, the corpus
-                               # showcase)
-make rc3-acceptance           # Stage 148 gate: the final dry-run
-                               # (the record quoting each
-                               # candidate's own phrase off the
-                               # roadmap, rc.4's successor line
-                               # speaking the release cut, the
-                               # whole candidate line walked on
-                               # one scratch world to the eve,
-                               # the release day itself — the
-                               # markers moved, the anchor
-                               # retired, the tag cut, the LTS
-                               # line opened, the windows the
-                               # clock, the RC kit refusing on
-                               # both laws — the morning after
-                               # rehearsed with it: the backport,
-                               # v1.0.1, the whole road green)
-bin/hls-rc signoff --by NAME  # Stage 149: the sign-off — the LAST
-                               # approval a candidate takes, cut
-                               # into the anchor with its signer's
-                               # name on it; the tree must be green
-                               # AT THE SIGNING MOMENT (readiness
-                               # and the freeze gate re-derived,
-                               # the tracked tree clean beyond the
-                               # anchor), one signature per
-                               # candidate; signoff --check
-                               # RE-DERIVES the verdict at every
-                               # gate — the signature is not
-                               # archived, it is re-earned
-make rc4-acceptance           # Stage 149 gate: the sign-off
-                               # (the destination law — the
-                               # record and the policy refuse an
-                               # unwritable destination with its
-                               # name at exit 2, never a panic —
-                               # the signature law refused law by
-                               # law, the witness re-deriving the
-                               # verdict and voiding it on a
-                               # feature past the anchor or a
-                               # drifted record, the render
-                               # speaking the signature exactly
-                               # once, the pre-flight pinning
-                               # signoff --check dynamically, the
-                               # corpus showcase)
-make release-acceptance       # Stage 150 gate: the release itself
-                               # (the state law — the tree a legal
-                               # state of the line: the eve, or the
-                               # release; a half-cut release is not
-                               # a state — the retirement law, the
-                               # RC kit green on the eve and every
-                               # command refusing NAMED after —
-                               # the line law, the windows read off
-                               # the base day, the line idempotent,
-                               # a second base refused — the wrong
-                               # turns and the cut rehearsed on a
-                               # scratch world — LTS.md still
-                               # matching its render, the corpus
-                               # showcase)
-bin/hls-lts status            # the line's clock — branch
-                               # release/1.0, the windows (3 years
-                               # of bug fixes, 5 of security,
-                               # counted from the base release's
-                               # day), the tags on the branch, the
-                               # audit verdict
-python3 tools/hls-xdiff.py     # Stage 133: the cross-impl
-                               # differential table — the SAME
-                               # program through the interpreter,
-                               # the native C build, the wasm
-                               # backend and (statically) the LLVM
-                               # emitter; bytes + halt classes
-                               # compared on a shared channel, the
-                               # ledger keeping the six real
-                               # findings of the first sweep loud;
-                               # --discover is the purity census,
-                               # --core the fast battery
-make xdiff-acceptance         # Stage 133 gate: the differential
-                               # battery (the convention, the
-                               # channel vectors, the three-backend
-                               # byte match, the halt law, the
-                               # ledger's negative space, the
-                               # purity census, the llvm leg's
-                               # labelling, the corpus showcase)
-python3 tools/hls-fuzzseed.py # Stage 134: fuzz corpus seeding from
-                               # real-world packages — REAL
-                               # functions harvested out of the
-                               # hls-pkg trees and the project's
-                               # own code, each completed into a
-                               # type-correct harness with corner-
-                               # valued parameters and a
-                               # deterministic projection; purity,
-                               # smoke, identity and budget gates;
-                               # a ranked, mutated, reproducible
-                               # corpus with a provenance manifest
-python3 tools/hls-fuzz.py --seed-corpus fuzz-corpus/seed
-                               # the fuzzer, seeded: the Stage 18
-                               # differential oracle runs over REAL
-                               # code shapes (mutation included)
-                               # instead of only grammar toys
-make fuzzseed-acceptance      # Stage 134 gate: the seeding battery
-                               # (the convention, the harvest law,
-                               # the harness law, the purity law,
-                               # the identity law, the census law,
-                               # the mutation law, the differential
-                               # + the fuzzer)
-python3 tools/hls-guarantee.py verify
-                               # Stage 135: re-demonstrate the
-                               # soundness guarantee ledger against
-                               # the live tree — 15 guarantees, 27
-                               # anchors grepped at their
-                               # enforcement points, 30 probes
-                               # re-run through the real
-                               # checker/interpreter (refusal
-                               # messages and panic exits pinned),
-                               # the SECURITY.md channel anchored
-python3 tools/hls-guarantee.py report --out SOUNDNESS.md
-                               # the bug-bounty scope document,
-                               # regenerated (never hand-edited):
-                               # deterministic, tree-sha-stamped,
-                               # byte-identical per tree
-make guarantee-acceptance      # Stage 135 gate: the ledger battery
-                               # (the convention, the ledger law,
-                               # the anchor law, the probe law, the
-                               # drift law, the report law, the
-                               # bounty law, the showcase)
-
-python3 tools/hls-perf.py record
-                               # Stage 136: file one measurement of
-                               # the tracked suite
-                               # (benchmarks/regression_watch.hls)
-                               # pinned to the current clean commit
-                               # — hls-bench measures, the ledger
-                               # remembers
-python3 tools/hls-perf.py gate
-                               # the CI leg: classify the newest
-                               # record against the prior record of
-                               # the same instrument (Welch +
-                               # seeded bootstrap, 5% band) — any
-                               # unsanctioned regressed or vanished
-                               # bench exits 1, named
-python3 tools/hls-perf.py sanction bench --reason "..."
-                               # a written excuse with an author —
-                               # sanctioned regressions are loud but
-                               # green
-python3 tools/hls-perf.py dashboard --out PERFORMANCE.md
-                               # the dashboard, regenerated (never
-                               # hand-edited): sorted verdicts,
-                               # per-bench trend sparklines, the
-                               # sanctions register, byte-identical
-                               # per ledger
-make perf-acceptance           # Stage 136 gate: the dashboard battery
-                               # (the convention, the record law,
-                               # the floor law, the classification
-                               # law, the gate law, the determinism
-                               # law, the ledger law, the showcase)
-
-python3 tools/hls-mem.py record
-                               # Stage 137: file one measurement of
-                               # the tracked memory suite
-                               # (benchmarks/rss_watch/ — the floor,
-                               # string growth, heap churn, boxed
-                               # objects) pinned to the current clean
-                               # commit — every workload must certify
-                               # STABLE under hls-rss before it can
-                               # be filed (a canary that leaks is a
-                               # bug, not a record)
-python3 tools/hls-mem.py gate
-                               # the CI leg: classify the newest
-                               # record against the prior record of
-                               # the same instrument (same suite
-                               # digest AND page size) — the metric
-                               # is the marker median (the resident
-                               # set at the cycle markers, measured
-                               # with the layout pinned by setarch
-                               # -R), significance is the seeded
-                               # bootstrap CI of the median change
-                               # excluding zero (the page law), the
-                               # band floored at 16 pages; any
-                               # unsanctioned regressed or vanished
-                               # workload exits 1, named
-python3 tools/hls-mem.py sanction node_box --reason "..."
-                               # a written excuse with an author —
-                               # sanctioned regressions are loud but
-                               # green
-python3 tools/hls-mem.py dashboard --out MEMORY.md
-                               # the dashboard, regenerated (never
-                               # hand-edited): verdicts, the
-                               # resident-set-at-markers trend (RSS
-                               # over time, literally), the slope
-                               # watch, the sanctions register,
-                               # byte-identical per ledger
-make memdash-acceptance        # Stage 137 gate: the memory battery
-                               # (the convention, the record law,
-                               # the floor law, the classification
-                               # law, the gate law, the determinism
-                               # law, the ledger law, the showcase)
-
-python3 tools/hls-ctime.py record
-                               # Stage 138: file one measurement of
-                               # the tracked compile suite
-                               # (benchmarks/ctime_watch/ — the
-                               # token stream, the parse tree, the
-                               # type checker, the effect graph,
-                               # the code generator) pinned to the
-                               # current clean commit — the
-                               # instrument is the compiler itself
-                               # (stage0, the bootstrap chain, by
-                               # default; --instrument native for
-                               # bin/hlc), and every record pins the
-                               # compiler's own identity: the source
-                               # digest and the binary digest, so a
-                               # stale bin/hlc is refused at record
-                               # time
-python3 tools/hls-ctime.py gate
-                               # the CI leg: classify the newest
-                               # record against the prior record of
-                               # the same instrument (Welch + seeded
-                               # bootstrap, 10% band) — any
-                               # unsanctioned regressed or vanished
-                               # workload exits 1, named
-python3 tools/hls-ctime.py sanction check_generic --reason "..."
-                               # a written excuse with an author —
-                               # sanctioned regressions are loud but
-                               # green
-python3 tools/hls-ctime.py dashboard --out COMPILETIME.md
-                               # the dashboard, regenerated (never
-                               # hand-edited): sorted verdicts,
-                               # per-workload compile-time trends,
-                               # both compiler digests, the
-                               # sanctions register, byte-identical
-                               # per ledger
-make ctime-acceptance          # Stage 138 gate: the compile-time
-                               # battery (the convention, the record
-                               # law, the floor law — including the
-                               # stale-binary refusal — the
-                               # classification law, the gate law,
-                               # the determinism law, the ledger
-                               # law, the showcase)
-
-python3 tools/hls-size.py record
-                               # Stage 139: file one size measurement
-                               # of the tracked suite
-                               # (benchmarks/size_watch/ — the runtime
-                               # floor, the string surface, the
-                               # per-function machinery, the
-                               # type-driven struct emission, the
-                               # match dispatch) pinned to the
-                               # current clean commit, every workload
-                               # weighed on five axes (emitted C,
-                               # binary, text/data/bss) — plus
-                               # hlc_self, the compiler's own girth,
-                               # on the native instrument. The axis
-                               # has no noise: byte-exact law, no
-                               # samples, no statistics, no noise
-                               # band — one byte of growth is a
-                               # regression it names
-python3 tools/hls-size.py gate
-                               # the CI leg: classify the newest
-                               # record against the prior record of
-                               # the same instrument, byte-identical
-                               # suite, same machine (cc/arch/recipe
-                               # are part of every record's
-                               # fingerprint) — any unsanctioned
-                               # regressed or vanished workload
-                               # exits 1, named
-python3 tools/hls-size.py sanction hlc_self --reason "..."
-                               # a written excuse with an author —
-                               # sanctioned growth is loud but green
-python3 tools/hls-size.py dashboard --out BINARYSIZE.md
-                               # the dashboard, regenerated (never
-                               # hand-edited): per-axis verdicts, the
-                               # bin_bytes trends, both compiler
-                               # digests, the sanctions register,
-                               # byte-identical per ledger
-make size-acceptance          # Stage 139 gate: the binary-size
-                               # battery (the convention, the record
-                               # law — the stage0 axes must equal
-                               # the native axes byte for byte — the
-                               # floor law, the classification law,
-                               # the gate law, the determinism law,
-                               # the ledger law, the showcase)
-
-python3 tools/hls-auditkit.py engage \
-       --firm "..." --auditor "A" --auditor "B" \
-       --window "2026-11-02/2026-12-24" --basis "..." \
-       --by mhieuhonda
-                               # Stage 140: sign the contract. One
-                               # engagement per ledger, ever; the
-                               # roster, the window (two ISO dates,
-                               # a window that ends before it starts
-                               # is refused at the signature), the
-                               # fee basis (recorded verbatim — a
-                               # gratis review is not an
-                               # independent audit), the signer —
-                               # who is never on their own roster
-python3 tools/hls-auditkit.py brief --out AUDITBRIEF.md
-                               # the RFP, derived LIVE from the
-                               # Stage 135 guarantee ledger: the
-                               # census (the 15 rows, their anchors
-                               # and probes), the method (re-derive
-                               # the anchors, re-run the probes,
-                               # attempt the violation contracts,
-                               # bounty-style), the findings
-                               # protocol, the commercial terms.
-                               # The only command that may run
-                               # before a ledger exists —
-                               # solicitation precedes contract
-                               # (OPEN SOLICITATION)
-python3 tools/hls-auditkit.py evidence --by "Dana Fischer"
-                               # the pass: re-runs the whole scope
-                               # through the real checker and
-                               # appends one chained transcript
-                               # naming WHO ran it. The label
-                               # follows the roster: a roster
-                               # member's pass is INDEPENDENT,
-                               # anyone else's is SELF-ASSESSED —
-                               # the report refuses to call a
-                               # self-run pass independent. A
-                               # failed pass exits 1 naming its
-                               # refusals and is still recorded:
-                               # a failed pass is a record, not a
-                               # shame
-python3 tools/hls-auditkit.py file \
-       --against G-TAINT-01 --severity high \
-       --title "..." --repro-path repro.hls \
-       --by "Dana Fischer"
-                               # the auditors' instrument: a finding
-                               # names one row from the scope, a
-                               # severity from the closed five-word
-                               # vocabulary, and a REPRODUCER (a
-                               # path that exists or inline text,
-                               # never both, never neither — a
-                               # finding that cannot be reproduced
-                               # is an opinion). Findings are the
-                               # auditors' to file; the project
-                               # cannot author one
-python3 tools/hls-auditkit.py triage AF-001 \
-       --verdict accepted --reason "..." \
-       --fix <40-hex> --by mhieuhonda
-                               # the project's response: one verdict,
-                               # one reason (the sanction law, on
-                               # the other side of the table), and
-                               # for an acceptance the remediation
-                               # commit itself — 40 hex naming a
-                               # commit that EXISTS. One response
-                               # per finding; an auditor cannot
-                               # triage one
-python3 tools/hls-auditkit.py report --out AUDITREPORT.md
-                               # the deliverable, rendered from the
-                               # chained ledger: the engagement, the
-                               # drift line (the scope that moved
-                               # under the auditors is named, never
-                               # hidden), every pass with its
-                               # independence label, the findings,
-                               # the triage, the derived state —
-                               # byte-identical per ledger
-make auditkit-acceptance      # Stage 140 gate: the audit battery
-                               # (the convention, the engagement
-                               # law, the brief law, the evidence
-                               # law, the finding law, the triage
-                               # law, the report law, the showcase)
-
-python3 tools/hls-freeze.py status
-                               # Stage 141: the quick verdict — the
-                               # live surface vs the freeze
-                               # (IDENTICAL, or the drift named at
-                               # its dotted paths)
-python3 tools/hls-freeze.py verify [--quiet] [--json]
-                               # the anti-rot pass, per commit: the
-                               # document must agree with ITSELF
-                               # (the digest matches the surface it
-                               # carries) and with the WORLD (the
-                               # live surface matches the frozen
-                               # one); REMOVED / ADDED / CHANGED,
-                               # each at its dotted path —
-                               # post-freeze additions are drift
-                               # too: the API is locked, not merely
-                               # backwards-compatible
-python3 tools/hls-freeze.py amend \
-       --reason "std.hex grows a helper for the v0.160 formatter" \
-       --by mhieuhonda
-                               # the ONLY legal mutation: refuses
-                               # without a written reason, refuses
-                               # a no-op (noise is how real
-                               # amendments stop being read),
-                               # rewrites the freeze to the live
-                               # surface and appends ONE
-                               # hash-chained record carrying who,
-                               # why, the commit, the delta and
-                               # both digests — the family's ONE
-                               # arithmetic since Stage 13; commit
-                               # the document and its chain
-                               # together
-python3 tools/hls-freeze.py report --out API.md
-                               # the frozen API document,
-                               # deterministic per freeze (the
-                               # digest embedded, the syntax
-                               # surface, the per-module census,
-                               # the amendment history) — and
-                               # never rendered from a drifted
-                               # tree: verify runs first, a
-                               # report from drift is fiction
-make freeze-acceptance        # Stage 141 gate: the freeze battery
-                               # (the convention, the syntax law,
-                               # the census law — the gate's own
-                               # independent re-derivation —, the
-                               # removal law, the mutation law,
-                               # the addition law, the amend law,
-                               # the report law, the showcase)
-
-python3 tools/hls-finalaudit.py engage \
-       --firm "..." --auditor "A" --auditor "B" \
-       --window "2026-11-02/2026-12-24" --basis "..." \
-       --by mhieuhonda
-                               # Stage 144: the FINAL audit — the
-                               # engagement the v1.0 release
-                               # candidates wait on. The signature
-                               # pins the FROZEN ARTIFACT whole:
-                               # THREE anchors at once (the Stage
-                               # 135 guarantee scope, the Stage 141
-                               # freeze with its amendment-chain
-                               # head, the Stage 142/143 snapshot
-                               # manifest) — a tree that carries
-                               # none of them cannot even be engaged
-python3 tools/hls-finalaudit.py brief --out FINALBRIEF.md
-                               # the RFP: the three anchors quoted
-                               # live, the scope census, the closure
-                               # criteria, the commercial terms.
-                               # OPEN SOLICITATION before any ledger
-                               # exists — solicitation precedes
-                               # contract
-python3 tools/hls-finalaudit.py evidence --by "Dana Fischer"
-                               # the pass: re-runs the whole scope
-                               # through the real checker AND
-                               # re-derives the three anchors live —
-                               # the label follows the roster
-                               # (INDEPENDENT vs SELF-ASSESSED),
-                               # and an anchor that moved since the
-                               # signature is a fact the entry
-                               # records, never a silence
-python3 tools/hls-finalaudit.py signoff --by mhieuhonda
-                               # the closure: refuses without an
-                               # INDEPENDENT pass on record and a
-                               # green latest pass (an audit that
-                               # closes on the project's own
-                               # evidence is a rubber stamp with a
-                               # paper trail), without every fix
-                               # LANDED (an ancestor of HEAD, and
-                               # not older than the finding it
-                               # fixes), and on any anchor that moved
-                               # — a moved surface is a new
-                               # engagement, not an amendment. When
-                               # every law holds it writes the SEAL
-                               # and closes the ledger: nothing
-                               # appends after it
-make finalaudit-gate
-                               # what the release process runs
-                               # before cutting a candidate: green
-                               # only when the audit is sealed, the
-                               # sealed tree is an ANCESTOR of the
-                               # current HEAD (the release is cut
-                               # from the audited tree or its
-                               # descendants, never around the
-                               # audit), the three anchors still
-                               # hold and the fixes still land —
-                               # anything else exits 1 with the
-                               # named refusal. RC1 is not a date on
-                               # a calendar; it is what this gate
-                               # says yes to
-make finalaudit-acceptance    # Stage 144 gate: the final-audit
-                               # battery (the convention, the
-                               # engagement law, the brief law, the
-                               # evidence law, the finding law, the
-                               # triage law — the landing law — the
-                               # signoff law, the gate law, the
-                               # showcase)
-
-# 13. Stage 15-alpha: Safe C FFI (v0.13.0-alpha)
-python3 tools/hlinterp/boot.py examples/ffi_demo.hls           # call libc functions
-python3 tools/hlbindgen.py /usr/include/stdlib.h      # generate extern block from C header
-
-# 14. Stage 19 (v0.35.0-alpha): profile-guided optimisation
-make pgo                        # train hlc on its own workload -> bin/hlc_pgo
-make pgo-acceptance             # the Stage 19 acceptance gate (<= 80% wall time)
-bin/hlc --pgo-generate prog.hls out.c   # instrument: counters -> .hlcprof
-HLS_PGO_FILE=p.hlcprof ./a.out          # run the workload (HLS_PGO_MERGE=1 to accumulate)
-bin/hlc --pgo-use p.hlcprof prog.hls out2.c  # retrain codegen with the profile
-
-# 15. Stage 20 (v0.36.0-alpha): LTO across crates
-make lto F=examples/primes.hls          # whole-program inlining + DCE, then run
-bin/hlc --lto prog.hls out.c            # cross-crate inline + dead-code eliminate
-make emit-lto-ir F=examples/hello.hls   # whole-program LTO'd LLVM IR (.ll/.bc)
-
-# 16. Stage 21 (v0.37.0-alpha): SIMD vectorisation
-make simd-acceptance                    # the Stage 21 acceptance gate (>= 2x on AVX2)
-bin/hlc --target-feature avx2 bench.hls out.c    # native intrinsics for std.simd
-python3 tools/hlinterp/boot.py examples/simd_demo.hls      # portable std.simd everywhere
-
-# 17. Stage 30 (v0.47.0-alpha): boxed-vs-stack layout analysis
-python3 tools/hlinterp/boot.py examples/stack_layout_demo.hls   # run the demo
-make escape-acceptance    # the Stage 30 gate: fibonacci inner loop, zero heap objects
-make layout-report F=examples/stack_layout_demo.hls   # per-binding layout decisions
-
-# 18. Stage 31 (v0.48.0-alpha): verified tail-call optimisation
-python3 tools/hlinterp/boot.py examples/fibonacci.hls 1000000  # fib_tail(1M), zero Python recursion
-make tail-acceptance      # the Stage 31 gate: fib_tail(1M) under ulimit -s 1024
-make tail-report F=examples/fibonacci.hls            # verified tail-call decisions
-```
-
-## Language example
+## A taste of the language
 
 ```hls
-# Struct + methods — structs have reference semantics
+import "std.result"
+import "std.sanitize"
+
 struct Point {
     x: int,
     y: int
@@ -906,432 +104,216 @@ impl Point {
     }
 }
 
-fn main() -> int uses IO {
+enum Shape {
+    Circle(float),
+    Rect(int, int)
+}
+
+fn area(s: Shape) -> float {
+    return match s {
+        Circle(r) => 3.14159 * r * r,
+        Rect(w, h) => (w * h).to_float()
+    }
+}
+
+# Error handling without exceptions: Result + the `?` propagate
+fn answer() -> Result[int, str] {
+    let n: Result[int, str] = int_parse("41")
+    n?
+    return Result.Ok(result_unwrap(n) + 1)
+}
+
+fn main() -> int uses IO, Args {
     let p: Point = Point { x: 3, y: 4 }
     p.translate(1)
-    println("dist2 = " + p.dist2().to_str())     # dist2 = 32
+    println("dist2 = " + p.dist2().to_str())    # dist2 = 32
 
-    # List + map (insertion-ordered)
-    let counts: map[str, int] = map_new()
-    counts.set("hieu", 1)
-    counts.set("louis", 2)
+    let a: Result[int, str] = answer()
+    println("answer = " + result_unwrap_or(a, 0).to_str())    # answer = 42
 
-    # Strings are byte strings, full operation set
-    let s: str = "  Halis  "
-    println("[" + s.trim() + "]")
-
-    # for-in loop: length snapshotted once
-    for i: int in range(0, 5) {
-        print(i.to_str() + " ")
+    # Command-line input arrives tainted; sanitise or untaint first
+    let argv: list[tainted[str]] = tainted_args()
+    if argv.len() > 1 {
+        println("hello, " + sanitize_filename(argv.get(1)))
     }
-    println("")
     return 0
 }
 ```
 
-See also: [examples/](examples/) — including `secure_demo.hls` demonstrating
-safe panics on integer overflow, `wordcount.hls` reading a real file,
-`web_demo.hls` showing URL parsing, JSON handling and HTML escaping,
-`enum_demo.hls` / `option_demo.hls` / `result_demo.hls` demonstrating Stage 7
-features (enums, match, `?` operator, Option/Result), the new
-`ownership_demo.hls` demonstrating Stage 8-alpha's `drop`/`clone`/`take`,
-and `effects_demo.hls` demonstrating Stage 9-alpha's fine-grained effects
-(`uses Fs`, `uses Clock`, `uses Args`).
+More programs live in [`examples/`](examples/) — from a word count
+over a real file to a complete HTTP server with sessions, CSRF
+protection and server-sent events.
 
-## Standard library (Stage 6 + Stage 7)
-
-HLS ships with a small pure-HLS standard library focused on web programming
-and error handling:
-
-| Module | What it provides |
-|--------|------------------|
-| `std.str` | `str_repeat`, `str_reverse`, `str_join` (O(n) via the `join` builtin), `str_replace`, `str_to_lower_ascii`, `str_to_upper_ascii`, `str_count`, `str_pad_left`, `str_pad_right`, `str_index_of` |
-| `std.math` | `math_abs_int/float`, `math_min/max`, `math_clamp`, `math_power_int/float`, `math_sqrt`, `math_floor`, `math_ceil`, `math_round`, `math_sum_int/float`, `math_avg_float` |
-| `std.json` | `json_parse(src) -> JsonValue`, `json_stringify(v) -> str`, plus constructors (`json_null/bool/int/float/str/array/object`) and accessors (`json_object_get`, `json_object_has`, `json_is_*`) |
-| `std.url` | `url_parse(s) -> Url`, `url_stringify(u) -> str`, `url_query_parse(qs) -> map[str,str]`, `url_query_stringify(m) -> str`, `url_encode(s)`, `url_decode(s)` |
-| `std.html` | `html_escape(s)`, `html_escape_attr(s)`, `html_unescape(s)`, `html_tag(name, attrs, content)`, `html_text(s)` |
-| `std.option` (Stage 7) | `enum Option[T] { Some(T), None }`, `option_unwrap`, `option_unwrap_or`, `option_is_some`, `option_is_none` |
-| `std.result` (Stage 7) | `enum Result[T, E] { Ok(T), Err(E) }`, `result_unwrap`, `result_unwrap_or`, `result_err_or`, `result_is_ok`, `result_is_err`, `int_parse(s) -> Result[int, str]`, `float_parse(s) -> Result[float, str]` |
-| `std.bits` (non-roadmap) | `bits_shl/shr/sar`, `bits_and/or/xor/not`, `bits_get/set`, `bits_popcount/clz/ctz`, `bits_byte`, `bits_bytes_be/le`, `bits_from_bytes_be/le` (HLS has no bitwise operators — these helpers are pure functions built on arithmetic) |
-| `std.simd` (Stage 21) | Explicit SIMD types `I32x4`/`F64x2`/`U8x16` (packed lanes, wrapping lane arithmetic, checked lane entry) + ops (splat/from/lane/set/add/sub/mul/min/max/shuffle/reduce/gather/scatter) + fused kernels (`simd_transform_sum_i32x4`, 8-tap FIR `simd_correlate8_sum_i32x4`); under `--target-feature avx2` the hot kernels lower to native intrinsics |
-| `std.set` (non-roadmap) | `set_str_new`, `set_str_from_list`, `set_str_add`, `set_str_contains`, `set_str_size`, `set_str_to_list`, `set_str_union`, `set_str_intersect`, `set_str_diff`, `set_str_equal` (string sets backed by `map[str, bool]`) |
-| `std.process` (Stage 47) | `Command` builder (`command_new`, `command_arg`, `command_stdin/stdout/stderr`), `Child` handle, `ExitStatus` decoder (`exit_status_decode`, `exit_status_success`, `exit_status_code`, `exit_status_signal`), `Stdio` enum (`Inherit`/`Pipe`/`Null`); 6 new builtins `proc_spawn`/`proc_wait`/`proc_kill`/`proc_child_write`/`proc_child_read`/`proc_child_close` (all `Proc`); `proc_spawn` uses fork+execvp WITHOUT a shell; `program` arg is a taint sink (command injection) |
-| `std.env` (Stage 48) | `env_var(key) -> Option[tainted[str]]`, `env_set_var(key, value)`, `env_unset_var(key)`, `env_current_dir() -> tainted[str]`, `env_set_current_dir(path) -> int`, `env_args_os() -> list[tainted[str]]`; 7 new builtins `env_get`/`env_has`/`env_set`/`env_unset`/`cwd_get`/`cwd_set`/`args_os` (all `Proc`); env vars tainted by default; key/path args are taint sinks (info disclosure, env injection, directory traversal) |
-| `std.time` (Stage 49) | `Instant` (monotonic, ns precision, `instant_now`/`elapsed`/`duration_since`/`add`/`sub`), `Duration` (signed nanos with **checked arithmetic** — `duration_add`/`sub`/`mul`/`div` panic cleanly on overflow), `SystemTime` (wall-clock ms since Unix epoch, `system_time_now`/`unix_secs`/`unix_millis`/`to_iso8601`/`duration_since -> Result[Duration, str]`), `time_sleep(Duration)`, `time_timeout_ms(ms) -> Future[bool]`; 2 new builtins `instant_now_ns`/`system_time_now_ms` (both `Clock`) |
-| `std.math` (Stage 50) | IEEE-754 edge cases (`math_isnan`/`isinf`/`isfinite`/`signbit`), libm-backed transcendental (`math_sin`/`cos`/`tan`/`asin`/`acos`/`atan`/`atan2`/`sinh`/`cosh`/`tanh`/`exp`/`log`/`log10`/`log2`/`pow`/`sqrt`/`cbrt`/`hypot`/`fmod`/`copysign`), special functions (`math_erf`/`erfc`/`tgamma`/`lgamma`), constants (`math_pi`/`math_e`/`math_pos_inf`/`math_neg_inf`/`math_nan`), `BigDecimal` (pure-HLS arbitrary-precision decimal — `0.1 + 0.2 == 0.3` exact); 28 new pure builtins (no effects, libm-backed) |
-| `std.archive` (Stage 51) | `TarReader` (USTAR format), `ZipReader` (PKWARE APPNOTE with stored entries + CRC-32 verification), `GzipEncoder` (RFC 1952 with stored DEFLATE blocks), `GzipDecoder` (stored blocks BTYPE=00; compressed blocks BTYPE=01/10 panic with a clear "not supported in v0.70.0-alpha" message), `archive_crc32` (IEEE 802.3, table-driven, matches `zlib.crc32`); **bounded decompression** (configurable `max_ratio`, default 100; zip bomb detection); **no unsafe decompression** (every byte bounds-checked); pure-HLS (no new builtins — uses `read_file` + `byte_at` + Stage 32 bitwise primitives) |
-| `std.uuid` v7 + `std.ulid` (Stage 52) | `uuid_v7()` (RFC 9562, time-ordered: 48-bit Unix ms + 12-bit rand_a + 62-bit rand_b; privacy-preserving — no MAC address leak like v1; lexicographically sortable for database indexes), `uuid_v7_from(ts_ms, rand_a, rand_b)` (deterministic), `uuid_v7_timestamp(s)` (extract timestamp); `ulid()` (26-char Crockford base32, lexicographically sortable), `ulid_from(ts_ms, rand_bytes)` (deterministic), `ulid_timestamp(s)`, `ulid_randomness(s) -> 10 bytes`, `ulid_is_valid(s)`, `ulid_compare(a, b)`; existing `uuid_v4_deterministic`/`uuid_v5_like` preserved (backwards compat); encoding matches python-ulid and the JS reference; pure-HLS extension to `std/uuid.hls` (no new builtins — uses `system_time_now_ms` from Stage 49 + `rand_int` from Stage 9) |
-| `std.cli` (Stage 53) | `CliParser` builder (`cli_parser_new`/`desc`/`after_help`/`flag`/`int_opt`/`str_opt`/`float_opt`/`str_positional`/`int_positional`/`env`/`subcommand`), `CliResult` (`ok`/`error`/`help_requested`/`version_requested`/`subcommand`/`matches`/`remaining`), type-safe accessors (`cli_get_bool`/`int`/`str`/`float`/`has`/`remaining_args`); implicit `--help`/`-h` and `--version`/`-V`; `--` end-of-options marker; long (`--port`), short (`-p`), `--port=8080`, `-p=8080` syntax all supported; env-var fallback (CLI takes precedence over env, env takes precedence over default); pure-HLS (no new builtins — uses `args()` Args + `env_get`/`env_has` Proc + `println` IO) |
-| `std.tui` (Stage 54) | Terminal UI primitives: `Term` (`term_new`/`raw`/`restore`/`screen`/`clear`/`flush`), `Cursor` escapes (`cursor_move_to`/`up`/`down`/`left`/`right`/`hide`/`show`/`save`/`restore`), `Color` (16-colour palette + bright variants + default + reset; `tui_color_bg` fg→bg conversion), `Style` (builder API: `style_new`/`fg`/`bg`/`bold`/`dim`/`italic`/`underline`/`blink_slow`/`blink_rapid`/`reverse`/`hidden`/`strikethrough`; `style_eq`/`style_to_sgr`/`tui_reset_sgr`), `Rect`/`Cell`/`Buffer` (off-screen grid; `buffer_new`/`get_cell`/`set_cell`/`set_str`/`fill_rect`/`clear`/`render_into`/`render`), Widget convention with 3 concrete widgets (`Text`/`Block`/`Paragraph`), layout helpers (`layout_split_horizontal`/`vertical`); pure-HLS (no new builtins — emits ANSI escape sequences via `print()` IO, constructed as `chr(27) + "[..."`) |
-| `std.color` (Stage 55) | Terminal color support + truecolor/256/16/monochrome fallback + `ColorStyle` builder. `ColorLevel` (`ColorNone`/`Basic`/`256`/`Truecolor` — total order; renderer quantises down to whatever the level supports). `Color` enum (`ColorNone`/`ColorBasic(int)`/`Color256(int)`/`ColorRgb(Rgb)`) — full color information up to the renderer. `Rgb` (0..255 per channel; range validation). Color constructors (named basic / bright / default / reset / `color_rgb` / `color_256` / `color_none` / `color_bg` fg→bg shift). `ColorStyle` builder via method chaining: `cstyle_new().fg(color_red()).bg(color_black()).bold().underline()` (uses Halis's `impl ColorStyle { ... }` method form, same as `std.fs.PathBuf`); equivalent free-function form `cstyle_fg/cstyle_bg/cstyle_bold/...` (byte-identical). `cstyle_to_sgr(s, level)` coalesces fg+bg+attrs into a single `\x1b[<codes>m` (one CSI per span); drops colors at `ColorNone` (keeps attrs — matches SGR spec). RGB down-sampling (pure int arithmetic): `rgb_to_xterm256` (cube + grayscale), `rgb_to_basic_sgr` (nearest of 16 reference colours), `xterm256_to_basic_sgr`. `color_downsample(c, level)` manual monotone down-sampling. `color_render`/`color_print`/`color_println` convenience. Detection: `color_detect()` reads `NO_COLOR`/`FORCE_COLOR`/`CLICOLOR_FORCE`/`COLORTERM`/`TERM` (precedence order; NO_COLOR wins); `color_detect_from(...)` pure form (explicit env values, differential-safe). Bridge to `std.tui`: `cstyle_to_basic_style(cs)` down-samples to `std.tui.Style` (handles fg→bg shift). Pure-HLS (no new builtins — uses `env_has`/`env_get` Proc + `print` IO + `chr(27) + "[..."` escapes) |
-| `std.progress` (Stage 56) | Progress bars, spinners, ETA estimation, multi-bar rendering. `ProgressBar` (`progress_new(total)`: `total > 0` determinate — bar + percent + ETA + rate; `total == 0` indeterminate spinner — frame + tick count + elapsed). State API (pure, zero-alloc, clamped): `progress_inc`/`progress_set_position`/`progress_set_message`/`progress_tick`/`progress_start` (Clock; stamps the monotonic baseline once)/`progress_finish_state`. Builders (immutable, method twins on `impl ProgressBar`): `.with_label`/`.with_message`/`.with_width`/`.with_chars` (multi-byte UTF-8 cells first-class — geometry counts CELLS not bytes)/`.with_head` (leading-edge char)/`.with_spinner`/`.with_color`/`.with_steady`. ETA: `progress_eta_secs(pb, now_ns)` — pure INTEGER math (`elapsed_secs * remaining / position`) with a pre-checked int64 overflow guard (unknown renders `eta ?`); `progress_rate_per_sec`; `progress_percent` (overflow-guarded); compact durations (45s/3m12s/2h05m/4d03h). 8 spinner styles (braille dots/line/dots-ascii/arrow/bounce/toggle/triangle/pipe) with `spinner_frame` (wraps)/`spinner_style_from_name` (`--spinner` flag surface)/`spinner_frames_preview`. Live drawing: bars draw to STDERR (data stays clean on stdout — the tqdm/indicatif convention) gated by `progress_should_draw()` (PROGRESS_DISABLE > PROGRESS_FORCE > `isatty(2)` — a piped process performs ZERO writes), rate-limited by `steady_ms` (default 100 ms; a suppressed draw performs zero string work). `impl ProgressBar` live methods: `.start()`/`.inc(delta)`/`.set_position`/`.set_message`/`.tick()`/`.draw()`/`.finish()`/`.finish_with(msg)` + pure accessors. MultiBar: one line per concurrent task, cursor-up + EL 2 in-place redraw, value-snapshot concurrency model (workers report through channels; the UI task updates snapshots via `multibar_set`). Color: the roadmap's `--color=always/never/auto` surface (`progress_color_from_str` + `progress_resolve_level`: Auto → color only when stderr is a TTY; the filled span green, spinner frame cyan, finished line bold green at every ColorLevel — monochrome is completely escape-free). Zero-allocation-after-creation: fixed-size state + a pre-allocated `cells` list mutated in place (ONE join per monochrome redraw). 3 new builtins: `eprint`/`eprintln` (stderr writes — IO effect, taint sinks, argument consumed, `fflush(stdout)` first so combined captures keep the caller's logical order) + `isatty(fd)` (TTY detection — the probe std.color deferred to this stage). Pure render core (`progress_render(pb, level, now_ns)` — explicit ColorLevel + now_ns) keeps interpreter and native byte-identical |
-| `std.log` (Stage 57) | Structured logging with three output formats (human / JSON / syslog), key-value pairs, and `HLS_LOG` level control. `LogLevel` ladder (`LogOff`/`LogError`/`LogWarn`/`LogInfo`/`LogDebug`/`LogTrace` — total order; `log_level_from_str` parses HLS_LOG: off/error/warn/warning-alias/info/debug/trace, case-insensitive, lenient INFO default — a typo must not silence the error channel; `log_enabled` filters). `Logger` as an EXPLICIT value (HLS has no global mutable state): `log_new()` (Proc — reads HLS_LOG/HLS_LOG_FORMAT + fills pid/hostname once via 2 new builtins `proc_pid()`/`sys_hostname()`), `log_new_with(...)` (pure constructor), `log_with_level/_format/_color/_app_name/_identity` (immutable builders) + `impl Logger` method twins. The roadmap's `info!`/`warn!`/`error!`/`debug!`/`trace!` map to functions (`log_info(lg, msg)` + `lg.info("msg")` method form — no macros until Stage 113+) + structured `_kv` variants (parallel keys/vals lists). Three renderers (PURE — differential-safe): human (`2025-09-09T12:40:00.123Z INFO  myapp: server started port=8080` — ISO-8601 UTC ms + 5-wide level token + colored ERROR red+bold/WARN yellow/INFO green/DEBUG blue/TRACE magenta, escape-free at ColorNone), JSON Lines (fixed key order ts/level/app/msg/kvs, FULL escaping: quote/backslash/control-\u00XX/the JS-breaking U+2028/U+2029 — the log-forging defense: multi-line messages cannot forge new records), syslog RFC 3164 (`<14>Sep  9 12:40:00 web01 myapp[1234]: msg k=v` — PRI = 8+severity, space-padded day, pid 0 omits [PID]). Timestamp math: Hinnant civil-from-days with explicit floor-division (pre-1970, leap days 2000/2024, 2100 non-leap all correct) — pure integer arithmetic. Logs go to STDERR (the 12-factor/systemd convention) via Stage 56's eprintln (stdout flushed first — data + logs keep the caller's order). Live emit path (`uses IO, Clock, Proc`): log_emit/log_log + the ten level fns + methods; suppressed records cost zero work |
-| `std.http_server` (Stage 64) | Multi-threaded HTTP/1.1 keep-alive server with HTTP/2 preface dispatch, work-stealing thread pool (bounded `Chan[TcpStream]` work queue with `2 * workers` capacity for backpressure), graceful shutdown (Mutex-guarded shutdown flag + inflight counter + Condvar + drain wait), and TLS-termination configuration hooks. `HttpServerConfig` builder (12 immutable setters: host/port/workers/backlog/keep_alive_max/keep_alive_timeout_ms/read_timeout_ms/max_body/graceful_shutdown_ms/http2/tls/alpn). `HttpServer { config, router, shutdown_mu+flag, inflight_mu+cv+count }`. HTTP/2 preface detection (`http_server_is_http2_preface` — RFC 7540 §3.5 24-byte magic) + minimal SETTINGS/ACK/GOAWAY handshake. HTTP/1.1 keep-alive loop (`http_server_should_keep_alive` — RFC 7230 §6.3/§6.6: HTTP/1.0 default=close, HTTP/1.1 default=keep-alive). Worker pool (`http_server_worker_loop`) + accept loop (`http_server_serve`) with N poison-pill sentinels for clean worker exit. Pure-HLS (no new builtins — uses std.http + std.http_router + std.http2 + std.net + std.sync + std.thread). TLS limitation: `wss://` is NOT directly supported (deploy behind nginx/caddy until `tls_listen` arrives). |
-| `std.sha1` (Stage 65) | RFC 3174 / FIPS 180-4 SHA-1 hash. `sha1_hash(data) -> str` (20-byte digest), `sha1_hex(data) -> str` (40-char lowercase hex). Pure-HLS implementation using std.bits (int_and/or/xor/shl/shr — Stage 32 native bitwise builtins). Verified against the canonical FIPS 180-4 test vectors (empty, "abc", 448-bit, "The quick brown fox..."). SHA-1 is cryptographically broken for collision resistance (SHAttered, 2017) but is REQUIRED by RFC 6455 §1.3 for the WebSocket handshake (Stage 65). Stage 65 uses SHA-1 ONLY for the WebSocket handshake; production code needing a collision-resistant hash should wait for the SHA-2 family (Stage 100+, Phase VII). |
-| `std.websocket` (Stage 65) | RFC 6455 WebSocket protocol — full-duplex bidirectional communication over a single TCP connection. BOTH server-side and client-side: handshake (`ws_accept_key`/`ws_handshake_response`/`ws_validate_upgrade`/`ws_pick_subprotocol` server-side; `ws_generate_key`/`ws_handshake_request`/`ws_validate_accept`/`ws_validate_upgrade_response` client-side — MITM detection via Sec-WebSocket-Accept verification), frame encode/decode (`WsFrame { fin, opcode, masked, mask_key, payload }` + `ws_frame_encode_with_key` DETERMINISTIC for tests + `ws_frame_encode` random mask + `ws_frame_decode` with RSV/opcode/control-frame validation + `ws_frame_decode_length` 0=partial/-1=oversized; handles 7/16/64-bit payload lengths per RFC 6455 §5.2), masking (`ws_apply_mask` involutive; `ws_generate_mask_key` random 4-byte key), close handshake (`ws_close_payload`/`ws_parse_close_payload`/`ws_is_valid_close_code` per RFC 6455 §7.4.2), connection helpers (`ws_send_text`/`ws_send_binary`/`ws_send_close`/`ws_send_ping`/`ws_send_pong` server-side UNMASKED; `ws_send_text_masked`/`ws_send_binary_masked`/`ws_send_close_masked` client-side MASKED; `ws_read_frame` bounded read loop). Constants: opcodes, close codes (1000-1011, 3000-3999 application, 4000-4999 private), frame-size bounds (16 MiB), GUID. Pure-HLS (no new builtins — uses std.http + std.http2 + std.bits + std.sha1 + std.base64 + std.str + std.option + std.result + std.net). `wss://` (TLS) NOT directly supported until `tls_listen` arrives. |
-| `std.cookie` (Stage 66) | RFC 6265bis HTTP cookies — state-management protocol for the web. CookieJar parsing (`cookie_parse_request`/`cookie_parse_string` — liberal: trims whitespace, skips empty pairs, splits on FIRST `=` so values may contain `=`; `cookie_get` returns FIRST match per RFC 6265 §5.4; `cookie_has`/`cookie_names`/`cookie_count`). SetCookie builder + immutable setters (`cookie_new` + `cookie_with_expires`/`_max_age`/`_domain`/`_path`/`_secure`/`_http_only`/`_same_site` — each returns a NEW SetCookie). Serialisation (`cookie_serialize` canonical RFC 6265 §4.1.1 form; attribute order: Expires/Max-Age/Domain/Path/Secure/HttpOnly/SameSite; panics if > 4096 bytes per §6.1; `cookie_to_header` HttpHeader wrapper). SameSite constants (`cookie_samesite_strict`/`lax`/`none`/`unset` + `cookie_samesite_is_valid` case-insensitive). Sanitisation (`cookie_sanitize_name`/`cookie_sanitize_value` per §4.1.1 grammar — names reject `=`/space; values allow them). Signing (`cookie_hmac_sha1` RFC 2104 HMAC-SHA1 pure-HLS via std.bits + std.sha1; `cookie_sign` appends `.<base64url(sig)>`; `cookie_verify` CONSTANT-TIME comparison; `cookie_unwrap_signed` verify+extract; `cookie_const_time_eq` timing-attack defense). HTTP date (`cookie_format_http_date(unix_ms)` RFC 7231 §7.1.1.1 IMF-fixdate via Hinnant civil-from-days). Security model: SECURE + HTTP-ONLY + SAMESITE + SIGNED are COMPLEMENTARY defenses (sniffing / XSS-hijack / CSRF / forgery). Pure-HLS (no new builtins). |
-| `std.graphql` (Stage 71) | Schema-first GraphQL server, pure-HLS. SDL parser (`graphql_parse_schema`: type/enum/scalar/schema blocks, field args with defaults, list/non-null modifiers, descriptions, directives skipped) + document parser (`graphql_parse_query`: anonymous/named queries + mutations, variables with defaults, aliases, argument literals incl. lists/objects/enum names/variable refs, named + inline fragments; subscriptions rejected -> std.sse; parse errors carry line/column; DEPTH LIMIT enforced during parsing). Anti-ReDoS bounds: 16 KiB document / depth 10 / 2048 expanded nodes (billion-laughs defence) / 256-element list literals / 16 args / 32 fragments / 32 variables. Static validation: field existence, leaf-vs-composite selection sets, argument existence/type/requiredness, variable declaration + type match, fragment usage + cycle detection, post-flatten collisions. TRAMPOLINE EXECUTOR (no fn pointers): `GqlResolver` table (type.field -> handler_id, the http_router pattern); `graphql_begin` -> `while graphql_has_pending` -> `graphql_next_task` -> user resolves -> `graphql_complete`/`graphql_fail_task` -> `graphql_finish`; tasks carry args_json (defaults applied, always well-formed JSON) + source_json (parent value); `__typename` meta-field; null propagation through non-null parents; structured errors with message + path + locations; dynamic node budget converts runaway list expansion into a field error. HTTP glue: `graphql_http_request` (POST JSON body + GET query string), `graphql_http_response`/`graphql_http_error` (400). Schema export: `graphql_schema_sdl` (canonical, round-trip FIXED POINT) + `graphql_schema_to_json` (structural introspection view). Pure-HLS (no new builtins — std.json + std.str + std.http + std.url) |
-| `std.openapi` (Stage 72) | OpenAPI 3.1 generation from handler types, pure-HLS. JSON Schema 2020-12 builders (`oa_int/int32/float/str/str_format/bool/str_enum/array/object/ref` + `oa_nullable` — 3.1 type arrays, NOT 3.0 `nullable:true` — and copy-first immutable setters). Operation model (parameters/query/path/header, request bodies, responses with duplicate-status replacement, tags, deprecated; free fns + `impl` method chains). ROUTER BRIDGE: `openapi_from_router` — `:param` -> `{param}` path conversion, implied path parameters auto-generated, handler_id bindings, ANY routes use the operation's method, sub-router mounts contribute prefixed routes, unbound routes skipped (internal endpoints), unbound bindings rejected (the spec cannot lie). `openapi_validate` (path shape, responses + descriptions, template <-> declared params, recursive $ref resolution). `openapi_to_json` (deterministic key order; paths grouped by path then lower-case method). Serving: `openapi_json_response` (/openapi.json) + `openapi_docs_response` (/docs Swagger UI, spec embedded INLINE) + URL variant; `</` -> `<\/` script-injection defence (JSON stays valid). Pure-HLS (no new builtins — std.json + std.http + std.http_router + std.html) |
-| `std.jsffi` (Stages 23+24+73) | JavaScript FFI for the wasm32 target. 48 `extern "js"` declarations (console + extras, DOM attrs/classes/styles/values, JSON bridge, URL encode/decode, fetch-with-options, localStorage management, platform/language/online/user-agent/screen, performance timing) — every one with a default in the AUTO-GENERATED JS glue (override via importOverrides). AUTO struct marshalling: hlwasm computes field layouts and exports `hl_struct_descriptors()`; the glue registers every struct at instantiation — a Halis struct becomes a JS object with zero manual setup (`Halis.readStruct`/`writeStruct`). JS->HLS callbacks: define `fn jsffi_on_callback(cb_id: int, arg: str) -> str`; hlwasm exports `hl_call_halis`; JS calls `Halis.callHalis(cbId, json)` (handler_id dispatch). Companion `std.jsffi_callback` (native): `JsffiCallback` protocol tables |
-| `std.dom` (Stage 74) | Server-side HTML DOM rendering, pure-HLS. `DomNode` sum type (`Element` / `Void` / `Text` / `Raw` / `Comment` / `Doctype` / `Fragment`) + `DomAttr` (name + value, validated). Constructors: `dom_text` / `dom_raw` / `dom_comment` / `dom_doctype` / `dom_fragment` / `dom_element` / `dom_void` (strict void-tag invariant — panics on mismatched kind). ~50 element shorthand builders: `dom_html` / `dom_head` / `dom_body` / `dom_title` / `dom_meta` / `dom_link` / `dom_script_src` / `dom_script_inline` / `dom_style_inline` + sectioning + headings (`h1`..`h6`) + text content (`p` / `span` / `div` / `pre` / `blockquote` / `hr`) + inline text (`a` / `em` / `strong` / `code` / `small` / `mark` / `abbr` / `b` / `i` / `u` / `sub` / `sup`) + lists + tables + forms + media + interactive. Attribute helpers: `dom_attr` / `dom_attr_true` / `dom_attr_false` (HTML5 boolean attributes — present emits just the name, absent omits entirely) / `dom_class` / `dom_id` / `dom_href` / `dom_src` / `dom_alt` / `dom_title_attr` / `dom_name_attr` / `dom_value_attr` / `dom_placeholder` / `dom_type_attr` / `dom_rel` / `dom_lang` / `dom_charset` / `dom_style_attr` / `dom_role` / `dom_data` (data-{name}) / `dom_aria` (aria-{name}). Document helpers: `dom_html_document` (minimal) / `dom_html_document_with_head` (full control). Immutable mutators (copy-then-return): `dom_with_attr` / `dom_with_attrs` / `dom_with_child` / `dom_with_children`. Attribute lookup/replace/remove (case-insensitive): `dom_attr_get` / `dom_attr_has` / `dom_attr_set` / `dom_attr_remove`. Introspection: `dom_node_kind` / `dom_is_*` / `dom_tag` / `dom_attrs` / `dom_children` / `dom_text_value`. Statistics: `dom_node_count` / `dom_count_by_kind` / `dom_describe`. Serialiser: `dom_render` (Text HTML-escaped; Raw verbatim; Comment sanitised against `-->` / `--!>` breakout; Doctype; Void no closing tag; empty element -> `<tag></tag>`; Fragment -> children concat). Inline `<script>` / `<style>` bodies: `</script>` / `</style>` rewritten to `<\/script>` / `<\/style>` (case-insensitive) — preventing premature element termination. HTTP integration: `dom_to_html_response` + 200/400/404/500 status helpers. Pure-HLS (no new builtins — std.html + std.str + std.option + std.result + std.http) |
-| `hls-serve` (Stage 75) | `webpack-dev-server`-equivalent dev server. Stage 24's `tools/hlserve.py` (SSE-based live reload, ~515 lines) is now a thin facade over the new modular `tools/hlserve_parts/` package (10 modules — common, config, watcher, compiler, hmr, overlay, proxy, tls, server, cli). WebSocket HMR (RFC 6455) at `/ws` replaces SSE — bi-directional; the browser can push `console.log` and uncaught errors back to the dev server's terminal. Compile-error overlay (CSS+JS injected before `</body>`) shows file:line + severity + message; auto-dismisses on the next clean compile. Hot reload swaps the wasm module in-place (calls `Halis.hotReload(bytes)`; preserves JS state). SPA history fallback (non-asset paths serve `index.html` — the `historyApiFallback` equivalent). HTTP reverse proxy (`--proxy /api=http://localhost:3001`, longest-prefix match, urllib, X-Forwarded-*). HTTPS with self-signed RSA-2048 cert (`--https`; uses the optional `cryptography` package; falls back to HTTP if absent — no new hard dependency). gzip compression (responses > 1 KB; skips `application/wasm`). Public static dir (`--public-dir DIR` -> `/static/*`). Auto-open browser (`--open`). TOML config file (`hls.serve.toml` auto-detected in cwd; CLI overrides). 13 new CLI flags on top of the preserved Stage 24 surface. No new compiler builtins; pure tooling stage. Acceptance: `make serve-acceptance` (10 sections, 50+ assertions). |
-
-Each module is written in HLS itself and can be used inside `hlc` (the
-compiler) or any user program. Import with `import "std.option"` (or whichever
-module you need).
-
-## Repository layout
+## Self-hosting, proven every build
 
 ```
-halis-lang/
-├── SPEC.md              # Language constitution (full v0.30 spec)
-├── ROADMAP.md           # 150-stage roadmap to v1.0
-├── SECURITY.md          # Threat model & security policy
-├── LTS.md               # Stage 145: the published support policy (3y
-│                        #   bug-fix, 5y security) — rendered from the
-│                        #   hls-lts constants, verified every run
-├── RC.md                # Stage 146: the release candidate's record —
-│                        #   rendered from the live tree by the rc kit,
-│                        #   deterministic per anchor, drift refused
-├── .hls-rc.json         # the anchor: the tag, its commit, its day and
-│                        #   the freeze digest the gate defends
-├── snapshot/            # Stage 142: the committed C snapshot — the seed the
-│   ├── hlc.c            #   pure bootstrap compiles (hlc's own emission for
-│   └── MANIFEST.json    #   src/hlc.hls) + its content-addressed manifest
-├── tools/               # The lab: all Python tooling, including the
-│   ├── hlinterp/        #   interpreter (moved from boot/ in v0.164.0-alpha —
-│   │   ├── lexer.py     #   plain lab tooling now: differential suites and
-│   │   ├── parser.py    #   the front-end the tools share; no law, target or
-│   │   ├── checker.py   #   build path names it — facade → hlinterp/checking/
-│   │   ├── interp.py    #   facade → hlinterp/interp_parts/
-│   │   └── boot.py      #   CLI
-│   └── hls-snap.hls     #   the snapshot kit, in Halis
-├── src/
-│   ├── hlc.hls          # ★ COMPILER written 100% in HLS — entry point that
-│   │                    #   imports the modules below (lexer → parser →
-│   │                    #   checker → C codegen → self-compile)
-│   └── hlc/             # compiler modules (loaded via `import "hlc/*.hls"`):
-│                        #   types · lexer · parser · checker · proof ·
-│                        #   check_expr · check_call · check_match · runtime ·
-│                        #   codegen · pgo · simd · lto · gen_expr · gen_stmt ·
-│                        #   gen_fn · main
-├── std/                 # Standard library (in HLS); large modules are a thin
-│                        #   facade + internal parts under std/<mod>/
-├── examples/            # hello, fibonacci, primes, wordcount, secure_demo, ...
-├── tests/
-│   ├── ok/              #   valid programs (incl. safe panics + Stage 30/31 demos)
-│   ├── fail/            #   programs that MUST be rejected (types/effects/taint/escape)
-│   ├── suites/          #   test suites sourced by run_tests.sh
-│   └── run_tests.sh     #   runner: ok/fail/differential/bootstrap fixed-point
-├── mk/                  # Makefile stage sections (included in original order)
-├── Makefile             # bootstrap · test · run · examples · audit · opt-stats · emit-ir · emit-llvm
-└── bin/                 # (generated) native hlc
+snapshot/hlc.c ── cc ──► bin/hlc ── compiles ──► src/hlc.hls
+(committed seed)          (native)                   │
+     ▲                                                 │
+     └────────── must re-derive byte for byte ─────────┘
 ```
 
-The `tools/` directory (Stage 11+) holds the SSA IR + optimiser
-(`tools/ir/`), the LLVM IR text backend (`tools/llvm_emit.py`), and the
-package manager (`tools/hls-pkg.py`). These are Python tools today;
-re-implementing them in HLS itself is a Stage 11/12/13 release target.
+`make bootstrap` compiles the committed C snapshot — the compiler's
+own emission, carried in the tree and content-addressed by
+`snapshot/MANIFEST.json` — and requires the resulting compiler to
+re-derive that snapshot exactly. A stale or hand-edited snapshot
+fails the build loudly. `make snapshot-chain` goes further: it runs
+the whole bootstrap as two independent ignitions, byte-compares
+every hop — each round against the snapshot, round against round —
+and prints the chain digest; `CC2=clang` proves a different compiler
+in the first slot lands on the same bytes.
 
-## Design philosophy (abridged)
+No Python is involved in any build, release or snapshot path. The
+interpreter under `tools/hlinterp/` is lab tooling for the
+differential suites; nothing on a lifecycle path reads it.
 
-| Principle | Realisation |
-|-----------|-------------|
-| Safety by default | Checked arithmetic, checked array bounds — no off switch |
-| Explicitness for audit | Mandatory types, no shadowing, no implicit casts, no hidden state |
-| I/O as an effect | `uses IO` statically verified, fixpoint over the call graph |
-| No null | No null references, no uninitialised variables |
-| Performance via AOT | HLS → C → machine code; future generics will monomorphise |
-| Small core | Everything else extends via the standard library, no syntax bloat |
+## Quick start
 
-Full details: [SPEC.md](SPEC.md) · Stage-by-stage roadmap:
-[ROADMAP.md](ROADMAP.md).
+Requirements: `gcc` or `clang`, and `make`. That is the whole list.
 
-## Status
+```bash
+git clone https://github.com/mhieuhonda/halis-lang.git
+cd halis-lang
 
-**v0.129.0-alpha → v0.130.0-alpha — Stage 111: capability token types — `Cap[Net]` as a value, not just effect.** An effect used to live in exactly one place: the `uses` clause on a signature — a static word checked against the call-graph fixpoint, unreachable from the value level. Stage 111 promotes the effect into a value: `Cap[E]` is a first-class capability token (the bracket names one of the nine effects the audit and the sandbox already speak), opaque by construction — no fields, no printing, no equality; `cap_effect_name(c)` reads its identity back — and unforgeable: `cap_take("Net")` mints one only in `main` (the process entry holds every effect ambiently) or inside a function already declaring `uses Net`. The grant rule is the heart: a direct `Cap[E]` parameter confers E on its body — `Cap[IO]` the whole hosted family, mirroring the `uses IO` blanket — and enforcement becomes `missing = computed − declared − grants`, which leaves the fixpoint untouched, so `hls-audit`'s computed surface and the Stage-110 sandbox derivation stay honest (the audit grows a Capability tokens section listing who holds what, word-for-word on both front-ends). The soundness edges are the content: authority does not leak transitively (a caller of a capability-using function still sees the requirement), a capability stored deeper — a struct field, a list element — is plumbing that confers nothing, `clone()` refuses tokens and every composite containing one (duplicating a token would mint authority), `pure` functions hold none, and `#![no_std]`/`#![freestanding]` refuse the whole mechanism (no OS behind the image, no authority to hold). Tokens are Send — authority crosses a `spawn` freshly minted at the call site and granted through the worker's parameter. Acceptance: `make cap-acceptance` (7 sections, 34 checks — the mint rules, the grant matrix, the opaqueness, the crate modes, the interpreter/native differential under both -O modes, and the audit section pinned byte-for-byte). SPEC section 65.
+make bootstrap          # ~20 s: cc builds the seed, HLS takes over
+make run F=examples/hello.hls
 
-**v0.128.0-alpha → v0.129.0-alpha — Stage 110: `hls-sandbox` — sandboxed package execution (seccomp-bpf).** The declaration becomes enforcement. Every claim the toolchain makes about a program — the effect surface, the supply-chain audit, the manifest contract — was compile-time truth a running machine had to take on faith; `hls-sandbox` derives a seccomp-bpf syscall filter from the SAME effect vocabulary the audit reports, arms it in a forked child (NO_NEW_PRIVS + SECCOMP_SET_MODE_FILTER), and executes the artifact inside it: an IO + Fs(read) program reads and prints, its open-for-write returns EPERM from the KERNEL, and memory corruption cannot widen the hole because the allowlist lives below the process. The precision is one level under the effect vocabulary: the reachable builtin census splits Fs into read and write — a read-only tree arms `open`/`openat` under a write-intent argument mask (0x410643) while one write-side builtin or one opaque `extern` declaring Fs honestly surrenders to rw. The filter is a fixed auditable shape (arch guard for the three tabled triples x86_64/aarch64/riscv64, ascending dispatch, mask-checked blocks, forward-only jumps, over-range refused), with four denial postures — errno EPERM (a denial the language observes as a value: the write panics "cannot write file", exit 101), kill (SIGSYS, observed 159), trap, log — an execve that is an entrance never an exit (the filter inherits across it), and undeniables (exit/exit_group/brk: a sandbox the program cannot leave is a hang). Delivery is twofold: the launcher, and `emit` — a C shim whose constructor bakes the filter INTO the binary, cross-arch by design. Package mode gates fail-closed (drift, unauditable, the [effects] policy — a tree that fails its own audit does not get armed), the `[sandbox]` manifest section pins default/fs/allow/deny, and the release statement pins the POSTURE into the same transparency ledger the SBOM, repro and sign chain into. Acceptance: `make sandbox-acceptance` (9 sections, 72 checks — the kernel half runs for real: the ro/rw/kill matrix on a native-compiled demo, the loader and static lines, the net probe whose declaration lied and whose kernel did not, the self-armed shim, the statement/ledger/drift refusals, byte-parity demos). SPEC section 64.
+make test              # ok/ + fail/ corpus, differential, bootstrap
+                        # determinism, LLVM, memory stress, fmt, lint
+```
 
-**v0.118.0-alpha → v0.119.0-alpha — Stage 100: the separation-logic fragment (heap shapes).** The prover goes from scalars to the heap. `hlprove --shapes` reads the heap out of ordinary code: every list binding gets an alias class (assignment aliases — Halis values are references; `clone(..)` and literals are fresh; unknown provenance is the wildcard), written classes get separation verdicts — `own(a) * own(b)` proven from freshness evidence, refused with the reason otherwise, because `f(xs, xs)` is legal in Halis and two parameters CAN alias, so separation is never assumed — and every cursor loop anchored directly on `xs.len()` (or `range(a, xs.len())`) gets its shape triple `lseg(xs,0,i) * cell(xs,i) * lseg(xs,i+1,xs.len())` decided: a frame check with teeth (every write through the anchor's class is the cursor cell; no push/pop; no escaping) justifies treating `len` as loop-invariant, and initiation + preservation go to z3 (or cvc5 with `--cvc5`). The refusals are the content: descending steps, off-cursor or through-alias writes, pushes inside the loop and captured lengths are all refused with their reasons, while a conditional bump keeps its shape but honestly loses the post-bump access (the cursor may sit at `len` — a real out-of-bounds the demo ships). Analysis-only: nothing changes compilation, and the fragment claims nothing without a solver verdict. Acceptance: `make shapes-acceptance` (6 sections, 39 checks — requires a decider: a z3 binary or `pip install z3-solver`). SPEC section 54.
+Day-to-day commands:
 
-**v0.117.0-alpha → v0.118.0-alpha — Stage 99: `hlprove --cvc5` — the CVC5 SMT backend.** The proof bridge has a second decider. `hlprove --cvc5` runs the SAME SMT-LIB2 files z3 runs — the contract bridge's vacuity/ensures queries and the invariant inference's initiation/preservation obligations, byte for byte unchanged — through CVC5, a different engine with the same semantics: a disagreement becomes a reported event instead of a silent assumption, and agreement is evidence the obligations, not one solver's quirks, decide the verdicts. The plumbing mirrors the z3 pattern exactly (binary first, then `pip install cvc5` as the module fallback — the module is executed command by command through an InputParser since it ships no file runner) and neither mode ever claims a verdict it does not have. `--cvc5` implies `--smt` and is mutually exclusive with `--z3` (`pick one`, exit 2); inference under it reports `cvc5-checked` / `inferred (cvc5-verified inductive)`. Acceptance: `make cvc5-acceptance` (6 sections, 32 checks — requires BOTH backends: contracts built to force implied / not-implied / vacuous verdicts, the Stage 97 battery re-decided by cvc5, all 28 demo obligations certified unsat by both engines, and the CLI reports byte-identical modulo the solver's name). SPEC section 53.
+| Command | What it does |
+|---------|--------------|
+| `make run F=prog.hls` | Compile to C, build natively, run |
+| `make check F=prog.hls` | Type- and effect-check without running |
+| `make audit F=prog.hls` | Capability + taint-flow report of the program |
+| `make fmt` / `make lint` | Format and lint the tree |
+| `bin/hlc --emit llvm prog.hls out.ll` | Emit LLVM IR instead of C |
+| `make lto F=prog.hls` | Whole-program link-time optimisation, then run |
+| `make pgo` | Profile-guided build of the compiler itself |
 
-**v0.116.0-alpha → v0.117.0-alpha — Stage 98: Refinement types (lightweight, opt-in).** A type can now carry its own invariant: `T where <pred>` attaches a pure predicate over the reserved binder `self` to `int` / `float` / `bool` / `str` — on fn parameters (guarded at fn entry), return types (guarded at every return), `let` annotations, and struct fields (guarded inside the generated constructor). A violation is a clean panic (exit 101) with an identical message in both implementations; the checks are always-on semantics, not a flag. The proof side keeps the hot path honest instead of slow: constant values are checked at compile time (`half(0)` against `x: int where self > 0` never compiles), same-predicate flow re-checks nothing, and the interval engine elides what it proves while tightening the target's facts to the post-guard interval. The payoff is composition: `fn ratio(num: int where self >= 0, den: int where self != 0) -> int` makes the division provable — the `-O fast` body is a bare `return (u_num / u_den);` with the entry guards still in place. Acceptance: `make refine-acceptance` (7 sections, 39 checks) plus `examples/refine_demo.hls`.
+## The toolchain
 
-**v0.115.0-alpha → v0.116.0-alpha — Stage 97: SMT-based loop-invariant inference (auto-discovery).** Phase VII opens. `hlprove --infer-invariants` summarises every loop (entry facts, a per-variable affine transition relation, the condition), generates candidates from templates — entry bounds, overshoot-weakened condition bounds, for-range equations, modular congruences — and lets z3 decide initiation + preservation. Only unsat verdicts are reported: `s >= 0` is inferred for `s' = s + i` only together with the `i >= 0` it leans on, `while i < n { i = i + 2 }` yields the overshoot bound `i <= n + 1` (not `i <= n`), and the `-2` skipper refuses `i >= 0` while discovering its true floor `i >= -1`. Unmodeled bodies encode their variables as free primed constants — precision is lost before soundness ever is. Inference is analysis-only: `-O fast` elision still belongs to the interval engine alone. Acceptance: `make invariant-acceptance` (6 sections, 28 checks; needs a z3 binary or `pip install z3-solver`).
+The entire toolchain is written in Halis and compiles itself:
 
-**v0.114.0-alpha → v0.115.0-alpha — Stage 96: ELF symbol-table emission + debug-info (DWARF 5).** Completes **Phase VI**. The image describes itself: `hlc --debug` lowers the C with `#line` directives at statement granularity, so `-g -gdwarf-5` (or `hlcross --debug`) produces DWARF 5 that names the `.hls` source — `addr2line` answers `dbg_demo.hls:16` for `usf_gcd`, gdb steps Halis lines, `objdump -S` interleaves them. Functions map to the file they were parsed from; everything the compiler generates maps to the generated C. `hlc --symbols <manifest>` writes every definition the compiler emits as `<binding> <section> <symbol> [<source>]`, and the gate holds it to the claim against `nm` — complete in the freestanding image (minus the linker script's own symbols and GCC's `.part.N` clones), complete over the hosted `hl_*`/`usf_*` symbols, classes agreeing wherever a symbol survives. Acceptance: `make debuginfo-acceptance` (7 sections, 23 checks).
+| Tool | What it does |
+|------|--------------|
+| `hlc` | The compiler — HLS to C, LLVM IR or HLIR; checker, proof engine and optimiser included |
+| `hlfmt` | Opinionated formatter with a team config file; comments preserved in every position |
+| `hllint` | Safety-first linter with `--fix` autofix and a `#[deprecated]` rule |
+| `hls-lsp` | Language server: hover, definitions, references, rename, completion, inlay hints |
+| `hls-dap` | Debug adapter: breakpoints, stepping, variable views, a REPL in the paused frame |
+| `hls-repl` | Interactive REPL — `:type`, `:effects`, `:audit`; the session is a program |
+| `hltest` | In-language test runner: table tests, snapshot testing, `--grep` |
+| `hls-bench` | Criterion-style micro-benchmarks with baselines and comparisons |
+| `hls-pkg` | Package manager: content-addressed deps, lock, audit, verify, publish with a transparency log |
+| `hls-rt` / `hls-det` / `hls-rss` | Soft-real-time, deterministic-scheduler and RSS-stability certification |
+| `hls-perf` / `hls-mem` / `hls-ctime` / `hls-size` | The four regression dashboards — performance, memory, compile time, binary size |
+| `hls-freeze` | The frozen API surface: digest-pinned, amendment-chain ledger, drift refused |
+| `hls-guarantee` | Re-derives the soundness ledger and renders the bug-bounty scope |
+| `hls-compat` / `hls-migrate` | Replay every prior release's corpus; upgrade old trees |
+| `hls-lts` / `hls-rc` | The support-line and release-candidate kits — policy as arithmetic, not prose |
+| `hlbindgen` | C-header to safe `extern "C"` blocks with ABI size checks |
+| `hlprove` / `hlmodel` | Proof reports with z3/CVC5 SMT bridges; finite-state model checking |
+| `hls-fuzz` / `hls-fuzzseed` | Differential fuzzer and corpus seeding from real packages |
+| `hls-auditkit` / `hls-finalaudit` | Third-party audit engagements: briefs, evidence, findings, the seal |
+| `hlserve` / `hls-wasm-pack` | Dev server and ready-to-publish WebAssembly packages |
 
-**v0.113.0-alpha → v0.114.0-alpha — Stage 95: bare-metal RISC-V — `target riscv64-unknown-none`, the trio complete.** Completes **Phase VI**. rv64imac has no float registers — the ISA itself backs the integer-only rule, and the gate verifies zero FP instructions in the linked image's disassembly. `targets/riscv64-unknown-none.ld` places the image at the riscv64 virt DRAM base (0x80000000) with `_start` first (the `-bios none` reset enters there); the demo writes the NS16550A console and exits through the SiFive test finisher — writing `0x3333 | (code << 16)` gives the one bare-metal run with a REAL exit code without semihosting (the demo's finisher carries 42). zig cc rejects GCC's `-march`, so the orchestrator drops it for zig and keeps `-mabi=lp64`. Acceptance: `make triple-riscv64-acceptance` (8 sections; the FP-free disassembly wherever an objdump exists, the QEMU banner + exit 42 wherever QEMU exists).
+## Standard library
 
-**v0.112.0-alpha → v0.113.0-alpha — Stage 94: bare-metal ARM — `target aarch64-unknown-none`.** Continues **Phase VI**. The ARM triple assembles for real: the Stage 77 entry branch carried x86's `call` (never assembled until now — no gate had an AArch64 toolchain), fixed to `bl hl_boot`; `hl_boot` grows `__attribute__((used))` because clang one-step links (zig cc) delete a definition referenced only from an asm string. `targets/aarch64-unknown-none.ld` places the image at QEMU virt's DRAM base (0x40000000) with `_start` first; the PL011 demo writes its banner through one self-contained `asm!` template that saves/restores its own registers. `hlcross` translates the triple for zig (`-unknown-none` → `-freestanding-none` — a spelling it only rejects at LINK time). Acceptance: `make triple-aarch64-acceptance` (8 sections; the cross-linked image at the virt base with zero undefined symbols wherever a toolchain exists, the honest SKIP that keeps the C where none does).
+Sixty-plus pure-HLS modules, grouped by the three application
+families Halis set out to serve:
 
-**v0.111.0-alpha → v0.112.0-alpha — Stage 93: bare-metal targets — `target x86_64-unknown-none`.** Continues **Phase VI (OS-development foundation, Stages 77-96)**. The freestanding image gets a name: `hlc --target x86_64-unknown-none` implies `#![freestanding]`, **enforces the integer-only discipline** — float literals and float annotations are compile errors at the two places a float value can be born, identical words from both front-ends, because the FPU is not enabled before a kernel saves its state — and stamps the C with the triple. `targets/x86_64-unknown-none.ld` places the image at 1 MiB with `_start` pinned first, and the link drops every hosted prop (`-mgeneral-regs-only -nostdlib -no-pie`). The probe image runs on any x86-64 host and exits 42; eight fail probes live in `tests/bare/` (each still a legal hosted crate — the rule is triple-conditional). `--target-feature` and `--no-libc` are refused on the triple with the same words from both front-ends. Acceptance: `make triple-x86_64-acceptance` (8 sections, 25 checks) + `make triple TRIPLE=x86_64-unknown-none`.
+| Group | Modules |
+|-------|---------|
+| Core | `str`, `math`, `fmt`, `list`, `map`, `set`, `collections`, `bits`, `option`, `result`, `hash`, `regex`, `template`, `log` |
+| System | `io`, `fs`, `env`, `process`, `thread`, `sync`, `time`, `stream`, `async`, `archive`, `uuid` |
+| Web | `http`, `http2`, `http_router`, `http_server`, `websocket`, `sse`, `cookie`, `session`, `csrf`, `graphql`, `openapi`, `dom`, `jsffi`, `url`, `html` |
+| Data | `json`, `json_stream`, `csv`, `config`, `crypto`, `sha1`, `sha256`, `base64`, `hex`, `simd` |
+| CLI | `cli`, `tui`, `color`, `progress`, `complete`, `man`, `hlsdoc`, `hlscli` |
+| Security | `taint`, `sanitize`, `csrf`, `crypto` |
+| Bare metal | `core.alloc`, `core.mem`, `core.interrupt`, `core.mmio`, `core.port`, `core.dma`, `core.atomics`, `core.boot`, `core.asm`, `core.stack`, `core.section`, `core.rt` |
+| Testing | `test`, `quickcheck`, `bench` |
 
-**v0.110.0-alpha → v0.111.0-alpha — Stage 92: cross-bootstrappable build — Stage-0 → freestanding hlc.** Continues **Phase VI (OS-development foundation, Stages 77-96)**. The bootstrap ladder gains its final rung: `make bootstrap-nolibc` builds `bin/hlc-fs`, the compiler compiled **with no libc** — linked `-ffreestanding -nostdlib`, zero undefined libc symbols, its own naked crt0 `_start` — and proves the rung three ways: the freestanding compiler recompiles the compiler source **byte-identically**, it emits **byte-identical C** to the hosted compiler for the same inputs, and its `--audit` agrees **word for word**. The new `hlc --no-libc` mode shares the freestanding runtime's extracted blocks and adds the raw-syscall layer, a 1 GiB mmap-backed bump arena (reserved virtual, committed by touching), fd-backed std streams, and real shims for exactly what the compiler reaches — `stat` is a static function literally named `stat` (a macro would mangle `struct stat st`), `realpath` is textual and says so. The gaps are pinned: pthread functions stay undeclared, so a no-libc program that reaches `spawn()` fails the **link** on `pthread_create` — a named undefined symbol, not a silent misbehavior. Acceptance: `make xbootstrap-acceptance` (7 sections, 12 checks) + `make bootstrap-nolibc` (the ladder itself).
+Every module is pure HLS, declares its capabilities honestly, and
+ships with known-answer tests in `tests/ok/` and a runnable example
+in `examples/`.
 
-**v0.109.2-alpha → v0.110.0-alpha — Stage 91: verified interrupt-safety — no allocation in IRQ context.** Continues **Phase VI (OS-development foundation, Stages 77-96)**. An interrupt handler runs on the interrupted context's stack while that context may be anywhere — including inside `malloc`, holding the allocator's own lock. One allocation in IRQ context deadlocks or corrupts the heap, and neither shows up in tests. So the property is **proved, not hoped**: both front-ends reject any `#[irq_handler]` that can reach an allocating construct — a list literal, a string concat, `str(int)`, `map_new`, `clone`, the growth methods, an allocating builtin, a building field default, and every `extern "C"` call (the proof cannot see into C, so it refuses to guess) — transitively through its whole call graph, with a witness chain naming the shortest path, in the same words from `boot.py --check` and `hlc --audit`. Two trust decisions are documented, not hidden: `asm!` is not an allocation (register work per the Stage 83 contract — an MMIO EOI write or a TSC stamp is normal IRQ work), and an extern call is one. `--audit` publishes one proof line per handler. Acceptance: `make irqsafe-acceptance` (7 sections, 28 checks: 8 fail programs at byte-identical parity, the witness chain, the audit lines, the ok-test on interpreter + native + `-nostdlib`, the classification probes, the demo, the tools).
+## Targets
 
-**v0.109.0-alpha → v0.109.1-alpha — audit pass: seven real defects.** The language was unchanged; the bugs were. A mutation fuzzer comparing the two front-ends found that **`hlc` accepted a program `boot.py` rejects** — `enum Color { secure, Red }` slipped past the reserved-identifier check, so the language's own reserved words compiled under the self-hosted compiler. `std.config` made a quoted TOML key **write-only**: `"a.b" = 1` parsed and serialised but could not be read back, and the serializer emitted it unquoted so a round trip turned a flat key into a nested table. A native **panic lost its source line** where the interpreter had one — an overflow at line 300 and one at line 900 were the same sentence — so the checked arithmetic and bounds accessors now carry the call site. Two lexer diagnostics disagreed down to the column and the escape character, three more messages disagreed on wording, and the jsffi checker was CommonJS named `.js` (an ancestor `package.json` with `"type": "module"` turned it into an ES module, so the gate depended on a file outside the repo). Found by the repository's own instruments: the 1-hour `hls-fuzz` gate (7829 programs, 0 divergences), a 65-target acceptance sweep, and a mutation fuzzer. Acceptance: full suite green, 71/74 gates (the other three are long-running by design: a 1-hour fuzz, a whole-stdlib benchmark, and a long stage gate).
+| Backend | Triples and notes |
+|---------|-------------------|
+| Native C | `x86_64`/`aarch64`/`riscv64` Linux, macOS, Windows, FreeBSD — the default path |
+| LLVM IR | Text emission for any LLVM-supported target |
+| WebAssembly | `wasm32` with `std.jsffi` / `std.dom`, optimised and packaged by `hls-wasm-pack` |
+| Bare metal | `x86_64-unknown-none`, `aarch64-unknown-none`, `riscv64-unknown-none` — Multiboot2/Limine headers, IDT/GDT syntax, MMIO, DMA-safe buffers, custom link scripts and sections, DWARF 5 |
 
-**v0.108.0-alpha → v0.109.0-alpha — Stage 90: `core.sync.nolock` — the memory orders, the sequential lock, RCU and hazard pointers.** Continues **Phase VI (OS-development foundation, Stages 77-96)**. Everything lock-free rests on which reordering is permitted, and the four memory orders are not interchangeable — so Stage 90 ships them as a **model**: values, not races, which is what makes a reader's retry, a reclaim's precondition and a CAS loop's give-up testable at all. `mem_order_has_acquire`/`_release` are the two bits, and `mem_order_stronger` is the check that catches "this one needed a release and someone wrote relaxed"; a store cannot carry Acquire. A CAS that succeeded always used AcqRel, and `atomic_cas_loop_gave_up` is a value because **giving up is not success**. `seqlock_read_ok` carries the subtle half: **odd and unchanged is not safe** — a writer inside has not bumped past what the reader saw, so the two reads agree while the data is being torn. RCU's correctness is one value: `rcu_try_reclaim` frees nothing while a reader is inside. Hazard pointers add the re-read after the publish that closes the load-to-publish window. The gate checks the lowering' memory class and clobbers, and **pins a known gap**: a locked read-modify-write needs a memory destination and HLS's `asm!` has no `"+m"` write constraint, so the assembler correctly refuses `lock addq` on a register. Acceptance: `make atomics-acceptance` (6 sections, 76 checks, 54-assertion ok-test).
+Halis does not build an operating system; it builds the language in
+which others do — `#![freestanding]`, `#![no_std]`, page-level memory
+control and volatile I/O included.
 
-**v0.107.0-alpha → v0.108.0-alpha — Stage 89: DMA-safe buffers — `core.dma`.** Continues **Phase VI (OS-development foundation, Stages 77-96)**. A device that can DMA cares about two things a kernel gets wrong SILENTLY: the buffer must be **physical** (a descriptor names a physical address — the device has no page tables) and it must not **move** (a relocating collector hands the device a descriptor for bytes that are no longer there). `core/dma.hls` puts both in values a driver checks before it hands anything over: the alignment and size rules, the coherency rule each direction follows (to-device FLUSHES — skipping it hands the device stale bytes and looks like a device bug; from-device INVALIDATES — skipping it reads the CPU's own cache and the symptom is "the transfer always returns zeros"; `Both` needs invalidate-then-flush in that order), the descriptor (address width, coverage — a SHORT length is a silent success on the device side — and page containment, with the page SHIFT named so shifting by the page size cannot silently answer 1 every time), a device-visible window with the map/unmap bookkeeping an IOMMU needs (unmap before the pages are freed; over-unmap clamps rather than wrapping), and the bounce buffer — sized for the largest transfer the device can ATTEMPT, which is why it cannot be a stack local. Acceptance: `make dma-acceptance` (6 sections, 59 checks, 49-assertion ok-test).
+## Verification and releases
 
-**v0.106.0-alpha → v0.107.0-alpha — Stage 88: core.port — typesafe x86 I/O ports.** Continues **Phase VI (OS-development foundation, Stages 77-96)**. A port number is a 16-bit quantity and the data is 8/16/32 bits, so `outb %al, %dx` carries one through the other — and no single carrier type expresses both. Stage 88 generalises the narrow-template rule so the DATA operand is a letter constraint (its width from the template's `b` suffix) while the PORT operand is a named register (`dx`, which says its own width); a 64-bit instruction on a narrow register is still rejected, so Stage 83's silent truncation stays caught. The disassembly is the proof — the gate checks the linked image really contains `out %al,(%dx)`, `in (%dx),%eax` and the other four forms. `core/port.hls` is the half a driver gets wrong: the 16-bit port bound and the imm8 form being a different encoding, the PIC's 8086 bit and the EOI order (the **slave's** first for IRQ 8..15), the PIT's divisor where zero means 65536 and the bytes go low first, PCI's 8/5/3/4-bit fields inside two 32-bit ports, ACPI PM1 status as write-1-to-clear (writing zero clears nothing — a hang), and the I/O serialisation delay as a value rather than an invisible wait. Acceptance: `make port-acceptance` (7 sections, 71 checks, 46-assertion ok-test).
+- **Differential everywhere.** The interpreter, the native build and
+  the wasm backend must produce identical bytes on the same program;
+  the differential suites run on every PR and the halt classes are
+  compared, not just the output.
+- **Regression dashboards.** Performance, RSS, compile time and
+  binary size are recorded per commit; a regression without a written
+  sanction fails the gate.
+- **Independent audits.** Two third-party audit kits — the standing
+  engagement kit and the final-audit kit that pins the frozen
+  surface, the snapshot manifest and the guarantee ledger — with the
+  independence of every evidence pass labelled and the closure seal
+  enforced by `make finalaudit-gate`.
+- **A frozen API.** The v1.0 surface travels at a pinned digest with
+  a hash-chained amendment ledger; `make freeze-verify` refuses drift
+  on every commit.
+- **Release gates.** `make release-acceptance` judges the tree as a
+  legal state of the release line, and `hls-lts status` reads the
+  clock of the opened line.
 
-**v0.105.0-alpha → v0.106.0-alpha — Stage 87: core.mmio — volatile device access through `asm!`.** Continues **Phase VI (OS-development foundation, Stages 77-96)**. Halis has no raw pointer type, so a device register is reached through `asm!` — which the backend already emits as `__asm__ __volatile__`, exactly the volatility a device access needs, with `"memory"` in the default clobber list so the compiler will not move memory across it. Stage 87 adds a 32-bit register spelling for `int` operands **when the template's instruction is 32-bit** (`movl %eax, (%ecx)` is the only correct way to write a 32-bit device register); a `movq` on `eax` is still rejected, so Stage 83's truncation bug stays caught. `core/mmio.hls` is the arithmetic as testable data: the width masks (a `movl` leaves the upper 32 bits ALONE, so a driver that skips the mask reads whatever the register held), sign extension that fills bits n..63, the read-modify-write for a bit field with the mask built from the FIELD and never the value, fields that straddle a 32-bit boundary or exceed the access width, device windows that reject a non-page-aligned base and answer "is this access legal?" as one predicate (starts inside, FITS, naturally aligned), the barrier levels and the memory-domain table (x86 device space is uncacheable; aarch64 needs the barriers), and the LAPIC register map. **Two compiler fixes fell out of it:** a freestanding `_start` is now `naked`, because an ordinary C entry let GCC leave the first Halis function 8 bytes off the SysV alignment, so every 16-byte-aligned slot GCC placed in its frame was misaligned and `movaps` initialisers faulted; and a stack-allocated list array is now 16-byte aligned for the same reason. Acceptance: `make mmio-acceptance` (7 sections, 86 checks, 123-assertion ok-test).
+## Releases and support
 
-**v0.104.0-alpha → v0.105.0-alpha — Stage 86: core.interrupt — `#[irq_handler(N)]` and the descriptor arithmetic.** Continues **Phase VI (OS-development foundation, Stages 77-96)**. A kernel enters a handler through an IDT gate, and a gate holds a 32-bit offset — which is why no IDT can be a static initialiser and every kernel fills its own. `#[irq_handler(14)]` now declares WHICH vector a function services (0..255, one per function, and no two functions may claim the same one), and the compiler emits a naked save/restore stub per vector plus a binding table and a one-call installer that builds the gates and loads the IDTR. The stub exists because gcc **rejects SSE anywhere inside an `interrupt` function** and a Halis body always uses it — so a Stage 28 handler taking a `list[int]` never compiled. `core/interrupt.hls` is the arithmetic as testable data: selectors (and why the largest well-formed GDT selector is 8187, not 8191), the 8-byte descriptor round trip, a `GdtFault` lattice that validates a table a kernel did not build, the packed TSS busy bit, the IST **byte** (the gate's own byte — packing it into the type/attribute byte overwrites the gate type), the 32-bit offset split, the page-fault error code decoded by bit with the reserved bit checked first, the 32 exception vectors, and the 8259 remap. Three encoding errors it makes impossible, each with a test: the limit's top nibble shares a byte with the flags, L is bit 6 and not bit 3, and the class bit is 0x08 while S is 0x10. Acceptance: `make idt-acceptance` (7 sections, 93+ checks, 159-assertion ok-test).
+**v1.0.0 is the current stable release** — see [RELEASES.md](RELEASES.md)
+for the record of every tag and the discipline for the next ones.
 
-**v0.104.0-alpha — Stage 85: Multiboot2 + Limine boot protocol headers.** Continues **Phase VI (OS-development foundation, Stages 77-96)**. `#![boot_header(multiboot2 | limine)]` makes the C backend emit the header a firmware scans for — a 40-byte Multiboot2 header whose four fields sum to zero (magic `0xE85250D6`, i386 architecture, length, the spec's checksum) plus the module and end tags, or a Limine request list (both delimiters, a base-revision-3 tag, the memory-map / framebuffer / RSDP / HHDM / stack-size requests). Both blobs are `const volatile` **and `used`**: nothing in the image calls them, so under `--gc-sections` an un-`used` header is simply gone. The Stage 84 machinery is pointed at the one section a firmware will not find unless the script KEEPs it — a bootloader that finds nothing refuses to boot with no diagnostic anywhere, so that case is now a compile error. `core/boot.hls` is the other half: every constant and predicate a kernel *receives*, including `mem_kind_from_e820` (usable = 1) and `mem_kind_from_limine` (usable = 0) landing in one `MemKind` so a page allocator never sees a wire value; `mem_find_usable` returning the first region that satisfies the request or -1, never the best partial fit; ORDERED reclaimability (the loader's and ACPI's scratch only after they are done, never ACPI NVS, never an unknown E820 type); `mem_no_overlaps` comparing only file-bearing regions; a checked and an unchecked framebuffer constructor; and `boot_report`, the one line a kernel prints at entry. `examples/boot_kernel.hls` links as a real freestanding image whose `.limine_requests` the gate inspects with `objdump`. Acceptance: `make boot-acceptance` (7 sections, 115+ checks, 157-assertion ok-test).
+The line `release/1.0` is the LTS stream: bug-fix backports only,
+each carrying a `Backported-from:` trailer, patch releases cut
+without gaps, and the whole history auditable by the day each commit
+landed. Every LTS line gets **3 years of bug-fix support** and
+**5 years of security support**; the full policy — the phases, the
+calendar law, what the tools refuse — is published in
+[LTS.md](LTS.md) and rendered from the constants the gates enforce.
 
-**v0.103.0-alpha — Stage 84: linker-script integration + custom sections.** Continues **Phase VI (OS-development foundation, Stages 77-96)**. A kernel is a *placement*, not just code. `#[section(".text.boot_stub")]` puts a function in a named output section (validated: 1..=64 bytes, starts with `.`/`_`/a letter, only `[A-Za-z0-9._$]`, no `..`, never one of the six compiler-owned sections) and `#[align(4096)]` pins its entry to a power of two — emitted as `__attribute__((section("X"), used))` and `__attribute__((aligned(N)))`. `used` is load-bearing: a function in its own section is usually one nothing calls yet, and `--gc-sections` would drop exactly the code you placed. `#![link_script("link.ld")]` names the script that places the image, and the compiler *reads it at check time*: a `#[section]` the script never places, or a script that is missing / has no `SECTIONS` block, becomes a compile error naming the section, the function and the output section to add — the two failures that are otherwise completely silent. `core/section.hls` is the whole story as data: the name/alignment rules as a testable `SectionFault` lattice, the section-kind model and its page-flag predicates (`.text` is never writable; `.bss` occupies a real VMA but no file bytes), a GNU-ld script reader, GNU ld's prefix-matching coverage rules, a placement solver that refuses an overlapping image, `layout_contains` / `layout_section_at` for the pointers a bootloader hands you, and an `ld -Map`-shaped `layout_render`. Acceptance: `make link-acceptance` (7 sections, 65+ checks, 114-assertion ok-test).
+To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
-**v0.102.0-alpha — Stage 83: inline-asm register constraints (clobber, input, output).** Continues **Phase VI (OS-development foundation, Stages 77-96)**. Makes every `asm!` register binding honest: a named register now binds EXACTLY the register the source spells (`in("rax")` means rax — the old checker silently widened "eax" to GCC's `a` class, which binds RAX for a 64-bit operand), `int`/`bool` operands require the 64-bit GP names (`rax`..`r15`), `float` operands require SSE (`reg` lowers to the `x` class, or a pinned `xmm0..xmm15` name), the compiler-owned `rsp`/`rbp` (any spelling) can be neither bound nor clobbered, and registers GCC cannot express as a constraint letter (`r8..r15`) plus pinned SSE registers plus bool-through-named-register lower through GCC **local register variables** (`register long t __asm__("r10")`) with automatic writeback to any lvalue form. The explicit `clobber("rcx", "r11")` clause declares destroyed registers — validated against a full x86-64 aliasing model (rax/eax/ax/al/ah are one physical register): duplicates and operand overlaps are compile errors, `cc`/`memory` are option-controlled (`preserves_flags`/`nomem`) and banned from the list. `core/asm.hls` is the register file as data — 21 pure functions, zero imports (`asm_reg_width`, `asm_reg_base`, `asm_regs_overlap`, `asm_clobber_fault` with the stable `AsmFault` lattice, the SysV vs syscall ABI tables including the rcx→r10 argument-4 move and `asm_syscall_clobbers()`) so kernel tooling can validate stub shapes at build time. `examples/asmreg_demo.hls` runs xchg/r10-add/addsd/bool/mfence + a syscall-shaped stub live. Acceptance: `make asmreg-acceptance` (7 sections, 90+ assertions).
+## Documentation
 
-**v0.100.0-alpha — Stage 81: core.panic + #[panic_handler] — kernel panic strategy.** Continues **Phase VI (OS-development foundation, Stages 77-96)**. Ships `core/panic.hls` — 16 pure functions, 2 structs (`PanicInfo`, `PanicLog`), 1 enum (`PanicAction`), zero imports, `no_std`-clean and importable from `#![freestanding]` identically — plus the `#[panic_handler]` function attribute: exactly one `fn panic_handler(msg: str) -> void` per program runs once per panic (reentrancy-guarded, receives a copy) before the default action (hosted: report + exit 101; freestanding: trap), with `exit()` propagation for handler-chosen halt codes and an explicit `--lto` root for the hook-only call edge. `examples/panic_demo.hls` prints the handler marker before the default report (exit 101). Acceptance: `make panic-acceptance` (7 sections, 60+ assertions).
-
-**v0.99.0-alpha — Stage 80: core.mem — physical-page allocator + page tables.** Continues **Phase VI (OS-development foundation, Stages 77-96)**. Ships `core/mem.hls` — 95 pure functions (imports only `core.option` + `core.result`, `no_std`-clean, importable from `#![freestanding]` identically) covering both structures every kernel needs before its first virtual mapping: the `FrameAlloc` bitmap allocator over a physical region (first-fit frames, contiguous runs, 2-MiB-address-aligned huge frames, double-free + out-of-range detection, firmware reservations, peak/allocations/frees accounting) and the x86-64 4-level page-table model with the real PTE format (flags bits 0..8, address bits 12..51, NX bit 63 = INT64_MIN), canonical-form validation (`vaddr_is_canonical`), and the `PageTable`/`AddressSpace` pair whose table pool stands in for the kernel direct map. `space_map`/`space_map_huge` walk-and-create intermediate tables on demand, bill their frames to the FrameAlloc, and are ATOMIC on failure (two-pass: validate + exact table count, then install). `space_translate`, `space_unmap`/`space_unmap_huge`, `space_protect` (W^X re-flagging), `mem_identity_map` + `mem_map_bytes` complete the boot surface. `examples/mem_demo.hls` is a no_std early-boot story that exits 0 on hosted, `-nostdlib` and interpreter runs. Acceptance: `make mem-acceptance` (8 sections, 60+ assertions).
-
-**v0.98.0-alpha — Stage 79: core.alloc — pluggable allocator protocol.** Continues **Phase VI (OS-development foundation, Stages 77-96)**. Ships `core/alloc.hls` — the Alloc protocol as free generic functions per concrete allocator type (HLS has no trait dispatch yet, mirroring the `core.iter`/`core.clone`/`core.eq` convention): `Layout` + `AllocError` + three reference allocators (`BumpAlloc` fast/no-reclaim with peak watermark, `PoolAlloc` fixed-size with LIFO free list and O(1) double-free detection, `NullAlloc` sentinel for the Stage 91 IRQ-safety hook) + an `AllocStats` accounting helper. 40 pure functions, 5 structs, 1 enum, imports only `core.option` + `core.result` — pure HLS, `no_std`-clean, importable from `#![no_std]` and `#![freestanding]` crates identically (no resolver changes — the `core.` prefix is already uniform). `examples/alloc_demo.hls` is a no_std "request router" (BumpAlloc scratch scope + PoolAlloc route table) that exits 0 on both hosted and `-nostdlib` links. Acceptance: `make alloc-acceptance` (7 sections, 50+ assertions).
-
-**v0.97.0-alpha — Stage 78: #![no_std] core-only stdlib subset.** Continues **Phase VI (OS-development foundation, Stages 77-96)**. Ships five `core/*.hls` modules — `option` / `result` (+ no-panic `parse_int`) / `iter` (`ListIter` + six helpers) / `clone` (container helpers + `clone_of` convention) / `eq` (six concrete helpers + `eq_of` convention) — all pure HLS, importable from `#![no_std]` / `#![freestanding]` crates via `import "core.*"`. Enforcement reuses the Stage 77 machinery with hosted codegen (`main` + libc kept). Acceptance: `make nostd-acceptance` (8 sections, 60+ assertions).
-
-**v0.96.0-alpha — Stage 77: #![freestanding] mode (no libc, no OS calls).** Opens **Phase VI (OS-development foundation, Stages 77-96)**. A crate-level attribute disabling libc linking, `std`, and all OS capabilities (every function must be pure; `extern` banned; float-library denylist enforced in both compilers). The C backend emits a freestanding TU — 3 headers, 1 MiB bump arena, trap panics, exact hand-rolled int rendering, `_start` entry with raw-syscall exit (x86-64/AArch64/RISC-V) — linking with `gcc -ffreestanding -nostdlib -ffunction-sections -Wl,--gc-sections` and running with the interpreter's exit code (proven by the link-closure check). Known limitation: the bump arena never reclaims (Stage 79 `core.alloc` replaces it). Acceptance: `make freestanding-acceptance` (8 sections, 58 assertions).
-
-**v0.95.0-alpha — Stage 76: hls-wasm-pack (publish-ready wasm + JS glue).** Closes **Phase V (web application track, Stages 63-76)**. Turns a `.hls` program into a publish-ready npm package (`pkg/`: `.wasm` + target-specific `.js` + `.d.ts` + `package.json` + `README.md` + `.pack-manifest.json`), then optionally packs it into a reproducible `.tgz` and (dry-run by default) publishes it. Six subcommands (`new`/`build`/`pack`/`publish`/`check`/`test`), five targets (`bundler`/`web`/`nodejs`/`deno`/`no-modules`), single-file source scanner, Halis→TypeScript declarations, npm name + semver validation, SHA-256 manifests, and the Stage 27 realpath path-traversal defence on every pack/unpack path. No new compiler builtins; pure tooling on the Stage 23/24 `hlwasm` backend + `wasm-opt` + Stage 73 `std.jsffi`. Acceptance: `make wasm-pack-acceptance` (10 sections, 140+ assertions).
-
-**v0.94.0-alpha — Stage 75: hls-serve (webpack-dev-server equivalent).** Continues **Phase V (web application track, Stages 63-76)**. The Stage 24 `tools/hlserve.py` (SSE-based live-reload, ~515 lines) is now a thin facade over the new modular `tools/hlserve_parts/` package (10 modules). Adds WebSocket HMR (RFC 6455) at `/ws`, a compile-error overlay (CSS+JS injected into every served HTML), SPA history fallback, HTTP reverse proxy (`--proxy /api=http://localhost:3001`), HTTPS with self-signed cert (`--https`; `cryptography` optional), gzip compression, public static dir, `--open`, and a TOML config file (`hls.serve.toml`). Hot reload swaps the wasm module in-place (preserves JS state). 13 new CLI flags; Stage 24 surface preserved exactly. Acceptance: `make serve-acceptance` (10 sections, 50+ assertions).
-
-**v0.93.0-alpha — Stage 74: std.dom (server-side HTML DOM rendering).** Continues **Phase V (web application track, Stages 63-76)**. Adds `std/dom.hls` — a pure-HLS DOM tree: an immutable `DomNode` sum type (`Element` / `Void` / `Text` / `Raw` / `Comment` / `Doctype` / `Fragment`) plus ~50 element shorthand builders, immutable mutators, attribute lookup/replace/remove (case-insensitive), introspection, statistics, and a pure serialiser. Strict void-tag invariant (dom_element panics on a void tag, dom_void panics on a non-void tag — guarantees valid HTML5). Inline `<script>` and `<style>` bodies protected against premature `</script>` / `</style>` termination. HTTP integration (`dom_to_html_response`). Pure-HLS, differential-verified.
-
-
-**v0.92.0-alpha — Stage 73: std.jsffi (JavaScript FFI for wasm32).** Continues **Phase V (web application track, Stages 63–76)**. The extern "js" surface grows 13 -> 48 declarations with glue defaults; hlwasm now computes struct field layouts, exports `hl_struct_descriptors()`, and the glue AUTO-registers every struct (a Halis struct becomes a JS object — zero manual marshalling setup). JS->HLS callbacks: `jsffi_on_callback` + `Halis.callHalis`. Fixed the Stage 24 `readStruct` string-field bug. Node-verified via `make jsffi-acceptance`; webapp-acceptance stays green.
-
-
-**v0.91.0-alpha — Stage 72: std.openapi (OpenAPI 3.1 from handler types).** Continues **Phase V (web application track, Stages 63–76)**. Adds `std/openapi.hls` — JSON Schema builders, an operation model, and the router bridge: `std.http_router` routes become documented OpenAPI paths (`:param` -> `{param}`), implied path parameters auto-generate, and handler_id bindings keep the spec and the router in agreement. Served at `/openapi.json` and `/docs` (Swagger UI, inline spec with the `</` -> `<\/` script-injection defence). Pure-HLS, differential-verified.
-
-
-**v0.90.0-alpha — Stage 71: std.graphql (schema-first GraphQL server).** Continues **Phase V (web application track, Stages 63–76)**. Adds `std/graphql.hls` — an SDL parser, a GraphQL document parser, a static validator, and a trampoline executor (resolvers dispatched by handler_id — HLS has no function pointers). Constant-memory parsing: depth/document/node budgets enforced before execution (the anti-ReDoS promise). Structured errors with message + path + locations; null propagation through non-null parents; HTTP glue for POST/GET; canonical SDL export. Pure-HLS, differential-verified.
-
-
-**v0.76.0-alpha — Stage 57: std.log (structured logging: human + JSON + syslog).** Continues **Phase IV (CLI tooling track, Stages 53–62)**. Adds `std/log.hls` — structured logging with three output formats (human — colored, for TTY; JSON Lines — for log aggregation; syslog RFC 3164 — for daemons), key-value pairs on every record, and log level control via the `HLS_LOG` env var — plus TWO new compiler builtins: `proc_pid() -> int` and `sys_hostname() -> str` (both Proc — process-identity access, the same family as `env_get`; they fill the syslog TAG[PID] and HOSTNAME fields; the values differ between the interpreter and native processes by design, so the pure renderers take them as explicit arguments and only the live emit path reads the builtins). The roadmap's `info!`/`warn!`/`error!`/`debug!`/`trace!` "macros" map to functions (Halis has no macros until Stage 113+ — the same convention std.fmt used for format!), available as free functions (`log_info(lg, msg)`) and `impl Logger` methods (`lg.info("msg")` — the closest HLS gets to the macros) + the structured `_kv` variants (`log_info_kv(lg, msg, keys, vals)` — parallel lists). The API covers everything the roadmap promises: the six-level ladder `LogOff < LogError < LogWarn < LogInfo < LogDebug < LogTrace` with `log_enabled` filtering (a Logger at Off enables nothing); HLS_LOG parsing (off/error/warn/warning-alias/info/debug/trace, case-insensitive, lenient INFO default — a typo must not silence the error channel) + HLS_LOG_FORMAT (human/json/syslog, default human); three PURE renderers — human (`2025-09-09T12:40:00.123Z INFO  myapp: server started port=8080`: ISO-8601 UTC with ms + the 5-wide aligned level token + the app prefix + `k=v` pairs; the level token colored ERROR red+bold / WARN yellow / INFO green / DEBUG blue / TRACE magenta at the terminal, completely escape-free at ColorNone — TERM=dumb safe), JSON Lines (one object per line, fixed key order ts/level/app/msg/kvs, FULL escaping: quotes, backslashes, control bytes as \u00XX, and the JSON-valid-but-JS-breaking U+2028/U+2029 — the log-forging defense: an attacker-controlled multi-line message cannot forge new records), syslog RFC 3164 (`<14>Sep  9 12:40:00 web01 myapp[1234]: server started port=8080`: PRI = 8 + severity with error→3/warn→4/info→6/debug+trace→7, the space-padded day, TAG[PID] with pid > 0 / TAG without pid); Hinnant's civil-from-days timestamp math with an explicit floor-division helper (HLS's `/` truncates like C) so pre-1970 timestamps, the 2000/2024 leap days, and 2100 (not a leap year) all render correctly — pure integer arithmetic, byte-identical between the backends; Logger as an explicit value (`log_new()` reads the env + fills pid/hostname once; `log_new_with(...)` is the pure constructor; the immutable `log_with_*` builders + method twins reconfigure); and the live emit path (`uses IO, Clock, Proc`): `log_emit` builds the record from the Logger's identity + the live wall clock, renders through the Logger's format, and writes to STDERR via Stage 56's eprintln (stdout is flushed first, so interleaved data + logs keep the caller's logical order — the 12-factor/systemd convention: stdout is the data pipeline, stderr is the operator channel); suppressed records cost zero work. Effect discipline: everything pure except `log_new`/`log_resolve_level` (Proc) and the emits (IO+Clock+Proc). Differential parity: every renderer is a pure function of (record, ColorLevel) with fixed ts/pid/hostname — verified byte-for-byte by `make log-acceptance` (11 sub-tests + 2 stdout differentials + 2 live smokes, all green — the acceptance compares stdout only and smoke-tests the live path because the live lines carry the wall clock + the real pid, which differ between the two backends' processes by design; the Stage 49 wall-clock discipline); 2 new fail tests cover the Proc effect gates of the new builtins. Bootstrap self-compilation remains deterministic. Limitations deferred to later stages: str-only KV values, no per-module level filtering (RUST_LOG-style directives), no file/network sink or rotation (stderr only — the supervisor owns rotation), no EMA rate limiting, RFC 3164 only (RFC 5424 structured data is future), UTC-only timestamps, and no wasm32 support (no stderr/fd concept in the JS sandbox).
-
-**v0.75.0-alpha — Stage 56: std.progress (progress bars, spinners, ETA).** Continues **Phase IV (CLI tooling track, Stages 53–62)**. Adds `std/progress.hls` — progress bars, spinners, ETA estimation, and multi-bar rendering for concurrent tasks — plus THREE new compiler builtins: `eprint(s)` / `eprintln(s)` (stderr writes — IO effect, taint sinks, the str argument consumed exactly like `print`/`println`, with an `fflush(stdout)` first so interleaved stdout/stderr output keeps the caller's logical order in a combined capture) and `isatty(fd) -> bool` (TTY detection — the probe std.color's v0.74.0-alpha limitations deferred to exactly "Stage 56+ when std.progress lands and the spinner needs it"). The API covers everything the roadmap promises: `ProgressBar::new(total)` (`progress_new(total)` — `total > 0` determinate with bar + percent + ETA + rate, `total == 0` indeterminate spinner with frame + tick count + elapsed) with the `impl ProgressBar` method form for the roadmap's exact API (`pb.start()` / `pb.inc(1)` / `pb.tick()` / `pb.finish()` + the pure accessors `.position()` / `.percent()` / `.eta_secs(now_ns)` / `.render(level, now_ns)`); `tick()` (spinner advance + rate-limited redraw); `finish()` (100% + the final line + newline); ETA estimation via pure INTEGER arithmetic (`elapsed_secs * remaining / position`) with a pre-checked int64 overflow guard (unknown renders `eta ?`, never a wrapped negative); multi-bar (one line per concurrent task — cursor-up + EL 2 in-place redraw; the value-snapshot concurrency model: workers report through channels, the UI task updates snapshots via `multibar_set`, no shared mutable state, no locks); 8 spinner styles (braille dots / line / dots-ascii / arrow / bounce / toggle / triangle / pipe); and the zero-allocation-after-creation contract (fixed-size state — state updates mutate fields in place with no allocation; a pre-allocated `cells` list is overwritten in place and materialised with ONE join per monochrome redraw; the 100 ms steady rate limiter bounds redraws to ≤ 10/s and a suppressed draw performs zero string work). Bars draw to STDERR (data stays clean on stdout — the tqdm/indicatif convention) and are gated by `progress_should_draw()`: `PROGRESS_DISABLE` beats `PROGRESS_FORCE` beats `isatty(2)` — a piped process performs ZERO writes. Color: the roadmap's `--color=always/never/auto` flag surface (`progress_color_from_str` parses the flag; `progress_resolve_level` resolves Auto → color only when stderr is a TTY, Always → the std.color env detector, Never → no escapes); the filled span renders green, the spinner frame cyan, the finished line bold green at every ColorLevel (truecolor → 256 → basic → none comes free from std.color), and the monochrome line is completely escape-free (TERM=dumb safe). Effect discipline: the render core is pure; `progress_start` carries Clock; `progress_should_draw`/`progress_resolve_level` carry IO+Proc; the live draws carry IO+Clock+Proc. Differential parity: every rendered line is a pure function of (state, ColorLevel, now_ns) — no clock, no env, no isatty on the render path — so interpreter and native outputs are byte-identical (verified by `make progress-acceptance` — 13 sub-tests + 2 differential tests, all green; 3 new fail tests cover the effect / taint-sink / type errors of the new builtins). Bootstrap self-compilation remains deterministic. Limitations deferred to later stages: terminal width detection (no ioctl TIOCGWINSZ builtin — the width is caller-controlled, default 30), smoothed/EMA ETA (linear only), MultiBar does not thread-track (value-snapshot model), and the wasm32 backend does not support `eprint`/`isatty` (no stderr/fd concept in the JS sandbox — the same class as std.env/std.net/std.process).
-
-**v0.74.0-alpha — Stage 55: std.color (terminal color support + Style builder).** Continues **Phase IV (CLI tooling track, Stages 53–62)**. Adds `std/color.hls` — the third module of Phase IV — providing terminal color support with auto-detection (TERM, COLORTERM, NO_COLOR, FORCE_COLOR, CLICOLOR_FORCE) and graceful fallback from truecolor (24-bit RGB) → 256-colour → 16-colour → monochrome. The `ColorStyle` builder supports the roadmap's exact API: `cstyle_new().fg(color_red()).bg(color_black()).bold().underline()` via Halis's `impl ColorStyle { ... }` method-call form (the same form `std.fs.PathBuf` uses for its builder). Pure-HLS implementation (no new compiler builtins): uses `env_has` + `env_get` (Proc effect, Stage 48, v0.67.0-alpha) for env-var detection, and `chr(27) + "[..."` byte strings for ANSI escape codes (same pattern as `std.tui`'s `tui_csi()` in Stage 54, v0.73.0-alpha). The API covers everything the roadmap promises: `ColorLevel` (None / Basic / 256 / Truecolor — total order; the renderer quantises a Color down to whatever the level supports); `Color` enum (`ColorNone` / `ColorBasic(int)` / `Color256(int)` / `ColorRgb(Rgb)` — full color information up to the renderer; same "rich type + quantise at the boundary" pattern used by Rust's `nu-ansi-term`, Python's `rich`, and Go's `lipgloss`); `Rgb` (24-bit, 0..255 per channel, range validation); Color constructors (named basic / bright / default / reset / `color_rgb` / `color_256` / `color_none` / `color_bg` fg→bg shift 30→40, 90→100, 39→49); `ColorStyle` builder in two equivalent forms — method chaining (`cstyle_new().fg(RED).bg(BLACK).bold().underline()`, the roadmap's exact API) and free-function form (`cstyle_underline(cstyle_bold(cstyle_fg(cstyle_new(), color_red())))`, matching std.tui's Style convention) — both produce byte-identical results (the methods are thin wrappers around the free functions); `cstyle_to_sgr(s, level)` coalesces fg+bg+attrs into a SINGLE SGR sequence (`\x1b[<codes>m` — one CSI per span, minimising escape overhead, matching the xterm spec); at `ColorNone` level, fg/bg colors are dropped (the convention is "no color", not "no attributes" — bold/italic/underline still render on a monochrome terminal, matching the SGR spec which defines these as part of the original VT100 attribute set); RGB down-sampling (pure integer arithmetic, byte-identical between interpreter and native): `rgb_to_xterm256` (cube 16..231 with 6 levels per channel: 0, 95, 135, 175, 215, 255; grayscale 232..255 with levels 8 + 10*i; nearest-of-240 by Euclidean distance — matches `termcolor` (Python) and `ansi_colours` (Rust)), `rgb_to_basic_sgr` (nearest of 16 reference colours by Euclidean distance — xterm/VT100 convention), `xterm256_to_basic_sgr` (map an xterm-256 code back to a basic SGR code: 0..15 → 30..37 / 90..97; 16..231 → cube → RGB → `rgb_to_basic_sgr`; 232..255 → gray → `rgb_to_basic_sgr`); `color_downsample(c, level)` manual monotone down-sampling; `color_render / color_print / color_println` convenience wrappers; `color_detect()` reads env vars in precedence order (NO_COLOR wins, then FORCE_COLOR, then CLICOLOR_FORCE, then COLORTERM, then TERM); `color_detect_from(...)` is the pure / differential-safe form with explicit env values (used by tests); Bridge to `std.tui`: `cstyle_to_basic_style(cs) -> Style` down-samples RGB/256 to the basic palette + applies the fg→bg shift, returning a `std.tui.Style` usable with `std.tui.Buffer`. Effect discipline: `ColorLevel` / `Color` / `Rgb` / `ColorStyle` are pure value types; `color_detect_from(...)` is pure (no `uses` clause); `color_detect()` carries `uses Proc`; `cstyle_to_sgr` is pure (returns the str); `color_print` / `color_println` carry `uses IO`; `cstyle_to_basic_style` is pure (returns a `std.tui.Style`). Differential parity: every escape sequence is a pure string operation on `chr(27)`, and the quantiser uses only integer arithmetic, so `cstyle_to_sgr(s, level)` is byte-identical between the interpreter and the native binary (verified by `make color-acceptance` — 16 sub-tests + 2 differential tests, all green). Bootstrap self-compilation remains deterministic. Limitations deferred to later stages: TTY detection (the detector reads env vars but does NOT `isatty(STDOUT)`; a program piped to `less` will still emit color codes if the env says so — the standard workaround is to honor `CLICOLOR_FORCE` and `NO_COLOR`, both honored here; true TTY detection requires a builtin, deferred to Stage 56+ when `std.progress` lands); `CLICOLOR=0` (the spec says "0 means no color even on a TTY"; the v0.74.0-alpha detector honors `CLICOLOR_FORCE` and `NO_COLOR` but treats `CLICOLOR=0` as set-and-non-empty `CLICOLOR`); per-stream detection (only stdout; a future perfection stage may add `color_detect_stream(fd)`); `COLORTERM` validation beyond substring match; `--color=always/never/auto` CLI flag integration (Stage 56+ concern).
-
-**v0.73.0-alpha — Stage 54: std.tui (terminal UI primitives).** Continues **Phase IV (CLI tooling track, Stages 53–62)**. Adds `std/tui.hls` — the second module of Phase IV — providing terminal UI primitives: `Term`, `Cursor`, `Color`, `Style`, `Rect`, `Cell`, `Buffer`, and a `Widget` trait convention with three concrete widgets (`Text`, `Block`, `Paragraph`). Pure-HLS implementation (no new compiler builtins): the module emits ANSI escape sequences via the existing `print()` builtin (IO effect), constructed as `chr(27) + "[..."` byte strings (same pattern as `std.http`'s `http_crlf()` in Stage 38, v0.57.0-alpha). The API covers everything the roadmap promises: `Term::raw()` / `Term::screen()` / `Term::clear()` / `Term::restore()` (mode transitions, tracked so `restore()` emits the exact inverse); `Cursor::move_to(x, y)` (CUP, 0-indexed → 1-indexed) + `move_up/down/left/right` + `hide/show` + `save/restore` (DECSC/DECRC); `Color` (16-colour palette + bright variants + default + reset; `tui_color_bg()` fg→bg conversion 30→40, 90→100, 39→49); `Style` (builder API: `style_new().fg(RED).bg(BLACK).bold().underline()`; `style_to_sgr(s)` emits `\x1b[<codes>m` in canonical SGR order); `Rect` / `Cell` / `Buffer` (off-screen rendering grid — the ratatui/crossterm model: render into a Buffer, then `buffer_render(b)` flushes it to stdout in a single `print()` call, minimal flicker); `Widget` trait convention (monomorphic helpers per concrete type — same pattern as `std.io`'s Read/Write in Stage 35, v0.54.0-alpha; when trait dispatch arrives in Stage 113+, each `impl Widget for X` will already be in place); three concrete widgets ship: `Text` (single styled line, clips to `area.width`), `Block` (border with optional title, ASCII box-drawing chars `+`, `-`, `|`), `Paragraph` (multi-line text with word wrap); layout helpers `layout_split_horizontal` / `layout_split_vertical` (weighted constraints, ratatui convention). Differential parity: every escape sequence is a pure string operation on `chr(27)`, so `buffer_render_into(b)` is byte-identical between the interpreter and the native binary (verified by `make tui-acceptance` — 2 differential tests, both green). Bootstrap self-compilation remains deterministic. Limitations deferred to later stages: actual termios raw mode (no echo, no char-by-char input — `Term::raw()` emits the ANSI sequences that bring the terminal closer to "raw" but does NOT call `tcgetattr`/`tcsetattr`; real raw mode requires a builtin, deferred to a future perfection stage or Stage 55+ when `std.color` lands); mouse support (parsing mouse reports requires char-by-char input → termios raw mode); diff-based flush (full repaint every frame; `buffer_diff_into(prev, cur)` is a future perfection); truecolor 24-bit RGB (arrives with Stage 55's `std.color`); Unicode box-drawing chars beyond ASCII.
-
-**v0.72.0-alpha — Stage 53: std.cli (type-safe CLI argument parser).** Opens **Phase IV (CLI tooling track, Stages 53–62)**. Adds `std/cli.hls` — a type-safe argument parser with subcommands, env-var fallback, defaults, help text generation, and `--version`. Pure-HLS implementation (no new compiler builtins): uses `args()` (Args effect) for argv, `env_get`/`env_has` (Proc effect) for env-var fallback, and `println` (IO effect) for help/version output. The API is a runtime builder pattern (`CliParser` + `cli_parser_flag` / `cli_parser_int_opt` / `cli_parser_str_opt` / `cli_parser_float_opt` / `cli_parser_str_positional` / `cli_parser_int_positional` / `cli_parser_env` / `cli_parser_subcommand`). The roadmap's `cli::Parser` derive macro will be added later as a thin layer over this builder API when derive macros arrive (Stage 113+). Type-safe parsing: a `--port int` argument rejects non-integers at PARSE time, not at accessor time; the accessors (`cli_get_bool`/`int`/`str`/`float`) never panic on a successfully-parsed `CliResult`. Argument syntax: long (`--port`), short (`-p`), `--port=8080`, `-p=8080`, `--` end-of-options, bool flags with optional explicit value (`--verbose=true`). Implicit flags: `--help`/`-h` and `--version`/`-V`. Env-var fallback: CLI takes precedence over env, env takes precedence over default. Acceptance (`make cli-acceptance`): 22 sub-tests + 2 differential tests, all green.
-
-**v0.71.0-alpha — Stage 52: std.uuid v7 + std.ulid (lexicographically sortable).** Completes **Phase III (Standard library expansion, Stages 35–52)**. Adds UUID v7 (RFC 9562 — time-ordered, privacy-preserving) and ULID (26-char Crockford base32, lexicographically sortable) to `std/uuid.hls`. Both are pure-HLS extensions; no new compiler builtins (uses `system_time_now_ms` from Stage 49 for the timestamp and `rand_int` from Stage 9 for randomness). The existing UUID v4 deterministic and v5-like functions are preserved unchanged (backwards compat). `uuid_version` now returns 7 in addition to 4 and 5. UUID v7 layout: 48-bit Unix millisecond timestamp (big-endian) + 4-bit version (= 0b0111) + 12-bit `rand_a` (random) + 2-bit variant (= 0b10) + 62-bit `rand_b` (random). API: `uuid_v7()` (live), `uuid_v7_from(ts_ms, rand_a, rand_b)` (deterministic), `uuid_v7_timestamp(s)`. Passes the RFC 9562 Appendix A test vector: `uuid_v7_from(1645553341471, 3267, 1784793296649003341) = "017f229f-541f-7cc3-98c4-dc0c0c43214d"`. ULID layout: 48-bit Unix millisecond timestamp (10 chars of Crockford base32 with 2 zero padding bits at the top) + 80-bit randomness (16 chars of Crockford base32, no padding) = 26 chars total. Crockford base32 alphabet: `0123456789ABCDEFGHJKMNPQRSTVWXYZ` (no I/L/O/U; on decode, these are accepted as substitutions I→1, L→1, O→0, U→V). The encoding matches the standard ULID spec (compatible with python-ulid and the JS reference) — cross-verified against python-ulid for both low-bit and high-bit random bytes. ULIDs are lexicographically sortable: comparing two ULID strings lexicographically gives the same result as comparing the underlying (timestamp, randomness) tuples — the killer feature for database indexes (B-trees stay balanced when IDs are inserted in time order). API: `ulid()` (live), `ulid_from(ts_ms, rand_bytes)` (deterministic), `ulid_timestamp(s)`, `ulid_randomness(s) -> 10 bytes`, `ulid_is_valid(s)`, `ulid_compare(a, b)`. Acceptance (`make uuid-ulid-acceptance`): 13 sub-tests, 1 differential test, 1 runs-cleanly check (non-deterministic due to live clock/random), 1 backwards-compat regression check, all green.
-
-**v0.70.0-alpha — Stage 51: std.archive (tar + zip + gzip, no unsafe decompression).** Adds `std/archive.hls` — the eighteenth module of Phase III (stdlib expansion). Provides `TarReader` (USTAR format), `ZipReader` (PKWARE APPNOTE with stored entries), `GzipEncoder` (RFC 1952 with stored DEFLATE blocks), and `GzipDecoder` (stored blocks only). Decompression is bounded (a configurable `max_ratio` rejects zip bombs — default 100). Every byte is bounds-checked (no unsafe decompression). Pure-HLS implementation — no new compiler builtins (uses `read_file` for the file-level wrappers + `byte_at` + Stage 32 native bitwise primitives for byte manipulation). `TarEntry` struct: `name`, `mode`, `size`, `typeflag` ('0' regular file, '5' directory), `uid`, `gid`, `mtime`, `data`. `tar_parse(s, max_ratio) -> list[TarEntry]` parses USTAR archives (two consecutive all-NUL 512-byte blocks mark end-of-archive; GNU "ustar  \0" magic accepted alongside POSIX "ustar\0"; PAX extended headers deferred to perfection). `ZipEntry` struct: `name`, `compression_method`, `compressed_size`, `uncompressed_size`, `crc32`, `data`. `zip_parse(s, max_ratio) -> list[ZipEntry]` parses ZIP archives — finds the EOCD by scanning backwards from the end, reads the central directory, then for each entry, locates the local file header and extracts the data. Compression method 0 (stored) is supported; methods 8 (deflate), 9 (deflate64), 12 (bzip2), 14 (LZMA), etc. panic with a clear "not supported in v0.70.0-alpha" message (a future perfection stage will add method 8 via the inflate algorithm). CRC-32 is verified against the central directory's CRC (data corruption is detected). `gzip_encode(data)` produces a gzip file with stored DEFLATE blocks (BTYPE=00, no compression, just framing) — splits the input into 65535-byte blocks. `gzip_decode(s, max_ratio)` decodes gzip files — supports stored blocks (BTYPE=00); panics on compressed blocks (BTYPE=01/10) with a clear "not supported in v0.70.0-alpha" message. The `GzipEncoder`/`GzipDecoder` pair is a matched set — files encoded by `gzip_encode` can be decoded by `gzip_decode` AND by external gzip tools (they all support stored blocks). `archive_crc32(s)` is the standard IEEE 802.3 CRC-32 (polynomial 0xEDB88320 reflected, table-driven) — matches `zlib.crc32` (verified on canonical test vectors: `crc32("hello") = 0x3610a686`, `crc32("The quick brown fox...") = 0x414fa339`). Acceptance (`make archive-acceptance`): 5 sub-tests (CRC-32, gzip round-trip with 6 size variations, tar parse, zip parse, zip-bomb defensive), 2 differential tests (archive_demo + feat_stage51_archive), all green.
-
-**v0.69.0-alpha — Stage 50: std.math (IEEE-754 + transcendental + BigDecimal).** Adds **28 new pure compiler builtins** wired through all four code-paths: trigonometric (`math_sin`/`cos`/`tan`/`asin`/`acos`/`atan`/`atan2`/`sinh`/`cosh`/`tanh`), exponential / logarithmic (`math_exp`/`log`/`log10`/`log2`/`pow`), power / root (`math_sqrt`/`cbrt`/`hypot`/`fmod`/`copysign`), special functions (`math_erf`/`erfc`/`tgamma`/`lgamma`), and IEEE-754 predicates (`math_isnan`/`isinf`/`isfinite`/`signbit`). All delegate to libm on the native side and Python's `math` module in the interpreter (CPython's `math` wraps libm, so differential parity holds bit-for-bit on the same platform). The previous Newton's-method `math_sqrt` HLS function is removed (the builtin supersedes it — libm is O(1) on x86-64 with hardware `sqrtss`). `std/math.hls` adds IEEE-754 constants (`math_pi`/`math_e`/`math_pos_inf`/`math_neg_inf`/`math_nan`) and `BigDecimal` — a pure-HLS arbitrary-precision decimal type. The struct is `{ sign, digits, scale }` (each digit 0..9, most-significant first). Constructors `bigdecimal_zero`/`from_int`/`from_str` (parses "123", "-12.34", "0.001", "1.5e3" — returns `Result`). Arithmetic `bigdecimal_add`/`sub`/`mul` (schoolbook O(n*m); `div` deferred). Comparison `eq`/`lt`/`gt`/`le`/`ge`. Helpers `neg`/`abs`/`is_zero`/`to_str`/`to_int`. All arithmetic is **exact** — the canonical IEEE-754 counter-example `0.1 + 0.2 == 0.3` holds (versus IEEE-754 which gives 0.30000000000000004). Acceptance (`make math-acceptance`): 12 sub-tests (predicates, constants, trig, exp/log, power/root, special, BigDecimal constructors, add, sub, mul, neg/abs, comparison, to_int), 2 differential tests (feat_stage50_math + math_demo), all green.
-
-**v0.68.0-alpha — Stage 49: std.time (Instant, Duration, SystemTime, sleep, timeout).** Adds `std/time.hls` — the seventeenth module of Phase III (stdlib expansion). Two new compiler builtins (`instant_now_ns`, `system_time_now_ms`) wired through all four code-paths. Both carry the `Clock` effect. `instant_now_ns` returns monotonic nanoseconds via `clock_gettime(CLOCK_MONOTONIC)` on POSIX (Python's `time.monotonic_ns()` in the interpreter) — the result never decreases. `system_time_now_ms` returns wall-clock milliseconds since the Unix epoch via `clock_gettime(CLOCK_REALTIME)` (Python's `time.time() * 1000`) — the wall clock can jump on NTP adjustments, so `Instant` (not `SystemTime`) should be used for duration measurements. The stdlib provides three structured types: `Instant` (monotonic, nanosecond precision, `instant_now`/`elapsed`/`duration_since`/`add`/`sub`); `Duration` (signed nanoseconds with **checked arithmetic** — `duration_add`/`sub`/`mul`/`div` pre-check for overflow / underflow / divide-by-zero and panic with a clear message instead of silently wrapping, satisfying the roadmap's "no overflow when adding two large durations" requirement); `SystemTime` (wall-clock ms since Unix epoch, `system_time_now`/`unix_secs`/`unix_millis`/`to_iso8601`/`duration_since -> Result[Duration, str]` — Err if the wall clock went backwards, matching Rust's `SystemTime::duration_since` failure mode). The `time_sleep(Duration)` helper wraps `thread_sleep_ms` (Stage 46); `time_timeout_ms(ms) -> Future[bool]` creates a future that resolves after `ms` milliseconds (uses `async_spawn` from Stage 33 to spawn a task that sleeps then returns `true`; the caller races the timeout against another future via `future_select`). Original low-resolution API (`time_now_ms`, `time_format_hms`, `time_format_iso8601`, `time_elapsed_ms`, `time_stopwatch_start`, `time_stopwatch_lap`, `time_human_ms`) preserved verbatim. Acceptance (`make time-acceptance`): 17 sub-tests, 2 differential tests, all green.
-
-**v0.67.0-alpha — Stage 48: std.env (env_var, env_set_var, env_unset_var, env_current_dir, env_set_current_dir, env_args_os).** Adds `std/env.hls` — the fifteenth module of Phase III (stdlib expansion) — providing the user-facing API for environment-variable and current-working-directory access. Seven new compiler builtins (`env_get`, `env_has`, `env_set`, `env_unset`, `cwd_get`, `cwd_set`, `args_os`) wired through all four code-paths (boot checker, boot interpreter, self-hosted compiler C codegen + C runtime, LLVM IR emit). All carry the `Proc` effect (env / cwd access is process-state access). The KEY arguments of `env_get` / `env_has` / `env_set` / `env_unset` are taint sinks (info disclosure — attacker learns which env vars exist; env injection — attacker sets `LD_PRELOAD` / `PATH` / `IFS`); the PATH argument of `cwd_set` is a taint sink (directory traversal — same threat as `read_file` / `write_file`). The stdlib (`std/env.hls`) provides the user-facing API names from the roadmap, applying the taint wrappers: `env_var(key) -> Option[tainted[str]]` (built from `env_has` + `env_get` + `taint_mark` — Some if exists, None if not; the value is tainted by default); `env_set_var` / `env_unset_var` (thin wrappers); `env_current_dir() -> tainted[str]` (wraps `cwd_get` with `taint_mark`); `env_set_current_dir(path) -> int` (thin wrapper; 0 / -1); `env_args_os() -> list[tainted[str]]` (wraps `args_os` with `taint_mark` per element — the os-string version of `tainted_args`). Type-level taint enforcement: passing a `tainted[str]` to any "set" wrapper is a compile error (the function signature requires `str`). Acceptance (`make env-acceptance`): 11 sub-tests (low-level env_get/has/set/unset, env_set with empty value, cwd round-trip via /tmp, cwd_set nonexistent, args_os count, stdlib wrappers), 4 fail tests (tainted key/path rejection), differential (interpreter == native) verified green.
-
-**v0.66.0-alpha — Stage 47: std.process (Command, Child, ExitStatus, Stdio).** Adds `std/process.hls` — the fourteenth module of Phase III (stdlib expansion) — formalising the child-process model that Stage 9 introduced (via `proc_exec`). Six new compiler builtins (`proc_spawn`, `proc_wait`, `proc_kill`, `proc_child_write`, `proc_child_read`, `proc_child_close`) wired through all four code-paths. `proc_spawn` uses fork+execvp WITHOUT a shell (the args list is passed as argv[1..], NOT shell-interpreted — eliminating the shell-injection vector that `proc_exec` carries). The `program` argument is a taint sink (command injection — same threat as `proc_exec`). The `Stdio` enum (`Inherit` / `Pipe` / `Null` — encoded as 0/1/2 ints, validated at compile time). `ExitStatus` is decoded from the encoded wait status (0..255 exit code, 128+signum signal kill, -1 error). The Halis-level pid namespace is a monotonic counter (1..64 in native, 1.. in interpreter) — the OS pid is NEVER exposed (it differs between backends and would break differential testing). `proc_exec` is preserved as a thin wrapper (shell one-shot — callers MUST sanitise; `command_spawn` is the type-safe, shell-free alternative). Stage 47 also adds LLVM backend support for the existing `proc_exec` builtin (previously declared but not yet codegen-able in the LLVM backend — Stage 12 alpha subset). Acceptance (`make process-acceptance`): 11 sub-tests (simple spawn/wait, args, piped stdin, capture stderr, kill via SIGTERM, exit_status_decode, Command builder, Stdio enum helpers, command_spawn, command_status), 2 fail tests (tainted program, missing `uses Proc`), differential verified green.
-
-**v0.48.0-alpha — Stage 31: tail-call optimisation (verified).** `#[tail_call]` asserts that every recursive call to a function is in verified tail position, and the compiler turns that proof into a jump: the codegen lowers each verified site to a parameter-rebinding `goto` — **a jmp, not a call — so stack usage is constant regardless of recursion depth** (`fib_tail(1_000_000)` uses the same stack as `fib_tail(1)`). "Verified" is mechanical: the checker proves *position* (every self-call is the entire `return f(...)` expression) and *no cleanup* (the body flows only `int`/`float`/`bool` — nothing needing release between the call and the jump; the only exception is a string literal passed directly to `panic`/`print`/`println`). Scope: plain fns only — not generic, not a method, no contracts, not `irq_handler`/`inline(always)` (both conflicts caught at parse time). Both backends transform: the native C backend emits the loop, and the Stage-0 interpreter mirrors it as a **trampoline** — 1M-deep tail recursion costs zero Python recursion. PGO entry counters keep counting real entries; LTO never inlines a `#[tail_call]` fn (the loop must stay a loop). `--opt-stats` reports the verified sites. Acceptance (`make tail-acceptance`): native `fib_tail(1_000_000)` = 918091266 (independently computed), the same run under `ulimit -s 1024` (a 1 MB stack — a 1M call chain would need ~48 MB), the interpreter at the same depth with byte-identical output, and a non-tail self-call is rejected. See `examples/fibonacci.hls` and `tests/ok/feat_stage31_tail.hls`.
-
-**v0.47.0-alpha — Stage 30: boxed-vs-stack layout analysis (escape analysis).** A `list[int]`/`list[float]`/`list[bool]` whose every use stays inside its creating function is allocated on the C stack as a typed array — **zero heap objects, zero refcount traffic** (a 3-element list literal drops from 5 mallocs to 0). The analysis is *proven*, not assumed: only borrow-safe uses (`.get`/`.set`/`.len` receiver, `xs[i]` base, for-in iterable) keep a binding in-frame, and `#[stack]` turns the proof into a compile-time guarantee — an escaping use is a compile error naming the site, so a stack-allocated value can NEVER outlive its creating frame. `#[boxed]` opts back into the heap layout; both are the first let-binding attributes. The analysis runs automatically with no annotation, the `--opt-stats` report gains a per-binding layout table, and the compiler is its own first customer (2 of its own bindings are stack-allocated in the self-compiled binary). Acceptance: the fibonacci inner loop runs 20,000 rounds with a constant 90 heap allocations (its `#[boxed]` twin: 1,280,234), verified by `make escape-acceptance` and `examples/stack_layout_demo.hls`. **712/720 tests PASS** (the 8 failures are pre-existing environment issues — 6 wasm-toolchain + 2 simd-timing — verified to fail identically on the pre-Stage-30 code).
-
-**v0.37.0-alpha — Stage 21: SIMD vectorisation. `std.simd` ships explicit SIMD types (I32x4/F64x2/U8x16, wrapping lanes, checked boundaries) with the full op set + fused whole-loop kernels; `hlc --target-feature avx2|sse4.2` lowers the hot kernels to native intrinsics (arch-guarded, scalar fallback); `has_feature()`/`simd_cpu_supports()` give compile-time and runtime dispatch; the HLIR auto-vectoriser detects the canonical loops. Acceptance: the 1M-element 8-tap FIR kernel runs 2.4× faster on AVX2 (gate ≥ 2×) with identical output, fast path byte-identical to portable. Fixed a latent std.bits bit-63 clobber. 587/587 tests PASS.** Stage 20 (previous) delivered whole-program LTO (`hlc --lto`, 52% binary size drop, list_sort_int_asc inlined with the standalone definition dropped). `hlc --lto` inlines small single-return functions from imported modules at statement-level call sites (ownership bit-for-bit preserved) and drops both unreachable functions and fully-inlined standalone definitions; the acceptance binary shrinks 52% (35,344 → 17,144 bytes) with byte-identical output on all 105 ok/ programs. `--emit lto` / `make emit-lto-ir` emit the whole-program LTO'd LLVM IR; `hls-pkg build --lto` compiles packages through the pipeline. The LTO work also found and fixed a latent C-backend soundness bug (eager hoisting broke `&&`/`||` lazy short-circuiting). 578/578 tests PASS, bootstrap deterministic, differential suite byte-identical (including `--lto`).** Previous release v0.35.0-alpha delivered Stage 19 (PGO): the trained `hlc` self-compiles in 69.2–73.4% of the plain build's wall time with byte-identical output, and the O(n) `join` builtin cut a full self-compilation from 3.3 s to 0.48 s. Before that, v0.34.0-alpha completed Stage 18 (hltest + quickcheck + hls-fuzz + hlcov + the 150-stage roadmap restructure); v0.33.0-alpha merged the deep-scan-and-beyond-v1 branch (PR #22) which closed all 7 open issues (#15-#21). Stage 17 was perfected in v0.30.0-alpha (proof-engine soundness overhaul + native ensures + loop-invariant engine).
-
-- ✅ Complete core specification
-- ✅ Stage-0 reference (interpreted, with type + effects checking)
-- ✅ Self-hosted compiler `hlc.hls` (front-end + C backend)
-- ✅ Self-compiling fixed-point; bootstrap is deterministic
-- ✅ Module system & standard library (Stage 6): `std.str`, `std.math`,
-  `std.json`, `std.url`, `std.html`
-- ✅ **Stage 7 — Advanced type system**: `enum` + `match` (with
-  exhaustiveness checking), `Option[T]`/`Result[T, E]` in stdlib,
-  `?` error-propagation operator, monomorphising generics on functions /
-  structs / enums, struct default field values, recursive enums
-- ✅ **Stage 8 — Ownership & memory model, COMPLETE** (alpha v0.4.0-alpha
-  + beta v0.19.0-alpha): `drop(x)` / `clone(x)` / `take(x)` builtins with
-  compile-time use-after-move tracking; **end of the arena** — the
-  generated C runtime is refcounted and the codegen's ownership-analysis
-  pass inserts exact retain/release at scope exit (cleanup attributes
-  cover every control-flow path). `clone()` supports every owned type
-  (str / list / map / struct / enum / tainted) via per-instantiation
-  helpers. The memory-stress acceptance test runs 500k allocation rounds
-  with **RSS delta = 0**, enforced under a 256 MB `ulimit -v` in the
-  test suite. **173/173 tests PASS** (Stage 8 final test count; the
-  current count after all Stage 9 release work is **185/185**).
-- ✅ **Stage 9-alpha — Fine-grained effects & capabilities** (v0.5.0-alpha):
-  Single `IO` effect split into five — `IO`, `Fs`, `Clock`, `Args`, `Exit`.
-  `uses` clause now accepts a comma-separated list; `uses IO` is a
-  backwards-compatible blanket alias. Capability subset semantics
-  (`declared ⊇ computed`) with default-deny for pure functions.
-- ✅ **Stage 9-beta — Explicit `pure` keyword + `--audit` flag**
-  (v0.6.0-alpha): `fn f(...) pure` declares purity explicitly; mutually
-  exclusive with `uses` at parse time. `hlc --audit` and
-  `boot.py --audit` print the full capability / effect tree of every
-  function in the program.
-- ✅ **Stage 10-alpha — Taint tracking & sandbox** (v0.7.0-alpha):
-  New built-in generic type `tainted[T]` wraps any value as potentially
-  attacker-controlled. Three new builtins: `tainted_args()` returns the
-  program's argv wrapped as `list[tainted[str]]`; `taint_mark(x)` wraps
-  any value; `taint_unwrap(x)` is the explicit untaint escape hatch. The
-  checker statically rejects passing `tainted[T]` to any sink
-  (`print`, `println`, `read_file`, `write_file`, `file_exists`,
-  `exit`). Two new stdlib modules: `std.taint` (pure-query helpers on
-  tainted strings — length, prefix/suffix, contains, slice that stays
-  tainted) and `std.sanitize` (six sanitizers: `sanitize_html`,
-  `sanitize_html_attr`, `sanitize_path`, `sanitize_sql_identifier`,
-  `sanitize_sql_string`, `sanitize_command`, `sanitize_filename`).
-  The new `examples/taint_demo.hls` exercises the full flow. **135/135
-  tests PASS**.
-- ✅ **Stage 10-beta — Taint tracking extended** (v0.8.0-alpha):
-  Second taint source `read_file_tainted(path: str) -> tainted[str]`
-  (file content is tainted by default — useful for untrusted
-  uploads / downloaded config). Extended `--audit` flag with a
-  taint-flow section listing which functions call each taint
-  source and each taint sink. Three new pure-query helpers in
-  `std.taint`: `taint_check_byte_at`, `taint_concat`,
-  `taint_concat_clean`. New JSON typed value accessors
-  (`json_bool_value` / `json_int_value` / `json_float_value` /
-  `json_str_value`). Bug fixes: `str.to_float` accepts scientific
-  notation; `float.to_int` range-checks; `html_escape` escapes
-  forward slash per OWASP; JSON parser handles UTF-16 surrogate
-  pairs; base64_decode validates padding placement; URL parser
-  uses the FIRST `@` for userinfo split (defensive).
-  The new `examples/taint_beta_demo.hls` exercises the flow.
-  **145/145 tests PASS**.
-- ✅ **Stage 9 release — Complete fine-grained effects & capabilities**
-  (v0.20.0-alpha): The three reserved effects `Net`, `Rand`, `Proc`
-  are now active with five new builtins — `net_lookup`,
-  `rand_int`, `rand_float`, `rand_seed`, `proc_exec`. The shared
-  64-bit LCG makes random sequences **deterministic across the
-  interpreter and native binary** — the same seed produces the same
-  sequence, critical for differential testing. `net_lookup` and
-  `proc_exec` are also TAINT SINKS (tainted host → DNS rebinding;
-  tainted command → shell injection). **185/185 tests PASS**.
-- ✅ **Stage 10 release — Taint tracking & sandbox** (v0.21.0-alpha):
-  `--sandbox DIR` restricts filesystem builtins to DIR (both
-  interpreter and native runtime). New taint source `read_line() ->
-  tainted[str]`. `--sandbox` rejects `extern "C"` blocks (FFI
-  bypasses the sandbox). 191/191 tests PASS.
-- ✅ **Stage 11 release — SSA IR + optimisation** (v0.21.0-alpha):
-  Two new optimiser passes — `inline_small` (inlines small pure
-  functions at their call sites) and `licm` (hoists loop-invariant
-  expressions out of loop bodies). 191/191 tests PASS.
-- ✅ **Stage 12 release — Native LLVM backend** (v0.22.0-alpha):
-  The LLVM IR text backend now lowers struct literals, enum literals,
-  match expressions, the `?` operator, struct field access and
-  assignment via a typed runtime API. The `noreturn` attribute is
-  attached to `hl_die`/`hl_panic`/`hl_exit` so the optimiser cannot
-  DCE the trailing `unreachable`. 199/199 + 13/13 LLVM tests PASS.
-- ✅ **Stage 13 release — Package manager `hls-pkg`** (v0.23.0-alpha):
-  Transparency log (append-only, SHA-256-chained JSON-lines),
-  multi-file packages (directory deps with content-addressed hashing),
-  version verification (records + verifies the git commit SHA).
-  New CLI: `hls-pkg publish` + `hls-pkg log [--verify]`. 199/199 +
-  13/13 LLVM tests PASS.
-- ✅ **Stage 14 release — Tooling** (v0.24.0-alpha, perfected
-  v0.26.0-alpha): `hls-lsp` language server, `hlfmt` formatter,
-  `hllint` linter (control-flow-aware `?`-unwrap analysis).
-- ✅ **Stage 15 release — Safe C FFI** (v0.25.0-alpha, perfected
-  v0.26.0-alpha): `extern "C"` blocks, `hlbindgen` C-header → HLS
-  generator (structs, enums, ABI header with `_Static_assert` size
-  checks), ownership-across-boundary enforcement.
-- ✅ **Stage 16 release — Concurrency & async, data-race freedom**
-  (v0.27.0-alpha): `spawn(f, args) -> Task[R]` (real threads —
-  pthread native / Python-thread interpreter), `Chan[T]`
-  message-passing channels (unbounded MPMC FIFO, blocking recv),
-  `select(list[Chan[T]])`, actor model via enum mailboxes, and a new
-  **`Conc` effect**. **Data races are impossible by construction:**
-  the Send rule set (Task handles are the first non-Send type) plus
-  the ownership boundary rule — *sharing a variable with a task
-  outside a channel is a compile error*. Runtime hardening deep-copies
-  non-provable values at the boundary, channels use atomic
-  refcounts, and a built-in deadlock detector halts all-blocked
-  programs with a clean panic. 426/426 tests PASS.
-- ✅ **Stage 17 release — Formal verification & contracts**
-  (v0.28.0-alpha): `requires`/`ensures` contracts (validated, pure,
-  params-only scope; `result` in ensures), **static call-site
-  checking** (`div(10, 0)` is a compile error), `--contracts` runtime
-  assertions, the **interval proof engine** — symbolic length and
-  minimum-length facts from contracts prove overflow/division/bounds
-  checks dead — and **`-O fast`** elides exactly those (soundness:
-  every elision is guarded by the precondition that proved it).
-  Tools: `hlprove` (proof reports + the z3 SMT-LIB2 bridge +
-  loop-invariant suggestions) and `hlmodel` (exhaustive finite-state
-  model checking by executing the transition relation; BFS
-  reachability + invariants). Acceptance: `examples/hmac_proven.hls`
-  — an HMAC envelope whose hot path is fully proven (fast output is
-  byte-identical to the interpreter). 459/459 tests PASS.
-- ✅ **Stage 18 release — testing ecosystem & fuzzing** (v0.34.0-alpha):
-  `hltest` in-language test runner, `std.test` assertion library,
-  `std.quickcheck` property generators, `hls-fuzz` differential fuzzer
-  with AST delta-debugging minimisation, `hlcov` HLIR coverage. 557/557
-  tests PASS.
-- ✅ **Stage 19 release — profile-guided optimisation** (v0.35.0-alpha):
-  `--pgo-generate` / `--pgo-use` in the self-hosted compiler, the O(n)
-  `join` builtin, `make pgo` / `make pgo-acceptance`, and the
-  PGO-trained `hlc` as the canonical CI release artifact. Acceptance:
-  trained hlc self-compiles in 73.4% of plain wall time (≤ 80% target),
-  byte-identical output. 567/567 tests PASS.
-- ✅ **Stage 20 release — LTO across crates** (v0.36.0-alpha):
-  `hlc --lto` (statement-position cross-crate inliner + two-phase
-  whole-program DCE, implemented in HLS), `--emit lto` / `make
-  emit-lto-ir`, `hls-pkg build --lto`, generic-instantiation dedup.
-  Acceptance: `list_sort_int_asc` inlined with the standalone
-  definition dropped; binary size −52% (target ≥ 15%); byte-identical
-  output on all ok/ programs. Fixed a latent `&&`/`||` eager-hoisting
-  short-circuit bug. 578/578 tests PASS.
-- ✅ **Stage 21 release — SIMD vectorisation** (v0.37.0-alpha):
-  `std.simd` (I32x4/F64x2/U8x16 + fused FIR kernel), intrinsic fast
-  paths under `--target-feature`, `has_feature`/`simd_cpu_supports`
-  dispatch, HLIR auto-vectoriser detection. Acceptance: 2.4× ≥ 2× on
-  AVX2, identical output. 587/587 tests PASS.
-- ✅ **Stage 30 release — boxed-vs-stack layout analysis**
-  (v0.47.0-alpha): automatic escape analysis for
-  `list[int/float/bool]` bindings — non-escaping lists are laid out
-  as typed C frame arrays (zero heap objects, zero refcount
-  traffic); `#[stack]` forces the layout with a compile-time escape
-  proof; `#[boxed]` opts back into the heap layout; `--opt-stats`
-  reports every per-binding layout decision; LTO/PGO/fast-mode
-  interaction-safe; differential suite byte-identical. Acceptance:
-  fibonacci inner loop, 20k rounds, 90 constant heap allocations
-  (`make escape-acceptance`).
-- ✅ **Stage 31 release — tail-call optimisation (verified)**
-  (v0.48.0-alpha): `#[tail_call]` — the checker proves every
-  recursive call is in tail position AND needs no cleanup between
-  the call and the jump (primitive-only dataflow), then the codegen
-  lowers each verified site to a parameter-rebinding `goto` (a jmp,
-  not a call — constant stack at any depth); the interpreter mirrors
-  it as a trampoline (zero Python recursion at 1M depth); LTO never
-  inlines a tail-call fn; `--opt-stats` reports the verified sites.
-  Acceptance: `fib_tail(1_000_000)` = 918091266 natively under
-  `ulimit -s 1024` and in the interpreter, byte-identical
-  (`make tail-acceptance`).
-- ⬜ RISC-V backend (Stage 26), inline assembly (Stage 27),
-  zero-cost abstractions audit (Stage 32), v1.0 (Stage 150)...
+| Document | What it covers |
+|----------|----------------|
+| [SPEC.md](SPEC.md) | The language reference — lexical rules, types, effects, taint, ownership, IR, every subsystem |
+| [RELEASES.md](RELEASES.md) | The release record and support discipline |
+| [SECURITY.md](SECURITY.md) | The security model, its honest limits, and how to report |
+| [LTS.md](LTS.md) | The support policy — rendered, not maintained |
+| [RC.md](RC.md) | The last release candidate's record |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | How to build, test and land changes |
+| [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) | Community standards |
+| [editors/vscode/halis/](editors/vscode/halis/) | The VS Code extension — LSP, formatter, linter, debugger |
 
 ## Contributing
 
-Every contribution must preserve the core guarantees and pass
-`make test` (the full suite: interpreter + native + differential +
-bootstrap determinism + LLVM IR + memory-stress + fmt + lint +
-proof/contracts). Every new feature must first be used inside `hlc`
-itself — the compiler is always the first customer of the language.
+Every contribution must preserve the guarantees above and pass
+`make test`. Every new language feature is used inside the compiler
+itself before it ships — `hlc` is always the language's first
+customer. The `main` branch is protected; work lands through pull
+requests with CI green on the gcc/clang and Python-version matrix.
 
-**Branch protection:** the `main` branch is protected — all non-admin
-contributors must open a pull request. CI must pass on every PR (full
-test suite + bootstrap determinism + example programs, on the 2×2
-matrix of Python 3.8/3.11 and gcc/clang). Direct pushes to `main` are
-limited to the repo owner. Linear history is enforced (no merge
-commits); force-push and branch deletion are disabled.
+Start with [CONTRIBUTING.md](CONTRIBUTING.md) — it walks the
+bootstrap, the snapshot rules, the code style and the commit format.
 
-## Licence
+## License
 
 [MIT](LICENSE) © 2026 mhieuhonda
