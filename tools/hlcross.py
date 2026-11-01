@@ -735,6 +735,15 @@ def cross_compile(input_hls: str, output_bin: str, target: str,
         if kind != "zig":
             arch_flags = ["-march=" + spec.get("march", "rv64imac")] + arch_flags
         arch_flags = ["-mabi=" + spec.get("mabi", "lp64")] + arch_flags
+        # medany, always: the image links at 0x80000000 (QEMU virt's
+        # DRAM base, per targets/riscv64-unknown-none.ld) — far beyond
+        # the ±2 MiB a medlow PC-relative address can reach. Under
+        # medlow every absolute reference to a static (hl_heap_pos,
+        # hl_heap_u, ...) grows an R_RISCV_HI20 relocation the linker
+        # must truncate: "relocation truncated to fit: R_RISCV_HI20
+        # against 'hl_heap_pos'" and the link dies. The same flag for
+        # zig (clang accepts -mcmodel for every RISC-V target).
+        arch_flags = ["-mcmodel=medany"] + arch_flags
     # Stage 96: --debug — DWARF 5 debug info in the image. gcc/clang
     # spell it the same; zig cc also accepts both. The mapping lives in
     # the C (hlc --debug); this flag decides whether the image keeps
@@ -748,9 +757,21 @@ def cross_compile(input_hls: str, output_bin: str, target: str,
         print(f"error: linker failed (exit {code})", file=sys.stderr)
         print(f"      command: {' '.join(cmd)}", file=sys.stderr)
         return 1
+    # A linker that exits 0 without producing the image is a broken
+    # linker, not a success — report it instead of crashing on the
+    # size query below.
+    if not os.path.exists(out_path):
+        print(f"error: linker reported success but {out_path} was not "
+              f"created", file=sys.stderr)
+        print(f"      command: {' '.join(cmd)}", file=sys.stderr)
+        return 1
     fmt = detect_binary_format(out_path)
+    # The success line names the target's canonical format alongside the
+    # detected one — "ELF 64-bit LE" alone cannot tell WHICH target was
+    # linked for, and the alias acceptance greps for the target's name
+    # ("ELF aarch64" / "ELF riscv64") to know the alias resolved.
     print(f"      binary: {out_path} ({os.path.getsize(out_path)} bytes, "
-          f"{fmt})")
+          f"{fmt}; target: {spec['binary_format']})")
     if not keep_c:
         try:
             os.unlink(c_path)
