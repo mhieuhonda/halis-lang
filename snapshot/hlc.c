@@ -1387,8 +1387,17 @@ static hl_str* hl_str_slice_unchecked(hl_str* s, int64_t a, int64_t b) {
 static int64_t hl_str_find(hl_str* s, hl_str* sub) {
     if (sub->len == 0) return 0;
     if (sub->len > s->len) return -1;
-    for (int64_t i = 0; i + sub->len <= s->len; i++) {
-        if (memcmp(s->data + i, sub->data, (size_t)sub->len) == 0) return i;
+    int64_t last = s->len - sub->len;
+    size_t n = (size_t)sub->len;
+    const char* p = s->data;
+    int first = (unsigned char)sub->data[0];
+    int64_t i = 0;
+    while (i <= last) {
+        const char* hit = (const char*)memchr(p + i, first, (size_t)(last - i + 1));
+        if (!hit) return -1;
+        i = (int64_t)(hit - p);
+        if (memcmp(p + i, sub->data, n) == 0) return i;
+        i++;
     }
     return -1;
 }
@@ -19639,6 +19648,13 @@ hl_list* usf_fs_mem_str_lines(void) {
     hl_list_push(u_r, hl_cstr("    }"));
     hl_list_push(u_r, hl_cstr("    return 0;"));
     hl_list_push(u_r, hl_cstr("}"));
+    hl_list_push(u_r, hl_cstr("static void* hl_memchr(const void* s, int c, size_t n) {"));
+    hl_list_push(u_r, hl_cstr("    const unsigned char* p = (const unsigned char*)s;"));
+    hl_list_push(u_r, hl_cstr("    for (size_t i = 0; i < n; i++) {"));
+    hl_list_push(u_r, hl_cstr("        if (p[i] == (unsigned char)c) return (void*)(p + i);"));
+    hl_list_push(u_r, hl_cstr("    }"));
+    hl_list_push(u_r, hl_cstr("    return (void*)0;"));
+    hl_list_push(u_r, hl_cstr("}"));
     hl_list_push(u_r, hl_cstr("static size_t hl_strlen(const char* s) {"));
     hl_list_push(u_r, hl_cstr("    size_t n = 0;"));
     hl_list_push(u_r, hl_cstr("    while (s[n]) n++;"));
@@ -19674,6 +19690,7 @@ hl_list* usf_fs_mem_str_lines(void) {
     hl_list_push(u_r, hl_cstr("#define memcpy hl_memcpy"));
     hl_list_push(u_r, hl_cstr("#define memset hl_memset"));
     hl_list_push(u_r, hl_cstr("#define memcmp hl_memcmp"));
+    hl_list_push(u_r, hl_cstr("#define memchr hl_memchr"));
     hl_list_push(u_r, hl_cstr("#define strlen hl_strlen"));
     hl_list_push(u_r, hl_cstr("#define strcmp hl_strcmp"));
     hl_list_push(u_r, hl_cstr("#define strncmp hl_strncmp"));
@@ -21789,8 +21806,17 @@ hl_list* usf_runtime_lines(bool u_fs_p, bool u_nl_p) {
     hl_list_push(u_r, hl_cstr("static int64_t hl_str_find(hl_str* s, hl_str* sub) {"));
     hl_list_push(u_r, hl_cstr("    if (sub->len == 0) return 0;"));
     hl_list_push(u_r, hl_cstr("    if (sub->len > s->len) return -1;"));
-    hl_list_push(u_r, hl_cstr("    for (int64_t i = 0; i + sub->len <= s->len; i++) {"));
-    hl_list_push(u_r, hl_cstr("        if (memcmp(s->data + i, sub->data, (size_t)sub->len) == 0) return i;"));
+    hl_list_push(u_r, hl_cstr("    int64_t last = s->len - sub->len;"));
+    hl_list_push(u_r, hl_cstr("    size_t n = (size_t)sub->len;"));
+    hl_list_push(u_r, hl_cstr("    const char* p = s->data;"));
+    hl_list_push(u_r, hl_cstr("    int first = (unsigned char)sub->data[0];"));
+    hl_list_push(u_r, hl_cstr("    int64_t i = 0;"));
+    hl_list_push(u_r, hl_cstr("    while (i <= last) {"));
+    hl_list_push(u_r, hl_cstr("        const char* hit = (const char*)memchr(p + i, first, (size_t)(last - i + 1));"));
+    hl_list_push(u_r, hl_cstr("        if (!hit) return -1;"));
+    hl_list_push(u_r, hl_cstr("        i = (int64_t)(hit - p);"));
+    hl_list_push(u_r, hl_cstr("        if (memcmp(p + i, sub->data, n) == 0) return i;"));
+    hl_list_push(u_r, hl_cstr("        i++;"));
     hl_list_push(u_r, hl_cstr("    }"));
     hl_list_push(u_r, hl_cstr("    return -1;"));
     hl_list_push(u_r, hl_cstr("}"));
