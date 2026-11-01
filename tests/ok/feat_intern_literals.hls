@@ -1,0 +1,162 @@
+# feat_intern_literals.hls — interned string literals + str.find edges.
+#
+# The literal pool (c_str_lit_ref) gives every distinct string literal
+# one static immortal object; str.find is memchr-driven. This battery
+# exercises the ownership paths a literal crosses: containers, tasks,
+# channels, match arms, clone/slice/trim, 20k retain/release cycles,
+# plus the str.find corner cases (empty needle, overlap, needle at
+# end, miss). Both backends must print ALL-PROBES-PASS and exit 0.
+
+import "std.option"
+import "std.result"
+
+fn edge_find(hay: str, needle: str, want: int, label: str) -> int uses IO {
+    let got: int = hay.find(needle)
+    if got != want {
+        println("FIND-MISMATCH " + label + ": got " + got.to_str() + " want " + want.to_str())
+        return 1
+    }
+    return 0
+}
+
+fn send_literal(sender: Chan[str], msg: str) -> void uses Conc {
+    sender.send(take(msg))
+}
+
+fn work(s: str) -> str {
+    # a literal flows through concat (heap copy), slice, trim
+    return "[" + s + "]" + "-tail"
+}
+
+fn main() -> int uses IO, Conc {
+    let mut bad: int = 0
+
+    # 1. str.find corners (the memchr rewrite must keep first-match)
+    bad = bad + edge_find("hello world", "world", 6, "basic")
+    bad = bad + edge_find("hello world", "", 0, "empty-needle")
+    bad = bad + edge_find("", "", 0, "both-empty")
+    bad = bad + edge_find("abc", "abcd", -1, "needle-longer")
+    bad = bad + edge_find("aaa", "aa", 0, "overlap-aaa")
+    bad = bad + edge_find("abcabcabc", "cab", 2, "second-third")
+    bad = bad + edge_find("abcabcabc", "c", 2, "single-char")
+    let mut longpad: str = ""
+    let mut pi: int = 0
+    while pi < 100 {
+        longpad = longpad + "x"
+        pi = pi + 1
+    }
+    longpad = longpad + "NEEDLE"
+    pi = 0
+    while pi < 100 {
+        longpad = longpad + "y"
+        pi = pi + 1
+    }
+    bad = bad + edge_find(longpad, "NEEDLE", 100, "needle-mid")
+    bad = bad + edge_find(longpad, "NEEDLEX", -1, "needle-extended-miss")
+    bad = bad + edge_find("abc", "abc", 0, "needle-equals")
+    let endsnip: str = "prefix-" + "target"
+    bad = bad + edge_find(endsnip, "target", 7, "needle-at-end")
+
+    # 2. equal literals: content equality through every operator
+    if !("sym" == "sym") {
+        println("LIT-EQ-FAIL")
+        bad = bad + 1
+    }
+    if !("a" + "b" == "ab") {
+        println("LIT-CONCAT-FAIL")
+        bad = bad + 1
+    }
+
+    # 3. literals in containers, then retrieved and compared
+    let m: map[str, int] = map_new()
+    m.set("alpha", 1)
+    m.set("beta", 2)
+    m.set("alpha", 11)
+    if m.get_or("alpha", 0) != 11 || m.get_or("beta", 0) != 2 || m.get_or("gamma", 7) != 7 {
+        println("MAP-OVERWRITE-FAIL")
+        bad = bad + 1
+    }
+    let keys: list[str] = m.keys()
+    if keys.len() != 2 {
+        println("MAP-KEYS-LEN " + keys.len().to_str())
+        bad = bad + 1
+    }
+
+    let lst: list[str] = ["one", "two", "one"]
+    if lst.get(0) != "one" || lst.get(2) != "one" || lst.len() != 3 {
+        println("LIST-LIT-FAIL")
+        bad = bad + 1
+    }
+
+    # 4. literal through function boundaries, clone, slice, trim
+    if work("mid") != "[mid]-tail" {
+        println("WORK-FAIL")
+        bad = bad + 1
+    }
+    let c: str = "  padded  "
+    if c.trim() != "padded" {
+        println("TRIM-FAIL")
+        bad = bad + 1
+    }
+    let sliced: str = "abcdefgh".slice(2, 5)
+    if sliced != "cde" {
+        println("SLICE-FAIL")
+        bad = bad + 1
+    }
+    let cl: str = clone("cloneme")
+    if cl != "cloneme" || cl.len() != 7 {
+        println("CLONE-FAIL")
+        bad = bad + 1
+    }
+
+    # 5. a literal across a task boundary (spawn captures + channel)
+    let ch: Chan[str] = chan_new()
+    spawn(send_literal, clone(ch), "spawn-literal")
+    let recv: str = ch.recv()
+    if recv != "spawn-literal" {
+        println("SPAWN-RECV-FAIL: " + recv)
+        bad = bad + 1
+    }
+
+    # 6. many literal retain/release cycles: the sentinel must keep
+    # this allocation-free (an RSS watcher would catch a leak; here we
+    # just check correctness survives the churn)
+    let mut i: int = 0
+    let acc: list[str] = []
+    while i < 20000 {
+        acc.push("constant-literal")
+        if acc.len() > 100 {
+            acc.pop()
+        }
+        i = i + 1
+    }
+    if acc.len() != 100 {
+        println("CHURN-LEN " + acc.len().to_str())
+        bad = bad + 1
+    }
+    if acc.get(0) != "constant-literal" {
+        println("CHURN-VAL-FAIL")
+        bad = bad + 1
+    }
+
+    # 7. literal in a Result, matched out
+    let r: Result[int, str] = Result.Ok(5)
+    let e: Result[int, str] = Result.Err("literal-error")
+    let rs: str = match r {
+        Result.Ok(v) => "ok" + v.to_str(),
+        Result.Err(m) => "err:" + m
+    }
+    let es: str = match e {
+        Result.Ok(v) => "ok" + v.to_str(),
+        Result.Err(m) => "err:" + m
+    }
+    if rs != "ok5" || es != "err:literal-error" {
+        println("RESULT-FAIL " + rs + " / " + es)
+        bad = bad + 1
+    }
+
+    if bad == 0 {
+        println("ALL-PROBES-PASS")
+    }
+    return bad
+}

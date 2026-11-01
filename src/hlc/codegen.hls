@@ -195,8 +195,13 @@ fn c_mangled_fn_name(key: str, tps: list[str], targs: list[str]) -> str {
     return out
 }
 
-fn c_str_lit(s: str) -> str {
-    let mut out: str = "hl_cstr(\""
+# c_str_lit_body(s) — the escaped C string-literal body (opening and
+# closing quotes included) for an HLS string value. The escape ladder is
+# the one the old hl_cstr()-wrapping form used: quotes and backslashes
+# escaped, newline/tab as their C escapes, printable ASCII verbatim and
+# everything else as three-digit octal.
+fn c_str_lit_body(s: str) -> str {
+    let mut out: str = "\""
     let mut i: int = 0
     while i < s.len() {
         let b: int = s.byte_at(i)
@@ -219,14 +224,50 @@ fn c_str_lit(s: str) -> str {
         }
         i = i + 1
     }
-    return out + "\")"
+    return out + "\""
+}
+
+# c_str_lit_ref(ctx, s) — an interned reference to an HLS string
+# literal. The first time a value is seen it is registered in the pool
+# as a static read-only hl_str whose refcnt is the HL_RC_IMMORTAL
+# sentinel; every use site (this one included) takes its address, so
+# the value costs one static object per DISTINCT literal instead of a
+# malloc + strlen + memcpy + free on every evaluation. The sentinel
+# makes retain and release no-ops on the object, which is what lets a
+# literal cross ownership paths unchanged: every +1/-1 the old fresh
+# literal balanced is still balanced, now as a no-op. Two equal
+# literals also share one object, so content equality subsumes pointer
+# equality. Declarations are emitted by gen_program (ctx.lit_decls)
+# after the runtime prelude, before the first use.
+#
+# The object is const-qualified and the reference carries the cast
+# back to hl_str*. Nothing ever writes a literal (that is what the
+# sentinel guarantees), so the const is the truth about the object —
+# and it is load-bearing for the C compiler: without it, the address
+# of five thousand mutable statics escaping through every call site
+# sends GCC's strict-aliasing points-to analysis into a superlinear
+# blowup (a 2.8 MB emission went from ~20 s to 6+ minutes of cc -O2;
+# with const it compiles FASTER than the hl_cstr form, because the
+# objects leave the mutable-memory graph entirely). The cast is
+# explicit at every use site, so -Wdiscarded-qualifiers stays quiet.
+fn c_str_lit_ref(ctx: Ctx, s: str) -> str {
+    let known: str = ctx.lit_pool.get_or(s, "")
+    if known != "" {
+        return "(hl_str*)&" + known
+    }
+    ctx.lit_n = ctx.lit_n + 1
+    let name: str = "HLC_LIT_" + ctx.lit_n.to_str()
+    ctx.lit_pool.set(s, name)
+    ctx.lit_decls.push("static const hl_str " + name + " = { HL_RC_IMMORTAL, "
+    + s.len().to_str() + "L, " + c_str_lit_body(s) + " };")
+    return "(hl_str*)&" + name
 }
 
 # c_path_lit(s) — Stage 96: a file path as a plain C string literal
 # (WITH the surrounding quotes), for the `#line <n> "<file>"`
-# directives --debug emits. c_str_lit above is the HL run-time form
-# (hl_cstr("...")); the preprocessor wants the bare literal. The
-# escaping mirrors c_str_lit exactly: quotes and backslashes escaped,
+# directives --debug emits. c_str_lit_body above is the escaping the
+# run-time literal form shares; the preprocessor wants the bare literal. The
+# escaping mirrors it exactly: quotes and backslashes escaped,
 # the control characters as octal — a path through them is not a path
 # this compiler accepts anyway, and the directive stays one line.
 fn c_path_lit(s: str) -> str {
