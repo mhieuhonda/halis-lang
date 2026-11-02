@@ -665,7 +665,8 @@ fn main() -> int uses IO {
 
 The two implementations (the reference interpreter `boot/` and the
 self-hosted compiler `src/hlc.hls`) must produce **identical output** on the
-same program (differential testing — see `tests/run_tests.sh`). The only
+same program (differential testing — see the suite gates under
+`tests/acc/`, driven by `tests/run_tests.sh`). The only
 allowed difference: panic messages on Stage-0 include the line location, the
 native version does not (debug info: Stage 11).
 
@@ -682,8 +683,8 @@ arena model**. It shipped in two steps:
   generated C runtime is now reference-counted, and the codegen performs
   a static **ownership analysis pass** that inserts exact
   retain/release/free at compile time. A memory-stress program now runs
-  with a completely flat RSS (verified by `tests/run_tests.sh` section
-  3b under a 256 MB address-space limit) and `clone()` supports every
+  with a completely flat RSS (verified by the boot suite gate's
+  memory-stress section under a 256 MB address-space limit) and `clone()` supports every
   owned type.
 
 This follows the ROADMAP's explicitly sanctioned downgrade path
@@ -865,7 +866,8 @@ b.inner.nums.push(99)              # only b changes
 
 The v0.4.0-alpha limitation table is now resolved in full: clone covers
 all owned types, `drop` reclaims at runtime, and the exact-free
-requirement is enforced by `tests/run_tests.sh` section 3b.
+requirement is enforced by the boot suite gate's memory-stress
+section (the `suite_01_boot` acceptance gate).
 
 ---
 
@@ -6303,7 +6305,8 @@ binary or `pip install z3-solver`):
   `cc -O2 -Werror`, byte for byte;
 - **the tools** — hlfmt stable, hllint clean.
 
-The suite keeps the two-tier smoke block in `tests/suites/`: the
+The suite keeps the two-tier smoke block (the `suite_02_differential`
+gate): the
 `--shapes` run must be clean with or without a solver installed, and
 wherever a decider exists the proven/refusal lines must appear.
 

@@ -1,0 +1,909 @@
+# ============================================================================
+# tests/acc/suite_06_advanced_acceptance.hls — the advanced suite, in Halis.
+# ----------------------------------------------------------------------------
+# The Halis twin of the old tests/suites/suite_06_advanced.sh (a sourced
+# fragment of the original run_tests.sh): same sections, same tools, same
+# needles — the harness is tests/acc/harness.hls and the gate runs native,
+# built by bin/hlc.
+#
+# The old suite shared the bash $TMP and the ok()/bad() counters; this gate
+# is standalone: every probe lives under tests/.acc-scratch/suite_06_advanced/
+# (wiped fresh by acc_new) and check() counts automatically. The native
+# compiler the suite chains through (the old $TMP/hlc1) is rebuilt here when
+# the legs need it; the fail-program globs walk tests/fail via the sorted
+# fs_read_dir builtin, exactly like the bash glob.
+#
+#  14. Stage 28 stack     — #[no_red_zone]/#[irq_handler]/#[stack_size(N)]
+#                            attributes, the freestanding irq compile, the
+#                            checker legs, the stack-acceptance gate
+#  15. Stage 29 inline    — #[inline(always/never)]/#[hot]/#[cold], --opt
+#                            -stats, the LTO inline laws, hllint L011
+#  16. Stage 30 escape    — typed frame arrays, the auto analysis, the 13
+#                            fail_stack_* rejections on both compilers, the
+#                            zero-heap fibonacci + malloc interposer
+#  17. Stage 31 tail call — the feature matrix, the goto transform, the
+#                            1 MB-stack law, the Python trampoline, the
+#                            fail_tail_call_* corpus, hllint L012
+#  16. Stage 26 riscv     — RVV intrinsics + guard + x86 fallback, the
+#                            hlcross/hlriscv surfaces, the bare-metal gate
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+
+# ----------------------------------------------------------------------------
+# The shared native-compiler build (the old $TMP/hlc1): Stage-0 interprets
+# the compiler source over itself, gcc links the result. Every leg that
+# needs a native hlc goes through this; the second caller reuses the path.
+# The Stage-0 C emission (the old $TMP/hlc_nat.c) doubles as the bootstrap
+# determinism reference the later sections diff against.
+# ----------------------------------------------------------------------------
+
+fn hlc1_path(acc: Acc) -> str uses Proc {
+    return scratch(acc, "hlc1")
+}
+
+fn hlc_nat_c(acc: Acc) -> str uses Proc {
+    return scratch(acc, "hlc_nat.c")
+}
+
+fn build_hlc1(acc: Acc, name: str) -> str uses IO, Fs, Proc {
+    let hlc1: str = hlc1_path(acc)
+    if file_exists(hlc1) {
+        return hlc1
+    }
+    println("  [..] building the native compiler (" + name + ")")
+    let s1: str = hlc_nat_c(acc)
+    let r: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "src/hlc.hls", "src/hlc.hls", s1])
+    if r.code != 0 {
+        return ""
+    }
+    if run_capture("gcc", ["-O2", "-o", hlc1, s1, "-lm", "-pthread"]).code != 0 {
+        return ""
+    }
+    return hlc1
+}
+
+# boot_self(acc, out_c, extra) — one Stage-0 self-compile of src/hlc.hls
+# (the bootstrap-determinism legs run it twice and byte-compare).
+fn boot_self(acc: Acc, out_c: str, extra: list[str]) -> RunResult uses Proc {
+    let argv: list[str] = ["tools/hlinterp/boot.py", "src/hlc.hls", "src/hlc.hls", out_c]
+    let mut i: int = 0
+    while i < extra.len() {
+        argv.push(extra.get(i))
+        i = i + 1
+    }
+    return run_capture("python3", argv)
+}
+
+# gcc_build(c_src, bin_out) — the hosted link recipe every suite leg uses.
+fn gcc_build(c_src: str, bin_out: str) -> bool uses Proc {
+    return run_capture("gcc",
+        ["-O2", "-o", bin_out, c_src, "-lm", "-pthread"]).code == 0
+}
+
+# c_has / c_has_E — grep -q and grep -qE via the grep binary.
+fn c_has(path: str, needle: str) -> bool uses Proc {
+    return run_capture("grep", ["-q", needle, path]).code == 0
+}
+
+fn c_has_e(path: str, pattern: str) -> bool uses Proc {
+    return run_capture("grep", ["-qE", pattern, path]).code == 0
+}
+
+# file_contains(path, needle) — grep without spawning (small text files).
+fn file_contains(path: str, needle: str) -> bool uses Fs {
+    return read_file(path).contains(needle)
+}
+
+# parse_uint(s) — the digits of s as an int (0 when none).
+fn parse_uint(s: str) -> int {
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c >= 48 && c <= 57 {
+            v = v * 10 + (c - 48)
+        }
+        i = i + 1
+    }
+    return v
+}
+
+# count_matching_lines(path, pattern) — grep -c on a file via the binary.
+fn count_matching_lines(path: str, pattern: str) -> int uses Proc {
+    let r: RunResult = run_capture("grep", ["-c", pattern, path])
+    if r.code != 0 {
+        return 0
+    }
+    return parse_uint(first_line(r.out))
+}
+
+# has_exact_line(text, line) — the `grep -q "^line$"` idiom.
+fn has_exact_line(text: str, line: str) -> bool {
+    let lines: list[str] = text.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i) == line {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# line_pair(text, a, b) — the `grep -qE "a.*b"` idiom, line-scoped.
+fn line_pair(text: str, a: str, b: str) -> bool {
+    let lines: list[str] = text.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).contains(a) && lines.get(i).contains(b) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# extract_body(text, marker, anchored) — the awk `/marker/,/^}/` range:
+# from the first line matching marker (at the start when anchored) through
+# the first line that begins with `}`.
+fn extract_body(text: str, marker: str, anchored: bool) -> str {
+    let lines: list[str] = text.split("\n")
+    let mut out: str = ""
+    let mut grabbing: bool = false
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i)
+        if grabbing {
+            out = out + line + "\n"
+            if line.starts_with("}") {
+                return out
+            }
+        } else {
+            let mut hit: bool = line.contains(marker)
+            if anchored {
+                hit = line.starts_with(marker)
+            }
+            if hit {
+                grabbing = true
+                out = out + line + "\n"
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# body_count(text, marker, anchored, needle) — the awk|grep -c idiom.
+fn body_count(text: str, marker: str, anchored: bool, needle: str) -> int {
+    return grep_count(extract_body(text, marker, anchored), needle)
+}
+
+# glob_hls(dir, prefix) — the bash `for f in dir/prefix*.hls` glob: the
+# fs_read_dir builtin returns the sorted entry names.
+fn glob_hls(dir: str, prefix: str) -> list[str] uses Fs {
+    let names: list[str] = fs_read_dir(dir)
+    let mut out: list[str] = []
+    let mut i: int = 0
+    while i < names.len() {
+        if names.get(i).starts_with(prefix) && names.get(i).ends_with(".hls") {
+            out.push(path_join3(dir, names.get(i)))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# parse_uint + count_lines are re-exported above; tail_lines feeds details.
+fn tail_lines(text: str, n: int) -> str {
+    let lines: list[str] = text.split("\n")
+    let mut out: str = ""
+    let mut start: int = lines.len() - n
+    if start < 0 {
+        start = 0
+    }
+    let mut i: int = start
+    while i < lines.len() {
+        if lines.get(i).trim() != "" {
+            out = out + lines.get(i).trim() + " | "
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# l011_body() — the 51 doubled statements the old printf loop appended.
+fn l011_body() -> str {
+    let mut body: str = ""
+    let mut n: int = 0
+    while n < 51 {
+        body = body + "  s = s + i\n  i = i + 1\n"
+        n = n + 1
+    }
+    return body
+}
+
+# after_prefix(text, prefix) — everything after the first prefix ("" when
+# the prefix is absent); the grep -o | cut -d= -f2 idiom.
+fn after_prefix(text: str, prefix: str) -> str {
+    let at: int = text.find(prefix)
+    if at < 0 {
+        return ""
+    }
+    return text.slice(at + prefix.len(), text.len())
+}
+
+# ----------------------------------------------------------------------------
+# 14. Stage 28: stack-frame layout control (kernel code)
+# ----------------------------------------------------------------------------
+
+fn section_stack(acc: Acc) -> void uses IO, Fs, Proc {
+    section("14. Stage 28: stack-frame layout control (kernel code)")
+
+    # (a) the example file parses with all three attributes (via boot).
+    let a: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "examples/kernel_irq_demo.hls"])
+    check(acc, "stack: examples/kernel_irq_demo.hls parses via boot",
+          a.code == 0, "stack: examples/kernel_irq_demo.hls failed to parse via boot")
+
+    # (b) hlc compiles it to a C source with __attribute__((interrupt)),
+    # (c) which compiles under freestanding flags.
+    let hlc1: str = build_hlc1(acc, "Stage 28 section")
+    let irq_c: str = scratch(acc, "kernel_irq.c")
+    let b: RunResult = run_capture(hlc1, ["examples/kernel_irq_demo.hls", irq_c])
+    if b.code == 0 {
+        check(acc, "stack: C source has __attribute__((interrupt))",
+              c_has(irq_c, "__attribute__((interrupt))"),
+              "stack: __attribute__((interrupt)) missing from C source")
+        let irq_o: str = scratch(acc, "kernel_irq.o")
+        let c: RunResult = run_capture("gcc",
+            ["-O2", "-Wno-attributes", "-ffreestanding", "-mgeneral-regs-only",
+             "-mno-red-zone", "-fno-stack-protector", "-fno-pic", "-c",
+             "-o", irq_o, irq_c])
+        check(acc, "stack: C source compiles under freestanding flags (-ffreestanding -mgeneral-regs-only -mno-red-zone)",
+              c.code == 0, "stack: freestanding compile failed " + clip(c.err, 120))
+    } else {
+        check(acc, "stack: C source has __attribute__((interrupt))",
+              false, "stack: hlc compile failed")
+    }
+
+    # (d) #[stack_size(N)] checker fires on a too-small bound.
+    let stack_fail: str = write_src(acc, "stack_fail.hls",
+        "#[stack_size(8)]\n"
+            + "fn too_big(x: int) -> int {\n"
+            + "    let a: int = x + 1\n"
+            + "    let b: int = a + 2\n"
+            + "    let c: int = b + 3\n"
+            + "    return a + b + c\n"
+            + "}\n"
+            + "\n"
+            + "fn main() -> int {\n"
+            + "    return too_big(10)\n"
+            + "}\n")
+    let d: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "src/hlc.hls", stack_fail, scratch(acc, "stack_fail.c")])
+    check(acc, "stack: #[stack_size(8)] checker fires on too-large frame",
+          d.combined.contains("#[stack_size(8)] violated"),
+          "stack: #[stack_size(N)] checker did NOT fire (got: " + clip(d.combined, 100) + ")")
+
+    # (e) #[irq_handler] checker rejects a non-void return.
+    let irq_bad: str = write_src(acc, "irq_bad.hls",
+        "#[irq_handler]\n"
+            + "fn bad_irq(frame: int) -> int {\n"
+            + "    return 0\n"
+            + "}\n"
+            + "\n"
+            + "fn main() -> int {\n"
+            + "    return 0\n"
+            + "}\n")
+    let e: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "src/hlc.hls", irq_bad, scratch(acc, "irq_bad.c")])
+    check(acc, "stack: #[irq_handler] rejects non-void return",
+          line_pair(e.combined, "irq_handler", "void"),
+          "stack: #[irq_handler] did NOT reject non-void (got: " + clip(e.combined, 100) + ")")
+
+    # (f) make stack-acceptance runs end-to-end.
+    let f: RunResult = run_capture("make", ["stack-acceptance"])
+    check(acc, "stack: make stack-acceptance runs end-to-end",
+          f.code == 0 && f.combined.contains("ACCEPTANCE OK"),
+          clip(tail_lines(f.combined, 10), 120))
+
+    # (g) bootstrap still works after the Stage 28 changes.
+    let g_c: str = scratch(acc, "hlc_s28.c")
+    let g: RunResult = boot_self(acc, g_c, [])
+    check(acc, "stack: bootstrap deterministic with Stage 28 changes",
+          g.code == 0 && run_capture("cmp", ["-s", g_c, hlc_nat_c(acc)]).code == 0,
+          "stack: bootstrap not deterministic with Stage 28 changes")
+}
+
+# ----------------------------------------------------------------------------
+# 15. Stage 29: inline / hot / cold attributes + --opt-stats
+# ----------------------------------------------------------------------------
+
+fn section_inline(acc: Acc) -> void uses IO, Fs, Proc {
+    section("15. Stage 29: inline / hot / cold attributes + --opt-stats")
+
+    # (a) the example file parses with all four attributes (via boot).
+    let a: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "examples/inline_attrs_demo.hls"])
+    check(acc, "inline: examples/inline_attrs_demo.hls parses via boot",
+          a.code == 0, "inline: examples/inline_attrs_demo.hls failed to parse via boot")
+
+    # (b) hlc compiles it to a C source with the right C attributes,
+    # (c) which compiles cleanly with -Wno-attributes and runs.
+    let hlc1: str = build_hlc1(acc, "Stage 29 section")
+    let attrs_c: str = scratch(acc, "inline_attrs.c")
+    let b: RunResult = run_capture(hlc1, ["examples/inline_attrs_demo.hls", attrs_c])
+    if b.code == 0 {
+        check(acc, "inline: C source has all four C attributes (always_inline / noinline / hot / cold)",
+              c_has(attrs_c, "static inline __attribute__((always_inline)) int64_t usf_small_hot_helper")
+                  && c_has(attrs_c, "__attribute__((noinline)) int64_t usf_big_rare_path")
+                  && c_has(attrs_c, "__attribute__((hot)) int64_t usf_hot_loop")
+                  && c_has(attrs_c, "__attribute__((cold)) int64_t usf_cold_path"),
+              "inline: C source missing one or more C attributes")
+        let attrs_bin: str = scratch(acc, "inline_attrs_bin")
+        let c: RunResult = run_capture("gcc",
+            ["-O2", "-Wno-attributes", "-o", attrs_bin, attrs_c, "-lm", "-pthread"])
+        if c.code == 0 {
+            check(acc, "inline: C source compiles cleanly (-Wno-attributes)", true, "")
+            check(acc, "inline: compiled binary runs cleanly",
+                  run_capture(attrs_bin, []).code == 0,
+                  "inline: compiled binary crashed at runtime")
+        } else {
+            check(acc, "inline: C source compiles cleanly (-Wno-attributes)",
+                  false, "inline: C source fails to compile " + clip(c.err, 120))
+        }
+    } else {
+        check(acc, "inline: C source has all four C attributes (always_inline / noinline / hot / cold)",
+              false, "inline: hlc compile failed")
+    }
+
+    # (d) --opt-stats prints the per-function decision table.
+    let os: RunResult = run_capture(hlc1,
+        ["--opt-stats", "examples/inline_attrs_demo.hls", scratch(acc, "inline_optstats.c")])
+    check(acc, "inline: --opt-stats prints inline/hot/cold decisions",
+          os.code == 0 && os.combined.contains("ALWAYS")
+              && os.combined.contains("NEVER") && os.combined.contains("HOT")
+              && os.combined.contains("COLD"),
+          "inline: --opt-stats missing one or more decisions")
+
+    # (e) --lto honours inline(always) and inline(never).
+    let lto_c: str = scratch(acc, "inline_lto.c")
+    let e: RunResult = run_capture(hlc1,
+        ["--lto", "--lto-stats", "examples/inline_attrs_demo.hls", lto_c])
+    if e.code == 0 {
+        check(acc, "inline: --lto inlines small_hot_helper (#[inline(always)])",
+              e.combined.contains("small_hot_helper")
+                  && !c_has(lto_c, "usf_small_hot_helper("),
+              "inline: --lto did not inline small_hot_helper properly")
+        check(acc, "inline: --lto keeps big_rare_path out-of-line (#[inline(never)])",
+              c_has(lto_c, "usf_big_rare_path("),
+              "inline: --lto did NOT keep big_rare_path out-of-line")
+    } else {
+        check(acc, "inline: --lto inlines small_hot_helper (#[inline(always)])",
+              false, "inline: --lto invocation failed")
+    }
+
+    # (f) hllint warns (L011) on #[inline(always)] > 50 statements.
+    let big: str = write_src(acc, "l011_test.hls",
+        "#[inline(always)]\n"
+            + "fn big_inline(n: int) -> int {\n"
+            + "  let mut s: int = 0\n"
+            + "  let mut i: int = 0\n"
+            + l011_body()
+            + "  return s\n"
+            + "}\n"
+            + "\n"
+            + "fn main() -> int {\n"
+            + "  return big_inline(10)\n"
+            + "}\n")
+    let f: RunResult = run_capture("python3",
+        ["tools/hllint.py", "--rule", "L011", big])
+    check(acc, "inline: hllint L011 warns on #[inline(always)] > 50 statements",
+          f.combined.contains("L011"),
+          "inline: hllint L011 did NOT warn on large #[inline(always)]")
+
+    # (g) hllint does NOT warn on #[inline(always)] <= 50 statements.
+    let small: str = write_src(acc, "l011_small.hls",
+        "#[inline(always)]\n"
+            + "fn small_inline(x: int) -> int {\n"
+            + "  return x + 1\n"
+            + "}\n"
+            + "\n"
+            + "fn main() -> int {\n"
+            + "  return small_inline(10)\n"
+            + "}\n")
+    let g: RunResult = run_capture("python3",
+        ["tools/hllint.py", "--rule", "L011", small])
+    check(acc, "inline: hllint L011 does NOT warn on small #[inline(always)]",
+          !g.combined.contains("L011"),
+          "inline: hllint L011 FALSE POSITIVE on small #[inline(always)]")
+
+    # (h) make inline-acceptance runs end-to-end.
+    let h: RunResult = run_capture("make", ["inline-acceptance"])
+    check(acc, "inline: make inline-acceptance runs end-to-end",
+          h.code == 0 && h.combined.contains("ACCEPTANCE OK"),
+          clip(tail_lines(h.combined, 10), 120))
+
+    # (i) bootstrap still works after the Stage 29 changes.
+    let i_c: str = scratch(acc, "hlc_s29.c")
+    let i: RunResult = boot_self(acc, i_c, [])
+    check(acc, "inline: bootstrap deterministic with Stage 29 changes",
+          i.code == 0 && run_capture("cmp", ["-s", i_c, hlc_nat_c(acc)]).code == 0,
+          "inline: bootstrap not deterministic with Stage 29 changes")
+}
+
+# ----------------------------------------------------------------------------
+# 16. Stage 30: boxed-vs-stack layout analysis (escape analysis)
+# ----------------------------------------------------------------------------
+
+fn section_escape(acc: Acc) -> void uses IO, Fs, Proc {
+    section("16. Stage 30: boxed-vs-stack layout analysis (escape analysis)")
+
+    # (a) the demo example runs via the boot interpreter (kept for the
+    # (c) differential).
+    let demo_out: str = scratch(acc, "s30_demo.out")
+    let a: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "examples/stack_layout_demo.hls"])
+    write_file(demo_out, a.out)
+    check(acc, "stage30: examples/stack_layout_demo.hls runs via boot",
+          a.code == 0, "stage30: examples/stack_layout_demo.hls failed via boot")
+
+    # (b) the native hlc compiles it; the C carries the typed frame
+    # arrays + accessors, (c) compiles, and differentials against boot.
+    let hlc1: str = build_hlc1(acc, "Stage 30 section")
+    let demo_c: str = scratch(acc, "s30_demo.c")
+    let b: RunResult = run_capture(hlc1, ["examples/stack_layout_demo.hls", demo_c])
+    if b.code == 0 {
+        check(acc, "stage30: C source has typed frame arrays (#[stack] + auto) + accessors",
+              c_has_e(demo_c, "int64_t u_window\\[[0-9]+\\][[:space:]]*(;|__attribute__)")
+                  && c_has_e(demo_c, "int64_t u_coeffs\\[[0-9]+\\][[:space:]]*(;|__attribute__)")
+                  && c_has(demo_c, "static inline int64_t hlc_sg_i64"),
+              "stage30: C source missing stack arrays / accessors")
+        let demo_bin: str = scratch(acc, "s30_demo_bin")
+        let c: RunResult = run_capture("gcc",
+            ["-O2", "-o", demo_bin, demo_c, "-lm", "-pthread"])
+        if c.code == 0 {
+            let nat_out: str = scratch(acc, "s30_demo_native.out")
+            let nat: RunResult = run_capture(demo_bin, [])
+            write_file(nat_out, nat.out)
+            check(acc, "stage30: differential (interpreter == native) for the demo",
+                  run_capture("cmp", ["-s", demo_out, nat_out]).code == 0,
+                  "stage30: differential mismatch on the demo")
+        } else {
+            check(acc, "stage30: differential (interpreter == native) for the demo",
+                  false, "stage30: C source fails to compile")
+        }
+    } else {
+        check(acc, "stage30: C source has typed frame arrays (#[stack] + auto) + accessors",
+              false, "stage30: hlc compile of the demo failed")
+    }
+
+    # (d) --opt-stats prints the layout decision table.
+    let stats: RunResult = run_capture(hlc1,
+        ["--opt-stats", "examples/stack_layout_demo.hls", scratch(acc, "s30_stats.c")])
+    check(acc, "stage30: --opt-stats prints the per-binding layout decisions",
+          stats.code == 0 && stats.combined.contains("list layout decisions")
+              && stats.combined.contains("stack-allocated list bindings")
+              && stats.combined.contains("fib_stack::window")
+              && stats.combined.contains("#[stack] forced (escape-free)")
+              && stats.combined.contains("escape-free (auto)")
+              && stats.combined.contains("escapes: return value")
+              && stats.combined.contains("#[boxed] forced heap layout"),
+          "stage30: --opt-stats layout section incomplete")
+
+    # (e) the auto mode fires without any attribute.
+    let auto_c: str = scratch(acc, "s30_auto.c")
+    let e: RunResult = run_capture(hlc1, ["tests/ok/feat_stage30_auto.hls", auto_c])
+    check(acc, "stage30: auto analysis (no attributes) picks stack + heap layouts",
+          e.code == 0
+              && c_has_e(auto_c, "int64_t u_coeffs\\[[0-9]+\\][[:space:]]*(;|__attribute__)")
+              && c_has(auto_c, "hl_list* u_xs"),
+          "stage30: hlc compile of feat_stage30_auto.hls failed")
+
+    # (f) the ok-program with #[stack] lowers int/float/bool stack arrays.
+    let ok_c: str = scratch(acc, "s30_ok.c")
+    let f: RunResult = run_capture(hlc1, ["tests/ok/feat_stage30_stack.hls", ok_c])
+    check(acc, "stage30: feat_stage30_stack.hls lowers int/float/bool stack arrays",
+          f.code == 0
+              && c_has_e(ok_c, "int64_t u_window\\[[0-9]+\\][[:space:]]*(;|__attribute__)")
+              && c_has_e(ok_c, "(bool|double) u_bs\\[[0-9]+\\][[:space:]]*(;|__attribute__)")
+              && c_has_e(ok_c, "(bool|double) u_fs\\[[0-9]+\\][[:space:]]*(;|__attribute__)"),
+          "stage30: hlc compile of feat_stage30_stack.hls failed")
+
+    # (g) boot --check AND the native compiler must both reject every
+    # escape class (the fail_stack_* corpus).
+    let corpus: list[str] = glob_hls("tests/fail", "fail_stack_")
+    let mut leaks: int = 0
+    let mut i: int = 0
+    while i < corpus.len() {
+        let bc: RunResult = run_capture("python3",
+            ["tools/hlinterp/boot.py", "--check", corpus.get(i)])
+        if bc.code == 0 {
+            println("  boot --check LEAK: " + corpus.get(i))
+            leaks = leaks + 1
+        }
+        i = i + 1
+    }
+    check(acc, "stage30: boot --check rejects all 13 fail_stack_* programs",
+          leaks == 0, "stage30: boot --check leaked " + leaks.to_str() + " fail_stack_* programs")
+    let mut nleaks: int = 0
+    let mut j: int = 0
+    while j < corpus.len() {
+        let nc: RunResult = run_capture(hlc1,
+            [corpus.get(j), scratch(acc, "s30_leak.c")])
+        if nc.code == 0 {
+            println("  native hlc LEAK: " + corpus.get(j))
+            nleaks = nleaks + 1
+        }
+        j = j + 1
+    }
+    check(acc, "stage30: native hlc rejects all 13 fail_stack_* programs",
+          nleaks == 0, "stage30: native hlc leaked " + nleaks.to_str() + " fail_stack_* programs")
+
+    # (h) the escape error message names the binding, the use class and line.
+    let err_c: str = scratch(acc, "s30_err.c")
+    let h: RunResult = run_capture(hlc1,
+        ["tests/fail/fail_stack_escape_return.hls", err_c])
+    check(acc, "stage30: escape error names binding + use class + the guarantee",
+          h.code != 0 && h.combined.contains("escapes its creating frame")
+              && h.combined.contains("return value")
+              && h.combined.contains("NEVER outlive"),
+          "stage30: escape error message incomplete")
+
+    # (i) the fibonacci acceptance: the #[stack] frame array, zero heap
+    # objects in the acceptance fns, and the malloc interposer count.
+    let fib_c: str = scratch(acc, "s30_fib.c")
+    let i1: RunResult = run_capture(hlc1, ["examples/fibonacci.hls", fib_c])
+    if i1.code == 0 {
+        check(acc, "stage30: fibonacci fib_loop carries the #[stack] frame array",
+              c_has_e(fib_c, "int64_t u_window\\[[0-9]+\\][[:space:]]*(;|__attribute__)"),
+              "stage30: fibonacci missing the #[stack] frame array")
+        let fib_txt: str = read_file(fib_c)
+        let fib_n: int = body_count(fib_txt, "int64_t usf_fib_loop", false, "hl_list_new")
+        let spin_n: int = body_count(fib_txt, "int64_t usf_spin_fib", false, "hl_list_new")
+        check(acc, "stage30: usf_fib_loop / usf_spin_fib contain zero hl_list_new calls",
+              fib_n == 0 && spin_n == 0,
+              "stage30: heap list construction leaked into the acceptance fns")
+    } else {
+        check(acc, "stage30: fibonacci fib_loop carries the #[stack] frame array",
+              false, "stage30: hlc compile of fibonacci.hls failed")
+    }
+    if file_exists(hlc1) {
+        let wrap_bin: str = scratch(acc, "s30_fib_wrap")
+        if run_capture("gcc",
+                ["-O2", "-o", wrap_bin, fib_c, "tests/memcheck/malloc_count_wrap.c",
+                 "-Wl,--wrap=malloc", "-Wl,--wrap=realloc", "-lm", "-pthread"]).code == 0 {
+            let wrap: RunResult = run_capture(wrap_bin, [])
+            let mc: int = parse_uint(after_prefix(wrap.err, "HL_MALLOC_COUNT="))
+            check(acc, "stage30: malloc interposer: " + mc.to_str()
+                        + " allocations across 20k inner-loop rounds (constant)",
+                  after_prefix(wrap.err, "HL_MALLOC_COUNT=") != "" && mc <= 128,
+                  "stage30: malloc interposer count too high: "
+                      + after_prefix(wrap.err, "HL_MALLOC_COUNT="))
+        } else {
+            check(acc, "stage30: malloc interposer: 0 allocations across 20k inner-loop rounds (constant)",
+                  false, "stage30: interposer build failed")
+        }
+    }
+
+    # (j) make escape-acceptance runs end-to-end.
+    let jj: RunResult = run_capture("make", ["escape-acceptance"])
+    check(acc, "stage30: make escape-acceptance runs end-to-end",
+          jj.code == 0 && jj.combined.contains("ACCEPTANCE OK: Stage 30"),
+          clip(tail_lines(jj.combined, 10), 120))
+
+    # (k) bootstrap still deterministic with the Stage 30 changes.
+    let k_c: str = scratch(acc, "hlc_s30.c")
+    let k: RunResult = boot_self(acc, k_c, [])
+    check(acc, "stage30: bootstrap deterministic with Stage 30 changes",
+          k.code == 0 && run_capture("cmp", ["-s", k_c, hlc_nat_c(acc)]).code == 0,
+          "stage30: bootstrap not deterministic with Stage 30 changes")
+}
+
+# ----------------------------------------------------------------------------
+# 17. Stage 31: verified tail calls (#[tail_call])
+# ----------------------------------------------------------------------------
+
+fn section_tail(acc: Acc) -> void uses IO, Fs, Proc {
+    section("17. Stage 31: verified tail calls (#[tail_call])")
+
+    # (a) the feature matrix runs via the interpreter (fast depths).
+    let s31: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "tests/ok/feat_stage31_tail.hls"])
+    check(acc, "stage31: feature matrix (fib / collatz / float / bool / while / panic-literal) via boot",
+          s31.code == 0 && s31.combined.contains("fib_tail(10000) = 271496360")
+              && s31.combined.contains("collatz_steps(27) = 111")
+              && s31.combined.contains("sum_tail(50000, 0) = 1250175003"),
+          "stage31: feature matrix produced wrong values")
+
+    # (b) the C source has the loop label + the rebind goto and ZERO
+    # recursive calls in usf_fib_tail (a jmp, not a call).
+    let hlc1: str = build_hlc1(acc, "Stage 31 section")
+    let s31_c: str = scratch(acc, "s31.c")
+    let b: RunResult = run_capture(hlc1, ["tests/ok/feat_stage31_tail.hls", s31_c])
+    if b.code == 0 {
+        let c_txt: str = read_file(s31_c)
+        check(acc, "stage31: C source lowers the tail call to a parameter-rebinding goto",
+              has_exact_line(c_txt, "hl_tail_restart:;")
+                  && c_txt.contains("goto hl_tail_restart;")
+                  && body_count(c_txt, "int64_t usf_fib_tail(int64_t u_n_p", true,
+                                "usf_fib_tail(") <= 1,
+              "stage31: the tail-call transform is missing from the C source")
+    } else {
+        check(acc, "stage31: C source lowers the tail call to a parameter-rebinding goto",
+              false, "stage31: native hlc failed to compile the feature matrix")
+    }
+
+    # (c) native + differential: the tail test's outputs match the
+    # interpreter's byte for byte.
+    let s31b_c: str = scratch(acc, "s31b.c")
+    let s31_bin: str = scratch(acc, "s31.bin")
+    let nat_ok: bool = hlc1 != ""
+        && run_capture(hlc1, ["tests/ok/feat_stage31_tail.hls", s31b_c]).code == 0
+        && gcc_build(s31b_c, s31_bin)
+    if nat_ok {
+        let nat: RunResult = run_capture(s31_bin, [])
+        check(acc, "stage31: differential (native tail loop == interpreter trampoline)",
+              nat.out.trim() == s31.combined.trim(),
+              "stage31: differential mismatch " + clip(nat.out, 80))
+    } else {
+        check(acc, "stage31: differential (native tail loop == interpreter trampoline)",
+              false, "stage31: differential mismatch (compile failed)")
+    }
+
+    # (d) constant stack: the native binary runs 1M-deep under a 1 MB stack.
+    check(acc, "stage31: native tail recursion under ulimit -s 1024 (1 MB stack)",
+          nat_ok && sh("ulimit -s 1024; '"
+              + shell_quote(s31_bin) + "' >/dev/null 2>&1") == 0,
+          "stage31: native binary blew the 1 MB stack limit")
+
+    # (e) the interpreter trampoline runs deep with zero Python recursion.
+    let tramp: str = write_src(acc, "s31_trampoline.py",
+        "import sys\n"
+            + "sys.path.insert(0, \".\")\n"
+            + "sys.setrecursionlimit(200)  # a 100k tail depth must NOT need Python frames\n"
+            + "from tools.hlinterp.boot import load_program\n"
+            + "from tools.hlinterp.checker import check\n"
+            + "from tools.hlinterp.interp import Interp\n"
+            + "import io\n"
+            + "prog = load_program(\"tests/ok/feat_stage31_tail.hls\")\n"
+            + "check(prog)\n"
+            + "interp = Interp(prog, [b\"tests/ok/feat_stage31_tail.hls\"], io.BytesIO())\n"
+            + "r = interp.call_fn(\"fib_tail\", [100000, 0, 1])\n"
+            + "assert r == 911435502, r\n"
+            + "print(\"trampoline ok at depth 100000 with recursionlimit 200\")\n")
+    let e: RunResult = run_capture("python3", [tramp])
+    check(acc, "stage31: interpreter trampoline, 100k deep under recursionlimit 200",
+          e.code == 0, "stage31: interpreter trampoline failed (RecursionError?)")
+
+    # (f) the verifier rejects every fail_tail_call_* program (boot +
+    # native, corpus counted dynamically).
+    let corpus: list[str] = glob_hls("tests/fail", "fail_tail_call_")
+    let total: int = corpus.len()
+    let mut bfail: int = 0
+    let mut i: int = 0
+    while i < corpus.len() {
+        let bc: RunResult = run_capture("python3",
+            ["tools/hlinterp/boot.py", "--check", corpus.get(i)])
+        if bc.code == 0 {
+            fail_msg(acc, "stage31: " + basename(corpus.get(i))
+                + " was NOT rejected by the boot checker")
+        } else {
+            bfail = bfail + 1
+        }
+        i = i + 1
+    }
+    if bfail == total && total > 0 {
+        if file_exists(hlc1) {
+            let mut nfail: int = 0
+            let mut j: int = 0
+            while j < corpus.len() {
+                let nc: RunResult = run_capture(hlc1,
+                    [corpus.get(j), scratch(acc, "s31f.c")])
+                if nc.code == 0 {
+                    fail_msg(acc, "stage31: " + basename(corpus.get(j))
+                        + " was NOT rejected by the native compiler")
+                } else {
+                    nfail = nfail + 1
+                }
+                j = j + 1
+            }
+            if nfail == total {
+                pass_msg(acc, "stage31: all " + total.to_str()
+                    + " fail_tail_call_* programs rejected (boot + native)")
+            }
+        } else {
+            pass_msg(acc, "stage31: all " + total.to_str()
+                + " fail_tail_call_* programs rejected by the boot checker")
+        }
+    }
+
+    # (g) --opt-stats prints the verified tail-call decisions.
+    let g: RunResult = run_capture(hlc1,
+        ["--opt-stats", "examples/fibonacci.hls", scratch(acc, "s31os.c")])
+    check(acc, "stage31: --opt-stats prints the verified tail-call table",
+          g.code == 0 && g.combined.contains("verified tail calls (Stage 31)"),
+          "stage31: --opt-stats missing the tail-call table")
+
+    # (h) hllint L012 fires on a large #[tail_call] fn and not on small ones.
+    let h: RunResult = run_capture("python3",
+        ["tools/hllint.py", "tests/ok/feat_stage31_tail.hls"])
+    check(acc, "stage31: hllint L012 silent on small #[tail_call] functions",
+          grep_count(h.combined, "L012") == 0,
+          "stage31: hllint L012 false positive on small functions")
+
+    # (i) make tail-acceptance runs end-to-end.
+    let i2: RunResult = run_capture("make", ["tail-acceptance"])
+    check(acc, "stage31: make tail-acceptance runs end-to-end",
+          i2.code == 0 && i2.combined.contains("ACCEPTANCE OK"),
+          clip(tail_lines(i2.combined, 10), 120))
+}
+
+# ----------------------------------------------------------------------------
+# 16. Stage 26: RISC-V 64 backend (RVV + bare-metal)
+# ----------------------------------------------------------------------------
+
+fn section_riscv(acc: Acc) -> void uses IO, Fs, Proc {
+    section("16. Stage 26: RISC-V 64 backend (RVV + bare-metal)")
+
+    # (a)-(d) the Stage-0 compiler emits RVV intrinsics under
+    # --target-feature rvv; the C still compiles + runs on x86_64.
+    let rvv_c: str = scratch(acc, "riscv_rvv.c")
+    let a: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "src/hlc.hls", "examples/riscv_demo.hls",
+         rvv_c, "--target-feature", "rvv"])
+    if a.code == 0 {
+        let rvv_count: int = count_matching_lines(rvv_c,
+            "__riscv_vadd_vv_i32m1\\|__riscv_vsub_vv_i32m1\\|__riscv_vmul_vv_i32m1\\|__riscv_vmin_vv_i32m1\\|__riscv_vmax_vv_i32m1")
+        check(acc, "riscv: --target-feature rvv emits RVV intrinsics (" + rvv_count.to_str() + " sites)",
+              rvv_count > 0,
+              "riscv: --target-feature rvv did not emit any RVV intrinsics")
+        check(acc, "riscv: --target-feature rvv includes <riscv_vector.h>",
+              c_has(rvv_c, "<riscv_vector.h>"),
+              "riscv: <riscv_vector.h> not included in RVV C source")
+        check(acc, "riscv: C source has __riscv && __riscv_v guard",
+              c_has(rvv_c, "defined(__riscv) && defined(__riscv_v)")
+                  || c_has(rvv_c, "defined(__riscv_v)"),
+              "riscv: missing __riscv/__riscv_v guard")
+        let x86_bin: str = scratch(acc, "riscv_rvv_x86")
+        if run_capture("gcc",
+                ["-O2", "-o", x86_bin, rvv_c, "-lm", "-pthread"]).code == 0 {
+            check(acc, "riscv: RVV C source compiles + runs on x86_64 (scalar fallback)",
+                  run_capture(x86_bin, []).code == 0,
+                  "riscv: RVV C source compiles on x86_64 but doesn't run cleanly")
+        } else {
+            check(acc, "riscv: RVV C source compiles + runs on x86_64 (scalar fallback)",
+                  false, "riscv: RVV C source fails to compile on x86_64")
+        }
+    } else {
+        check(acc, "riscv: --target-feature rvv emits RVV intrinsics (0 sites)",
+              false, "riscv: --target-feature rvv compile failed")
+    }
+
+    # (e) hlcross --list-targets prints the RISC-V target set.
+    let list_out: str = run_capture("python3", ["tools/hlcross.py", "--list-targets"]).combined
+    check(acc, "riscv: hlcross --list-targets includes RISC-V targets",
+          list_out.contains("riscv64gc-unknown-linux-gnu")
+              && list_out.contains("riscv64-unknown-none"),
+          "riscv: hlcross --list-targets missing RISC-V targets")
+
+    # (f) hlcross accepts the riscv64 alias.
+    let f: RunResult = run_capture("python3",
+        ["tools/hlcross.py", "examples/hello.hls", scratch(acc, "riscv_alias"),
+         "--target", "riscv64", "--keep-c", scratch(acc, "riscv_alias.c")])
+    check(acc, "riscv: hlcross accepts the 'riscv64' alias",
+          f.combined.contains("no cross-linker found")
+              || f.combined.contains("ELF riscv64"),
+          "riscv: hlcross did not accept the 'riscv64' alias")
+
+    # (g) the hlriscv.py helper exists and has a main().
+    let g: RunResult = run_capture("python3",
+        ["-c", "import sys; sys.path.insert(0, 'tools'); import hlriscv; assert hasattr(hlriscv, 'main'); print('OK')"])
+    check(acc, "riscv: tools/hlriscv.py imports and has main()",
+          g.combined.contains("OK"), "riscv: tools/hlriscv.py import failed")
+
+    # (h) hlriscv --list-targets prints the RVV target + bare-metal info.
+    let h: RunResult = run_capture("python3", ["tools/hlriscv.py", "--list-targets"])
+    check(acc, "riscv: hlriscv --list-targets prints RVV feature + bare-metal target",
+          h.combined.contains("rvv") && h.combined.contains("riscv64-unknown-none"),
+          "riscv: hlriscv --list-targets missing RVV or bare-metal")
+
+    # (i) hlriscv compiles simd_bench.hls with RVV (exit 0 or SKIP 3 —
+    # the C source is written either way).
+    let bench_c: str = scratch(acc, "riscv_bench.c")
+    let i: RunResult = run_capture("python3",
+        ["tools/hlriscv.py", "benchmarks/simd_bench.hls",
+         scratch(acc, "riscv_bench"), "--target", "riscv64gc-unknown-linux-gnu",
+         "--target-feature", "rvv", "--keep-c", bench_c])
+    if i.code == 0 || i.code == 3 {
+        check(acc, "riscv: hlriscv produces C source with RVV intrinsics + riscv_vector.h",
+              (c_has(bench_c, "__riscv_vadd_vv_i32m1")
+                  || c_has(bench_c, "__riscv_vsub_vv_i32m1")
+                  || c_has(bench_c, "__riscv_vmul_vv_i32m1"))
+                  && c_has(bench_c, "<riscv_vector.h>"),
+              "riscv: hlriscv C source missing RVV intrinsics")
+    } else {
+        check(acc, "riscv: hlriscv produces C source with RVV intrinsics + riscv_vector.h",
+              false, "riscv: hlriscv compile failed unexpectedly " + clip(i.combined, 120))
+    }
+
+    # (j)/(k) the RVV codegen gate and the zero-libc gate.
+    let j: RunResult = run_capture("make", ["riscv-acceptance"])
+    check(acc, "riscv: make riscv-acceptance runs end-to-end",
+          j.code == 0 && j.combined.contains("ACCEPTANCE OK"),
+          clip(tail_lines(j.combined, 10), 120))
+    let k: RunResult = run_capture("make", ["riscv-bare-acceptance"])
+    check(acc, "riscv: make riscv-bare-acceptance runs end-to-end",
+          k.code == 0 && k.combined.contains("ACCEPTANCE OK"),
+          clip(tail_lines(k.combined, 10), 120))
+
+    # (l) the feature test runs on the portable path AND with rvv.
+    let l1: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "tests/ok/feat_stage26_riscv.hls"])
+    check(acc, "riscv: feat_stage26_riscv.hls runs on portable path",
+          l1.code == 0 && l1.combined.contains("ACCEPTANCE OK"),
+          clip(tail_lines(l1.combined, 5), 120))
+    let l2: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "--target-feature", "rvv",
+         "tests/ok/feat_stage26_riscv.hls"])
+    check(acc, "riscv: feat_stage26_riscv.hls runs with --target-feature rvv (has_feature(rvv)=true)",
+          l2.code == 0 && l2.combined.contains("has_feature(\"rvv\"): true")
+              && l2.combined.contains("ACCEPTANCE OK"),
+          clip(tail_lines(l2.combined, 5), 120))
+
+    # (m) bootstrap still deterministic with the RVV changes.
+    let m1_c: str = scratch(acc, "hlc_rvv.c")
+    let m2_c: str = scratch(acc, "hlc_rvv2.c")
+    let m1: RunResult = boot_self(acc, m1_c, [])
+    let m2: RunResult = boot_self(acc, m2_c, ["--target-feature", "rvv"])
+    check(acc, "riscv: bootstrap deterministic with --target-feature rvv",
+          m1.code == 0 && m2.code == 0
+              && run_capture("cmp", ["-s", m1_c, m2_c]).code == 0,
+          "riscv: bootstrap not deterministic with --target-feature rvv")
+
+    # (n) has_feature("rvv") const-folds correctly under the native
+    # compiler (the C text, or the runtime print as the fallback).
+    let hlc1: str = build_hlc1(acc, "riscv section")
+    let n_c: str = scratch(acc, "s26_native.c")
+    let n: RunResult = run_capture(hlc1,
+        ["--target-feature", "rvv", "tests/ok/feat_stage26_riscv.hls", n_c])
+    if n.code == 0 {
+        let in_c: bool = c_has(n_c, "has_feature(\"rvv\"): true")
+            || c_has_e(n_c, "has_feature(.rvv.): true")
+        if in_c {
+            check(acc, "riscv: native has_feature(\"rvv\") const-folds to true under --target-feature rvv",
+                  true, "")
+        } else {
+            let n_bin: str = scratch(acc, "s26_native_bin")
+            if gcc_build(n_c, n_bin) {
+                let nat: RunResult = run_capture(n_bin, [])
+                check(acc, "riscv: native has_feature(\"rvv\") const-folds to true under --target-feature rvv",
+                      nat.combined.contains("has_feature(\"rvv\"): true"),
+                      "riscv: native has_feature(\"rvv\") did not const-fold to true")
+            } else {
+                check(acc, "riscv: native has_feature(\"rvv\") const-folds to true under --target-feature rvv",
+                      false, "riscv: native C source fails to compile on x86_64")
+            }
+        }
+    } else {
+        check(acc, "riscv: native has_feature(\"rvv\") const-folds to true under --target-feature rvv",
+              false, "riscv: native --target-feature rvv compile failed")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Fs, Proc, Exit {
+    let acc: Acc = acc_new("suite_06_advanced")
+    section_stack(acc)
+    section_inline(acc)
+    section_escape(acc)
+    section_tail(acc)
+    section_riscv(acc)
+    return finish(acc, "suite 06 -- advanced (stack, inline, escape, tail, riscv)")
+}

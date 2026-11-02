@@ -1,29 +1,29 @@
 #!/usr/bin/env bash
-# run_one_suite.sh — run a single suite file with the shared harness
-# Usage: bash tests/run_one_suite.sh tests/suites/suite_07_asm.sh
+# run_one_suite.sh — run a single suite gate with the shared build law.
+# Usage: bash tests/run_one_suite.sh suite_07_asm
+#        bash tests/run_one_suite.sh tests/suites/suite_07_asm.sh  (legacy path)
+#
+# The suites are Halis gates now (tests/acc/suite_XX_*_acceptance.hls);
+# this runner accepts the old suite name or path, maps it to the gate,
+# builds it once, and runs it from the repo root.
 set -u
 cd "$(dirname "$0")/.."
-PASS=0
-FAIL=0
-TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT INT TERM HUP
 
-ok()   { PASS=$((PASS+1)); echo "  [PASS] $1"; }
-bad()  { FAIL=$((FAIL+1)); echo "  [FAIL] $1"; }
-
-# Suites 07/08 consume the native compiler binary ($TMP/hlc1) that the
-# full-suite order builds in suite_03. When a suite runs STANDALONE
-# (tests/run_one_suite.sh), build it here — same recipe as suite_02's
-# guard — so the dependent checks don't spuriously fail with
-# "command not found".
-if [ ! -x "$TMP/hlc1" ]; then
-    python3 tools/hlinterp/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_nat.c" >/dev/null 2>&1
-    gcc -O2 -o "$TMP/hlc1" "$TMP/hlc_nat.c" -lm -pthread 2>/dev/null
+arg="${1:-}"
+if [ -z "$arg" ]; then
+    echo "usage: bash tests/run_one_suite.sh <suite-gate|legacy-suite-path>" >&2
+    exit 2
 fi
 
-source "$1"
+gate=$(basename "$arg" .sh)
 
-echo "=========================================="
-echo "SUITE RESULT: $PASS PASS / $FAIL FAIL"
-echo "=========================================="
-[ $FAIL -eq 0 ]
+if [ ! -x "bin/acc-$gate" ]; then
+    make -s "bin/acc-$gate" >/dev/null 2>&1
+fi
+
+if [ ! -x "bin/acc-$gate" ]; then
+    echo "  [FAIL] $gate (gate build failed)"
+    exit 1
+fi
+
+"bin/acc-$gate"

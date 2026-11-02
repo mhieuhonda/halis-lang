@@ -1,36 +1,46 @@
 #!/usr/bin/env bash
 # ============================================================================
-# run_tests.sh — Full test suite for Halis (HLS)
-#  1. Stage-0: run the ok programs (compare to snapshot if present)
-#  2. Stage-0: reject the fail programs (expect compile errors)
-#  3. Self-compile: hlc.hls (via Stage-0) compiles each ok program -> C
-#     -> gcc -> run native -> COMPARE TO INTERPRETER OUTPUT (differential)
-#  3b. Stage 8-beta: native memory-stress — RSS must stay flat under a
-#      256 MB address-space limit (end-of-arena refcounted runtime)
-#  4. Bootstrap: hlc self-compiles twice -> the two C outputs must be identical
+# run_tests.sh — the full suite driver.
+# ----------------------------------------------------------------------------
+# The eight differential suites are Halis gates now (tests/acc/
+# suite_XX_*_acceptance.hls, compiled by bin/hlc): this driver builds
+# each gate once and runs it, letting the gates print their own
+# per-leg [OK]/[FAIL] grammar and keeping the suite exit law — the
+# run is green only when every gate is.
 # ============================================================================
 set -u
 cd "$(dirname "$0")/.."
 PASS=0
 FAIL=0
-TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT INT TERM HUP
 
-ok()   { PASS=$((PASS+1)); echo "  [PASS] $1"; }
-bad()  { FAIL=$((FAIL+1)); echo "  [FAIL] $1"; }
+GATES=(
+    suite_01_boot
+    suite_02_differential
+    suite_03_selfhost
+    suite_04_optimizers
+    suite_05_backends
+    suite_06_advanced
+    suite_07_asm
+    suite_08_osdev
+)
 
-# Suites live in tests/suites/ and are sourced in the original
-# section order; PASS/FAIL counters and helpers are shared.
-source "$(dirname "$0")/suites/suite_01_boot.sh"
-source "$(dirname "$0")/suites/suite_02_differential.sh"
-source "$(dirname "$0")/suites/suite_03_selfhost.sh"
-source "$(dirname "$0")/suites/suite_04_optimizers.sh"
-source "$(dirname "$0")/suites/suite_05_backends.sh"
-source "$(dirname "$0")/suites/suite_06_advanced.sh"
-source "$(dirname "$0")/suites/suite_07_asm.sh"
-source "$(dirname "$0")/suites/suite_08_osdev.sh"
+for gate in "${GATES[@]}"; do
+    if [ ! -x "bin/acc-$gate" ]; then
+        if ! make -s "bin/acc-$gate" >/dev/null 2>&1; then
+            FAIL=$((FAIL+1))
+            echo "  [FAIL] $gate (gate build failed)"
+            continue
+        fi
+    fi
+    if "bin/acc-$gate"; then
+        PASS=$((PASS+1))
+    else
+        FAIL=$((FAIL+1))
+        echo "  [FAIL] $gate"
+    fi
+done
 
 echo "=========================================="
-echo "RESULT: $PASS PASS / $FAIL FAIL"
+echo "RESULT: $PASS PASS / $FAIL FAIL (suite gates)"
 echo "=========================================="
 [ $FAIL -eq 0 ]

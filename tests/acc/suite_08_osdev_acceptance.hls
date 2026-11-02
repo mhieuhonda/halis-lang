@@ -1,0 +1,1454 @@
+# ============================================================================
+# tests/acc/suite_08_osdev_acceptance.hls — the osdev suite, in Halis.
+# ----------------------------------------------------------------------------
+# The Halis twin of the old tests/suites/suite_08_osdev.sh (Phase VI: OS
+# development foundation, Stages 77-96): same sections, same tools, same
+# needles — the harness is tests/acc/harness.hls and the gate runs native,
+# built by bin/hlc.
+#
+# The old suite shared the bash $TMP and the ok()/bad() counters; this gate
+# is standalone: every probe lives under tests/.acc-scratch/suite_08_osdev/
+# (wiped fresh by acc_new) and check() counts automatically. The native
+# compiler the suite chains through (the old $TMP/hlc1) is rebuilt here when
+# the legs need it. Legs that consume the CI-built bin/hlc + bin/hlc-fs do
+# exactly what the bash did: the make legs build them first, and the
+# bin/hlc-fs honesty leg FAILS with the build recipe when it is missing.
+# The `#![no_std]` -> `#![freestanding]` source rewrites are done in-gate
+# (the bash mktemp+python/sed dance), and the compiler-diagnostic parity
+# loops strip the front-end prefixes exactly like the bash sed pipeline.
+#
+#  14. Stage 77 freestanding   21. Stage 84 linker scripts
+#  15. Stage 78 no_std+core    22. Stage 85 Multiboot2/Limine headers
+#  16. Stage 79 core.alloc     23. Stage 86 core.interrupt (IDT/GDT)
+#  17. Stage 80 core.mem       24. Stage 87 core.mmio
+#  18. Stage 81 core.panic     25. Stage 88 core.port
+#  19. Stage 82 stack guard    26. Stage 89 DMA-safe buffers
+#      Stage 83 asm registers  27. Stage 90 core.sync.nolock
+#                              28. Stage 91 verified IRQ safety
+#                              29.-33. Stages 92-96 xboot/triples/DWARF
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+
+# ----------------------------------------------------------------------------
+# The shared native-compiler build (the old $TMP/hlc1) + link recipes.
+# ----------------------------------------------------------------------------
+
+fn hlc1_path(acc: Acc) -> str uses Proc {
+    return scratch(acc, "hlc1")
+}
+
+fn build_hlc1(acc: Acc, name: str) -> str uses IO, Fs, Proc {
+    let hlc1: str = hlc1_path(acc)
+    if file_exists(hlc1) {
+        return hlc1
+    }
+    println("  [..] building the native compiler (" + name + ")")
+    let s1: str = scratch(acc, "hlc_nat.c")
+    let r: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "src/hlc.hls", "src/hlc.hls", s1])
+    if r.code != 0 {
+        return ""
+    }
+    if run_capture("gcc", ["-O2", "-o", hlc1, s1, "-lm", "-pthread"]).code != 0 {
+        return ""
+    }
+    return hlc1
+}
+
+# gcc_build(c_src, bin_out) — the hosted link recipe.
+fn gcc_build(c_src: str, bin_out: str) -> bool uses Proc {
+    return run_capture("gcc",
+        ["-O2", "-o", bin_out, c_src, "-lm", "-pthread"]).code == 0
+}
+
+# nostdlib_build(c_src, bin_out) — the freestanding -nostdlib recipe the
+# no-libc binaries link with.
+fn nostdlib_build(c_src: str, bin_out: str) -> RunResult uses Proc {
+    return run_capture("gcc",
+        ["-O2", "-ffreestanding", "-nostdlib", "-ffunction-sections",
+         "-fno-stack-protector", "-Wl,--gc-sections", "-o", bin_out, c_src])
+}
+
+# c_has / c_has_E — grep -q / grep -qE via the grep binary.
+fn c_has(path: str, needle: str) -> bool uses Proc {
+    return run_capture("grep", ["-q", needle, path]).code == 0
+}
+
+fn c_has_e(path: str, pattern: str) -> bool uses Proc {
+    return run_capture("grep", ["-qE", pattern, path]).code == 0
+}
+
+# file_contains(path, needle) — grep without spawning (small text files).
+fn file_contains(path: str, needle: str) -> bool uses Fs {
+    return read_file(path).contains(needle)
+}
+
+# parse_uint(s) — the digits of s as an int (0 when none).
+fn parse_uint(s: str) -> int {
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c >= 48 && c <= 57 {
+            v = v * 10 + (c - 48)
+        }
+        i = i + 1
+    }
+    return v
+}
+
+# glob_hls(dir, prefix) — the bash `for f in dir/prefix*.hls` glob.
+fn glob_hls(dir: str, prefix: str) -> list[str] uses Fs {
+    let names: list[str] = fs_read_dir(dir)
+    let mut out: list[str] = []
+    let mut i: int = 0
+    while i < names.len() {
+        if names.get(i).starts_with(prefix) && names.get(i).ends_with(".hls") {
+            out.push(path_join3(dir, names.get(i)))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# replace_once(text, from, to) — the bash python `src.replace(a, b, 1)`.
+fn replace_once(text: str, from: str, to: str) -> str {
+    let at: int = text.find(from)
+    if at < 0 {
+        return text
+    }
+    return text.slice(0, at) + to + text.slice(at + from.len(), text.len())
+}
+
+# replace_line(text, from, to) — the sed `s/^from$/to/`: whole-line rewrite.
+fn replace_line(text: str, from: str, to: str) -> str {
+    let lines: list[str] = text.split("\n")
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i) == from {
+            out = out + to + "\n"
+        } else {
+            out = out + lines.get(i) + "\n"
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# head_line(text) — the literal `head -1` (even when the line is empty).
+fn head_line(text: str) -> str {
+    let lines: list[str] = text.split("\n")
+    if lines.len() > 0 {
+        return lines.get(0)
+    }
+    return ""
+}
+
+# strip_err_prefix(line) — the sed `s/^[a-z ]*error: //`: a leading run of
+# lowercase/space, then "error: ", is dropped.
+fn strip_err_prefix(line: str) -> str {
+    let mut i: int = 0
+    while i < line.len() {
+        let c: int = line.byte_at(i)
+        if !((c >= 97 && c <= 122) || c == 32) {
+            break
+        }
+        i = i + 1
+    }
+    if line.slice(i, line.len()).starts_with("error: ") {
+        return line.slice(i + 7, line.len())
+    }
+    return line
+}
+
+# strip_err_greedy(line) — the sed `s/^.*error: //` (BRE greedy: the LAST
+# "error: " on the line is the cut point).
+fn strip_err_greedy(line: str) -> str {
+    let mut last: int = -1
+    let mut at: int = line.find("error: ")
+    while at >= 0 {
+        last = at
+        let next: int = line.slice(at + 1, line.len()).find("error: ")
+        if next >= 0 {
+            at = at + 1 + next
+        } else {
+            at = -1
+        }
+    }
+    if last >= 0 {
+        return line.slice(last + 7, line.len())
+    }
+    return line
+}
+
+# strip_line_num(line) — the sed `s/ \(line [0-9]+\)$//`.
+fn strip_line_num(line: str) -> str {
+    if line.len() < 8 || line.byte_at(line.len() - 1) != 41 {
+        return line
+    }
+    let mut end: int = line.len() - 1
+    let mut start: int = end
+    while start > 0 {
+        let c: int = line.byte_at(start - 1)
+        if c >= 48 && c <= 57 {
+            start = start - 1
+        } else {
+            break
+        }
+    }
+    if start == end {
+        return line
+    }
+    if start >= 7 && line.slice(start - 7, start) == " (line " {
+        return line.slice(0, start - 7)
+    }
+    return line
+}
+
+# norm_stream(text, panic_too) — the sed pipeline over every line: strip
+# "panic: " (when asked), then the `[a-z ]*error: ` prefix.
+fn norm_stream(text: str, panic_too: bool) -> str {
+    let lines: list[str] = text.split("\n")
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < lines.len() {
+        let mut line: str = lines.get(i)
+        if panic_too && line.starts_with("panic: ") {
+            line = line.slice(7, line.len())
+        }
+        out = out + strip_err_prefix(line) + "\n"
+        i = i + 1
+    }
+    return out
+}
+
+# norm_head(text, panic_too) — the Stage 91 `| head -1` parity line.
+fn norm_head(text: str, panic_too: bool) -> str {
+    let mut line: str = head_line(text)
+    if panic_too && line.starts_with("panic: ") {
+        line = line.slice(7, line.len())
+    }
+    return strip_line_num(strip_err_prefix(line))
+}
+
+# norm_greedy_stream(text) — the Stage 93 `sed 's/^.*error: //;
+# s/ (line [0-9]*)$//'` over every line (greedy prefix, line-num suffix).
+fn norm_greedy_stream(text: str) -> str {
+    let lines: list[str] = text.split("\n")
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < lines.len() {
+        out = out + strip_line_num(strip_err_greedy(lines.get(i))) + "\n"
+        i = i + 1
+    }
+    return out
+}
+
+# count_import_lines(path) — `grep -c '^import'`: only lines that BEGIN
+# with import count.
+fn count_import_lines(path: str) -> int uses Fs {
+    let lines: list[str] = read_or(path, "").split("\n")
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).starts_with("import") {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+# core_file_has(path, needle) — the `[ -f core/x.hls ] && grep -q` idiom,
+# guarded so a missing module is a failed check, never a crash.
+fn core_file_has(path: str, needle: str) -> bool uses Fs {
+    if !file_exists(path) {
+        return false
+    }
+    return read_file(path).contains(needle)
+}
+
+# boot_check_err(path) — `boot.py --check f 2>&1 >/dev/null`.
+fn boot_check_err(path: str) -> RunResult uses Proc {
+    return run_capture("python3", ["tools/hlinterp/boot.py", "--check", path])
+}
+
+# boot_run(path) — the plain interpreter run.
+fn boot_run(path: str) -> RunResult uses Proc {
+    return run_capture("python3", ["tools/hlinterp/boot.py", path])
+}
+
+# ----------------------------------------------------------------------------
+# tail_lines(text, n) — the `tail -n` evidence idiom for fail details.
+# ----------------------------------------------------------------------------
+
+fn tail_lines(text: str, n: int) -> str {
+    let lines: list[str] = text.split("\n")
+    let mut out: str = ""
+    let mut start: int = lines.len() - n
+    if start < 0 {
+        start = 0
+    }
+    let mut i: int = start
+    while i < lines.len() {
+        if lines.get(i).trim() != "" {
+            out = out + lines.get(i).trim() + " | "
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# skip_pass(acc, msg) — the bash `echo SKIP; PASS=$((PASS+1))`: counts a
+# pass silently and names the skip, keeping the totals branch-for-branch.
+fn skip_pass(acc: Acc, msg: str) -> void uses IO {
+    acc.pass = acc.pass + 1
+    println(msg)
+}
+
+# ----------------------------------------------------------------------------
+# 14. Stage 77: #![freestanding] mode (no libc, no OS calls)
+# ----------------------------------------------------------------------------
+
+fn sec77_freestanding(acc: Acc) -> void uses IO, Fs, Proc {
+    section("14. Stage 77: #![freestanding] mode (no libc, no OS calls)")
+
+    let fs_f: str = "tests/ok/feat_freestanding_basic.hls"
+
+    # (a) the freestanding ok-test checks + runs on the interpreter.
+    let fs_i: RunResult = boot_run(fs_f)
+    check(acc, "freestanding: feat_freestanding_basic runs on the interpreter (exit 0)",
+          fs_i.code == 0,
+          "freestanding: feat_freestanding_basic interpreter exit=" + fs_i.code.to_str())
+
+    # (b) every Stage 77 fail program is rejected with a mode-specific
+    # message (fail_freestanding_late_attr pins the POSITION rule instead).
+    let corpus: list[str] = glob_hls("tests/fail", "fail_freestanding_")
+    let mut i: int = 0
+    while i < corpus.len() {
+        let ff: str = corpus.get(i)
+        let name: str = stem(ff)
+        let e: RunResult = boot_check_err(ff)
+        let mut needle: str = "freestanding"
+        if name == "fail_freestanding_late_attr" {
+            needle = "before any item"
+        }
+        check(acc, "freestanding: " + name + " rejected (" + first_line(e.err) + ")",
+              e.code == 1 && e.err.contains(needle),
+              "freestanding: " + name + " not rejected with a freestanding message (rc="
+                  + e.code.to_str() + ")")
+        i = i + 1
+    }
+
+    # (c) the self-hosted compiler emits the freestanding TU shape.
+    let fs_c: str = scratch(acc, "fs_basic.c")
+    let c: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "src/hlc.hls", fs_f, fs_c])
+    if c.code == 0 {
+        check(acc, "freestanding: hlc emits _start + traps with no hosted headers",
+              c_has(fs_c, "void _start(void)")
+                  && !c_has_e(fs_c, "int main\\s*\\(")
+                  && c_has(fs_c, "__builtin_trap")
+                  && !c_has(fs_c, "#include <stdio.h>"),
+              "freestanding: hlc emission has the wrong TU shape")
+    } else {
+        check(acc, "freestanding: hlc emits _start + traps with no hosted headers",
+              false, "freestanding: hlc emission failed")
+    }
+
+    # (d) the freestanding binary links -nostdlib and runs with the
+    # interpreter's exit code (skipped gracefully without gcc).
+    if which("gcc") {
+        let fs_bin: str = scratch(acc, "fs_basic")
+        if nostdlib_build(fs_c, fs_bin).code == 0 {
+            let nat: RunResult = run_capture(fs_bin, [])
+            check(acc, "freestanding: -nostdlib binary exit (" + nat.code.to_str() + ") == interpreter",
+                  nat.code == fs_i.code,
+                  "freestanding: -nostdlib binary exit=" + nat.code.to_str()
+                      + ", interp=" + fs_i.code.to_str())
+        } else {
+            check(acc, "freestanding: -nostdlib binary exit (0) == interpreter",
+                  false, "freestanding: -nostdlib link failed")
+        }
+    } else {
+        skip_pass(acc, "  [SKIP] freestanding: gcc not installed (-nostdlib link skipped)")
+    }
+
+    # (e) make freestanding-acceptance runs end-to-end (8 sections).
+    let e: RunResult = run_capture("make", ["freestanding-acceptance"])
+    check(acc, "freestanding: make freestanding-acceptance runs end-to-end",
+          e.code == 0 && e.combined.contains("ACCEPTANCE OK: Stage 77"),
+          clip(tail_lines(e.combined, 15), 120))
+}
+
+# ----------------------------------------------------------------------------
+# 15. Stage 78: #![no_std] + core modules
+# ----------------------------------------------------------------------------
+
+fn sec78_nostd(acc: Acc) -> void uses IO, Fs, Proc {
+    section("15. Stage 78: #![no_std] + core modules")
+
+    let ns_f: str = "tests/ok/feat_nostd_core.hls"
+
+    # (a) the no_std ok-test checks + runs on the interpreter.
+    let ns_i: RunResult = boot_run(ns_f)
+    check(acc, "nostd: feat_nostd_core runs on the interpreter (exit 0)",
+          ns_i.code == 0,
+          "nostd: feat_nostd_core interpreter exit=" + ns_i.code.to_str())
+
+    # (b) every core module resolves through the `core.` prefix.
+    let mut mods: list[str] = []
+    mods.push("option")
+    mods.push("result")
+    mods.push("iter")
+    mods.push("clone")
+    mods.push("eq")
+    let mut i: int = 0
+    while i < mods.len() {
+        check(acc, "nostd: core/" + mods.get(i) + ".hls present",
+              file_exists("core/" + mods.get(i) + ".hls"),
+              "nostd: core/" + mods.get(i) + ".hls missing")
+        i = i + 1
+    }
+
+    # (c) every Stage 78 fail program is rejected with a mode message.
+    let corpus: list[str] = glob_hls("tests/fail", "fail_nostd_")
+    let mut j: int = 0
+    while j < corpus.len() {
+        let name: str = stem(corpus.get(j))
+        let e: RunResult = boot_check_err(corpus.get(j))
+        check(acc, "nostd: " + name + " rejected (" + first_line(e.err) + ")",
+              e.code == 1 && e.err.contains("no_std"),
+              "nostd: " + name + " not rejected with a no_std message (rc="
+                  + e.code.to_str() + ")")
+        j = j + 1
+    }
+
+    # (d) make nostd-acceptance runs end-to-end (8 sections).
+    let d: RunResult = run_capture("make", ["nostd-acceptance"])
+    check(acc, "nostd: make nostd-acceptance runs end-to-end",
+          d.code == 0 && d.combined.contains("ACCEPTANCE OK: Stage 78"),
+          clip(tail_lines(d.combined, 15), 120))
+}
+
+# ----------------------------------------------------------------------------
+# 16. Stage 79: core.alloc — pluggable allocator protocol
+# 17. Stage 80: core.mem — physical-page allocator + page tables
+# (the two stages share the freestanding-parity leg shape)
+# ----------------------------------------------------------------------------
+
+# freestanding_parity(acc, ok_name, ok_f, interp_code) — the shared (d)
+# leg: the ok-test with `#![no_std]` swapped for `#![freestanding]` links
+# -nostdlib and exits with the interpreter's code.
+fn freestanding_parity(acc: Acc, ok_name: str, ok_f: str, interp_code: int) -> void uses IO, Fs, Proc {
+    let tag: str = stem(ok_f)
+    let fs_src: str = scratch(acc, tag + "_fs.hls")
+    write_file(fs_src, replace_once(read_file(ok_f), "\n#![no_std]\n", "\n#![freestanding]\n"))
+    let fs_c: str = scratch(acc, tag + "_fs.c")
+    let fs_bin: str = scratch(acc, tag + "_fs.bin")
+    let comp: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "src/hlc.hls", fs_src, fs_c])
+    if comp.code == 0 {
+        let link: RunResult = nostdlib_build(fs_c, fs_bin)
+        if link.code == 0 {
+            let nat: RunResult = run_capture(fs_bin, [])
+            check(acc, ok_name,
+                  nat.code == interp_code,
+                  ok_name + " — binary exit=" + nat.code.to_str()
+                      + ", interp=" + interp_code.to_str())
+        } else {
+            check(acc, ok_name, false,
+                ok_name + " — freestanding -nostdlib link failed " + clip(link.err, 120))
+        }
+    } else {
+        check(acc, ok_name, false,
+            ok_name + " — freestanding -nostdlib link failed (emission failed)")
+    }
+}
+
+fn sec79_alloc(acc: Acc) -> void uses IO, Fs, Proc {
+    section("16. Stage 79: core.alloc — pluggable allocator protocol")
+
+    let alloc_f: str = "tests/ok/feat_stage79_alloc.hls"
+
+    # (a) the alloc ok-test checks + runs on the interpreter.
+    let a: RunResult = boot_run(alloc_f)
+    check(acc, "alloc: feat_stage79_alloc runs on the interpreter (exit 0)",
+          a.code == 0, "alloc: feat_stage79_alloc interpreter exit=" + a.code.to_str())
+
+    # (b) the alloc module resolves through the `core.` prefix.
+    check(acc, "alloc: core/alloc.hls present",
+          file_exists("core/alloc.hls"), "alloc: core/alloc.hls missing")
+
+    # (c) the demo runs end-to-end on the interpreter.
+    let c: RunResult = boot_run("examples/alloc_demo.hls")
+    check(acc, "alloc: examples/alloc_demo.hls runs on the interpreter (exit 0)",
+          c.code == 0, "alloc: examples/alloc_demo.hls interpreter exit=" + c.code.to_str())
+
+    # (d) the same ok-test with #![freestanding] links -nostdlib.
+    freestanding_parity(acc, "alloc: freestanding -nostdlib binary exit (0) == interpreter",
+                        alloc_f, a.code)
+
+    # (e) make alloc-acceptance runs end-to-end (7 sections).
+    let e: RunResult = run_capture("make", ["alloc-acceptance"])
+    check(acc, "alloc: make alloc-acceptance runs end-to-end",
+          e.code == 0 && e.combined.contains("ACCEPTANCE OK: Stage 79"),
+          clip(tail_lines(e.combined, 15), 120))
+}
+
+fn sec80_mem(acc: Acc) -> void uses IO, Fs, Proc {
+    section("17. Stage 80: core.mem — physical-page allocator + page tables")
+
+    let mem_f: str = "tests/ok/feat_stage80_mem.hls"
+
+    # (a) the mem ok-test checks + runs on the interpreter.
+    let a: RunResult = boot_run(mem_f)
+    check(acc, "mem: feat_stage80_mem runs on the interpreter (exit 0)",
+          a.code == 0, "mem: feat_stage80_mem interpreter exit=" + a.code.to_str())
+
+    # (b) the mem module resolves through the `core.` prefix.
+    check(acc, "mem: core/mem.hls present",
+          file_exists("core/mem.hls"), "mem: core/mem.hls missing")
+
+    # (c) the demo runs end-to-end on the interpreter.
+    let c: RunResult = boot_run("examples/mem_demo.hls")
+    check(acc, "mem: examples/mem_demo.hls runs on the interpreter (exit 0)",
+          c.code == 0, "mem: examples/mem_demo.hls interpreter exit=" + c.code.to_str())
+
+    # (d) the same ok-test with #![freestanding] links -nostdlib.
+    freestanding_parity(acc, "mem: freestanding -nostdlib binary exit (0) == interpreter",
+                        mem_f, a.code)
+
+    # (e) make mem-acceptance runs end-to-end (8 sections).
+    let e: RunResult = run_capture("make", ["mem-acceptance"])
+    check(acc, "mem: make mem-acceptance runs end-to-end",
+          e.code == 0 && e.combined.contains("ACCEPTANCE OK: Stage 80"),
+          clip(tail_lines(e.combined, 15), 120))
+}
+
+# ----------------------------------------------------------------------------
+# 18. Stage 81: core.panic + #[panic_handler]
+# ----------------------------------------------------------------------------
+
+fn sec81_panic(acc: Acc) -> void uses IO, Fs, Proc {
+    section("18. Stage 81: core.panic + #[panic_handler]")
+
+    let panic_f: str = "tests/ok/feat_stage81_panic.hls"
+
+    # (a) the panic ok-test checks + runs on the interpreter.
+    let a: RunResult = boot_run(panic_f)
+    check(acc, "panic: feat_stage81_panic runs on the interpreter (exit 0)",
+          a.code == 0, "panic: feat_stage81_panic interpreter exit=" + a.code.to_str())
+
+    # (b) the panic module resolves through the `core.` prefix.
+    check(acc, "panic: core/panic.hls present",
+          file_exists("core/panic.hls"), "panic: core/panic.hls missing")
+
+    # (c) the hosted demo panics with the handler marker first (exit 101).
+    let demo_out: RunResult = boot_run("examples/panic_demo.hls")
+    check(acc, "panic: examples/panic_demo.hls handler fires, exit 101",
+          demo_out.code == 101 && demo_out.out.contains("kernel panic: demo fault"),
+          "panic: examples/panic_demo.hls exit=" + demo_out.code.to_str() + " (want 101 + marker)")
+    let demo_err: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "examples/panic_demo.hls"])
+    check(acc, "panic: default report still runs after the handler",
+          demo_err.err.contains("panic: demo fault"),
+          "panic: default report missing after the handler")
+
+    # (d) the same ok-test with #![freestanding] links -nostdlib.
+    freestanding_parity(acc, "panic: freestanding -nostdlib binary exit (0) == interpreter",
+                        panic_f, a.code)
+
+    # (e) make panic-acceptance runs end-to-end (7 sections).
+    let e: RunResult = run_capture("make", ["panic-acceptance"])
+    check(acc, "panic: make panic-acceptance runs end-to-end",
+          e.code == 0 && e.combined.contains("ACCEPTANCE OK: Stage 81"),
+          clip(tail_lines(e.combined, 15), 120))
+}
+
+# ----------------------------------------------------------------------------
+# 19. Stage 82: deterministic stack size + guard pages
+# ----------------------------------------------------------------------------
+
+fn sec82_stack(acc: Acc, hlc1: str) -> void uses IO, Fs, Proc {
+    section("19. Stage 82: deterministic stack size + guard pages")
+
+    let stk_f: str = "tests/ok/feat_stage82_stack.hls"
+
+    # (a) the stack ok-test checks + runs on the interpreter.
+    let a: RunResult = boot_run(stk_f)
+    check(acc, "stack: feat_stage82_stack runs on the interpreter (exit 0)",
+          a.code == 0, "stack: feat_stage82_stack interpreter exit=" + a.code.to_str())
+
+    # (b) the stack module resolves through the `core.` prefix.
+    check(acc, "stack: core/stack.hls present",
+          file_exists("core/stack.hls"), "stack: core/stack.hls missing")
+
+    # (c) every Stage 82 fail program is rejected by Stage-0 with the
+    # Stage 82 message, and the self-hosted checker agrees.
+    let mut files: list[str] = []
+    files.push("tests/fail/fail_stack_budget_exceeded.hls")
+    files.push("tests/fail/fail_stack_budget_recursion.hls")
+    files.push("tests/fail/fail_stack_size_fn.hls")
+    let mut i: int = 0
+    while i < files.len() {
+        let ff: str = files.get(i)
+        let name: str = stem(ff)
+        let e: RunResult = boot_check_err(ff)
+        check(acc, "stack: " + name + " rejected by boot (" + first_line(e.err) + ")",
+              e.code == 1 && (e.err.contains("stack_size")
+                  || e.err.contains("bounded recursion")),
+              "stack: " + name + " not rejected with a stack message (rc="
+                  + e.code.to_str() + ")")
+        let h: RunResult = run_capture("python3",
+            ["tools/hlinterp/boot.py", "src/hlc.hls", ff, scratch(acc, "stk_fail.c")])
+        check(acc, "stack: " + name + " rejected by hlc too (parity)",
+              h.code != 0, "stack: " + name + " accepted by the self-hosted checker")
+        i = i + 1
+    }
+
+    # (d) the hosted demo hits the guard (exit 101, handler marker first).
+    let d: RunResult = boot_run("examples/stack_guard_demo.hls")
+    check(acc, "stack: examples/stack_guard_demo.hls hits the guard, exit 101",
+          d.code == 101 && d.out.contains("kernel panic: stack overflow"),
+          "stack: examples/stack_guard_demo.hls exit=" + d.code.to_str()
+              + " (want 101 + marker)")
+
+    # (e) make stackguard-acceptance runs end-to-end (7 sections).
+    let e: RunResult = run_capture("make", ["stackguard-acceptance"])
+    check(acc, "stack: make stackguard-acceptance runs end-to-end",
+          e.code == 0 && e.combined.contains("ACCEPTANCE OK: Stage 82"),
+          clip(tail_lines(e.combined, 15), 120))
+}
+
+# ----------------------------------------------------------------------------
+# Stage 83 (v0.102.0-alpha): inline-asm register constraints (no echo
+# header in the old suite — the comment block only).
+# ----------------------------------------------------------------------------
+
+fn sec83_asmreg(acc: Acc, hlc1: str) -> void uses IO, Fs, Proc {
+    let asm_f: str = "tests/ok/feat_stage83_asmreg.hls"
+
+    # (a) the asmreg ok-test checks + runs on the interpreter.
+    let a: RunResult = boot_run(asm_f)
+    check(acc, "asmreg: feat_stage83_asmreg runs on the interpreter (exit 0)",
+          a.code == 0, "asmreg: feat_stage83_asmreg interpreter exit=" + a.code.to_str())
+
+    # (b) the asm module resolves through the `core.` prefix.
+    check(acc, "asmreg: core/asm.hls present",
+          file_exists("core/asm.hls"), "asmreg: core/asm.hls missing")
+
+    # (c) every Stage 83 fail program is rejected by Stage-0 with the
+    # Stage 83 message, and the self-hosted checker agrees.
+    let corpus: list[str] = glob_hls("tests/fail", "fail_asmreg_")
+    let mut i: int = 0
+    while i < corpus.len() {
+        let ff: str = corpus.get(i)
+        let name: str = stem(ff)
+        let e: RunResult = boot_check_err(ff)
+        check(acc, "asmreg: " + name + " rejected by boot (" + first_line(e.err) + ")",
+              e.code == 1 && e.err.contains("asm!"),
+              "asmreg: " + name + " not rejected with an asm! message (rc="
+                  + e.code.to_str() + ")")
+        let h: RunResult = run_capture("python3",
+            ["tools/hlinterp/boot.py", "src/hlc.hls", ff, scratch(acc, "asm83_fail.c")])
+        check(acc, "asmreg: " + name + " rejected by hlc too (parity)",
+              h.code != 0, "asmreg: " + name + " accepted by the self-hosted checker")
+        i = i + 1
+    }
+
+    # (d) the demo compiles natively, runs (exit 0), exercises the
+    # named-register + clobber machinery for real; (e) the C lowering
+    # uses GCC local register variables + explicit clobbers.
+    if file_exists(hlc1) {
+        let demo_c: str = scratch(acc, "asm83_demo.c")
+        let demo_bin: str = scratch(acc, "asm83_demo")
+        let d1: RunResult = run_capture(hlc1, ["examples/asmreg_demo.hls", demo_c])
+        let d2: RunResult = run_capture("gcc",
+            ["-O2", "-Werror", "-o", demo_bin, demo_c, "-lm", "-pthread"])
+        if d1.code == 0 && d2.code == 0 {
+            let demo: RunResult = run_capture(demo_bin, [])
+            check(acc, "asmreg: examples/asmreg_demo.hls runs natively, DEMO OK",
+                  demo.code == 0 && demo.out.contains("DEMO OK"),
+                  "asmreg: examples/asmreg_demo.hls exit=" + demo.code.to_str()
+                      + " (want 0 + DEMO OK)")
+            check(acc, "asmreg: C lowering has register variables + explicit clobbers",
+                  c_has(demo_c, "__asm__(\"r10\")")
+                      && c_has(demo_c, "__asm__(\"xmm0\")")
+                      && c_has(demo_c, "\"cc\", \"rcx\"")
+                      && c_has(demo_c, "\"cc\", \"xmm3\"")
+                      && c_has(demo_c, "\"cc\", \"memory\""),
+                  "asmreg: C lowering missing register variables / explicit clobbers")
+        } else {
+            check(acc, "asmreg: examples/asmreg_demo.hls runs natively, DEMO OK",
+                  false, "asmreg: examples/asmreg_demo.hls failed to compile + link "
+                      + clip(d2.err, 120))
+        }
+
+        # (f) the no_std ok-test links -nostdlib (freestanding parity).
+        let fs_src: str = scratch(acc, "asm83_fs.hls")
+        write_file(fs_src, replace_line(read_file(asm_f), "#![no_std]", "#![freestanding]"))
+        let fs_c: str = scratch(acc, "asm83_fs.c")
+        let f1: RunResult = run_capture("python3",
+            ["tools/hlinterp/boot.py", "src/hlc.hls", fs_src, fs_c])
+        if f1.code == 0 && c_has(fs_c, "void _start(void)") {
+            let fs_bin: str = scratch(acc, "asm83_fs")
+            let f2: RunResult = nostdlib_build(fs_c, fs_bin)
+            if f2.code == 0 {
+                let nat: RunResult = run_capture(fs_bin, [])
+                check(acc, "asmreg: ok-test links -nostdlib and exits 0 (freestanding)",
+                      nat.code == 0,
+                      "asmreg: freestanding ok-test exit=" + nat.code.to_str() + " (want 0)")
+            } else {
+                check(acc, "asmreg: ok-test links -nostdlib and exits 0 (freestanding)",
+                      false, "asmreg: freestanding link failed " + clip(f2.err, 120))
+            }
+        } else {
+            check(acc, "asmreg: ok-test links -nostdlib and exits 0 (freestanding)",
+                  false, "asmreg: freestanding emission failed (no _start)")
+        }
+    }
+
+    # (g) make asmreg-acceptance runs end-to-end.
+    let g: RunResult = run_capture("make", ["asmreg-acceptance"])
+    check(acc, "asmreg: make asmreg-acceptance runs end-to-end",
+          g.code == 0 && g.combined.contains("ACCEPTANCE OK: Stage 83"),
+          clip(tail_lines(g.combined, 15), 120))
+}
+
+# ----------------------------------------------------------------------------
+# 21. Stage 84: linker script + custom sections
+# ----------------------------------------------------------------------------
+
+fn sec84_link(acc: Acc, hlc1: str) -> void uses IO, Fs, Proc {
+    section("21. Stage 84: linker script + custom sections")
+
+    let sec_f: str = "tests/ok/feat_stage84_section.hls"
+
+    # (a) the no_std ok-test is clean on the interpreter.
+    let a: RunResult = boot_run(sec_f)
+    check(acc, "link: feat_stage84_section runs on the interpreter (exit 0)",
+          a.code == 0, "link: feat_stage84_section interpreter exit=" + a.code.to_str())
+
+    # (b) core/section.hls is importable and freestanding-clean.
+    check(acc, "link: core/section.hls present",
+          core_file_has("core/section.hls", "fn parse_link_script"),
+          "link: core/section.hls missing")
+
+    # (c) every Stage 84 fail program is rejected by BOTH compilers with
+    # its own (identical, prefix-stripped) diagnostic.
+    let corpus: list[str] = glob_hls("tests/fail", "fail_stage84_")
+    let mut i: int = 0
+    while i < corpus.len() {
+        let sf: str = corpus.get(i)
+        let name: str = stem(sf)
+        let e: RunResult = boot_check_err(sf)
+        if e.code != 1 {
+            fail_msg(acc, "link: " + name + " not rejected by boot")
+        } else {
+            let e2: RunResult = run_capture(hlc1, ["--audit", sf])
+            if e2.code == 0 {
+                fail_msg(acc, "link: " + name + " accepted by hlc (parity)")
+            } else {
+                let m1: str = norm_stream(e.err, true)
+                let m2: str = norm_stream(e2.err, true)
+                check(acc, "link: " + name + " rejected by both compilers (identical diagnostic)",
+                      m1 == m2 && m1.trim() != "",
+                      "link: " + name + " diagnostics differ — boot: "
+                          + clip(first_line(e.err), 80) + " / hlc: "
+                          + clip(first_line(e2.err), 80))
+            }
+        }
+        i = i + 1
+    }
+
+    # (d) the C lowering carries the section + aligned attributes (the
+    # probe program, compiled + run natively).
+    let sec_src: str = write_src(acc, "feat_stage84_sections_src.hls",
+        "#[section(\".text.suite_probe\")]\n"
+            + "#[align(64)]\n"
+            + "fn suite_probe(x: int) -> int pure {\n"
+            + "    return x + 1\n"
+            + "}\n"
+            + "\n"
+            + "fn main() -> int {\n"
+            + "    return suite_probe(1)\n"
+            + "}\n")
+    if file_exists(hlc1) {
+        let sec84_c: str = scratch(acc, "sec84.c")
+        let d1: RunResult = run_capture(hlc1, [sec_src, sec84_c])
+        if d1.code == 0 {
+            check(acc, "link: C carries section + aligned attributes",
+                  c_has(sec84_c, "__attribute__((section(\".text.suite_probe\"), used))")
+                      && c_has(sec84_c, "__attribute__((aligned(64)))"),
+                  "link: C missing the section/aligned attributes")
+            let sec84: str = scratch(acc, "sec84")
+            if gcc_build(sec84_c, sec84) {
+                let nat: RunResult = run_capture(sec84, [])
+                check(acc, "link: annotated program runs natively",
+                      nat.code == 2, "link: annotated program did not return 2")
+            } else {
+                check(acc, "link: annotated program runs natively",
+                      false, "link: annotated program failed to link")
+            }
+        } else {
+            fail_msg(acc, "link: annotated program did not compile (or the native hlc is missing)")
+        }
+    } else {
+        fail_msg(acc, "link: annotated program did not compile (or the native hlc is missing)")
+    }
+
+    # (e) the shipped link.ld places a custom section, and linking with
+    # it really puts the function there.
+    if file_exists(hlc1) {
+        let sd_c: str = scratch(acc, "sd84.c")
+        let sd: str = scratch(acc, "sd84")
+        let e1: RunResult = run_capture(hlc1, ["examples/section_demo.hls", sd_c])
+        if e1.code == 0 && gcc_build(sd_c, sd) {
+            let nat: RunResult = run_capture(sd, [])
+            check(acc, "link: examples/section_demo.hls runs natively, DEMO OK",
+                  nat.out.contains("DEMO OK"),
+                  "link: section_demo did not print DEMO OK")
+        } else {
+            check(acc, "link: examples/section_demo.hls runs natively, DEMO OK",
+                  false, "link: section_demo failed to build")
+        }
+    } else {
+        check(acc, "link: examples/section_demo.hls runs natively, DEMO OK",
+              false, "link: section_demo failed to build (or the native hlc is missing)")
+    }
+
+    # (f) make link-acceptance runs end-to-end.
+    let f: RunResult = run_capture("make", ["link-acceptance"])
+    check(acc, "link: make link-acceptance runs end-to-end",
+          f.code == 0 && f.combined.contains("ACCEPTANCE OK: Stage 84"),
+          clip(tail_lines(f.combined, 15), 120))
+}
+
+# ----------------------------------------------------------------------------
+# 22. Stage 85: Multiboot2 + Limine boot protocol headers
+# ----------------------------------------------------------------------------
+
+fn sec85_boot(acc: Acc, hlc1: str) -> void uses IO, Fs, Proc {
+    section("22. Stage 85: Multiboot2 + Limine boot protocol headers")
+
+    let boot_f: str = "tests/ok/feat_stage85_boot.hls"
+
+    # interpreter + module presence.
+    let a: RunResult = boot_run(boot_f)
+    check(acc, "boot: feat_stage85_boot runs on the interpreter (exit 0)",
+          a.code == 0, "boot: feat_stage85_boot interpreter exit=" + a.code.to_str())
+    check(acc, "boot: core/boot.hls present",
+          core_file_has("core/boot.hls", "fn mb2_header_ok"),
+          "boot: core/boot.hls missing")
+
+    # Every Stage 85 fail program is rejected by BOTH compilers with the
+    # SAME message (boot side strips only the error prefix).
+    let corpus: list[str] = glob_hls("tests/fail", "fail_stage85_")
+    let mut i: int = 0
+    while i < corpus.len() {
+        let bf: str = corpus.get(i)
+        let name: str = stem(bf)
+        let e: RunResult = boot_check_err(bf)
+        if e.code != 1 {
+            fail_msg(acc, "boot: " + name + " not rejected by boot")
+        } else {
+            let e2: RunResult = run_capture(hlc1, ["--audit", bf])
+            if e2.code == 0 {
+                fail_msg(acc, "boot: " + name + " accepted by hlc (parity)")
+            } else {
+                let m1: str = norm_stream(e.err, false)
+                let m2: str = norm_stream(e2.err, true)
+                check(acc, "boot: " + name + " rejected by both compilers (identical diagnostic)",
+                      m1 == m2 && m1.trim() != "",
+                      "boot: " + name + " diagnostics differ — boot: "
+                          + clip(first_line(e.err), 80) + " / hlc: "
+                          + clip(first_line(e2.err), 80))
+            }
+        }
+        i = i + 1
+    }
+
+    # The four CHECKED constructors are accepted by the checker and panic
+    # at run time.
+    let panics: list[str] = glob_hls("tests/ok", "panic_stage85_")
+    let mut j: int = 0
+    while j < panics.len() {
+        let bp: str = panics.get(j)
+        let name: str = stem(bp)
+        let chk: RunResult = boot_check_err(bp)
+        if chk.code == 0 {
+            let run: RunResult = run_capture("python3",
+                ["tools/hlinterp/boot.py", bp])
+            check(acc, "boot: " + name + " accepted, panics at run time",
+                  run.code == 101 && run.err != "",
+                  "boot: " + name + " did not panic (exit=" + run.code.to_str() + ")")
+        } else {
+            check(acc, "boot: " + name + " accepted, panics at run time",
+                  false, "boot: " + name + " must be ACCEPTED by the checker")
+        }
+        j = j + 1
+    }
+
+    # The emitted header really is in its section in the LINKED image.
+    if file_exists(hlc1) && which("objdump") {
+        let k_c: str = scratch(acc, "k85.c")
+        let k_elf: str = scratch(acc, "k85.elf")
+        let k1: RunResult = run_capture(hlc1, ["examples/boot_kernel.hls", k_c])
+        let k2: RunResult = run_capture("gcc",
+            ["-O2", "-ffreestanding", "-nostdlib", "-fno-pie", "-no-pie",
+             "-ffunction-sections", "-fno-stack-protector", "-T", "link.ld",
+             "-o", k_elf, k_c])
+        if k1.code == 0 && k2.code == 0 {
+            let dis: RunResult = run_capture("objdump", ["-h", k_elf])
+            check(acc, "boot: the kernel image carries .limine_requests",
+                  dis.combined.contains("limine_requests"),
+                  "boot: the kernel image has no .limine_requests")
+        } else {
+            check(acc, "boot: the kernel image carries .limine_requests",
+                  false, "boot: the kernel image did not link")
+        }
+    } else {
+        check(acc, "boot: the kernel image carries .limine_requests",
+              false, "boot: cannot link the kernel image (the native hlc is missing or no objdump)")
+    }
+
+    # The demo.
+    let bd_c: str = scratch(acc, "bd85.c")
+    let bd: str = scratch(acc, "bd85")
+    let d1: RunResult = run_capture(hlc1, ["examples/boot_demo.hls", bd_c])
+    if d1.code == 0 && gcc_build(bd_c, bd) {
+        let nat: RunResult = run_capture(bd, [])
+        check(acc, "boot: examples/boot_demo.hls runs natively, DEMO OK",
+              nat.out.contains("DEMO OK"), "boot: boot_demo did not print DEMO OK")
+    } else {
+        check(acc, "boot: examples/boot_demo.hls runs natively, DEMO OK",
+              false, "boot: boot_demo failed to build")
+    }
+
+    # make boot-acceptance runs end-to-end.
+    let m: RunResult = run_capture("make", ["boot-acceptance"])
+    check(acc, "boot: make boot-acceptance runs end-to-end",
+          m.code == 0 && m.combined.contains("ACCEPTANCE OK: Stage 85"),
+          clip(tail_lines(m.combined, 15), 120))
+}
+
+# ----------------------------------------------------------------------------
+# 23. Stage 86: core.interrupt — IDT/GDT declaration syntax
+# ----------------------------------------------------------------------------
+
+fn sec86_idt(acc: Acc, hlc1: str) -> void uses IO, Fs, Proc {
+    section("23. Stage 86: core.interrupt — IDT/GDT declaration syntax")
+
+    let idt_f: str = "tests/ok/feat_stage86_interrupt.hls"
+
+    # interpreter + module presence.
+    let a: RunResult = boot_run(idt_f)
+    check(acc, "idt: feat_stage86_interrupt runs on the interpreter (exit 0)",
+          a.code == 0, "idt: feat_stage86_interrupt interpreter exit=" + a.code.to_str())
+    check(acc, "idt: core/interrupt.hls present",
+          core_file_has("core/interrupt.hls", "fn page_fault_decode"),
+          "idt: core/interrupt.hls missing")
+
+    # fail programs: the parity protocol.
+    let corpus: list[str] = glob_hls("tests/fail", "fail_stage86_")
+    let mut i: int = 0
+    while i < corpus.len() {
+        let iff: str = corpus.get(i)
+        let name: str = stem(iff)
+        let e: RunResult = boot_check_err(iff)
+        if e.code != 1 {
+            fail_msg(acc, "idt: " + name + " not rejected by boot")
+        } else {
+            let e2: RunResult = run_capture(hlc1, ["--audit", iff])
+            if e2.code == 0 {
+                fail_msg(acc, "idt: " + name + " accepted by hlc (parity)")
+            } else {
+                let m1: str = norm_stream(e.err, false)
+                let m2: str = norm_stream(e2.err, true)
+                check(acc, "idt: " + name + " rejected by both compilers (identical diagnostic)",
+                      m1 == m2 && m1.trim() != "",
+                      "idt: " + name + " diagnostics differ — boot: "
+                          + clip(first_line(e.err), 80) + " / hlc: "
+                          + clip(first_line(e2.err), 80))
+            }
+        }
+        i = i + 1
+    }
+
+    # The emitted stub + table, compiled -Werror, read off the object.
+    if file_exists(hlc1) {
+        let idt_src: str = write_src(acc, "idtsrc.hls",
+            "#[irq_handler(14)]\n"
+                + "fn on_page_fault(frame: list[int]) -> void {\n"
+                + "    return\n"
+                + "}\n"
+                + "\n"
+                + "fn main() -> int {\n"
+                + "    return 0\n"
+                + "}\n")
+        let idt_c: str = scratch(acc, "idtsrc.c")
+        let c1: RunResult = run_capture(hlc1, [idt_src, idt_c])
+        if c1.code == 0 {
+            check(acc, "idt: the C carries a stub and the binding table",
+                  c_has(idt_c, "hl_irq_stub_14") && c_has(idt_c, "hl_idt_bindings"),
+                  "idt: the C is missing the stub or the table")
+            check(acc, "idt: the vector form avoids gcc's interrupt attribute",
+                  !c_has(idt_c, "__attribute__((interrupt))"),
+                  "idt: the vector form still uses gcc's interrupt attribute")
+            let idt_o: str = scratch(acc, "idtsrc.o")
+            if run_capture("gcc",
+                    ["-O2", "-Werror", "-ffreestanding", "-fno-pie", "-c",
+                     idt_c, "-o", idt_o]).code == 0 {
+                let nm: RunResult = run_capture("nm", [idt_o])
+                check(acc, "idt: the stub is a real code symbol",
+                      nm.combined.contains("T hl_irq_stub_14"),
+                      "idt: the stub is not a code symbol")
+            } else {
+                check(acc, "idt: the stub is a real code symbol",
+                      false, "idt: the annotated TU did not compile -Werror")
+            }
+        } else {
+            fail_msg(acc, "idt: the annotated program did not compile")
+        }
+    }
+
+    # The demo.
+    let id_c: str = scratch(acc, "id86.c")
+    let id: str = scratch(acc, "id86")
+    let d1: RunResult = run_capture(hlc1, ["examples/interrupt_demo.hls", id_c])
+    if d1.code == 0 && gcc_build(id_c, id) {
+        let nat: RunResult = run_capture(id, [])
+        check(acc, "idt: examples/interrupt_demo.hls runs natively, DEMO OK",
+              nat.out.contains("DEMO OK"), "idt: interrupt_demo did not print DEMO OK")
+    } else {
+        check(acc, "idt: examples/interrupt_demo.hls runs natively, DEMO OK",
+              false, "idt: interrupt_demo failed to build")
+    }
+
+    # the gate.
+    let m: RunResult = run_capture("make", ["idt-acceptance"])
+    check(acc, "idt: make idt-acceptance runs end-to-end",
+          m.code == 0 && m.combined.contains("ACCEPTANCE OK: Stage 86"),
+          clip(tail_lines(m.combined, 15), 120))
+}
+
+# ----------------------------------------------------------------------------
+# 24. Stage 87: core.mmio — memory-mapped I/O
+# ----------------------------------------------------------------------------
+
+# mmvol_src() — the volatile-read probe (the heredoc, verbatim).
+fn mmvol_src() -> str {
+    return "fn rd() -> int {\n"
+        + "    let mut lo: int = 0\n"
+        + "    let mut hi: int = 0\n"
+        + "    asm!(\"rdtsc\", out(\"rax\") lo, out(\"rdx\") hi)\n"
+        + "    return int_or(int_shl(int_and(hi, 4294967295), 32), int_and(lo, 4294967295))\n"
+        + "}\n"
+        + "\n"
+        + "fn main() -> int {\n"
+        + "    let a: int = rd()\n"
+        + "    let mut i: int = 0\n"
+        + "    while i < 4000000 {\n"
+        + "        i = i + 1\n"
+        + "    }\n"
+        + "    let b: int = rd()\n"
+        + "    if b < a {\n"
+        + "        return 1\n"
+        + "    }\n"
+        + "    if b == a {\n"
+        + "        return 2\n"
+        + "    }\n"
+        + "    return 0\n"
+        + "}\n"
+}
+
+fn sec87_mmio(acc: Acc, hlc1: str) -> void uses IO, Fs, Proc {
+    section("24. Stage 87: core.mmio — memory-mapped I/O")
+
+    let mm_f: str = "tests/ok/feat_stage87_mmio.hls"
+
+    # interpreter + module presence.
+    let a: RunResult = boot_run(mm_f)
+    check(acc, "mmio: feat_stage87_mmio runs on the interpreter (exit 0)",
+          a.code == 0, "mmio: feat_stage87_mmio interpreter exit=" + a.code.to_str())
+    check(acc, "mmio: core/mmio.hls present",
+          core_file_has("core/mmio.hls", "fn page_fault_decode")
+              || core_file_has("core/mmio.hls", "fn mmio_access_ok"),
+          "mmio: core/mmio.hls missing")
+
+    # A volatile DEVICE read must not be folded.
+    let mm_hls: str = write_src(acc, "mmvol.hls", mmvol_src())
+    let mm_c: str = scratch(acc, "mmvol.c")
+    let mm: str = scratch(acc, "mmvol")
+    let v1: RunResult = run_capture(hlc1, [mm_hls, mm_c])
+    let v2: RunResult = run_capture("gcc",
+        ["-O2", "-Werror", "-o", mm, mm_c, "-lm", "-pthread"])
+    if v1.code == 0 && v2.code == 0 {
+        let nat: RunResult = run_capture(mm, [])
+        check(acc, "mmio: a volatile device read is not folded",
+              nat.code == 0, "mmio: the volatile-read probe failed")
+    } else {
+        check(acc, "mmio: a volatile device read is not folded",
+              false, "mmio: the volatile-read probe did not build")
+    }
+
+    # The same probe -nostdlib: the ABI-alignment property.
+    let fs_hls: str = scratch(acc, "mmvolfs.hls")
+    write_file(fs_hls, "#![freestanding]\n" + mmvol_src())
+    let fs_c: str = scratch(acc, "mmvolfs.c")
+    let fs_bin: str = scratch(acc, "mmvolfs")
+    let f1: RunResult = run_capture(hlc1, [fs_hls, fs_c])
+    let f2: RunResult = nostdlib_build(fs_c, fs_bin)
+    if f1.code == 0 && f2.code == 0 {
+        let nat: RunResult = run_capture(fs_bin, [])
+        check(acc, "mmio: the volatile read works -nostdlib (naked entry)",
+              nat.code == 0, "mmio: the -nostdlib volatile probe failed")
+        check(acc, "mmio: the freestanding entry is naked",
+              c_has(fs_c, "naked, noreturn)) void _start"),
+              "mmio: the freestanding entry is not naked")
+    } else {
+        fail_msg(acc, "mmio: the -nostdlib volatile probe did not build")
+    }
+
+    # The checked constructors are accepted by the checker and panic at run.
+    let panics: list[str] = glob_hls("tests/ok", "panic_stage87_")
+    let mut j: int = 0
+    while j < panics.len() {
+        let mp: str = panics.get(j)
+        let name: str = stem(mp)
+        let chk: RunResult = boot_check_err(mp)
+        if chk.code == 0 {
+            let run: RunResult = run_capture("python3", ["tools/hlinterp/boot.py", mp])
+            check(acc, "mmio: " + name + " accepted, panics at run time",
+                  run.code == 101 && run.err != "",
+                  "mmio: " + name + " did not panic (exit=" + run.code.to_str() + ")")
+        } else {
+            check(acc, "mmio: " + name + " accepted, panics at run time",
+                  false, "mmio: " + name + " must be ACCEPTED by the checker")
+        }
+        j = j + 1
+    }
+
+    # The demo (asm + model) runs natively.
+    let md_c: str = scratch(acc, "mmd.c")
+    let md: str = scratch(acc, "mmd")
+    let d1: RunResult = run_capture(hlc1, ["examples/mmio_demo.hls", md_c])
+    let d2: RunResult = run_capture("gcc",
+        ["-O2", "-Werror", "-o", md, md_c, "-lm", "-pthread"])
+    if d1.code == 0 && d2.code == 0 {
+        let nat: RunResult = run_capture(md, [])
+        check(acc, "mmio: examples/mmio_demo.hls runs natively, DEMO OK",
+              nat.out.contains("DEMO OK"), "mmio: mmio_demo did not print DEMO OK")
+    } else {
+        check(acc, "mmio: examples/mmio_demo.hls runs natively, DEMO OK",
+              false, "mmio: mmio_demo failed to build")
+    }
+
+    # the gate.
+    let m: RunResult = run_capture("make", ["mmio-acceptance"])
+    check(acc, "mmio: make mmio-acceptance runs end-to-end",
+          m.code == 0 && m.combined.contains("ACCEPTANCE OK: Stage 87"),
+          clip(tail_lines(m.combined, 15), 120))
+}
+
+# ----------------------------------------------------------------------------
+# 25. Stage 88: core.port — x86 I/O ports
+# ----------------------------------------------------------------------------
+
+fn sec88_port(acc: Acc, hlc1: str) -> void uses IO, Fs, Proc {
+    section("25. Stage 88: core.port — x86 I/O ports")
+
+    let port_f: str = "tests/ok/feat_stage88_port.hls"
+
+    # interpreter + module presence.
+    let a: RunResult = boot_run(port_f)
+    check(acc, "port: feat_stage88_port runs on the interpreter (exit 0)",
+          a.code == 0, "port: feat_stage88_port interpreter exit=" + a.code.to_str())
+    check(acc, "port: core/port.hls present",
+          core_file_has("core/port.hls", "fn port_is_legal"),
+          "port: core/port.hls missing")
+
+    # The six real port instructions, and the disassembly that proves it.
+    let pd_c: str = scratch(acc, "portdemo.c")
+    let pd_elf: str = scratch(acc, "portdemo.elf")
+    let b1: RunResult = run_capture(hlc1, ["examples/port_demo.hls", pd_c])
+    let b2: RunResult = run_capture("gcc",
+        ["-O2", "-Werror", "-ffreestanding", "-nostdlib", "-fno-pie", "-no-pie",
+         "-ffunction-sections", "-fno-stack-protector", "-T", "link.ld",
+         "-o", pd_elf, pd_c])
+    if b1.code == 0 && b2.code == 0 {
+        let dis: RunResult = run_capture("objdump", ["-d", pd_elf])
+        let mut wants: list[str] = []
+        wants.push("out    %al,(%dx)")
+        wants.push("in     (%dx),%al")
+        wants.push("out    %eax,(%dx)")
+        wants.push("in     (%dx),%eax")
+        let mut i: int = 0
+        while i < wants.len() {
+            check(acc, "port: the image contains " + wants.get(i),
+                  dis.out.contains(wants.get(i)),
+                  "port: the image is missing " + wants.get(i))
+            i = i + 1
+        }
+        let nat: RunResult = run_capture(pd_elf, [])
+        check(acc, "port: the demo image runs (its main touches no port)",
+              nat.code == 0, "port: the demo image failed")
+    } else {
+        fail_msg(acc, "port: the demo image did not build")
+    }
+
+    # the gate.
+    let m: RunResult = run_capture("make", ["port-acceptance"])
+    check(acc, "port: make port-acceptance runs end-to-end",
+          m.code == 0 && m.combined.contains("ACCEPTANCE OK: Stage 88"),
+          clip(tail_lines(m.combined, 15), 120))
+}
+
+# ----------------------------------------------------------------------------
+# 26. Stage 89: DMA-safe buffer types
+# 27. Stage 90: core.sync.nolock — lock-free primitives
+# ----------------------------------------------------------------------------
+
+fn sec89_dma(acc: Acc, hlc1: str) -> void uses IO, Fs, Proc {
+    section("26. Stage 89: DMA-safe buffer types")
+
+    let dma_f: str = "tests/ok/feat_stage89_dma.hls"
+
+    let a: RunResult = boot_run(dma_f)
+    check(acc, "dma: feat_stage89_dma runs on the interpreter (exit 0)",
+          a.code == 0, "dma: feat_stage89_dma interpreter exit=" + a.code.to_str())
+    check(acc, "dma: core/dma.hls present",
+          core_file_has("core/dma.hls", "fn dma_desc_covers"),
+          "dma: core/dma.hls missing")
+
+    let d_c: str = scratch(acc, "dma_demo.c")
+    let d: str = scratch(acc, "dma_demo")
+    let d1: RunResult = run_capture(hlc1, ["examples/dma_demo.hls", d_c])
+    let d2: RunResult = run_capture("gcc",
+        ["-O2", "-Werror", "-o", d, d_c, "-lm", "-pthread"])
+    if d1.code == 0 && d2.code == 0 {
+        check(acc, "dma: examples/dma_demo.hls runs natively, exit 0",
+              run_capture(d, []).code == 0, "dma: dma_demo did not run")
+    } else {
+        check(acc, "dma: examples/dma_demo.hls runs natively, exit 0",
+              false, "dma: dma_demo failed to build")
+    }
+
+    let m: RunResult = run_capture("make", ["dma-acceptance"])
+    check(acc, "dma: make dma-acceptance runs end-to-end",
+          m.code == 0 && m.combined.contains("ACCEPTANCE OK: Stage 89"),
+          clip(tail_lines(m.combined, 15), 120))
+}
+
+fn sec90_atomics(acc: Acc, hlc1: str) -> void uses IO, Fs, Proc {
+    section("27. Stage 90: core.sync.nolock — lock-free primitives")
+
+    let at_f: str = "tests/ok/feat_stage90_atomics.hls"
+
+    let a: RunResult = boot_run(at_f)
+    check(acc, "atomics: feat_stage90_atomics runs on the interpreter (exit 0)",
+          a.code == 0, "atomics: feat_stage90_atomics interpreter exit=" + a.code.to_str())
+    check(acc, "atomics: core/atomics.hls present",
+          core_file_has("core/atomics.hls", "fn seqlock_read_ok"),
+          "atomics: core/atomics.hls missing")
+
+    # ZERO imports: the module must be usable from a freestanding image.
+    check(acc, "atomics: core/atomics.hls has zero imports (freestanding-clean)",
+          count_import_lines("core/atomics.hls") == 0,
+          "atomics: core/atomics.hls imports something")
+
+    let t_c: str = scratch(acc, "at_demo.c")
+    let t: str = scratch(acc, "at_demo")
+    let t1: RunResult = run_capture(hlc1, ["examples/atomics_demo.hls", t_c])
+    let t2: RunResult = run_capture("gcc",
+        ["-O2", "-Werror", "-o", t, t_c, "-lm", "-pthread"])
+    if t1.code == 0 && t2.code == 0 {
+        check(acc, "atomics: examples/atomics_demo.hls runs natively, exit 0",
+              run_capture(t, []).code == 0, "atomics: atomics_demo did not run")
+    } else {
+        check(acc, "atomics: examples/atomics_demo.hls runs natively, exit 0",
+              false, "atomics: atomics_demo failed to build")
+    }
+
+    let m: RunResult = run_capture("make", ["atomics-acceptance"])
+    check(acc, "atomics: make atomics-acceptance runs end-to-end",
+          m.code == 0 && m.combined.contains("ACCEPTANCE OK: Stage 90"),
+          clip(tail_lines(m.combined, 15), 120))
+}
+
+# ----------------------------------------------------------------------------
+# 28. Stage 91: verified interrupt-safety (no alloc in IRQ context)
+# ----------------------------------------------------------------------------
+
+fn sec91_irqsafe(acc: Acc, hlc1: str) -> void uses IO, Fs, Proc {
+    section("28. Stage 91: verified interrupt-safety (no alloc in IRQ context)")
+
+    let irq_f: str = "tests/ok/feat_stage91_irqsafe.hls"
+
+    let a: RunResult = boot_run(irq_f)
+    check(acc, "irqsafe: feat_stage91_irqsafe runs on the interpreter (exit 0)",
+          a.code == 0, "irqsafe: feat_stage91_irqsafe interpreter exit=" + a.code.to_str())
+
+    # (a) every Stage 91 fail program: rejected by Stage-0 AND by the
+    # self-hosted --audit (bin/hlc), with the same diagnostic
+    # (prefix-stripped, first line, line-number stripped).
+    let corpus: list[str] = glob_hls("tests/fail", "fail_stage91_")
+    let mut i: int = 0
+    while i < corpus.len() {
+        let ff: str = corpus.get(i)
+        let name: str = stem(ff)
+        let e: RunResult = boot_check_err(ff)
+        let h: RunResult = run_capture("./bin/hlc", ["--audit", ff])
+        let nb: str = norm_head(e.err, false)
+        let nh: str = norm_head(h.err, true)
+        check(acc, "irqsafe: " + name + " rejected identically by both front-ends",
+              e.code == 1 && h.code != 0 && nb == nh,
+              "irqsafe: " + name + " parity broken (boot rc=" + e.code.to_str()
+                  + ", hlc rc=" + h.code.to_str() + ")")
+        i = i + 1
+    }
+
+    # (b) the demo compiles -Werror and runs natively with exit 0.
+    let d_c: str = scratch(acc, "irq91_demo.c")
+    let d: str = scratch(acc, "irq91_demo")
+    let d1: RunResult = run_capture(hlc1, ["examples/irqsafe_demo.hls", d_c])
+    let d2: RunResult = run_capture("gcc",
+        ["-O2", "-Werror", "-o", d, d_c, "-lm", "-pthread"])
+    if d1.code == 0 && d2.code == 0 {
+        check(acc, "irqsafe: examples/irqsafe_demo.hls runs natively, exit 0",
+              run_capture(d, []).code == 0, "irqsafe: irqsafe_demo did not run")
+    } else {
+        check(acc, "irqsafe: examples/irqsafe_demo.hls runs natively, exit 0",
+              false, "irqsafe: irqsafe_demo failed to build")
+    }
+
+    # (c) --audit publishes the proof lines (bin/hlc).
+    let c: RunResult = run_capture("./bin/hlc", ["--audit", "examples/irqsafe_demo.hls"])
+    check(acc, "irqsafe: --audit publishes the per-handler proof lines",
+          c.out.contains("IRQ vector 32: 'pit_isr' — allocation-free"),
+          "irqsafe: --audit proof lines missing")
+
+    # (d) the gate itself.
+    let m: RunResult = run_capture("make", ["irqsafe-acceptance"])
+    check(acc, "irqsafe: make irqsafe-acceptance runs end-to-end",
+          m.code == 0 && m.combined.contains("ACCEPTANCE OK: Stage 91"),
+          clip(tail_lines(m.combined, 15), 120))
+}
+
+# ----------------------------------------------------------------------------
+# 29. Stage 92: cross-bootstrappable build (Stage-0 -> freestanding hlc)
+# 30.-33. Stages 93-96: the bare-metal triples + DWARF close-out
+# ----------------------------------------------------------------------------
+
+fn sec92_xboot(acc: Acc) -> void uses IO, Fs, Proc {
+    section("29. Stage 92: cross-bootstrappable build (Stage-0 -> freestanding hlc)")
+
+    # the gate builds bin/hlc-fs via the ladder.
+    let m: RunResult = run_capture("make", ["xbootstrap-acceptance"])
+    check(acc, "xbootstrap: make xbootstrap-acceptance runs end-to-end",
+          m.code == 0 && m.combined.contains("ACCEPTANCE OK: Stage 92"),
+          clip(tail_lines(m.combined, 15), 120))
+
+    # The freestanding binary exists after the gate and is honest about
+    # libc (a missing bin/hlc-fs is a FAIL naming the build recipe).
+    let fs_ok: bool = file_exists("bin/hlc-fs")
+        && !contains_libc_sym(run_capture("nm", ["-u", "bin/hlc-fs"]).out)
+    check(acc, "xbootstrap: bin/hlc-fs links with zero libc symbols",
+          fs_ok,
+          "xbootstrap: bin/hlc-fs missing or carries libc symbols — build it "
+              + "with `make bootstrap-nolibc` (the xbootstrap-acceptance ladder)")
+}
+
+# contains_libc_sym(text) — the `nm -u | grep -E 'fopen|malloc|printf|getenv'`
+# probe, as a str extension so the leg stays one line.
+fn contains_libc_sym(text: str) -> bool {
+    return text.contains("fopen") || text.contains("malloc")
+        || text.contains("printf") || text.contains("getenv")
+}
+
+fn sec93_triples(acc: Acc, hlc1: str) -> void uses IO, Fs, Proc {
+    section("30. Stage 93: target x86_64-unknown-none (bare-metal triple)")
+
+    # (a) the demo probe runs on the interpreter (exit 42).
+    let a: RunResult = boot_run("examples/bare_x86_64.hls")
+    check(acc, "triple93: bare_x86_64 probe computes 42 on the interpreter",
+          a.code == 42, "triple93: bare_x86_64 probe exit=" + a.code.to_str() + " (want 42)")
+
+    # (b) a float literal is refused under --target by BOTH front-ends
+    # with the same words, and stays legal WITHOUT the flag.
+    let bm_f: str = "tests/bare/fail_bare_float_literal.hls"
+    let b: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "--check", "--target", "x86_64-unknown-none", bm_f])
+    let h: RunResult = run_capture("./bin/hlc",
+        ["--target", "x86_64-unknown-none", bm_f, scratch(acc, "bm93.c")])
+    let mb: str = norm_greedy_stream(b.err)
+    let mh: str = norm_greedy_stream(h.err)
+    check(acc, "triple93: the float-literal probe rejected identically by both",
+          b.code != 0 && h.code != 0
+              && b.err.contains("bare-metal targets are integer-only")
+              && mb == mh,
+          "triple93: float-literal probe parity (boot rc=" + b.code.to_str()
+              + ", hlc rc=" + h.code.to_str() + ")")
+    let c: RunResult = boot_check_err(bm_f)
+    check(acc, "triple93: the probe is a legal hosted crate without --target",
+          c.code == 0,
+          "triple93: the probe is rejected without --target (not conditional)")
+
+    # (c) the gate itself.
+    let m: RunResult = run_capture("make", ["triple-x86_64-acceptance"])
+    check(acc, "triple93: make triple-x86_64-acceptance runs end-to-end",
+          m.code == 0 && m.combined.contains("ACCEPTANCE OK: Stage 93"),
+          clip(tail_lines(m.combined, 15), 120))
+}
+
+fn sec9495_close(acc: Acc) -> void uses IO, Proc {
+    section("31. Stage 94: target aarch64-unknown-none (bare-metal ARM)")
+    let m94: RunResult = run_capture("make", ["triple-aarch64-acceptance"])
+    check(acc, "triple94: make triple-aarch64-acceptance runs end-to-end",
+          m94.code == 0 && m94.combined.contains("ACCEPTANCE OK: Stage 94"),
+          clip(tail_lines(m94.combined, 15), 120))
+
+    section("32. Stage 95: target riscv64-unknown-none (bare-metal RISC-V)")
+    let m95: RunResult = run_capture("make", ["triple-riscv64-acceptance"])
+    check(acc, "triple95: make triple-riscv64-acceptance runs end-to-end",
+          m95.code == 0 && m95.combined.contains("ACCEPTANCE OK: Stage 95"),
+          clip(tail_lines(m95.combined, 15), 120))
+
+    section("33. Stage 96: ELF symbol-table emission + debug-info (DWARF 5)")
+    let m96: RunResult = run_capture("make", ["debuginfo-acceptance"])
+    check(acc, "stage96: make debuginfo-acceptance runs end-to-end",
+          m96.code == 0 && m96.combined.contains("ACCEPTANCE OK: Stage 96"),
+          clip(tail_lines(m96.combined, 15), 120))
+}
+
+# ----------------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Fs, Proc, Exit {
+    let acc: Acc = acc_new("suite_08_osdev")
+    let hlc1: str = build_hlc1(acc, "osdev sections")
+    sec77_freestanding(acc)
+    sec78_nostd(acc)
+    sec79_alloc(acc)
+    sec80_mem(acc)
+    sec81_panic(acc)
+    sec82_stack(acc, hlc1)
+    sec83_asmreg(acc, hlc1)
+    sec84_link(acc, hlc1)
+    sec85_boot(acc, hlc1)
+    sec86_idt(acc, hlc1)
+    sec87_mmio(acc, hlc1)
+    sec88_port(acc, hlc1)
+    sec89_dma(acc, hlc1)
+    sec90_atomics(acc, hlc1)
+    sec91_irqsafe(acc, hlc1)
+    sec92_xboot(acc)
+    sec93_triples(acc, hlc1)
+    sec9495_close(acc)
+    return finish(acc, "suite 08 -- osdev (Stages 77-96)")
+}

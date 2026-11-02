@@ -1,0 +1,404 @@
+# ============================================================================
+# tests/acc/suite_03_selfhost_acceptance.hls — the selfhost suite, in Halis.
+# ----------------------------------------------------------------------------
+# The Halis twin of the old tests/suites/suite_03_selfhost.sh (a sourced
+# fragment of the original run_tests.sh): same sections, same tools, same
+# needles — the harness is tests/acc/harness.hls and the gate runs native,
+# built by bin/hlc. Run with `make suite-03-selfhost-acceptance`.
+#
+# The old suite sourced a shared bash harness (ok/bad counters + a shared
+# mktemp TMP). This gate is standalone: every probe lives under
+# tests/.acc-scratch/suite_03_selfhost/ (wiped fresh by acc_new) and the
+# interpreted-compiler binary the suite chains through (the old $TMP/hlc1)
+# is rebuilt here when the legs need it, exactly like run_one_suite.sh did.
+#
+#  5. BOOTSTRAP          — hlc.hls self-compiles via Stage-0, gcc builds
+#                          the native compiler, pass 2 is byte-identical
+#                          (the fixed-point law), a sample program agrees
+#  6. Stage 18 tooling   — hltest discovers and passes the battery,
+#                          hlcov reports a total, hls-fuzz runs clean
+#  7. Stage 19 PGO       — --pgo-generate writes sane counters, --pgo-use
+#                          trains byte-identically, unflagged C stays
+#                          clean; the join builtin is differential-safe;
+#                          hlpgo report/merge/diff/v0 all hold
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.env"
+import "std.regex"
+
+# ----------------------------------------------------------------------------
+# The shared native-compiler build (the old $TMP/hlc1): Stage-0 interprets
+# the compiler source over itself, gcc links the result. Every leg that
+# needs a native hlc goes through this; the second caller reuses the path.
+# ----------------------------------------------------------------------------
+
+fn hlc1_path(acc: Acc) -> str uses Proc {
+    return scratch(acc, "hlc1")
+}
+
+fn build_hlc1(acc: Acc, name: str) -> str uses IO, Proc {
+    let hlc1: str = hlc1_path(acc)
+    if file_exists(hlc1) {
+        return hlc1
+    }
+    println("  [..] building the native compiler (" + name + ")")
+    let s1: str = scratch(acc, "hlc_nat.c")
+    let r: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "src/hlc.hls", "src/hlc.hls", s1])
+    if r.code != 0 {
+        return ""
+    }
+    if run_capture("gcc", ["-O2", "-o", hlc1, s1, "-lm", "-pthread"]).code != 0 {
+        return ""
+    }
+    return hlc1
+}
+
+# native_compile(hlc1, src, c_out, extra) — one native-hlc compile leg;
+# false when the compiler refused (the caller fails its check loudly).
+# run_capture(program, args) takes the args WITHOUT argv[0] — the list
+# starts with the flags, never with the program path.
+fn native_compile(acc: Acc, hlc1: str, src: str, c_out: str, extra: list[str]) -> bool uses Proc {
+    let argv: list[str] = []
+    let mut i: int = 0
+    while i < extra.len() {
+        argv.push(extra.get(i))
+        i = i + 1
+    }
+    argv.push(src)
+    argv.push(c_out)
+    return run_capture(hlc1, argv).code == 0
+}
+
+# gcc_build(c_src, bin_out) — the hosted link recipe every suite leg uses.
+fn gcc_build(c_src: str, bin_out: str) -> bool uses Proc {
+    return run_capture("gcc",
+        ["-O2", "-o", bin_out, c_src, "-lm", "-pthread"]).code == 0
+}
+
+# file_contains(path, needle) — grep without spawning: the probe files
+# here are small; the multi-MB compiler artifacts use the grep binary.
+fn file_contains(path: str, needle: str) -> bool uses Fs {
+    return read_file(path).contains(needle)
+}
+
+# parse_uint(s) — the digits of s as an int (0 when none); the awk
+# numeric comparisons the old suite relied on.
+fn parse_uint(s: str) -> int {
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c >= 48 && c <= 57 {
+            v = v * 10 + (c - 48)
+        }
+        i = i + 1
+    }
+    return v
+}
+
+# tail_line(text) — the last non-empty line, trimmed.
+fn tail_line(text: str) -> str {
+    let lines: list[str] = text.split("\n")
+    let mut i: int = lines.len() - 1
+    while i >= 0 {
+        let t: str = lines.get(i).trim()
+        if t != "" {
+            return t
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+# count_matching_lines(path, pattern) — grep -c on a file, via the grep
+# binary (the patterns are anchored BREs the plain substring census
+# cannot express).
+fn count_matching_lines(path: str, pattern: str) -> int uses Proc {
+    let r: RunResult = run_capture("grep", ["-c", pattern, path])
+    if r.code != 0 {
+        return 0
+    }
+    return parse_uint(first_line(r.out))
+}
+
+# field_of(text, needle, col) — the awk idiom: the first line containing
+# needle, split on whitespace, column col (0-based); "" when absent.
+fn field_of(text: str, needle: str, col: int) -> str {
+    let lines: list[str] = text.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).contains(needle) {
+            let parts: list[str] = lines.get(i).trim().split(" ")
+            let mut j: int = 0
+            let mut k: int = 0
+            while j < parts.len() {
+                if parts.get(j) != "" {
+                    if k == col {
+                        return parts.get(j)
+                    }
+                    k = k + 1
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# pgo_profile_path(acc) — the trained profile lives across sections 7.
+fn pgo_profile_path(acc: Acc) -> str uses Proc {
+    return scratch(acc, "pgo.hlcprof")
+}
+
+# join_probe_src() — the Stage-19 join probe (the heredoc, verbatim).
+fn join_probe_src() -> str {
+    return "fn main() -> int uses IO {\n"
+        + "    let parts: list[str] = [\"x\", \"yy\", \"zzz\"]\n"
+        + "    println(join(parts, \"-\"))\n"
+        + "    println(\"empty=[\" + join([], \",\") + \"]\")\n"
+        + "    let big: list[str] = []\n"
+        + "    let mut i: int = 0\n"
+        + "    while i < 5000 {\n"
+        + "        big.push(i.to_str())\n"
+        + "        i = i + 1\n"
+        + "    }\n"
+        + "    println(\"big join len = \" + join(big, \",\").len().to_str())\n"
+        + "    return 0\n"
+        + "}\n"
+}
+
+# ----------------------------------------------------------------------------
+# 5. BOOTSTRAP: hlc self-compiles (fixed-point)
+# ----------------------------------------------------------------------------
+
+fn section_bootstrap(acc: Acc) -> void uses IO, Fs, Proc {
+    section("5. BOOTSTRAP: hlc self-compiles (fixed-point)")
+
+    let s1: str = scratch(acc, "hlc_s1.c")
+    let r: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "src/hlc.hls", "src/hlc.hls", s1])
+    let pass1: bool = r.code == 0
+    check(acc, "hlc.hls self-compiles via Stage-0", pass1, clip(r.err, 120))
+
+    let hlc1: str = hlc1_path(acc)
+    let gcc_ok: bool = pass1 && gcc_build(s1, hlc1)
+    check(acc, "gcc compiles native hlc", gcc_ok, "")
+
+    let s2: str = scratch(acc, "hlc_s2.c")
+    let pass2: bool = gcc_ok
+        && run_capture(hlc1, ["src/hlc.hls", s2]).code == 0
+    check(acc, "native hlc compiles hlc.hls", pass2, "")
+
+    let same: bool = pass2 && run_capture("cmp", ["-s", s1, s2]).code == 0
+    check(acc, "BOOTSTRAP DETERMINISTIC: two passes produce identical output",
+          same, "")
+
+    let fib_c: str = scratch(acc, "fib.c")
+    let fib_bin: str = scratch(acc, "fib")
+    let nat_ok: bool = gcc_ok
+        && run_capture(hlc1, ["examples/fibonacci.hls", fib_c]).code == 0
+        && gcc_build(fib_c, fib_bin)
+    if nat_ok {
+        let nat: RunResult = run_capture(fib_bin, [])
+        let interp: RunResult = run_capture("python3",
+            ["tools/hlinterp/boot.py", "examples/fibonacci.hls"])
+        check(acc, "native hlc compiles + runs fibonacci correctly",
+              nat.out.trim() != "" && nat.out == interp.out, "")
+    } else {
+        check(acc, "native hlc compiles + runs fibonacci correctly", false,
+              "compile failed")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 6. Stage 18: testing ecosystem (hltest + hlcov + hls-fuzz)
+# ----------------------------------------------------------------------------
+
+fn section_tooling(acc: Acc) -> void uses IO, Proc {
+    section("6. Stage 18: testing ecosystem (hltest + hlcov)")
+
+    let ht: RunResult = run_capture("timeout",
+        ["60", "python3", "tools/hltest.py", "tests/ok/feat_stage18_hltest.hls"])
+    let ht_last: str = tail_line(ht.combined)
+    check(acc, "hltest discovers and passes the Stage 18 battery",
+          ht.code == 0 && ht_last.contains("0 fail"), ht_last)
+
+    let cov: RunResult = run_capture("python3",
+        ["tools/hlcov.py", "tests/ok/feat_stage18_hltest.hls"])
+    let mut cov_line: str = ""
+    let cov_lines: list[str] = cov.combined.split("\n")
+    let mut i: int = 0
+    while i < cov_lines.len() {
+        if cov_lines.get(i).contains("total:") {
+            cov_line = cov_lines.get(i).trim()
+        }
+        i = i + 1
+    }
+    check(acc, "hlcov reports a coverage total",
+          cov_line != "" && cov.combined.contains("blocks hit"), cov_line)
+
+    let fz: RunResult = run_capture("timeout",
+        ["15", "python3", "tools/hls-fuzz.py", "--time", "5", "--quiet"])
+    let fz_last: str = tail_line(fz.combined)
+    check(acc, "hls-fuzz runs 5s without a divergence",
+          fz.code == 0 && fz_last.contains("0 diverge"),
+          clip(fz_last, 120))
+}
+
+# ----------------------------------------------------------------------------
+# 7. Stage 19: profile-guided optimisation (PGO) + join + hlpgo
+# ----------------------------------------------------------------------------
+
+fn section_pgo(acc: Acc) -> void uses IO, Fs, Proc {
+    section("7. Stage 19: profile-guided optimisation (PGO)")
+
+    let hlc1: str = build_hlc1(acc, "PGO section")
+    let pgo_f: str = "tests/ok/feat_stage19_pgo.hls"
+    let gen_c: str = scratch(acc, "pgo_gen.c")
+    let gen_bin: str = scratch(acc, "pgo_gen_bin")
+
+    let gen_ok: bool = hlc1 != ""
+        && native_compile(acc, hlc1, pgo_f, gen_c, ["--pgo-generate"])
+        && gcc_build(gen_c, gen_bin)
+    check(acc, "pgo-generate: instrumented binary compiles", gen_ok, "")
+    if !gen_ok {
+        check(acc, "pgo-generate: .hlcprof has entry/branch/loop counters",
+              false, "no instrumented binary")
+        return
+    }
+
+    let prof: str = pgo_profile_path(acc)
+    env_set_var("HLS_PGO_FILE", prof)
+    let train_code: int = run_quiet(gen_bin, [])
+    env_unset_var("HLS_PGO_FILE")
+
+    let prof_txt: str = read_or(prof, "")
+    let prof_ok: bool = train_code == 0 && prof_txt != ""
+        && count_matching_lines(prof, "^e:main 1$") == 1
+        && count_matching_lines(prof, "^l:sum_upto:0 1000$") == 1
+        && run_capture("grep", ["-q", "^b:classify:0 ", prof]).code == 0
+    check(acc, "pgo-generate: .hlcprof has entry/branch/loop counters",
+          prof_ok, clip(prof_txt, 80))
+
+    let use_c: str = scratch(acc, "pgo_use.c")
+    let use_bin: str = scratch(acc, "pgo_use_bin")
+    let use_ok: bool = hlc1 != "" && file_exists(prof)
+        && native_compile(acc, hlc1, pgo_f, use_c, ["--pgo-use", prof])
+        && gcc_build(use_c, use_bin)
+    check(acc, "pgo-use: trained binary compiles", use_ok, "")
+    if use_ok {
+        let trained: RunResult = run_capture(use_bin, [])
+        let plain: RunResult = run_capture(gen_bin, [])
+        check(acc, "pgo-use: trained output byte-identical to plain build",
+              trained.out == plain.out && trained.out != "", "")
+        check(acc, "pgo-use: branch hints present in trained C",
+              file_contains(use_c, "__builtin_expect"), "")
+    } else {
+        check(acc, "pgo-use: trained output byte-identical to plain build",
+              false, "no trained binary")
+        check(acc, "pgo-use: branch hints present in trained C",
+              false, "no trained C")
+    }
+
+    let plain_c: str = scratch(acc, "pgo_plain.c")
+    let clean_ok: bool = gen_ok && file_contains(gen_c, "__hlc_pgo_counts")
+        && native_compile(acc, hlc1, pgo_f, plain_c, [])
+        && !file_contains(plain_c, "__hlc_pgo_counts")
+        && !file_contains(plain_c, "__builtin_expect")
+    check(acc, "pgo: unflagged build has zero instrumentation", clean_ok, "")
+
+    # The join builtin must be pure and differential-safe.
+    let j_src: str = write_src(acc, "join_check.hls", join_probe_src())
+    let j_c: str = scratch(acc, "join_check.c")
+    let j_bin: str = scratch(acc, "join_check_bin")
+    let j_interp: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", j_src])
+    let j_nat_ok: bool = run_capture("python3",
+            ["tools/hlinterp/boot.py", "src/hlc.hls", j_src, j_c]).code == 0
+        && gcc_build(j_c, j_bin)
+    if j_nat_ok {
+        let j_nat: RunResult = run_capture(j_bin, [])
+        check(acc, "join builtin: interpreter and native agree (O(n) path)",
+              j_interp.out == j_nat.out && j_nat.out.contains("big join len = 23889"),
+              clip(j_nat.out, 80))
+    } else {
+        check(acc, "join builtin: interpreter and native agree (O(n) path)",
+              false, "native compile failed")
+    }
+
+    # hlpgo: report / merge / diff / v0 backward compat, over the profile.
+    if prof_txt == "" {
+        check(acc, "pgo-report: hotness report lists entry/branch/loop sites + top-N fns",
+              false, "no profile available for hlpgo tests")
+        check(acc, "pgo-merge: forward-compatible v1 header written",
+              false, "no profile available for hlpgo tests")
+        check(acc, "pgo-merge: the merged counters are the sum",
+              false, "no profile available for hlpgo tests")
+        check(acc, "pgo-diff: per-site deltas reported",
+              false, "no profile available for hlpgo tests")
+        check(acc, "pgo-report: v0 (headerless) profile parses backward-compatibly",
+              false, "no profile available for hlpgo tests")
+        return
+    }
+
+    let rep: RunResult = run_capture("python3",
+        ["tools/hlpgo.py", "report", prof, "--top", "5"])
+    let rep_ok: bool = rep.code == 0
+        && rep.combined.contains("sites  :")
+        && rep.combined.contains("calls  :")
+        && rep.combined.contains("hottest functions")
+        && (rep.combined.contains("classify") || rep.combined.contains("sum_upto")
+            || rep.combined.contains("e:main"))
+    check(acc, "pgo-report: hotness report lists entry/branch/loop sites + top-N fns",
+          rep_ok, clip(first_line(rep.err), 120))
+
+    let a_prof: str = scratch(acc, "pgo_a.hlcprof")
+    let b_prof: str = scratch(acc, "pgo_b.hlcprof")
+    let m_prof: str = scratch(acc, "pgo_merged.hlcprof")
+    cp(prof, a_prof)
+    cp(prof, b_prof)
+    let merged_ok: bool = run_capture("python3",
+        ["tools/hlpgo.py", "merge", m_prof, a_prof, b_prof]).code == 0
+    if merged_ok {
+        let head1: str = first_line(read_file(m_prof))
+        check(acc, "pgo-merge: forward-compatible v1 header written",
+              head1 == "# hlcprof v1", head1)
+        let sample_id: str = field_of(read_file(a_prof), "e:", 0)
+        let sample_a: int = parse_uint(field_of(read_file(a_prof), sample_id, 1))
+        let sample_m: int = parse_uint(field_of(read_file(m_prof), sample_id, 1))
+        let doubled: bool = sample_a > 0 && sample_m == sample_a * 2
+        check(acc, "pgo-merge: the merged counters are the sum", doubled,
+              sample_id + " " + sample_a.to_str() + " -> " + sample_m.to_str())
+    } else {
+        check(acc, "pgo-merge: forward-compatible v1 header written",
+              false, "merge failed")
+        check(acc, "pgo-merge: the merged counters are the sum",
+              false, "merge failed")
+    }
+
+    let diff: RunResult = run_capture("python3",
+        ["tools/hlpgo.py", "diff", a_prof, m_prof, "--min-delta", "1000"])
+    check(acc, "pgo-diff: per-site deltas reported",
+          diff.code == 0 && diff.combined.contains("sites that differ by")
+              && diff.combined.contains("delta +"), clip(first_line(diff.err), 120))
+
+    let v0: RunResult = run_capture("python3", ["tools/hlpgo.py", "report", prof])
+    check(acc, "pgo-report: v0 (headerless) profile parses backward-compatibly",
+          v0.combined.contains("format : v0"), "")
+}
+
+# ----------------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Fs, Proc, Exit {
+    let acc: Acc = acc_new("suite_03_selfhost")
+    section_bootstrap(acc)
+    section_tooling(acc)
+    section_pgo(acc)
+    return finish(acc, "suite 03 -- selfhost (bootstrap, hltest, PGO)")
+}

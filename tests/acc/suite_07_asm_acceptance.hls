@@ -1,0 +1,612 @@
+# ============================================================================
+# tests/acc/suite_07_asm_acceptance.hls — the asm! suite, in Halis.
+# ----------------------------------------------------------------------------
+# The Halis twin of the old tests/suites/suite_07_asm.sh (a sourced fragment
+# of the original run_tests.sh): same single section, same tools, same
+# needles — the harness is tests/acc/harness.hls and the gate runs native,
+# built by bin/hlc.
+#
+# The old suite shared the bash $TMP and the ok()/bad() counters; this gate
+# is standalone: every probe lives under tests/.acc-scratch/suite_07_asm/
+# (wiped fresh by acc_new) and check() counts automatically. The native
+# compiler the suite chains through (the old $TMP/hlc1) is rebuilt here
+# when the legs need it.
+#
+#  18. Stage 27 asm!     — boot parses + checks the asm! syntax, the
+#                          self-hosted hlc lowers it to GCC extended asm
+#                          (clobbers, noreturn, pure), gcc -O2 -Werror is
+#                          clean, objdump proves the single `in`, the deep
+#                          -scan-17/18 hardening rejects every malformed
+#                          shape identically from both front-ends, the
+#                          bootstrap stays deterministic, asm_demo runs
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+
+# ----------------------------------------------------------------------------
+# The shared native-compiler build (the old $TMP/hlc1): Stage-0 interprets
+# the compiler source over itself, gcc links the result. Every leg that
+# needs a native hlc goes through this; the second caller reuses the path.
+# ----------------------------------------------------------------------------
+
+fn hlc1_path(acc: Acc) -> str uses Proc {
+    return scratch(acc, "hlc1")
+}
+
+fn build_hlc1(acc: Acc, name: str) -> str uses IO, Fs, Proc {
+    let hlc1: str = hlc1_path(acc)
+    if file_exists(hlc1) {
+        return hlc1
+    }
+    println("  [..] building the native compiler (" + name + ")")
+    let s1: str = scratch(acc, "hlc_nat.c")
+    let r: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "src/hlc.hls", "src/hlc.hls", s1])
+    if r.code != 0 {
+        return ""
+    }
+    if run_capture("gcc", ["-O2", "-o", hlc1, s1, "-lm", "-pthread"]).code != 0 {
+        return ""
+    }
+    return hlc1
+}
+
+# gcc_build(c_src, bin_out) — the hosted link recipe every suite leg uses.
+fn gcc_build(c_src: str, bin_out: str) -> bool uses Proc {
+    return run_capture("gcc",
+        ["-O2", "-o", bin_out, c_src, "-lm", "-pthread"]).code == 0
+}
+
+# gcc_werror_object(c_src, o_out) — the `-O2 -Werror -c` recipe the asm
+# legs compile their generated C with.
+fn gcc_werror_object(c_src: str, o_out: str) -> RunResult uses Proc {
+    return run_capture("gcc",
+        ["-O2", "-Werror", "-c", "-o", o_out, c_src, "-lm", "-pthread"])
+}
+
+# c_has(path, needle) — grep -q via the grep binary (the generated C
+# artifacts here are compiler outputs).
+fn c_has(path: str, needle: str) -> bool uses Proc {
+    return run_capture("grep", ["-q", needle, path]).code == 0
+}
+
+# parse_uint(s) — the digits of s as an int (0 when none).
+fn parse_uint(s: str) -> int {
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c >= 48 && c <= 57 {
+            v = v * 10 + (c - 48)
+        }
+        i = i + 1
+    }
+    return v
+}
+
+# count_matching_lines(path, pattern) — grep -c on a file via the binary.
+fn count_matching_lines(path: str, pattern: str) -> int uses Proc {
+    let r: RunResult = run_capture("grep", ["-c", pattern, path])
+    if r.code != 0 {
+        return 0
+    }
+    return parse_uint(first_line(r.out))
+}
+
+# next_line_contains(text, needle, want) — the `grep -A 1 needle | grep -q
+# want` idiom: the line AFTER the first needle line carries want.
+fn next_line_contains(text: str, needle: str, want: str) -> bool {
+    let lines: list[str] = text.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).contains(needle) {
+            if i + 1 < lines.len() {
+                return lines.get(i + 1).contains(want)
+            }
+            return false
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# line_pair(text, a, b) — the `grep -q "a.*b"` idiom: SOME single line
+# carries both a and b (grep works line by line).
+fn line_pair(text: str, a: str, b: str) -> bool {
+    let lines: list[str] = text.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).contains(a) && lines.get(i).contains(b) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# objdump_in_count(acc, o_path) — `objdump -d f.o | grep -E "in\s+\(%dx\),
+# %al|in\s+%dx,%al" | wc -l`: the disassembly is grepped for the single-in
+# shape of the inb() helper.
+fn objdump_in_count(acc: Acc, o_path: str) -> int uses Fs, Proc {
+    let dis: RunResult = run_capture("objdump", ["-d", o_path])
+    let tmp: str = scratch(acc, "objdump.txt")
+    write_file(tmp, dis.out)
+    let g: RunResult = run_capture("grep",
+        ["-cE", "in\\s+\\(%dx\\),%al|in\\s+%dx,%al", tmp])
+    if g.code != 0 {
+        return 0
+    }
+    return parse_uint(first_line(g.out))
+}
+
+# tail_lines(text, n) — the `tail -n` evidence idiom for fail details.
+fn tail_lines(text: str, n: int) -> str {
+    let lines: list[str] = text.split("\n")
+    let mut out: str = ""
+    let mut start: int = lines.len() - n
+    if start < 0 {
+        start = 0
+    }
+    let mut i: int = start
+    while i < lines.len() {
+        if lines.get(i).trim() != "" {
+            out = out + lines.get(i).trim() + " | "
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# boot_check_err(path) — `boot.py --check f 2>&1 >/dev/null`: the checker's
+# stderr, which is where the diagnostics live.
+fn boot_check_err(path: str) -> RunResult uses Proc {
+    let r: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "--check", path])
+    return r
+}
+
+# ----------------------------------------------------------------------------
+# 18. Stage 27: inline assembly (asm!)
+# ----------------------------------------------------------------------------
+
+fn section_asm(acc: Acc) -> void uses IO, Fs, Proc {
+    section("18. Stage 27: inline assembly (asm!)")
+
+    let hlc1: str = build_hlc1(acc, "asm section")
+
+    # (a) boot parses feat_stage27_asm.hls (smoke test).
+    let a: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "tests/ok/feat_stage27_asm.hls"])
+    check(acc, "asm: feat_stage27_asm.hls runs on the boot interpreter (no asm executed)",
+          a.code == 0 && a.combined.contains("ACCEPTANCE OK"),
+          clip(a.combined, 120))
+
+    # (b) the asm! syntax parses via boot's --check mode.
+    let b: RunResult = boot_check_err("tests/ok/feat_stage27_asm.hls")
+    check(acc, "asm: boot --check accepts the asm! syntax (types + effects valid)",
+          b.code == 0 && b.combined.contains("OK: types and effects valid"),
+          clip(b.combined, 120))
+
+    # (c) the self-hosted hlc.hls parses + checks feat_stage27_asm.hls.
+    let s27_c: str = scratch(acc, "s27.c")
+    let c: RunResult = run_capture(hlc1, ["tests/ok/feat_stage27_asm.hls", s27_c])
+    check(acc, "asm: self-hosted hlc compiles feat_stage27_asm.hls",
+          c.code == 0, clip(c.combined, 120))
+
+    # (d) the C source contains __asm__ on every asm!-containing function.
+    let asm_count: int = count_matching_lines(s27_c, "__asm__")
+    check(acc, "asm: C source has " + asm_count.to_str() + " __asm__ sites (6+ expected)",
+          asm_count >= 6,
+          "asm: C source has only " + asm_count.to_str() + " __asm__ sites (expected 6+)")
+
+    # (e) the C source contains the default clobber list ("cc", "memory").
+    check(acc, "asm: C source has default clobber list (\"cc\", \"memory\")",
+          c_has(s27_c, "\"cc\", \"memory\""),
+          "asm: C source missing default clobber list")
+
+    # (f) the noreturn option emits __builtin_unreachable() after the asm.
+    check(acc, "asm: noreturn option emits __builtin_unreachable()",
+          next_line_contains(read_or(s27_c, ""), "\"hlt\"", "__builtin_unreachable"),
+          "asm: noreturn option did not emit __builtin_unreachable()")
+
+    # (g) the pure option drops __volatile__ (gcc may elide if outputs unused).
+    check(acc, "asm: pure option drops __volatile__ (gcc may elide)",
+          c_has(s27_c, "__asm__ (\"mov"),
+          "asm: pure option did not drop __volatile__")
+
+    # (h) the C source compiles cleanly with gcc -O2 -Werror.
+    let s27_o: str = scratch(acc, "s27.o")
+    let h: RunResult = gcc_werror_object(s27_c, s27_o)
+    check(acc, "asm: C source compiles cleanly with gcc -O2 -Werror",
+          h.code == 0, clip(h.err, 120))
+
+    # (i) the inb() helper compiles to a SINGLE in instruction.
+    let in_count: int = objdump_in_count(acc, s27_o)
+    check(acc, "asm: inb() compiles to a single 'in' instruction (" + in_count.to_str() + " site(s))",
+          in_count >= 1,
+          "asm: inb() did not compile to a single 'in' instruction")
+
+    # (j) the interpreter raises a clean error if asm! is executed.
+    let run_hls: str = write_src(acc, "s27_run.hls",
+        "fn trigger_asm() -> void {\n"
+            + "    asm!(\"nop\")\n"
+            + "}\n"
+            + "fn main() -> int uses IO {\n"
+            + "    trigger_asm()\n"
+            + "    return 0\n"
+            + "}\n")
+    let j: RunResult = run_capture("python3", ["tools/hlinterp/boot.py", run_hls])
+    check(acc, "asm: interpreter raises a clean error when asm! is executed",
+          j.code != 0 && j.combined.contains("asm! cannot be executed by the boot interpreter"),
+          "asm: interpreter did not raise the expected asm! error " + clip(j.combined, 120))
+
+    # (k) the checker rejects an out-of-range {N} template placeholder.
+    let oob_hls: str = write_src(acc, "s27_bad_oob.hls",
+        "fn bad_oob() -> void {\n"
+            + "    let mut x: int = 0\n"
+            + "    asm!(\"mov {0}, {5}\", out(reg) x)\n"
+            + "}\n"
+            + "fn main() -> int uses IO {\n"
+            + "    return 0\n"
+            + "}\n")
+    let k: RunResult = boot_check_err(oob_hls)
+    check(acc, "asm: checker rejects out-of-range {5} template placeholder",
+          k.code != 0 && k.combined.contains("out of range"),
+          "asm: checker rejected {5} but with the wrong message " + clip(k.combined, 120))
+
+    # (l) the checker rejects options(pure) with no outputs.
+    let pure_hls: str = write_src(acc, "s27_bad_pure.hls",
+        "fn bad_pure() -> void {\n"
+            + "    asm!(\"nop\", options(pure))\n"
+            + "}\n"
+            + "fn main() -> int uses IO {\n"
+            + "    return 0\n"
+            + "}\n")
+    let l: RunResult = boot_check_err(pure_hls)
+    check(acc, "asm: checker rejects options(pure) with no outputs",
+          l.code != 0 && l.combined.contains("pure"),
+          "asm: checker rejected pure-no-outputs but with the wrong message "
+              + clip(l.combined, 120))
+
+    # (m) the checker rejects options(noreturn) with outputs.
+    let noret_hls: str = write_src(acc, "s27_bad_noret.hls",
+        "fn bad_noret() -> void {\n"
+            + "    let mut x: int = 0\n"
+            + "    asm!(\"nop\", out(reg) x, options(noreturn))\n"
+            + "}\n"
+            + "fn main() -> int uses IO {\n"
+            + "    return 0\n"
+            + "}\n")
+    let m: RunResult = boot_check_err(noret_hls)
+    check(acc, "asm: checker rejects options(noreturn) with outputs",
+          m.code != 0 && m.combined.contains("noreturn"),
+          "asm: checker rejected noreturn-with-outputs but with the wrong message "
+              + clip(m.combined, 120))
+
+    # (n) the checker rejects `out(reg) x` on an immutable variable.
+    let immut_hls: str = write_src(acc, "s27_bad_immut.hls",
+        "fn bad_immut() -> void {\n"
+            + "    let x: int = 0\n"
+            + "    asm!(\"nop\", out(reg) x)\n"
+            + "}\n"
+            + "fn main() -> int uses IO {\n"
+            + "    return 0\n"
+            + "}\n")
+    let n: RunResult = boot_check_err(immut_hls)
+    check(acc, "asm: checker rejects out(reg) on immutable x",
+          n.code != 0 && n.combined.contains("mut"),
+          "asm: checker rejected immutable out but with the wrong message "
+              + clip(n.combined, 120))
+
+    # (o) make asm-acceptance runs end-to-end.
+    let o: RunResult = run_capture("make", ["asm-acceptance"])
+    check(acc, "asm: make asm-acceptance runs end-to-end",
+          o.code == 0 && o.combined.contains("ACCEPTANCE OK"),
+          clip(tail_lines(o.combined, 10), 120))
+
+    # (p) bootstrap is deterministic with the asm! additions.
+    let p1_c: str = scratch(acc, "hlc_asm1.c")
+    let p2_c: str = scratch(acc, "hlc_asm2.c")
+    let p1: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "src/hlc.hls", "src/hlc.hls", p1_c])
+    let p2: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "src/hlc.hls", "src/hlc.hls", p2_c])
+    check(acc, "asm: bootstrap deterministic with asm! changes",
+          p1.code == 0 && p2.code == 0
+              && run_capture("cmp", ["-s", p1_c, p2_c]).code == 0,
+          "asm: bootstrap not deterministic with asm! changes")
+
+    # (q) the asm_demo.hls example compiles + runs cleanly (the safe
+    # helpers run on the host; the privileged ones are not called).
+    let demo_c: str = scratch(acc, "s27_demo.c")
+    let demo_bin: str = scratch(acc, "s27_demo")
+    let q: RunResult = run_capture(hlc1, ["examples/asm_demo.hls", demo_c])
+    let q_gcc: RunResult = run_capture("gcc",
+        ["-O2", "-o", demo_bin, demo_c, "-lm", "-pthread"])
+    if q.code == 0 && q_gcc.code == 0 {
+        let q_run: RunResult = run_capture(demo_bin, [])
+        check(acc, "asm: examples/asm_demo.hls runs cleanly (asm_add_one(41) -> 42)",
+              q_run.code == 0 && q_run.combined.contains("Stage 27 asm! demo:")
+                  && q_run.combined.contains("asm_add_one(41)  -> 42"),
+              "asm: examples/asm_demo.hls ran but output is unexpected "
+                  + clip(q_run.combined, 120))
+    } else {
+        check(acc, "asm: examples/asm_demo.hls runs cleanly (asm_add_one(41) -> 42)",
+              false, "asm: examples/asm_demo.hls failed to compile + link "
+                  + clip(q_gcc.err, 120))
+    }
+
+    # ======================================================================
+    # Stage 27 perfection (v0.50.2-alpha) deep-scan-17: the soundness
+    # hardening rejects every previously-opaque asm! shape.
+    # ======================================================================
+
+    # (r) checker rejects an unknown string-form constraint (`"exa"`).
+    let r_f: str = "tests/fail/fail_asm_bad_constraint_str.hls"
+    let r: RunResult = boot_check_err(r_f)
+    check(acc, "asm: checker rejects unknown string-form constraint 'exa'",
+          r.code != 0 && r.combined.contains("not a recognised x86-64 register name"),
+          "asm: rejected 'exa' but with the wrong message " + clip(r.combined, 120))
+
+    # (r-self) the self-hosted hlc rejects the same program (mirrors boot).
+    let r_c: str = scratch(acc, "s27_r.c")
+    let r2: RunResult = run_capture(hlc1, [r_f, r_c])
+    check(acc, "asm: self-hosted hlc rejects unknown string-form constraint 'exa'",
+          r2.code != 0 && r2.combined.contains("not a recognised x86-64 register name"),
+          "asm: self-hosted hlc rejected 'exa' but with the wrong message "
+              + clip(r2.combined, 120))
+
+    # (s) checker rejects duplicate options (`options(nomem, nomem)`).
+    let s_f: str = "tests/fail/fail_asm_dup_option.hls"
+    let s: RunResult = boot_check_err(s_f)
+    check(acc, "asm: checker rejects duplicate option 'nomem'",
+          s.code != 0 && s.combined.contains("appears more than once"),
+          "asm: rejected duplicate 'nomem' but with the wrong message "
+              + clip(s.combined, 120))
+
+    # (s-self) self-hosted mirror.
+    let s_c: str = scratch(acc, "s27_s.c")
+    let s2: RunResult = run_capture(hlc1, [s_f, s_c])
+    check(acc, "asm: self-hosted hlc rejects duplicate option 'nomem'",
+          s2.code != 0 && s2.combined.contains("appears more than once"),
+          "asm: self-hosted hlc rejected duplicate 'nomem' but with the wrong "
+              + "message " + clip(s2.combined, 120))
+
+    # (t) checker rejects pure + noreturn (contradictory).
+    let t: RunResult = boot_check_err("tests/fail/fail_asm_pure_noreturn.hls")
+    check(acc, "asm: checker rejects contradictory pure + noreturn",
+          t.code != 0 && t.combined.contains("contradictory"),
+          "asm: rejected pure+noreturn but with the wrong message "
+              + clip(t.combined, 120))
+
+    # (u) checker rejects pure without nomem.
+    let u: RunResult = boot_check_err("tests/fail/fail_asm_pure_without_nomem.hls")
+    check(acc, "asm: checker rejects pure without nomem",
+          u.code != 0 && line_pair(u.combined, "requires", "nomem"),
+          "asm: rejected pure-without-nomem but with the wrong message "
+              + clip(u.combined, 120))
+
+    # (v) checker rejects imm constraint on out/inout/late_out.
+    let v: RunResult = boot_check_err("tests/fail/fail_asm_imm_out.hls")
+    check(acc, "asm: checker rejects imm constraint on out direction",
+          v.code != 0 && line_pair(v.combined, "imm", "cannot be used"),
+          "asm: rejected imm-on-out but with the wrong message "
+              + clip(v.combined, 120))
+
+    # (w) checker rejects direction-prefix/constraint mismatch (`in("=r") x`).
+    let w: RunResult = boot_check_err("tests/fail/fail_asm_in_prefix_constraint.hls")
+    check(acc, "asm: checker rejects in(\"=r\") x (direction-prefix mismatch)",
+          w.code != 0 && w.combined.contains("direction prefix"),
+          "asm: rejected in(\"=r\") but with the wrong message " + clip(w.combined, 120))
+
+    # (x) the deep-scan-17 positive regression test runs on boot.
+    let x: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "tests/ok/feat_stage27_perfection.hls"])
+    check(acc, "asm: feat_stage27_perfection.hls runs on the boot interpreter",
+          x.code == 0 && x.combined.contains("deep-scan-17 hardening does not break valid asm!"),
+          clip(x.combined, 120))
+
+    # (x-check) the self-hosted hlc compiles it: 9+ __asm__ sites, gcc
+    # -O2 -Werror clean, inb() = a single `in`.
+    let x_c: str = scratch(acc, "s27_x.c")
+    let x_ok_name: str = "asm: feat_stage27_perfection.hls compiles + inb()=single 'in' instruction"
+    let x2: RunResult = run_capture(hlc1, ["tests/ok/feat_stage27_perfection.hls", x_c])
+    if x2.code == 0 {
+        let x_asm: int = count_matching_lines(x_c, "__asm__")
+        if x_asm >= 9 {
+            let x_o: str = scratch(acc, "s27_x.o")
+            let x_gcc: RunResult = gcc_werror_object(x_c, x_o)
+            if x_gcc.code == 0 {
+                let x_in: int = objdump_in_count(acc, x_o)
+                check(acc, x_ok_name + " (" + x_asm.to_str() + " __asm__ sites)",
+                      x_in >= 1,
+                      "asm: feat_stage27_perfection.hls inb() did not compile to a single 'in' instruction")
+            } else {
+                check(acc, x_ok_name, false,
+                    "asm: feat_stage27_perfection.hls C source fails to compile with gcc -O2 -Werror "
+                        + clip(x_gcc.err, 120))
+            }
+        } else {
+            check(acc, x_ok_name, false,
+                "asm: feat_stage27_perfection.hls C source has only " + x_asm.to_str()
+                    + " __asm__ sites (expected 9+)")
+        }
+    } else {
+        check(acc, x_ok_name, false,
+            "asm: self-hosted hlc failed to compile feat_stage27_perfection.hls "
+                + clip(x2.combined, 120))
+    }
+
+    # (y) boot --check accepts feat_stage27_perfection.hls.
+    let y: RunResult = boot_check_err("tests/ok/feat_stage27_perfection.hls")
+    check(acc, "asm: boot --check accepts feat_stage27_perfection.hls",
+          y.code == 0 && y.combined.contains("OK: types and effects valid"),
+          clip(y.combined, 120))
+
+    # (z) bootstrap is still deterministic with the deep-scan-17 checker
+    # additions.
+    let z1_c: str = scratch(acc, "hlc_ds17_1.c")
+    let z2_c: str = scratch(acc, "hlc_ds17_2.c")
+    let z1: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "src/hlc.hls", "src/hlc.hls", z1_c])
+    let z2: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "src/hlc.hls", "src/hlc.hls", z2_c])
+    check(acc, "asm: bootstrap deterministic with deep-scan-17 checker additions",
+          z1.code == 0 && z2.code == 0
+              && run_capture("cmp", ["-s", z1_c, z2_c]).code == 0,
+          "asm: bootstrap not deterministic with deep-scan-17 checker additions")
+
+    # ======================================================================
+    # Stage 27 perfection (v0.50.3-alpha) deep-scan-18: broader hardening.
+    # ======================================================================
+
+    # (aa) checker rejects in(imm) on a RUNTIME expression.
+    let aa: RunResult = boot_check_err("tests/fail/fail_asm_imm_runtime.hls")
+    check(acc, "asm: checker rejects in(imm) on runtime expr",
+          aa.code != 0 && aa.combined.contains("requires a compile-time constant"),
+          "asm: rejected in(imm)-runtime but with the wrong message "
+              + clip(aa.combined, 120))
+
+    # (bb) the deep-scan-18 positive regression test runs on boot.
+    let bb: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "tests/ok/feat_stage27_perfection2.hls"])
+    check(acc, "asm: feat_stage27_perfection2.hls runs on the boot interpreter",
+          bb.code == 0 && bb.combined.contains("deep-scan-18 hardening does not break valid programs"),
+          clip(bb.combined, 120))
+
+    # (bc) the self-hosted hlc compiles feat_stage27_perfection2.hls +
+    # gcc -O2 -Werror.
+    let bb_c: str = scratch(acc, "s27_bb.c")
+    let bb2: RunResult = run_capture(hlc1, ["tests/ok/feat_stage27_perfection2.hls", bb_c])
+    if bb2.code == 0 {
+        let bb_o: str = scratch(acc, "s27_bb.o")
+        let bc_gcc: RunResult = gcc_werror_object(bb_c, bb_o)
+        check(acc, "asm: feat_stage27_perfection2.hls compiles cleanly with gcc -O2 -Werror",
+              bc_gcc.code == 0,
+              "asm: feat_stage27_perfection2.hls C source fails to compile with gcc -O2 -Werror "
+                  + clip(bc_gcc.err, 120))
+    } else {
+        check(acc, "asm: feat_stage27_perfection2.hls compiles cleanly with gcc -O2 -Werror",
+              false, "asm: self-hosted hlc failed to compile feat_stage27_perfection2.hls "
+                  + clip(bb2.combined, 120))
+    }
+
+    # (bd) the BUG-05 fix does not break the stdlib math_sqrt finite path.
+    let bd_hls: str = write_src(acc, "s27_bd.hls",
+        "import \"std.math\"\n"
+            + "fn check_sqrt() -> int uses IO {\n"
+            + "    # sqrt(4) = 2.0, sqrt(2) ~= 1.41421..., sqrt(0) = 0.0\n"
+            + "    let s4: float = math_sqrt(4.0)\n"
+            + "    let s2: float = math_sqrt(2.0)\n"
+            + "    let s0: float = math_sqrt(0.0)\n"
+            + "    if s4 == 2.0 && s2 > 1.4142135 && s2 < 1.4142136 && s0 == 0.0 {\n"
+            + "        println(\"deep-scan-18: math_sqrt finite-path unchanged\")\n"
+            + "        return 0\n"
+            + "    }\n"
+            + "    println(\"FAIL: s4=\" + s4.to_str() + \" s2=\" + s2.to_str() + \" s0=\" + s0.to_str())\n"
+            + "    return 1\n"
+            + "}\n"
+            + "fn main() -> int uses IO {\n"
+            + "    return check_sqrt()\n"
+            + "}\n")
+    let bd: RunResult = run_capture("python3", ["tools/hlinterp/boot.py", bd_hls])
+    check(acc, "asm: math_sqrt finite-path unchanged (BUG-05 fix is sound)",
+          bd.code == 0 && bd.combined.contains("deep-scan-18: math_sqrt finite-path unchanged"),
+          clip(bd.combined, 120))
+
+    # (be) the BUG-02 fix does not break the proof const-eval normal path.
+    let be_hls: str = write_src(acc, "s27_be.hls",
+        "fn safe_div(a: int, b: int) -> int requires b != 0 {\n"
+            + "    return a / b\n"
+            + "}\n"
+            + "fn main() -> int uses IO {\n"
+            + "    # Normal division corner — must still work.\n"
+            + "    let r: int = safe_div(20, 4)\n"
+            + "    if r == 5 {\n"
+            + "        println(\"deep-scan-18: const_eval normal path unchanged\")\n"
+            + "        return 0\n"
+            + "    }\n"
+            + "    println(\"FAIL: safe_div(20,4)=\" + r.to_str())\n"
+            + "    return 1\n"
+            + "}\n")
+    let be: RunResult = run_capture("python3", ["tools/hlinterp/boot.py", be_hls])
+    check(acc, "asm: proof const_eval normal-path unchanged (BUG-02 fix is sound)",
+          be.code == 0 && be.combined.contains("const_eval normal path unchanged"),
+          clip(be.combined, 120))
+
+    # (bf) the BUG-03 cyclic-clone fix does not break non-cyclic clone.
+    let bf_hls: str = write_src(acc, "s27_bf.hls",
+        "struct Point { x: int, y: int }\n"
+            + "fn clone_smoke() -> int {\n"
+            + "    let p: Point = Point { x: 1, y: 2 }\n"
+            + "    let q: Point = clone(p)\n"
+            + "    # Mutating q must not affect p (deep clone).\n"
+            + "    return q.x + q.y + p.x + p.y  # 1+2+1+2 = 6\n"
+            + "}\n"
+            + "fn main() -> int uses IO {\n"
+            + "    let r: int = clone_smoke()\n"
+            + "    if r == 6 {\n"
+            + "        println(\"deep-scan-18: non-cyclic clone unchanged (BUG-03 fix is sound)\")\n"
+            + "        return 0\n"
+            + "    }\n"
+            + "    println(\"FAIL: clone_smoke()=\" + r.to_str())\n"
+            + "    return 1\n"
+            + "}\n")
+    let bf: RunResult = run_capture("python3", ["tools/hlinterp/boot.py", bf_hls])
+    check(acc, "asm: non-cyclic clone unchanged (BUG-03 fix is sound)",
+          bf.code == 0 && bf.combined.contains("non-cyclic clone unchanged"),
+          clip(bf.combined, 120))
+
+    # (bg) the BUG-04 struct-default effect fix does not break the
+    # struct-default machinery.
+    let bg_hls: str = write_src(acc, "s27_bg.hls",
+        "struct WithDefault {\n"
+            + "    x: int,\n"
+            + "    y: int = io_default()\n"
+            + "}\n"
+            + "fn io_default() -> int uses IO {\n"
+            + "    return 99\n"
+            + "}\n"
+            + "# This fn OMITS y -> the default IS evaluated -> this fn must use IO.\n"
+            + "fn construct_with_default() -> int uses IO {\n"
+            + "    let w: WithDefault = WithDefault { x: 1 }\n"
+            + "    return w.x + w.y\n"
+            + "}\n"
+            + "fn main() -> int uses IO {\n"
+            + "    let r: int = construct_with_default()\n"
+            + "    if r == 100 {\n"
+            + "        println(\"deep-scan-18: struct-default effect propagation unchanged (BUG-04 fix is sound)\")\n"
+            + "        return 0\n"
+            + "    }\n"
+            + "    println(\"FAIL: construct_with_default()=\" + r.to_str())\n"
+            + "    return 1\n"
+            + "}\n")
+    let bg: RunResult = run_capture("python3", ["tools/hlinterp/boot.py", bg_hls])
+    check(acc, "asm: struct-default effect propagation unchanged (BUG-04 fix is sound)",
+          bg.code == 0 && bg.combined.contains("struct-default effect propagation unchanged"),
+          clip(bg.combined, 120))
+
+    # (bh) bootstrap is still deterministic with the deep-scan-18
+    # codegen additions.
+    let b1_c: str = scratch(acc, "hlc_ds18_1.c")
+    let b2_c: str = scratch(acc, "hlc_ds18_2.c")
+    let b1: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "src/hlc.hls", "src/hlc.hls", b1_c])
+    let b2: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "src/hlc.hls", "src/hlc.hls", b2_c])
+    check(acc, "asm: bootstrap deterministic with deep-scan-18 codegen additions",
+          b1.code == 0 && b2.code == 0
+              && run_capture("cmp", ["-s", b1_c, b2_c]).code == 0,
+          "asm: bootstrap not deterministic with deep-scan-18 codegen additions")
+}
+
+# ----------------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Fs, Proc, Exit {
+    let acc: Acc = acc_new("suite_07_asm")
+    section_asm(acc)
+    return finish(acc, "suite 07 -- asm (inline assembly, deep-scan-17/18)")
+}

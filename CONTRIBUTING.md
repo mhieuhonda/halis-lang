@@ -123,8 +123,8 @@ tools/                   # The toolchain (mostly Halis) and the lab
 examples/                # Demonstration programs
 tests/ok/                # Valid programs (must compile + run)
 tests/fail/              # Programs that MUST be rejected
-tests/*_acceptance.py    # The acceptance batteries (one per law)
-tests/suites/            # make test sections, sourced in order
+tests/acc/*_acceptance.hls  # The acceptance gates, in Halis (one per law)
+tests/run_tests.sh       # the suite driver over the Halis gates
 Makefile, mk/            # Core targets; stage sections live in mk/
 ```
 

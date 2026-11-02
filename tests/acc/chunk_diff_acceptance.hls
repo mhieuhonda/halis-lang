@@ -1,0 +1,207 @@
+# ============================================================================
+# tests/acc/chunk_diff_acceptance.hls — the chunked differential runner.
+# ----------------------------------------------------------------------------
+# The Halis twin of the old tests/run_chunk_diff.sh: the same differential
+# loop as suite 01 section 3, sliced over tests/ok/*.hls by index so a CI
+# job (or a laptop) can chew the corpus in parallel chunks. Run with
+#
+#     make chunk-diff START=0 COUNT=64      (defaults: START=0, COUNT=all)
+#
+# or directly: bin/acc-chunk_diff <start_idx> <count>   (0-based start).
+# The harness is tests/acc/harness.hls; the gate runs native, built by
+# bin/hlc. Every probe lives under tests/.acc-scratch/chunk_diff/.
+#
+# Usage law (unchanged): a file passes when the interpreter's stdout and
+# exit code equal the native binary's, byte for byte after the `$(...)`
+# trailing-newline strip; libcurl is probed exactly like the shell did;
+# `#![freestanding]` crates take the freestanding link recipe.
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+
+struct LinkFlags {
+    cflags: str,
+    libs: str
+}
+
+# strip_trailing_nl(s) — the `$(...)` semantics the shell compared under.
+fn strip_trailing_nl(s: str) -> str {
+    let mut end: int = s.len()
+    while end > 0 && s.byte_at(end - 1) == 10 {
+        end = end - 1
+    }
+    return s.slice(0, end)
+}
+
+# first_lines(text, n) — the `head -n N` window.
+fn first_lines(text: str, n: int) -> str {
+    let lines: list[str] = text.split("\n")
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < n && i < lines.len() {
+        out = out + lines.get(i) + "\n"
+        i = i + 1
+    }
+    return out
+}
+
+# ok_corpus() — tests/ok/*.hls, sorted.
+fn ok_corpus() -> list[str] uses Fs {
+    let names: list[str] = fs_read_dir("tests/ok")
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < names.len() {
+        let n: str = names.get(i)
+        if n.len() > 4 && n.slice(n.len() - 4, n.len()) == ".hls" {
+            out.push(path_join3("tests/ok", n))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# is_freestanding(src) — the crate attribute inside the first five lines.
+fn is_freestanding(src: str) -> bool uses Fs {
+    return first_lines(read_file(src), 5).contains("#![freestanding]")
+}
+
+# curl_link_flags() — curl-config, then pkg-config; empty libs means the
+# guarded stub stays.
+fn curl_link_flags() -> LinkFlags uses Proc {
+    let mut f: LinkFlags = LinkFlags { cflags: "", libs: "" }
+    let cc: RunResult = run_capture("curl-config", ["--cflags"])
+    let cl: RunResult = run_capture("curl-config", ["--libs"])
+    if cl.code == 0 && cl.out.trim() != "" {
+        f.cflags = cc.out.trim()
+        f.libs = cl.out.trim()
+    } else {
+        let pc: RunResult = run_capture("pkg-config", ["--cflags", "libcurl"])
+        let pl: RunResult = run_capture("pkg-config", ["--libs", "libcurl"])
+        if pl.code == 0 && pl.out.trim() != "" {
+            f.cflags = pc.out.trim()
+            f.libs = pl.out.trim()
+        }
+    }
+    return f
+}
+
+# split_flags(argv, flags) — push a whitespace-split flag string.
+fn split_flags(argv: list[str], flags: str) -> void {
+    if flags == "" {
+        return
+    }
+    let parts: list[str] = flags.split(" ")
+    let mut i: int = 0
+    while i < parts.len() {
+        if parts.get(i) != "" {
+            argv.push(parts.get(i))
+        }
+        i = i + 1
+    }
+}
+
+# gcc_link(c_src, bin_out, freestanding, cflags, libs) — the two recipes.
+fn gcc_link(c_src: str, bin_out: str, freestanding: bool,
+            cflags: str, libs: str) -> bool uses Proc {
+    if freestanding {
+        let argv: list[str] = ["-O2", "-ffreestanding", "-nostdlib",
+            "-ffunction-sections", "-fno-stack-protector",
+            "-Wl,--gc-sections", "-o", bin_out, c_src]
+        return run_capture("gcc", argv).code == 0
+    }
+    let argv: list[str] = ["-O2"]
+    split_flags(argv, cflags)
+    argv.push("-o")
+    argv.push(bin_out)
+    argv.push(c_src)
+    argv.push("-lm")
+    argv.push("-pthread")
+    split_flags(argv, libs)
+    return run_capture("gcc", argv).code == 0
+}
+
+# chunk_slice(files, start, count) — the sed -n "$((START+1)),$((START+COUNT))p" slice.
+fn chunk_slice(files: list[str], start: int, count: int) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = start
+    while i < files.len() && i < start + count {
+        out.push(files.get(i))
+        i = i + 1
+    }
+    return out
+}
+
+# parse_uint(s) — the digits of s as an int (0 when none).
+fn parse_uint(s: str) -> int {
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c >= 48 && c <= 57 {
+            v = v * 10 + (c - 48)
+        } else {
+            break
+        }
+        i = i + 1
+    }
+    return v
+}
+
+fn main() -> int uses IO, Fs, Proc, Exit, Args {
+    let acc: Acc = acc_new("chunk_diff")
+    let argv: list[str] = args()
+    # args() carries argv[0] = the program itself; the slice spec follows.
+    # Bare invocation means the whole corpus, START=0.
+    let mut start: int = 0
+    let mut count_arg: int = 0
+    if argv.len() >= 2 {
+        start = parse_uint(argv.get(1))
+    }
+    if argv.len() >= 3 {
+        count_arg = parse_uint(argv.get(2))
+    }
+    let all: list[str] = ok_corpus()
+    let mut count: int = count_arg
+    if count <= 0 {
+        count = all.len()
+    }
+    let files: list[str] = chunk_slice(all, start, count)
+    println("chunk: " + files.len().to_str() + " files ("
+        + start.to_str() + " .. " + (start + files.len() - 1).to_str() + ")")
+
+    let flags: LinkFlags = curl_link_flags()
+    let mut i: int = 0
+    while i < files.len() {
+        let f: str = files.get(i)
+        let name: str = stem(f)
+        let interp: RunResult = run_capture("python3",
+            ["tools/hlinterp/boot.py", f])
+        let c_path: str = scratch(acc, name + ".c")
+        if run_capture("python3",
+                ["tools/hlinterp/boot.py", "src/hlc.hls", f, c_path]).code != 0 {
+            check(acc, name, false, "hlc compile failed")
+            i = i + 1
+            continue
+        }
+        let bin_path: str = scratch(acc, name + ".bin")
+        if !gcc_link(c_path, bin_path, is_freestanding(f),
+                     flags.cflags, flags.libs) {
+            check(acc, name, false, "gcc error")
+            i = i + 1
+            continue
+        }
+        let nat: RunResult = run_capture(bin_path, [])
+        if strip_trailing_nl(interp.out) == strip_trailing_nl(nat.out)
+                && interp.code == nat.code {
+            check(acc, name, true, "native matches interpreter")
+        } else {
+            check(acc, name, false, "interp=" + interp.code.to_str()
+                + " nat=" + nat.code.to_str()
+                + " interp head: " + clip(interp.out, 60))
+        }
+        i = i + 1
+    }
+    return finish(acc, "chunk differential -- ok[" + start.to_str() + " .. "
+        + (start + files.len() - 1).to_str() + "]")
+}

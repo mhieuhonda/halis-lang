@@ -1,0 +1,689 @@
+# ============================================================================
+# tests/acc/suite_04_optimizers_acceptance.hls — the optimizers suite, in Halis.
+# ----------------------------------------------------------------------------
+# The Halis twin of the old tests/suites/suite_04_optimizers.sh (a sourced
+# fragment of the original run_tests.sh): same sections, same tools, same
+# needles — the harness is tests/acc/harness.hls and the gate runs native,
+# built by bin/hlc.
+#
+# The old suite shared the bash $TMP and the ok()/bad() counters; this gate
+# is standalone: every probe lives under tests/.acc-scratch/suite_04_optimizers/
+# (wiped fresh by acc_new) and check()/pass_msg/fail_msg count automatically.
+# The native compiler the suite chains through (the old $TMP/hlc1) is rebuilt
+# here when the legs need it, exactly like the bash guard did.
+#
+#  8. Stage 20 LTO       — inlining + DCE across crates: byte-identical
+#                          output, the standalone definition dropped,
+#                          >= 15% binary size drop, --emit lto IR, the
+#                          && short-circuit regression, --lto-stats,
+#                          generic-instantiation dedup, --lto-threshold
+#  9. Stage 21 SIMD      — the intrinsic fast path, has_feature
+#                          const-folding, the acceptance benchmark, the
+#                          fused kernels (scalar + avx2 + sse4.2 + neon),
+#                          the 5003-element multi-block law, reduce_min/max,
+#                          --target-feature native auto-detection
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+
+# ----------------------------------------------------------------------------
+# The shared native-compiler build (the old $TMP/hlc1): Stage-0 interprets
+# the compiler source over itself, gcc links the result. Every leg that
+# needs a native hlc goes through this; the second caller reuses the path.
+# ----------------------------------------------------------------------------
+
+fn hlc1_path(acc: Acc) -> str uses Proc {
+    return scratch(acc, "hlc1")
+}
+
+fn build_hlc1(acc: Acc, name: str) -> str uses IO, Fs, Proc {
+    let hlc1: str = hlc1_path(acc)
+    if file_exists(hlc1) {
+        return hlc1
+    }
+    println("  [..] building the native compiler (" + name + ")")
+    let s1: str = scratch(acc, "hlc_nat.c")
+    let r: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "src/hlc.hls", "src/hlc.hls", s1])
+    if r.code != 0 {
+        return ""
+    }
+    if run_capture("gcc", ["-O2", "-o", hlc1, s1, "-lm", "-pthread"]).code != 0 {
+        return ""
+    }
+    return hlc1
+}
+
+# gcc_build(c_src, bin_out) — the hosted link recipe every suite leg uses.
+fn gcc_build(c_src: str, bin_out: str) -> bool uses Proc {
+    return run_capture("gcc",
+        ["-O2", "-o", bin_out, c_src, "-lm", "-pthread"]).code == 0
+}
+
+# c_has(path, needle) — grep -q via the grep binary (the generated C
+# artifacts here are compiler outputs; spawning grep is cheaper than
+# reading them into the gate).
+fn c_has(path: str, needle: str) -> bool uses Proc {
+    return run_capture("grep", ["-q", needle, path]).code == 0
+}
+
+# c_has_any(path, needles) — grep -q "a\|b\|..." without spawning per needle.
+fn c_has_any(path: str, needles: list[str]) -> bool uses Proc {
+    let mut i: int = 0
+    while i < needles.len() {
+        if c_has(path, needles.get(i)) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# parse_uint(s) — the digits of s as an int (0 when none); the awk/$(())
+# numeric comparisons the old suite relied on.
+fn parse_uint(s: str) -> int {
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c >= 48 && c <= 57 {
+            v = v * 10 + (c - 48)
+        }
+        i = i + 1
+    }
+    return v
+}
+
+# count_matching_lines(path, pattern) — grep -c on a file, via the grep
+# binary (0 when grep finds nothing, like the bash `|| true` guard).
+fn count_matching_lines(path: str, pattern: str) -> int uses Proc {
+    let r: RunResult = run_capture("grep", ["-c", pattern, path])
+    if r.code != 0 {
+        return 0
+    }
+    return parse_uint(first_line(r.out))
+}
+
+# stat_size(path) — `stat -c %s`; 0 when the file is missing.
+fn stat_size(path: str) -> int uses Proc {
+    let r: RunResult = run_capture("stat", ["-c", "%s", path])
+    if r.code != 0 {
+        return 0
+    }
+    return parse_uint(first_line(r.out))
+}
+
+# last_field_of(text, needle) — the `grep needle | awk '{print $NF}'` idiom:
+# the last whitespace field of the first line containing needle; "" when
+# the needle never appears.
+fn last_field_of(text: str, needle: str) -> str {
+    let lines: list[str] = text.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).contains(needle) {
+            let parts: list[str] = lines.get(i).trim().split(" ")
+            let mut last: str = ""
+            let mut j: int = 0
+            while j < parts.len() {
+                if parts.get(j) != "" {
+                    last = parts.get(j)
+                }
+                j = j + 1
+            }
+            return last
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# tail_containing(text, needle) — the `grep needle | tail -1` idiom.
+fn tail_containing(text: str, needle: str) -> str {
+    let lines: list[str] = text.split("\n")
+    let mut i: int = lines.len() - 1
+    while i >= 0 {
+        if lines.get(i).contains(needle) {
+            return lines.get(i).trim()
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+# has_exact_line(text, line) — the `grep -q "^line$"` idiom: some whole
+# line of the text equals line exactly.
+fn has_exact_line(text: str, line: str) -> bool {
+    let lines: list[str] = text.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i) == line {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# lines_with(text, needle) — the `grep needle` evidence dump for details.
+fn lines_with(text: str, needle: str) -> str {
+    let lines: list[str] = text.split("\n")
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).contains(needle) {
+            out = out + lines.get(i).trim() + " | "
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# 8. Stage 20: LTO across crates (inlining + DCE)
+# ----------------------------------------------------------------------------
+
+fn section_lto(acc: Acc) -> void uses IO, Fs, Proc {
+    section("8. Stage 20: LTO across crates (inlining + DCE)")
+
+    let hlc1: str = build_hlc1(acc, "LTO section")
+    let lto_f: str = "tests/ok/feat_stage20_lto.hls"
+    let interp: RunResult = run_capture("python3", ["tools/hlinterp/boot.py", lto_f])
+
+    # (a)-(c) the three-step Stage 20 acceptance: LTO build, plain build,
+    # then byte-identity + the inlining + the size law.
+    let l20_c: str = scratch(acc, "l20.c")
+    let l20_bin: str = scratch(acc, "l20_bin")
+    let l20p_c: str = scratch(acc, "l20p.c")
+    let l20p_bin: str = scratch(acc, "l20p_bin")
+    let built: bool = hlc1 != ""
+        && run_capture(hlc1, ["--lto", lto_f, l20_c]).code == 0
+        && gcc_build(l20_c, l20_bin)
+        && run_capture(hlc1, [lto_f, l20p_c]).code == 0
+        && gcc_build(l20p_c, l20p_bin)
+    if built {
+        let lto_out: str = run_capture(l20_bin, []).out.trim()
+        let lto_plain_out: str = run_capture(l20p_bin, []).out.trim()
+        check(acc, "lto: inlined binary output identical (interpreter = plain native = LTO native)",
+              lto_out == interp.out.trim() && lto_out == lto_plain_out,
+              "lto: output divergence")
+        # (a) the sort standalone definition must be GONE (fully inlined).
+        check(acc, "lto: list_sort_int_asc inlined into the caller, standalone definition dropped",
+              !c_has(l20_c, "usf_list_sort_int_asc"),
+              "lto: list_sort_int_asc was not inlined (standalone definition present)")
+        # (c) binary size drop >= 15%.
+        let sz_lto: int = stat_size(l20_bin)
+        let sz_plain: int = stat_size(l20p_bin)
+        let mut pct: int = 0
+        if sz_plain > 0 {
+            pct = 100 - sz_lto * 100 / sz_plain
+        }
+        check(acc, "lto: binary size " + sz_plain.to_str() + " -> " + sz_lto.to_str()
+                    + " bytes (" + pct.to_str()
+                    + "% drop, >= 15%)",
+              sz_plain > 0 && sz_lto <= sz_plain * 85 / 100,
+              "lto: binary size drop below 15% (" + sz_plain.to_str() + " -> "
+                  + sz_lto.to_str() + ")")
+    } else {
+        check(acc, "lto: inlined binary output identical (interpreter = plain native = LTO native)",
+              false, "lto: LTO compile failed")
+    }
+
+    # (d) --emit lto: whole-program LTO'd LLVM IR (DCE'd — fewer defines
+    # than the non-LTO emission).
+    let ll_lto: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "--emit", "lto", lto_f])
+    let l20_ll: str = scratch(acc, "l20.ll")
+    write_file(l20_ll, ll_lto.out)
+    let defs_lto: int = count_matching_lines(l20_ll, "^define")
+    let ll_plain: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "--emit", "llvm", lto_f])
+    let l20p_ll: str = scratch(acc, "l20p.ll")
+    write_file(l20p_ll, ll_plain.out)
+    let defs_plain: int = count_matching_lines(l20p_ll, "^define")
+    check(acc, "lto: --emit lto IR has " + defs_lto.to_str()
+                + " defines (non-LTO: " + defs_plain.to_str() + " — DCE applied)",
+          defs_lto > 0 && defs_lto < defs_plain,
+          "lto: --emit lto produced " + defs_lto.to_str() + " defines (non-LTO: "
+              + defs_plain.to_str() + ")")
+
+    # The && short-circuit regression (found by the LTO work): the native
+    # build must not eagerly evaluate the right operand of &&/||.
+    let sc_f: str = "tests/ok/feat_shortcircuit_slice.hls"
+    let sc: RunResult = run_capture("python3", ["tools/hlinterp/boot.py", sc_f])
+    let sc_c: str = scratch(acc, "sc.c")
+    let sc_bin: str = scratch(acc, "sc_bin")
+    let sc_built: bool = hlc1 != ""
+        && run_capture(hlc1, [sc_f, sc_c]).code == 0
+        && gcc_build(sc_c, sc_bin)
+    if sc_built {
+        let nat: RunResult = run_capture(sc_bin, [])
+        check(acc, "&& short-circuit: fresh right-operand subexpressions stay lazy (regression)",
+              nat.out.trim() == sc.out.trim() && nat.code == sc.code,
+              "&& short-circuit regression (interp=" + sc.code.to_str()
+                  + " native=" + nat.code.to_str() + ")")
+    } else {
+        check(acc, "&& short-circuit: fresh right-operand subexpressions stay lazy (regression)",
+              false, "&& short-circuit: native compile failed")
+    }
+
+    # Stage 20 perfection: --lto-stats, --lto-threshold, and generic
+    # instantiation dedup verification.
+    let dedup_f: str = "tests/ok/feat_stage20_lto_dedup.hls"
+    let dedup_interp: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", dedup_f])
+
+    # (a) --lto-stats prints a structured summary; the dedup program must
+    # show 1 generic struct instantiation and 2 generic fn instantiations.
+    let dedup_c: str = scratch(acc, "dedup.c")
+    let stats: RunResult = run_capture(hlc1, ["--lto-stats", dedup_f, dedup_c])
+    if stats.code == 0 {
+        check(acc, "lto-stats: structured summary correct (2 fn insts, 1 struct inst — dedup verified)",
+              stats.combined.contains("=== LTO stats ===")
+                  && stats.combined.contains("inline expansions (sites)")
+                  && stats.combined.contains("bodies dropped (phase A+B)")
+                  && stats.combined.contains("inline stmt budget")
+                  && stats.combined.contains("generic fn instantiations   : 2")
+                  && stats.combined.contains("generic struct instantiations: 1"),
+              clip(stats.combined, 120))
+    } else {
+        check(acc, "lto-stats: structured summary correct (2 fn insts, 1 struct inst — dedup verified)",
+              false, "lto-stats: --lto-stats compile failed")
+    }
+
+    # (b) the LTO binary must produce byte-identical output to the
+    # interpreter (differential on the dedup program).
+    let dedup_bin: str = scratch(acc, "dedup_bin")
+    if gcc_build(dedup_c, dedup_bin) {
+        let nat: RunResult = run_capture(dedup_bin, [])
+        check(acc, "lto-dedup: LTO binary output == interpreter (byte-identical)",
+              nat.out.trim() == dedup_interp.out.trim(),
+              "lto-dedup: divergence (interp vs LTO native) " + clip(nat.out, 80))
+    } else {
+        check(acc, "lto-dedup: LTO binary output == interpreter (byte-identical)",
+              false, "lto-dedup: gcc failed on LTO output")
+    }
+
+    # (c) the C output must contain exactly ONE definition of each Pair
+    # instantiation (dedup). Prototypes end in `;` — NOT definitions.
+    let pair_defs: int = count_matching_lines(dedup_c, "^static.*usf_new_Pair__int__int.*{$")
+    let pair_first_defs: int = count_matching_lines(dedup_c, "^int64_t usf_pair_first__int__int.*{$")
+    let pair_second_defs: int = count_matching_lines(dedup_c, "^int64_t usf_pair_second__int__int.*{$")
+    check(acc, "lto-dedup: 1 def each for Pair[int,int] / pair_first / pair_second (no duplicate instantiations)",
+          pair_defs == 1 && pair_first_defs == 1 && pair_second_defs == 1,
+          "lto-dedup: duplicate instantiations (Pair=" + pair_defs.to_str()
+              + " first=" + pair_first_defs.to_str()
+              + " second=" + pair_second_defs.to_str() + ")")
+
+    # (d) --lto-threshold=N controls inlining: threshold=5 must inline
+    # FEWER call sites than threshold=60.
+    let t5: RunResult = run_capture(hlc1,
+        ["--lto-threshold", "5", "--lto-stats", lto_f, scratch(acc, "lto_t5.c")])
+    let n5: int = parse_uint(last_field_of(t5.combined, "inline expansions (sites)"))
+    let t60: RunResult = run_capture(hlc1,
+        ["--lto-threshold", "60", "--lto-stats", lto_f, scratch(acc, "lto_t60.c")])
+    let n60: int = parse_uint(last_field_of(t60.combined, "inline expansions (sites)"))
+    check(acc, "lto-threshold: higher budget (60) inlines more (" + n5.to_str()
+                + " -> " + n60.to_str() + " expansions)",
+          n60 > n5,
+          "lto-threshold: threshold did not affect inline count (" + n5.to_str()
+              + " -> " + n60.to_str() + ")")
+
+    # (e) --lto-threshold rejects out-of-range values.
+    let bad: RunResult = run_capture(hlc1,
+        ["--lto-threshold", "0", dedup_f, scratch(acc, "bad.c")])
+    check(acc, "lto-threshold: out-of-range value (0) rejected",
+          bad.combined.contains("error: --lto-threshold"),
+          "lto-threshold: out-of-range value (0) not rejected")
+
+    # (f) boot.py accepts the new flags silently (no effect on interpreter).
+    let bo: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "--lto-stats", "--lto-threshold", "30", dedup_f])
+    check(acc, "lto-flags: boot.py accepts --lto-stats / --lto-threshold (interpreter unaffected)",
+          bo.out.trim() == dedup_interp.out.trim(),
+          "lto-flags: boot.py diverged with --lto-stats / --lto-threshold")
+}
+
+# ----------------------------------------------------------------------------
+# 9. Stage 21: SIMD vectorisation (std.simd + target features)
+# ----------------------------------------------------------------------------
+
+# feat_check_src() — the has_feature const-fold probe (the heredoc, verbatim).
+fn feat_check_src() -> str {
+    return "fn main() -> int uses IO {\n"
+        + "    if has_feature(\"avx2\") {\n"
+        + "        println(\"flag-on\")\n"
+        + "    } else {\n"
+        + "        println(\"flag-off\")\n"
+        + "    }\n"
+        + "    return 0\n"
+        + "}\n"
+}
+
+# fused_big_src() — the 5003-element multi-block probe (the heredoc,
+# verbatim; it lives in the repo ROOT as a dot-file so `import "std.simd"`
+# resolves — the import walker searches from the IMPORTING FILE's
+# directory upward).
+fn fused_big_src() -> str {
+    return "import \"std.simd\"\n"
+        + "\n"
+        + "fn build_list(n: int, seed: int) -> list[int] {\n"
+        + "    let xs: list[int] = []\n"
+        + "    let mut v: int = seed\n"
+        + "    let mut i: int = 0\n"
+        + "    while i < n {\n"
+        + "        v = (v * 1103515245 + 12345) % 2147483647\n"
+        + "        if v < 0 { v = 0 - v }\n"
+        + "        xs.push(v % 1000000)\n"
+        + "        i = i + 1\n"
+        + "    }\n"
+        + "    return xs\n"
+        + "}\n"
+        + "\n"
+        + "fn scalar_correlate8(xs: list[int], w0: int, w1: int, w2: int, w3: int,\n"
+        + "                      w4: int, w5: int, w6: int, w7: int) -> int {\n"
+        + "    let mut total: int = 0\n"
+        + "    let n: int = xs.len()\n"
+        + "    let mut i: int = 0\n"
+        + "    while i + 8 <= n {\n"
+        + "        total = total + xs.get(i) * w0 + xs.get(i + 1) * w1 + xs.get(i + 2) * w2\n"
+        + "            + xs.get(i + 3) * w3 + xs.get(i + 4) * w4 + xs.get(i + 5) * w5\n"
+        + "            + xs.get(i + 6) * w6 + xs.get(i + 7) * w7\n"
+        + "        i = i + 1\n"
+        + "    }\n"
+        + "    return total\n"
+        + "}\n"
+        + "\n"
+        + "fn main() -> int uses IO {\n"
+        + "    let xs: list[int] = build_list(5003, 7)\n"
+        + "    let ys: list[int] = build_list(5003, 11)\n"
+        + "    let c: int = scalar_correlate8(xs, 3, 1, 4, 1, 5, 9, 2, 6)\n"
+        + "    let v: int = simd_correlate8_sum_i32x4(xs, 3, 1, 4, 1, 5, 9, 2, 6)\n"
+        + "    if c != v {\n"
+        + "        println(\"correlate8 MISMATCH scalar=\" + c.to_str() + \" vector=\" + v.to_str())\n"
+        + "        return 1\n"
+        + "    }\n"
+        + "    println(\"correlate8(5003) = \" + v.to_str())\n"
+        + "    println(\"transform(5003) = \" + simd_transform_sum_i32x4(xs, ys, 3, 1).to_str())\n"
+        + "    return 0\n"
+        + "}\n"
+}
+
+fn section_simd(acc: Acc) -> void uses IO, Fs, Proc {
+    section("9. Stage 21: SIMD vectorisation (std.simd + target features)")
+
+    let hlc1: str = build_hlc1(acc, "SIMD section")
+    let simd_f: str = "tests/ok/feat_stage21_simd.hls"
+    let simd_interp_flag: str = run_capture("python3",
+        ["tools/hlinterp/boot.py", "--target-feature", "avx2", simd_f]).out
+    let arch: str = run_capture("uname", ["-m"]).out.trim()
+    let x86: bool = arch.contains("x86_64") || arch.contains("i386")
+        || arch.contains("i686")
+
+    if x86 {
+        # (a) the intrinsic fast path: --target-feature avx2 build must
+        # carry hl_simd_ helpers and agree with the interpreter.
+        let s21a_c: str = scratch(acc, "s21a.c")
+        let s21a_bin: str = scratch(acc, "s21a_bin")
+        let built: bool = hlc1 != ""
+            && run_capture(hlc1, ["--target-feature", "avx2", simd_f, s21a_c]).code == 0
+            && gcc_build(s21a_c, s21a_bin)
+        if built {
+            check(acc, "simd: intrinsic fast path present in --target-feature build",
+                  c_has(s21a_c, "hl_simd_"),
+                  "simd: fast path missing from --target-feature build")
+            let s21_out: str = run_capture(s21a_bin, []).out
+            check(acc, "simd: AVX2 fast path output == interpreter (byte-identical)",
+                  s21_out.trim() == simd_interp_flag.trim(),
+                  "simd: AVX2 fast path diverges from interpreter "
+                      + clip(s21_out, 80))
+        } else {
+            check(acc, "simd: intrinsic fast path present in --target-feature build",
+                  false, "simd: --target-feature avx2 compile failed")
+        }
+        # The unflagged native build must contain ZERO SIMD machinery
+        # (immintrin/NEON/RVV headers and intrinsics, plus the fast-path
+        # kernel names).
+        let s21u_c: str = scratch(acc, "s21_unflagged.c")
+        let mut leaks: list[str] = []
+        leaks.push("immintrin")
+        leaks.push("arm_neon")
+        leaks.push("riscv_vector")
+        leaks.push("_mm_")
+        leaks.push("vld1q_")
+        leaks.push("vst1q_")
+        leaks.push("__riscv_v")
+        leaks.push("hl_simd_add_i32x4")
+        let u_built: bool = hlc1 != ""
+            && run_capture(hlc1, [simd_f, s21u_c]).code == 0
+        check(acc, "simd: unflagged build has no SIMD helper emission",
+              u_built && !c_has_any(s21u_c, leaks),
+              "simd: SIMD machinery leaked into an unflagged build")
+    } else {
+        println("  [SKIP] non-x86 host: intrinsic fast-path check skipped")
+    }
+
+    # (b) the feature-flag const-folds has_feature in the native build.
+    let feat_hls: str = write_src(acc, "feat_check.hls", feat_check_src())
+    let fc_c: str = scratch(acc, "fc.c")
+    let fc_bin: str = scratch(acc, "fc_bin")
+    let fc_built: bool = hlc1 != ""
+        && run_capture(hlc1, ["--target-feature", "avx2", feat_hls, fc_c]).code == 0
+        && gcc_build(fc_c, fc_bin)
+    if fc_built {
+        let fc_out: str = run_capture(fc_bin, []).out.trim()
+        let fc_interp: str = run_capture("python3",
+            ["tools/hlinterp/boot.py", "--target-feature", "avx2", feat_hls]).out.trim()
+        check(acc, "simd: has_feature const-folds (native and interpreter agree)",
+              fc_out == "flag-on" && fc_interp == "flag-on",
+              "simd: has_feature mis-folded (native='" + fc_out
+                  + "' interp='" + fc_interp + "')")
+    } else {
+        check(acc, "simd: has_feature const-folds (native and interpreter agree)",
+              false, "simd: feature-flag compile failed")
+    }
+
+    # (c) the SIMD acceptance benchmark (checksum-gated everywhere; the
+    # >= 2x timing gate only on AVX2 hosts).
+    let s21b_c: str = scratch(acc, "s21b.c")
+    let s21b_bin: str = scratch(acc, "s21b_bin")
+    let s21b_out: str = scratch(acc, "s21b.out")
+    let bench_built: bool = hlc1 != ""
+        && run_capture(hlc1, ["--target-feature", "avx2",
+                              "benchmarks/simd_bench.hls", s21b_c]).code == 0
+        && gcc_build(s21b_c, s21b_bin)
+    if bench_built {
+        sh("cd '" + shell_quote(acc.root) + "' && '" + shell_quote(s21b_bin)
+            + "' > '" + shell_quote(s21b_out) + "' 2>&1")
+        let bench: str = read_or(s21b_out, "")
+        check(acc, "simd-bench: 1M-element kernel checksums MATCH (vector == scalar)",
+              bench.contains("checksums MATCH"),
+              "simd-bench: checksum mismatch")
+        if bench.contains("simd_cpu_supports(avx2) = true") {
+            if !file_exists("bin/simd-ratio") {
+                sh("cd '" + shell_quote(acc.root) + "' && make bin/simd-ratio >/dev/null 2>&1")
+            }
+            let ratio: RunResult = run_capture("./bin/simd-ratio",
+                ["--out", s21b_out, "--min", "2.0"])
+            if ratio.code == 0 {
+                pass_msg(acc, "simd-bench: acceptance ratio >= 2x ("
+                    + tail_containing(read_or(s21b_out, ""), "RATIO") + ")")
+            } else {
+                fail_msg(acc, "simd-bench: acceptance ratio below 2x")
+            }
+        } else {
+            println("  [SKIP] host CPU has no AVX2 — timing gate skipped (checksum still verified)")
+        }
+    } else {
+        check(acc, "simd-bench: 1M-element kernel checksums MATCH (vector == scalar)",
+              false, "simd-bench: compile failed")
+    }
+
+    # (c2) Stage 31 perfection: the harmonised fused kernels. The
+    # interpreter output must be byte-identical to the unflagged native
+    # build, the avx2 build and the sse4.2 build (out AND exit code).
+    let fused_f: str = "tests/ok/feat_stage31_simd_fused.hls"
+    let fused: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", fused_f])
+    let mut modes: list[str] = []
+    modes.push("")
+    modes.push("avx2")
+    modes.push("sse4.2")
+    let mut fused_fail: int = 0
+    let mut m: int = 0
+    while m < modes.len() {
+        let mode: str = modes.get(m)
+        let c_out: str = scratch(acc, "fused_" + mode + ".c")
+        let bin: str = scratch(acc, "fused_" + mode + ".bin")
+        let mut ok_name: str = "simd-fused: " + mode + " kernel output == interpreter (byte-identical)"
+        if mode == "" {
+            ok_name = "simd-fused: scalar-fallback output == interpreter (byte-identical)"
+        }
+        let argv: list[str] = []
+        if mode != "" {
+            argv.push("--target-feature")
+            argv.push(mode)
+        }
+        argv.push(fused_f)
+        argv.push(c_out)
+        let built: bool = hlc1 != ""
+            && run_capture(hlc1, argv).code == 0
+            && gcc_build(c_out, bin)
+        if built {
+            let nat: RunResult = run_capture(bin, [])
+            if !check(acc, ok_name,
+                      nat.out.trim() == fused.out.trim() && nat.code == fused.code,
+                      "simd-fused: " + mode + " kernel diverges from interpreter "
+                          + clip(nat.out, 80)) {
+                fused_fail = 1
+            }
+        } else {
+            check(acc, ok_name, false, "simd-fused: " + mode + " compile failed")
+            fused_fail = 1
+        }
+        m = m + 1
+    }
+
+    # (c3) Stage 31 perfection: multi-block native self-consistency — a
+    # 5,003-element list must give byte-identical output through the
+    # fallback and BOTH intrinsic paths.
+    write_file(".fused_big_tmp.hls", fused_big_src())
+    let mut ref_out: str = ""
+    let mut ref_rc: int = -1
+    let mut have_ref: bool = false
+    let mut m2: int = 0
+    while m2 < modes.len() {
+        let mode: str = modes.get(m2)
+        let c_out: str = scratch(acc, "fused_big_" + mode + ".c")
+        let bin: str = scratch(acc, "fused_big_" + mode + ".bin")
+        let argv: list[str] = []
+        if mode != "" {
+            argv.push("--target-feature")
+            argv.push(mode)
+        }
+        argv.push(".fused_big_tmp.hls")
+        argv.push(c_out)
+        let built: bool = hlc1 != ""
+            && run_capture(hlc1, argv).code == 0
+            && gcc_build(c_out, bin)
+        if built {
+            let nat: RunResult = run_capture(bin, [])
+            if !have_ref {
+                ref_out = nat.out
+                ref_rc = nat.code
+                have_ref = true
+            } else if nat.out.trim() != ref_out.trim() || nat.code != ref_rc {
+                fail_msg(acc, "simd-fused-big: " + mode
+                    + " output differs from the unflagged build (block boundary?)")
+                fused_fail = 1
+            }
+        } else {
+            fail_msg(acc, "simd-fused-big: " + mode + " compile failed")
+            fused_fail = 1
+        }
+        m2 = m2 + 1
+    }
+    if fused_fail == 0 && have_ref {
+        pass_msg(acc, "simd-fused-big: 5003-element multi-block output identical across fallback + avx2 + sse4.2")
+    }
+    rmrf(".fused_big_tmp.hls")
+
+    # (c4) Stage 31 perfection: the NEON link regression. Under
+    # --target-feature neon the fused kernels must be defined in BOTH the
+    # #if __aarch64__ branch and the #else branch.
+    let neon_c: str = scratch(acc, "fused_neon.c")
+    let neon_built: bool = hlc1 != ""
+        && run_capture(hlc1, ["--target-feature", "neon", fused_f, neon_c]).code == 0
+    if neon_built {
+        let n_corr: int = count_matching_lines(neon_c, "static int64_t hl_simd_correlate8_sum_i32x4")
+        let n_tran: int = count_matching_lines(neon_c, "static int64_t hl_simd_transform_sum_i32x4")
+        if n_corr == 2 && n_tran == 2 && c_has(neon_c, "vld1q_s32") {
+            check(acc, "simd-neon: fused kernels defined in BOTH branches (NEON + fallback) — no aarch64 link hole",
+                  true, "")
+            let neon_bin: str = scratch(acc, "fused_neon.bin")
+            if gcc_build(neon_c, neon_bin) {
+                let neon_out: str = run_capture(neon_bin, []).out
+                check(acc, "simd-neon: x86 fallback of the neon build == interpreter (byte-identical)",
+                      neon_out.trim() == fused.out.trim(),
+                      "simd-neon: fallback diverges from interpreter")
+            }
+        } else {
+            check(acc, "simd-neon: fused kernels defined in BOTH branches (NEON + fallback) — no aarch64 link hole",
+                  false, "simd-neon: fused kernels missing from a branch (correlate="
+                      + n_corr.to_str() + " transform=" + n_tran.to_str() + ")")
+        }
+    } else {
+        check(acc, "simd-neon: fused kernels defined in BOTH branches (NEON + fallback) — no aarch64 link hole",
+              false, "simd-neon: --target-feature neon compile failed")
+    }
+
+    # (d) the reduce_min/reduce_max values are correct (mixed-sign lanes).
+    let v2: RunResult = run_capture("python3", ["tools/hlinterp/boot.py", simd_f])
+    check(acc, "simd: reduce_min/reduce_max correct on mixed-sign lanes (-5, 7)",
+          has_exact_line(v2.out, "reduce_min: -5")
+              && has_exact_line(v2.out, "reduce_max: 7"),
+          "simd: reduce_min/reduce_max values wrong " + clip(lines_with(v2.out, "reduce_"), 100))
+
+    # (e) --target-feature native: auto-detects the host's best feature;
+    # interpreter and native must agree byte for byte.
+    let nat_interp: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "--target-feature", "native", simd_f])
+    let s21n_c: str = scratch(acc, "s21n.c")
+    let s21n_bin: str = scratch(acc, "s21n_bin")
+    let n_built: bool = hlc1 != ""
+        && run_capture(hlc1, ["--target-feature", "native", simd_f, s21n_c]).code == 0
+        && gcc_build(s21n_c, s21n_bin)
+    if n_built {
+        let s21n_out: str = run_capture(s21n_bin, []).out
+        check(acc, "simd: --target-feature native produces byte-identical output (interp == native)",
+              s21n_out.trim() == nat_interp.out.trim(),
+              "simd: --target-feature native diverged from interpreter "
+                  + clip(s21n_out, 80))
+        if s21n_out.contains("simd_cpu_supports(avx2) = true") {
+            check(acc, "simd: --target-feature native emitted intrinsic fast path on AVX2 host",
+                  c_has(s21n_c, "hl_simd_"),
+                  "simd: --target-feature native did not emit intrinsic fast path on AVX2 host")
+        }
+    } else {
+        check(acc, "simd: --target-feature native produces byte-identical output (interp == native)",
+              false, "simd: --target-feature native compile failed")
+    }
+
+    # (f) --target-feature native is accepted by boot.py and resolves to
+    # a concrete feature (avx2 on an AVX2 host).
+    check(acc, "simd: boot.py --target-feature native resolves to avx2 on AVX2 host",
+          has_exact_line(nat_interp.out, "has_feature(avx2) = true"),
+          "simd: boot.py --target-feature native did not resolve to avx2 "
+              + clip(lines_with(nat_interp.out, "has_feature"), 100))
+}
+
+# ----------------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Fs, Proc, Exit {
+    let acc: Acc = acc_new("suite_04_optimizers")
+    section_lto(acc)
+    section_simd(acc)
+    return finish(acc, "suite 04 -- optimizers (LTO + SIMD)")
+}
