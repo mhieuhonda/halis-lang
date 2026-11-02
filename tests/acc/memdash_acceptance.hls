@@ -1,0 +1,1048 @@
+# ============================================================================
+# tests/acc/memdash_acceptance.hls — Stage 137 acceptance gate, in Halis
+# (the Halis twin of tests/memdash_acceptance.py; same eight sections,
+# same laws, same needles — the harness is tests/acc/harness.hls and
+# the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make memdash-acceptance`.
+#
+#  1. the convention     — usage exits 2; missing/empty ledgers refuse
+#  2. the record law     — the REAL hls-rss instruments file the tracked
+#                          suite pinned to live HEAD; the bundle round trip;
+#                          the git refusals; the dirty-tree refusal
+#  3. the floor law      — verdict / sample / trace / slope / unit refusals
+#  4. the page law       — no-change / regressed / within-noise / improved,
+#                          the band floor, the rename law
+#  5. the gate law       — sanctions, --baseline laws, the unit law (page
+#                          size), the suite law, --threshold + --floor
+#  6. the determinism    — byte-identical dashboards, --stamp, the trend
+#                          tables, the slope watch, the mid band, the n/a
+#  7. the ledger law     — every corrupt line is a named error naming the
+#                          line; --workload filters
+#  8. the corpus         — the showcase boots, formats, lints, runs green
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.json"
+import "std.sha256"
+import "std.env"
+
+# ----------------------------------------------------------------------------
+# Shared helpers (the size / ctime toolkit, same laws).
+# ----------------------------------------------------------------------------
+
+struct MdRun {
+    code: int,
+    out: str,
+    err: str
+}
+
+fn mem(argv: list[str]) -> MdRun uses Proc {
+    let full: list[str] = ["tools/hls-mem.py"]
+    let mut i: int = 0
+    while i < argv.len() {
+        full.push(argv.get(i))
+        i = i + 1
+    }
+    let r: RunResult = run_capture("python3", full)
+    return MdRun { code: r.code, out: r.out, err: r.err }
+}
+
+fn starts_with(s: str, prefix: str) -> bool {
+    if s.len() < prefix.len() {
+        return false
+    }
+    return s.slice(0, prefix.len()) == prefix
+}
+
+fn repeat_str(s: str, n: int) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < n {
+        out = out + s
+        i = i + 1
+    }
+    return out
+}
+
+fn nul() -> str {
+    return chr(0)
+}
+
+fn hex40(n: int) -> str {
+    let digits: str = "0123456789abcdef"
+    let mut v: int = n
+    let mut s: str = ""
+    if v == 0 {
+        s = "0"
+    }
+    while v > 0 {
+        s = digits.slice(v % 16, v % 16 + 1) + s
+        v = v / 16
+    }
+    while s.len() < 40 {
+        s = "0" + s
+    }
+    return s
+}
+
+fn file_sha(path: str) -> str uses Fs {
+    return sha256_hex(read_file(path))
+}
+
+# suite_digest_of(dirpath) — the tracked suite digest, names AND bytes.
+fn suite_digest_of(dirpath: str) -> str uses Fs {
+    let names: list[str] = fs_read_dir(dirpath)
+    let mut body: str = ""
+    let mut i: int = 0
+    while i < names.len() {
+        let n: str = names.get(i)
+        if n.len() > 4 && n.slice(n.len() - 4, n.len()) == ".hls" {
+            body = body + n.slice(0, n.len() - 4) + nul()
+                + read_file(path_join3(dirpath, n)) + nul()
+        }
+        i = i + 1
+    }
+    return sha256_hex(body)
+}
+
+# ----------------------------------------------------------------------------
+# std.json build/read helpers.
+# ----------------------------------------------------------------------------
+
+fn jobject(keys: list[str], vals: list[JsonValue]) -> JsonValue {
+    return JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+                       sval: "", arr: [], obj_keys: keys, obj_vals: vals }
+}
+
+fn jarr(items: list[JsonValue]) -> JsonValue {
+    return JsonValue { kind: "array", bval: false, ival: 0, fval: 0.0,
+                       sval: "", arr: items, obj_keys: [], obj_vals: [] }
+}
+
+fn ints_json(vals: list[int]) -> JsonValue {
+    let out: list[JsonValue] = []
+    let mut i: int = 0
+    while i < vals.len() {
+        out.push(json_int(vals.get(i)))
+        i = i + 1
+    }
+    return jarr(out)
+}
+
+# cycle_points — [[i, float(i), hw] for i in range(50)].
+fn cycle_points(hw: int) -> JsonValue {
+    let out: list[JsonValue] = []
+    let mut i: int = 0
+    while i < 50 {
+        let row: list[JsonValue] = [json_int(i), json_int(i) , json_int(hw)]
+        out.push(jarr(row))
+        i = i + 1
+    }
+    return jarr(out)
+}
+
+# synth_rss(hw, verdict, slope, tool, with_traces, with_slope).
+fn synth_rss(hw: int, verdict: str, slope: float, tool: str,
+             with_traces: bool, with_slope: bool) -> JsonValue {
+    let config: JsonValue = jobject(
+        ["cycles", "interval", "threshold", "warmup"],
+        [json_int(40), json_float(10.0), json_float(0.25), json_int(10)])
+    let cps: JsonValue = cycle_points(hw)
+    let tl_row: list[JsonValue] = [json_float(0.5), json_int(hw)]
+    let timeline: JsonValue = jarr([jarr(tl_row)])
+    let empty_tl: JsonValue = jarr([])
+    let mut tl: JsonValue = timeline
+    let mut pts: JsonValue = cps
+    if !with_traces {
+        tl = empty_tl
+        pts = empty_tl
+    }
+    let run_a: JsonValue = jobject(
+        ["cycle_points", "observed_markers", "rc", "timeline"],
+        [pts, json_int(50), json_int(0), tl])
+    let slope_full: JsonValue = jobject(
+        ["ci", "slope", "unit", "verdict"],
+        [jarr([json_float(slope - 0.01), json_float(slope + 0.01)]),
+         json_float(slope), json_str("page/cycle"), json_str("stable")])
+    let slope_min: JsonValue = jobject(["verdict"], [json_str("stable")])
+    let mut sl: JsonValue = slope_full
+    if !with_slope {
+        sl = slope_min
+    }
+    return jobject(
+        ["config", "run_a", "slope", "tool", "verdict", "version", "workload"],
+        [config, run_a, sl,
+         json_str(tool), json_str(verdict), json_str("0.143.0-alpha"),
+         json_str("watched")])
+}
+
+# five_reports(hw_list, verdict, with_traces, with_slope) — one per sample.
+fn five_reports(vals: list[int], verdict: str, with_traces: bool,
+                with_slope: bool) -> JsonValue {
+    let out: list[JsonValue] = []
+    let mut i: int = 0
+    while i < vals.len() {
+        out.push(synth_rss(vals.get(i), verdict, 0.0, "hls-rss",
+                           with_traces, with_slope))
+        i = i + 1
+    }
+    return jarr(out)
+}
+
+# synth_bundle(hw_list, workload, env, verdict, tool_of_reports,
+#              with_traces, with_slope) — every knob the battery turned.
+fn synth_bundle(vals: list[int], workload: str, env: JsonValue,
+                verdict: str, tool_of_reports: str, with_traces: bool,
+                with_slope: bool) -> JsonValue {
+    let reports: list[JsonValue] = []
+    let mut i: int = 0
+    while i < vals.len() {
+        reports.push(synth_rss(vals.get(i), verdict, 0.0, tool_of_reports,
+                               with_traces, with_slope))
+        i = i + 1
+    }
+    let wl_keys: list[str] = [workload]
+    let wl_vals: list[JsonValue] = [jarr(reports)]
+    let mut keys: list[str] = ["tool", "version", "workloads"]
+    let mut vals2: list[JsonValue] = [json_str("hls-mem-bundle"),
+        json_str("0.155.0"), jobject(wl_keys, wl_vals)]
+    if json_is_object(env) && env.obj_keys.len() > 0 {
+        keys.push("env")
+        vals2.push(env)
+    }
+    return jobject(keys, vals2)
+}
+
+fn base_hw() -> list[int] {
+    let out: list[int] = [200, 200, 200, 200, 200]
+    return out
+}
+
+fn scaled_up_hw() -> list[int] {
+    let out: list[int] = [280, 280, 280, 280, 280]
+    return out
+}
+
+fn in_band_hw() -> list[int] {
+    let out: list[int] = [210, 210, 210, 210, 210]
+    return out
+}
+
+fn scaled_down_hw() -> list[int] {
+    let out: list[int] = [120, 120, 120, 120, 120]
+    return out
+}
+
+fn default_env() -> JsonValue {
+    return jobject([], [])
+}
+
+fn page_env(sz: int) -> JsonValue {
+    return jobject(["page_size"], [json_int(sz)])
+}
+
+fn write_bundle(acc: Acc, obj: JsonValue) -> str uses Fs, Proc {
+    let p: str = scratch(acc, "in.json")
+    write_file(p, json_stringify(obj) + "\n")
+    return p
+}
+
+fn record_from(acc: Acc, bundle_obj: JsonValue, history: str, commit: str,
+               extra: list[str]) -> MdRun uses Fs, Proc {
+    let bp: str = write_bundle(acc, bundle_obj)
+    let argv: list[str] = ["record", "--from-bundle", bp,
+                           "--commit", commit, "--history", history]
+    let mut i: int = 0
+    while i < extra.len() {
+        argv.push(extra.get(i))
+        i = i + 1
+    }
+    return mem(argv)
+}
+
+fn parse_json_or_null(text: str) -> JsonValue {
+    let rr: Result[JsonValue, str] = json_parse_result(text)
+    if result_is_ok(rr) {
+        return result_unwrap(rr)
+    }
+    return json_null()
+}
+
+fn jstr(v: JsonValue, key: str) -> str {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_str(x) {
+        return json_str_value(x)
+    }
+    return ""
+}
+
+fn jint(v: JsonValue, key: str) -> int {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_int(x) {
+        return json_int_value(x)
+    }
+    return -1
+}
+
+fn jfloat(v: JsonValue, key: str) -> float {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_float(x) {
+        return json_float_value(x)
+    }
+    if json_is_int(x) {
+        return json_int_value(x).to_float()
+    }
+    return -1.0
+}
+
+fn jobj(v: JsonValue, key: str) -> JsonValue {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_object(x) {
+        return x
+    }
+    return json_null()
+}
+
+fn jarray(v: JsonValue, key: str) -> list[JsonValue] {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_array(x) {
+        return x.arr
+    }
+    let empty: list[JsonValue] = []
+    return empty
+}
+
+fn records_of(entries: JsonValue) -> list[JsonValue] {
+    let out: list[JsonValue] = []
+    if !json_is_array(entries) {
+        return out
+    }
+    let mut i: int = 0
+    while i < entries.arr.len() {
+        let e: JsonValue = entries.arr.get(i)
+        if jstr(e, "type") == "record" {
+            out.push(e)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# 1-8. The sections.
+# ----------------------------------------------------------------------------
+
+fn s1_convention(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 1 — the convention")
+    let p: MdRun = mem([])
+    check(acc, "a bare invocation is usage error 2", p.code == 2, "")
+    let q: MdRun = mem(["warp"])
+    check(acc, "an unknown command is usage error 2", q.code == 2, "")
+
+    let absent: str = scratch(acc, "absent.jsonl")
+    let h: MdRun = mem(["history", "--history", absent])
+    check(acc, "history over a missing ledger is a named usage error",
+          h.code == 2 && h.err.contains("does not exist"), "")
+    let g: MdRun = mem(["gate", "--history", absent])
+    check(acc, "gate over a missing ledger is a named usage error",
+          g.code == 2 && g.err.contains("does not exist"), "")
+    let d: MdRun = mem(["dashboard", "--history", absent, "--out",
+                        scratch(acc, "x.md")])
+    check(acc, "dashboard over a missing ledger is a named usage error",
+          d.code == 2 && d.err.contains("does not exist"), "")
+    let no_out: MdRun = mem(["dashboard", "--out", scratch(acc, "x.md")])
+    check(acc, "a dashboard without --history is usage error 2",
+          no_out.code == 2, "")
+
+    let empty: str = scratch(acc, "empty.jsonl")
+    write_file(empty, "")
+    let ge: MdRun = mem(["gate", "--history", empty])
+    check(acc, "gate over an empty ledger refuses, named",
+          ge.code == 2 && ge.err.contains("no records"), "")
+    let never: str = scratch(acc, "never.md")
+    let de: MdRun = mem(["dashboard", "--history", empty, "--out", never])
+    check(acc, "dashboard over an empty ledger refuses and writes nothing",
+          de.code == 2 && de.err.contains("no records") && !file_exists(never), "")
+}
+
+fn s2_record_law(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 2 — the record law")
+    if !(file_exists("bin/hlc") && which("gcc")) {
+        println("  (bin/hlc or cc not available — the real-measurement legs skipped; the import legs below still run)")
+    } else {
+        # The live tree may carry in-flight edits; the battery runs the
+        # real measurement under --allow-dirty then (a clean CI checkout
+        # passes no flag).
+        let st: RunResult = run_capture("git", ["status", "--porcelain", "-uno"])
+        let h: str = scratch(acc, "real.jsonl")
+        let argv: list[str] = ["record", "--history", h, "--samples", "2",
+                               "--cycles", "40", "--warmup", "10"]
+        if st.out.trim() != "" {
+            argv.push("--allow-dirty")
+        }
+        let p: MdRun = mem(argv)
+        check(acc, "record runs the real suite through the real hls-rss",
+              p.code == 0 && p.out.contains("recorded"), clip(first_line(p.err), 120))
+        let head: RunResult = run_capture("git", ["rev-parse", "HEAD"])
+        let head_sha: str = head.out.trim()
+        check(acc, "the record is pinned to the live HEAD",
+              p.out.contains("recorded " + head_sha.slice(0, 10)), "")
+
+        let hj: MdRun = mem(["history", "--history", h, "--json"])
+        let recs: list[JsonValue] = records_of(parse_json_or_null(hj.out))
+        check(acc, "exactly one record was appended", recs.len() == 1, "")
+        if recs.len() >= 1 {
+            let r: JsonValue = recs.get(0)
+            check(acc, "the record carries the live HEAD sha",
+                  jstr(r, "commit") == head_sha, "")
+            check(acc, "the record names the tracked suite",
+                  jstr(r, "suite") == "benchmarks/rss_watch", "")
+            check(acc, "the suite digest covers workload names AND bytes",
+                  jstr(r, "suite_digest") == suite_digest_of("benchmarks/rss_watch"), "")
+            let plan: JsonValue = jobj(r, "plan")
+            check(acc, "the measurement plan is pinned in the record",
+                  jint(plan, "cycles") == 40 && jint(plan, "warmup") == 10
+                      && jfloat(plan, "interval") == 10.0
+                      && jint(plan, "samples") == 2, "")
+            let wls: JsonValue = jobj(r, "workloads")
+            check(acc, "all 4 tracked workloads measured",
+                  wls.obj_keys.len() == 4, "")
+            let mut samples_ok: bool = wls.obj_keys.len() > 0
+            let mut stable_ok: bool = wls.obj_keys.len() > 0
+            let mut files_ok: bool = wls.obj_keys.len() > 0
+            let mut wi: int = 0
+            while wi < wls.obj_keys.len() {
+                let w: JsonValue = wls.obj_vals.get(wi)
+                let samples: list[JsonValue] = jarray(w, "marker_rss_pages")
+                if samples.len() < 2 {
+                    samples_ok = false
+                }
+                let mut si: int = 0
+                while si < samples.len() {
+                    if jint_val(samples.get(si)) <= 0 {
+                        samples_ok = false
+                    }
+                    si = si + 1
+                }
+                if jstr(w, "hls_rss_verdict") != "stable" {
+                    stable_ok = false
+                }
+                if !starts_with(jstr(w, "file"), "benchmarks/rss_watch/")
+                        || jstr(w, "digest") == "" {
+                    files_ok = false
+                }
+                wi = wi + 1
+            }
+            check(acc, "every workload carries >= 2 positive samples", samples_ok, "")
+            check(acc, "every workload certified STABLE under hls-rss", stable_ok, "")
+            check(acc, "every workload carries its tracked file and digest", files_ok, "")
+            let env: JsonValue = jobj(r, "env")
+            check(acc, "the env fingerprint carries the page size (the unit)",
+                  jint(env, "page_size") > 0, "")
+            let aslr: str = jstr(env, "aslr")
+            check(acc, "the env fingerprint records the address-space mode (setarch fixed / random)",
+                  aslr == "fixed" || aslr == "random", "")
+
+            let before: str = read_file(h)
+            let p2: MdRun = mem(argv)
+            let after: str = read_file(h)
+            check(acc, "the ledger is append-only: the bytes before are a prefix of the bytes after",
+                  p2.code == 0 && starts_with(after, before), "")
+        }
+    }
+
+    # The --json artifact re-files (the round trip).
+    let h: str = scratch(acc, "artifact.jsonl")
+    let bp: str = write_bundle(acc, synth_bundle(base_hw(), "watched",
+                                                 default_env(), "stable",
+                                                 "hls-rss", true, true))
+    let jp: str = scratch(acc, "art-out.json")
+    let p3: MdRun = mem(["record", "--from-bundle", bp, "--commit", hex40(31),
+                         "--history", h, "--json", jp])
+    check(acc, "record --json files the measurement bundle",
+          p3.code == 0 && jstr(parse_json_or_null(read_or(jp, "")), "tool")
+              == "hls-mem-bundle", "")
+    let p4: MdRun = mem(["record", "--from-bundle", jp, "--commit", hex40(32),
+                         "--history", h])
+    check(acc, "the --json artifact re-files as a record (the round trip)",
+          p4.code == 0, "")
+
+    # The git refusal family.
+    let nogit: str = scratch(acc, "nogit")
+    mkdirs(nogit)
+    let bp2: str = write_bundle(acc, synth_bundle(base_hw(), "watched",
+                                                  default_env(), "stable",
+                                                  "hls-rss", true, true))
+    env_set_var("GIT_CEILING_DIRECTORIES", acc.scratch_base)
+    let ng: MdRun = mem(["record", "--from-bundle", bp2, "--root", nogit,
+                         "--history", scratch(acc, "pin.jsonl")])
+    env_unset_var("GIT_CEILING_DIRECTORIES")
+    check(acc, "a record without git and without --commit is refused",
+          ng.code == 2 && ng.err.contains("not a git work tree"), "")
+    let bad: MdRun = mem(["record", "--from-bundle", bp2, "--commit", "xyz",
+                          "--history", scratch(acc, "pin.jsonl")])
+    check(acc, "a bad --commit sha is a usage error",
+          bad.code == 2 && bad.err.contains("40-hex"), "")
+
+    let clone: str = scratch(acc, "clone")
+    let c: RunResult = run_capture("git", ["clone", "-q", ".", clone])
+    if c.code != 0 {
+        check(acc, "git clone for the dirty-tree law", false,
+              clip(first_line(c.err), 120))
+    } else {
+        write_file(path_join3(clone, "README.md"),
+                   read_file(path_join3(clone, "README.md")) + "\n# dirt\n")
+        let d2: MdRun = mem(["record", "--root", clone,
+                             "--history", scratch(acc, "dirty.jsonl")])
+        check(acc, "a work tree with tracked modifications is refused — a per-commit record pins a clean commit",
+              d2.code == 1 && d2.err.contains("tracked modifications"), "")
+    }
+}
+
+fn jint_val(v: JsonValue) -> int {
+    if json_is_int(v) {
+        return json_int_value(v)
+    }
+    return -1
+}
+
+# jnum_val(v) — int-or-float as float (the tools emit both).
+fn jnum_val(v: JsonValue) -> float {
+    if json_is_float(v) {
+        return json_float_value(v)
+    }
+    if json_is_int(v) {
+        return json_int_value(v).to_float()
+    }
+    return -1.0
+}
+
+fn s3_floor_law(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 3 — the floor law")
+    let h: str = scratch(acc, "floor.jsonl")
+
+    let c1: MdRun = record_from(acc, synth_bundle(base_hw(), "watched",
+        default_env(), "leak", "hls-rss", true, true), h, hex40(1), [])
+    check(acc, "a run that certified LEAK is refused (named)",
+          c1.code == 1 && c1.err.contains("not stable"), "")
+    let c2: MdRun = record_from(acc, synth_bundle(base_hw(), "watched",
+        default_env(), "inconclusive", "hls-rss", true, true), h, hex40(2), [])
+    check(acc, "a run that certified INCONCLUSIVE is refused (named)",
+          c2.code == 1 && c2.err.contains("not stable"), "")
+
+    let one: list[int] = [200]
+    let c3: MdRun = record_from(acc, synth_bundle(one, "watched",
+        default_env(), "stable", "hls-rss", true, true), h, hex40(3), [])
+    check(acc, "a one-sample workload is refused (named)",
+          c3.code == 1 && c3.err.contains("fewer than 2"), "")
+
+    let zero_runs: JsonValue = jobject(["tool", "workloads"],
+        [json_str("hls-mem-bundle"),
+         jobject(["watched"], [jarr([])])])
+    let c4: MdRun = record_from(acc, zero_runs, h, hex40(4), [])
+    check(acc, "a workload with zero runs is refused (named)",
+          c4.code == 2 && c4.err.contains("no runs"), "")
+
+    let zero_wl: JsonValue = jobject(["tool", "workloads"],
+        [json_str("hls-mem-bundle"), jobject([], [])])
+    let c5: MdRun = record_from(acc, zero_wl, h, hex40(5), [])
+    check(acc, "a bundle with zero workloads is refused (named)",
+          c5.code == 2 && c5.err.contains("no workloads"), "")
+
+    let foreign: JsonValue = jobject(["tool", "workloads"],
+        [json_str("not-mem"), jobject(["watched"], [jarr([])])])
+    let c6: MdRun = record_from(acc, foreign, h, hex40(6), [])
+    check(acc, "a foreign bundle is refused (named)",
+          c6.code == 2 && c6.err.contains("not an hls-mem-bundle"), "")
+
+    let c7: MdRun = record_from(acc, synth_bundle(base_hw(), "watched",
+        default_env(), "stable", "not-rss", true, true), h, hex40(7), [])
+    check(acc, "a foreign report is refused (named)",
+          c7.code == 2 && c7.err.contains("not an hls-rss report"), "")
+
+    let c8: MdRun = record_from(acc, synth_bundle(base_hw(), "watched",
+        default_env(), "stable", "hls-rss", false, true), h, hex40(8), [])
+    check(acc, "a report with no traces is refused (named)",
+          c8.code == 2 && c8.err.contains("no RSS readings"), "")
+
+    let c9: MdRun = record_from(acc, synth_bundle(base_hw(), "watched",
+        default_env(), "stable", "hls-rss", true, false), h, hex40(9), [])
+    check(acc, "a stable report without its slope is refused (named)",
+          c9.code == 2 && c9.err.contains("without its slope"), "")
+
+    let c10: MdRun = record_from(acc, synth_bundle(base_hw(), "watched",
+        page_env(0), "stable", "hls-rss", true, true), h, hex40(10), [])
+    check(acc, "a bundle env without a positive page size is refused (named)",
+          c10.code == 2 && c10.err.contains("page_size"), "")
+}
+
+fn s4_page_law(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 4 — the classification law (the page law)")
+    let names: list[str] = ["identical", "zero-var-regressed", "zero-var-in-band",
+                            "zero-var-improved", "with-variance-regressed"]
+    let klasses: list[str] = ["no-change", "regressed", "within-noise",
+                              "improved", "regressed"]
+    let want_rc: list[int] = [0, 1, 0, 0, 1]
+    let bases: list[list[int]] = [base_hw(), base_hw(), base_hw(), base_hw(),
+                                  vary_base()]
+    let curs: list[list[int]] = [base_hw(), scaled_up_hw(), in_band_hw(),
+                                 scaled_down_hw(), vary_reg()]
+
+    let mut ci: int = 0
+    while ci < names.len() {
+        let name: str = names.get(ci)
+        let h: str = scratch(acc, "cls-" + name + ".jsonl")
+        let r1: MdRun = record_from(acc, bundle_of(bases.get(ci)), h, hex40(1), [])
+        let r2: MdRun = record_from(acc, bundle_of(curs.get(ci)), h, hex40(2), [])
+        if r1.code != 0 || r2.code != 0 {
+            check(acc, name + ": both records filed", false,
+                  clip(first_line(r1.err), 80) + " / " + clip(first_line(r2.err), 80))
+            ci = ci + 1
+            continue
+        }
+        let jp: str = scratch(acc, name + ".verdict.json")
+        let p: MdRun = mem(["gate", "--history", h, "--json", jp])
+        let v: JsonValue = parse_json_or_null(read_or(jp, ""))
+        let rows: list[JsonValue] = jarray(v, "workloads")
+        let mut klass: str = ""
+        let mut point_pages: float = -1.0
+        let mut band_pages: float = -1.0
+        let mut ci0: float = -1.0
+        if rows.len() > 0 {
+            let row: JsonValue = rows.get(0)
+            klass = jstr(row, "class")
+            point_pages = jnum_val(json_object_get(row, "point_pages"))
+            band_pages = jnum_val(json_object_get(row, "band_pages"))
+            let ci_arr: list[JsonValue] = jarray(row, "ci_pages")
+            if ci_arr.len() > 0 {
+                ci0 = jnum_val(ci_arr.get(0))
+            }
+        }
+        let want_klass: str = klasses.get(ci)
+        let want_code: int = want_rc.get(ci)
+        check(acc, name + " samples classify " + want_klass,
+              klass == want_klass, "got " + klass + " want " + want_klass)
+        check(acc, name + ": gate exit " + want_code.to_str(),
+              p.code == want_code, "")
+        if want_klass == "regressed" {
+            check(acc, "a regression is named, not summarised",
+                  p.out.contains("GATE FAIL") && p.out.contains("watched"), "")
+        }
+        if want_klass == "no-change" {
+            check(acc, "identical samples: point 0 pages, band floored",
+                  point_pages == 0.0 && band_pages >= 16.0, "")
+        }
+        if want_klass == "within-noise" {
+            check(acc, "an in-band shift is still significant — the CI excludes zero (the page law)",
+                  ci0 > 0.0, "")
+        }
+        ci = ci + 1
+    }
+
+    # The rename law.
+    let h: str = scratch(acc, "cls-vanish.jsonl")
+    let w1_keys: list[str] = ["watched", "other"]
+    let w1_vals: list[JsonValue] = [five_reports(base_hw(), "stable", true, true),
+                                    five_reports(base_hw(), "stable", true, true)]
+    let w2_keys: list[str] = ["watched", "third"]
+    let w2_vals: list[JsonValue] = [five_reports(base_hw(), "stable", true, true),
+                                    five_reports(base_hw(), "stable", true, true)]
+    record_from(acc, jobject(["tool", "workloads"],
+        [json_str("hls-mem-bundle"), jobject(w1_keys, w1_vals)]), h, hex40(1), [])
+    record_from(acc, jobject(["tool", "workloads"],
+        [json_str("hls-mem-bundle"), jobject(w2_keys, w2_vals)]), h, hex40(2), [])
+    let jp: str = scratch(acc, "vanish.verdict.json")
+    let p: MdRun = mem(["gate", "--history", h, "--json", jp])
+    let v: JsonValue = parse_json_or_null(read_or(jp, ""))
+    let rows: list[JsonValue] = jarray(v, "workloads")
+    let mut watched_c: str = ""
+    let mut other_c: str = ""
+    let mut third_c: str = ""
+    let mut ri: int = 0
+    while ri < rows.len() {
+        let row: JsonValue = rows.get(ri)
+        let w: str = jstr(row, "workload")
+        if w == "watched" {
+            watched_c = jstr(row, "class")
+        }
+        if w == "other" {
+            other_c = jstr(row, "class")
+        }
+        if w == "third" {
+            third_c = jstr(row, "class")
+        }
+        ri = ri + 1
+    }
+    check(acc, "the rename law: new is reported, vanished fails",
+          watched_c == "no-change" && other_c == "vanished" && third_c == "new", "")
+    check(acc, "a vanished workload fails the gate by name",
+          p.code == 1 && p.out.contains("other"), "")
+}
+
+fn vary_base() -> list[int] {
+    let out: list[int] = [200, 202, 198, 201, 199]
+    return out
+}
+
+fn vary_reg() -> list[int] {
+    let out: list[int] = [280, 282, 278, 281, 279]
+    return out
+}
+
+# bundle_of(vals) — the plain stable watched bundle.
+fn bundle_of(vals: list[int]) -> JsonValue {
+    return synth_bundle(vals, "watched", default_env(), "stable",
+                        "hls-rss", true, true)
+}
+
+fn s5_gate_law(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 5 — the gate law")
+
+    let h: str = scratch(acc, "gate.jsonl")
+    record_from(acc, bundle_of(base_hw()), h, hex40(1), [])
+    record_from(acc, bundle_of(scaled_up_hw()), h, hex40(2), [])
+    let p: MdRun = mem(["gate", "--history", h])
+    check(acc, "an unsanctioned regression fails the gate, named",
+          p.code == 1 && p.out.contains("watched"), "")
+
+    let s1: MdRun = mem(["sanction", "nope", "--reason", "x", "--history", h])
+    check(acc, "a sanction for an unknown workload is refused naming the known ones",
+          s1.code == 2 && s1.err.contains("unknown workload")
+              && s1.err.contains("watched"), "")
+    let s2: MdRun = mem(["sanction", "watched", "--history", h])
+    check(acc, "a sanction without a written reason is refused",
+          s2.code == 2 && s2.err.contains("reason"), "")
+    let s3: MdRun = mem(["sanction", "watched", "--reason",
+                         "the allocator now pre-sizes its bins; the constant was the price",
+                         "--history", h])
+    check(acc, "the sanction is filed", s3.code == 0, "")
+
+    let jp: str = scratch(acc, "gate.verdict.json")
+    let p2: MdRun = mem(["gate", "--history", h, "--json", jp])
+    let v: JsonValue = parse_json_or_null(read_or(jp, ""))
+    check(acc, "a sanctioned regression is loud but green",
+          p2.code == 0 && jstr(v, "verdict") == "pass", "")
+    let sanctioned: list[JsonValue] = jarray(v, "sanctioned")
+    check(acc, "the verdict carries the sanctioned workload",
+          sanctioned.len() == 1 && json_is_str(sanctioned.get(0))
+              && json_str_value(sanctioned.get(0)) == "watched", "")
+    check(acc, "the gate output carries the written reason",
+          p2.out.contains("sanctioned") && p2.out.contains("pre-sizes its bins"), "")
+
+    let b1: MdRun = mem(["gate", "--history", h, "--baseline", "deadbeef"])
+    check(acc, "an unknown --baseline prefix is a named usage error",
+          b1.code == 2 && b1.err.contains("no record carries"), "")
+
+    let h_amb: str = scratch(acc, "ambiguous.jsonl")
+    record_from(acc, bundle_of(base_hw()), h_amb, hex40(7), [])
+    record_from(acc, bundle_of(base_hw()), h_amb, hex40(7), [])
+    let b2: MdRun = mem(["gate", "--history", h_amb, "--baseline", hex40(7)])
+    check(acc, "an ambiguous commit prefix is refused",
+          b2.code == 2 && b2.err.contains("ambiguous"), "")
+    let b3: MdRun = mem(["gate", "--history", h_amb,
+                         "--baseline", hex40(7).slice(0, 12)])
+    check(acc, "prefix resolution is by prefix, and ambiguity is found there too",
+          b3.code == 2 && b3.err.contains("ambiguous"), "")
+    let b4: MdRun = mem(["gate", "--history", h, "--baseline", hex40(2)])
+    check(acc, "the record does not regress against itself",
+          b4.code == 2 && b4.err.contains("the baseline is the record itself"), "")
+
+    # The unit law: a different page size is a different instrument.
+    let h_unit: str = scratch(acc, "unit.jsonl")
+    record_from(acc, bundle_of(base_hw()), h_unit, hex40(1), [])
+    record_from(acc, synth_bundle(base_hw(), "watched", page_env(8192),
+                                  "stable", "hls-rss", true, true),
+                h_unit, hex40(3), [])
+    let u1: MdRun = mem(["gate", "--history", h_unit])
+    check(acc, "an 8192-byte-page record with no 8192-byte-page baseline refuses by default",
+          u1.code == 2 && u1.err.contains("no earlier record of the same instrument"), "")
+    let u2: MdRun = mem(["gate", "--history", h_unit, "--baseline", hex40(1)])
+    check(acc, "an explicit cross-page-size baseline is refused, named",
+          u2.code == 1 && u2.err.contains("different units")
+              && u2.err.contains("8192"), "")
+
+    # The suite law.
+    let h_suite: str = scratch(acc, "suite.jsonl")
+    record_from(acc, bundle_of(base_hw()), h_suite, hex40(1), [])
+    record_from(acc, bundle_of(base_hw()), h_suite, hex40(2),
+                ["--suite", "benchmarks"])
+    let sq: MdRun = mem(["gate", "--history", h_suite, "--baseline", hex40(1)])
+    check(acc, "a changed suite digest refuses comparison — re-baseline, do not compare",
+          sq.code == 1 && sq.err.contains("suite changed"), "")
+
+    # --threshold moves the band.
+    let h_t: str = scratch(acc, "threshold.jsonl")
+    record_from(acc, bundle_of(base_hw()), h_t, hex40(1), [])
+    record_from(acc, bundle_of(scaled_up_hw()), h_t, hex40(2), [])
+    let t1: MdRun = mem(["gate", "--history", h_t, "--threshold", "60"])
+    check(acc, "--threshold moves the noise band",
+          t1.code == 0 && t1.out.contains("within-noise"), "")
+
+    # --floor moves the band the other way.
+    let h_f: str = scratch(acc, "floorband.jsonl")
+    record_from(acc, bundle_of(base_hw()), h_f, hex40(1), [])
+    record_from(acc, bundle_of(in_band_hw()), h_f, hex40(2), [])
+    let f1: MdRun = mem(["gate", "--history", h_f])
+    check(acc, "+10 pages inside the 16-page floor is within-noise",
+          f1.code == 0 && f1.out.contains("within-noise"), "")
+    let f2: MdRun = mem(["gate", "--history", h_f, "--floor", "4",
+                         "--threshold", "2"])
+    check(acc, "--floor and --threshold together move the band the other way",
+          f2.code == 1 && f2.out.contains("regressed"), "")
+}
+
+fn s6_determinism(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 6 — the determinism law")
+    let h: str = scratch(acc, "gate.jsonl")
+    let d1: str = scratch(acc, "dash1.md")
+    let d2: str = scratch(acc, "dash2.md")
+    let p1: MdRun = mem(["dashboard", "--history", h, "--out", d1])
+    check(acc, "the dashboard renders", p1.code == 0 && file_exists(d1), "")
+    mem(["dashboard", "--history", h, "--out", d2])
+    let doc1: str = read_file(d1)
+    let doc2: str = read_file(d2)
+    check(acc, "two dashboards of one ledger are byte-identical", doc1 == doc2, "")
+    check(acc, "the document embeds the sha256 of the ledger bytes",
+          doc1.contains("sha256 `" + file_sha(h) + "`"), "")
+    check(acc, "the newest record's commit is embedded",
+          doc1.contains("`" + hex40(2) + "`"), "")
+
+    let d3: str = scratch(acc, "dash3.md")
+    mem(["dashboard", "--history", h, "--out", d3, "--stamp"])
+    let doc3: str = read_file(d3)
+    let keep1: list[str] = nonempty(doc1.split("\n"))
+    let keep3: list[str] = filtered_nonempty(doc3.split("\n"))
+    let mut same: bool = keep1.len() == keep3.len()
+    let mut i: int = 0
+    while same && i < keep1.len() {
+        if keep1.get(i) != keep3.get(i) {
+            same = false
+        }
+        i = i + 1
+    }
+    check(acc, "--stamp changes ONLY the Generated line",
+          same && doc3.contains("- Generated: "), "")
+
+    check(acc, "the resident-set-at-markers trend table renders — RSS over time, literally",
+          doc1.contains("## Trends — resident set at markers"), "")
+    check(acc, "the slope watch renders against the 0.25 page/cycle leak threshold",
+          doc1.contains("## Slope watch") && doc1.contains("250.0"), "")
+
+    let jp: str = scratch(acc, "dash.json")
+    let p3: MdRun = mem(["dashboard", "--history", h, "--out", d1, "--json", jp])
+    let v: JsonValue = parse_json_or_null(read_or(jp, ""))
+    let rows: list[JsonValue] = jarray(v, "workloads")
+    let mut sorted_ok: bool = rows.len() > 0
+    let mut k: int = 1
+    while k < rows.len() {
+        if jstr(rows.get(k - 1), "workload") > jstr(rows.get(k), "workload") {
+            sorted_ok = false
+        }
+        k = k + 1
+    }
+    check(acc, "the verdict rows are sorted", sorted_ok, "")
+    check(acc, "the sanctioned ledger gates pass",
+          p3.code == 0 && jstr(v, "verdict") == "pass", "")
+
+    let h_flat: str = scratch(acc, "flat.jsonl")
+    record_from(acc, bundle_of(base_hw()), h_flat, hex40(1), [])
+    record_from(acc, bundle_of(base_hw()), h_flat, hex40(2), [])
+    let flat_path: str = scratch(acc, "flat.md")
+    let pf: MdRun = mem(["dashboard", "--history", h_flat, "--out", flat_path])
+    let flat: str = read_file(flat_path)
+    check(acc, "a constant trend renders mid bands — no fake wall",
+          pf.code == 0 && flat.contains("▄") && !flat.contains("█"), "")
+
+    let h_first: str = scratch(acc, "first.jsonl")
+    record_from(acc, bundle_of(base_hw()), h_first, hex40(1), [])
+    let first_path: str = scratch(acc, "first.md")
+    let pr: MdRun = mem(["dashboard", "--history", h_first, "--out", first_path])
+    check(acc, "a first-record dashboard renders with an n/a verdict",
+          pr.code == 0 && read_file(first_path).contains("n/a")
+              && read_file(first_path).contains("No comparison yet"), "")
+}
+
+fn nonempty(lines: list[str]) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i) != "" {
+            out.push(lines.get(i))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn filtered_nonempty(lines: list[str]) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i) != "" && !starts_with(lines.get(i), "- Generated: ") {
+            out.push(lines.get(i))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# mem_record_line(commit, suite_d, env, verdict) — the §7 record shape.
+fn mem_record_line(commit: str, suite_d: str, env: JsonValue,
+                   verdict: str) -> JsonValue {
+    let plan: JsonValue = jobject(["cycles", "interval", "samples", "warmup"],
+        [json_int(40), json_float(10.0), json_int(5), json_int(10)])
+    let wl: JsonValue = jobject(
+        ["end_rss_pages", "hls_rss_verdict", "marker_rss_pages",
+         "slope_ci_pages", "slope_pages_per_cycle", "warmup_end_rss_pages"],
+        [ints_json([1, 2]), json_str(verdict), ints_json([1, 2]),
+         jarr([jarr([json_float(-0.1), json_float(0.1)]),
+               jarr([json_float(-0.1), json_float(0.1)])]),
+         jarr([json_float(0.0), json_float(0.0)]), ints_json([1, 2])])
+    return jobject(
+        ["commit", "env", "floor_pages", "noise_pct", "plan", "suite",
+         "suite_digest", "type", "workloads"],
+        [json_str(commit), env, json_int(16), json_float(5.0), plan,
+         json_str("benchmarks/rss_watch"), json_str(suite_d),
+         json_str("record"), jobject(["watched"], [wl])])
+}
+
+fn s7_ledger_law(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 7 — the ledger law")
+    let suite_d: str = suite_digest_of("benchmarks/rss_watch")
+
+    let h1: str = scratch(acc, "corrupt.jsonl")
+    record_from(acc, bundle_of(base_hw()), h1, hex40(1), [])
+    write_file(h1, read_file(h1) + "this is not json\n")
+    let c1: MdRun = mem(["history", "--history", h1])
+    check(acc, "a corrupt line is a named error naming the line",
+          c1.code == 1 && c1.err.contains("line 2 is corrupt"), "")
+
+    let h2: str = scratch(acc, "badtype.jsonl")
+    record_from(acc, bundle_of(base_hw()), h2, hex40(1), [])
+    write_file(h2, read_file(h2) + "{\"type\": \"quantum\"}\n")
+    let c2: MdRun = mem(["history", "--history", h2])
+    check(acc, "an unknown entry type is a named error",
+          c2.code == 1 && c2.err.contains("unknown type"), "")
+
+    let h3: str = scratch(acc, "nopin.jsonl")
+    record_from(acc, bundle_of(base_hw()), h3, hex40(1), [])
+    let nopin: JsonValue = mem_record_line("cafe", suite_d,
+        page_env(4096), "stable")
+    write_file(h3, read_file(h3) + json_stringify(nopin) + "\n")
+    let c3: MdRun = mem(["history", "--history", h3])
+    check(acc, "a record without a 40-hex commit pin is a named error",
+          c3.code == 1 && c3.err.contains("commit pin"), "")
+
+    let h4: str = scratch(acc, "nodigest.jsonl")
+    let nodigest: JsonValue = mem_record_line(hex40(5), "", page_env(4096),
+                                              "stable")
+    write_file(h4, json_stringify(nodigest) + "\n")
+    let c4: MdRun = mem(["history", "--history", h4])
+    check(acc, "a record without a suite digest is a named error",
+          c4.code == 1 && c4.err.contains("suite digest"), "")
+
+    let h5: str = scratch(acc, "nounit.jsonl")
+    let nounit: JsonValue = mem_record_line(hex40(5), suite_d,
+        jobject(["cpus"], [json_int(8)]), "stable")
+    write_file(h5, json_stringify(nounit) + "\n")
+    let c5: MdRun = mem(["history", "--history", h5])
+    check(acc, "a record without its page size is a record without its unit — a named error",
+          c5.code == 1 && c5.err.contains("page size"), "")
+
+    let h6: str = scratch(acc, "leaky.jsonl")
+    let leaky: JsonValue = mem_record_line(hex40(5), suite_d,
+        page_env(4096), "leak")
+    write_file(h6, json_stringify(leaky) + "\n")
+    let c6: MdRun = mem(["history", "--history", h6])
+    check(acc, "a record whose workload did not certify stable is a named error (the floor law holds on read too)",
+          c6.code == 1 && c6.err.contains("certify stable"), "")
+
+    let h7: str = scratch(acc, "noreason.jsonl")
+    let noreason: JsonValue = jobject(["type", "workload"],
+                                      [json_str("sanction"), json_str("watched")])
+    write_file(h7, json_stringify(noreason) + "\n")
+    let c7: MdRun = mem(["history", "--history", h7])
+    check(acc, "a sanction without a written reason is a named error",
+          c7.code == 1 && c7.err.contains("reason"), "")
+
+    # history --workload keeps exactly the entries that touch it.
+    let h: str = scratch(acc, "filter.jsonl")
+    record_from(acc, bundle_of(base_hw()), h, hex40(1), [])
+    let other: JsonValue = jobject(["tool", "workloads"],
+        [json_str("hls-mem-bundle"),
+         jobject(["other"], [five_reports(base_hw(), "stable", true, true)])])
+    record_from(acc, other, h, hex40(2), [])
+    mem(["sanction", "watched", "--reason", "later", "--history", h])
+    let f: MdRun = mem(["history", "--history", h, "--workload", "watched",
+                        "--json"])
+    let entries: JsonValue = parse_json_or_null(f.out)
+    let two: bool = json_is_array(entries) && entries.arr.len() == 2
+    let mut order_ok: bool = false
+    if two {
+        order_ok = jstr(entries.arr.get(0), "type") == "record"
+            && jstr(entries.arr.get(1), "type") == "sanction"
+    }
+    check(acc, "history --workload keeps exactly the entries that touch the workload (records and sanctions)",
+          two && order_ok, "")
+}
+
+fn s8_corpus(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 8 — the corpus showcase")
+    let showcase: str = "tests/ok/feat_stage137_mem.hls"
+    let expected: str = "stage 137: hls-mem\n"
+        + "  MEM OK: 4 workloads tracked, floored, classified, pinned\n"
+
+    let chk: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "--check", showcase])
+    check(acc, "the showcase boots through the real checker", chk.code == 0, "")
+    let run_it: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", showcase])
+    check(acc, "the showcase runs green on the interpreter, exact output",
+          run_it.code == 0 && run_it.out == expected, "")
+    let fmt: RunResult = run_capture("bin/hlfmt", ["--check", showcase])
+    check(acc, "the showcase is hlfmt-canonical", fmt.code == 0, "")
+    let lint: RunResult = run_capture("python3", ["tools/hllint.py", showcase])
+    check(acc, "the showcase is hllint-clean",
+          lint.code == 0 && lint.out.contains("no warnings"), "")
+
+    if file_exists("bin/hlc") && which("gcc") {
+        let c_path: str = scratch(acc, "showcase.c")
+        let bin_path: str = scratch(acc, "showcase_bin")
+        let r1: RunResult = run_capture("bin/hlc", [showcase, c_path])
+        if r1.code != 0 {
+            check(acc, "hlc compiled the showcase", false, clip(first_line(r1.out), 120))
+        } else {
+            let r2: RunResult = run_capture("gcc",
+                ["-O2", "-o", bin_path, c_path, "-lm", "-pthread"])
+            if r2.code != 0 {
+                check(acc, "gcc compiled the showcase", false,
+                      clip(first_line(r2.err), 120))
+            } else {
+                let rn: RunResult = run_capture(bin_path, [])
+                check(acc, "the showcase matches natively, byte for byte",
+                      rn.code == 0 && rn.out == expected, "")
+            }
+        }
+    } else {
+        println("  (bin/hlc or cc not available — native differential skipped, interpreter legs ran)")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Fs, Proc, Exit {
+    let acc: Acc = acc_new("memdash")
+    s1_convention(acc)
+    s2_record_law(acc)
+    s3_floor_law(acc)
+    s4_page_law(acc)
+    s5_gate_law(acc)
+    s6_determinism(acc)
+    s7_ledger_law(acc)
+    s8_corpus(acc)
+    return finish(acc, "Stage 137 -- the memory dashboard")
+}

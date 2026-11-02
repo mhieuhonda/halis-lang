@@ -32,7 +32,7 @@ else
   HL_CURL_DEFS :=
 endif
 
-.PHONY: all bootstrap bootstrap-nolibc xbootstrap-acceptance refine-acceptance test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full infer infer-smt model prove-acceptance invariant-acceptance cvc5 cvc5-acceptance shapes shapes-smt shapes-acceptance sidechannel sidechannel-acceptance ct ct-acceptance supply supply-pkg supply-acceptance sbom sbom-pkg sbom-release sbom-acceptance repro repro-pkg repro-release repro-verify repro-acceptance sign-keygen sign sign-verify sign-release sign-verify-release sign-selftest sign-acceptance tlog-verify tlog tlog-gossip tlog-witness tlog-witness-verify tlog-prove tlog-prove-verify tlog-selftest tlog-acceptance reverify reverify-json reverify-lto reverify-report reverify-selftest reverify-acceptance ffi-taint ffi-taint-acceptance sandbox sandbox-run sandbox-emit sandbox-release sandbox-verify-release sandbox-selftest sandbox-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve serve-acceptance wasm-pack wasm-pack-check wasm-pack-pack wasm-pack-acceptance aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance tui-acceptance color-acceptance progress-acceptance log-acceptance http-server-acceptance websocket-acceptance cookie-acceptance session-acceptance csrf-acceptance template-acceptance sse-acceptance graphql-acceptance openapi-acceptance jsffi-acceptance dom-acceptance freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance stackguard-acceptance asmreg-acceptance link-acceptance boot-acceptance idt-acceptance mmio-acceptance port-acceptance dma-acceptance atomics-acceptance irqsafe-acceptance triple triple-x86_64-acceptance triple-aarch64-acceptance triple-riscv64-acceptance debuginfo-acceptance cap cap-acceptance test-linker auditlog-list auditlog-show auditlog-verify auditlog-sign auditlog-verify-sign auditlog-selftest auditlog-acceptance lsp-def-acceptance lsp-hints-acceptance lsp-refactor-acceptance fmt-comments-acceptance fmt-config-acceptance lint-fix-acceptance snapshot-acceptance cases-acceptance dap-acceptance repl-acceptance bench-acceptance rss-acceptance rt-acceptance det-acceptance compat-acceptance migrate-acceptance deprecated-acceptance semver-acceptance lts-acceptance lts-policy lts-policy-verify lts-policy-acceptance xdiff xdiff-acceptance fuzzseed fuzzseed-acceptance guarantee guarantee-report guarantee-acceptance perf perf-gate perf-dashboard perf-acceptance mem mem-gate mem-dashboard memdash-acceptance ctime ctime-gate ctime-dashboard ctime-acceptance size size-gate size-dashboard size-acceptance auditkit-brief auditkit-evidence auditkit-report auditkit-acceptance freeze freeze-verify freeze-report freeze-acceptance snapshot-status snapshot-verify snapshot-regen snapshot-prove snapshot-chain purebootstrap-acceptance finalaudit-brief finalaudit-evidence finalaudit-report finalaudit-gate finalaudit-acceptance rc-readiness rc-declare rc-gate rc-report rc-report-check rc-acceptance rc3-acceptance rc4-acceptance rc-signoff-check release-acceptance
+.PHONY: all bootstrap bootstrap-nolibc xbootstrap-acceptance refine-acceptance test examples clean run check bench install uninstall audit opt-stats emit-ir emit-llvm fmt lint lsp-check pkg-init pkg-add pkg-lock pkg-audit pkg-verify pkg-build pkg-publish pkg-log pkg-log-verify prove prove-full infer infer-smt model prove-acceptance invariant-acceptance cvc5 cvc5-acceptance shapes shapes-smt shapes-acceptance sidechannel sidechannel-acceptance ct ct-acceptance supply supply-pkg supply-acceptance sbom sbom-pkg sbom-release sbom-acceptance repro repro-pkg repro-release repro-verify repro-acceptance sign-keygen sign sign-verify sign-release sign-verify-release sign-selftest sign-acceptance tlog-verify tlog tlog-gossip tlog-witness tlog-witness-verify tlog-prove tlog-prove-verify tlog-selftest tlog-acceptance reverify reverify-json reverify-lto reverify-report reverify-selftest reverify-acceptance ffi-taint ffi-taint-acceptance sandbox sandbox-run sandbox-emit sandbox-release sandbox-verify-release sandbox-selftest sandbox-acceptance hltest fuzz cov fuzz-acceptance wasm-opt webapp webapp-acceptance serve serve-acceptance wasm-pack wasm-pack-check wasm-pack-pack wasm-pack-acceptance aarch64-bench aarch64-acceptance aarch64-list-targets stack-acceptance inline-acceptance opt-stats-report kernel-attrs escape-acceptance layout-report tail-acceptance tail-report asm-acceptance asm-attrs bench-stdlib spec-check stage32-acceptance async-acceptance stream-acceptance io-acceptance fs-acceptance net-acceptance http-acceptance http2-acceptance json-stream-acceptance regex-acceptance fmt-acceptance hash-acceptance collections-acceptance sync-acceptance thread-acceptance time-acceptance math-acceptance process-acceptance env-acceptance archive-acceptance uuid-ulid-acceptance cli-acceptance tui-acceptance color-acceptance progress-acceptance log-acceptance http-server-acceptance websocket-acceptance cookie-acceptance session-acceptance csrf-acceptance template-acceptance sse-acceptance graphql-acceptance openapi-acceptance jsffi-acceptance dom-acceptance freestanding freestanding-check freestanding-acceptance nostd nostd-acceptance alloc-acceptance mem-acceptance panic-acceptance stackguard-acceptance asmreg-acceptance link-acceptance boot-acceptance idt-acceptance mmio-acceptance port-acceptance dma-acceptance atomics-acceptance irqsafe-acceptance triple triple-x86_64-acceptance triple-aarch64-acceptance triple-riscv64-acceptance debuginfo-acceptance cap cap-acceptance test-linker auditlog-list auditlog-show auditlog-verify auditlog-sign auditlog-verify-sign auditlog-selftest auditlog-acceptance lsp-def-acceptance lsp-hints-acceptance lsp-refactor-acceptance fmt-comments-acceptance fmt-config-acceptance lint-fix-acceptance snapshot-acceptance cases-acceptance dap-acceptance repl-acceptance bench-acceptance rss-acceptance rt-acceptance det-acceptance compat-acceptance migrate-acceptance deprecated-acceptance semver-acceptance lts-acceptance lts-policy lts-policy-verify lts-policy-acceptance xdiff xdiff-acceptance fuzzseed fuzzseed-acceptance guarantee guarantee-report guarantee-acceptance perf perf-gate perf-dashboard perf-acceptance mem mem-gate mem-dashboard memdash-acceptance ctime ctime-gate ctime-dashboard ctime-acceptance size size-gate size-dashboard size-acceptance auditkit-brief auditkit-evidence auditkit-report auditkit-acceptance freeze freeze-verify freeze-report freeze-acceptance snapshot-status snapshot-verify snapshot-regen snapshot-prove snapshot-chain purebootstrap-acceptance finalaudit-brief finalaudit-evidence finalaudit-report finalaudit-gate finalaudit-acceptance rc-readiness rc-declare rc-gate rc-report rc-report-check rc-acceptance rc3-acceptance rc4-acceptance rc-signoff-check release-acceptance suite-01-boot-acceptance suite-02-differential-acceptance suite-03-selfhost-acceptance suite-04-optimizers-acceptance suite-05-backends-acceptance suite-06-advanced-acceptance suite-07-asm-acceptance suite-08-osdev-acceptance chunk-diff
 
 # Main goal: use the full bootstrap chain to build the native compiler
 all: bootstrap
@@ -356,6 +356,40 @@ check:
 test:
 	bash tests/run_tests.sh
 
+# The eight differential suites, ported from tests/suites/*.sh to
+# Halis gates (same sections, same tools, same needles; each runs
+# standalone, the way run_one_suite.sh drove the sourced bash).
+suite-01-boot-acceptance: $(BIN)/acc-suite_01_boot
+	@$(BIN)/acc-suite_01_boot
+
+suite-02-differential-acceptance: $(BIN)/acc-suite_02_differential
+	@$(BIN)/acc-suite_02_differential
+
+suite-03-selfhost-acceptance: $(BIN)/acc-suite_03_selfhost
+	@$(BIN)/acc-suite_03_selfhost
+
+suite-04-optimizers-acceptance: $(BIN)/acc-suite_04_optimizers
+	@$(BIN)/acc-suite_04_optimizers
+
+suite-05-backends-acceptance: $(BIN)/acc-suite_05_backends
+	@$(BIN)/acc-suite_05_backends
+
+suite-06-advanced-acceptance: $(BIN)/acc-suite_06_advanced
+	@$(BIN)/acc-suite_06_advanced
+
+suite-07-asm-acceptance: $(BIN)/acc-suite_07_asm
+	@$(BIN)/acc-suite_07_asm
+
+suite-08-osdev-acceptance: $(BIN)/acc-suite_08_osdev
+	@$(BIN)/acc-suite_08_osdev
+
+# The chunked differential runner (the old tests/run_chunk_diff.sh):
+# `make chunk-diff START=0 COUNT=64` slices tests/ok/*.hls by index so
+# a CI job can chew the corpus in parallel chunks; bare = the corpus.
+chunk-diff:
+	@test -x $(BIN)/acc-chunk_diff || $(MAKE) --no-print-directory $(BIN)/acc-chunk_diff
+	@$(BIN)/acc-chunk_diff $(START) $(COUNT)
+
 # Run the benchmarks folder (interpreter + native paths)
 bench:
 	@bash benchmarks/run_bench.sh
@@ -412,9 +446,9 @@ lsp-def-acceptance: $(BIN)/acc-lsp_def
 # bindings, the redundancies, the protocol, the utf-16 line, the
 # smoke + corpus). Protocol-level - the gate drives the real server
 # over stdio JSON-RPC.
-lsp-hints-acceptance:
-	@echo "[Stage 114 acceptance] running tests/lsp_hints_acceptance.py..."
-	@$(PYTHON) tests/lsp_hints_acceptance.py
+lsp-hints-acceptance: $(BIN)/acc-lsp_hints
+	@echo "[Stage 114 acceptance] running tests/acc/lsp_hints_acceptance.hls..."
+	@$(BIN)/acc-lsp_hints
 
 # Stage 115 acceptance gate: the eight-section battery for the refactor
 # actions (the scope law, the renames, the inlines, the extracts, the
@@ -467,9 +501,9 @@ snapshot-acceptance: $(BIN)/acc-snapshot bin/hlc
 # Stage 120 (v0.139.0-alpha): parameterised (table-driven) testing
 # acceptance gate. The differential half compiles the stage's ok
 # fixture on bin/hlc and gcc, so the native build is a prerequisite.
-cases-acceptance: $(BIN)/hlfmt bin/hlc
-	@echo "[Stage 120 acceptance] running tests/cases_acceptance.py..."
-	@$(PYTHON) tests/cases_acceptance.py
+cases-acceptance: $(BIN)/acc-cases bin/hlc
+	@echo "[Stage 120 acceptance] running tests/acc/cases_acceptance.hls..."
+	@$(BIN)/acc-cases
 
 # Stage 121 (v0.140.0-alpha): VS Code extension debugger (DAP)
 # acceptance gate. Nine sections over the REAL adapter subprocess:
@@ -653,9 +687,9 @@ migrate-acceptance: $(BIN)/acc-migrate bin/hlc
 # fmt-canonical, lint-clean). The gate runs its own isolated ledger,
 # cache and audit log via the Stage 131 env overrides, so it never
 # touches the developer's real state.
-semver-acceptance: $(BIN)/hlfmt
-	@echo "[Stage 131 acceptance] running tests/semver_acceptance.py..."
-	@$(PYTHON) tests/semver_acceptance.py
+semver-acceptance: $(BIN)/acc-semver
+	@echo "[Stage 131 acceptance] running tests/acc/semver_acceptance.hls..."
+	@$(BIN)/acc-semver
 	@echo "ACCEPTANCE OK: Stage 131 -- semantic-versioning enforcement in hls-pkg"
 
 # Stage 132 (v0.150.0-alpha): the LTS-policy gate. Eight sections
@@ -683,9 +717,9 @@ semver-acceptance: $(BIN)/hlfmt
 # fmt-canonical, lint-clean). The gate builds its own scratch repos
 # under a temp root it removes afterwards; the developer's real
 # repository is never touched.
-lts-acceptance: $(BIN)/hlfmt $(BIN)/hls-lts
-	@echo "[Stage 132 acceptance] running tests/lts_acceptance.py..."
-	@$(PYTHON) tests/lts_acceptance.py
+lts-acceptance: $(BIN)/acc-lts $(BIN)/hls-lts
+	@echo "[Stage 132 acceptance] running tests/acc/lts_acceptance.hls..."
+	@$(BIN)/acc-lts
 	@echo "ACCEPTANCE OK: Stage 132 -- LTS branch policy (backport-only after v1.0)"
 
 # Stage 145 (v0.166.0-alpha): the support-window gate. The published
@@ -726,9 +760,9 @@ lts-policy-verify: $(BIN)/hls-lts
 # life), the publication law (the render deterministic, the
 # committed LTS.md matching, the drifted copy refused) — and the
 # corpus showcase, the window law as a pure-HLS program.
-lts-policy-acceptance: $(BIN)/hlfmt $(BIN)/hls-lts
-	@echo "[Stage 145 acceptance] running tests/lts_policy_acceptance.py..."
-	@$(PYTHON) tests/lts_policy_acceptance.py
+lts-policy-acceptance: $(BIN)/acc-lts_policy $(BIN)/hls-lts
+	@echo "[Stage 145 acceptance] running tests/acc/lts_policy_acceptance.hls..."
+	@$(BIN)/acc-lts_policy
 	@echo "ACCEPTANCE OK: Stage 145 -- LTS policy published (3 years bug-fix, 5 years security)"
 
 # Stage 133 (v0.151.0-alpha): the cross-impl differential table. The
@@ -848,9 +882,9 @@ mem-gate:
 mem-dashboard:
 	@$(PYTHON) tools/hls-mem.py dashboard --out MEMORY.md
 
-memdash-acceptance: $(BIN)/hlfmt bin/hlc
-	@echo "[Stage 137 acceptance] running tests/memdash_acceptance.py..."
-	@$(PYTHON) tests/memdash_acceptance.py
+memdash-acceptance: $(BIN)/acc-memdash bin/hlc
+	@echo "[Stage 137 acceptance] running tests/acc/memdash_acceptance.hls..."
+	@$(BIN)/acc-memdash
 	@echo "ACCEPTANCE OK: Stage 137 -- memory regression dashboard (RSS over time)"
 
 # Stage 138 (v0.156.0-alpha): the compile-time regression dashboard.
@@ -894,9 +928,9 @@ ctime-gate:
 ctime-dashboard:
 	@$(PYTHON) tools/hls-ctime.py dashboard --out COMPILETIME.md
 
-ctime-acceptance: $(BIN)/hlfmt bin/hlc
-	@echo "[Stage 138 acceptance] running tests/ctime_acceptance.py..."
-	@$(PYTHON) tests/ctime_acceptance.py
+ctime-acceptance: $(BIN)/acc-ctime bin/hlc
+	@echo "[Stage 138 acceptance] running tests/acc/ctime_acceptance.hls..."
+	@$(BIN)/acc-ctime
 	@echo "ACCEPTANCE OK: Stage 138 -- compile-time regression dashboard (per-commit)"
 
 # Stage 139 (v0.157.0-alpha): the binary-size regression dashboard.
@@ -933,9 +967,9 @@ size-gate:
 size-dashboard:
 	@$(PYTHON) tools/hls-size.py dashboard --out BINARYSIZE.md
 
-size-acceptance: $(BIN)/hlfmt bin/hlc
-	@echo "[Stage 139 acceptance] running tests/size_acceptance.py..."
-	@$(PYTHON) tests/size_acceptance.py
+size-acceptance: $(BIN)/acc-size bin/hlc
+	@echo "[Stage 139 acceptance] running tests/acc/size_acceptance.hls..."
+	@$(BIN)/acc-size
 	@echo "ACCEPTANCE OK: Stage 139 -- binary-size regression dashboard (per-commit)"
 
 # Stage 140 (v0.158.0-alpha): the third-party audit kit. The
@@ -977,9 +1011,9 @@ auditkit-evidence:
 auditkit-report:
 	@$(PYTHON) tools/hls-auditkit.py report --out AUDITREPORT.md
 
-auditkit-acceptance: $(BIN)/hlfmt bin/hlc
-	@echo "[Stage 140 acceptance] running tests/auditkit_acceptance.py..."
-	@$(PYTHON) tests/auditkit_acceptance.py
+auditkit-acceptance: $(BIN)/acc-auditkit bin/hlc
+	@echo "[Stage 140 acceptance] running tests/acc/auditkit_acceptance.hls..."
+	@$(BIN)/acc-auditkit
 	@echo "ACCEPTANCE OK: Stage 140 -- independent security audit (third-party, paid)"
 
 
@@ -1021,9 +1055,9 @@ freeze-verify:
 freeze-report:
 	@$(PYTHON) tools/hls-freeze.py report --out API.md
 
-freeze-acceptance: $(BIN)/hlfmt bin/hlc
-	@echo "[Stage 141 acceptance] running tests/freeze_acceptance.py..."
-	@$(PYTHON) tests/freeze_acceptance.py
+freeze-acceptance: $(BIN)/acc-freeze bin/hlc
+	@echo "[Stage 141 acceptance] running tests/acc/freeze_acceptance.hls..."
+	@$(BIN)/acc-freeze
 	@echo "ACCEPTANCE OK: Stage 141 -- API freeze (syntax + stdlib locked)"
 
 # Stage 142 (v0.161.0-alpha): the pure-bootstrap acceptance gate.
@@ -1067,9 +1101,9 @@ finalaudit-report:
 finalaudit-gate:
 	@$(PYTHON) tools/hls-finalaudit.py gate
 
-finalaudit-acceptance: $(BIN)/hlfmt bin/hlc
-	@echo "[Stage 144 acceptance] running tests/finalaudit_acceptance.py..."
-	@$(PYTHON) tests/finalaudit_acceptance.py
+finalaudit-acceptance: $(BIN)/acc-finalaudit bin/hlc
+	@echo "[Stage 144 acceptance] running tests/acc/finalaudit_acceptance.hls..."
+	@$(BIN)/acc-finalaudit
 	@echo "ACCEPTANCE OK: Stage 144 -- independent third-party security audit (final)"
 
 

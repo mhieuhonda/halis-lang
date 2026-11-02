@@ -1,0 +1,1188 @@
+# ============================================================================
+# tests/acc/lsp_hints_acceptance.hls — Stage 114 acceptance gate, in Halis
+# (the Halis twin of tests/lsp_hints_acceptance.py; same eight sections,
+# same laws, same needles — the harness is tests/acc/harness.hls and
+# the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make lsp-hints-acceptance`.
+#
+#  1. the call sites  — bare fns name their arguments, methods skip the
+#                       receiver, constructors name nothing, nesting found
+#  2. the layer law   — builtins beat user fns, local beats import,
+#                       imports provide, open buffers beat disk
+#  3. the guards      — every ambiguity degrades to NO hint, never to a
+#                       wrong one, and never takes the server down
+#  4. the bindings    — checker-instantiated generics, the wildcard skip,
+#                       the bare pattern, the fallback
+#  5. the redundancies— f(x: x) says nothing the source does not
+#  6. the protocol    — the capability, the version, the range, the sorted
+#                       output, the didChange
+#  7. the utf-16 line — an emoji shifts bytes, not the character units
+#  8. the corpus      — lsp_smoke stays green; the stage's ok file yields
+#                       exactly the hints it describes
+#
+# The protocol harness drives the real server the way an editor does
+# (initialize -> didOpen -> requests -> shutdown/exit) over stdin/stdout
+# pipes: run_feed, then the gate parses the Content-Length frames itself.
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.json"
+
+# ----------------------------------------------------------------------------
+# The protocol harness.
+# ----------------------------------------------------------------------------
+
+struct LspOut {
+    results: list[JsonValue],   # one per request, in order (null when absent)
+    rc: int,
+    err: str,
+    init: JsonValue             # initialize's result (null when absent)
+}
+
+# frame(obj) — Content-Length framing; the length counts BYTES.
+fn frame(obj: JsonValue) -> str {
+    let body: str = json_stringify(obj)
+    let crlf: str = chr(13) + chr(10)
+    return "Content-Length: " + body.len().to_str() + crlf + crlf + body
+}
+
+# replace_first(s, from, to) — the one-shot string surgery.
+fn replace_first(s: str, from: str, to: str) -> str {
+    let mut i: int = 0
+    while i + from.len() <= s.len() {
+        if s.slice(i, i + from.len()) == from {
+            return s.slice(0, i) + to + s.slice(i + from.len(), s.len())
+        }
+        i = i + 1
+    }
+    return s
+}
+
+fn jarr(items: list[JsonValue]) -> JsonValue {
+    return JsonValue { kind: "array", bval: false, ival: 0, fval: 0.0,
+                       sval: "", arr: items, obj_keys: [], obj_vals: [] }
+}
+
+fn starts_with(s: str, prefix: str) -> bool {
+    if s.len() < prefix.len() {
+        return false
+    }
+    return s.slice(0, prefix.len()) == prefix
+}
+
+# index_of_str(hay, needle) — the first byte offset (or -1).
+fn index_of_str(hay: str, needle: str) -> int {
+    let mut i: int = 0
+    while i + needle.len() <= hay.len() {
+        if hay.slice(i, i + needle.len()) == needle {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# last_index_of_str(hay, needle) — the last byte offset (or -1).
+fn last_index_of_str(hay: str, needle: str) -> int {
+    let mut i: int = hay.len() - needle.len()
+    while i >= 0 {
+        if hay.slice(i, i + needle.len()) == needle {
+            return i
+        }
+        i = i - 1
+    }
+    return -1
+}
+
+fn parse_json_or_null(text: str) -> JsonValue {
+    let rr: Result[JsonValue, str] = json_parse_result(text)
+    if result_is_ok(rr) {
+        return result_unwrap(rr)
+    }
+    return json_null()
+}
+
+# parse_frames(buf) — every complete JSON body, in order.
+fn parse_frames(buf: str) -> list[JsonValue] {
+    let msgs: list[JsonValue] = []
+    let mut rest: str = buf
+    while true {
+        let i: int = index_of_str(rest, "Content-Length:")
+        if i < 0 {
+            break
+        }
+        let j: int = index_of_str(rest, chr(13) + chr(10) + chr(13) + chr(10))
+        if j < 0 {
+            break
+        }
+        let num: str = rest.slice(i + 15, j).trim()
+        let n: int = parse_uint(num)
+        if j + 4 + n > rest.len() {
+            break
+        }
+        msgs.push(parse_json_or_null(rest.slice(j + 4, j + 4 + n)))
+        rest = rest.slice(j + 4 + n, rest.len())
+    }
+    return msgs
+}
+
+fn parse_uint(s: str) -> int {
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c >= 48 && c <= 57 {
+            v = v * 10 + (c - 48)
+        } else {
+            break
+        }
+        i = i + 1
+    }
+    return v
+}
+
+fn jstr(v: JsonValue, key: str) -> str {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_str(x) {
+        return json_str_value(x)
+    }
+    return ""
+}
+
+fn jint(v: JsonValue, key: str) -> int {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_int(x) {
+        return json_int_value(x)
+    }
+    return -1
+}
+
+fn jobj(v: JsonValue, key: str) -> JsonValue {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_object(x) {
+        return x
+    }
+    return json_null()
+}
+
+fn jbool(v: JsonValue, key: str) -> bool {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_bool(x) {
+        return json_bool_value(x)
+    }
+    return false
+}
+
+fn jarray(v: JsonValue, key: str) -> list[JsonValue] {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_array(x) {
+        return x.arr
+    }
+    let empty: list[JsonValue] = []
+    return empty
+}
+
+# req(method, id, params) — one request frame's JSON.
+fn req(method: str, id: int, params: JsonValue) -> JsonValue {
+    return JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+        sval: "", arr: [],
+        obj_keys: ["id", "jsonrpc", "method", "params"],
+        obj_vals: [json_int(id), json_str("2.0"), json_str(method), params] }
+}
+
+fn note(method: str, params: JsonValue) -> JsonValue {
+    return JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+        sval: "", arr: [],
+        obj_keys: ["jsonrpc", "method", "params"],
+        obj_vals: [json_str("2.0"), json_str(method), params] }
+}
+
+fn td_object(uri: str, version: int, text: str) -> JsonValue {
+    return JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+        sval: "", arr: [],
+        obj_keys: ["text", "uri", "version"],
+        obj_vals: [json_str(text), json_str(uri), json_int(version)] }
+}
+
+# session(ws_name, opens_rels, opens_text, req_methods, req_params,
+#         seed_rels, seed_text) — one server session, driven by pipe.
+# The request params carry no textDocument; request i targets open 0
+# unless the caller routes it (the battery's open_idx stays 0 everywhere).
+fn session(acc: Acc, ws_name: str, opens_rels: list[str],
+           opens_text: list[str], req_methods: list[str],
+           req_params: list[JsonValue], seed_rels: list[str],
+           seed_text: list[str]) -> LspOut uses Fs, Proc {
+    let base: str = scratch(acc, ws_name)
+    let mut i: int = 0
+    while i < seed_rels.len() {
+        let full: str = path_join3(base, seed_rels.get(i))
+        mkdirs(path_dir3(full))
+        write_file(full, seed_text.get(i))
+        i = i + 1
+    }
+    let uris: list[str] = []
+    i = 0
+    while i < opens_rels.len() {
+        uris.push("file://" + path_join3(base, opens_rels.get(i)))
+        i = i + 1
+    }
+    let payload: list[str] = []
+    payload.push(frame(req("initialize", 1, json_null())))
+    i = 0
+    while i < opens_rels.len() {
+        payload.push(frame(note("textDocument/didOpen",
+            JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+                sval: "", arr: [], obj_keys: ["textDocument"],
+                obj_vals: [td_object(uris.get(i), 1, opens_text.get(i))] })))
+        i = i + 1
+    }
+    i = 0
+    while i < req_methods.len() {
+        let p: JsonValue = req_params.get(i)
+        let with_td: JsonValue = JsonValue { kind: "object", bval: false,
+            ival: 0, fval: 0.0, sval: "", arr: [],
+            obj_keys: ["textDocument"],
+            obj_vals: [td_object(uris.get(0), 0, "")] }
+        # merge: the request's own keys + textDocument (params win on
+        # their own keys by re-adding them after).
+        let merged: JsonValue = merge_objects(with_td, p)
+        payload.push(frame(req(req_methods.get(i), 100 + i, merged)))
+        i = i + 1
+    }
+    payload.push(frame(req("shutdown", 2, json_null())))
+    payload.push(frame(note("exit", json_null())))
+
+    let r: RunResult = run_feed("python3", ["tools/hls-lsp.py"],
+                                str_join(payload, ""))
+    let out: LspOut = LspOut { results: [], rc: r.code, err: r.err,
+                               init: json_null() }
+    let frames: list[JsonValue] = parse_frames(r.out)
+    let mut k: int = 0
+    while k < req_methods.len() {
+        out.results.push(json_null())
+        k = k + 1
+    }
+    k = 0
+    while k < frames.len() {
+        let m: JsonValue = frames.get(k)
+        let id: int = jint(m, "id")
+        if id == 1 {
+            out.init = json_object_get(m, "result")
+        }
+        if id >= 100 && id - 100 < out.results.len() {
+            out.results.set(id - 100, json_object_get(m, "result"))
+        }
+        k = k + 1
+    }
+    return out
+}
+
+# merge_objects(a, b) — a's keys, then b's keys overriding.
+fn merge_objects(a: JsonValue, b: JsonValue) -> JsonValue {
+    if !json_is_object(b) {
+        return a
+    }
+    let keys: list[str] = []
+    let vals: list[JsonValue] = []
+    let mut i: int = 0
+    while i < a.obj_keys.len() {
+        keys.push(a.obj_keys.get(i))
+        vals.push(a.obj_vals.get(i))
+        i = i + 1
+    }
+    i = 0
+    while i < b.obj_keys.len() {
+        let k: str = b.obj_keys.get(i)
+        let mut found: bool = false
+        let mut j: int = 0
+        while j < keys.len() {
+            if keys.get(j) == k {
+                vals.set(j, b.obj_vals.get(i))
+                found = true
+            }
+            j = j + 1
+        }
+        if !found {
+            keys.push(k)
+            vals.push(b.obj_vals.get(i))
+        }
+        i = i + 1
+    }
+    return JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+                       sval: "", arr: [], obj_keys: keys, obj_vals: vals }
+}
+
+# hints_of(ws, main_rel, main_text, extra_open_rel, extra_open_text,
+#          seed_rel, seed_text, range_json) — one inlayHint request.
+# Empty strings mean "absent".
+fn hints_of(acc: Acc, ws: str, main_rel: str, main_text: str,
+            extra_rel: str, extra_text: str, seed_rel: str, seed_text: str,
+            range_json: JsonValue) -> LspOut uses Fs, Proc {
+    let opens_rels: list[str] = [main_rel]
+    let opens_text: list[str] = [main_text]
+    if extra_rel != "" {
+        opens_rels.push(extra_rel)
+        opens_text.push(extra_text)
+    }
+    let mut params: JsonValue = json_null()
+    if json_is_object(range_json) {
+        params = JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+            sval: "", arr: [], obj_keys: ["range"],
+            obj_vals: [range_json] }
+    }
+    let methods: list[str] = ["textDocument/inlayHint"]
+    let params_list: list[JsonValue] = [params]
+    let seed_rels: list[str] = []
+    let seed_texts: list[str] = []
+    if seed_rel != "" {
+        seed_rels.push(seed_rel)
+        seed_texts.push(seed_text)
+    }
+    return session(acc, ws, opens_rels, opens_text, methods, params_list,
+                   seed_rels, seed_texts)
+}
+
+# hints_of_simple — the common no-extras shape.
+fn hints_of_simple(acc: Acc, ws: str, main_text: str) -> LspOut uses Fs, Proc {
+    return hints_of(acc, ws, "main.hls", main_text, "", "", "", "",
+                    json_null())
+}
+
+# find(hs, line0, label) — the hint at an exact (line, label) pair.
+fn find(hs: JsonValue, line0: int, label: str) -> JsonValue {
+    if !json_is_array(hs) {
+        return json_null()
+    }
+    let mut i: int = 0
+    while i < hs.arr.len() {
+        let h: JsonValue = hs.arr.get(i)
+        let pos: JsonValue = jobj(h, "position")
+        if jint(pos, "line") == line0 && jstr(h, "label") == label {
+            return h
+        }
+        i = i + 1
+    }
+    return json_null()
+}
+
+fn is_null(v: JsonValue) -> bool {
+    return !json_is_object(v) && !json_is_array(v) && !json_is_str(v)
+        && !json_is_int(v) && !json_is_float(v) && !json_is_bool(v)
+}
+
+# line_of(text, needle) — the 0-based line carrying the needle (-1).
+fn line_of(text: str, needle: str) -> int {
+    let lines: list[str] = text.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).contains(needle) {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# line_text(text, n) — the n-th line.
+fn line_text(text: str, n: int) -> str {
+    let lines: list[str] = text.split("\n")
+    if n >= 0 && n < lines.len() {
+        return lines.get(n)
+    }
+    return ""
+}
+
+# count_kind(hs, kind) — hints of one kind.
+fn count_kind(hs: JsonValue, kind: int) -> int {
+    if !json_is_array(hs) {
+        return 0
+    }
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < hs.arr.len() {
+        if jint(hs.arr.get(i), "kind") == kind {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+# has_label(hs, label) — any hint with that label.
+fn has_label(hs: JsonValue, label: str) -> bool {
+    if !json_is_array(hs) {
+        return false
+    }
+    let mut i: int = 0
+    while i < hs.arr.len() {
+        if jstr(hs.arr.get(i), "label") == label {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# line_has_kind(hs, line0, kind) — hints of one kind on one line.
+fn line_has_kind(hs: JsonValue, line0: int, kind: int) -> bool {
+    if !json_is_array(hs) {
+        return false
+    }
+    let mut i: int = 0
+    while i < hs.arr.len() {
+        let h: JsonValue = hs.arr.get(i)
+        if jint(jobj(h, "position"), "line") == line0
+                && jint(h, "kind") == kind {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# count_kind_on_line(hs, line0, kind).
+fn count_kind_on_line(hs: JsonValue, line0: int, kind: int) -> int {
+    if !json_is_array(hs) {
+        return 0
+    }
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < hs.arr.len() {
+        let h: JsonValue = hs.arr.get(i)
+        if jint(jobj(h, "position"), "line") == line0
+                && jint(h, "kind") == kind {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+# hints_sorted(hs) — the (line, character) pairs ascend.
+fn hints_sorted(hs: JsonValue) -> bool {
+    if !json_is_array(hs) {
+        return true
+    }
+    let mut i: int = 1
+    while i < hs.arr.len() {
+        let a: JsonValue = hs.arr.get(i - 1)
+        let b: JsonValue = hs.arr.get(i)
+        let la: int = jint(jobj(a, "position"), "line")
+        let lb: int = jint(jobj(b, "position"), "line")
+        if la > lb {
+            return false
+        }
+        if la == lb && jint(jobj(a, "position"), "character")
+                > jint(jobj(b, "position"), "character") {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# all_in_range(hs, lo, hi).
+fn all_in_range(hs: JsonValue, lo: int, hi: int) -> bool {
+    if !json_is_array(hs) {
+        return true
+    }
+    let mut i: int = 0
+    while i < hs.arr.len() {
+        let l: int = jint(jobj(hs.arr.get(i), "position"), "line")
+        if l < lo || l > hi {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# ----------------------------------------------------------------------------
+# The probe sources (the battery's heredocs, verbatim).
+# ----------------------------------------------------------------------------
+
+fn main_basic() -> str {
+    return "fn add(a: int, b: int) -> int {\n"
+        + "    return a + b\n"
+        + "}\n"
+        + "\n"
+        + "fn shout(s: str, times: int) -> str {\n"
+        + "    let mut out: str = s\n"
+        + "    let mut i: int = 0\n"
+        + "    while i < times {\n"
+        + "        out = out + s\n"
+        + "        i = i + 1\n"
+        + "    }\n"
+        + "    return out\n"
+        + "}\n"
+        + "\n"
+        + "struct Acc {\n"
+        + "    total: int,\n"
+        + "}\n"
+        + "\n"
+        + "impl Acc {\n"
+        + "    fn bump(self: Acc, by: int) -> Acc {\n"
+        + "        return Acc { total: self.total + by }\n"
+        + "    }\n"
+        + "}\n"
+        + "\n"
+        + "enum Shape {\n"
+        + "    Circle(int),\n"
+        + "    Rect(int, int),\n"
+        + "    Point\n"
+        + "}\n"
+        + "\n"
+        + "fn area(sh: Shape) -> int {\n"
+        + "    return match sh {\n"
+        + "        Shape.Circle(r) => 3 * r * r,\n"
+        + "        Shape.Rect(w, h) => w * h,\n"
+        + "        Shape.Point => 0\n"
+        + "    }\n"
+        + "}\n"
+        + "\n"
+        + "fn wrap(inner: int) -> int {\n"
+        + "    return inner\n"
+        + "}\n"
+        + "\n"
+        + "fn main() -> int uses IO {\n"
+        + "    let sum: int = add(40, 2)\n"
+        + "    let banner: str = shout(\"hi\", 2)\n"
+        + "    let acc: Acc = Acc { total: 1 }\n"
+        + "    let acc2: Acc = acc.bump(2)\n"
+        + "    let a1: int = area(Shape.Circle(3))\n"
+        + "    let a2: int = area(Shape.Rect(4, 5))\n"
+        + "    let w: int = wrap(add(1, add(2, 3)))\n"
+        + "    println(sum.to_str())\n"
+        + "    return 0\n"
+        + "}\n"
+}
+
+fn lib_v1() -> str {
+    return "fn scale(base: int, factor: int) -> int {\n"
+        + "    return base * factor\n"
+        + "}\n"
+}
+
+fn lib_v2() -> str {
+    return "fn scale(mantissa: int, exponent: int) -> int {\n"
+        + "    return mantissa * exponent\n"
+        + "}\n"
+}
+
+fn main_import() -> str {
+    return "import \"lib.hls\"\n"
+        + "\n"
+        + "fn local_only(grit: int) -> int {\n"
+        + "    return grit\n"
+        + "}\n"
+        + "\n"
+        + "fn scale(local_first: int, local_second: int) -> int {\n"
+        + "    return local_first + local_second\n"
+        + "}\n"
+        + "\n"
+        + "fn main() -> int {\n"
+        + "    let a: int = scale(6, 7)\n"
+        + "    let b: int = local_only(1)\n"
+        + "    return a + b\n"
+        + "}\n"
+}
+
+# main_import_only() — the import-only main (the local scale dropped).
+fn main_import_only() -> str {
+    return "import \"lib.hls\"\n"
+        + "\n"
+        + "fn local_only(grit: int) -> int {\n"
+        + "    return grit\n"
+        + "}\n"
+        + "\n"
+        + "fn main() -> int {\n"
+        + "    let a: int = scale(6, 7)\n"
+        + "    let b: int = local_only(1)\n"
+        + "    return a + b\n"
+        + "}\n"
+}
+
+fn main_shadow() -> str {
+    return "fn write_file(destination: str, payload: str) -> int {\n"
+        + "    return 0\n"
+        + "}\n"
+        + "\n"
+        + "fn main() -> int {\n"
+        + "    let n: int = write_file(\"a.txt\", \"b\")\n"
+        + "    return n\n"
+        + "}\n"
+}
+
+fn bad_arity() -> str {
+    return "fn two(a: int, b: int) -> int {\n    return a + b\n}\n\n"
+        + "fn main() -> int {\n    let x: int = two(1, 2, 3)\n"
+        + "    return x\n}\n"
+}
+
+fn unknown_callee() -> str {
+    return "fn main() -> int {\n    let t: int = spawn(1, 2, 3)\n"
+        + "    return t\n}\n"
+}
+
+fn set_ambig() -> str {
+    return "fn main() -> int {\n"
+        + "    let xs: list[int] = [1, 2]\n"
+        + "    let m: map[str, int] = map_new()\n"
+        + "    xs.set(0, 9)\n"
+        + "    m.set(\"k\", 9)\n"
+        + "    return 0\n}\n"
+}
+
+fn two_structs() -> str {
+    return "struct S1 {\n    x: int,\n}\n\nstruct S2 {\n    x: int,\n}\n\n"
+        + "impl S1 {\n    fn grow(self: S1, n: int) -> S1 {\n"
+        + "        return self\n    }\n}\n\n"
+        + "impl S2 {\n    fn grow(self: S2, n: int) -> S2 {\n"
+        + "        return self\n    }\n}\n\n"
+        + "fn main() -> int {\n    let a: S1 = S1 { x: 1 }\n"
+        + "    let b: S2 = a.grow(2)\n    return 0\n}\n"
+}
+
+fn shadow_m() -> str {
+    return "struct S {\n    v: int,\n}\n\n"
+        + "impl S {\n    fn split(self: S, sep: str) -> S {\n"
+        + "        return self\n    }\n}\n\n"
+        + "fn main() -> int {\n    let s: S = S { v: 1 }\n"
+        + "    let t: S = s.split(\"-\")\n    return 0\n}\n"
+}
+
+fn broken_doc() -> str {
+    return "fn broken( {\n    let x: int = =\n}\n"
+}
+
+fn mixed_doc() -> str {
+    return "fn known(a: int) -> int {\n    return a\n}\n\n"
+        + "fn main() -> int {\n    let x: int = known(mystery(1))\n"
+        + "    return x\n}\n"
+}
+
+fn generic_main() -> str {
+    return "enum Box[T] {\n    Some(T),\n    Nothing\n}\n\n"
+        + "fn pick(b: Box[int]) -> int {\n    return match b {\n"
+        + "        Box.Some(v) => v,\n        Box.Nothing => 0\n    }\n}\n\n"
+        + "fn main() -> int {\n    let x: int = pick(Box.Some(5))\n"
+        + "    return x - 5\n}\n"
+}
+
+fn plain_main() -> str {
+    return "enum Color {\n    RGB(int, int, str),\n    Named(str)\n}\n\n"
+        + "fn mix(c: Color) -> str {\n    return match c {\n"
+        + "        Color.RGB(r, g, nm) => nm,\n"
+        + "        Color.Named(nm2) => nm2\n    }\n}\n\n"
+        + "fn main() -> int {\n    let s: str = mix(Color.RGB(1, 2, \"x\"))\n"
+        + "    return s.len()\n}\n"
+}
+
+fn poison_main() -> str {
+    return "enum Color {\n    RGB(int, int, str),\n    Named(str)\n}\n\n"
+        + "fn mix(c: Color) -> str {\n"
+        + "    let boom: int = this_fn_does_not_exist(1)\n"
+        + "    return match c {\n"
+        + "        Color.RGB(r, g, nm) => nm,\n"
+        + "        Color.Named(nm2) => nm2\n    }\n}\n\n"
+        + "fn main() -> int {\n    return 0\n}\n"
+}
+
+fn wildcard_main() -> str {
+    return "enum Pair {\n    Two(int, int),\n    One(int)\n}\n\n"
+        + "fn sum(p: Pair) -> int {\n    return match p {\n"
+        + "        Pair.Two(a, _) => a,\n        Pair.One(b) => b\n    }\n}\n\n"
+        + "fn main() -> int {\n    return sum(Pair.Two(1, 2)) + sum(Pair.One(3))\n}\n"
+}
+
+fn red_doc() -> str {
+    return "fn two(a: int, b: int) -> int {\n    return a + b\n}\n\n"
+        + "fn main() -> int {\n"
+        + "    let a: int = 7\n    let b: int = 8\n    let other: int = 9\n"
+        + "    let x: int = two(other, a)\n    let y: int = two(a, b)\n"
+        + "    let z: int = two(other, other + 1)\n"
+        + "    return x + y + z\n}\n"
+}
+
+fn emoji() -> str {
+    return "😀"
+}
+
+fn emoji_src() -> str {
+    return "fn add(a: int, b: int) -> int {\n"
+        + "    return a + b\n}\n\n"
+        + "fn main() -> int {\n"
+        + "    let mood: str = \"" + emoji() + "\"\n"
+        + "    print(\"" + emoji() + "\")\n"
+        + "    let z: int = add(mood.len(), 2)\n"
+        + "    return z - 3\n}\n"
+}
+
+fn emoji_src3() -> str {
+    return "fn join2(parts: list[str], sep: str) -> str {\n"
+        + "    return sep\n}\n\n"
+        + "fn main() -> int uses IO {\n"
+        + "    let s: str = join2([\"" + emoji() + "\"], \"b\")\n"
+        + "    println(s)\n    return 0\n}\n"
+}
+
+# bare_pattern() — GENERIC_MAIN with the enum prefix dropped in the arm.
+fn bare_pattern() -> str {
+    return "enum Box[T] {\n    Some(T),\n    Nothing\n}\n\n"
+        + "fn pick(b: Box[int]) -> int {\n    return match b {\n"
+        + "        Some(v) => v,\n        Box.Nothing => 0\n    }\n}\n\n"
+        + "fn main() -> int {\n    let x: int = pick(Box.Some(5))\n"
+        + "    return x - 5\n}\n"
+}
+
+# ----------------------------------------------------------------------------
+# 1-8. The sections.
+# ----------------------------------------------------------------------------
+
+fn s1_call_sites(acc: Acc) -> void uses IO, Fs, Proc {
+    section("1. the call sites — bare fns name their arguments, methods skip the receiver, constructors name nothing, nesting is found")
+    let src: str = main_basic()
+    let out: LspOut = hints_of_simple(acc, "s1", src)
+    let hs: JsonValue = out.results.get(0)
+    check(acc, "server exits cleanly (rc=0)", out.rc == 0, clip(first_line(out.err), 120))
+    check(acc, "inlayHint answered a list", json_is_array(hs), "")
+    if !json_is_array(hs) {
+        return
+    }
+
+    let l_add: int = line_of(src, "add(40, 2)")
+    let l_shout: int = line_of(src, "shout(\"hi\", 2)")
+    let l_bump: int = line_of(src, "acc.bump(2)")
+    let l_circ: int = line_of(src, "area(Shape.Circle(3))")
+    let l_rect: int = line_of(src, "area(Shape.Rect(4, 5))")
+    let l_wrap: int = line_of(src, "wrap(add(1, add(2, 3)))")
+
+    let h: JsonValue = find(hs, l_add, "a:")
+    check(acc, "bare fn: add's first argument is named a:", !is_null(h), "")
+    if !is_null(h) {
+        let line: str = line_text(src, l_add)
+        let col: int = index_of_str(line, "40")
+        check(acc, "bare fn: the hint sits ON the argument (character "
+              + col.to_str() + ")",
+              jint(jobj(h, "position"), "character") == col, "")
+        check(acc, "parameter hints carry kind=2 (Parameter)",
+              jint(h, "kind") == 2, "")
+        check(acc, "parameter hints pad right (renders 'a: 40')",
+              jbool(h, "paddingRight"), "")
+        check(acc, "the tooltip names the parameter",
+              jstr(h, "tooltip").contains("a"), "")
+    }
+    check(acc, "bare fn: add's second argument is named b:",
+          !is_null(find(hs, l_add, "b:")), "")
+
+    check(acc, "bare fn: shout's first argument is named s:",
+          !is_null(find(hs, l_shout, "s:")), "")
+    check(acc, "bare fn: shout's second argument is named times:",
+          !is_null(find(hs, l_shout, "times:")), "")
+
+    check(acc, "method call: the receiver is skipped, by: lands",
+          !is_null(find(hs, l_bump, "by:")), "")
+    check(acc, "method call: no self: hint — the receiver is not an argument",
+          is_null(find(hs, l_bump, "self:")), "")
+
+    check(acc, "the outer call is hinted even when the argument is a constructor",
+          !is_null(find(hs, l_circ, "sh:")), "")
+    check(acc, "constructor: Shape.Circle(3) names NOTHING — payloads have no parameter names",
+          is_null(find(hs, l_circ, "r:")) && is_null(find(hs, l_circ, "radius:")), "")
+    check(acc, "constructor: the Rect call's outer sh: still lands",
+          !is_null(find(hs, l_rect, "sh:")), "")
+    check(acc, "constructor: Shape.Rect(4, 5) earns no parameter hints",
+          is_null(find(hs, l_rect, "width:")) && is_null(find(hs, l_rect, "height:")), "")
+
+    let hw: JsonValue = find(hs, l_wrap, "inner:")
+    check(acc, "nested: wrap's argument is named inner:", !is_null(hw), "")
+    if !is_null(hw) {
+        let line: str = line_text(src, l_wrap)
+        let col: int = index_of_str(line, "add(1, add(2, 3))")
+        check(acc, "nested: inner: sits before the outer add, not the inner one",
+              jint(jobj(hw, "position"), "character") == col, "")
+    }
+    check(acc, "hints are sorted by (line, character) — editors depend on it",
+          hints_sorted(hs), "")
+}
+
+fn s2_layer_law(acc: Acc) -> void uses IO, Fs, Proc {
+    section("2. the layer law — builtins beat user fns, local beats import, imports provide, open buffers beat disk")
+    let out: LspOut = hints_of(acc, "s2a", "main.hls", main_shadow(),
+                               "", "", "", "", json_null())
+    let hs: JsonValue = out.results.get(0)
+    let l: int = line_of(main_shadow(), "write_file(\"a.txt\", \"b\")")
+    check(acc, "builtin beats user fn: write_file hints use SPEC's names (path:, content:), not the shadowing signature",
+          !is_null(find(hs, l, "path:")) && !is_null(find(hs, l, "content:")), "")
+    check(acc, "builtin beats user fn: the shadowing names never appear",
+          is_null(find(hs, l, "destination:")) && is_null(find(hs, l, "payload:")), "")
+
+    let outb: LspOut = hints_of(acc, "s2b", "main.hls", main_import(),
+                                "", "", "lib.hls", lib_v1(), json_null())
+    let hsb: JsonValue = outb.results.get(0)
+    let lb: int = line_of(main_import(), "scale(6, 7)")
+    check(acc, "local beats import: the local scale's names win over lib.hls's",
+          !is_null(find(hsb, lb, "local_first:"))
+              && !is_null(find(hsb, lb, "local_second:")), "")
+
+    let outc: LspOut = hints_of(acc, "s2c", "main.hls", main_import_only(),
+                                "", "", "lib.hls", lib_v1(), json_null())
+    let hsc: JsonValue = outc.results.get(0)
+    let lc: int = line_of(main_import_only(), "scale(6, 7)")
+    check(acc, "imports provide: an unopened sibling's signature names the arguments (base:, factor:)",
+          !is_null(find(hsc, lc, "base:")) && !is_null(find(hsc, lc, "factor:")), "")
+
+    let outd: LspOut = hints_of(acc, "s2d", "main.hls", main_import_only(),
+                                "lib.hls", lib_v2(), "lib.hls", lib_v1(),
+                                json_null())
+    let hsd: JsonValue = outd.results.get(0)
+    let ld: int = line_of(main_import_only(), "scale(6, 7)")
+    check(acc, "open beats disk: the OPEN lib.hls's names (mantissa:, exponent:) win over the stale on-disk copy",
+          !is_null(find(hsd, ld, "mantissa:"))
+              && !is_null(find(hsd, ld, "exponent:")), "")
+}
+
+fn s3_guards(acc: Acc) -> void uses IO, Fs, Proc {
+    section("3. the guards — every ambiguity degrades to NO hint, never to a wrong one, and never takes the server down")
+    let outa: LspOut = hints_of_simple(acc, "s3a", bad_arity())
+    check(acc, "arity mismatch: two(1, 2, 3) earns no parameter hints",
+          count_kind(outa.results.get(0), 2) == 0, "")
+
+    let outb: LspOut = hints_of_simple(acc, "s3b", unknown_callee())
+    let hb: JsonValue = outb.results.get(0)
+    check(acc, "variadic/unresolved callee (spawn) earns no hints",
+          !json_is_array(hb) || hb.arr.len() == 0 || count_kind(hb, 2) == 0, "")
+
+    let outc: LspOut = hints_of_simple(acc, "s3c", set_ambig())
+    let hc: JsonValue = outc.results.get(0)
+    check(acc, "builtin-method ambiguity: .set earns no hints on either receiver (list.set(index, value) vs map.set(key, value))",
+          !has_label(hc, "index:") && !has_label(hc, "key:")
+              && !has_label(hc, "value:"), "")
+
+    let outd: LspOut = hints_of_simple(acc, "s3d", two_structs())
+    check(acc, "ambiguous method: grow lives on two structs — no hints (the receiver's type is not tracked at hint time)",
+          count_kind(outd.results.get(0), 2) == 0, "")
+
+    let oute: LspOut = hints_of_simple(acc, "s3e", shadow_m())
+    check(acc, "shadowed builtin method: a user split() silences .split — the receiver could be either",
+          count_kind(oute.results.get(0), 2) == 0, "")
+
+    let outf: LspOut = hints_of_simple(acc, "s3f", broken_doc())
+    let hf: JsonValue = outf.results.get(0)
+    check(acc, "syntax-error document answers [] (not an error)",
+          json_is_array(hf) && hf.arr.len() == 0, "")
+    check(acc, "syntax-error document: the server still exits cleanly",
+          outf.rc == 0, "")
+
+    let outg: LspOut = hints_of_simple(acc, "s3g", mixed_doc())
+    let hg: JsonValue = outg.results.get(0)
+    let lg: int = line_of(mixed_doc(), "known(mystery(1))")
+    check(acc, "one unknown callee does not blind the server to the known one wrapping it",
+          !is_null(find(hg, lg, "a:")), "")
+}
+
+fn s4_bindings(acc: Acc) -> void uses IO, Fs, Proc {
+    section("4. the bindings — checker-instantiated generics, the wildcard skip, the bare pattern, the fallback")
+    let outa: LspOut = hints_of_simple(acc, "s4a", generic_main())
+    let ha: JsonValue = outa.results.get(0)
+    let l_v: int = line_of(generic_main(), "Box.Some(v) => v")
+    let h: JsonValue = find(ha, l_v, ": int")
+    check(acc, "generic enum: the binding shows the INSTANTIATED type (: int)",
+          !is_null(h) && jint(h, "kind") == 1, "")
+    check(acc, "generic enum: the raw type parameter never leaks through the checker path",
+          is_null(find(ha, l_v, ": T")), "")
+    if !is_null(h) {
+        let line: str = line_text(generic_main(), l_v)
+        let col: int = index_of_str(line, "v") + 1
+        check(acc, "the type hint sits just past the binding name",
+              jint(jobj(h, "position"), "character") == col, "")
+    }
+
+    let outb: LspOut = hints_of_simple(acc, "s4b", plain_main())
+    let hb: JsonValue = outb.results.get(0)
+    let l_rgb: int = line_of(plain_main(), "Color.RGB(r, g, nm) =>")
+    check(acc, "plain enum: r's payload type is int",
+          !is_null(find(hb, l_rgb, ": int")), "")
+    check(acc, "plain enum: nm's payload type is str",
+          !is_null(find(hb, l_rgb, ": str")), "")
+    let l_named: int = line_of(plain_main(), "Color.Named(nm2) =>")
+    check(acc, "second arm: nm2 is str",
+          !is_null(find(hb, l_named, ": str")), "")
+
+    let outc: LspOut = hints_of_simple(acc, "s4c", poison_main())
+    let hc: JsonValue = outc.results.get(0)
+    let lc: int = line_of(poison_main(), "Color.RGB(r, g, nm) =>")
+    check(acc, "fallback: raw variant payloads type the bindings even when the checker aborted earlier in the file",
+          !is_null(find(hc, lc, ": int")) && !is_null(find(hc, lc, ": str")), "")
+
+    let outd: LspOut = hints_of_simple(acc, "s4d", wildcard_main())
+    let hd: JsonValue = outd.results.get(0)
+    let l_two: int = line_of(wildcard_main(), "Pair.Two(a, _) => a")
+    check(acc, "wildcard: `_` is skipped, the real binding keeps its type (1 type hint on the arm)",
+          count_kind_on_line(hd, l_two, 1) == 1, "")
+
+    let oute: LspOut = hints_of_simple(acc, "s4e", bare_pattern())
+    let he: JsonValue = oute.results.get(0)
+    let le: int = line_of(bare_pattern(), "Some(v) => v")
+    check(acc, "bare pattern: the checker's scrutinee resolution still types the binding",
+          !is_null(find(he, le, ": int")), "")
+}
+
+fn s5_redundancies(acc: Acc) -> void uses IO, Fs, Proc {
+    section("5. the redundancies — f(x: x) says nothing the source does not")
+    let src: str = red_doc()
+    let out: LspOut = hints_of_simple(acc, "s5", src)
+    let hs: JsonValue = out.results.get(0)
+    let l_mixed: int = line_of(src, "two(other, a)")
+    check(acc, "two(other, a): the first argument still gets a:",
+          !is_null(find(hs, l_mixed, "a:")), "")
+    check(acc, "two(other, a): the second argument is a bare `a` — spelled differently from its parameter b:, so b: IS shown",
+          !is_null(find(hs, l_mixed, "b:")), "")
+    let l_pure: int = line_of(src, "two(a, b)")
+    check(acc, "two(a, b): both arguments spell their parameter names — the whole site is silent",
+          !line_has_kind(hs, l_pure, 2), "")
+    let l_expr: int = line_of(src, "two(other, other + 1)")
+    check(acc, "two(other, other + 1): a compound argument is never redundant",
+          !is_null(find(hs, l_expr, "b:")), "")
+}
+
+fn s6_protocol(acc: Acc) -> void uses IO, Fs, Proc {
+    section("6. the protocol — the capability, the version, the range, the sorted output, the didChange")
+    let full_range: JsonValue = JsonValue { kind: "object", bval: false,
+        ival: 0, fval: 0.0, sval: "", arr: [],
+        obj_keys: ["end", "start"],
+        obj_vals: [JsonValue { kind: "object", bval: false, ival: 0,
+            fval: 0.0, sval: "", arr: [], obj_keys: ["character", "line"],
+            obj_vals: [json_int(0), json_int(500)] },
+            JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+            sval: "", arr: [], obj_keys: ["character", "line"],
+            obj_vals: [json_int(0), json_int(0)] }] }
+    let out: LspOut = hints_of(acc, "s6", "main.hls", main_basic(),
+                               "", "", "", "", full_range)
+    let hs: JsonValue = out.results.get(0)
+    let caps: JsonValue = jobj(out.init, "capabilities")
+    check(acc, "initialize advertises inlayHintProvider",
+          jbool(caps, "inlayHintProvider"), "")
+    check(acc, "serverInfo version is 0.134.0-alpha",
+          jstr(jobj(out.init, "serverInfo"), "version") == "0.134.0-alpha", "")
+
+    let rng: JsonValue = JsonValue { kind: "object", bval: false, ival: 0,
+        fval: 0.0, sval: "", arr: [], obj_keys: ["end", "start"],
+        obj_vals: [JsonValue { kind: "object", bval: false, ival: 0,
+            fval: 0.0, sval: "", arr: [], obj_keys: ["character", "line"],
+            obj_vals: [json_int(0), json_int(40)] },
+            JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+            sval: "", arr: [], obj_keys: ["character", "line"],
+            obj_vals: [json_int(0), json_int(24)] }] }
+    let out2: LspOut = hints_of(acc, "s6b", "main.hls", main_basic(),
+                                "", "", "", "", rng)
+    let hs2: JsonValue = out2.results.get(0)
+    check(acc, "range filter: every hint inside the requested lines (hints in 24..40)",
+          all_in_range(hs2, 24, 40), "")
+    let mut n_all: int = 0
+    if json_is_array(hs) {
+        n_all = hs.arr.len()
+    }
+    let mut n_rng: int = 0
+    if json_is_array(hs2) {
+        n_rng = hs2.arr.len()
+    }
+    check(acc, "range filter: strictly fewer hints than the whole-document request",
+          n_rng < n_all, n_rng.to_str() + " < " + n_all.to_str())
+
+    let methods: list[str] = ["textDocument/inlayHint", "textDocument/inlayHint"]
+    let empty_p: list[JsonValue] = [json_null(), json_null()]
+    let out3: LspOut = session(acc, "s6c", one_open("main.hls"),
+                               one_open(main_basic()), methods, empty_p,
+                               no_seeds(), no_seeds())
+    check(acc, "two identical requests agree byte for byte",
+          json_stringify(out3.results.get(0))
+              == json_stringify(out3.results.get(1)), "")
+
+    # didChange: an arity-breaking edit drops the site's hints.
+    let base: str = scratch(acc, "s6d")
+    let uri: str = "file://" + path_join3(base, "main.hls")
+    let changed: str = replace_first(main_basic(), "add(40, 2)",
+                                     "add(40, 2, 3)")
+    let payload: list[str] = []
+    payload.push(frame(req("initialize", 1, json_null())))
+    payload.push(frame(note("textDocument/didOpen",
+        JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+            sval: "", arr: [], obj_keys: ["textDocument"],
+            obj_vals: [td_object(uri, 1, main_basic())] })))
+    payload.push(frame(req("textDocument/inlayHint", 100,
+        JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+            sval: "", arr: [], obj_keys: ["textDocument"],
+            obj_vals: [td_object(uri, 0, "")] })))
+    payload.push(frame(note("textDocument/didChange",
+        JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+            sval: "", arr: [], obj_keys: ["contentChanges", "textDocument"],
+            obj_vals: [jarr([td_object("", 0, changed)]),
+                       td_object(uri, 2, "")] })))
+    payload.push(frame(req("textDocument/inlayHint", 101,
+        JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+            sval: "", arr: [], obj_keys: ["textDocument"],
+            obj_vals: [td_object(uri, 0, "")] })))
+    payload.push(frame(req("shutdown", 2, json_null())))
+    payload.push(frame(note("exit", json_null())))
+    let r: RunResult = run_feed("python3", ["tools/hls-lsp.py"],
+                                str_join(payload, ""))
+    let frames: list[JsonValue] = parse_frames(r.out)
+    let mut before: JsonValue = json_null()
+    let mut after: JsonValue = json_null()
+    let mut i: int = 0
+    while i < frames.len() {
+        let m: JsonValue = frames.get(i)
+        let id: int = jint(m, "id")
+        if id == 100 {
+            before = json_object_get(m, "result")
+        }
+        if id == 101 {
+            after = json_object_get(m, "result")
+        }
+        i = i + 1
+    }
+    let l_add: int = line_of(main_basic(), "add(40, 2)")
+    check(acc, "before the edit: add's site is hinted",
+          !is_null(find(before, l_add, "a:")), "")
+    check(acc, "after an arity-breaking edit: the site's hints are GONE (the didChange re-parsed, re-checked, and the guard held)",
+          is_null(find(after, l_add, "a:")), "")
+}
+
+fn one_open(s: str) -> list[str] {
+    let out: list[str] = [s]
+    return out
+}
+
+fn no_seeds() -> list[str] {
+    let out: list[str] = []
+    return out
+}
+
+# utf16_len(s) — the LSP character units: ASCII = 1, an emoji = 2.
+fn utf16_len(s: str) -> int {
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c >= 240 && i + 3 < s.len() {
+            n = n + 2
+            i = i + 4
+        } else if c >= 224 && i + 2 < s.len() {
+            n = n + 1
+            i = i + 3
+        } else if c >= 192 && i + 1 < s.len() {
+            n = n + 1
+            i = i + 2
+        } else {
+            n = n + 1
+            i = i + 1
+        }
+    }
+    return n
+}
+
+fn s7_utf16(acc: Acc) -> void uses IO, Fs, Proc {
+    section("7. the utf-16 line — an emoji in a string literal shifts bytes, not the hint's character units")
+    let src: str = emoji_src()
+    let out: LspOut = hints_of_simple(acc, "s7", src)
+    let hs: JsonValue = out.results.get(0)
+    let l_add: int = line_of(src, "add(mood.len(), 2)")
+    let h: JsonValue = find(hs, l_add, "a:")
+    check(acc, "the call after emoji-bearing lines is hinted", !is_null(h), "")
+    if !is_null(h) {
+        let line: str = line_text(src, l_add)
+        let col: int = index_of_str(line, "mood.len()")
+        check(acc, "character offset is UTF-16 units ON the argument ("
+              + col.to_str() + ")",
+              jint(jobj(h, "position"), "character") == col, "")
+    }
+    let h2: JsonValue = find(hs, l_add, "b:")
+    if !is_null(h2) {
+        let line: str = line_text(src, l_add)
+        let col: int = last_index_of_str(line, "2")
+        check(acc, "second argument lands at character " + col.to_str(),
+              jint(jobj(h2, "position"), "character") == col, "")
+    }
+
+    let src3: str = emoji_src3()
+    let out3: LspOut = hints_of_simple(acc, "s7b", src3)
+    let hs3: JsonValue = out3.results.get(0)
+    let l_join: int = line_of(src3, "join2([\"" + emoji() + "\"], \"b\")")
+    let h3: JsonValue = find(hs3, l_join, "sep:")
+    check(acc, "the emoji-bearing line's second argument is hinted",
+          !is_null(h3), "")
+    if !is_null(h3) {
+        let line: str = line_text(src3, l_join)
+        let quote: int = index_of_str(line, "\"b\"")
+        let col16: int = utf16_len(line.slice(0, quote))
+        check(acc, "character offset counts the emoji as ONE UTF-16 unit ("
+              + col16.to_str() + "), not four bytes",
+              jint(jobj(h3, "position"), "character") == col16, "")
+        check(acc, "the line really is byte-shifting (byte col "
+              + quote.to_str() + " != utf16 col " + col16.to_str()
+              + ") — the guard has something to guard",
+              col16 != quote, "")
+    }
+}
+
+fn s8_corpus(acc: Acc) -> void uses IO, Fs, Proc {
+    section("8. the corpus — lsp_smoke.py stays green; the stage's ok file runs and yields exactly the hints it describes")
+    let smoke: RunResult = run_capture("python3", ["tools/lsp_smoke.py"])
+    check(acc, "lsp_smoke.py passes (protocol resilience intact)",
+          smoke.code == 0, clip(first_line(smoke.err), 120))
+
+    let corpus: str = "tests/ok/feat_stage114_lsp_hints.hls"
+    let boot_run: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", corpus])
+    let lines: list[str] = boot_run.out.split("\n")
+    let mut pinned: bool = boot_run.code == 0 && lines.len() >= 4
+    if pinned {
+        pinned = lines.get(0) == "42" && lines.get(1) == "hihihi"
+            && lines.get(2) == "47" && lines.get(3) == "n=7"
+    }
+    check(acc, "the corpus file runs under boot", boot_run.code == 0, "")
+    check(acc, "the corpus output is the pinned 42 / hihihi / 47 / n=7",
+          pinned, "")
+
+    let corpus_text: str = read_file(corpus)
+    let out: LspOut = hints_of(acc, "s8", "feat_stage114_lsp_hints.hls",
+                               corpus_text, "", "", "", "", json_null())
+    let hs: JsonValue = out.results.get(0)
+    let l_add: int = line_of(corpus_text, "add(40, 2)")
+    let l_shout: int = line_of(corpus_text, "shout(\"hi\", 2)")
+    let l_rect_pat: int = line_of(corpus_text, "Shape.Rect(w, h) =>")
+    let l_circ_call: int = line_of(corpus_text, "area(Shape.Circle(3))")
+    let l_describe: int = line_of(corpus_text, "describe(t)")
+    check(acc, "corpus: add(40, 2) -> a:, b:",
+          !is_null(find(hs, l_add, "a:")) && !is_null(find(hs, l_add, "b:")), "")
+    check(acc, "corpus: shout(\"hi\", 2) -> s:, times:",
+          !is_null(find(hs, l_shout, "s:"))
+              && !is_null(find(hs, l_shout, "times:")), "")
+    check(acc, "corpus: the Rect(w, h) pattern types its bindings",
+          !is_null(find(hs, l_rect_pat, ": int")), "")
+    check(acc, "corpus: the area call is named, the Circle constructor is not",
+          !is_null(find(hs, l_circ_call, "sh:"))
+              && is_null(find(hs, l_circ_call, "r:")), "")
+    check(acc, "corpus: describe(t) is redundant (the argument IS t) — no hint, exactly the discipline section 5 pins",
+          is_null(find(hs, l_describe, "t:")), "")
+}
+
+# ----------------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Fs, Proc, Exit {
+    let acc: Acc = acc_new("lsp_hints")
+    s1_call_sites(acc)
+    s2_layer_law(acc)
+    s3_guards(acc)
+    s4_bindings(acc)
+    s5_redundancies(acc)
+    s6_protocol(acc)
+    s7_utf16(acc)
+    s8_corpus(acc)
+    return finish(acc, "Stage 114 -- LSP inlay hints")
+}

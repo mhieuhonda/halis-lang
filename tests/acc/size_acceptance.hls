@@ -1,0 +1,1272 @@
+# ============================================================================
+# tests/acc/size_acceptance.hls — Stage 139 acceptance gate, in Halis
+# (the Halis twin of tests/size_acceptance.py; same eight sections,
+# same laws, same needles — the harness is tests/acc/harness.hls and
+# the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make size-acceptance`.
+#
+#  1. the convention     — usage exits 2; missing ledgers are named errors
+#  2. the record law     — the REAL bin/hlc and the REAL stage0 chain file
+#                          records pinned to live HEAD; append-only ledger;
+#                          the git refusals; the dirty-tree refusal
+#  3. the floor law      — foreign/invalid reports refuse; the stale-binary
+#                          law on a dedicated ledger
+#  4. the classification — no-change / regress / worst-axis / improved /
+#                          rename, on synthetic reports
+#  5. the gate law       — cross-instrument, machine and suite refusals,
+#                          --baseline prefix resolution, sanctions
+#  6. the determinism    — byte-identical dashboards, --stamp, embedded
+#                          digests, sorted verdict rows, the n/a first record
+#  7. the ledger law     — every corrupt line is a named refusal naming it
+#  8. the corpus         — the showcase boots, formats, lints, runs green
+#
+# The battery validated documents with embedded python; this gate reads
+# the same JSON through std.json and pins the same fields. The digest
+# helpers spell the algorithms out (suite, compiler source) exactly like
+# the battery did — the gate pins the algorithm, not just consumes it.
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.json"
+import "std.sha256"
+import "std.env"
+import "std.taint"
+
+# nul() — the digest separator (no \0 escape in Halis strings).
+fn nul() -> str {
+    return chr(0)
+}
+
+# starts_with(s, prefix) — the glob prefix test.
+fn starts_with(s: str, prefix: str) -> bool {
+    if s.len() < prefix.len() {
+        return false
+    }
+    return s.slice(0, prefix.len()) == prefix
+}
+
+# ----------------------------------------------------------------------------
+# The world.
+# ----------------------------------------------------------------------------
+
+struct SizeRun {
+    code: int,
+    out: str,
+    err: str
+}
+
+fn size_run(argv: list[str]) -> SizeRun uses Proc {
+    let full: list[str] = ["tools/hls-size.py"]
+    let mut i: int = 0
+    while i < argv.len() {
+        full.push(argv.get(i))
+        i = i + 1
+    }
+    let r: RunResult = run_capture("python3", full)
+    return SizeRun { code: r.code, out: r.out, err: r.err }
+}
+
+# hex40(n) — the battery's sha(n): "%040x" % n (lowercase hex, 40 wide).
+fn hex40(n: int) -> str {
+    # n is tiny in the battery's uses (1..4): one hex digit, padded.
+    let digits: str = "0123456789abcdef"
+    let mut v: int = n
+    let mut s: str = ""
+    if v == 0 {
+        s = "0"
+    }
+    while v > 0 {
+        s = digits.slice(v % 16, v % 16 + 1) + s
+        v = v / 16
+    }
+    while s.len() < 40 {
+        s = "0" + s
+    }
+    return s
+}
+
+# suite_digest() — sha256 over the sorted (name, bytes) pairs of
+# benchmarks/size_watch, names included; the tool's algorithm, spelled out.
+fn suite_digest() -> str uses Fs {
+    let names: list[str] = fs_read_dir("benchmarks/size_watch")
+    let mut body: str = ""
+    let mut i: int = 0
+    while i < names.len() {
+        let n: str = names.get(i)
+        if n.len() > 4 && n.slice(n.len() - 4, n.len()) == ".hls" {
+            body = body + n.slice(0, n.len() - 4) + nul()
+                + read_file(path_join3("benchmarks/size_watch", n)) + nul()
+        }
+        i = i + 1
+    }
+    return sha256_hex(body)
+}
+
+# live_source_digest() — src/hlc.hls + every src/hlc/*.hls, names and bytes.
+fn live_source_digest() -> str uses Fs {
+    let names: list[str] = fs_read_dir("src/hlc")
+    let mut body: str = "src/hlc.hls" + nul() + read_file("src/hlc.hls") + nul()
+    let mut i: int = 0
+    while i < names.len() {
+        let n: str = names.get(i)
+        if n.len() > 4 && n.slice(n.len() - 4, n.len()) == ".hls" {
+            body = body + "src/hlc/" + n + nul()
+                + read_file(path_join3("src/hlc", n)) + nul()
+        }
+        i = i + 1
+    }
+    return sha256_hex(body)
+}
+
+fn file_sha(path: str) -> str uses Fs {
+    return sha256_hex(read_file(path))
+}
+
+# ----------------------------------------------------------------------------
+# Synthetic hls-size machine reports (the schema record --from-report eats).
+# ----------------------------------------------------------------------------
+
+fn axes_json(c: int, b: int, t: int, d: int, s: int) -> JsonValue {
+    let keys: list[str] = ["bss_bytes", "bin_bytes", "c_bytes", "data_bytes",
+                           "text_bytes"]
+    let vals: list[JsonValue] = [json_int(s), json_int(b), json_int(c),
+                                 json_int(d), json_int(t)]
+    return JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+                       sval: "", arr: [], obj_keys: keys, obj_vals: vals }
+}
+
+fn workload_axes(w: JsonValue, axis: str) -> int {
+    let x: JsonValue = json_object_get(w, axis)
+    if json_is_int(x) {
+        return json_int_value(x)
+    }
+    return -1
+}
+
+# synth_report(workloads, instrument, source, compiler, suite_digest,
+#              cc, arch, recipe, with_env) — every knob the battery turned.
+fn synth_report(workloads: JsonValue, instrument: str, source: str,
+                compiler: str, suite_d: str, cc: str, arch: str,
+                recipe: str, with_env: bool) -> JsonValue {
+    let env_keys: list[str] = ["arch", "cc", "cpus", "python", "recipe"]
+    let env_vals: list[JsonValue] = [json_str(arch), json_str(cc), json_int(2),
+                                     json_str("3.12.0"), json_str(recipe)]
+    let mut keys: list[str] = ["compiler_digest", "env", "instrument", "source_digest",
+                               "suite", "suite_digest", "tool", "version",
+                               "workloads"]
+    let mut vals: list[JsonValue] = [json_str(compiler),
+        JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0, sval: "",
+                    arr: [], obj_keys: env_keys, obj_vals: env_vals },
+        json_str(instrument), json_str(source), json_str("benchmarks/size_watch"),
+        json_str(suite_d), json_str("hls-size"), json_str("0.157.0"),
+        workloads]
+    if !with_env {
+        # Drop the env entry (the machine-fingerprint refusal probe).
+        let k2: list[str] = []
+        let v2: list[JsonValue] = []
+        let mut i: int = 0
+        while i < keys.len() {
+            if keys.get(i) != "env" {
+                k2.push(keys.get(i))
+                v2.push(vals.get(i))
+            }
+            i = i + 1
+        }
+        keys = k2
+        vals = v2
+    }
+    return JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+                       sval: "", arr: [], obj_keys: keys, obj_vals: vals }
+}
+
+# default_report(workloads) — the common shape (native, the a/b digests).
+fn default_report(workloads: JsonValue) -> JsonValue uses Fs {
+    return synth_report(workloads, "native", repeat_str("a", 64), repeat_str("b", 64), suite_d(),
+                        "cc (gate) 1.0", "gate64",
+                        "gcc -O2 -o out out.c -lm -pthread", true)
+}
+
+# json_to_string(v) — the exact stringify (std.json).
+fn json_to_string(v: JsonValue) -> str {
+    return json_stringify(v)
+}
+
+# write_report(path, obj) — one JSON line, the way the battery files it.
+fn write_report(acc: Acc, obj: JsonValue) -> str uses Fs, Proc {
+    let p: str = scratch(acc, "in.json")
+    write_file(p, json_to_string(obj) + "\n")
+    return p
+}
+
+# record_from(report_obj, history, commit, extra) — the battery's workhorse.
+fn record_from(acc: Acc, report_obj: JsonValue, history: str, commit: str,
+               extra: list[str]) -> SizeRun uses Fs, Proc {
+    let rp: str = write_report(acc, report_obj)
+    let argv: list[str] = ["record", "--from-report", rp,
+                           "--commit", commit, "--history", history]
+    let mut i: int = 0
+    while i < extra.len() {
+        argv.push(extra.get(i))
+        i = i + 1
+    }
+    return size_run(argv)
+}
+
+# ----------------------------------------------------------------------------
+# std.json read helpers (typed accessors behind guards).
+# ----------------------------------------------------------------------------
+
+fn parse_json_or_null(text: str) -> JsonValue {
+    let rr: Result[JsonValue, str] = json_parse_result(text)
+    if result_is_ok(rr) {
+        return result_unwrap(rr)
+    }
+    return json_null()
+}
+
+fn jstr(v: JsonValue, key: str) -> str {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_str(x) {
+        return json_str_value(x)
+    }
+    return ""
+}
+
+fn jint(v: JsonValue, key: str) -> int {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_int(x) {
+        return json_int_value(x)
+    }
+    return -1
+}
+
+fn jobj(v: JsonValue, key: str) -> JsonValue {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_object(x) {
+        return x
+    }
+    return json_null()
+}
+
+# records_of(history_json) — the {"type":"record"} entries, in order.
+fn records_of(entries: JsonValue) -> list[JsonValue] {
+    let out: list[JsonValue] = []
+    if !json_is_array(entries) {
+        return out
+    }
+    let mut i: int = 0
+    while i < entries.arr.len() {
+        let e: JsonValue = entries.arr.get(i)
+        if jstr(e, "type") == "record" {
+            out.push(e)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# workload_names(w) — the sorted keys (json_object order is the writer's).
+fn workload_names(w: JsonValue) -> list[str] {
+    return w.obj_keys
+}
+
+# axes_hold(w) — all five axes present, non-negative ints; c/bin positive.
+fn axes_hold(w: JsonValue) -> bool {
+    let axes: list[str] = ["bss_bytes", "bin_bytes", "c_bytes", "data_bytes",
+                           "text_bytes"]
+    if !axes_positive(w, axes) {
+        return false
+    }
+    return workload_axes(w, "c_bytes") > 0 && workload_axes(w, "bin_bytes") > 0
+}
+
+fn axes_positive(w: JsonValue, axes: list[str]) -> bool {
+    let mut i: int = 0
+    while i < axes.len() {
+        let v: int = workload_axes(w, axes.get(i))
+        if v < 0 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# default_workloads() — {"floor": synth_workload()}.
+fn default_workloads() -> JsonValue {
+    let keys: list[str] = ["floor"]
+    let vals: list[JsonValue] = [axes_json(100000, 20000, 7000, 700, 100)]
+    return JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+                       sval: "", arr: [], obj_keys: keys, obj_vals: vals }
+}
+
+# two_workloads(floor, grid) — the classification base pair.
+fn two_workloads(floor: JsonValue, grid: JsonValue) -> JsonValue {
+    let keys: list[str] = ["floor", "grid"]
+    let vals: list[JsonValue] = [floor, grid]
+    return JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+                       sval: "", arr: [], obj_keys: keys, obj_vals: vals }
+}
+
+fn grid_workload() -> JsonValue {
+    return axes_json(90000, 18000, 6000, 600, 90)
+}
+
+# ----------------------------------------------------------------------------
+# 1-8. The sections.
+# ----------------------------------------------------------------------------
+
+# suite_d() — the tracked suite digest (computed fresh; the dir is small).
+fn suite_d() -> str uses Fs {
+    return suite_digest()
+}
+
+fn s1_convention(acc: Acc) -> void uses IO, Proc {
+    section("Section 1 — the convention")
+    let p: SizeRun = size_run([])
+    check(acc, "a bare invocation is a usage error (exit 2)", p.code == 2, "")
+    let q: SizeRun = size_run(["no-such-command"])
+    check(acc, "an unknown command is a usage error (exit 2)", q.code == 2, "")
+
+    let missing: str = acc.scratch_base + "/missing.jsonl"
+    let cmds: list[str] = ["gate", "dashboard", "history", "sanction"]
+    let mut i: int = 0
+    while i < cmds.len() {
+        let cmdname: str = cmds.get(i)
+        let argv: list[str] = [cmdname]
+        if cmdname == "dashboard" {
+            argv.push("--out")
+            argv.push(scratch(acc, "d.md"))
+        }
+        if cmdname == "sanction" {
+            argv.push("fn_grid")
+        }
+        argv.push("--history")
+        argv.push(missing)
+        let r: SizeRun = size_run(argv)
+        check(acc, cmdname + " on a missing ledger is a named error",
+              r.code == 2 && r.err.contains("does not exist"), "")
+        i = i + 1
+    }
+}
+
+fn s2_record_law(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 2 — the record law")
+    let h: str = scratch(acc, "real-native.jsonl")
+
+    # The REAL native instrument.
+    let p: SizeRun = size_run(["record", "--history", h])
+    check(acc, "record runs the tracked suite through the real self-hosted compiler",
+          p.code == 0 && p.out.contains("recorded"), clip(first_line(p.err), 120))
+    let head: RunResult = run_capture("git", ["rev-parse", "HEAD"])
+    let head_sha: str = head.out.trim()
+    check(acc, "the record is pinned to the live HEAD",
+          p.out.contains("recorded " + head_sha.slice(0, 10)), "")
+
+    let hj: SizeRun = size_run(["history", "--history", h, "--json"])
+    let entries: JsonValue = parse_json_or_null(hj.out)
+    let recs: list[JsonValue] = records_of(entries)
+    check(acc, "exactly one record was appended", recs.len() == 1, "")
+    if recs.len() < 1 {
+        return
+    }
+    let r: JsonValue = recs.get(0)
+    check(acc, "the record carries the live HEAD sha", jstr(r, "commit") == head_sha, "")
+    check(acc, "the default instrument is native, bin/hlc",
+          jstr(r, "instrument") == "native", "")
+    check(acc, "the suite digest is the sha256 of the tracked suite",
+          jstr(r, "suite_digest") == suite_d(), "")
+    check(acc, "the compiler source digest pins the compiler that measured",
+          jstr(r, "source_digest") == live_source_digest(), "")
+    check(acc, "the native record pins the sha256 of bin/hlc itself",
+          jstr(r, "compiler_digest") == file_sha("bin/hlc"), "")
+    let wls: JsonValue = jobj(r, "workloads")
+    check(acc, "the native record carries the 5 workloads AND hlc_self",
+          wls.obj_keys.len() == 6 && json_object_has(wls, "hlc_self"), "")
+    check(acc, "hlc_self — the compiler's own girth — is a first-class workload",
+          json_object_has(wls, "hlc_self"), "")
+    let mut all_axes: bool = wls.obj_keys.len() > 0
+    let mut wi: int = 0
+    while wi < wls.obj_keys.len() {
+        if !axes_hold(wls.obj_vals.get(wi)) {
+            all_axes = false
+        }
+        wi = wi + 1
+    }
+    check(acc, "every workload carries all five axes, counted in non-negative integers",
+          all_axes, "")
+    let hlc_self: JsonValue = jobj(wls, "hlc_self")
+    check(acc, "hlc_self c_bytes is the real size of bin/hlc.c",
+          workload_axes(hlc_self, "c_bytes") == file_size("bin/hlc.c"), "")
+    check(acc, "hlc_self bin_bytes is the real size of bin/hlc",
+          workload_axes(hlc_self, "bin_bytes") == file_size("bin/hlc"), "")
+    let env: JsonValue = jobj(r, "env")
+    check(acc, "the machine fingerprint pins the cc the bytes were made on",
+          jstr(env, "cc") != "", "")
+    check(acc, "the machine fingerprint pins the arch the bytes were made on",
+          jstr(env, "arch") != "", "")
+    check(acc, "the machine fingerprint pins the recipe the bytes were made on",
+          jstr(env, "recipe") != "", "")
+
+    # Append-only ledger.
+    let before: str = read_file(h)
+    let p2: SizeRun = size_run(["record", "--history", h])
+    let after: str = read_file(h)
+    check(acc, "the ledger is append-only: the bytes before are a prefix of the bytes after",
+          p2.code == 0 && starts_with(after, before), "")
+
+    # The REAL stage0 instrument; the five shared workloads must agree
+    # BYTE FOR BYTE with the native record, and hlc_self must be absent.
+    let hs: str = scratch(acc, "real-stage0.jsonl")
+    let ps: SizeRun = size_run(["record", "--history", hs, "--instrument", "stage0"])
+    check(acc, "record runs the tracked suite through the real stage0 bootstrap chain",
+          ps.code == 0 && ps.out.contains("instrument=stage0"), "")
+    let hsj: SizeRun = size_run(["history", "--history", hs, "--json"])
+    let rs_list: list[JsonValue] = records_of(parse_json_or_null(hsj.out))
+    if rs_list.len() < 1 {
+        check(acc, "the stage0 record carries the 5 workloads and NO hlc_self",
+              false, "no stage0 record")
+        return
+    }
+    let rs: JsonValue = rs_list.get(0)
+    let swls: JsonValue = jobj(rs, "workloads")
+    check(acc, "the stage0 record carries the 5 workloads and NO hlc_self (the bootstrap chain has no built compiler to weigh)",
+          swls.obj_keys.len() == 5 && !json_object_has(swls, "hlc_self"), "")
+    check(acc, "the stage0 record pins the sha256 of the driver it ran through",
+          jstr(rs, "compiler_digest") == file_sha("tools/hlinterp/boot.py"), "")
+    let mut same: bool = swls.obj_keys.len() > 0
+    let mut si: int = 0
+    while si < swls.obj_keys.len() {
+        let n: str = swls.obj_keys.get(si)
+        let sw: JsonValue = swls.obj_vals.get(si)
+        let nw: JsonValue = jobj(wls, n)
+        if !json_is_object(nw) || !axes_equal(sw, nw) {
+            same = false
+        }
+        si = si + 1
+    }
+    check(acc, "stage0 and native emissions are byte-identical on every axis (the bootstrap invariant, cross-checked)",
+          same, "")
+
+    # No git + no --commit is refused (GIT_CEILING_DIRECTORIES pins the walk).
+    let nogit: str = scratch(acc, "nogit")
+    mkdirs(nogit)
+    let rp: str = write_report(acc, default_report(default_workloads()))
+    env_set_var("GIT_CEILING_DIRECTORIES", acc.scratch_base)
+    let ng: SizeRun = size_run(["record", "--from-report", rp, "--root", nogit,
+                                "--history", scratch(acc, "pin.jsonl")])
+    env_unset_var("GIT_CEILING_DIRECTORIES")
+    check(acc, "a record without git and without --commit is refused",
+          ng.code == 2 && ng.err.contains("not a git work tree"), "")
+
+    let bad_sha: SizeRun = size_run(["record", "--from-report", rp, "--commit", "xyz",
+                                     "--history", scratch(acc, "pin.jsonl")])
+    check(acc, "a bad --commit sha is a usage error",
+          bad_sha.code == 2 && bad_sha.err.contains("40-hex"), "")
+
+    # The dirty-tree law, on a throwaway clone.
+    let clone: str = scratch(acc, "clone")
+    let c: RunResult = run_capture("git", ["clone", "-q", ".", clone])
+    if c.code != 0 {
+        check(acc, "git clone for the dirty-tree law", false,
+              clip(first_line(c.err), 120))
+    } else {
+        write_file(path_join3(clone, "README.md"),
+                   read_file(path_join3(clone, "README.md")) + "\n# dirt\n")
+        let d: SizeRun = size_run(["record", "--root", clone,
+                                   "--history", scratch(acc, "dirty.jsonl")])
+        check(acc, "a work tree with tracked modifications is refused — a per-commit record pins a clean commit",
+              d.code == 1 && d.err.contains("tracked modifications"), "")
+    }
+}
+
+fn axes_equal(a: JsonValue, b: JsonValue) -> bool {
+    let axes: list[str] = ["bss_bytes", "bin_bytes", "c_bytes", "data_bytes",
+                           "text_bytes"]
+    let mut i: int = 0
+    while i < axes.len() {
+        if workload_axes(a, axes.get(i)) != workload_axes(b, axes.get(i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn s3_floor_law(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 3 — the floor law")
+    let h: str = scratch(acc, "floor.jsonl")
+
+    # A foreign report is refused by tool name.
+    let foreign: JsonValue = default_report(default_workloads())
+    let fkeys: list[str] = []
+    let fvals: list[JsonValue] = []
+    let mut i: int = 0
+    while i < foreign.obj_keys.len() {
+        if foreign.obj_keys.get(i) == "tool" {
+            fkeys.push("tool")
+            fvals.push(json_str("hls-ctime"))
+        } else {
+            fkeys.push(foreign.obj_keys.get(i))
+            fvals.push(foreign.obj_vals.get(i))
+        }
+        i = i + 1
+    }
+    let foreign2: JsonValue = JsonValue { kind: "object", bval: false, ival: 0,
+        fval: 0.0, sval: "", arr: [], obj_keys: fkeys, obj_vals: fvals }
+    let p1: SizeRun = record_from(acc, foreign2, h, hex40(1), [])
+    check(acc, "a foreign tool's report is refused",
+          p1.code == 2 && p1.err.contains("not an hls-size report"), "")
+
+    let p2: SizeRun = record_from(acc,
+        synth_report(default_workloads(), "interp", repeat_str("a", 64), repeat_str("b", 64),
+                     suite_d(), "cc (gate) 1.0", "gate64",
+                     "gcc -O2 -o out out.c -lm -pthread", true),
+        h, hex40(1), [])
+    check(acc, "an unknown instrument is refused",
+          p2.code == 2 && p2.err.contains("not one of"), "")
+
+    # A report without a valid digest (each of the three).
+    let digests: list[str] = ["suite_digest", "source_digest", "compiler_digest"]
+    let mut k: int = 0
+    while k < digests.len() {
+        let key: str = digests.get(k)
+        let broken: JsonValue = default_report(default_workloads())
+        let bkeys: list[str] = []
+        let bvals: list[JsonValue] = []
+        let mut bi: int = 0
+        while bi < broken.obj_keys.len() {
+            if broken.obj_keys.get(bi) == key {
+                bkeys.push(key)
+                bvals.push(json_str("nothex"))
+            } else {
+                bkeys.push(broken.obj_keys.get(bi))
+                bvals.push(broken.obj_vals.get(bi))
+            }
+            bi = bi + 1
+        }
+        let broken2: JsonValue = JsonValue { kind: "object", bval: false, ival: 0,
+            fval: 0.0, sval: "", arr: [], obj_keys: bkeys, obj_vals: bvals }
+        let pr: SizeRun = record_from(acc, broken2, h, hex40(1), [])
+        check(acc, "a report without a valid " + key + " is refused",
+              pr.code == 2 && pr.err.contains("no valid " + key), "")
+        k = k + 1
+    }
+
+    let p3: SizeRun = record_from(acc,
+        synth_report(default_workloads(), "native", repeat_str("a", 64), repeat_str("b", 64),
+                     suite_d(), "cc (gate) 1.0", "gate64",
+                     "gcc -O2 -o out out.c -lm -pthread", false),
+        h, hex40(1), [])
+    check(acc, "a report without its machine fingerprint is refused",
+          p3.code == 2 && p3.err.contains("machine"), "")
+
+    let p4: SizeRun = record_from(acc,
+        synth_report(default_workloads(), "native", repeat_str("a", 64), repeat_str("b", 64),
+                     "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                     "cc (gate) 1.0", "gate64",
+                     "gcc -O2 -o out out.c -lm -pthread", true),
+        h, hex40(1), [])
+    check(acc, "a report whose suite digest does not match the local suite is refused — re-baseline, do not file",
+          p4.code == 1 && p4.err.contains("does not match the local suite"), "")
+
+    # A workload measured on four axes.
+    let four: JsonValue = axes_json(100000, 20000, 7000, 700, 100)
+    let four2: JsonValue = drop_key(four, "bss_bytes")
+    let p5: SizeRun = record_from(acc,
+        default_report(with_workload("floor", four2)), h, hex40(1), [])
+    check(acc, "a workload measured without one of its five axes is refused",
+          p5.code == 1 && p5.err.contains("carries no bss_bytes"), "")
+
+    # The honest zero law.
+    let zero_c: SizeRun = record_from(acc,
+        default_report(with_workload("floor", axes_json(0, 20000, 7000, 700, 100))),
+        h, hex40(1), [])
+    check(acc, "a zero emission is a bug, not a size",
+          zero_c.code == 1 && zero_c.err.contains("c_bytes is zero"), "")
+    let zero_b: SizeRun = record_from(acc,
+        default_report(with_workload("floor", axes_json(100000, 0, 7000, 700, 100))),
+        h, hex40(1), [])
+    check(acc, "a zero binary is a bug, not a size",
+          zero_b.code == 1 && zero_b.err.contains("bin_bytes is zero"), "")
+
+    let negative: SizeRun = record_from(acc,
+        default_report(with_workload("floor", axes_json(100000, 20000, 7000, 700, -40))),
+        h, hex40(1), [])
+    check(acc, "a negative axis is refused — bytes are counted, never estimated",
+          negative.code == 1 && negative.err.contains("non-negative"), "")
+
+    # hlc_self is a native-instrument workload only.
+    let stg: SizeRun = record_from(acc,
+        synth_report(with_workload("hlc_self", axes_json(100000, 20000, 7000, 700, 100)),
+                     "stage0", repeat_str("a", 64), repeat_str("b", 64), suite_d(),
+                     "cc (gate) 1.0", "gate64",
+                     "gcc -O2 -o out out.c -lm -pthread", true),
+        h, hex40(1), [])
+    check(acc, "an hlc_self row on the stage0 instrument is refused",
+          stg.code == 1 && stg.err.contains("native instrument")
+              && stg.err.contains("hlc_self"), "")
+
+    # THE STALE-BINARY LAW, on a dedicated ledger.
+    let hs: str = scratch(acc, "stale.jsonl")
+    let first: SizeRun = record_from(acc,
+        synth_report(default_workloads(), "native", repeat_str("a", 64), repeat_str("b", 64),
+                     suite_d(), "cc (gate) 1.0", "gate64",
+                     "gcc -O2 -o out out.c -lm -pthread", true),
+        hs, hex40(1), [])
+    check(acc, "the first native record is filed", first.code == 0, "")
+    let stale: SizeRun = record_from(acc,
+        synth_report(default_workloads(), "native", repeat_str("c", 64), repeat_str("b", 64),
+                     suite_d(), "cc (gate) 1.0", "gate64",
+                     "gcc -O2 -o out out.c -lm -pthread", true),
+        hs, hex40(2), [])
+    check(acc, "the same binary under a different compiler source is refused (bin/hlc was not rebuilt)",
+          stale.code == 1 && stale.err.contains("stale-binary law")
+              && stale.err.contains("make bootstrap"), "")
+    let same_src: SizeRun = record_from(acc,
+        synth_report(default_workloads(), "native", repeat_str("a", 64), repeat_str("b", 64),
+                     suite_d(), "cc (gate) 1.0", "gate64",
+                     "gcc -O2 -o out out.c -lm -pthread", true),
+        hs, hex40(3), [])
+    check(acc, "the same binary under the SAME source is expected (the doc-only commit), not stale",
+          same_src.code == 0, "")
+    let fresh: SizeRun = record_from(acc,
+        synth_report(default_workloads(), "native", repeat_str("c", 64), repeat_str("d", 64),
+                     suite_d(), "cc (gate) 1.0", "gate64",
+                     "gcc -O2 -o out out.c -lm -pthread", true),
+        hs, hex40(4), [])
+    check(acc, "a fresh binary under a changed source is a rebuild, not a stale pin",
+          fresh.code == 0, "")
+}
+
+# with_workload(name, w) — {"name": w}.
+fn with_workload(name: str, w: JsonValue) -> JsonValue {
+    let keys: list[str] = [name]
+    let vals: list[JsonValue] = [w]
+    return JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+                       sval: "", arr: [], obj_keys: keys, obj_vals: vals }
+}
+
+# drop_key(obj, key) — rebuild without one key.
+fn drop_key(obj: JsonValue, key: str) -> JsonValue {
+    let keys: list[str] = []
+    let vals: list[JsonValue] = []
+    let mut i: int = 0
+    while i < obj.obj_keys.len() {
+        if obj.obj_keys.get(i) != key {
+            keys.push(obj.obj_keys.get(i))
+            vals.push(obj.obj_vals.get(i))
+        }
+        i = i + 1
+    }
+    return JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+                       sval: "", arr: [], obj_keys: keys, obj_vals: vals }
+}
+
+fn file_size(path: str) -> int uses Fs {
+    return read_file(path).len()
+}
+
+fn s4_classification(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 4 — the classification law")
+    let base: JsonValue = two_workloads(axes_json(100000, 20000, 7000, 700, 100),
+                                        grid_workload())
+
+    let h1: str = scratch(acc, "cls-same.jsonl")
+    record_from(acc, default_report(base), h1, hex40(1), [])
+    record_from(acc, default_report(base), h1, hex40(2), [])
+    let g1: SizeRun = size_run(["gate", "--history", h1])
+    check(acc, "identical records classify no-change on every axis (the gate passes)",
+          g1.code == 0 && g1.out.contains("all axes held"), "")
+
+    let h2: str = scratch(acc, "cls-grow.jsonl")
+    record_from(acc, default_report(base), h2, hex40(1), [])
+    record_from(acc, default_report(two_workloads(
+        axes_json(100000, 20001, 7000, 700, 100), grid_workload())), h2, hex40(2), [])
+    let g2: SizeRun = size_run(["gate", "--history", h2])
+    check(acc, "one byte of growth on one axis regresses the workload naming the axis",
+          g2.code == 1 && g2.out.contains("floor") && g2.out.contains("bin_bytes +1"), "")
+    check(acc, "the untouched workload holds (reported, never failed)",
+          g2.out.contains("grid") && g2.out.contains("no-change"), "")
+
+    let h3: str = scratch(acc, "cls-worst.jsonl")
+    record_from(acc, default_report(base), h3, hex40(1), [])
+    record_from(acc, default_report(two_workloads(
+        axes_json(100001, 20000, 7000, 700, 99), grid_workload())), h3, hex40(2), [])
+    let worst_path: str = scratch(acc, "worst.json")
+    let g3: SizeRun = size_run(["gate", "--history", h3, "--json", worst_path])
+    let v: JsonValue = parse_json_or_null(read_or(worst_path, ""))
+    let rows: list[JsonValue] = jarray(v, "workloads")
+    let mut row_class: str = ""
+    let mut bss_class: str = ""
+    let mut ri: int = 0
+    while ri < rows.len() {
+        let row: JsonValue = rows.get(ri)
+        if jstr(row, "workload") == "floor" {
+            row_class = jstr(row, "class")
+            let ax: JsonValue = jobj(row, "axes")
+            bss_class = jstr(jobj(ax, "bss_bytes"), "class")
+        }
+        ri = ri + 1
+    }
+    check(acc, "a workload that grew one axis and shrank another is regressed — the worst axis wins",
+          g3.code == 1 && row_class == "regressed" && bss_class == "improved", "")
+
+    let h4: str = scratch(acc, "cls-shrink.jsonl")
+    record_from(acc, default_report(base), h4, hex40(1), [])
+    record_from(acc, default_report(two_workloads(
+        axes_json(100000, 20000, 6999, 700, 100), grid_workload())), h4, hex40(2), [])
+    let g4: SizeRun = size_run(["gate", "--history", h4])
+    check(acc, "every axis held but one that strictly shrank: improved, and improvements never fail the gate",
+          g4.code == 0 && g4.out.contains("improved")
+              && g4.out.contains("text_bytes -1"), "")
+
+    let h5: str = scratch(acc, "cls-rename.jsonl")
+    record_from(acc, default_report(base), h5, hex40(1), [])
+    let rw_keys: list[str] = ["floor", "grid_wide"]
+    let rw_vals: list[JsonValue] = [axes_json(100000, 20000, 7000, 700, 100),
+                                    grid_workload()]
+    record_from(acc, default_report(JsonValue { kind: "object", bval: false,
+        ival: 0, fval: 0.0, sval: "", arr: [], obj_keys: rw_keys,
+        obj_vals: rw_vals }), h5, hex40(2), [])
+    let g5: SizeRun = size_run(["gate", "--history", h5])
+    check(acc, "a vanished workload fails the gate BY NAME",
+          g5.code == 1 && g5.out.contains("grid") && g5.out.contains("vanished"), "")
+    check(acc, "the renamed workload is reported as new, never failed",
+          g5.out.contains("new") && g5.out.contains("grid_wide"), "")
+}
+
+fn jarray(v: JsonValue, key: str) -> list[JsonValue] {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_array(x) {
+        return x.arr
+    }
+    let empty: list[JsonValue] = []
+    return empty
+}
+
+fn s5_gate_law(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 5 — the gate law")
+    let base: JsonValue = default_workloads()
+
+    let h: str = scratch(acc, "gate.jsonl")
+    record_from(acc, synth_report(base, "stage0", repeat_str("a", 64), repeat_str("b", 64),
+                                  suite_d(), "cc (gate) 1.0", "gate64",
+                                  "gcc -O2 -o out out.c -lm -pthread", true),
+                h, hex40(1), [])
+    record_from(acc, default_report(base), h, hex40(2), [])
+
+    let p1: SizeRun = size_run(["gate", "--history", h])
+    check(acc, "the native record has no native baseline to compare against — the stage0 record is not one",
+          p1.code == 2 && p1.err.contains("no earlier record of the same instrument"), "")
+    let p2: SizeRun = size_run(["gate", "--history", h, "--baseline", hex40(1)])
+    check(acc, "an explicit --baseline across instruments is refused",
+          p2.code == 1 && p2.err.contains("different instruments"), "")
+
+    # The machine law: cc, arch, recipe — one at a time.
+    let hm: str = scratch(acc, "machine.jsonl")
+    record_from(acc, default_report(base), hm, hex40(1), [])
+    record_from(acc, synth_report(base, "native", repeat_str("a", 64), repeat_str("b", 64),
+                                  suite_d(), "cc (other) 9.9", "gate64",
+                                  "gcc -O2 -o out out.c -lm -pthread", true),
+                hm, hex40(2), [])
+    let pm: SizeRun = size_run(["gate", "--history", hm])
+    check(acc, "a changed cc refuses the comparison — sizes from two toolchains are not the same language",
+          pm.code == 1 && pm.err.contains("the machine changed")
+              && pm.err.contains("cc"), "")
+
+    let hm2: str = scratch(acc, "machine-arch.jsonl")
+    record_from(acc, default_report(base), hm2, hex40(1), [])
+    record_from(acc, synth_report(base, "native", repeat_str("a", 64), repeat_str("b", 64),
+                                  suite_d(), "cc (gate) 1.0", "other64",
+                                  "gcc -O2 -o out out.c -lm -pthread", true),
+                hm2, hex40(2), [])
+    let pm2: SizeRun = size_run(["gate", "--history", hm2])
+    check(acc, "a changed arch refuses the comparison",
+          pm2.code == 1 && pm2.err.contains("arch"), "")
+
+    let hm3: str = scratch(acc, "machine-recipe.jsonl")
+    record_from(acc, default_report(base), hm3, hex40(1), [])
+    record_from(acc, synth_report(base, "native", repeat_str("a", 64), repeat_str("b", 64),
+                                  suite_d(), "cc (gate) 1.0", "gate64",
+                                  "cc -O3 -o out out.c", true),
+                hm3, hex40(2), [])
+    let pm3: SizeRun = size_run(["gate", "--history", hm3])
+    check(acc, "a changed link recipe refuses the comparison",
+          pm3.code == 1 && pm3.err.contains("recipe"), "")
+
+    # A hand-written ledger after a re-baselined suite.
+    let hq: str = scratch(acc, "suite.jsonl")
+    let r1: JsonValue = synth_report(default_workloads(), "native", repeat_str("a", 64),
+                                     repeat_str("b", 64),
+                                     "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                                     "cc (gate) 1.0", "gate64",
+                                     "gcc -O2 -o out out.c -lm -pthread", true)
+    let r2: JsonValue = default_report(default_workloads())
+    write_file(hq, json_to_string(with_type_commit(r1, hex40(1))) + "\n"
+        + json_to_string(with_type_commit(r2, hex40(2))) + "\n")
+    let pq: SizeRun = size_run(["gate", "--history", hq])
+    check(acc, "a changed suite digest leaves no comparable baseline in the default path",
+          pq.code == 2 && pq.err.contains("no earlier record of the same instrument"), "")
+    let pq2: SizeRun = size_run(["gate", "--history", hq, "--baseline", hex40(1)])
+    check(acc, "an explicit --baseline over a changed suite digest is refused — re-baseline, do not compare",
+          pq2.code == 1 && pq2.err.contains("the suite changed"), "")
+
+    # --baseline prefix resolution: unknown, ambiguous, itself.
+    let hb: str = scratch(acc, "baseline.jsonl")
+    let prefixes: list[str] = ["a", "b", "c", "d"]
+    let mut pi: int = 0
+    while pi < prefixes.len() {
+        record_from(acc, default_report(base), hb,
+                    repeat_str(prefixes.get(pi), 40), [])
+        pi = pi + 1
+    }
+    record_from(acc, default_report(base), hb, repeat_str("e", 39) + "1", [])
+    record_from(acc, default_report(base), hb, repeat_str("e", 39) + "2", [])
+    let b1: SizeRun = size_run(["gate", "--history", hb, "--baseline", "bbbbb"])
+    check(acc, "--baseline resolves a commit prefix", b1.code == 0, "")
+    let b2: SizeRun = size_run(["gate", "--history", hb, "--baseline", "fffff"])
+    check(acc, "an unknown --baseline prefix is refused",
+          b2.code == 2 && b2.err.contains("no record carries commit prefix"), "")
+    let b3: SizeRun = size_run(["gate", "--history", hb, "--baseline", "eeeee"])
+    check(acc, "an ambiguous --baseline prefix is refused",
+          b3.code == 2 && b3.err.contains("ambiguous"), "")
+    let b4: SizeRun = size_run(["gate", "--history", hb,
+                                "--baseline", repeat_str("e", 39) + "2"])
+    check(acc, "the record itself cannot be its own baseline",
+          b4.code == 2 && b4.err.contains("does not regress against itself"), "")
+
+    # A sanction flips a regression loud-but-green.
+    let hg: str = scratch(acc, "sanction.jsonl")
+    record_from(acc, default_report(base), hg, hex40(1), [])
+    record_from(acc, default_report(
+        with_workload("floor", axes_json(100000, 20064, 7000, 700, 100))),
+        hg, hex40(2), [])
+    let sg: SizeRun = size_run(["gate", "--history", hg])
+    check(acc, "an unsanctioned regression fails the gate naming the workload",
+          sg.code == 1 && sg.out.contains("GATE FAIL") && sg.out.contains("floor"), "")
+    let sn: SizeRun = size_run(["sanction", "floor", "--history", hg])
+    check(acc, "a sanction without a written reason is refused",
+          sn.code == 2 && sn.err.contains("--reason"), "")
+    let sn2: SizeRun = size_run(["sanction", "no_such_workload", "--reason", "why",
+                                 "--history", hg])
+    check(acc, "an unknown workload is refused naming the known ones",
+          sn2.code == 2 && sn2.err.contains("unknown workload")
+              && sn2.err.contains("floor"), "")
+    let sn3: SizeRun = size_run(["sanction", "floor", "--reason",
+                                 "the runtime grew a guard page check",
+                                 "--author", "mhieuhonda", "--history", hg])
+    check(acc, "a written sanction is filed with its author",
+          sn3.code == 0 && sn3.out.contains("mhieuhonda"), "")
+    let sg2: SizeRun = size_run(["gate", "--history", hg])
+    check(acc, "a sanctioned regression is loud but green",
+          sg2.code == 0 && sg2.out.contains("sanctioned")
+              && sg2.out.contains("GATE PASS"), "")
+}
+
+# with_type_commit(report, commit) — the hand-written ledger record shape.
+fn with_type_commit(report: JsonValue, commit: str) -> JsonValue {
+    let keys: list[str] = ["commit"]
+    let vals: list[JsonValue] = [json_str(commit)]
+    let mut i: int = 0
+    while i < report.obj_keys.len() {
+        if report.obj_keys.get(i) != "type" {
+            keys.push(report.obj_keys.get(i))
+            vals.push(report.obj_vals.get(i))
+        }
+        i = i + 1
+    }
+    keys.push("type")
+    vals.push(json_str("record"))
+    return JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+                       sval: "", arr: [], obj_keys: keys, obj_vals: vals }
+}
+
+fn repeat_str(s: str, n: int) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < n {
+        out = out + s
+        i = i + 1
+    }
+    return out
+}
+
+fn s6_determinism(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 6 — the determinism law")
+    let base: JsonValue = two_workloads(axes_json(100000, 20000, 7000, 700, 100),
+                                        grid_workload())
+    let h: str = scratch(acc, "dash.jsonl")
+    record_from(acc, default_report(base), h, hex40(1), [])
+    record_from(acc, default_report(base), h, hex40(2), [])
+
+    let d1: str = scratch(acc, "dash1.md")
+    let d2: str = scratch(acc, "dash2.md")
+    size_run(["dashboard", "--out", d1, "--history", h])
+    size_run(["dashboard", "--out", d2, "--history", h])
+    check(acc, "two dashboards of one ledger are byte-identical",
+          read_file(d1) == read_file(d2), "")
+
+    let d3: str = scratch(acc, "dash3.md")
+    size_run(["dashboard", "--out", d3, "--history", h, "--stamp"])
+    # Strip the Generated lines from BOTH documents, then compare what
+    # remains — --stamp may only move that one line.
+    let l1: list[str] = read_file(d1).split("\n")
+    let l3: list[str] = read_file(d3).split("\n")
+    let mut gen1: int = 0
+    let mut gen3: int = 0
+    let keep1: list[str] = []
+    let keep3: list[str] = []
+    let mut i: int = 0
+    while i < l1.len() {
+        if starts_with(l1.get(i), "- Generated:") {
+            gen1 = gen1 + 1
+        } else {
+            keep1.push(l1.get(i))
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < l3.len() {
+        if starts_with(l3.get(i), "- Generated:") {
+            gen3 = gen3 + 1
+        } else {
+            keep3.push(l3.get(i))
+        }
+        i = i + 1
+    }
+    let mut rest_same: bool = keep1.len() == keep3.len()
+    i = 0
+    while rest_same && i < keep1.len() {
+        if keep1.get(i) != keep3.get(i) {
+            rest_same = false
+        }
+        i = i + 1
+    }
+    check(acc, "--stamp changes ONLY the Generated line",
+          gen3 == 1 && gen1 == 0 && rest_same, "")
+
+    let doc: str = read_file(d1)
+    check(acc, "the document embeds the sha256 of the ledger bytes",
+          doc.contains(file_sha(h)), "")
+    check(acc, "the document embeds the newest record's commit",
+          doc.contains(hex40(2)), "")
+    check(acc, "the document embeds BOTH compiler digests",
+          doc.contains(repeat_str("a", 64)) && doc.contains(repeat_str("b", 64)), "")
+
+    # The verdict rows are sorted.
+    let doc_lines: list[str] = doc.split("\n")
+    let start: int = index_of_line(doc_lines,
+        "## Verdicts (newest record vs baseline, byte-exact)")
+    let end: int = index_of_line(doc_lines,
+        "## Trends (bin_bytes across records, oldest to newest)")
+    let rows: list[str] = []
+    let mut j: int = start + 1
+    while j < end {
+        let l: str = doc_lines.get(j)
+        if starts_with(l, "| ") && l.contains(" | ")
+                && !starts_with(l, "| workload") {
+            rows.push(l)
+        }
+        j = j + 1
+    }
+    let mut sorted_ok: bool = true
+    let mut k: int = 1
+    while k < rows.len() {
+        if rows.get(k - 1) > rows.get(k) {
+            sorted_ok = false
+        }
+        k = k + 1
+    }
+    check(acc, "the verdict table rows are sorted", sorted_ok, "")
+    check(acc, "a constant trend renders the mid band, not a wall of max-height blocks",
+          doc.contains("▄▄"), "")
+
+    # A first-record ledger renders with an n/a verdict.
+    let hf: str = scratch(acc, "dash-first.jsonl")
+    record_from(acc, default_report(default_workloads()), hf, hex40(1), [])
+    let d4: str = scratch(acc, "dash4.md")
+    let p: SizeRun = size_run(["dashboard", "--out", d4, "--history", hf])
+    check(acc, "a first-record ledger renders with an n/a verdict instead of crashing",
+          p.code == 0 && read_file(d4).contains("n/a"), "")
+}
+
+fn line_at(lines: list[str], i: int) -> str {
+    if i < lines.len() {
+        return lines.get(i)
+    }
+    return ""
+}
+
+fn index_of_line(lines: list[str], needle: str) -> int {
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i) == needle {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn s7_ledger_law(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 7 — the ledger law")
+    let base_line: JsonValue = with_type_commit(
+        default_report(default_workloads()), hex40(1))
+    let base_txt: str = json_to_string(base_line)
+
+    # (name, line, expected needle) — the battery's case table.
+    let h0: str = scratch(acc, "ledger-0.jsonl")
+    write_file(h0, base_txt + "\n{not json at all\n")
+    let c0: SizeRun = size_run(["history", "--history", h0])
+    check(acc, "a corrupt line is a named refusal naming the line",
+          c0.code == 1 && c0.err.contains("line 2") && c0.err.contains("corrupt"), "")
+
+    let h1: str = scratch(acc, "ledger-1.jsonl")
+    write_file(h1, base_txt + "\n{\"type\": \"poem\"}\n")
+    let c1: SizeRun = size_run(["history", "--history", h1])
+    check(acc, "an unknown entry type is a named refusal naming the line",
+          c1.code == 1 && c1.err.contains("line 2") && c1.err.contains("unknown type"), "")
+
+    # commit pin / suite digest / source digest / binary digest / machine.
+    let mut idx: int = 2
+    let mut v: JsonValue = json_clone_set(base_line, "commit", "")
+    let r: SizeRun = ledger_case(acc, idx, base_txt, v, "commit pin")
+    check(acc, "a record without its commit pin is a named refusal naming the line", r.code == 1, "")
+    idx = idx + 1
+    v = json_clone_set(base_line, "suite_digest", "")
+    let r2: SizeRun = ledger_case(acc, idx, base_txt, v, "suite digest")
+    check(acc, "a record without its suite digest is a named refusal naming the line", r2.code == 1, "")
+    idx = idx + 1
+    v = json_clone_set(base_line, "source_digest", "")
+    let r3: SizeRun = ledger_case(acc, idx, base_txt, v, "source digest")
+    check(acc, "a record without its compiler source digest is a named refusal naming the line", r3.code == 1, "")
+    idx = idx + 1
+    v = json_clone_set(base_line, "compiler_digest", "")
+    let r4: SizeRun = ledger_case(acc, idx, base_txt, v, "binary digest")
+    check(acc, "a record without its compiler binary digest is a named refusal naming the line", r4.code == 1, "")
+    idx = idx + 1
+    v = json_clone_set_empty_obj(base_line, "env")
+    let r5: SizeRun = ledger_case(acc, idx, base_txt, v, "machine")
+    check(acc, "a record without its machine fingerprint is a named refusal naming the line", r5.code == 1, "")
+    idx = idx + 1
+
+    # A workload without an axis.
+    let wl: JsonValue = drop_key(jobj(jobj(base_line, "workloads"), "floor"),
+                                 "text_bytes")
+    let mut v6: JsonValue = json_clone_set_workload(base_line, "floor", wl)
+    let h6: str = ledger_path(acc, idx, base_txt, v6)
+    let r6: SizeRun = size_run(["history", "--history", h6])
+    check(acc, "a workload without an axis is a named refusal naming the line",
+          r6.code == 1 && r6.err.contains("line 2")
+              && r6.err.contains("carries no text_bytes"), "")
+    idx = idx + 1
+
+    # A workload with a negative axis.
+    let mut v7: JsonValue = json_clone_set_workload(base_line, "floor",
+        axes_json(100000, 20000, 7000, -1, 100))
+    let h7: str = ledger_path(acc, idx, base_txt, v7)
+    let r7: SizeRun = size_run(["history", "--history", h7])
+    check(acc, "a workload with a negative axis is a named refusal naming the line",
+          r7.code == 1 && r7.err.contains("line 2")
+              && r7.err.contains("non-negative"), "")
+    idx = idx + 1
+
+    # An hlc_self row on the stage0 instrument.
+    let hs_keys: list[str] = ["floor", "hlc_self"]
+    let hs_vals: list[JsonValue] = [axes_json(100000, 20000, 7000, 700, 100),
+                                    axes_json(100000, 20000, 7000, 700, 100)]
+    let stg_keys: list[str] = ["compiler_digest", "env", "instrument",
+                               "source_digest", "suite", "suite_digest",
+                               "tool", "version", "workloads"]
+    let stg_vals: list[JsonValue] = [json_str(repeat_str("b", 64)),
+        json_object_get(base_line, "env"), json_str("stage0"),
+        json_str(repeat_str("a", 64)), json_str("benchmarks/size_watch"),
+        json_str(suite_d()), json_str("hls-size"), json_str("0.157.0"),
+        JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+                    sval: "", arr: [], obj_keys: hs_keys, obj_vals: hs_vals }]
+    let mut v8: JsonValue = JsonValue { kind: "object", bval: false, ival: 0,
+        fval: 0.0, sval: "", arr: [], obj_keys: stg_keys, obj_vals: stg_vals }
+    v8 = with_type_commit(v8, hex40(1))
+    let h8: str = ledger_path(acc, idx, base_txt, v8)
+    let r8: SizeRun = size_run(["history", "--history", h8])
+    check(acc, "an hlc_self row on the stage0 instrument is a named refusal naming the line",
+          r8.code == 1 && r8.err.contains("line 2")
+              && r8.err.contains("native instrument"), "")
+    idx = idx + 1
+
+    # A sanction without a written reason.
+    let s_keys: list[str] = ["tool", "type", "version", "workload"]
+    let s_vals: list[JsonValue] = [json_str("hls-size"), json_str("sanction"),
+                                   json_str("0.157.0"), json_str("floor")]
+    let v9: JsonValue = JsonValue { kind: "object", bval: false, ival: 0,
+        fval: 0.0, sval: "", arr: [], obj_keys: s_keys, obj_vals: s_vals }
+    let h9: str = ledger_path(acc, idx, base_txt, v9)
+    let r9: SizeRun = size_run(["history", "--history", h9])
+    check(acc, "a sanction without a written reason is a named refusal naming the line",
+          r9.code == 1 && r9.err.contains("line 2")
+              && r9.err.contains("written reason"), "")
+
+    # history --workload filters records and sanctions alike.
+    let h: str = scratch(acc, "filter.jsonl")
+    record_from(acc, default_report(two_workloads(
+        axes_json(100000, 20000, 7000, 700, 100), grid_workload())),
+        h, hex40(1), [])
+    size_run(["sanction", "grid", "--reason", "wide by design",
+              "--author", "mhieuhonda", "--history", h])
+    let f1: SizeRun = size_run(["history", "--history", h])
+    check(acc, "the ledger holds the record and the sanction",
+          f1.code == 0 && f1.out.contains("2 entries"), "")
+    let f2: SizeRun = size_run(["history", "--workload", "grid", "--history", h])
+    check(acc, "history --workload filters records and sanctions alike",
+          f2.code == 0 && f2.out.contains("record") && f2.out.contains("sanction")
+              && f2.out.contains("sanction grid"), "")
+    let f3: SizeRun = size_run(["history", "--workload", "grid", "--json",
+                                "--history", h])
+    let entries: JsonValue = parse_json_or_null(f3.out)
+    let mut all_grid: bool = json_is_array(entries)
+    let mut sanction_grid: bool = false
+    if all_grid {
+        let mut i: int = 0
+        while i < entries.arr.len() {
+            let e: JsonValue = entries.arr.get(i)
+            if jstr(e, "type") == "record" {
+                if !json_object_has(jobj(e, "workloads"), "grid") {
+                    all_grid = false
+                }
+            }
+            if jstr(e, "type") == "sanction" {
+                if jstr(e, "workload") == "grid" {
+                    sanction_grid = true
+                }
+            }
+            i = i + 1
+        }
+    }
+    check(acc, "history --workload --json round-trips the filtered entries",
+          all_grid && sanction_grid, "")
+}
+
+# ledger_case / ledger_path — write base + variant, run history.
+fn ledger_path(acc: Acc, idx: int, base_txt: str, variant: JsonValue) -> str uses Fs, Proc {
+    let h: str = scratch(acc, "ledger-" + idx.to_str() + ".jsonl")
+    write_file(h, base_txt + "\n" + json_to_string(variant) + "\n")
+    return h
+}
+
+fn ledger_case(acc: Acc, idx: int, base_txt: str, variant: JsonValue,
+               expect: str) -> SizeRun uses Fs, Proc {
+    let h: str = ledger_path(acc, idx, base_txt, variant)
+    return size_run(["history", "--history", h])
+}
+
+# json_clone_set(obj, key, val) — rebuild with one string field replaced.
+fn json_clone_set(obj: JsonValue, key: str, val: str) -> JsonValue {
+    let keys: list[str] = []
+    let vals: list[JsonValue] = []
+    let mut i: int = 0
+    while i < obj.obj_keys.len() {
+        if obj.obj_keys.get(i) == key {
+            keys.push(key)
+            vals.push(json_str(val))
+        } else {
+            keys.push(obj.obj_keys.get(i))
+            vals.push(obj.obj_vals.get(i))
+        }
+        i = i + 1
+    }
+    return JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+                       sval: "", arr: [], obj_keys: keys, obj_vals: vals }
+}
+
+fn json_clone_set_empty_obj(obj: JsonValue, key: str) -> JsonValue {
+    return json_clone_set_val(obj, key,
+        JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0, sval: "",
+                    arr: [], obj_keys: [], obj_vals: [] })
+}
+
+fn json_clone_set_val(obj: JsonValue, key: str, val: JsonValue) -> JsonValue {
+    let keys: list[str] = []
+    let vals: list[JsonValue] = []
+    let mut i: int = 0
+    while i < obj.obj_keys.len() {
+        if obj.obj_keys.get(i) == key {
+            keys.push(key)
+            vals.push(val)
+        } else {
+            keys.push(obj.obj_keys.get(i))
+            vals.push(obj.obj_vals.get(i))
+        }
+        i = i + 1
+    }
+    return JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+                       sval: "", arr: [], obj_keys: keys, obj_vals: vals }
+}
+
+fn json_clone_set_workload(obj: JsonValue, name: str, w: JsonValue) -> JsonValue {
+    let wl: JsonValue = jobj(obj, "workloads")
+    return json_clone_set_val(obj, "workloads",
+        json_clone_set_val(wl, name, w))
+}
+
+fn s8_corpus(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 8 — the corpus showcase")
+    let showcase: str = "tests/ok/feat_stage139_size.hls"
+    let expected: str = "all 9 size laws hold\n"
+
+    let chk: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "--check", showcase])
+    check(acc, "the showcase boots through the real checker", chk.code == 0, "")
+    let run_it: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", showcase])
+    check(acc, "the showcase runs green on the interpreter, exact output",
+          run_it.code == 0 && run_it.out == expected, "")
+    let fmt: RunResult = run_capture("bin/hlfmt", ["--check", showcase])
+    check(acc, "the showcase is hlfmt-canonical", fmt.code == 0, "")
+    let lint: RunResult = run_capture("python3",
+        ["tools/hllint.py", showcase])
+    check(acc, "the showcase is hllint-clean",
+          lint.code == 0 && lint.out.contains("no warnings"), "")
+
+    # The native differential, when bin/hlc exists.
+    if file_exists("bin/hlc") && which("gcc") {
+        let c_path: str = scratch(acc, "showcase.c")
+        let bin_path: str = scratch(acc, "showcase_bin")
+        let r1: RunResult = run_capture("bin/hlc", [showcase, c_path])
+        if r1.code != 0 {
+            check(acc, "hlc compiled the showcase", false, clip(first_line(r1.out), 120))
+        } else {
+            let r2: RunResult = run_capture("gcc",
+                ["-O2", "-o", bin_path, c_path, "-lm", "-pthread"])
+            if r2.code != 0 {
+                check(acc, "gcc compiled the showcase", false,
+                      clip(first_line(r2.err), 120))
+            } else {
+                let rn: RunResult = run_capture(bin_path, [])
+                check(acc, "the showcase matches natively, byte for byte",
+                      rn.code == 0 && rn.out == expected, "")
+            }
+        }
+    } else {
+        println("  (bin/hlc or cc not available — native differential skipped, interpreter legs ran)")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Fs, Proc, Exit {
+    let acc: Acc = acc_new("size")
+    s1_convention(acc)
+    s2_record_law(acc)
+    s3_floor_law(acc)
+    s4_classification(acc)
+    s5_gate_law(acc)
+    s6_determinism(acc)
+    s7_ledger_law(acc)
+    s8_corpus(acc)
+    return finish(acc, "Stage 139 -- the binary-size dashboard")
+}

@@ -1,0 +1,1190 @@
+# ============================================================================
+# tests/acc/auditkit_acceptance.hls — Stage 140 acceptance gate, in Halis
+# (the Halis twin of tests/auditkit_acceptance.py; same eight sections,
+# same laws, same needles — the harness is tests/acc/harness.hls and
+# the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make auditkit-acceptance`.
+#
+#  1. the convention    — usage exits 2; readers on a missing ledger are
+#                         named errors; brief alone renders the RFP
+#  2. the engagement    — entry one chained from GENESIS (the gate
+#                         re-derives the chain INDEPENDENTLY of the tool's
+#                         reader); the live scope digest; the window,
+#                         self-signature and roster refusals
+#  3. the brief law     — the RFP and the engaged brief, the census, the
+#                         determinism, the live channel anchor, the scope
+#                         follows the tree
+#  4. the evidence law  — INDEPENDENT vs SELF-ASSESSED, the engine's own
+#                         counts, append-only, the FAILED pass on record,
+#                         the drift fact
+#  5. the finding law   — sequential ids, the authorship + severity +
+#                         scope + reproducer refusals
+#  6. the triage law    — one response per finding, the fix laws, the
+#                         authorship law, the reason law
+#  7. the report law    — deterministic renders, the embedded digest, the
+#                         honest banners, the tampered ledgers named at
+#                         their line
+#  8. the corpus        — the showcase boots, formats, lints, runs green
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.json"
+import "std.sha256"
+
+# ----------------------------------------------------------------------------
+# The world.
+# ----------------------------------------------------------------------------
+
+struct KitRun {
+    code: int,
+    out: str,
+    err: str
+}
+
+fn kit(acc: Acc, argv: list[str]) -> KitRun uses Proc {
+    let full: list[str] = ["tools/hls-auditkit.py"]
+    let mut i: int = 0
+    while i < argv.len() {
+        full.push(argv.get(i))
+        i = i + 1
+    }
+    let r: RunResult = run_capture("python3", full)
+    return KitRun { code: r.code, out: r.out, err: r.err }
+}
+
+fn guar(acc: Acc, argv: list[str]) -> KitRun uses Proc {
+    let full: list[str] = ["tools/hls-guarantee.py"]
+    let mut i: int = 0
+    while i < argv.len() {
+        full.push(argv.get(i))
+        i = i + 1
+    }
+    let r: RunResult = run_capture("python3", full)
+    return KitRun { code: r.code, out: r.out, err: r.err }
+}
+
+# replace_first(s, from, to) — the one-shot string surgery.
+fn replace_first(s: str, from: str, to: str) -> str {
+    let mut i: int = 0
+    while i + from.len() <= s.len() {
+        if s.slice(i, i + from.len()) == from {
+            return s.slice(0, i) + to + s.slice(i + from.len(), s.len())
+        }
+        i = i + 1
+    }
+    return s
+}
+
+fn starts_with(s: str, prefix: str) -> bool {
+    if s.len() < prefix.len() {
+        return false
+    }
+    return s.slice(0, prefix.len()) == prefix
+}
+
+fn repeat_str(s: str, n: int) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < n {
+        out = out + s
+        i = i + 1
+    }
+    return out
+}
+
+fn genesis() -> str {
+    return repeat_str("0", 64)
+}
+
+# ----------------------------------------------------------------------------
+# The canonical JSON + the chain arithmetic, re-derived by the gate (the
+# same canon() the freeze gate pins: sorted keys, compact separators,
+# ensure_ascii).
+# ----------------------------------------------------------------------------
+
+fn canon_str(s: str) -> str {
+    let mut out: str = "\""
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c == 34 {
+            out = out + "\\\""
+        } else if c == 92 {
+            out = out + "\\\\"
+        } else if c == 10 {
+            out = out + "\\n"
+        } else if c == 13 {
+            out = out + "\\r"
+        } else if c == 9 {
+            out = out + "\\t"
+        } else if c < 32 {
+            out = out + hex_byte_lo(c)
+        } else if c < 128 {
+            out = out + s.slice(i, i + 1)
+        } else {
+            let mut cp: int = 0
+            let mut advance: int = 1
+            if c >= 240 {
+                cp = (c - 240) * 262144
+                    + (s.byte_at(i + 1) - 128) * 4096
+                    + (s.byte_at(i + 2) - 128) * 64
+                    + (s.byte_at(i + 3) - 128)
+                advance = 4
+            } else if c >= 224 {
+                cp = (c - 224) * 4096
+                    + (s.byte_at(i + 1) - 128) * 64
+                    + (s.byte_at(i + 2) - 128)
+                advance = 3
+            } else {
+                cp = (c - 192) * 64 + (s.byte_at(i + 1) - 128)
+                advance = 2
+            }
+            if cp > 65535 {
+                out = out + hex4_surro(cp)
+            } else {
+                out = out + hex4(cp)
+            }
+            i = i + advance
+            continue
+        }
+        i = i + 1
+    }
+    return out + "\""
+}
+
+fn hex_byte_lo(c: int) -> str {
+    let lo: int = c % 16
+    let digits: str = "0123456789abcdef"
+    return "0" + digits.slice(lo, lo + 1)
+}
+
+fn hex4(cp: int) -> str {
+    let digits: str = "0123456789abcdef"
+    let a: int = (cp / 4096) % 16
+    let b: int = (cp / 256) % 16
+    let c: int = (cp / 16) % 16
+    let d: int = cp % 16
+    return "\\u" + digits.slice(a, a + 1) + digits.slice(b, b + 1)
+        + digits.slice(c, c + 1) + digits.slice(d, d + 1)
+}
+
+fn hex4_surro(cp: int) -> str {
+    let v: int = cp - 65536
+    let hi: int = 55296 + v / 1024
+    let lo: int = 56320 + v % 1024
+    return hex4(hi) + hex4(lo)
+}
+
+fn sort_strs(items: list[str]) -> list[str] {
+    let a: list[str] = items
+    let mut i: int = 1
+    while i < a.len() {
+        let key: str = a.get(i)
+        let mut j: int = i - 1
+        while j >= 0 && a.get(j) > key {
+            a.set(j + 1, a.get(j))
+            j = j - 1
+        }
+        a.set(j + 1, key)
+        i = i + 1
+    }
+    return a
+}
+
+fn canon(v: JsonValue) -> str {
+    if json_is_null(v) {
+        return "null"
+    }
+    if json_is_bool(v) {
+        if v.bval {
+            return "true"
+        }
+        return "false"
+    }
+    if json_is_int(v) {
+        return v.ival.to_str()
+    }
+    if json_is_float(v) {
+        return v.fval.to_str()
+    }
+    if json_is_str(v) {
+        return canon_str(v.sval)
+    }
+    if json_is_array(v) {
+        let parts: list[str] = []
+        parts.push("[")
+        let mut i: int = 0
+        while i < v.arr.len() {
+            if i > 0 {
+                parts.push(",")
+            }
+            parts.push(canon(v.arr.get(i)))
+            i = i + 1
+        }
+        parts.push("]")
+        return str_join(parts, "")
+    }
+    let keys: list[str] = sort_strs(v.obj_keys)
+    let parts: list[str] = []
+    parts.push("{")
+    let mut i: int = 0
+    while i < keys.len() {
+        if i > 0 {
+            parts.push(",")
+        }
+        let k: str = keys.get(i)
+        parts.push(canon_str(k))
+        parts.push(":")
+        parts.push(canon(json_object_get(v, k)))
+        i = i + 1
+    }
+    parts.push("}")
+    return str_join(parts, "")
+}
+
+# chain_of(prev_hash, record) — sha256 over prev + canonical body, the
+# chain_hash field itself left out; the family arithmetic.
+fn chain_of(prev_hash: str, record: JsonValue) -> str {
+    return sha256_hex(prev_hash + canon(drop_key(record, "chain_hash")))
+}
+
+fn drop_key(obj: JsonValue, key: str) -> JsonValue {
+    let keys: list[str] = []
+    let vals: list[JsonValue] = []
+    let mut i: int = 0
+    while i < obj.obj_keys.len() {
+        if obj.obj_keys.get(i) != key {
+            keys.push(obj.obj_keys.get(i))
+            vals.push(obj.obj_vals.get(i))
+        }
+        i = i + 1
+    }
+    return JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+                       sval: "", arr: [], obj_keys: keys, obj_vals: vals }
+}
+
+# ----------------------------------------------------------------------------
+# Ledger reading + the independent chain verifier.
+# ----------------------------------------------------------------------------
+
+fn parse_json_or_null(text: str) -> JsonValue {
+    let rr: Result[JsonValue, str] = json_parse_result(text)
+    if result_is_ok(rr) {
+        return result_unwrap(rr)
+    }
+    return json_null()
+}
+
+# entries_of(path) — the non-blank lines, parsed in order.
+fn entries_of(path: str) -> list[JsonValue] uses Fs {
+    let out: list[JsonValue] = []
+    if !file_exists(path) {
+        return out
+    }
+    let lines: list[str] = read_file(path).split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).trim() != "" {
+            out.push(parse_json_or_null(lines.get(i)))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+struct ChainVerdict {
+    ok: bool,
+    detail: str
+}
+
+# verify_chain(path) — the chain law, re-derived by the gate, not the
+# tool's own reader.
+fn verify_chain(path: str) -> ChainVerdict uses Fs {
+    let entries: list[JsonValue] = entries_of(path)
+    let mut prev: str = genesis()
+    let mut i: int = 0
+    while i < entries.len() {
+        let e: JsonValue = entries.get(i)
+        let mut seq: int = -1
+        let seqv: JsonValue = json_object_get(e, "seq")
+        if json_is_int(seqv) {
+            seq = json_int_value(seqv)
+        }
+        if seq != i + 1 {
+            return ChainVerdict { ok: false,
+                detail: "line " + (i + 1).to_str() + ": seq wrong" }
+        }
+        if jstr(e, "prev_hash") != prev {
+            return ChainVerdict { ok: false,
+                detail: "line " + (i + 1).to_str() + ": prev does not chain" }
+        }
+        if jstr(e, "chain_hash") != chain_of(prev, e) {
+            return ChainVerdict { ok: false,
+                detail: "line " + (i + 1).to_str() + ": chain_hash does not hash" }
+        }
+        prev = jstr(e, "chain_hash")
+        i = i + 1
+    }
+    return ChainVerdict { ok: true,
+        detail: entries.len().to_str() + " entries, head "
+            + prev.slice(0, 12) + "..." }
+}
+
+fn jstr(v: JsonValue, key: str) -> str {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_str(x) {
+        return json_str_value(x)
+    }
+    return ""
+}
+
+fn jint(v: JsonValue, key: str) -> int {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_int(x) {
+        return json_int_value(x)
+    }
+    return -1
+}
+
+fn jbool(v: JsonValue, key: str) -> bool {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_bool(x) {
+        return json_bool_value(x)
+    }
+    return false
+}
+
+fn jobj(v: JsonValue, key: str) -> JsonValue {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_object(x) {
+        return x
+    }
+    return json_null()
+}
+
+fn jarray(v: JsonValue, key: str) -> list[JsonValue] {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_array(x) {
+        return x.arr
+    }
+    let empty: list[JsonValue] = []
+    return empty
+}
+
+# ----------------------------------------------------------------------------
+# The engagement + the probe trees.
+# ----------------------------------------------------------------------------
+
+# engage(path, by, window, basis, firm, auditors).
+fn engage(acc: Acc, path: str, by: str, window: str, basis: str,
+          firm: str, auditors: list[str]) -> KitRun uses Proc {
+    let argv: list[str] = ["engage", "--ledger", path, "--firm", firm,
+                           "--window", window, "--basis", basis, "--by", by]
+    let mut i: int = 0
+    while i < auditors.len() {
+        argv.push("--auditor")
+        argv.push(auditors.get(i))
+        i = i + 1
+    }
+    return kit(acc, argv)
+}
+
+# default_engage(path) — the battery's standard terms.
+fn default_engage(acc: Acc, path: str) -> KitRun uses Proc {
+    let roster: list[str] = ["Dana Fischer", "Ravi Chandran"]
+    return engage(acc, path, "mhieuhonda", "2026-11-02/2026-12-24",
+                  "fixed fee against the scope census, half at engagement",
+                  "Meridian Audit Partners", roster)
+}
+
+# mini_tree(tag, security, shrink) — the guarantee tool + its SECURITY.md,
+# optionally a 14-row ledger. No probes run here — the mini tree briefs.
+fn mini_tree(acc: Acc, tag: str, security: bool, shrink: bool) -> str uses Fs, Proc {
+    let d: str = scratch(acc, "mini-" + tag)
+    mkdirs(path_join3(d, "tools"))
+    cp("tools/hls-guarantee.py", path_join3(d, "tools/hls-guarantee.py"))
+    if shrink {
+        write_file(path_join3(d, "tools/hls-guarantee.py"),
+                   read_file(path_join3(d, "tools/hls-guarantee.py"))
+                       + "\nLEDGER = LEDGER[:14]\n")
+    }
+    if security {
+        cp("SECURITY.md", path_join3(d, "SECURITY.md"))
+    } else {
+        write_file(path_join3(d, "SECURITY.md"),
+                   "# Security policy\n(no anchored channel here)\n")
+    }
+    return d
+}
+
+# full_tree(tag) — a full copy of the repo the tamper sections mangle
+# (the copytree ignore list, via tar's excludes).
+fn full_tree(acc: Acc, tag: str) -> str uses Proc {
+    let dst: str = scratch(acc, "tree-" + tag)
+    mkdirs(dst)
+    sh("tar -C . --exclude=./.git --exclude=./bin --exclude=./fuzz-corpus"
+       + " --exclude=./tests/.acc-scratch --exclude='__pycache__'"
+       + " --exclude='*.pyc' --exclude='./.hlaudit' -cf - ."
+       + " | tar -C '" + shell_quote(dst) + "' -xf -")
+    return dst
+}
+
+fn led(acc: Acc, name: str) -> str uses Proc {
+    return scratch(acc, name + "/engagement.jsonl")
+}
+
+# ----------------------------------------------------------------------------
+# 1-8. The sections.
+# ----------------------------------------------------------------------------
+
+fn s1_convention(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 1 — the convention")
+    let p: KitRun = kit(acc, [])
+    check(acc, "a bare invocation is a usage error (exit 2)", p.code == 2, "")
+    let q: KitRun = kit(acc, ["no-such-command"])
+    check(acc, "an unknown command is a usage error (exit 2)", q.code == 2, "")
+    let e: KitRun = kit(acc, ["engage"])
+    check(acc, "engage without its terms is a usage error (exit 2)",
+          e.code == 2, "")
+
+    let missing: str = led(acc, "missing")
+    let cmds: list[str] = ["evidence", "file", "triage", "report", "status"]
+    let mut i: int = 0
+    while i < cmds.len() {
+        let cmdname: str = cmds.get(i)
+        let argv: list[str] = [cmdname, "--ledger", missing]
+        if cmdname == "file" {
+            argv.push("--against")
+            argv.push("G-TAINT-01")
+            argv.push("--severity")
+            argv.push("high")
+            argv.push("--title")
+            argv.push("t")
+            argv.push("--repro-text")
+            argv.push("t")
+        }
+        if cmdname == "triage" {
+            argv.push("AF-001")
+            argv.push("--verdict")
+            argv.push("disputed")
+            argv.push("--reason")
+            argv.push("r")
+        }
+        if cmdname == "report" {
+            argv.push("--out")
+            argv.push(scratch(acc, "d.md"))
+        }
+        let r: KitRun = kit(acc, argv)
+        check(acc, cmdname + " on a missing ledger is a named error",
+              r.code == 1 && r.err.contains("no engagement ledger"), "")
+        i = i + 1
+    }
+
+    let b: KitRun = kit(acc, ["brief", "--ledger", missing])
+    check(acc, "brief on a missing ledger is the RFP, open solicitation",
+          b.code == 0 && b.out.contains("OPEN SOLICITATION"), "")
+}
+
+fn s2_engagement(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 2 — the engagement law")
+    let h: str = led(acc, "engage")
+    let p: KitRun = default_engage(acc, h)
+    check(acc, "engage signs on a fresh ledger",
+          p.code == 0 && p.out.contains("engaged"), clip(first_line(p.err), 120))
+
+    let entries: list[JsonValue] = entries_of(h)
+    check(acc, "exactly one entry was written", entries.len() == 1, "")
+    if entries.len() < 1 {
+        return
+    }
+    let e: JsonValue = entries.get(0)
+    check(acc, "the entry is an engagement", jstr(e, "kind") == "engagement", "")
+    check(acc, "the engagement is entry one", jint(e, "seq") == 1, "")
+    check(acc, "entry one chains from GENESIS, 64 zeros",
+          jstr(e, "prev_hash") == genesis(), "")
+    let roster: list[JsonValue] = jarray(e, "roster")
+    check(acc, "the roster is recorded in order, verbatim",
+          roster.len() == 2 && json_is_str(roster.get(0))
+              && json_str_value(roster.get(0)) == "Dana Fischer"
+              && json_is_str(roster.get(1))
+              && json_str_value(roster.get(1)) == "Ravi Chandran", "")
+    check(acc, "the firm, the window and the basis are recorded verbatim",
+          jstr(e, "window") == "2026-11-02/2026-12-24"
+              && jstr(e, "basis") == "fixed fee against the scope census, half at engagement"
+              && jstr(e, "firm") == "Meridian Audit Partners", "")
+    check(acc, "the signer is recorded", jstr(e, "by") == "mhieuhonda", "")
+    let cv: ChainVerdict = verify_chain(h)
+    check(acc, "the chain law holds, re-derived by the gate (" + cv.detail + ")",
+          cv.ok, cv.detail)
+
+    let live_run: KitRun = guar(acc, ["list", "--json"])
+    let live: JsonValue = parse_json_or_null(live_run.out)
+    check(acc, "the engagement pins the live guarantee ledger digest",
+          jstr(e, "scope_sha256") == jstr(live, "ledger_sha256"), "")
+    check(acc, "the scope is the 15 guarantees of Stage 135",
+          jarray(live, "guarantees").len() == 15, "")
+
+    let windows: list[str] = ["2026-12-24/2026-11-02", "2026-11-02",
+                              "2026-13-45/2026-12-24"]
+    let whys: list[str] = ["a window that ends before it starts",
+                           "a window that is not two dates",
+                           "a window that is not ISO"]
+    let mut wi: int = 0
+    while wi < windows.len() {
+        let r: KitRun = engage(acc, led(acc, "win-" + wi.to_str()),
+                               "mhieuhonda", windows.get(wi),
+                               "fixed fee against the scope census, half at engagement",
+                               "Meridian Audit Partners",
+                               two_auditors())
+        check(acc, whys.get(wi) + " is refused at the signature",
+              r.code == 1 && r.err.contains("window"), "")
+        wi = wi + 1
+    }
+
+    let second: KitRun = default_engage(acc, h)
+    check(acc, "a second engagement is refused — a contract is not a draft",
+          second.code == 1 && second.err.contains("already on record"), "")
+
+    let self_roster: list[str] = ["Dana Fischer", "Ravi Chandran"]
+    let ss: KitRun = engage(acc, led(acc, "selfsig"), "Dana Fischer",
+                            "2026-11-02/2026-12-24",
+                            "fixed fee against the scope census, half at engagement",
+                            "Meridian Audit Partners", self_roster)
+    check(acc, "a signer on their own roster is refused — independence starts at the signature",
+          ss.code == 1 && ss.err.contains("own roster"), "")
+
+    let none: list[str] = []
+    let nr: KitRun = engage(acc, led(acc, "noroster"), "mhieuhonda",
+                            "2026-11-02/2026-12-24",
+                            "fixed fee against the scope census, half at engagement",
+                            "Meridian Audit Partners", none)
+    check(acc, "an empty roster is refused — an audit with no auditors is a monologue",
+          nr.code == 1 && nr.err.contains("monologue"), "")
+}
+
+fn two_auditors() -> list[str] {
+    let out: list[str] = ["Dana Fischer", "Ravi Chandran"]
+    return out
+}
+
+fn s3_brief_law(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 3 — the brief law")
+    let h: str = led(acc, "brief")
+    default_engage(acc, h)
+
+    let b1: str = scratch(acc, "brief-1.md")
+    let p: KitRun = kit(acc, ["brief", "--ledger", h, "--out", b1])
+    check(acc, "brief renders from the live tree",
+          p.code == 0 && p.out.contains("15 guarantees"), "")
+    let doc: str = read_file(b1)
+
+    let live_run: KitRun = guar(acc, ["list", "--json"])
+    let live: JsonValue = parse_json_or_null(live_run.out)
+    let ids: list[JsonValue] = jarray(live, "guarantees")
+    let mut all_ids: bool = ids.len() > 0
+    let mut i: int = 0
+    while i < ids.len() {
+        if !doc.contains("| " + jstr(ids.get(i), "id") + " |") {
+            all_ids = false
+        }
+        i = i + 1
+    }
+    check(acc, "every guarantee id appears in the census table", all_ids, "")
+    check(acc, "the scope digest embedded is the live ledger digest",
+          doc.contains("`sha256:" + jstr(live, "ledger_sha256") + "`"), "")
+    check(acc, "the engaged brief names the firm, the window, the basis",
+          doc.contains("window 2026-11-02/2026-12-24")
+              && doc.contains("Meridian Audit Partners")
+              && doc.contains("fixed fee against the scope census, half at engagement"),
+          "")
+    check(acc, "the reporting channel is quoted in the brief",
+          doc.contains("90-day coordinated-disclosure")
+              && doc.contains("security/advisories"), "")
+
+    let b2: str = scratch(acc, "brief-2.md")
+    kit(acc, ["brief", "--ledger", h, "--out", b2])
+    check(acc, "two renders of one tree are byte-identical",
+          read_file(b1) == read_file(b2), "")
+
+    let b3: str = scratch(acc, "brief-3.md")
+    kit(acc, ["brief", "--ledger", h, "--out", b3, "--stamp"])
+    # --stamp changes ONLY the Generated line.
+    let d1: list[str] = read_file(b1).split("\n")
+    let d2: list[str] = read_file(b3).split("\n")
+    let keep1: list[str] = without_generated(d1)
+    let keep2: list[str] = without_generated(d2)
+    let mut gen_count: int = 0
+    let mut j: int = 0
+    while j < d2.len() {
+        if starts_with(d2.get(j), "- Generated") {
+            gen_count = gen_count + 1
+        }
+        j = j + 1
+    }
+    let mut same: bool = keep1.len() == keep2.len()
+    j = 0
+    while same && j < keep1.len() {
+        if keep1.get(j) != keep2.get(j) {
+            same = false
+        }
+        j = j + 1
+    }
+    check(acc, "--stamp changes ONLY the Generated line",
+          same && gen_count == 1, "")
+
+    let gone: str = mini_tree(acc, "nochan", false, false)
+    let g1: KitRun = kit(acc, ["brief", "--ledger", h, "--root", gone])
+    check(acc, "a tree that lost the anchored channel refuses to brief",
+          g1.code == 1 && g1.err.contains("reporting channel anchor is gone"), "")
+
+    let shrunk: str = mini_tree(acc, "shrunk", true, true)
+    let b4: str = scratch(acc, "brief-4.md")
+    let g2: KitRun = kit(acc, ["brief", "--ledger", h, "--root", shrunk,
+                               "--out", b4])
+    let doc4: str = read_file(b4)
+    check(acc, "a 14-row ledger briefs a 14-row scope",
+          g2.code == 0 && g2.out.contains("14 guarantees"), "")
+    check(acc, "the dropped row is absent, the rest present",
+          !doc4.contains("G-CORPUS-01") && doc4.contains("G-DET-01"), "")
+
+    let entries: list[JsonValue] = entries_of(h)
+    let eng_digest: str = jstr(entries.get(0), "scope_sha256")
+    let mut digest_line: str = ""
+    let b4_lines: list[str] = doc4.split("\n")
+    let mut k: int = 0
+    while k < b4_lines.len() {
+        if starts_with(b4_lines.get(k), "- Scope digest:") {
+            digest_line = b4_lines.get(k)
+        }
+        k = k + 1
+    }
+    check(acc, "the shrunk tree's scope digest differs from the engagement's",
+          digest_line != ""
+              && digest_line != "- Scope digest: `sha256:" + eng_digest + "`", "")
+}
+
+# without_generated(lines) — drop the Generated lines.
+fn without_generated(lines: list[str]) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < lines.len() {
+        if !starts_with(lines.get(i), "- Generated") {
+            out.push(lines.get(i))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn s4_evidence_law(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 4 — the evidence law")
+    let h: str = led(acc, "life")
+    default_engage(acc, h)
+    let head: RunResult = run_capture("git", ["rev-parse", "HEAD"])
+    let head_sha: str = head.out.trim()
+
+    # The same engine, the same counts.
+    let gv_run: KitRun = guar(acc, ["verify", "--json"])
+    let gv: JsonValue = parse_json_or_null(gv_run.out)
+    let glist: list[JsonValue] = jarray(gv, "guarantees")
+    let mut g_ok: int = 0
+    let mut g_anchors: int = 0
+    let mut g_probes: int = 0
+    let mut i: int = 0
+    while i < glist.len() {
+        let r: JsonValue = glist.get(i)
+        if jstr(r, "status") == "verified" {
+            g_ok = g_ok + 1
+        }
+        let anchors: list[JsonValue] = jarray(r, "anchors")
+        let mut a: int = 0
+        while a < anchors.len() {
+            if jbool(anchors.get(a), "ok") {
+                g_anchors = g_anchors + 1
+            }
+            a = a + 1
+        }
+        let probes: list[JsonValue] = jarray(r, "probes")
+        let mut b: int = 0
+        while b < probes.len() {
+            if jstr(probes.get(b), "verdict") == "ok" {
+                g_probes = g_probes + 1
+            }
+            b = b + 1
+        }
+        i = i + 1
+    }
+
+    let p: KitRun = kit(acc, ["evidence", "--ledger", h, "--by", "Dana Fischer"])
+    check(acc, "a pass by a roster member is labelled INDEPENDENT",
+          p.code == 0 && p.out.contains("INDEPENDENT"), clip(first_line(p.err), 120))
+    let entries: list[JsonValue] = entries_of(h)
+    let e: JsonValue = entries.get(entries.len() - 1)
+    check(acc, "the transcript records the auditor role and the label",
+          jstr(e, "kind") == "evidence" && jstr(e, "role") == "auditor"
+              && jbool(e, "independent"), "")
+    check(acc, "the transcript pins the tree it ran", jstr(e, "tree") == head_sha, "")
+    check(acc, "the counts are the guarantee engine's counts (" + g_ok.to_str()
+          + " guarantees, " + g_anchors.to_str() + " anchors, "
+          + g_probes.to_str() + " probes)",
+          jint(e, "verified_guarantees") == g_ok
+              && jint(e, "anchors") == g_anchors
+              && jint(e, "probes") == g_probes, "")
+
+    let before: str = read_file(h)
+    let p2: KitRun = kit(acc, ["evidence", "--ledger", h, "--by", "mhieuhonda"])
+    let after: str = read_file(h)
+    check(acc, "the ledger is append-only: the bytes before are a prefix of the bytes after",
+          p2.code == 0 && starts_with(after, before), "")
+    let entries2: list[JsonValue] = entries_of(h)
+    let e2: JsonValue = entries2.get(entries2.len() - 1)
+    check(acc, "a pass by the project itself is labelled SELF-ASSESSED, role project — the roster decides, never the mood",
+          jstr(e2, "role") == "project" && !jbool(e2, "independent")
+              && p2.out.contains("SELF-ASSESSED"), "")
+
+    # A FAILED pass is recorded, not skipped. The tampered tree drops
+    # the G-MEM-01 anchor (the ownership checker's refusal message).
+    let broken: str = full_tree(acc, "broken")
+    let expr: str = path_join3(broken, "tools/hlinterp/checking/expr.py")
+    write_file(expr, replace_first(read_file(expr), "use of moved value",
+                              "use of moved VALUE"))
+    let p3: KitRun = kit(acc, ["evidence", "--ledger", h, "--root", broken,
+                               "--by", "Dana Fischer"])
+    check(acc, "a failed pass exits 1 naming its refusals",
+          p3.code == 1 && p3.err.contains("EVIDENCE FAILED"), "")
+    let entries3: list[JsonValue] = entries_of(h)
+    let e3: JsonValue = entries3.get(entries3.len() - 1)
+    let refusals: list[JsonValue] = jarray(e3, "refusals")
+    let mut names_mem: bool = false
+    let mut has_refusals: bool = refusals.len() > 0
+    let mut r_i: int = 0
+    while r_i < refusals.len() {
+        let r: JsonValue = refusals.get(r_i)
+        if json_is_str(r) && json_str_value(r).contains("G-MEM-01") {
+            names_mem = true
+        }
+        r_i = r_i + 1
+    }
+    check(acc, "the failed pass is ON RECORD — a failed pass is a record, not a shame",
+          jstr(e3, "outcome") == "failed" && has_refusals, "")
+    check(acc, "the refusals name the voided guarantee", names_mem, "")
+    let cv: ChainVerdict = verify_chain(h)
+    check(acc, "the chain still verifies across a failed pass (" + cv.detail + ")",
+          cv.ok, "")
+    let st1: KitRun = kit(acc, ["status", "--ledger", h])
+    check(acc, "status reads a ledger that carries a failed pass without drama",
+          st1.code == 0, "")
+
+    # The drift fact: a pass against a 14-row ledger records the digest
+    # it RAN.
+    let drift: str = full_tree(acc, "drift")
+    write_file(path_join3(drift, "tools/hls-guarantee.py"),
+               read_file(path_join3(drift, "tools/hls-guarantee.py"))
+                   + "\nLEDGER = LEDGER[:14]\n")
+    let p4: KitRun = kit(acc, ["evidence", "--ledger", h, "--root", drift,
+                               "--by", "Dana Fischer"])
+    check(acc, "a pass against the smaller scope still runs — drift is a fact to record, not a refusal",
+          p4.code == 0, "")
+    let entries4: list[JsonValue] = entries_of(h)
+    let e4: JsonValue = entries4.get(entries4.len() - 1)
+    let eng: JsonValue = entries4.get(0)
+    check(acc, "the pass records the digest it ran (14 rows), which is not the digest the engagement signed (15)",
+          jstr(e4, "scope_sha256") != jstr(eng, "scope_sha256")
+              && jint(e4, "total_guarantees") == 14, "")
+
+    let p5: KitRun = kit(acc, ["evidence", "--ledger", led(acc, "noeng")])
+    check(acc, "a pass without a ledger is a named error",
+          p5.code == 1 && p5.err.contains("no engagement ledger"), "")
+}
+
+# replace_first(s, from, to) — the one-shot string surgery.
+fn s5_finding_law(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 5 — the finding law")
+    let h: str = led(acc, "life")
+
+    let p: KitRun = kit(acc, ["file", "--ledger", h, "--against", "G-TAINT-01",
+                              "--severity", "high",
+                              "--title", "taint sink accepts through a crafted alias",
+                              "--repro-path", "tests/fail/fail_taint_read_file.hls",
+                              "--by", "Dana Fischer"])
+    check(acc, "a roster member files the first finding, AF-001",
+          p.code == 0 && p.out.contains("filed AF-001"), clip(first_line(p.err), 120))
+    let entries: list[JsonValue] = entries_of(h)
+    let f: JsonValue = entries.get(entries.len() - 1)
+    check(acc, "the finding carries the row, the severity and the path reproducer",
+          jstr(f, "repro_mode") == "path" && jstr(f, "severity") == "high"
+              && jstr(f, "against") == "G-TAINT-01", "")
+
+    let p2: KitRun = kit(acc, ["file", "--ledger", h, "--against", "G-CT-01",
+                               "--severity", "low",
+                               "--title", "const-time margin thinner than claimed",
+                               "--repro-text",
+                               "echo 'CT lane leaks through the scheduler' && exit 1",
+                               "--by", "Ravi Chandran"])
+    check(acc, "the second roster member files AF-002 — ids are sequential",
+          p2.code == 0 && p2.out.contains("filed AF-002"), "")
+    let entries2: list[JsonValue] = entries_of(h)
+    let f2: JsonValue = entries2.get(entries2.len() - 1)
+    check(acc, "an inline reproducer is filed as text",
+          jstr(f2, "repro_mode") == "text", "")
+
+    let p3: KitRun = kit(acc, ["file", "--ledger", h, "--against", "G-CT-01",
+                               "--severity", "low", "--title", "x",
+                               "--repro-text", "x", "--by", "mhieuhonda"])
+    check(acc, "the project cannot author a finding",
+          p3.code == 1 && p3.err.contains("findings are the auditors' to file"), "")
+
+    let p4: KitRun = kit(acc, ["file", "--ledger", h, "--against", "G-CT-01",
+                               "--severity", "severe", "--title", "x",
+                               "--repro-text", "x", "--by", "Dana Fischer"])
+    check(acc, "a severity outside the closed vocabulary is refused",
+          p4.code == 1 && p4.err.contains("severity"), "")
+
+    let p5: KitRun = kit(acc, ["file", "--ledger", h, "--against", "G-NOPE-99",
+                               "--severity", "low", "--title", "x",
+                               "--repro-text", "x", "--by", "Dana Fischer"])
+    check(acc, "a finding against a row outside the scope is refused naming the known rows",
+          p5.code == 1 && p5.err.contains("not one of the scope's"), "")
+
+    let p6: KitRun = kit(acc, ["file", "--ledger", h, "--against", "G-CT-01",
+                               "--severity", "low", "--title", "x",
+                               "--by", "Dana Fischer"])
+    check(acc, "a finding with no reproducer is an opinion",
+          p6.code == 1 && p6.err.contains("opinions are not findings"), "")
+
+    let p7: KitRun = kit(acc, ["file", "--ledger", h, "--against", "G-CT-01",
+                               "--severity", "low", "--title", "x",
+                               "--repro-path", "a.hls", "--repro-text", "x",
+                               "--by", "Dana Fischer"])
+    check(acc, "a finding carries one reproducer, never two",
+          p7.code == 1 && p7.err.contains("ONE reproducer, not two"), "")
+
+    let p8: KitRun = kit(acc, ["file", "--ledger", h, "--against", "G-CT-01",
+                               "--severity", "low", "--title", "x",
+                               "--repro-path", "no/such/file.hls",
+                               "--by", "Dana Fischer"])
+    check(acc, "a reproducer that points at nothing is a rumor",
+          p8.code == 1 && p8.err.contains("points at nothing"), "")
+}
+
+fn s6_triage_law(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 6 — the triage law")
+    let h: str = led(acc, "life")
+    let head: RunResult = run_capture("git", ["rev-parse", "HEAD"])
+    let head_sha: str = head.out.trim()
+
+    let p: KitRun = kit(acc, ["triage", "AF-001", "--ledger", h,
+                              "--verdict", "accepted",
+                              "--reason", "the alias route is real; fixed at the checker boundary",
+                              "--fix", head_sha, "--by", "mhieuhonda"])
+    check(acc, "the project accepts with its remediation commit",
+          p.code == 0 && p.out.contains("triaged AF-001: accepted"), "")
+    let entries: list[JsonValue] = entries_of(h)
+    let t: JsonValue = entries.get(entries.len() - 1)
+    check(acc, "the triage records the fix sha verbatim",
+          jstr(t, "fix") == head_sha && jstr(t, "verdict") == "accepted", "")
+
+    let p2: KitRun = kit(acc, ["triage", "AF-001", "--ledger", h,
+                               "--verdict", "disputed", "--reason", "x",
+                               "--by", "mhieuhonda"])
+    check(acc, "a second triage is refused — the record is the response, not a negotiation",
+          p2.code == 1 && p2.err.contains("one finding, one response"), "")
+
+    let p3: KitRun = kit(acc, ["triage", "AF-002", "--ledger", h,
+                               "--verdict", "accepted", "--reason", "x",
+                               "--by", "mhieuhonda"])
+    check(acc, "an acceptance without its remediation is a wish",
+          p3.code == 1 && p3.err.contains("wish, not a fix"), "")
+
+    let p4: KitRun = kit(acc, ["triage", "AF-002", "--ledger", h,
+                               "--verdict", "accepted", "--reason", "x",
+                               "--fix", "not-a-sha", "--by", "mhieuhonda"])
+    check(acc, "the fix must be 40 hex", p4.code == 1 && p4.err.contains("40 hex"), "")
+
+    let p5: KitRun = kit(acc, ["triage", "AF-002", "--ledger", h,
+                               "--verdict", "accepted", "--reason", "x",
+                               "--fix", repeat_str("f", 40), "--by", "mhieuhonda"])
+    check(acc, "a well-formed sha that names no commit is refused — a remediation that exists nowhere is a promise",
+          p5.code == 1 && p5.err.contains("names no commit"), "")
+
+    let p6: KitRun = kit(acc, ["triage", "AF-002", "--ledger", h,
+                               "--verdict", "disputed", "--reason", "x",
+                               "--fix", head_sha, "--by", "mhieuhonda"])
+    check(acc, "a disputed finding with a fix is a contradiction",
+          p6.code == 1 && p6.err.contains("only an acceptance carries a fix"), "")
+
+    let p7: KitRun = kit(acc, ["triage", "AF-002", "--ledger", h,
+                               "--verdict", "disputed", "--reason", "",
+                               "--by", "mhieuhonda"])
+    check(acc, "a triage without a reason is refused — the sanction law, on the other side of the table",
+          p7.code == 1 && p7.err.contains("sanction law"), "")
+
+    let p8: KitRun = kit(acc, ["triage", "AF-002", "--ledger", h,
+                               "--verdict", "rejected", "--reason", "x",
+                               "--by", "mhieuhonda"])
+    check(acc, "a verdict outside the closed vocabulary is refused",
+          p8.code == 1 && p8.err.contains("not one of"), "")
+
+    let p9: KitRun = kit(acc, ["triage", "AF-099", "--ledger", h,
+                               "--verdict", "disputed", "--reason", "x",
+                               "--by", "mhieuhonda"])
+    check(acc, "a triage on a finding that is not on record is refused",
+          p9.code == 1 && p9.err.contains("no finding AF-099"), "")
+
+    let p10: KitRun = kit(acc, ["triage", "AF-002", "--ledger", h,
+                                "--verdict", "disputed",
+                                "--reason", "the lane is measured, not guessed",
+                                "--by", "Ravi Chandran"])
+    check(acc, "an auditor cannot triage — the response is the project's to give",
+          p10.code == 1 && p10.err.contains("the project's to give"), "")
+
+    let p11: KitRun = kit(acc, ["triage", "AF-002", "--ledger", h,
+                                "--verdict", "disputed",
+                                "--reason", "the lane is measured, not guessed",
+                                "--by", "mhieuhonda"])
+    check(acc, "the project disputes with a written reason",
+          p11.code == 0 && p11.out.contains("triaged AF-002: disputed"), "")
+
+    let cv: ChainVerdict = verify_chain(h)
+    check(acc, "the chain law holds over the whole life ledger (" + cv.detail + ")",
+          cv.ok, "")
+}
+
+fn s7_report_law(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 7 — the report law")
+    let h: str = led(acc, "life")
+    let head: RunResult = run_capture("git", ["rev-parse", "HEAD"])
+    let head_sha: str = head.out.trim()
+
+    # One more pass by the project, AFTER the auditors' own.
+    kit(acc, ["evidence", "--ledger", h, "--by", "mhieuhonda"])
+
+    let r1: str = scratch(acc, "rep-1.md")
+    let r2: str = scratch(acc, "rep-2.md")
+    let p: KitRun = kit(acc, ["report", "--ledger", h, "--out", r1])
+    check(acc, "report renders the deliverable",
+          p.code == 0 && p.out.contains("state remediated"), "")
+    let doc: str = read_file(r1)
+    let raw: str = read_file(h)
+    check(acc, "the report embeds the ledger digest, re-derived by the gate from the raw bytes",
+          doc.contains("`sha256:" + sha256_hex(raw) + "`"), "")
+
+    kit(acc, ["report", "--ledger", h, "--out", r2])
+    check(acc, "two renders of one ledger are byte-identical",
+          read_file(r1) == read_file(r2), "")
+
+    let r3: str = scratch(acc, "rep-3.md")
+    kit(acc, ["report", "--ledger", h, "--out", r3, "--stamp"])
+    # --stamp changes ONLY the Generated line: the lines of doc3 that
+    # doc1 lacks are exactly the Generated lines.
+    let d1: list[str] = read_file(r1).split("\n")
+    let d2: list[str] = read_file(r3).split("\n")
+    let extra: list[str] = lines_not_in(d2, d1)
+    let mut stamp_ok: bool = extra.len() >= 0
+    let mut i: int = 0
+    while i < extra.len() {
+        if !starts_with(extra.get(i), "- Generated") {
+            stamp_ok = false
+        }
+        i = i + 1
+    }
+    let mut has_gen: bool = false
+    i = 0
+    while i < d2.len() {
+        if starts_with(d2.get(i), "- Generated") {
+            has_gen = true
+        }
+        i = i + 1
+    }
+    check(acc, "--stamp changes ONLY the Generated line", stamp_ok && has_gen, "")
+
+    check(acc, "the report names the scope that moved under the auditors",
+          doc.contains("Scope drift: **MOVED**"), "")
+    check(acc, "naming the last pass that ran a different scope",
+          doc.contains("the last pass that ran a different scope"), "")
+    check(acc, "an independent pass is on record and the banner says so",
+          doc.contains("**Independent pass on record:**")
+              && doc.contains("latest such pass, by the auditors' own roster."), "")
+    check(acc, "and the newest self-run pass is named as such — both records stand, each labelled by who ran it",
+          doc.contains("The latest pass overall was run by the")
+              && doc.contains("project itself (SELF-ASSESSED)"), "")
+    check(acc, "a ledger WITH an independent pass never renders the empty banner",
+          !doc.contains("No independent pass on record"), "")
+    check(acc, "the findings table renders both findings",
+          doc.contains("| AF-001 | high | G-TAINT-01 |")
+              && doc.contains("| AF-002 | low | G-CT-01 |"), "")
+    check(acc, "the triage table renders the acceptance and its fix",
+          doc.contains("| AF-001 | accepted |") && doc.contains(head_sha), "")
+    check(acc, "and the dispute, with its written reason",
+          doc.contains("| AF-002 | disputed |"), "")
+
+    let st_run: KitRun = kit(acc, ["status", "--ledger", h, "--json"])
+    let st: JsonValue = parse_json_or_null(st_run.out)
+    check(acc, "status --json agrees with the census",
+          jstr(st, "state") == "remediated"
+              && jint(jobj(st, "findings"), "total") == 2
+              && jint(jobj(st, "triage"), "accepted") == 1
+              && jint(st, "fixes") == 1, "")
+    check(acc, "the report's state word is the derived one",
+          doc.contains("**REMEDIATED.**"), "")
+    check(acc, "the census counts independent and self-assessed passes",
+          jint(jobj(st, "evidence"), "independent") >= 1
+              && doc.contains("SELF-ASSESSED"), "")
+
+    # A self-run-only ledger: the honest banner.
+    let solo: str = led(acc, "solo")
+    default_engage(acc, solo)
+    kit(acc, ["evidence", "--ledger", solo, "--by", "mhieuhonda"])
+    let s1: str = scratch(acc, "solo-1.md")
+    let s2: str = scratch(acc, "solo-2.md")
+    kit(acc, ["report", "--ledger", solo, "--out", s1])
+    kit(acc, ["report", "--ledger", solo, "--out", s2])
+    let sdoc: str = read_file(s1)
+    check(acc, "a self-run-only ledger renders the empty banner",
+          sdoc.contains("No independent pass on record"), "")
+    check(acc, "no pass on such a ledger is ever labelled independent",
+          !replace_first(sdoc, "INDEPENDENT — no contract on record", "")
+              .contains("INDEPENDENT"), "")
+    check(acc, "a clean audit honestly stays underway",
+          sdoc.contains("No findings on record") && sdoc.contains("stays underway"), "")
+    check(acc, "the solo report is deterministic too", read_file(s1) == read_file(s2), "")
+
+    # The broken chain: an edited entry, a reordered entry.
+    let lines: list[str] = raw.split("\n")
+    let edited: str = led(acc, "tamp-edited")
+    let mut edited_lines: list[str] = []
+    let mut j: int = 0
+    while j < lines.len() {
+        if j == 1 {
+            edited_lines.push(replace_first(lines.get(j), "\"Dana Fischer\"",
+                              "\"Dana T. Fischer\""))
+        } else {
+            edited_lines.push(lines.get(j))
+        }
+        j = j + 1
+    }
+    write_file(edited, join_lines(edited_lines))
+    let t1: KitRun = kit(acc, ["report", "--ledger", edited,
+                               "--out", scratch(acc, "no.md")])
+    check(acc, "an entry edited after it was written is named at its line, and nothing renders from it",
+          t1.code == 1 && t1.err.contains("line 2")
+              && t1.err.contains("edited after it was written"), "")
+    let t2: KitRun = kit(acc, ["status", "--ledger", edited])
+    check(acc, "status refuses a broken chain", t2.code == 1, "")
+    let t3: KitRun = kit(acc, ["evidence", "--ledger", edited,
+                               "--by", "Dana Fischer"])
+    check(acc, "an appender refuses a broken chain — nothing writes onto a chain it could not verify",
+          t3.code == 1, "")
+
+    let reordered: str = led(acc, "tamp-reordered")
+    let swapped: list[str] = []
+    j = 0
+    while j < lines.len() {
+        if j == 1 {
+            swapped.push(lines.get(2))
+        } else if j == 2 {
+            swapped.push(lines.get(1))
+        } else {
+            swapped.push(lines.get(j))
+        }
+        j = j + 1
+    }
+    write_file(reordered, join_lines(swapped))
+    let t4: KitRun = kit(acc, ["report", "--ledger", reordered,
+                               "--out", scratch(acc, "no2.md")])
+    check(acc, "a reordered ledger is a hole or a lie, named at its line",
+          t4.code == 1 && t4.err.contains("line 2")
+              && t4.err.contains("hole or a lie"), "")
+}
+
+# lines_not_in(a, b) — the lines of a that b lacks (order kept).
+fn lines_not_in(a: list[str], b: list[str]) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < a.len() {
+        let line: str = a.get(i)
+        let mut found: bool = false
+        let mut j: int = 0
+        while j < b.len() {
+            if b.get(j) == line {
+                found = true
+            }
+            j = j + 1
+        }
+        if !found {
+            out.push(line)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn join_lines(lines: list[str]) -> str {
+    let parts: list[str] = []
+    let mut i: int = 0
+    while i < lines.len() {
+        parts.push(lines.get(i))
+        i = i + 1
+    }
+    return str_join(parts, "\n") + "\n"
+}
+
+fn s8_corpus(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 8 — the corpus showcase")
+    let showcase: str = "tests/ok/feat_stage140_auditkit.hls"
+    let expected: str = "all 8 auditkit laws hold\n"
+
+    let chk: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "--check", showcase])
+    check(acc, "the showcase boots through the real checker", chk.code == 0, "")
+    let run_it: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", showcase])
+    check(acc, "the showcase runs green on the interpreter, exact output",
+          run_it.code == 0 && run_it.out == expected, "")
+    let fmt: RunResult = run_capture("bin/hlfmt", ["--check", showcase])
+    check(acc, "the showcase is hlfmt-canonical", fmt.code == 0, "")
+    let lint: RunResult = run_capture("python3", ["tools/hllint.py", showcase])
+    check(acc, "the showcase is hllint-clean",
+          lint.code == 0 && lint.out.contains("no warnings"), "")
+
+    if file_exists("bin/hlc") && which("gcc") {
+        let c_path: str = scratch(acc, "showcase.c")
+        let bin_path: str = scratch(acc, "showcase_bin")
+        let r1: RunResult = run_capture("bin/hlc", [showcase, c_path])
+        if r1.code != 0 {
+            check(acc, "hlc compiled the showcase", false, clip(first_line(r1.out), 120))
+        } else {
+            let r2: RunResult = run_capture("gcc",
+                ["-O2", "-o", bin_path, c_path, "-lm", "-pthread"])
+            if r2.code != 0 {
+                check(acc, "gcc compiled the showcase", false,
+                      clip(first_line(r2.err), 120))
+            } else {
+                let rn: RunResult = run_capture(bin_path, [])
+                check(acc, "the showcase matches natively, byte for byte",
+                      rn.code == 0 && rn.out == expected, "")
+            }
+        }
+    } else {
+        println("  (bin/hlc or cc not available — native differential skipped, interpreter legs ran)")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Fs, Proc, Exit {
+    let acc: Acc = acc_new("auditkit")
+    s1_convention(acc)
+    s2_engagement(acc)
+    s3_brief_law(acc)
+    s4_evidence_law(acc)
+    s5_finding_law(acc)
+    s6_triage_law(acc)
+    s7_report_law(acc)
+    s8_corpus(acc)
+    return finish(acc, "Stage 140 -- the independent audit kit")
+}
