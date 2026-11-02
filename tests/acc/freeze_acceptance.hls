@@ -323,6 +323,18 @@ fn fzprobe_src() -> str {
         + "    return json.dumps(obj, sort_keys=True, "
         + "separators=(',', ':'), ensure_ascii=True)\n"
         + "mode = sys.argv[1]\n"
+        + "if mode == 'untamper':\n"
+        + "    open(sys.argv[2], 'w').write(open(sys.argv[2] + '.orig').read())\n"
+        + "    print('restored')\n"
+        + "if mode == 'tamper':\n"
+        + "    open(sys.argv[2] + '.orig', 'w').write(open(sys.argv[2]).read())\n"
+        + "    lines = [l for l in open(sys.argv[2]).read().split('\\n') if l.strip()]\n"
+        + "    recs = [json.loads(l) for l in lines]\n"
+        + "    recs[1]['reason'] = 'a different story'\n"
+        + "    recs[1]['chain_hash'] = '0' * 64\n"
+        + "    canon = lambda o: json.dumps(o, sort_keys=True, ensure_ascii=True, separators=(',',':'))\n"
+        + "    open(sys.argv[2], 'w').write(canon(recs[0]) + '\\n' + canon(recs[1]) + '\\n')\n"
+        + "    print('tampered')\n"
         + "if mode == 'syntax':\n"
         + "    which = sys.argv[2]\n"
         + "    tbl = {'keywords': KEYWORDS, 'reserved': "
@@ -455,7 +467,8 @@ fn freeze_run(acc: Acc, args: list[str], dir: str) -> RunResult uses Proc {
     if dir != "" {
         env_set_current_dir(dir)
     }
-    let argv: list[str] = ["tools/hls-freeze.py"]
+    let argv: list[str] = [path_join3(cwd_get(), "tools/hls-freeze.py")]
+    # absolute: the cwd may have moved to the tree under test
     let mut i: int = 0
     while i < args.len() {
         argv.push(args.get(i))
@@ -470,6 +483,9 @@ fn freeze_run(acc: Acc, args: list[str], dir: str) -> RunResult uses Proc {
 
 # make_scratch(acc, tag) — a disposable copy of the tree parts the
 # tool reads.
+# The path is ABSOLUTE: the freeze legs chdir into the tree, and a
+# relative --root would re-resolve against the new cwd (the battery's
+# tempfile root was absolute for the same reason).
 fn make_scratch(acc: Acc, tag: str) -> str uses IO, Fs, Proc {
     let root: str = scratch(acc, "tree-" + tag)
     let parts: list[str] = ["tools", "std", "core", "src/hlc/types.hls",
@@ -484,7 +500,8 @@ fn make_scratch(acc: Acc, tag: str) -> str uses IO, Fs, Proc {
         if d_ok != 0 {
             println("freeze-acceptance: mkdirs failed for " + dst)
         }
-        cp(src, dst)
+        # -r: tools / std / core are directories
+        sh("cp -r '" + shell_quote(src) + "' '" + shell_quote(dst) + "'")
         i = i + 1
     }
     return root
@@ -635,7 +652,7 @@ fn section_1(acc: Acc) -> void uses IO, Fs, Proc {
     # The tools answer on the real tree.
     let p: RunResult = freeze_run(acc, ["status"], "")
     check(acc, "status answers IDENTICAL on the tree",
-          p.code == 0 && p.out.contains("IDENTICAL"),
+          p.code == 0 && p.combined.contains("IDENTICAL"),
           clip(first_line(p.combined), 120))
     let p2: RunResult = freeze_run(acc, ["verify", "--quiet"], "")
     check(acc, "verify is green on the tree", p2.code == 0,
@@ -1044,11 +1061,11 @@ fn section_4(acc: Acc) -> void uses IO, Fs, Proc {
         write_file(hex_path, src.slice(0, i) + src.slice(j, src.len()))
         let p: RunResult = freeze_run(acc, ["verify", "--root", root], root)
         check(acc, "a removed export is drift, exit 1",
-              p.code == 1 && p.out.contains("DRIFTED"),
+              p.code == 1 && p.combined.contains("DRIFTED"),
               clip(first_line(p.combined), 120))
         check(acc, "the removal is named at its dotted path",
               p.out.contains("REMOVED")
-                  && p.out.contains("stdlib.std.hex.fns.hex_byte"),
+                  && p.combined.contains("stdlib.std.hex.fns.hex_byte"),
               clip(first_line(p.combined), 120))
         write_file(hex_path, src)
         let p2: RunResult = freeze_run(acc,
@@ -1071,7 +1088,7 @@ fn section_4(acc: Acc) -> void uses IO, Fs, Proc {
     let p3: RunResult = freeze_run(acc, ["verify", "--root", root], root)
     check(acc, "a one-front-end keyword removal is refused outright (the "
           + "agreement law fires first)",
-          p3.code == 1 && p3.out.contains("front-ends disagree"),
+          p3.code == 1 && p3.combined.contains("front-ends disagree"),
           clip(first_line(p3.combined), 120))
     write_file(boot_lexer, replace_first(bl, "\"__moved__\",", "\"where\","))
 
@@ -1082,7 +1099,7 @@ fn section_4(acc: Acc) -> void uses IO, Fs, Proc {
                              "|| w == \"__moved__\""))
     let p4: RunResult = freeze_run(acc, ["verify", "--root", root], root)
     check(acc, "a keyword removed from both front-ends is drift",
-          p4.code == 1 && p4.out.contains("DRIFTED"),
+          p4.code == 1 && p4.combined.contains("DRIFTED"),
           clip(first_line(p4.combined), 120))
     check(acc, "the keyword drift is named in the syntax section",
           p4.out.contains("syntax.keywords"),
@@ -1102,7 +1119,7 @@ fn expect_drift(acc: Acc, root: str, hex_path: str, restore: str, tag: str,
                 needle: str) -> void uses IO, Proc {
     let p: RunResult = freeze_run(acc, ["verify", "--root", root], root)
     check(acc, tag + " is named at its path",
-          p.code == 1 && p.out.contains(needle),
+          p.code == 1 && p.combined.contains(needle),
           clip(first_line(p.combined), 120))
     write_file(hex_path, restore)
     freeze_run(acc, ["verify", "--quiet", "--root", root], root)
@@ -1161,7 +1178,7 @@ fn section_5(acc: Acc) -> void uses IO, Fs, Proc {
                                           root)
             check(acc, "a removed enum variant is named at its path",
                   p.code == 1
-                      && p.out.contains("stdlib.core.option.enums."
+                      && p.combined.contains("stdlib.core.option.enums."
                           + "Option.variants"),
                   clip(first_line(p.combined), 120))
             write_file(opt_path, opt)
@@ -1199,7 +1216,7 @@ fn section_5(acc: Acc) -> void uses IO, Fs, Proc {
             let p2: RunResult = freeze_run(acc, ["verify", "--root", root],
                                            root)
             check(acc, "a removed struct field is named at its path",
-                  p2.code == 1 && p2.out.contains(".fields"),
+                  p2.code == 1 && p2.combined.contains(".fields"),
                   clip(first_line(p2.combined), 120))
             write_file(io_path, io_src)
         } else {
@@ -1216,8 +1233,8 @@ fn section_5(acc: Acc) -> void uses IO, Fs, Proc {
             + src.slice(i3, src.len()))
         let p3: RunResult = freeze_run(acc, ["verify", "--root", root], root)
         check(acc, "a new deprecation is drift at the record's path",
-              p3.code == 1 && p3.out.contains("ADDED")
-                  && p3.out.contains("fns.hex_byte.deprecated"),
+              p3.code == 1 && p3.combined.contains("ADDED")
+                  && p3.combined.contains("fns.hex_byte.deprecated"),
               clip(first_line(p3.combined), 120))
         write_file(hex_path, src)
     } else {
@@ -1242,8 +1259,8 @@ fn section_6(acc: Acc) -> void uses IO, Fs, Proc {
         + "{ return x + 1 }\n")
     let p: RunResult = freeze_run(acc, ["verify", "--root", root], root)
     check(acc, "a post-freeze addition is drift, named at its path",
-          p.code == 1 && p.out.contains("ADDED")
-              && p.out.contains("stdlib.std.hex.fns.hex_freeze_new"),
+          p.code == 1 && p.combined.contains("ADDED")
+              && p.combined.contains("stdlib.std.hex.fns.hex_freeze_new"),
           clip(first_line(p.combined), 120))
     write_file(hex_path, src)
 
@@ -1258,7 +1275,7 @@ fn section_6(acc: Acc) -> void uses IO, Fs, Proc {
             + "\"len\", \"range\", \"zz_gate_new_builtin\","))
     let p2: RunResult = freeze_run(acc, ["verify", "--root", root], root)
     check(acc, "a grown builtin table is syntax drift, named",
-          p2.code == 1 && p2.out.contains("syntax.builtin_fns"),
+          p2.code == 1 && p2.combined.contains("syntax.builtin_fns"),
           clip(first_line(p2.combined), 120))
     write_file(helpers, hsrc)
 
@@ -1295,7 +1312,7 @@ fn section_7(acc: Acc) -> void uses IO, Fs, Proc {
         ["amend", "--reason", "   ", "--by", "tester", "--root", root],
         root)
     check(acc, "a whitespace-only reason is a named refusal",
-          p2.code == 1 && p2.out.contains("without a written reason"),
+          p2.code == 1 && p2.combined.contains("without a written reason"),
           clip(first_line(p2.combined), 120))
     let p3: RunResult = freeze_run(acc,
         ["amend", "--reason", "a real reason", "--root", root], root)
@@ -1306,7 +1323,7 @@ fn section_7(acc: Acc) -> void uses IO, Fs, Proc {
          root], root)
     check(acc, "a no-op amendment is refused (noise is how real amendments "
           + "stop being read)",
-          p4.code == 1 && p4.out.contains("nothing to amend"),
+          p4.code == 1 && p4.combined.contains("nothing to amend"),
           clip(first_line(p4.combined), 120))
 
     # (b) the real amendment: the drift is absorbed, exactly one
@@ -1318,7 +1335,7 @@ fn section_7(acc: Acc) -> void uses IO, Fs, Proc {
          "std.hex grows a helper for the v0.160 formatter",
          "--by", "mhieuhonda", "--root", root], root)
     check(acc, "a real amendment succeeds",
-          p5.code == 0 && p5.out.contains("AMENDED"),
+          p5.code == 0 && p5.combined.contains("AMENDED"),
           clip(first_line(p5.combined), 120))
     let records: list[JsonValue] = jsonl_records(read_file(chain_p))
     check(acc, "exactly one record appended (the chain carried the sha256 "
@@ -1408,26 +1425,31 @@ fn section_7(acc: Acc) -> void uses IO, Fs, Proc {
         ["amend", "--reason", "another", "--by", "tester", "--root", root],
         root)
     check(acc, "a second amendment with no drift is refused",
-          p7.code == 1 && p7.out.contains("nothing to amend"),
+          p7.code == 1 && p7.combined.contains("nothing to amend"),
           clip(first_line(p7.combined), 120))
 
     # (f) a tampered record breaks the replay at its line.
     let records2: list[JsonValue] = jsonl_records(read_file(chain_p))
     if records2.len() == 2 {
-        let rec2: JsonValue = records2.get(1)
-        let tampered: JsonValue = json_with_str(
-            json_with_str(rec2, "reason", "a different story"),
-            "chain_hash", hex64("0"))
-        write_file(chain_p, canon(records2.get(0)) + "\n"
-            + canon(tampered) + "\n")
+        let tp: RunResult = fzprobe(acc,
+            ["tamper", chain_p])
+        if tp.code != 0 {
+            check(acc, "a tampered record breaks the replay at its line",
+                  false, "the tamper probe failed")
+            return
+        }
         let p8: RunResult = freeze_run(acc, ["verify", "--root", root],
                                        root)
         check(acc, "a tampered record breaks the replay at its line",
-              p8.code == 1 && p8.out.contains("BROKEN")
-                  && p8.out.contains("record 2"),
+              p8.code == 1 && p8.combined.contains("BROKEN")
+                  && p8.combined.contains("record 2"),
               clip(first_line(p8.combined), 120))
-        write_file(chain_p, canon(records2.get(0)) + "\n"
-            + canon(rec2) + "\n")
+        let rp: RunResult = fzprobe(acc, ["untamper", chain_p])
+        if rp.code != 0 {
+            check(acc, "the restored chain replays clean", false,
+                  "the restore probe failed")
+            return
+        }
         let p9: RunResult = freeze_run(acc,
             ["verify", "--quiet", "--root", root], root)
         check(acc, "the restored chain replays clean", p9.code == 0,
@@ -1531,7 +1553,7 @@ fn section_8(acc: Acc) -> void uses IO, Fs, Proc {
           clip(first_line(p6.combined), 120))
     let p7: RunResult = run_capture("python3", ["tools/hllint.py", showcase])
     check(acc, "the showcase is hllint-clean",
-          p7.code == 0 && p7.out.contains("no warnings"),
+          p7.code == 0 && p7.combined.contains("no warnings"),
           clip(first_line(p7.combined), 120))
 
     let mut cc: str = "gcc"
