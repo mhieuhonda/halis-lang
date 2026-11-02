@@ -1,0 +1,853 @@
+# ============================================================================
+# tests/acc/cases_acceptance.hls — Stage 120 acceptance gate, in Halis
+# (the Halis twin of tests/cases_acceptance.py; same eight sections, same
+# assertions, same needles — the harness is tests/acc/harness.hls and
+# the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Eight sections over the REAL hltest CLI (tools/hltest.py, the runner
+# a developer drives) and probe programs written into the gate's
+# scratch world:
+#
+#  1. the convention — a test fn with exactly one parameter + a
+#                      cases_* table runs ONCE PER ROW, each row its own
+#                      result named test_<name>#<case>; struct, str and
+#                      enum rows all drive the test; a failing row fails
+#                      alone; mark_skip inside one row skips THAT row;
+#                      a plain test's mark_skip is a SKIP; an empty
+#                      table is a SKIP, never a silent pass
+#  2. the static      — the convention errors fail before any row runs,
+#     contract          with the fix in the message; exit code 1
+#  3. the table       — a panicking table fails under the base name (no
+#     runtime           b'' repr); a void table names what it returned;
+#                       duplicate case names fail; the charset rule; the
+#                       store-key grammar helpers accept/reject exactly
+#                       the Stage 120 shapes
+#  4. the store       — rows are first-class store keys: -u records,
+#                       the framing, verify, the changed row value, the
+#                       dropped row, the stale shapes both directions
+#  5. the selection   — --grep knows rows; a broken table only fails a
+#                       run that selected it; no-match is a skip
+#  6. the runner      — parallel -u writes each file's own row store,
+#     integration       exit codes, the JUnit XML
+#  7. the differential — TestCase[T] through the native compiler, byte
+#                       for byte, one store serving both backends
+#  8. the fixed point — the committed store verifies the committed
+#     and hygiene      fixture green in-tree; -u on it is a no-op
+#
+# Adaptations the Halis port had to make (behaviour-preserving):
+#  - the battery imported tools.hltest directly (load_store,
+#    store_path_for, row_base, _table_row_type, _STORE_TEST_RE,
+#    parse_snapshot_records); the gate reaches the SAME functions
+#    through one small `python3 <helper> <mode>` child in the gate's
+#    scratch — every assertion is still made HERE, on the child's
+#    printed values.
+#  - the tree has no listdir primitive: the .tmp-leftover census runs
+#    through find.
+# ============================================================================
+
+import "./harness.hls"
+import "std.json"
+
+# ----------------------------------------------------------------------------
+# The hltest probe helper — the battery's direct imports, as a child.
+# ----------------------------------------------------------------------------
+
+fn hlprobe_src() -> str {
+    return "import sys\n"
+        + "sys.path.insert(0, '.')\n"
+        + "from tools.hltest import (load_store, store_path_for, row_base,\n"
+        + "    _table_row_type, _STORE_TEST_RE, parse_snapshot_records)\n"
+        + "mode = sys.argv[1]\n"
+        + "if mode == 'rowbase':\n"
+        + "    print(row_base(sys.argv[2].encode()).decode())\n"
+        + "elif mode == 'rowtype':\n"
+        + "    t = sys.argv[2]\n"
+        + "    print(_table_row_type(t) or 'NONE')\n"
+        + "elif mode == 'store_re':\n"
+        + "    print(int(bool(_STORE_TEST_RE.match(b'test_add#zero-left'))),\n"
+        + "          int(bool(_STORE_TEST_RE.match(b'test_plain'))),\n"
+        + "          int(not _STORE_TEST_RE.match(b'test_add#two#hashes')),\n"
+        + "          int(not _STORE_TEST_RE.match(b'has space')))\n"
+        + "elif mode == 'store_lines':\n"
+        + "    recs = load_store(sys.argv[2]) if len(sys.argv) > 2 else {}\n"
+        + "    for k in sorted(recs.keys()):\n"
+        + "        print(k[0].decode() + '\\t' + k[1].decode() + '\\t'\n"
+        + "              + recs[k].decode())\n"
+        + "elif mode == 'store_path':\n"
+        + "    print(store_path_for(sys.argv[2]))\n"
+        + "elif mode == 'cmp_records':\n"
+        + "    stored = load_store(sys.argv[2])\n"
+        + "    nrecs, nerr = parse_snapshot_records(open(sys.argv[3]).read())\n"
+        + "    print('err=' + ('NONE' if nerr is None else str(nerr)))\n"
+        + "    print('A=' + '|'.join(sorted(v.decode()\n"
+        + "                                  for v in stored.values())))\n"
+        + "    print('B=' + '|'.join(sorted(v.decode() for _n, v in nrecs)))\n"
+}
+
+fn hlprobe(acc: Acc, args: list[str]) -> RunResult uses Fs, Proc {
+    let helper: str = scratch(acc, "hlprobe.py")
+    if !file_exists(helper) {
+        write_file(helper, hlprobe_src())
+    }
+    let argv: list[str] = [helper]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    return run_capture("python3", argv)
+}
+
+# ----------------------------------------------------------------------------
+# Port helpers.
+# ----------------------------------------------------------------------------
+
+# run_cli(args) — the battery's run_cli: python3 tools/hltest.py ...
+# from the repo root.
+fn run_cli(args: list[str]) -> RunResult uses Proc {
+    let argv: list[str] = ["tools/hltest.py"]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    return run_capture("python3", argv)
+}
+
+# replace_first(s, from, to) — the battery's bytes.replace(..., 1).
+fn replace_first(s: str, from: str, to: str) -> str {
+    let i: int = s.find(from)
+    if i < 0 {
+        return s
+    }
+    return s.slice(0, i) + to + s.slice(i + from.len(), s.len())
+}
+
+# copytree(dst) / move(src, dst) — the battery's shutil copytree/move
+# (the scratch tree is the gate's own).
+fn copytree(src: str, dst: str) -> int uses Proc {
+    return sh("cp -r '" + shell_quote(src) + "' '" + shell_quote(dst) + "'")
+}
+
+fn mv(src: str, dst: str) -> int uses Proc {
+    return sh("mv '" + shell_quote(src) + "' '" + shell_quote(dst) + "'")
+}
+
+# jget_str — kind-guarded accessor.
+fn jget_str(v: JsonValue, key: str) -> str {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_str(x) {
+        return json_str_value(x)
+    }
+    return ""
+}
+
+# ----------------------------------------------------------------------------
+# The probe programs (the battery's heredocs, verbatim).
+# ----------------------------------------------------------------------------
+
+fn rows_src() -> str {
+    return "import \"std.test\"\n\n"
+        + "struct Pt {\n    x: int,\n    y: int\n}\n\n"
+        + "fn cases_sum() -> list[TestCase[Pt]] {\n    return [\n"
+        + "        TestCase { name: \"first\", row: Pt { x: 1, y: 2 } },\n"
+        + "        TestCase { name: \"second\", row: Pt { x: 10, y: 20 } }\n"
+        + "    ]\n}\n\n"
+        + "fn test_sum(p: Pt) {\n    assert_eq_int(p.x + p.y, p.y + p.x)\n}\n\n"
+        + "fn cases_tag() -> list[TestCase[str]] {\n    return [\n"
+        + "        TestCase { name: \"short\", row: \"a\" },\n"
+        + "        TestCase { name: \"long\", row: \"abc\" }\n    ]\n}\n\n"
+        + "fn test_tag(s: str) {\n    assert_true_msg(s.len() > 0, \"non-empty\")\n}\n\n"
+        + "enum Mood {\n    Up,\n    Down\n}\n\n"
+        + "fn cases_mood() -> list[TestCase[Mood]] {\n    return [\n"
+        + "        TestCase { name: \"up\", row: Mood.Up },\n"
+        + "        TestCase { name: \"down\", row: Mood.Down }\n    ]\n}\n\n"
+        + "fn test_mood(m: Mood) {\n    let want: int = match m {\n"
+        + "        Mood.Up => 1,\n        Mood.Down => -1\n    }\n"
+        + "    assert_eq_int(mood_sign(m), want)\n}\n\n"
+        + "fn mood_sign(m: Mood) -> int {\n    return match m {\n"
+        + "        Mood.Up => 1,\n        Mood.Down => -1\n    }\n}\n\n"
+        + "fn main() -> int {\n    return 0\n}\n"
+}
+
+fn midfail_src() -> str {
+    return "import \"std.test\"\n\n"
+        + "struct C {\n    v: int\n}\n\n"
+        + "fn cases_c() -> list[TestCase[C]] {\n    return [\n"
+        + "        TestCase { name: \"good\", row: C { v: 1 } },\n"
+        + "        TestCase { name: \"bad\", row: C { v: 2 } },\n"
+        + "        TestCase { name: \"also-good\", row: C { v: 3 } }\n"
+        + "    ]\n}\n\n"
+        + "fn test_c(c: C) {\n    assert_eq_int(c.v % 2, 1)\n}\n\n"
+        + "fn main() -> int {\n    return 0\n}\n"
+}
+
+fn rowskip_src() -> str {
+    return "import \"std.test\"\n\n"
+        + "struct C {\n    v: int\n}\n\n"
+        + "fn cases_c() -> list[TestCase[C]] {\n    return [\n"
+        + "        TestCase { name: \"kept\", row: C { v: 1 } },\n"
+        + "        TestCase { name: \"parked\", row: C { v: 0 } }\n"
+        + "    ]\n}\n\n"
+        + "fn test_c(c: C) {\n    if c.v == 0 {\n"
+        + "        mark_skip(\"not interesting on this shard\")\n    }\n"
+        + "    assert_eq_int(c.v, 1)\n}\n\n"
+        + "fn main() -> int {\n    return 0\n}\n"
+}
+
+fn plainskip_src() -> str {
+    return "import \"std.test\"\n\n"
+        + "fn test_plain_skip() {\n    mark_skip(\"table-free skip\")\n}\n\n"
+        + "fn main() -> int {\n    return 0\n}\n"
+}
+
+fn emptytable_src() -> str {
+    return "import \"std.test\"\n\n"
+        + "struct C {\n    v: int\n}\n\n"
+        + "fn cases_c() -> list[TestCase[C]] {\n    return []\n}\n\n"
+        + "fn test_c(c: C) {\n    assert_eq_int(c.v, c.v)\n}\n\n"
+        + "fn main() -> int {\n    return 0\n}\n"
+}
+
+fn static_src() -> str {
+    return "import \"std.test\"\n\n"
+        + "struct C {\n    v: int\n}\n\n"
+        + "fn test_no_table(c: C) {\n    assert_eq_int(c.v, c.v)\n}\n\n"
+        + "fn test_two(a: int, b: int) {\n    assert_eq_int(a, b)\n}\n\n"
+        + "fn cases_takes_params(x: int) -> list[TestCase[C]] {\n"
+        + "    return [TestCase { name: \"c\", row: C { v: x } }]\n}\n\n"
+        + "fn test_takes_params(c: C) {\n    assert_eq_int(c.v, c.v)\n}\n\n"
+        + "fn cases_mismatch() -> list[TestCase[str]] {\n"
+        + "    return [TestCase { name: \"s\", row: \"x\" }]\n}\n\n"
+        + "fn test_mismatch(c: C) {\n    assert_eq_int(c.v, c.v)\n}\n\n"
+        + "fn cases_stray() -> list[TestCase[C]] {\n"
+        + "    return [TestCase { name: \"s\", row: C { v: 1 } }]\n}\n\n"
+        + "fn cases_plainname() -> list[TestCase[C]] {\n"
+        + "    return [TestCase { name: \"s\", row: C { v: 1 } }]\n}\n\n"
+        + "fn test_plainname() {\n    assert_true(true)\n}\n\n"
+        + "fn main() -> int {\n    return 0\n}\n"
+}
+
+fn tablepanic_src() -> str {
+    return "import \"std.test\"\n\n"
+        + "struct C {\n    v: int\n}\n\n"
+        + "fn cases_boom() -> list[TestCase[C]] {\n"
+        + "    panic(\"table construction exploded\")\n}\n\n"
+        + "fn test_boom(c: C) {\n    assert_eq_int(c.v, c.v)\n}\n\n"
+        + "fn main() -> int {\n    return 0\n}\n"
+}
+
+fn voidtable_src() -> str {
+    return "import \"std.test\"\n\n"
+        + "struct C {\n    v: int\n}\n\n"
+        + "fn cases_void() {\n    let unused: int = 1\n}\n\n"
+        + "fn test_void(c: C) {\n    assert_eq_int(c.v, c.v)\n}\n\n"
+        + "fn main() -> int {\n    return 0\n}\n"
+}
+
+fn dup_src() -> str {
+    return "import \"std.test\"\n\n"
+        + "struct C {\n    v: int\n}\n\n"
+        + "fn cases_c() -> list[TestCase[C]] {\n    return [\n"
+        + "        TestCase { name: \"same\", row: C { v: 1 } },\n"
+        + "        TestCase { name: \"same\", row: C { v: 2 } }\n"
+        + "    ]\n}\n\n"
+        + "fn test_c(c: C) {\n    assert_eq_int(c.v, c.v)\n}\n\n"
+        + "fn main() -> int {\n    return 0\n}\n"
+}
+
+fn badname_src() -> str {
+    return "import \"std.test\"\n\n"
+        + "struct C {\n    v: int\n}\n\n"
+        + "fn cases_c() -> list[TestCase[C]] {\n    return [\n"
+        + "        TestCase { name: \"has space\", row: C { v: 1 } }\n"
+        + "    ]\n}\n\n"
+        + "fn test_c(c: C) {\n    assert_eq_int(c.v, c.v)\n}\n\n"
+        + "fn main() -> int {\n    return 0\n}\n"
+}
+
+fn evolve_plain_src() -> str {
+    return "import \"std.test\"\n\n"
+        + "fn test_evolve() uses IO {\n"
+        + "    assert_snapshot(\"era\", \"plain\")\n}\n\n"
+        + "fn main() -> int uses IO {\n    test_evolve()\n    return 0\n}\n"
+}
+
+fn evolve_para_src() -> str {
+    return "import \"std.test\"\n\n"
+        + "struct C {\n    v: int\n}\n\n"
+        + "fn cases_evolve() -> list[TestCase[C]] {\n"
+        + "    return [TestCase { name: \"a\", row: C { v: 1 } }]\n}\n\n"
+        + "fn test_evolve(c: C) {\n    assert_eq_int(c.v, 1)\n}\n\n"
+        + "fn main() -> int {\n"
+        + "    let rows: list[TestCase[C]] = cases_evolve()\n"
+        + "    let mut i: int = 0\n"
+        + "    while i < rows.len() {\n        test_evolve(rows[i].row)\n"
+        + "        i = i + 1\n    }\n    return 0\n}\n"
+}
+
+fn evolve_row_src() -> str {
+    return replace_first(replace_first(evolve_para_src(),
+            "fn test_evolve(c: C) {\n    assert_eq_int(c.v, 1)\n}",
+            "fn test_evolve(c: C) uses IO {\n    assert_eq_int(c.v, 1)\n"
+                + "    assert_snapshot(\"era\", \"row\")\n}"),
+        "fn main() -> int {", "fn main() -> int uses IO {")
+}
+
+# ----------------------------------------------------------------------------
+# Section 1 — the convention: one row, one result, one fresh state
+# ----------------------------------------------------------------------------
+
+fn section_1(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 1 — the convention: one row, one result, one fresh state")
+
+    let rows: str = write_src(acc, "s1/rows.hls", rows_src())
+    let r: RunResult = run_cli([rows])
+    check(acc, "a table test runs once per row; every row is its own "
+          + "result named test_<name>#<case> (struct, str and enum rows)",
+          r.code == 0 && r.out.contains("6 pass, 0 fail, 0 skip")
+              && r.out.contains("test_sum#first")
+              && r.out.contains("test_sum#second")
+              && r.out.contains("test_tag#short")
+              && r.out.contains("test_mood#up"),
+          clip(first_line(r.combined), 120))
+
+    # A failing row fails ALONE: the table's other rows still run.
+    let midfail: str = write_src(acc, "s1/midfail.hls", midfail_src())
+    let r2: RunResult = run_cli([midfail])
+    check(acc, "a failing row fails alone; the other rows still run and "
+          + "pass (exit 1)",
+          r2.code == 1 && r2.out.contains("test_c#bad")
+              && r2.out.contains("assert_eq_int failed")
+              && r2.out.contains("PASS")
+              && r2.out.contains("test_c#good")
+              && r2.out.contains("test_c#also-good")
+              && r2.out.contains("2 pass, 1 fail, 0 skip"),
+          clip(first_line(r2.combined), 120))
+
+    # mark_skip inside ONE row: that row is a SKIP, the rest pass.
+    let rowskip: str = write_src(acc, "s1/rowskip.hls", rowskip_src())
+    let r3: RunResult = run_cli(["-v", rowskip])
+    check(acc, "mark_skip inside one row reports THAT row SKIP; the rest run",
+          r3.code == 0 && r3.out.contains("test_c#parked")
+              && r3.out.contains("not interesting on this shard")
+              && r3.out.contains("1 pass, 0 fail, 1 skip"),
+          clip(first_line(r3.combined), 120))
+
+    # The Stage 18 latent bug this stage fixes: a PLAIN test's
+    # mark_skip is a SKIP, never a FAIL with a b'...' payload.
+    let plainskip: str = write_src(acc, "s1/plainskip.hls", plainskip_src())
+    let r4: RunResult = run_cli(["-v", plainskip])
+    check(acc, "a plain test's mark_skip is a SKIP (Stage 18 bytes-panic "
+          + "fix), never a FAIL with a b'...' payload",
+          r4.code == 0 && r4.out.contains("SKIP")
+              && r4.out.contains("table-free skip")
+              && r4.out.contains("0 pass, 0 fail, 1 skip"),
+          clip(first_line(r4.combined), 120))
+
+    # An empty table is a SKIP with its reason, not a silent pass.
+    let empty: str = write_src(acc, "s1/empty.hls", emptytable_src())
+    let r5: RunResult = run_cli(["-v", empty])
+    check(acc, "an empty table is a SKIP naming the table, never a silent "
+          + "pass",
+          r5.code == 0 && r5.out.contains("0 pass, 0 fail, 1 skip")
+              && r5.out.contains("empty case table 'cases_c' (0 rows)"),
+          clip(first_line(r5.combined), 120))
+}
+
+# ----------------------------------------------------------------------------
+# Section 2 — the static contract
+# ----------------------------------------------------------------------------
+
+fn section_2(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 2 — the static contract: convention errors fail "
+        + "before rows run")
+
+    let static_p: str = write_src(acc, "s2/static.hls", static_src())
+    let r: RunResult = run_cli([static_p])
+    check(acc, "a parameterised test without its table fails, naming the "
+          + "expected companion fn",
+          r.code == 1
+              && r.out.contains("parameterised test 'test_no_table' has "
+                  + "no case table")
+              && r.out.contains("cases_no_table"),
+          clip(first_line(r.combined), 120))
+    check(acc, "a test with two parameters fails: the row value is the "
+          + "only parameter",
+          r.out.contains("parameterised test 'test_two' must take exactly "
+              + "one parameter"),
+          "")
+    check(acc, "a table that takes parameters fails (the runner calls it "
+          + "with none)",
+          r.out.contains("case table 'cases_takes_params' must take no "
+              + "parameters"),
+          "")
+    check(acc, "a statically-checkable row/test type mismatch fails naming "
+          + "BOTH types",
+          r.out.contains("case table 'cases_mismatch' returns rows of type "
+              + "'str' but 'test_mismatch' takes 'C'"),
+          "")
+    check(acc, "a stray table with no matching test fails (the typo case)",
+          r.out.contains("cases_stray")
+              && r.out.contains("no matching parameterised test "
+                  + "'test_stray'"),
+          "")
+    check(acc, "a table whose matching test lost its parameter fails",
+          r.out.contains("case table 'cases_plainname' has a matching test "
+              + "'test_plainname', but the test takes no parameters"),
+          "")
+}
+
+# ----------------------------------------------------------------------------
+# Section 3 — the table runtime: panics, shapes, names
+# ----------------------------------------------------------------------------
+
+fn section_3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 3 — the table runtime: panics, shapes, names")
+
+    let tablepanic: str = write_src(acc, "s3/tablepanic.hls",
+                                    tablepanic_src())
+    let r: RunResult = run_cli([tablepanic])
+    check(acc, "a panicking table fails under the base name, message "
+          + "decoded (no Python repr)",
+          r.code == 1
+              && r.out.contains("case table 'cases_boom' panicked: table "
+                  + "construction exploded")
+              && !r.out.contains("b'"),
+          clip(first_line(r.combined), 120))
+
+    let voidtable: str = write_src(acc, "s3/voidtable.hls", voidtable_src())
+    let r2: RunResult = run_cli([voidtable])
+    check(acc, "a table that returns nothing names what it returned (void) "
+          + "and the expected shape",
+          r2.code == 1
+              && r2.out.contains("case table 'cases_void' returned void, "
+                  + "expected a list[std.test.TestCase[...]]"),
+          clip(first_line(r2.combined), 120))
+
+    let dup: str = write_src(acc, "s3/dup.hls", dup_src())
+    let r3: RunResult = run_cli([dup])
+    check(acc, "duplicate case names fail the table (one report line, one "
+          + "store slot)",
+          r3.code == 1
+              && r3.out.contains("duplicate case name 'same' in 'cases_c'")
+              && r3.out.contains("race for one report line"),
+          clip(first_line(r3.combined), 120))
+
+    let badname: str = write_src(acc, "s3/badname.hls", badname_src())
+    let r4: RunResult = run_cli([badname])
+    check(acc, "case names outside [A-Za-z0-9_.:-] fail with the charset "
+          + "rule (a row name is also a store key)",
+          r4.code == 1
+              && r4.out.contains("invalid case name 'has space' in 'cases_c'")
+              && r4.out.contains("[A-Za-z0-9_.:-]"),
+          clip(first_line(r4.combined), 120))
+
+    # Store-key grammar: the helpers behind the report and the store.
+    let rb1: RunResult = hlprobe(acc, ["rowbase", "test_parse#empty"])
+    let rb2: RunResult = hlprobe(acc, ["rowbase", "test_plain"])
+    check(acc, "row_base: the first # starts the row suffix; a plain key "
+          + "is its own base",
+          rb1.code == 0 && rb2.code == 0
+              && first_line(rb1.out) == "test_parse"
+              && first_line(rb2.out) == "test_plain",
+          first_line(rb1.out) + " / " + first_line(rb2.out))
+
+    let rt1: RunResult = hlprobe(acc, ["rowtype", "list[TestCase[AddCase]]"])
+    let rt2: RunResult = hlprobe(acc, ["rowtype", "list[TestCase[list[int]]]"])
+    let rt3: RunResult = hlprobe(acc, ["rowtype", "list[Pt]"])
+    let rt4: RunResult = hlprobe(acc, ["rowtype", "int"])
+    let rt5: RunResult = hlprobe(acc, ["rowtype", "NONE"])
+    check(acc, "_table_row_type: parses list[TestCase[X]] (nested generics "
+          + "included), refuses everything else silently",
+          rt1.code == 0 && first_line(rt1.out) == "AddCase"
+              && first_line(rt2.out) == "list[int]"
+              && first_line(rt3.out) == "NONE"
+              && first_line(rt4.out) == "NONE"
+              && first_line(rt5.out) == "NONE",
+          first_line(rt1.out) + " / " + first_line(rt2.out) + " / "
+              + first_line(rt3.out) + " / " + first_line(rt4.out) + " / "
+              + first_line(rt5.out))
+
+    # (the battery fed _table_row_type(None); argv has no None — the
+    # empty case is covered by rt5's sentinel.)
+    let sr: RunResult = hlprobe(acc, ["store_re"])
+    check(acc, "the store test-name grammar: <test>[#<case>], one optional "
+          + "row suffix",
+          sr.code == 0 && first_line(sr.out).trim() == "1 1 1 1",
+          first_line(sr.out))
+}
+
+# ----------------------------------------------------------------------------
+# Section 4 — the store: rows are first-class store keys
+# ----------------------------------------------------------------------------
+
+fn fixture_path(acc: Acc) -> str {
+    return path_join3(acc.root, "tests/ok/feat_stage120_cases.hls")
+}
+
+fn committed_store(acc: Acc) -> str {
+    return path_join3(acc.root,
+        "tests/ok/__snapshots__/feat_stage120_cases.snap")
+}
+
+fn section_4(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 4 — the store: rows are first-class store keys")
+
+    let fixture: str = fixture_path(acc)
+    let work: str = write_src(acc, "s4/fixture.hls", read_file(fixture))
+
+    # Record the fixture: row keys, exact framing.
+    let r: RunResult = run_cli(["-u", work])
+    let store: str = scratch(acc, "s4/__snapshots__/fixture.snap")
+    let recs: RunResult = hlprobe(acc, ["store_lines", store])
+    let rec_txt: str = recs.out
+    let n_recs: int = grep_count(rec_txt, "\t")
+    let has_boundary: bool = rec_txt.contains("test_bound#boundary\trange-line\t")
+    let has_inside: bool = rec_txt.contains("test_bound#inside\trange-line\t")
+    check(acc, "-u records each row under its test_x#case store key with "
+          + "its own value",
+          r.code == 0 && file_exists(store) && n_recs == 2
+              && has_boundary && has_inside
+              && rec_txt.contains("test_bound#inside\trange-line\t"
+                  + "5 in [0, 10]"),
+          clip(rec_txt, 120))
+
+    let raw: str = read_file(store)
+    check(acc, "the store framing is unchanged: v1 header, '@@@ "
+          + "<test#case> <name> <len>' records, sorted",
+          raw.starts_with("# hltest-snapshots v1\n"
+              + "# generated by `hltest --update-snapshots` - do not edit "
+              + "by hand\n")
+              && raw.contains("@@@ test_bound#boundary range-line 13\n"
+                  + "10 in [0, 10]\n"),
+          clip(first_line(raw), 80))
+
+    let r2: RunResult = run_cli([work])
+    check(acc, "verify passes against the recorded row store (11 pass, 1 "
+          + "table-level skip)",
+          r2.code == 0 && r2.out.contains("11 pass, 0 fail, 1 skip"),
+          clip(first_line(r2.combined), 120))
+
+    # A changed row value fails THAT row with the diff and the hint.
+    let mut_src: str = replace_first(read_file(fixture),
+                                     "\" in [\"", "\" within [\"")
+    let mut_p: str = write_src(acc, "s4m/mut.hls", mut_src)
+    let cp_ok: int = copytree(scratch(acc, "s4/__snapshots__"),
+                              scratch(acc, "s4m/__snapshots__"))
+    let mv_ok: int = mv(scratch(acc, "s4m/__snapshots__/fixture.snap"),
+                        scratch(acc, "s4m/__snapshots__/mut.snap"))
+    let r3: RunResult = run_cli([mut_p])
+    check(acc, "a changed row value fails that row with a unified diff and "
+          + "the accept hint (the other row still passes)",
+          cp_ok == 0 && mv_ok == 0
+              && r3.code == 1 && r3.out.contains("test_bound#inside")
+              && r3.out.contains("snapshot 'range-line' differs")
+              && r3.out.contains("-5 in [0, 10]")
+              && r3.out.contains("+5 within [0, 10]")
+              && r3.out.contains("--update-snapshots"),
+          clip(first_line(r3.combined), 120))
+
+    let r4: RunResult = run_cli(["-u", mut_p])
+    let mut_recs: RunResult = hlprobe(acc,
+        ["store_lines", scratch(acc, "s4m/__snapshots__/mut.snap")])
+    check(acc, "-u accepts the changed row value",
+          r4.code == 0
+              && mut_recs.out.contains("test_bound#inside\trange-line\t"
+                  + "5 within [0, 10]"),
+          clip(first_line(mut_recs.out), 80))
+
+    # A row dropped from the table: verify fails under the base name
+    # naming the dead row; -u prunes exactly it.
+    let dropped: str = "    TestCase {\n        name: \"inside\", "
+        + "row: BoundCase {\n            v: 5, lo: 0, hi: 10\n"
+        + "        }\n    },\n"
+    let drop: str = write_src(acc, "s4d/fixture.hls",
+                              replace_first(read_file(fixture), dropped, ""))
+    let cp2: int = copytree(scratch(acc, "s4/__snapshots__"),
+                            scratch(acc, "s4d/__snapshots__"))
+    let r5: RunResult = run_cli([drop])
+    check(acc, "a row dropped from the table is a verify failure naming "
+          + "the dead row key",
+          cp2 == 0 && r5.code == 1 && r5.out.contains("FAIL")
+              && r5.out.contains("stored snapshot records for case row(s) "
+                  + "the table no longer contains: test_bound#inside")
+              && r5.out.contains("--update-snapshots"),
+          clip(first_line(r5.combined), 120))
+
+    let r6: RunResult = run_cli(["-u", drop])
+    let kept: RunResult = hlprobe(acc,
+        ["store_lines", scratch(acc, "s4d/__snapshots__/fixture.snap")])
+    check(acc, "-u prunes exactly the dead row's records",
+          r6.code == 0
+              && grep_count(kept.out, "\t") == 1
+              && kept.out.contains("test_bound#boundary"),
+          clip(kept.out, 80))
+
+    # Stale shape, both directions: plain records after a test became
+    # parameterised, and row records after it became plain.
+    let evolve: str = write_src(acc, "s4e/evolve.hls", evolve_plain_src())
+    run_cli(["-u", evolve])
+    write_file(evolve, evolve_para_src())
+    let r7: RunResult = run_cli([evolve])
+    check(acc, "plain records left behind after a test became parameterised "
+          + "are a stale-shape failure",
+          r7.code == 1 && r7.out.contains("<snapshots>")
+              && r7.out.contains("shape no longer matches")
+              && r7.out.contains("test_evolve"),
+          clip(first_line(r7.combined), 120))
+
+    let r8: RunResult = run_cli(["-u", evolve])
+    let kept2: RunResult = hlprobe(acc,
+        ["store_lines", scratch(acc, "s4e/__snapshots__/evolve.snap")])
+    check(acc, "-u prunes the stale plain records (the row emits no "
+          + "snapshots)",
+          r8.code == 0 && kept2.out.trim() == "",
+          clip(kept2.out, 40))
+
+    write_file(evolve, evolve_row_src())
+    run_cli(["-u", evolve])
+    write_file(evolve, evolve_plain_src())
+    let r9: RunResult = run_cli([evolve])
+    check(acc, "row records left behind after a test became plain are a "
+          + "stale-shape failure naming the row key",
+          r9.code == 1 && r9.out.contains("<snapshots>")
+              && r9.out.contains("test_evolve#a"),
+          clip(first_line(r9.combined), 120))
+}
+
+# ----------------------------------------------------------------------------
+# Section 5 — the selection: --grep knows rows
+# ----------------------------------------------------------------------------
+
+fn section_5(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 5 — the selection: --grep knows rows")
+
+    let work: str = scratch(acc, "s4/fixture.hls")
+    let tablepanic: str = scratch(acc, "s3/tablepanic.hls")
+
+    # grep by base name: the whole table runs.
+    let r: RunResult = run_cli(["--grep", "test_bound", work])
+    check(acc, "--grep by base name runs the whole table and nothing else",
+          r.code == 0 && r.out.contains("test_bound#boundary")
+              && r.out.contains("test_bound#inside")
+              && !r.out.contains("test_add#positives"),
+          clip(first_line(r.combined), 120))
+
+    # grep by row name: exactly one row.
+    let r2: RunResult = run_cli(["--grep", "#boundary", work])
+    check(acc, "--grep '#case' selects one row",
+          r2.code == 0 && r2.out.contains("test_bound#boundary")
+              && !r2.out.contains("test_bound#inside")
+              && r2.out.contains("1 pass, 0 fail, 0 skip"),
+          clip(first_line(r2.combined), 120))
+
+    # -u with a row filter keeps the unselected row's records.
+    let sp: str = scratch(acc, "s4/__snapshots__/fixture.snap")
+    let before: str = read_file(sp)
+    let r3: RunResult = run_cli(["-u", "--grep", "#boundary", work])
+    let after: str = read_file(sp)
+    check(acc, "-u with a row filter never touches the unselected rows' "
+          + "records",
+          r3.code == 0 && before == after, "")
+
+    # A broken table never fails a run that did not select it.
+    let r4: RunResult = run_cli(["--grep", "test_boom", tablepanic])
+    check(acc, "a selected broken table still fails its run",
+          r4.code == 1
+              && r4.out.contains("case table 'cases_boom' panicked"),
+          clip(first_line(r4.combined), 120))
+
+    let r5: RunResult = run_cli(["--grep", "nothing-matches-this",
+                                 tablepanic])
+    check(acc, "an unselected broken table never fails a targeted run "
+          + "(--grep is a selection tool)",
+          !r5.out.contains("case table 'cases_boom' panicked"),
+          clip(first_line(r5.combined), 80))
+
+    # grep matching nothing at all: a skip, not an error (-v shows the
+    # skip's reason line).
+    let r6: RunResult = run_cli(["-v", "--grep", "zzz-no-match", work])
+    check(acc, "a grep matching nothing is a <no-tests> skip with its "
+          + "reason",
+          r6.code == 0 && r6.out.contains("<no-tests>")
+              && r6.out.contains("no tests match --grep"),
+          clip(first_line(r6.combined), 120))
+}
+
+# ----------------------------------------------------------------------------
+# Section 6 — the runner integration
+# ----------------------------------------------------------------------------
+
+fn section_6(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 6 — the runner integration")
+
+    let fixture: str = fixture_path(acc)
+    mkdirs(scratch(acc, "s6/a"))
+    mkdirs(scratch(acc, "s6/b"))
+    let fa: str = write_src(acc, "s6/a/alpha.hls", read_file(fixture))
+    let fb: str = write_src(acc, "s6/b/beta.hls",
+                            replace_first(read_file(fixture),
+                                          "\" in [\"", "\" between [\""))
+    let r: RunResult = run_cli(["-j", "4", "-u", "-r", scratch(acc, "s6")])
+    let sa: str = scratch(acc, "s6/a/__snapshots__/alpha.snap")
+    let sb: str = scratch(acc, "s6/b/__snapshots__/beta.snap")
+    let ra: RunResult = hlprobe(acc, ["store_lines", sa])
+    let rb: RunResult = hlprobe(acc, ["store_lines", sb])
+    check(acc, "parallel -u writes each file's own row store; values never "
+          + "cross files",
+          r.code == 0 && file_exists(sa) && file_exists(sb)
+              && ra.out.contains("test_bound#inside\trange-line\t5 in [0, 10]")
+              && rb.out.contains("test_bound#inside\trange-line\t"
+                  + "5 between [0, 10]"),
+          clip(first_line(ra.out) + " / " + first_line(rb.out), 120))
+
+    let r2: RunResult = run_cli([fa])
+    check(acc, "exit codes: 0 when every row passes (a table-level skip is "
+          + "not a failure)",
+          r2.code == 0 && r2.out.contains("11 pass, 0 fail, 1 skip"),
+          clip(first_line(r2.combined), 120))
+
+    let jpath: str = scratch(acc, "s6/j.xml")
+    let jr: RunResult = run_cli(["--junit", jpath, fa])
+    let xml: str = read_file(jpath)
+    check(acc, "the JUnit XML carries rows as testcases, skip node included",
+          jr.code == 0 && xml.contains("name=\"test_add#positives\"")
+              && xml.contains("name=\"test_mod#trivial\"")
+              && xml.contains("<skipped"),
+          clip(first_line(xml), 80))
+}
+
+# ----------------------------------------------------------------------------
+# Section 7 — the differential: TestCase[T] through the native compiler
+# ----------------------------------------------------------------------------
+
+fn section_7(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 7 — the differential: TestCase[T] goes through the "
+        + "native compiler")
+
+    let fixture: str = fixture_path(acc)
+    if file_exists(hlc_path(acc)) && which("gcc") {
+        mkdirs(scratch(acc, "s7"))
+        let c: str = scratch(acc, "s7/fixture.c")
+        let e: str = scratch(acc, "s7/native")
+        let b: RunResult = run_capture(hlc_path(acc), [fixture, c])
+        let g: RunResult = run_capture("gcc",
+            ["-O2", "-o", e, c, "-lm", "-pthread"])
+        if b.code == 0 && g.code == 0 {
+            let rn: RunResult = run_capture(e, [])
+            let ri: RunResult = boot(acc, [fixture])
+            check(acc, "the fixture's output is byte-identical: interpreter "
+                  + "vs native (the generic TestCase rows and the "
+                  + "runner-mirror main compile and agree)",
+                  rn.code == 0 && rn.out == ri.out, "")
+
+            # the native run's snapshot records equal the committed
+            # store's values (one store serves both backends)
+            let out_file: str = write_src(acc, "s7/native_stdout.txt",
+                                          rn.out)
+            let cmp: RunResult = hlprobe(acc,
+                ["cmp_records", committed_store(acc), out_file])
+            let lines: list[str] = cmp.out.trim().split("\n")
+            let mut err_line: str = ""
+            let mut a_line: str = ""
+            let mut b_line: str = ""
+            let mut i: int = 0
+            while i < lines.len() {
+                if lines.get(i).starts_with("err=") {
+                    err_line = lines.get(i)
+                }
+                if lines.get(i).starts_with("A=") {
+                    a_line = lines.get(i)
+                }
+                if lines.get(i).starts_with("B=") {
+                    b_line = lines.get(i)
+                }
+                i = i + 1
+            }
+            check(acc, "the native run's snapshot records equal the "
+                  + "committed store's values (one store serves both "
+                  + "backends)",
+                  err_line == "err=NONE" && a_line != "" && a_line == b_line,
+                  clip(err_line + " " + a_line, 120))
+        } else {
+            check(acc, "the native build of the fixture failed", false,
+                  clip(first_line(b.err) + " / " + first_line(g.err), 60))
+        }
+    } else {
+        check(acc, "the native half of the differential could not run (no "
+              + "gcc or no bin/hlc)", false, "no native toolchain")
+    }
+
+    let fresh: str = write_src(acc, "s7/fresh.hls", read_file(fixture))
+    let r: RunResult = run_cli(["-u", fresh])
+    let committed: str = read_file(committed_store(acc))
+    let recorded: str = read_file(scratch(acc,
+        "s7/__snapshots__/fresh.snap"))
+    check(acc, "-u on a fresh copy reproduces the committed store byte for "
+          + "byte (deterministic serialization, row keys sorted)",
+          r.code == 0 && recorded == committed, "")
+}
+
+# ----------------------------------------------------------------------------
+# Section 8 — the fixed point and tree hygiene
+# ----------------------------------------------------------------------------
+
+fn section_8(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 8 — the fixed point and tree hygiene")
+
+    let fixture: str = fixture_path(acc)
+
+    let r: RunResult = run_cli([fixture])
+    check(acc, "the committed store verifies the committed fixture green "
+          + "in-tree",
+          r.code == 0 && r.out.contains("11 pass, 0 fail, 1 skip"),
+          clip(first_line(r.combined), 120))
+
+    let cstore: str = committed_store(acc)
+    let before: str = read_file(cstore)
+    let r2: RunResult = run_cli(["-u", fixture])
+    let after: str = read_file(cstore)
+    let leftovers: RunResult = run_capture("find",
+        [path_dir3(cstore), "-maxdepth", "1", "-name", "*.tmp"])
+    check(acc, "-u on the committed fixture is a no-op (bytes, report, no "
+          + ".tmp)",
+          r2.code == 0 && before == after
+              && !r2.out.contains("store(s) updated")
+              && leftovers.out.trim() == "",
+          clip(leftovers.out.trim(), 80))
+
+    let fr: RunResult = run_capture(path_join3(acc.root, "bin/hlfmt"),
+                                    ["-c", fixture])
+    check(acc, "the fixture is an hlfmt fixed point",
+          fr.code == 0 && fr.out.contains("already formatted"),
+          clip(first_line(fr.combined), 120))
+
+    let rc: RunResult = boot_check(acc, fixture)
+    check(acc, "the fixture type-checks as a plain program (boot --check)",
+          rc.code == 0 && rc.out.contains("OK"),
+          clip(first_line(rc.combined), 120))
+
+    let spf: RunResult = hlprobe(acc, ["store_path", "/x/y/feat.hls"])
+    check(acc, "store_path_for: one store per file, next to it",
+          spf.code == 0
+              && first_line(spf.out) == "/x/y/__snapshots__/feat.snap",
+          first_line(spf.out))
+}
+
+# ----------------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Fs, Proc, Exit {
+    let acc: Acc = acc_new("cases")
+    section_1(acc)
+    section_2(acc)
+    section_3(acc)
+    section_4(acc)
+    section_5(acc)
+    section_6(acc)
+    section_7(acc)
+    section_8(acc)
+    return finish(acc, "Stage 120 -- hltest parameterised tests")
+}

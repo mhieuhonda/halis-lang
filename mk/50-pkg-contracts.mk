@@ -421,9 +421,9 @@ tlog-selftest:
 # grown, rewritten), the repo ledger end to end, the demos, the
 # tools). Tool-only — no solver needed; the native half of the demo
 # parity runs when bin/hlc exists.
-tlog-acceptance: $(BIN)/hlfmt
-	@echo "[Stage 107 acceptance] running tests/tlog_acceptance.py..."
-	@$(PYTHON) tests/tlog_acceptance.py
+tlog-acceptance: $(BIN)/acc-tlog $(BIN)/hlfmt
+	@echo "[Stage 107 acceptance] running tests/acc/tlog_acceptance.hls..."
+	@$(BIN)/acc-tlog
 
 # ============================================================================
 # Stage 108 (v0.127.0-alpha): hls-reverify — memory-safety

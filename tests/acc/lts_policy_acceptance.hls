@@ -1,0 +1,1204 @@
+# ============================================================================
+# tests/acc/lts_policy_acceptance.hls — Stage 145 acceptance gate, in Halis
+# (the Halis twin of tests/lts_policy_acceptance.py; same nine sections,
+# same assertions, same needles — the harness is tests/acc/harness.hls
+# and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Nine sections over the REAL policy CLI (bin/hls-lts, the interface a
+# release manager drives) and REAL scratch git repositories whose
+# birthdays are fabricated on command (GIT_COMMITTER_DATE) — a support
+# window cannot wait three years to be tested:
+#
+#  1. the convention  — `window` without a policy or a tag refuses and
+#                       names both remedies; the --at grammar; the exits
+#                       (0 ok / 1 refusal / 2 usage)
+#  2. the calendar    — anniversaries, not day counts: the February-29
+#     law               clamp, the plain anniversary, the horizon day
+#                       that belongs to the phase it closes (--at, never
+#                       a slept-on clock)
+#  3. the phase       — active / security / eol over fabricated bases,
+#     machine           --json exact, the same law through the declared
+#                       line and through --tag
+#  4. the marking     — `classify` reports the Security mark beside the
+#     law                class: the trailer grammar, a marked FEATURE is
+#                       still a FEATURE
+#  5. the backport    — the window gate: a plain fix refused in
+#     window law        security-only (both horizons named), the marked
+#                       fix landing with its window line, the dry run,
+#                       the dead line refusing everything
+#  6. the tag law     — the security phase demands a security backport;
+#                       a dead line cuts no release; an alive line cuts
+#                       bookkeeping freely
+#  7. the audit law   — history judged the day it landed: the planted
+#                       bypass named, the marked backport clean, the
+#                       commit past end of life a violation, the tag cut
+#                       past the horizon named with its day
+#  8. the publication — the render deterministic, the committed LTS.md
+#     law                matching it on THIS tree, the drifted copy
+#                       refused with the regenerate command named
+#  9. the corpus      — tests/ok/feat_stage145_ltspolicy.hls is
+#     showcase          hlfmt-canonical, hllint-clean, boots through the
+#                       real checker, runs green on the interpreter and
+#                       (when bin/hlc exists) matches natively byte for
+#                       byte
+#
+# The battery ran every child under a pinned git identity (GIT_ENV) and
+# fabricated the committer day per call (`when=`); the gate sets the
+# identity once up front (children inherit the parent's env) and
+# set/unsets the two DATE vars around exactly the legs that carry a
+# `when`, so no fabricated day leaks into a neighbouring leg.
+# ============================================================================
+
+import "./harness.hls"
+import "std.json"
+import "std.env"
+import "std.taint"
+
+# ----------------------------------------------------------------------------
+# Port helpers — the battery's run/world/JSON kit.
+# ----------------------------------------------------------------------------
+
+# set_when(when) — fabricate the committer day for the NEXT child (the
+# battery's per-call env), or clear it (when == "") so the day never
+# leaks into a leg that runs on the real clock.
+fn set_when(when: str) -> void uses Proc {
+    if when != "" {
+        env_set_var("GIT_COMMITTER_DATE", when + "T12:00:00+00:00")
+        env_set_var("GIT_AUTHOR_DATE", when + "T12:00:00+00:00")
+    } else {
+        env_unset_var("GIT_COMMITTER_DATE")
+        env_unset_var("GIT_AUTHOR_DATE")
+    }
+}
+
+# lts_run(args, repo, when) — the battery's lts(*args, repo=None,
+# when=None): --repo appended LAST when the battery passed the kwarg
+# (when the battery inlined --repo in args, the caller passes "" here
+# and keeps the flags in args), the fabricated day bracketing the run.
+fn lts_run(root: str, args: list[str], repo: str, when: str) -> RunResult uses Proc {
+    set_when(when)
+    let argv: list[str] = []
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    if repo != "" {
+        argv.push("--repo")
+        argv.push(repo)
+    }
+    let r: RunResult = run_capture(path_join3(root, "bin/hls-lts"), argv)
+    set_when("")
+    return r
+}
+
+# git_run(repo, args, when) — the battery's git(repo, *args, when=None).
+fn git_run(repo: str, args: list[str], when: str) -> RunResult uses Proc {
+    set_when(when)
+    let argv: list[str] = ["-C", repo]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    let r: RunResult = run_capture("git", argv)
+    set_when("")
+    return r
+}
+
+# make_repo(acc, name, base_day, tag) — a fresh scratch repo whose base
+# release was cut on base_day. The battery's asserts become "": the
+# callers fail their first leg loudly instead of dying silently.
+fn make_repo(acc: Acc, name: str, base_day: str, tag: str) -> str uses IO, Fs, Proc {
+    let repo: str = scratch(acc, name)
+    let init: RunResult = git_run(repo, ["init", "-q", "-b", "main", "."], "")
+    if init.code != 0 {
+        println("lts_policy-acceptance: git init failed in " + repo + " — "
+            + first_line(init.combined))
+        return ""
+    }
+    let seed: str = commit_file(repo, "app.txt", "seed line\n",
+        "stage 1: seed the project", base_day, "")
+    if seed == "" {
+        return ""
+    }
+    let t: RunResult = git_run(repo, ["tag", tag], "")
+    if t.code != 0 {
+        return ""
+    }
+    return repo
+}
+
+# commit_file(repo, fname, content, msg, when, tag) — the battery's
+# one-file commit(files, message, when=None, tag=None); "" on failure.
+fn commit_file(repo: str, fname: str, content: str, msg: str, when: str,
+               tag: str) -> str uses Fs, Proc {
+    let p: str = path_join3(repo, fname)
+    mkdirs(path_dir3(p))
+    write_file(p, content)
+    let add: RunResult = git_run(repo, ["add", "--", fname], "")
+    if add.code != 0 {
+        return ""
+    }
+    let c: RunResult = git_run(repo,
+        ["commit", "-q", "--allow-empty-message", "-m", msg], when)
+    if c.code != 0 {
+        return ""
+    }
+    if tag != "" {
+        let t: RunResult = git_run(repo, ["tag", tag], "")
+        if t.code != 0 {
+            return ""
+        }
+    }
+    let r: RunResult = git_run(repo, ["rev-parse", "HEAD"], "")
+    if r.code != 0 {
+        return ""
+    }
+    return r.out.trim()
+}
+
+# branch_head(repo, branch) — the battery's branch_head: "" for None.
+fn branch_head(repo: str, branch: str) -> str uses Proc {
+    let r: RunResult = git_run(repo, ["rev-parse", branch], "")
+    if r.code != 0 {
+        return ""
+    }
+    return r.out.trim()
+}
+
+# load_json(acc, r) — the battery's load_json: parse the child's stdout,
+# a failed parse is a counted FAIL ("json is not well-formed") and the
+# caller's data becomes null (its own check fails too).
+fn load_json(acc: Acc, r: RunResult) -> JsonValue uses IO {
+    let rr: Result[JsonValue, str] = json_parse_result(r.out)
+    if result_is_ok(rr) {
+        return result_unwrap(rr)
+    }
+    check(acc, "json is not well-formed", false, clip(r.out, 80))
+    return json_null()
+}
+
+# jget_str / jget_int / jget_bool — the battery's data["k"] with default
+# semantics (std.json's typed accessors panic on a kind mismatch, so
+# guard first).
+fn jget_str(v: JsonValue, key: str) -> str {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_str(x) {
+        return json_str_value(x)
+    }
+    return ""
+}
+
+fn jget_int(v: JsonValue, key: str) -> int {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_int(x) {
+        return json_int_value(x)
+    }
+    return -1
+}
+
+fn jget_bool(v: JsonValue, key: str) -> bool {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_bool(x) {
+        return json_bool_value(x)
+    }
+    return false
+}
+
+# replace_first(s, from, to) — the battery's str.replace(..., 1).
+fn replace_first(s: str, from: str, to: str) -> str {
+    let i: int = s.find(from)
+    if i < 0 {
+        return s
+    }
+    return s.slice(0, i) + to + s.slice(i + from.len(), s.len())
+}
+
+# ----------------------------------------------------------------------------
+# Section 1 — the convention
+# ----------------------------------------------------------------------------
+
+fn section_1(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 1 — the convention")
+
+    # window needs a line: the declaration or a tag.
+    let r: str = make_repo(acc, "conv", "2026-10-01", "v1.0.0")
+    if r == "" {
+        check(acc, "window without a policy names both remedies", false,
+              "make_repo failed")
+        return
+    }
+    let p: RunResult = lts_run(acc.root, ["window"], r, "")
+    check(acc, "window without a policy names both remedies",
+          p.code == 1 && p.out.contains("no LTS policy declared")
+              && p.out.contains("--tag") && p.out.contains("init --tag"),
+          clip(first_line(p.combined), 120))
+
+    # The --at grammar.
+    let p2: RunResult = lts_run(acc.root,
+        ["window", "--tag", "v1.0.0", "--at", "not-a-day"], r, "")
+    check(acc, "a malformed --at is refused, named",
+          p2.code == 1 && p2.out.contains("--at must be a plain ISO day"),
+          clip(first_line(p2.combined), 120))
+
+    let p3: RunResult = lts_run(acc.root,
+        ["window", "--tag", "v1.0.0", "--at", "2026-13-40"], r, "")
+    check(acc, "an impossible calendar day is refused, named",
+          p3.code == 1 && p3.out.contains("--at must be a plain ISO day"),
+          clip(first_line(p3.combined), 120))
+
+    # The tag laws: the windows are a release's promise.
+    let p4: RunResult = lts_run(acc.root,
+        ["window", "--tag", "v1.0.0-rc.1"], r, "")
+    check(acc, "a pre-release tag is refused (the windows are a "
+          + "release's promise)",
+          p4.code == 1 && p4.out.contains("pre-release"),
+          clip(first_line(p4.combined), 120))
+
+    let p5: RunResult = lts_run(acc.root, ["window", "--tag", "v0.9.0"], r, "")
+    check(acc, "a pre-1.0 tag is refused (the policy begins after v1.0)",
+          p5.code == 1 && p5.out.contains("pre-1.0"),
+          clip(first_line(p5.combined), 120))
+
+    let p6: RunResult = lts_run(acc.root, ["window", "--tag", "v9.9.9"], r, "")
+    check(acc, "a nonexistent tag is refused, named",
+          p6.code == 1 && p6.out.contains("does not exist"),
+          clip(first_line(p6.combined), 120))
+
+    # The policy document command: unknown flags are usage errors.
+    let p7: RunResult = lts_run(acc.root, ["policy", "--no-such-flag"], "", "")
+    check(acc, "an unknown flag is a usage error (2)", p7.code == 2,
+          p7.code.to_str())
+
+    # The publication is live on THIS tree.
+    let p8: RunResult = lts_run(acc.root, ["policy", "--check"], "", "")
+    check(acc, "the committed LTS.md matches the render on this tree",
+          p8.code == 0 && p8.out.contains("matches the render")
+              && p8.out.contains("3 years bug-fix, 5 years security"),
+          clip(first_line(p8.combined), 120))
+}
+
+# ----------------------------------------------------------------------------
+# Section 2 — the calendar law
+# ----------------------------------------------------------------------------
+
+fn section_2(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 2 — the calendar law")
+
+    # The February-29 clamp: the anniversary lands on a day that
+    # exists. A line born on the leap day of 2020 is bug-fixed
+    # through 2023-02-28 and dies on 2025-02-28 (through).
+    let r: str = make_repo(acc, "leap", "2020-02-29", "v1.0.0")
+    if r == "" {
+        check(acc, "the February-29 base clamps to the 28th on both "
+              + "horizons", false, "make_repo failed")
+        return
+    }
+    let p: RunResult = lts_run(acc.root,
+        ["window", "--tag", "v1.0.0", "--at", "2020-03-01"], r, "")
+    check(acc, "the February-29 base clamps to the 28th on both horizons",
+          p.code == 0 && p.out.contains("base released 2020-02-29")
+              && p.out.contains("bug fixes until:  2023-02-28")
+              && p.out.contains("security until:   2025-02-28"),
+          clip(first_line(p.combined), 120))
+
+    # The horizon day belongs to the phase it closes: 2023-02-28 is
+    # still active; 2023-03-01 is security-only.
+    let pj: RunResult = lts_run(acc.root,
+        ["window", "--tag", "v1.0.0", "--at", "2023-02-28", "--json"], r, "")
+    let data: JsonValue = load_json(acc, pj)
+    check(acc, "the third anniversary (clamped) is still active",
+          json_is_object(data) && jget_str(data, "phase") == "active",
+          jget_str(data, "phase"))
+
+    let pj2: RunResult = lts_run(acc.root,
+        ["window", "--tag", "v1.0.0", "--at", "2023-03-01", "--json"], r, "")
+    let data2: JsonValue = load_json(acc, pj2)
+    check(acc, "the day after the clamped horizon is security-only",
+          json_is_object(data2) && jget_str(data2, "phase") == "security",
+          jget_str(data2, "phase"))
+
+    let pj3: RunResult = lts_run(acc.root,
+        ["window", "--tag", "v1.0.0", "--at", "2025-02-28", "--json"], r, "")
+    let data3: JsonValue = load_json(acc, pj3)
+    check(acc, "the fifth anniversary (clamped) is the last supported day",
+          json_is_object(data3) && jget_str(data3, "phase") == "security",
+          jget_str(data3, "phase"))
+
+    let pj4: RunResult = lts_run(acc.root,
+        ["window", "--tag", "v1.0.0", "--at", "2025-03-01", "--json"], r, "")
+    let data4: JsonValue = load_json(acc, pj4)
+    check(acc, "the day after the fifth anniversary is end of life",
+          json_is_object(data4) && jget_str(data4, "phase") == "eol",
+          jget_str(data4, "phase"))
+
+    # The plain anniversary: no clamping, exact month and day.
+    let r2: str = make_repo(acc, "plain", "2021-01-31", "v1.0.0")
+    if r2 == "" {
+        check(acc, "the plain anniversary keeps month and day", false,
+              "make_repo failed")
+        return
+    }
+    let p5: RunResult = lts_run(acc.root,
+        ["window", "--tag", "v1.0.0", "--at", "2021-02-01"], r2, "")
+    check(acc, "the plain anniversary keeps month and day",
+          p5.code == 0 && p5.out.contains("bug fixes until:  2024-01-31")
+              && p5.out.contains("security until:   2026-01-31"),
+          clip(first_line(p5.combined), 120))
+
+    # The leap-day base into a leap target keeps the day.
+    let r3: str = make_repo(acc, "leap2", "2024-02-29", "v1.0.0")
+    if r3 == "" {
+        check(acc, "a 2024-02-29 base clamps through both horizons", false,
+              "make_repo failed")
+        return
+    }
+    let p6: RunResult = lts_run(acc.root,
+        ["window", "--tag", "v1.0.0", "--at", "2024-03-01"], r3, "")
+    check(acc, "a 2024-02-29 base clamps through both horizons",
+          p6.code == 0 && p6.out.contains("bug fixes until:  2027-02-28")
+              && p6.out.contains("security until:   2029-02-28"),
+          clip(first_line(p6.combined), 120))
+}
+
+# ----------------------------------------------------------------------------
+# Section 3 — the phase machine
+# ----------------------------------------------------------------------------
+
+fn section_3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 3 — the phase machine")
+
+    # A base 2 years old: active, with the day counts in the json.
+    let r: str = make_repo(acc, "young", "2024-06-15", "v1.0.0")
+    if r == "" {
+        check(acc, "a 2-year-old line is active, horizons and days exact",
+              false, "make_repo failed")
+        return
+    }
+    let ini: RunResult = lts_run(acc.root, ["init", "--tag", "v1.0.0"], r, "")
+    if ini.code != 0 {
+        check(acc, "a 2-year-old line is active, horizons and days exact",
+              false, "init failed: " + clip(first_line(ini.combined), 80))
+        return
+    }
+    let p: RunResult = lts_run(acc.root,
+        ["window", "--at", "2026-06-15", "--json"], r, "")
+    let data: JsonValue = load_json(acc, p)
+    check(acc, "a 2-year-old line is active, horizons and days exact",
+          json_is_object(data) && jget_str(data, "base_date") == "2024-06-15"
+              && jget_str(data, "bug_fix_until") == "2027-06-15"
+              && jget_str(data, "security_until") == "2029-06-15"
+              && jget_str(data, "phase") == "active"
+              && jget_int(data, "days_bugfix_left") == 365,
+          clip(json_stringify(data), 120))
+
+    # A base 4 years old: security-only.
+    let r2: str = make_repo(acc, "mid", "2022-06-15", "v1.0.0")
+    if r2 == "" {
+        check(acc, "a 4-year-old line is security-only, one year of it left",
+              false, "make_repo failed")
+        return
+    }
+    let ini2: RunResult = lts_run(acc.root, ["init", "--tag", "v1.0.0"], r2, "")
+    if ini2.code != 0 {
+        check(acc, "a 4-year-old line is security-only, one year of it left",
+              false, "init failed: " + clip(first_line(ini2.combined), 80))
+        return
+    }
+    let p2: RunResult = lts_run(acc.root,
+        ["window", "--at", "2026-06-15", "--json"], r2, "")
+    let data2: JsonValue = load_json(acc, p2)
+    check(acc, "a 4-year-old line is security-only, one year of it left",
+          json_is_object(data2) && jget_str(data2, "phase") == "security"
+              && jget_int(data2, "days_security_left") == 365,
+          clip(json_stringify(data2), 120))
+
+    # A base 6 years old: dead.
+    let r3: str = make_repo(acc, "old", "2020-06-15", "v1.0.0")
+    if r3 == "" {
+        check(acc, "a 6-year-old line is past end of life", false,
+              "make_repo failed")
+        return
+    }
+    let ini3: RunResult = lts_run(acc.root, ["init", "--tag", "v1.0.0"], r3, "")
+    if ini3.code != 0 {
+        check(acc, "a 6-year-old line is past end of life", false,
+              "init failed: " + clip(first_line(ini3.combined), 80))
+        return
+    }
+    let p3: RunResult = lts_run(acc.root,
+        ["window", "--at", "2026-06-15", "--json"], r3, "")
+    let data3: JsonValue = load_json(acc, p3)
+    check(acc, "a 6-year-old line is past end of life",
+          json_is_object(data3) && jget_str(data3, "phase") == "eol",
+          jget_str(data3, "phase"))
+
+    # The human render names the phase and its meaning.
+    let p4: RunResult = lts_run(acc.root, ["window", "--at", "2026-06-15"],
+                                r3, "")
+    check(acc, "the eol render names the day the line died",
+          p4.code == 0 && p4.out.contains("phase at 2026-06-15: eol")
+              && p4.out.contains("end of life — nothing lands on a dead line")
+              && p4.out.contains("the line ended 2025-06-15"),
+          clip(first_line(p4.combined), 120))
+
+    # status carries the live window.
+    let p5: RunResult = lts_run(acc.root, ["status", "--repo", r2], "", "")
+    check(acc, "status prints the live window line",
+          p5.code == 0
+              && p5.out.contains("window: bug fixes until 2025-06-15")
+              && p5.out.contains("phase today: security"),
+          clip(first_line(p5.combined), 120))
+
+    let p6: RunResult = lts_run(acc.root, ["status", "--repo", r2, "--json"],
+                                "", "")
+    let data6: JsonValue = load_json(acc, p6)
+    check(acc, "status --json carries the window",
+          json_is_object(data6)
+              && jget_str(json_object_get(data6, "window"), "phase")
+                  == "security",
+          jget_str(json_object_get(data6, "window"), "phase"))
+
+    # The same law through --tag, no declaration needed.
+    let p7: RunResult = lts_run(acc.root,
+        ["window", "--tag", "v1.0.0", "--at", "2024-06-15", "--json"], r, "")
+    let data7: JsonValue = load_json(acc, p7)
+    check(acc, "window --tag judges the line without a declaration",
+          json_is_object(data7) && jget_str(data7, "base_tag") == "v1.0.0"
+              && jget_str(data7, "phase") == "active",
+          jget_str(data7, "base_tag") + " " + jget_str(data7, "phase"))
+}
+
+# ----------------------------------------------------------------------------
+# Section 4 — the marking law
+# ----------------------------------------------------------------------------
+
+fn section_4(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 4 — the marking law")
+    let r: str = make_repo(acc, "marking", "2026-10-01", "v1.0.0")
+    if r == "" {
+        check(acc, "the Security trailer marks the fix, value carried",
+              false, "make_repo failed")
+        return
+    }
+
+    let marked: str = commit_file(r, "b1.txt", "one\n",
+        "fix: the taint escape\n\nSecurity: CVE-2027-1234", "", "")
+    if marked == "" {
+        check(acc, "the Security trailer marks the fix, value carried",
+              false, "commit failed")
+        return
+    }
+    let p: RunResult = lts_run(acc.root,
+        ["classify", marked, "--repo", r, "--json"], "", "")
+    let data: JsonValue = load_json(acc, p)
+    check(acc, "the Security trailer marks the fix, value carried",
+          json_is_object(data) && jget_str(data, "class") == "BUGFIX"
+              && jget_bool(data, "security")
+              && jget_str(data, "security_reason") == "CVE-2027-1234",
+          clip(json_stringify(data), 120))
+
+    # The human render reports the marking beside the class.
+    let p2: RunResult = lts_run(acc.root, ["classify", marked, "--repo", r],
+                                "", "")
+    check(acc, "classify prints the mark beside the class",
+          p2.code == 0
+              && p2.out.contains("security: marked — CVE-2027-1234"),
+          clip(first_line(p2.combined), 120))
+
+    # Case-insensitive name, trimmed value.
+    let lower: str = commit_file(r, "b2.txt", "two\n",
+        "fix: lowercase trailer\n\nsecurity:   high  ", "", "")
+    if lower == "" {
+        check(acc, "the name is case-insensitive, the value trimmed", false,
+              "commit failed")
+        return
+    }
+    let p3: RunResult = lts_run(acc.root,
+        ["classify", lower, "--repo", r, "--json"], "", "")
+    let data3: JsonValue = load_json(acc, p3)
+    check(acc, "the name is case-insensitive, the value trimmed",
+          json_is_object(data3) && jget_bool(data3, "security")
+              && jget_str(data3, "security_reason") == "high",
+          clip(json_stringify(data3), 120))
+
+    # An empty value is not a marking — fail-closed.
+    let empty: str = commit_file(r, "b3.txt", "three\n",
+        "fix: empty claim\n\nSecurity:", "", "")
+    if empty == "" {
+        check(acc, "an empty Security value is no claim", false,
+              "commit failed")
+        return
+    }
+    let p4: RunResult = lts_run(acc.root,
+        ["classify", empty, "--repo", r, "--json"], "", "")
+    let data4: JsonValue = load_json(acc, p4)
+    check(acc, "an empty Security value is no claim",
+          json_is_object(data4) && !jget_bool(data4, "security"),
+          jget_str(data4, "security_reason"))
+
+    # The first such line decides, even when it is empty.
+    let first: str = commit_file(r, "b4.txt", "four\n",
+        "fix: first decides\n\nSecurity:\nsecurity: real", "", "")
+    if first == "" {
+        check(acc, "the first Security line decides, empty or not", false,
+              "commit failed")
+        return
+    }
+    let p5: RunResult = lts_run(acc.root,
+        ["classify", first, "--repo", r, "--json"], "", "")
+    let data5: JsonValue = load_json(acc, p5)
+    check(acc, "the first Security line decides, empty or not",
+          json_is_object(data5) && !jget_bool(data5, "security"),
+          jget_str(data5, "security_reason"))
+
+    # A marked FEATURE is still a FEATURE — the marking is a fact,
+    # not a key past the class law.
+    let feat: str = commit_file(r, "std/extra.hls",
+        "fn shiny() -> int { return 1 }\n",
+        "feat: confetti mode\n\nSecurity: does not help", "", "")
+    if feat == "" {
+        check(acc, "a marked FEATURE is still a FEATURE, mark carried as "
+              + "fact", false, "commit failed")
+        return
+    }
+    let p6: RunResult = lts_run(acc.root,
+        ["classify", feat, "--repo", r, "--json"], "", "")
+    let data6: JsonValue = load_json(acc, p6)
+    check(acc, "a marked FEATURE is still a FEATURE, mark carried as fact",
+          json_is_object(data6) && jget_str(data6, "class") == "FEATURE"
+              && jget_bool(data6, "security"),
+          clip(json_stringify(data6), 120))
+
+    # No trailer, no claim.
+    let plain: str = commit_file(r, "b5.txt", "five\n",
+        "fix: plain bug fix", "", "")
+    if plain == "" {
+        check(acc, "no trailer, no security claim", false, "commit failed")
+        return
+    }
+    let p7: RunResult = lts_run(acc.root,
+        ["classify", plain, "--repo", r, "--json"], "", "")
+    let data7: JsonValue = load_json(acc, p7)
+    check(acc, "no trailer, no security claim",
+          json_is_object(data7) && !jget_bool(data7, "security"),
+          jget_str(data7, "security_reason"))
+
+    # A word in front of the name is not the name.
+    let prose: str = commit_file(r, "b6.txt", "six\n",
+        "fix: prose\n\nthe Security: docs say no", "", "")
+    if prose == "" {
+        check(acc, "a word in front of the name is not the name", false,
+              "commit failed")
+        return
+    }
+    let p8: RunResult = lts_run(acc.root,
+        ["classify", prose, "--repo", r, "--json"], "", "")
+    let data8: JsonValue = load_json(acc, p8)
+    check(acc, "a word in front of the name is not the name",
+          json_is_object(data8) && !jget_bool(data8, "security"),
+          jget_str(data8, "security_reason"))
+}
+
+# ----------------------------------------------------------------------------
+# Section 5 — the backport window law
+# ----------------------------------------------------------------------------
+
+fn section_5(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 5 — the backport window law")
+
+    # A line in its security-only phase (base 2022, judged 2026).
+    let r: str = make_repo(acc, "bp", "2022-06-15", "v1.0.0")
+    if r == "" {
+        check(acc, "a plain fix is refused in security-only, horizons named",
+              false, "make_repo failed")
+        return
+    }
+    let plain_fix: str = commit_file(r, "bug.txt", "one\n",
+        "fix: the wrap on leap days", "2026-06-10", "")
+    let sec_fix: str = commit_file(r, "bug2.txt", "two\n",
+        "fix: the taint escape\n\nSecurity: CVE-2027-1234", "2026-06-11", "")
+    let feat: str = commit_file(r, "widget.txt", "w\n", "feat: confetti mode",
+                                "2026-06-12", "")
+    if plain_fix == "" || sec_fix == "" || feat == "" {
+        check(acc, "a plain fix is refused in security-only, horizons named",
+              false, "commit failed")
+        return
+    }
+    let ini: RunResult = lts_run(acc.root, ["init", "--tag", "v1.0.0"], r, "")
+    if ini.code != 0 {
+        check(acc, "a plain fix is refused in security-only, horizons named",
+              false, "init failed: " + clip(first_line(ini.combined), 80))
+        return
+    }
+
+    # The plain fix is refused in security-only, both horizons named.
+    let p: RunResult = lts_run(acc.root,
+        ["backport", plain_fix, "--repo", r, "--at", "2026-06-15"], r, "")
+    check(acc, "a plain fix is refused in security-only, horizons named",
+          p.code == 1 && p.out.contains("security-only")
+              && p.out.contains("since 2025-06-15")
+              && p.out.contains("until 2027-06-15")
+              && p.out.contains("Security"),
+          clip(first_line(p.combined), 120))
+
+    # The marked fix lands, with the window line.
+    let p2: RunResult = lts_run(acc.root,
+        ["backport", sec_fix, "--repo", r, "--at", "2026-06-15"], "", "")
+    check(acc, "the marked fix lands in security-only, window named",
+          p2.code == 0 && p2.out.contains("applied")
+              && p2.out.contains("Backported-from")
+              && p2.out.contains("security-only — the line takes security "
+                  + "fixes until 2027-06-15"),
+          clip(first_line(p2.combined), 120))
+    set_when("")
+
+    # The feature is refused by the class law, as ever.
+    let p3: RunResult = lts_run(acc.root,
+        ["backport", feat, "--repo", r, "--at", "2026-06-15"], r, "")
+    check(acc, "the class law is unchanged under the window law",
+          p3.code == 1 && p3.out.contains("classifies FEATURE"),
+          clip(first_line(p3.combined), 120))
+
+    # A dry run reflects the phase, touches nothing.
+    let plain2: str = commit_file(r, "bug.txt", "three\n",
+        "fix: another plain one", "2026-06-13", "")
+    if plain2 == "" {
+        check(acc, "the dry run names the phase and the refusal, touching "
+              + "nothing", false, "commit failed")
+        return
+    }
+    let before: str = branch_head(r, "release/1.0")
+    let p4: RunResult = lts_run(acc.root,
+        ["backport", plain2, "--repo", r, "--at", "2026-06-15", "--dry-run"],
+        r, "")
+    let after: str = branch_head(r, "release/1.0")
+    check(acc, "the dry run names the phase and the refusal, touching nothing",
+          p4.code == 0 && p4.out.contains("window: security")
+              && p4.out.contains("would refuse")
+              && p4.out.contains("no 'Security:' trailer")
+              && after == before && after != "",
+          clip(first_line(p4.combined), 120))
+
+    # A dead line refuses everything — the marked fix too.
+    let r2: str = make_repo(acc, "dead", "2020-06-15", "v1.0.0")
+    if r2 == "" {
+        check(acc, "a dead line refuses even a marked fix", false,
+              "make_repo failed")
+        return
+    }
+    let dead_sec: str = commit_file(r2, "bug.txt", "x\n",
+        "fix: the taint escape\n\nSecurity: CVE-2027-9999", "2026-06-10", "")
+    if dead_sec == "" {
+        check(acc, "a dead line refuses even a marked fix", false,
+              "commit failed")
+        return
+    }
+    let ini2: RunResult = lts_run(acc.root, ["init", "--tag", "v1.0.0"], r2,
+                                  "")
+    if ini2.code != 0 {
+        check(acc, "a dead line refuses even a marked fix", false,
+              "init failed: " + clip(first_line(ini2.combined), 80))
+        return
+    }
+    let p5: RunResult = lts_run(acc.root,
+        ["backport", dead_sec, "--repo", r2, "--at", "2026-06-15"], r2, "")
+    check(acc, "a dead line refuses even a marked fix",
+          p5.code == 1 && p5.out.contains("end of life")
+              && p5.out.contains("2025-06-15")
+              && p5.out.contains("dead line"),
+          clip(first_line(p5.combined), 120))
+
+    # An active line takes the plain fix without ceremony.
+    let r3: str = make_repo(acc, "alive", "2024-06-15", "v1.0.0")
+    if r3 == "" {
+        check(acc, "an active line takes the plain fix, window named", false,
+              "make_repo failed")
+        return
+    }
+    let alive_fix: str = commit_file(r3, "bug.txt", "y\n",
+        "fix: plain but welcome", "2026-06-10", "")
+    if alive_fix == "" {
+        check(acc, "an active line takes the plain fix, window named", false,
+              "commit failed")
+        return
+    }
+    let ini3: RunResult = lts_run(acc.root, ["init", "--tag", "v1.0.0"], r3,
+                                  "")
+    if ini3.code != 0 {
+        check(acc, "an active line takes the plain fix, window named", false,
+              "init failed: " + clip(first_line(ini3.combined), 80))
+        return
+    }
+    let p6: RunResult = lts_run(acc.root,
+        ["backport", alive_fix, "--repo", r3, "--at", "2026-06-15"], "",
+        "2026-06-15")
+    check(acc, "an active line takes the plain fix, window named",
+          p6.code == 0 && p6.out.contains("applied")
+              && p6.out.contains("window: active"),
+          clip(first_line(p6.combined), 120))
+    set_when("")
+
+    # The same repo judged inside its active window (2025) would
+    # have taken it too — --at is the whole clock.
+    let r4: str = make_repo(acc, "clock", "2024-06-15", "v1.0.0")
+    if r4 == "" {
+        check(acc, "--at moves the clock: the same line takes the fix a "
+              + "year earlier", false, "make_repo failed")
+        return
+    }
+    let clock_fix: str = commit_file(r4, "bug.txt", "z\n",
+        "fix: judged early", "2026-06-10", "")
+    if clock_fix == "" {
+        check(acc, "--at moves the clock: the same line takes the fix a "
+              + "year earlier", false, "commit failed")
+        return
+    }
+    let ini4: RunResult = lts_run(acc.root, ["init", "--tag", "v1.0.0"], r4,
+                                  "")
+    if ini4.code != 0 {
+        check(acc, "--at moves the clock: the same line takes the fix a "
+              + "year earlier", false,
+              "init failed: " + clip(first_line(ini4.combined), 80))
+        return
+    }
+    let p7: RunResult = lts_run(acc.root,
+        ["backport", clock_fix, "--repo", r4, "--at", "2026-01-01"], "",
+        "2026-01-01")
+    check(acc, "--at moves the clock: the same line takes the fix a year "
+          + "earlier",
+          p7.code == 0 && p7.out.contains("window: active"),
+          clip(first_line(p7.combined), 120))
+    set_when("")
+}
+
+# ----------------------------------------------------------------------------
+# Section 6 — the tag law
+# ----------------------------------------------------------------------------
+
+fn section_6(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 6 — the tag law")
+
+    # Security-only line: a chore-only release is refused.
+    let r: str = make_repo(acc, "tag1", "2022-06-15", "v1.0.0")
+    if r == "" {
+        check(acc, "a chore-only release in the security phase is refused",
+              false, "make_repo failed")
+        return
+    }
+    let ini: RunResult = lts_run(acc.root, ["init", "--tag", "v1.0.0"], r, "")
+    if ini.code != 0 {
+        check(acc, "a chore-only release in the security phase is refused",
+              false, "init failed: " + clip(first_line(ini.combined), 80))
+        return
+    }
+    # Land a chore directly on the branch (bookkeeping is allowed in
+    # the security phase — but it is not a security backport).
+    let co1: RunResult = git_run(r, ["checkout", "-q", "release/1.0"], "")
+    let notes: str = commit_file(r, "notes.txt", "n\n",
+        "docs: release notes draft", "2026-06-15", "")
+    let co2: RunResult = git_run(r, ["checkout", "-q", "main"], "")
+    if notes == "" || co1.code != 0 || co2.code != 0 {
+        check(acc, "a chore-only release in the security phase is refused",
+              false, "commit failed")
+        return
+    }
+    let p: RunResult = lts_run(acc.root,
+        ["tag-patch", "--repo", r, "--at", "2026-06-15"], r, "")
+    check(acc, "a chore-only release in the security phase is refused",
+          p.code == 1 && p.out.contains("security-only")
+              && p.out.contains("at least one security backport")
+              && p.out.contains("pretends to be alive"),
+          clip(first_line(p.combined), 120))
+
+    # With a marked backport, the release cuts.
+    let sec_fix: str = commit_file(r, "bug.txt", "s\n",
+        "fix: the taint escape\n\nSecurity: CVE-2027-1234", "2026-06-16", "")
+    if sec_fix == "" {
+        check(acc, "the marked fix backports", false, "commit failed")
+        return
+    }
+    let p2: RunResult = lts_run(acc.root,
+        ["backport", sec_fix, "--repo", r, "--at", "2026-06-17"], "",
+        "2026-06-17")
+    check(acc, "the marked fix backports", p2.code == 0,
+          clip(first_line(p2.combined), 120))
+    set_when("")
+    let p3: RunResult = lts_run(acc.root,
+        ["tag-patch", "--repo", r, "--at", "2026-06-17"], r, "")
+    check(acc, "the security release carrying the marked fix cuts green",
+          p3.code == 0 && p3.out.contains("tagged v1.0.1"),
+          clip(first_line(p3.combined), 120))
+
+    # A dead line cuts no release at all.
+    let r2: str = make_repo(acc, "tag2", "2020-06-15", "v1.0.0")
+    if r2 == "" {
+        check(acc, "the dead line refused the backport on the way", false,
+              "make_repo failed")
+        return
+    }
+    let sec_fix2: str = commit_file(r2, "bug.txt", "s\n",
+        "fix: too late\n\nSecurity: CVE-2031-0001", "2026-06-10", "")
+    if sec_fix2 == "" {
+        check(acc, "the dead line refused the backport on the way", false,
+              "commit failed")
+        return
+    }
+    let ini2: RunResult = lts_run(acc.root, ["init", "--tag", "v1.0.0"], r2,
+                                  "")
+    if ini2.code != 0 {
+        check(acc, "the dead line refused the backport on the way", false,
+              "init failed: " + clip(first_line(ini2.combined), 80))
+        return
+    }
+    let p4: RunResult = lts_run(acc.root,
+        ["backport", sec_fix2, "--repo", r2, "--at", "2026-06-15"], r2, "")
+    check(acc, "the dead line refused the backport on the way",
+          p4.code == 1 && p4.out.contains("end of life"),
+          clip(first_line(p4.combined), 120))
+    let p5: RunResult = lts_run(acc.root,
+        ["tag-patch", "--repo", r2, "--at", "2026-06-15"], r2, "")
+    check(acc, "a dead line cuts no release",
+          p5.code == 1 && p5.out.contains("no release is cut from a dead line")
+              && p5.out.contains("2025-06-15"),
+          clip(first_line(p5.combined), 120))
+
+    # An active line cuts a chore release with no ceremony.
+    let r3: str = make_repo(acc, "tag3", "2024-06-15", "v1.0.0")
+    if r3 == "" {
+        check(acc, "an alive line cuts bookkeeping releases freely", false,
+              "make_repo failed")
+        return
+    }
+    let ini3: RunResult = lts_run(acc.root, ["init", "--tag", "v1.0.0"], r3,
+                                  "")
+    if ini3.code != 0 {
+        check(acc, "an alive line cuts bookkeeping releases freely", false,
+              "init failed: " + clip(first_line(ini3.combined), 80))
+        return
+    }
+    let co3: RunResult = git_run(r3, ["checkout", "-q", "release/1.0"], "")
+    let note3: str = commit_file(r3, "notes.txt", "n\n", "docs: note",
+                                 "2026-06-15", "")
+    let co4: RunResult = git_run(r3, ["checkout", "-q", "main"], "")
+    if note3 == "" || co3.code != 0 || co4.code != 0 {
+        check(acc, "an alive line cuts bookkeeping releases freely", false,
+              "commit failed")
+        return
+    }
+    let p6: RunResult = lts_run(acc.root,
+        ["tag-patch", "--repo", r3, "--at", "2026-06-15"], r3, "")
+    check(acc, "an alive line cuts bookkeeping releases freely",
+          p6.code == 0 && p6.out.contains("tagged v1.0.1"),
+          clip(first_line(p6.combined), 120))
+}
+
+# ----------------------------------------------------------------------------
+# Section 7 — the audit law
+# ----------------------------------------------------------------------------
+
+fn section_7(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 7 — the audit law")
+
+    # History judged the day it landed. The security-phase landing of
+    # an unmarked fix: planted by hand (the bypass the audit exists
+    # to catch), dated inside the security window.
+    let r: str = make_repo(acc, "aud", "2022-06-15", "v1.0.0")
+    if r == "" {
+        check(acc, "an unmarked backport landing in security-only is a "
+              + "violation", false, "make_repo failed")
+        return
+    }
+    let plain_fix: str = commit_file(r, "bug.txt", "one\n",
+        "fix: the wrap on leap days", "2022-06-20", "")
+    if plain_fix == "" {
+        check(acc, "an unmarked backport landing in security-only is a "
+              + "violation", false, "commit failed")
+        return
+    }
+    let ini: RunResult = lts_run(acc.root, ["init", "--tag", "v1.0.0"], r, "")
+    if ini.code != 0 {
+        check(acc, "an unmarked backport landing in security-only is a "
+              + "violation", false,
+              "init failed: " + clip(first_line(ini.combined), 80))
+        return
+    }
+    let co1: RunResult = git_run(r, ["checkout", "-q", "release/1.0"], "")
+    let plant: str = commit_file(r, "bug.txt", "one\n",
+        "fix: the wrap on leap days\n\nBackported-from: " + plain_fix,
+        "2026-06-15", "")
+    let co2: RunResult = git_run(r, ["checkout", "-q", "main"], "")
+    if plant == "" || co1.code != 0 || co2.code != 0 {
+        check(acc, "an unmarked backport landing in security-only is a "
+              + "violation", false, "commit failed")
+        return
+    }
+
+    let p: RunResult = lts_run(acc.root, ["audit", "--repo", r], r, "")
+    check(acc, "an unmarked backport landing in security-only is a violation",
+          p.code == 1 && p.out.contains("security-only phase")
+              && p.out.contains("without a Security mark")
+              && p.out.contains("after 2025-06-15"),
+          clip(first_line(p.combined), 120))
+
+    # Roll it back; a marked backport landing in the security phase
+    # audits clean.
+    let anchor: str = branch_head(r, "v1.0.0")
+    let rb: RunResult = git_run(r,
+        ["update-ref", "refs/heads/release/1.0", anchor], "")
+    let sec_fix: str = commit_file(r, "bugsec.txt", "two\n",
+        "fix: the taint escape\n\nSecurity: CVE-2027-1234", "2026-06-16", "")
+    if sec_fix == "" || rb.code != 0 || anchor == "" {
+        check(acc, "the marked fix backports, dated by the gate", false,
+              "commit failed")
+        return
+    }
+    let p2: RunResult = lts_run(acc.root,
+        ["backport", sec_fix, "--repo", r, "--at", "2026-06-17"], "",
+        "2026-06-17")
+    check(acc, "the marked fix backports, dated by the gate", p2.code == 0,
+          clip(first_line(p2.combined), 120))
+    set_when("")
+    let p3: RunResult = lts_run(acc.root, ["audit", "--repo", r], r, "")
+    check(acc, "a marked backport in security-only audits clean",
+          p3.code == 0 && p3.out.contains("clean"),
+          clip(first_line(p3.combined), 120))
+
+    # A commit past end of life is a violation, whatever it is
+    # (this line's end of life is 2027-06-15 — the plant is dated
+    # after it).
+    let co3: RunResult = git_run(r, ["checkout", "-q", "release/1.0"], "")
+    let late: str = commit_file(r, "notes.txt", "n\n", "docs: on a dead line",
+                                "2027-07-01", "")
+    let co4: RunResult = git_run(r, ["checkout", "-q", "main"], "")
+    if late == "" || co3.code != 0 || co4.code != 0 {
+        check(acc, "a commit past end of life is a violation, even "
+              + "bookkeeping", false, "commit failed")
+        return
+    }
+    let p4: RunResult = lts_run(acc.root, ["audit", "--repo", r], r, "")
+    check(acc, "a commit past end of life is a violation, even bookkeeping",
+          p4.code == 1 && p4.out.contains("past end of life")
+              && p4.out.contains("dead line takes nothing"),
+          clip(first_line(p4.combined), 120))
+    let prev: str = branch_head(r, "release/1.0~1")
+    let rb2: RunResult = git_run(r,
+        ["update-ref", "refs/heads/release/1.0", prev], "")
+    if rb2.code != 0 || prev == "" {
+        check(acc, "the tag on the live commit audits clean", false,
+              "update-ref failed")
+        return
+    }
+
+    # A tag cut from a commit dated past end of life is a violation.
+    let tg: RunResult = git_run(r, ["tag", "v1.0.1", "release/1.0"], "")
+    if tg.code != 0 {
+        check(acc, "the tag on the live commit audits clean", false,
+              "tag failed")
+        return
+    }
+    let p5: RunResult = lts_run(acc.root, ["audit", "--repo", r], r, "")
+    check(acc, "the tag on the live commit audits clean", p5.code == 0,
+          clip(first_line(p5.combined), 120))
+
+    # A tag whose commit is dated past the horizon: plant the
+    # branch's head in the future, tag it, roll back the branch.
+    let r2: str = make_repo(acc, "aud2", "2020-06-15", "v1.0.0")
+    if r2 == "" {
+        check(acc, "a tag cut past end of life is a violation, named with "
+              + "its day", false, "make_repo failed")
+        return
+    }
+    let future_fix: str = commit_file(r2, "bug.txt", "f\n",
+        "fix: from the future", "2027-01-01", "")
+    if future_fix == "" {
+        check(acc, "a tag cut past end of life is a violation, named with "
+              + "its day", false, "commit failed")
+        return
+    }
+    let ini2: RunResult = lts_run(acc.root, ["init", "--tag", "v1.0.0"], r2,
+                                  "")
+    if ini2.code != 0 {
+        check(acc, "a tag cut past end of life is a violation, named with "
+              + "its day", false,
+              "init failed: " + clip(first_line(ini2.combined), 80))
+        return
+    }
+    let co5: RunResult = git_run(r2, ["checkout", "-q", "release/1.0"], "")
+    let plant2: str = commit_file(r2, "bug.txt", "f\n",
+        "fix: from the future\n\nBackported-from: " + future_fix,
+        "2027-01-01", "")
+    let tg2: RunResult = git_run(r2, ["tag", "v1.0.1"], "")
+    let co6: RunResult = git_run(r2, ["checkout", "-q", "main"], "")
+    if plant2 == "" || tg2.code != 0 || co5.code != 0 || co6.code != 0 {
+        check(acc, "a tag cut past end of life is a violation, named with "
+              + "its day", false, "commit failed")
+        return
+    }
+    let p6: RunResult = lts_run(acc.root, ["audit", "--repo", r2], r2, "")
+    check(acc, "a tag cut past end of life is a violation, named with its day",
+          p6.code == 1
+              && p6.out.contains("tag v1.0.1 is cut from a commit dated "
+                  + "2027-01-01, past end of life"),
+          clip(first_line(p6.combined), 120))
+}
+
+# ----------------------------------------------------------------------------
+# Section 8 — the publication law
+# ----------------------------------------------------------------------------
+
+fn section_8(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 8 — the publication law")
+
+    # Two renders are byte-identical.
+    let p1: RunResult = lts_run(acc.root, ["policy"], "", "")
+    let p2: RunResult = lts_run(acc.root, ["policy"], "", "")
+    check(acc, "the policy render is deterministic",
+          p1.code == 0 && p1.out == p2.out
+              && p1.out.starts_with("# Long-term support policy — Halis"),
+          clip(first_line(p1.combined), 120))
+
+    # The committed document IS the render, on this tree.
+    let committed: str = read_file(path_join3(acc.root, "LTS.md"))
+    check(acc, "the committed LTS.md is byte-identical to the render",
+          committed == p1.out, "")
+
+    # The document carries the tool's own constants — the numbers the
+    # gates enforce are the numbers on the page.
+    check(acc, "the published numbers are the tool's constants",
+          committed.contains("**3 years of bug-fix")
+              && committed.contains("**5 years of security support**")
+              && committed.contains("last 2 years of a 5-year"),
+          "")
+
+    # A drifted copy is refused, with the regenerate command named.
+    let r: str = make_repo(acc, "pub", "2026-10-01", "v1.0.0")
+    if r == "" {
+        check(acc, "a hand-edited policy is refused, the regenerate command "
+              + "named", false, "make_repo failed")
+        return
+    }
+    let drifted: str = replace_first(p1.out, "3 years of bug-fix",
+                                     "2 years of bug-fix")
+    write_file(path_join3(r, "LTS.md"), drifted)
+    let p3: RunResult = lts_run(acc.root, ["policy", "--check"], r, "")
+    check(acc, "a hand-edited policy is refused, the regenerate command named",
+          p3.code == 1 && p3.out.contains("drifted")
+              && p3.out.contains("hand-edited")
+              && p3.out.contains("policy --out LTS.md"),
+          clip(first_line(p3.combined), 120))
+
+    # Regenerating repairs it (the --out path is the caller's, not
+    # the repo's — an absolute one keeps it inside the scratch repo).
+    let p4: RunResult = lts_run(acc.root,
+        ["policy", "--out", path_join3(r, "LTS.md")], r, "")
+    check(acc, "the regenerate command writes the render",
+          p4.code == 0 && p4.out.contains("rendered"),
+          clip(first_line(p4.combined), 120))
+    let p5: RunResult = lts_run(acc.root, ["policy", "--check"], r, "")
+    check(acc, "the regenerated copy verifies green",
+          p5.code == 0 && p5.out.contains("matches the render"),
+          clip(first_line(p5.combined), 120))
+
+    # A repo without the document says so.
+    let r2: str = make_repo(acc, "pub2", "2026-10-01", "v1.0.0")
+    if r2 == "" {
+        check(acc, "a tree without LTS.md says it is not published", false,
+              "make_repo failed")
+        return
+    }
+    let p6: RunResult = lts_run(acc.root, ["policy", "--check"], r2, "")
+    check(acc, "a tree without LTS.md says it is not published",
+          p6.code == 1 && p6.out.contains("not published here"),
+          clip(first_line(p6.combined), 120))
+}
+
+# ----------------------------------------------------------------------------
+# Section 9 — the corpus showcase
+# ----------------------------------------------------------------------------
+
+fn section_9(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 9 — the corpus showcase")
+
+    let showcase: str = path_join3(acc.root,
+        "tests/ok/feat_stage145_ltspolicy.hls")
+    let showcase_out: str = "stage 145: hls-lts windows\n"
+        + "  LTS windows OK: calendar, phases, marking, admission\n"
+
+    let p: RunResult = boot_check(acc, showcase)
+    check(acc, "the showcase boots through the real checker", p.code == 0,
+          clip(first_line(p.combined), 120))
+
+    let p2: RunResult = boot(acc, [showcase])
+    check(acc, "the showcase runs green on the interpreter, exact output",
+          p2.code == 0 && p2.out == showcase_out,
+          clip(first_line(p2.combined), 120))
+
+    let p3: RunResult = run_capture(path_join3(acc.root, "bin/hlfmt"),
+                                    ["--check", showcase])
+    check(acc, "the showcase is hlfmt-canonical", p3.code == 0,
+          clip(first_line(p3.combined), 120))
+
+    let p4: RunResult = run_capture("python3",
+        ["tools/hllint.py", showcase])
+    check(acc, "the showcase is hllint-clean",
+          p4.code == 0 && p4.out.contains("no warnings"),
+          clip(first_line(p4.combined), 120))
+
+    # NATIVE = bin/hlc exists && cc resolves; the battery read CC from
+    # the environment (default gcc).
+    let mut cc: str = "gcc"
+    let ccv: Option[tainted[str]] = env_var("CC")
+    if option_is_some(ccv) {
+        cc = taint_unwrap(option_unwrap(ccv))
+    }
+    if file_exists(hlc_path(acc)) && which(cc) {
+        let c_path: str = scratch(acc, "showcase.c")
+        let bin_path: str = scratch(acc, "showcase_bin")
+        let r1: RunResult = run_capture(hlc_path(acc), [showcase, c_path])
+        if r1.code != 0 {
+            check(acc, "hlc compiled the showcase", false,
+                  clip(r1.out.trim(), 120))
+        } else {
+            let r2: RunResult = run_capture(cc,
+                ["-O2", "-o", bin_path, c_path, "-lm", "-pthread"])
+            if r2.code != 0 {
+                check(acc, "gcc compiled the showcase", false,
+                      clip(r2.out.trim(), 120))
+            } else {
+                let rn: RunResult = run_capture(bin_path, [])
+                check(acc, "the showcase matches natively, byte for byte",
+                      rn.code == 0 && rn.out == showcase_out,
+                      clip(first_line(rn.combined), 120))
+            }
+        }
+    } else {
+        println("  (bin/hlc or cc not available — native differential "
+            + "skipped, interpreter legs ran)")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Fs, Proc, Exit {
+    # the battery's GIT_ENV — every child sees the pinned identity
+    env_set_var("GIT_AUTHOR_NAME", "lts145-gate")
+    env_set_var("GIT_AUTHOR_EMAIL", "lts145-gate@example.invalid")
+    env_set_var("GIT_COMMITTER_NAME", "lts145-gate")
+    env_set_var("GIT_COMMITTER_EMAIL", "lts145-gate@example.invalid")
+
+    let acc: Acc = acc_new("lts_policy")
+    section_1(acc)
+    section_2(acc)
+    section_3(acc)
+    section_4(acc)
+    section_5(acc)
+    section_6(acc)
+    section_7(acc)
+    section_8(acc)
+    section_9(acc)
+    return finish(acc, "Stage 145 -- the LTS policy published")
+}

@@ -1,0 +1,1339 @@
+# ============================================================================
+# tests/acc/tlog_acceptance.hls — Stage 107 acceptance gate, in Halis
+# (the Halis twin of tests/tlog_acceptance.py; same nine sections, same
+# assertions, same needles — the harness is tests/acc/harness.hls and
+# the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Nine sections over the REAL hls-tlog CLI (tools/hls-tlog.py, the
+# transparency-log gossip protocol) and REAL fixtures built through the
+# SAME chain arithmetic the battery used (hltlog_parts.hltlog_common,
+# hpkg_log's own writer — the fixtures cannot invent a second
+# definition):
+#
+#  1. the primitives — the SHA-256 standard vector, the chain hash over
+#                      a hand-built canonical record, the ONE DEFINITION
+#                      against hpkg_log's own writer, the CLI selftest
+#  2. the views       — the view's fields, determinism over unchanged
+#                      bytes, the empty log, verify/summary exits and
+#                      the refusal wording
+#  3. the sources     — file, directory (the ledger inside), a local
+#                      HTTP URL, and the refusals
+#  4. the gossip      — consensus, lag, fork, diverged, the missing
+#                      source, --require, --max-lag, the json verdict
+#  5. the witnesses   — the versioned pair, determinism, verify against
+#                      the log, tampered witness, wrong key, missing
+#                      signature, sign-before-verify
+#  6. the proofs      — prove by name / name+version / seq, prove-verify
+#                      offline / live / grown / rewritten, the tampered
+#                      record and tail, the garbage shape
+#  7. the ledger      — a real package: hls-pkg lock + publish; the
+#                      repo log grows; hls-tlog agrees with hls-pkg log
+#                      --verify; the summary head IS the last chain hash
+#  8. the demos       — the demo and the ok-test run; interpreter and
+#                      native agree byte for byte
+#  9. the tools       — hlfmt stable, hllint clean on the new sources
+#
+# Adaptations the Halis port had to make (behaviour-preserving):
+#  - the battery imported hltlog_parts / hpkg_log directly; the gate
+#    reaches the SAME modules through small `python3 <helper> <mode>`
+#    children (one helper file in the gate's scratch), so a module pass
+#    cannot hide behind a CLI pass and vice versa — every assertion is
+#    still made HERE, on the child's printed values.
+#  - the battery's in-process HTTPServer became a backgrounded python3
+#    child on a free ephemeral port (nohup + pid file + kill, the
+#    serve-gate idiom), shut down before the section returns.
+#  - hls-pkg lock/publish ran with cwd=rel_root; the gate chdirs for
+#    the spawn and restores the repo root after.
+# ============================================================================
+
+import "./harness.hls"
+import "std.json"
+import "std.env"
+import "std.sha256"
+
+struct TJson {
+    r: RunResult,
+    rep: JsonValue
+}
+
+# ----------------------------------------------------------------------------
+# Port helpers.
+# ----------------------------------------------------------------------------
+
+fn tlog(args: list[str]) -> RunResult uses Proc {
+    let argv: list[str] = ["tools/hls-tlog.py"]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    return run_capture("python3", argv)
+}
+
+# tlog_json(acc, args) — the battery's tlog_json: --json appended last;
+# a malformed payload becomes json_null() SILENTLY (the battery only
+# set rep = None — no FAIL of its own).
+fn tlog_json(acc: Acc, args: list[str]) -> TJson uses IO, Proc {
+    let argv: list[str] = []
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    argv.push("--json")
+    let r: RunResult = tlog(argv)
+    let rr: Result[JsonValue, str] = json_parse_result(r.out)
+    if result_is_ok(rr) {
+        let t: TJson = TJson { r: r, rep: result_unwrap(rr) }
+        return t
+    }
+    let t2: TJson = TJson { r: r, rep: json_null() }
+    return t2
+}
+
+# pkg_run(args, dir) — the battery's run(PKG + args, cwd=rel_root):
+# chdir for the spawn, restore the repo root after (dir == "" stays).
+fn pkg_run(acc: Acc, args: list[str], dir: str) -> RunResult uses Proc {
+    let home: str = cwd_get()
+    if dir != "" {
+        env_set_current_dir(dir)
+    }
+    let argv: list[str] = ["tools/hls-pkg.py"]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    let r: RunResult = run_capture("python3", argv)
+    if dir != "" {
+        env_set_current_dir(home)
+    }
+    return r
+}
+
+# jget_str / jget_int / jget_bool — kind-guarded accessors (std.json's
+# typed accessors panic on a kind mismatch).
+fn jget_str(v: JsonValue, key: str) -> str {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_str(x) {
+        return json_str_value(x)
+    }
+    return ""
+}
+
+fn jget_int(v: JsonValue, key: str) -> int {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_int(x) {
+        return json_int_value(x)
+    }
+    return -1
+}
+
+fn jget_bool(v: JsonValue, key: str) -> bool {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_bool(x) {
+        return json_bool_value(x)
+    }
+    return false
+}
+
+# src_err_has(rep, needle) — any(s and needle in (s.get("error") or "")
+# over rep["sources"].
+fn src_err_has(rep: JsonValue, needle: str) -> bool {
+    let srcs: JsonValue = json_object_get(rep, "sources")
+    if !json_is_array(srcs) {
+        return false
+    }
+    let mut i: int = 0
+    while i < srcs.arr.len() {
+        if jget_str(srcs.arr.get(i), "error").contains(needle) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# src_any_refused(rep) — any(not s["ok"] for s in rep["sources"]).
+fn src_any_refused(rep: JsonValue) -> bool {
+    let srcs: JsonValue = json_object_get(rep, "sources")
+    if !json_is_array(srcs) {
+        return false
+    }
+    let mut i: int = 0
+    while i < srcs.arr.len() {
+        if !jget_bool(srcs.arr.get(i), "ok") {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# pair_has_lag(rep, cls, lag) — any(pr["class"] == cls and
+# pr.get("lag") == lag) over rep["pairs"].
+fn pair_has_lag(rep: JsonValue, cls: str, lag: int) -> bool {
+    let pairs: JsonValue = json_object_get(rep, "pairs")
+    if !json_is_array(pairs) {
+        return false
+    }
+    let mut i: int = 0
+    while i < pairs.arr.len() {
+        let pr: JsonValue = pairs.arr.get(i)
+        if jget_str(pr, "class") == cls && jget_int(pr, "lag") == lag {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# pair_has_class(rep, cls) — any(pr["class"] == cls).
+fn pair_has_class(rep: JsonValue, cls: str) -> bool {
+    let pairs: JsonValue = json_object_get(rep, "pairs")
+    if !json_is_array(pairs) {
+        return false
+    }
+    let mut i: int = 0
+    while i < pairs.arr.len() {
+        if jget_str(pairs.arr.get(i), "class") == cls {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# hex64(c) — the 64-char hex constants the broken-record fixture needs
+# ("1" * 64 / "2" * 64 in the battery).
+fn hex64(c: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < 64 {
+        out = out + c
+        i = i + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# The fixture helper — the battery imported hltlog_parts / hpkg_log and
+# built every ledger with com.chain_of; the gate does exactly that
+# through this python child (one definition, no reimplementation).
+# ----------------------------------------------------------------------------
+
+fn mklog_src() -> str {
+    return "# the tlog gate's fixture helper — the battery's own imports\n"
+        + "import sys, json\n"
+        + "sys.path.insert(0, 'tools')\n"
+        + "from hltlog_parts import hltlog_common as com\n"
+        + "def chain(rec):\n"
+        + "    return com.chain_of(rec['prev_hash'], rec)\n"
+        + "def build(path, n, name, start, prev, ts0, append, evil_seq=0):\n"
+        + "    recs = []\n"
+        + "    for i in range(start, start + n):\n"
+        + "        rec = {'kind': 'publish' if i % 2 else 'sign', "
+        + "'name': name, 'version': '1.%d.0' % i, 'prev_hash': prev, "
+        + "'seq': i, 'timestamp': ts0 + i}\n"
+        + "        if evil_seq and i == evil_seq:\n"
+        + "            rec['name'] = 'evil'\n"
+        + "        rec['chain_hash'] = chain(rec)\n"
+        + "        recs.append(rec)\n"
+        + "        prev = rec['chain_hash']\n"
+        + "    with open(path, 'a' if append else 'w') as f:\n"
+        + "        for r in recs:\n"
+        + "            f.write(json.dumps(r, sort_keys=True) + '\\n')\n"
+        + "    return prev\n"
+        + "mode = sys.argv[1]\n"
+        + "if mode == 'mk':\n"
+        + "    print(build(sys.argv[2], int(sys.argv[3]), sys.argv[4], "
+        + "int(sys.argv[5]), sys.argv[6], int(sys.argv[7]), "
+        + "sys.argv[8] == '1'))\n"
+        + "elif mode == 'mk_evil_mid':\n"
+        + "    build(sys.argv[2], int(sys.argv[3]), sys.argv[4], "
+        + "int(sys.argv[5]), sys.argv[6], int(sys.argv[7]), False, "
+        + "evil_seq=int(sys.argv[8]))\n"
+        + "elif mode == 'evilapp':\n"
+        + "    p = sys.argv[2]\n"
+        + "    recs = [json.loads(l) for l in open(p).read().splitlines() "
+        + "if l.strip()]\n"
+        + "    evil = dict(recs[-1])\n"
+        + "    evil['name'] = 'evil'\n"
+        + "    evil['chain_hash'] = chain(evil)\n"
+        + "    with open(p, 'a') as f:\n"
+        + "        f.write(json.dumps(evil, sort_keys=True) + '\\n')\n"
+        + "elif mode == 'consts':\n"
+        + "    print(com.GENESIS)\n"
+        + "    print(com.VIEW_SCHEMA)\n"
+        + "    print(com.PROOF_SCHEMA)\n"
+        + "elif mode == 'selftest':\n"
+        + "    from hltlog_parts import hltlog_selftest as st\n"
+        + "    print(len(st.selftest()))\n"
+        + "elif mode == 'onedeff':\n"
+        + "    from hpkg_log import _build_chained_record\n"
+        + "    probe = {'kind': 'publish', 'name': 'probe', "
+        + "'version': '9.9.9'}\n"
+        + "    built = _build_chained_record(dict(probe), com.GENESIS)\n"
+        + "    bare = {k: v for k, v in built.items() if k != 'chain_hash'}\n"
+        + "    print(built['chain_hash'])\n"
+        + "    print(com.chain_of(built['prev_hash'], bare))\n"
+        + "    print(com.chain_of(built['prev_hash'], bare))\n"
+        + "elif mode == 'fetch':\n"
+        + "    from hltlog_parts import hltlog_sources as srcs\n"
+        + "    import hashlib\n"
+        + "    label, data, reason = srcs.fetch(sys.argv[2])\n"
+        + "    print('reason=' + ('NONE' if reason is None else "
+        + "str(reason)))\n"
+        + "    print('sha=' + (hashlib.sha256(data).hexdigest() "
+        + "if data is not None else ''))\n"
+        + "elif mode == 'view':\n"
+        + "    print(json.dumps(com.view_for_path(sys.argv[2]), "
+        + "sort_keys=True))\n"
+        + "elif mode == 'tamper_w':\n"
+        + "    p = sys.argv[2]\n"
+        + "    d = json.load(open(p))\n"
+        + "    d['length'] = 99\n"
+        + "    open(p, 'w').write(json.dumps(d, indent=2, sort_keys=True) "
+        + "+ '\\n')\n"
+        + "elif mode == 'tamper_prec':\n"
+        + "    d = json.load(open(sys.argv[2]))\n"
+        + "    d['record'] = dict(d['record'], name='evil')\n"
+        + "    open(sys.argv[3], 'w').write(json.dumps(d, indent=2, "
+        + "sort_keys=True) + '\\n')\n"
+        + "elif mode == 'tamper_ptail':\n"
+        + "    d = json.load(open(sys.argv[2]))\n"
+        + "    d['tail'] = [dict(d['tail'][0], kind='evil')] + "
+        + "d['tail'][1:]\n"
+        + "    open(sys.argv[3], 'w').write(json.dumps(d, indent=2, "
+        + "sort_keys=True) + '\\n')\n"
+}
+
+# mklog(acc, argv...) — one helper run; "" for a failed run.
+fn mklog(acc: Acc, args: list[str]) -> RunResult uses Fs, Proc {
+    let helper: str = scratch(acc, "mklog.py")
+    if !file_exists(helper) {
+        write_file(helper, mklog_src())
+    }
+    let argv: list[str] = [helper]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    return run_capture("python3", argv)
+}
+
+# make_log(acc, path, n, name, start, prev, ts0, append) — the battery's
+# make_log: returns the chained head (the caller's `prev`).
+fn make_log(acc: Acc, path: str, n: int, name: str, start: int, prev: str,
+            ts0: int, append: bool) -> str uses Fs, Proc {
+    let mut ap: str = "0"
+    if append {
+        ap = "1"
+    }
+    let r: RunResult = mklog(acc, ["mk", path, n.to_str(), name,
+        start.to_str(), prev, ts0.to_str(), ap])
+    if r.code != 0 {
+        return ""
+    }
+    return first_line(r.out)
+}
+
+# ----------------------------------------------------------------------------
+# The HTTP fixture server — the battery's in-process HTTPServer, as a
+# backgrounded python child on a free ephemeral port.
+# ----------------------------------------------------------------------------
+
+fn free_port() -> int uses Proc {
+    let r: RunResult = run_capture("python3", ["-c",
+        "import socket; s = socket.socket(); s.bind(('127.0.0.1', 0)); "
+        + "port = s.getsockname()[1]; s.close(); print(port)"])
+    let lines: list[str] = r.out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let t: str = lines.get(i).trim()
+        if t != "" {
+            return t.to_int()
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn http_server_src() -> str {
+    return "import sys, signal\n"
+        + "from http.server import BaseHTTPRequestHandler, HTTPServer\n"
+        + "port = int(sys.argv[1])\n"
+        + "good = open(sys.argv[2], 'rb').read()\n"
+        + "bad = open(sys.argv[3], 'rb').read()\n"
+        + "class Handler(BaseHTTPRequestHandler):\n"
+        + "    def do_GET(self):\n"
+        + "        path = self.path.strip('/')\n"
+        + "        body = good if path == 'good' else "
+        + "(bad if path == 'bad' else None)\n"
+        + "        if body is None:\n"
+        + "            self.send_response(404)\n"
+        + "            self.end_headers()\n"
+        + "            return\n"
+        + "        self.send_response(200)\n"
+        + "        self.send_header('Content-Length', str(len(body)))\n"
+        + "        self.end_headers()\n"
+        + "        self.wfile.write(body)\n"
+        + "    def log_message(self, *a):\n"
+        + "        pass\n"
+        + "signal.alarm(120)\n"
+        + "HTTPServer(('127.0.0.1', port), Handler).serve_forever()\n"
+}
+
+fn spawn_http(acc: Acc, dir: str, port: int, good_path: str,
+              bad_path: str) -> bool uses Fs, Proc {
+    let script: str = write_src(acc, "http_fixture.py", http_server_src())
+    let log: str = dir + "/http.log"
+    let pidf: str = dir + "/http.pid"
+    let cmd: str = "cd '" + shell_quote(dir) + "' && nohup python3 "
+        + shell_quote(script) + " " + port.to_str()
+        + " '" + shell_quote(good_path) + "' '" + shell_quote(bad_path)
+        + "' > '" + shell_quote(log) + "' 2>&1 & echo $! > '"
+        + shell_quote(pidf) + "'"
+    sh(cmd)
+    return file_exists(pidf)
+}
+
+# wait_port(port) — poll until the fixture answers, 5s deadline.
+fn wait_port(port: int) -> bool uses Proc {
+    let script: str = "import socket, sys, time\n"
+        + "host, port = '127.0.0.1', int(sys.argv[1])\n"
+        + "up = False\n"
+        + "for _ in range(50):\n"
+        + "    try:\n"
+        + "        socket.create_connection((host, port), timeout=0.5).close()\n"
+        + "        up = True\n"
+        + "        break\n"
+        + "    except OSError:\n"
+        + "        time.sleep(0.1)\n"
+        + "print('up' if up else 'down')\n"
+        + "sys.exit(0 if up else 1)\n"
+    let r: RunResult = run_capture("python3", ["-c", script, port.to_str()])
+    return r.code == 0 && r.out.contains("up")
+}
+
+fn kill_server(dir: str) -> void uses Fs, Proc, Clock, Conc {
+    let pf: str = dir + "/http.pid"
+    if !file_exists(pf) {
+        return
+    }
+    let pid: str = read_file(pf).trim()
+    if pid == "" {
+        return
+    }
+    sh("kill '" + shell_quote(pid) + "' 2>/dev/null")
+    let mut i: int = 0
+    while i < 20 {
+        if sh("kill -0 '" + shell_quote(pid) + "' 2>/dev/null") != 0 {
+            return
+        }
+        thread_sleep_ms(200)
+        i = i + 1
+    }
+    sh("kill -9 '" + shell_quote(pid) + "' 2>/dev/null")
+}
+
+# ----------------------------------------------------------------------------
+# 1. the primitives (the chain arithmetic, one definition)
+# ----------------------------------------------------------------------------
+
+fn section_1(acc: Acc) -> void uses IO, Fs, Proc {
+    section("1. the primitives (the chain arithmetic, one definition)")
+
+    let st: RunResult = mklog(acc, ["selftest"])
+    check(acc, "the selftest runs all fifteen vectors in-memory",
+          st.code == 0 && first_line(st.out).trim() == "15",
+          clip(first_line(st.out), 40))
+
+    check(acc, "the SHA-256 the chain hash leans on is the standard one",
+          sha256_hex("abc")
+              == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+          sha256_hex("abc"))
+
+    # ONE DEFINITION: any record through hpkg_log's own writer must
+    # re-verify under hls-tlog's arithmetic, byte for byte.
+    let od: RunResult = mklog(acc, ["onedeff"])
+    if od.code == 0 {
+        let lines: list[str] = od.out.trim().split("\n")
+        let built: str = lines.get(0).trim()
+        let mine1: str = lines.get(1).trim()
+        let mine2: str = lines.get(2).trim()
+        check(acc, "hls-tlog's chain hash IS hpkg_log's writer (one "
+              + "definition)",
+              built != "" && built == mine1, clip(built, 40))
+        check(acc, "the built record re-verifies under the shared arithmetic",
+              built != "" && built == mine2, clip(built, 40))
+    } else {
+        check(acc, "hls-tlog's chain hash IS hpkg_log's writer (one "
+              + "definition)", false, clip(first_line(od.combined), 80))
+        check(acc, "the built record re-verifies under the shared arithmetic",
+              false, "helper failed")
+    }
+
+    let p: RunResult = tlog(["selftest"])
+    check(acc, "the CLI selftest reports all fifteen vectors (exit 0)",
+          p.code == 0 && grep_count(p.out, "  ok: ") == 15
+              && p.out.contains("hand-built canonical record"),
+          clip(first_line(p.combined), 120))
+}
+
+# ----------------------------------------------------------------------------
+# 2. the views (the summary every witness signs)
+# ----------------------------------------------------------------------------
+
+fn section_2(acc: Acc, genesis: str, view_schema: str) -> void
+    uses IO, Fs, Proc {
+    section("2. the views (the summary every witness signs)")
+
+    let views_dir: str = scratch(acc, "views")
+    let log_a: str = path_join3(views_dir, "a.json")
+    let head_a: str = make_log(acc, log_a, 4, "app", 1, genesis, 1700000000,
+                               false)
+    if head_a == "" {
+        check(acc, "the view's fields: length, head, kinds, seq range",
+              false, "make_log failed")
+        return
+    }
+
+    let v1: RunResult = mklog(acc, ["view", log_a])
+    let rr: Result[JsonValue, str] = json_parse_result(v1.out)
+    if !result_is_ok(rr) {
+        check(acc, "the view's fields: length, head, kinds, seq range",
+              false, "view did not parse")
+        return
+    }
+    let view: JsonValue = result_unwrap(rr)
+    let kinds: JsonValue = json_object_get(view, "kinds")
+    check(acc, "the view's fields: length, head, kinds, seq range",
+          json_is_object(view) && jget_str(view, "schema") == view_schema
+              && jget_int(view, "length") == 4
+              && jget_str(view, "head") == head_a
+              && jget_int(view, "first_seq") == 1
+              && jget_int(view, "last_seq") == 4
+              && json_is_object(kinds) && kinds.obj_keys.len() == 2
+              && jget_int(kinds, "publish") == 2
+              && jget_int(kinds, "sign") == 2,
+          clip(json_stringify(view), 120))
+    check(acc, "the view pins the log's raw bytes",
+          jget_str(view, "log_sha256") == sha256_hex(read_file(log_a)),
+          jget_str(view, "log_sha256"))
+
+    let v2: RunResult = mklog(acc, ["view", log_a])
+    let rr2: Result[JsonValue, str] = json_parse_result(v2.out)
+    check(acc, "the view is deterministic over unchanged bytes",
+          result_is_ok(rr2)
+              && json_stringify(result_unwrap(rr2)) == json_stringify(view),
+          "")
+
+    let empty: str = path_join3(views_dir, "empty.json")
+    write_file(empty, "")
+    let ev: RunResult = mklog(acc, ["view", empty])
+    let rre: Result[JsonValue, str] = json_parse_result(ev.out)
+    if result_is_ok(rre) {
+        let evj: JsonValue = result_unwrap(rre)
+        let ek: JsonValue = json_object_get(evj, "kinds")
+        check(acc, "an empty log views as length 0 with the genesis head",
+              jget_int(evj, "length") == 0
+                  && jget_str(evj, "head") == genesis
+                  && json_is_object(ek) && ek.obj_keys.len() == 0,
+              clip(json_stringify(evj), 80))
+    } else {
+        check(acc, "an empty log views as length 0 with the genesis head",
+              false, "view did not parse")
+    }
+
+    let tj: TJson = tlog_json(acc, ["summary", log_a])
+    check(acc, "summary --json reports the verified view",
+          tj.r.code == 0 && jget_str(tj.rep, "schema") == view_schema
+              && jget_int(json_object_get(tj.rep, "view"), "length") == 4
+              && jget_bool(tj.rep, "sound"),
+          clip(json_stringify(tj.rep), 120))
+
+    let p: RunResult = tlog(["verify", log_a])
+    check(acc, "verify: a sound log exits 0 and says so",
+          p.code == 0 && p.out.contains("chain is sound"),
+          clip(first_line(p.combined), 120))
+
+    let tam: str = path_join3(views_dir, "tam.json")
+    make_log(acc, tam, 3, "app", 1, genesis, 1700000000, false)
+    let ev2: RunResult = mklog(acc, ["evilapp", tam])
+    if ev2.code != 0 {
+        check(acc, "verify: a grafted record is named by the broken link",
+              false, "evilapp failed")
+    } else {
+        let p2: RunResult = tlog(["verify", tam])
+        check(acc, "verify: a grafted record is named by the broken link",
+              p2.code == 1 && p2.out.contains("prev_hash does not chain"),
+              clip(first_line(p2.combined), 120))
+    }
+
+    let bad_json: str = path_join3(views_dir, "bad.json")
+    write_file(bad_json, "{not json\n")
+    let p3: RunResult = tlog(["verify", bad_json])
+    check(acc, "verify: a non-JSON line refuses with the line number",
+          p3.code == 1 && p3.err.contains("line 1 is not JSON"),
+          clip(first_line(p3.combined), 120))
+
+    let bad_shape: str = path_join3(views_dir, "shape.json")
+    write_file(bad_shape, "{\"kind\": \"publish\"}\n")
+    let p4: RunResult = tlog(["verify", bad_shape])
+    check(acc, "verify: a record without the mandatory shape refuses",
+          p4.code == 1 && p4.err.contains("bad seq"),
+          clip(first_line(p4.combined), 120))
+}
+
+# ----------------------------------------------------------------------------
+# 3. the sources (file, directory, URL)
+# ----------------------------------------------------------------------------
+
+fn section_3(acc: Acc, log_a: str) -> void uses IO, Fs, Proc, Clock, Conc {
+    section("3. the sources (file, directory, URL)")
+
+    let f1: RunResult = mklog(acc, ["fetch", log_a])
+    check(acc, "the file source serves the bytes",
+          f1.code == 0 && f1.out.contains("reason=NONE")
+              && f1.out.contains("sha=" + sha256_hex(read_file(log_a))),
+          clip(first_line(f1.combined), 120))
+
+    let pkg_dir_source: str = scratch(acc, "pkgdir")
+    let ledger: str = ".hls-pkg-transparency.log"
+    cp(log_a, path_join3(pkg_dir_source, ledger))
+    let tj: TJson = tlog_json(acc, ["gossip", pkg_dir_source, pkg_dir_source])
+    check(acc, "a directory source resolves to the ledger inside it",
+          tj.r.code == 0 && jget_str(tj.rep, "verdict") == "consensus"
+              && jget_int(tj.rep, "ok_sources") == 2,
+          clip(json_stringify(tj.rep), 120))
+
+    let f2: RunResult = mklog(acc, ["fetch", path_join3(acc.scratch_base,
+                                                        "nope.json")])
+    check(acc, "a missing file source is refused with the reason",
+          f2.code == 0 && f2.out.contains("no such file"),
+          clip(first_line(f2.combined), 120))
+
+    let dirless: str = scratch(acc, "dirless")
+    let f3: RunResult = mklog(acc, ["fetch", dirless])
+    check(acc, "a directory without a ledger is refused",
+          f3.code == 0
+              && f3.out.contains("no .hls-pkg-transparency.log"),
+          clip(first_line(f3.combined), 120))
+
+    # A local HTTP source — hermetic: a free port on 127.0.0.1 serving
+    # the fixture bytes, killed before the section ends.
+    let port: int = free_port()
+    let up: bool = spawn_http(acc, acc.scratch_base, port, log_a,
+                              write_src(acc, "bad_serve.json", "{oops\n"))
+    if !up || !wait_port(port) {
+        kill_server(acc.scratch_base)
+        check(acc, "an HTTP URL is a first-class gossip source", false,
+              "fixture server did not come up")
+        check(acc, "a URL serving garbage is a reported refusal, not a "
+              + "crash", false, "fixture server did not come up")
+        check(acc, "a 404 URL is a reported refusal", false,
+              "fixture server did not come up")
+        check(acc, "the size cap refuses an oversized source", false,
+              "fixture server did not come up")
+        return
+    }
+    let url: str = "http://127.0.0.1:" + port.to_str() + "/good"
+    let tj2: TJson = tlog_json(acc, ["gossip", log_a, url])
+    check(acc, "an HTTP URL is a first-class gossip source",
+          tj2.r.code == 0 && jget_str(tj2.rep, "verdict") == "consensus"
+              && jget_int(tj2.rep, "ok_sources") == 2,
+          clip(json_stringify(tj2.rep), 120))
+
+    let bad_url: str = "http://127.0.0.1:" + port.to_str() + "/bad"
+    let tj3: TJson = tlog_json(acc, ["gossip", log_a, bad_url])
+    check(acc, "a URL serving garbage is a reported refusal, not a crash",
+          tj3.r.code == 1 && jget_int(tj3.rep, "ok_sources") == 1
+              && src_err_has(tj3.rep, "not JSON"),
+          clip(json_stringify(tj3.rep), 120))
+
+    let nf_url: str = "http://127.0.0.1:" + port.to_str() + "/absent"
+    let tj4: TJson = tlog_json(acc, ["gossip", log_a, nf_url])
+    check(acc, "a 404 URL is a reported refusal",
+          tj4.r.code == 1 && jget_int(tj4.rep, "ok_sources") == 1
+              && src_err_has(tj4.rep, "HTTP Error 404"),
+          clip(json_stringify(tj4.rep), 120))
+
+    let tj5: TJson = tlog_json(acc,
+        ["gossip", log_a, url, "--max-bytes", "10"])
+    check(acc, "the size cap refuses an oversized source",
+          tj5.r.code == 1 && src_err_has(tj5.rep, "byte cap"),
+          clip(json_stringify(tj5.rep), 120))
+
+    kill_server(acc.scratch_base)
+}
+
+# ----------------------------------------------------------------------------
+# 4. the gossip (the multi-source verdict)
+# ----------------------------------------------------------------------------
+
+fn section_4(acc: Acc, genesis: str) -> void uses IO, Fs, Proc {
+    section("4. the gossip (the multi-source verdict)")
+
+    let g_dir: str = scratch(acc, "gossip")
+    let base: str = path_join3(g_dir, "base.json")
+    make_log(acc, base, 4, "gossip", 1, genesis, 1700000000, false)
+    let copy1: str = path_join3(g_dir, "copy1.json")
+    cp(base, copy1)
+    let copy2: str = path_join3(g_dir, "copy2.json")
+    cp(base, copy2)
+
+    let tj: TJson = tlog_json(acc, ["gossip", base, copy1, copy2])
+    check(acc, "three identical sources: consensus, three agree pairs",
+          tj.r.code == 0 && jget_str(tj.rep, "verdict") == "consensus"
+              && jget_int(tj.rep, "max_lag") == 0
+              && json_object_get(tj.rep, "pairs").arr.len() == 3,
+          clip(json_stringify(tj.rep), 120))
+
+    let lag: str = path_join3(g_dir, "lag.json")
+    make_log(acc, lag, 2, "gossip", 1, genesis, 1700000000, false)
+    let tj2: TJson = tlog_json(acc, ["gossip", base, lag])
+    check(acc, "a lagging mirror is consensus with the lag named",
+          tj2.r.code == 0 && jget_str(tj2.rep, "verdict") == "consensus"
+              && jget_int(tj2.rep, "max_lag") == 2
+              && pair_has_lag(tj2.rep, "lag", 2),
+          clip(json_stringify(tj2.rep), 120))
+
+    let fork: str = path_join3(g_dir, "fork.json")
+    let fk: RunResult = mklog(acc,
+        ["mk_evil_mid", fork, "4", "gossip", "1", genesis, "1700000000", "4"])
+    if fk.code != 0 {
+        check(acc, "same length, different history: the pair is named as "
+              + "a fork", false, "mk_evil_mid failed")
+        check(acc, "the verdict stays fork with a quorum on one side", false,
+              "mk_evil_mid failed")
+        check(acc, "an unrelated history is diverged (fork evidence)", false,
+              "mk_evil_mid failed")
+        check(acc, "--max-lag never downgrades a fork", false,
+              "mk_evil_mid failed")
+    } else {
+        let p: RunResult = tlog(["gossip", base, fork])
+        check(acc, "same length, different history: the pair is named as "
+              + "a fork",
+              p.code == 1 && p.out.contains("CONFLICT")
+                  && p.out.contains("fork"),
+              clip(first_line(p.combined), 120))
+        let tj3: TJson = tlog_json(acc, ["gossip", base, fork, copy1])
+        check(acc, "the verdict stays fork with a quorum on one side",
+              jget_str(tj3.rep, "verdict") == "fork",
+              clip(json_stringify(tj3.rep), 120))
+
+        # A fork must not be downgraded by a generous --max-lag:
+        # evidence outranks health, always.
+        let tj7: TJson = tlog_json(acc,
+            ["gossip", base, fork, "--max-lag", "1000"])
+        check(acc, "--max-lag never downgrades a fork",
+              tj7.r.code == 1 && jget_str(tj7.rep, "verdict") == "fork",
+              clip(json_stringify(tj7.rep), 120))
+    }
+
+    let div: str = path_join3(g_dir, "div.json")
+    make_log(acc, div, 3, "other", 1, genesis, 1600000000, false)
+    let tj4: TJson = tlog_json(acc, ["gossip", base, div])
+    check(acc, "an unrelated history is diverged (fork evidence)",
+          tj4.r.code == 1 && jget_str(tj4.rep, "verdict") == "fork"
+              && pair_has_class(tj4.rep, "diverged"),
+          clip(json_stringify(tj4.rep), 120))
+
+    let p2: RunResult = tlog(["gossip", base, path_join3(g_dir, "absent.json")])
+    check(acc, "a missing source is reported; the verdict is insufficient",
+          p2.code == 1 && p2.out.contains("insufficient")
+              && p2.out.contains("1 of 2"),
+          clip(first_line(p2.combined), 120))
+
+    let tj5: TJson = tlog_json(acc, ["gossip", base, "--require", "1"])
+    check(acc, "--require 1 names the isolation instead of failing it",
+          tj5.r.code == 0 && jget_str(tj5.rep, "verdict") == "isolated",
+          clip(json_stringify(tj5.rep), 120))
+
+    let tj6: TJson = tlog_json(acc, ["gossip", base, lag, "--max-lag", "1"])
+    check(acc, "--max-lag turns excessive lag into a refusal",
+          tj6.r.code == 1 && jget_str(tj6.rep, "verdict") == "stale",
+          clip(json_stringify(tj6.rep), 120))
+
+    # A refused source never kills the conversation: two good sources
+    # still reach consensus with the refusal reported.
+    let garbage_log: str = path_join3(g_dir, "garbage.json")
+    write_file(garbage_log, "not json at all\n")
+    let tj8: TJson = tlog_json(acc, ["gossip", base, copy1, garbage_log])
+    check(acc, "a refused source is reported; the healthy ones still agree",
+          tj8.r.code == 0 && jget_str(tj8.rep, "verdict") == "consensus"
+              && jget_int(tj8.rep, "ok_sources") == 2
+              && src_any_refused(tj8.rep),
+          clip(json_stringify(tj8.rep), 120))
+
+    let p3: RunResult = tlog(["gossip"])
+    check(acc, "gossip with no sources is a usage error", p3.code == 2,
+          p3.code.to_str())
+}
+
+# ----------------------------------------------------------------------------
+# 5. the witnesses (the signed view)
+# ----------------------------------------------------------------------------
+
+fn sign_run(acc: Acc, args: list[str], with_pw: bool) -> RunResult uses Proc {
+    if with_pw {
+        env_set_var("HLS_SIGN_PASSWORD", "gate-passphrase-107")
+    }
+    let argv: list[str] = ["tools/hls-sign.py"]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    let r: RunResult = run_capture("python3", argv)
+    if with_pw {
+        env_unset_var("HLS_SIGN_PASSWORD")
+    }
+    return r
+}
+
+fn section_5(acc: Acc, genesis: str) -> void uses IO, Fs, Proc {
+    section("5. the witnesses (the signed view)")
+
+    let w_dir: str = scratch(acc, "witness")
+    let w_log: str = path_join3(w_dir, "w.json")
+    let head_w: str = make_log(acc, w_log, 4, "wit", 1, genesis, 1700000000,
+                               false)
+    if head_w == "" {
+        check(acc, "witness signs the verified view (exit 0)", false,
+              "make_log failed")
+        return
+    }
+    let key: str = path_join3(w_dir, "hls-sign.key")
+    let pub: str = path_join3(w_dir, "hls-sign.pub")
+    sign_run(acc, ["keygen", "-f", key, "-p", pub, "-c", "gate fixture",
+                   "--password-env", "HLS_SIGN_PASSWORD",
+                   "--iterations", "1000"], true)
+
+    let w1: RunResult = tlog_full(acc,
+        ["witness", w_log, "--sign", key, "--out", w_dir,
+         "--trusted-comment", "timestamp:0"], true)
+    check(acc, "witness signs the verified view (exit 0)", w1.code == 0,
+          clip(first_line(w1.combined), 120))
+
+    let wfile: str = path_join3(w_dir, "hls-tlog-witness-4-"
+        + head_w.slice(0, 16) + ".witness.json")
+    let wsig: str = wfile + ".minisig"
+    check(acc, "the witness pair lands content-named beside the log",
+          file_exists(wfile) && file_exists(wsig), wfile)
+
+    let wdoc: str = read_file(wfile)
+    check(acc, "the witness names its schema and its signing key",
+          wdoc.contains("hls-tlog-witness/v1") && wdoc.contains("\"key_id\""),
+          "")
+
+    let doc_bytes: str = wdoc
+    let w2: RunResult = tlog_full(acc,
+        ["witness", w_log, "--sign", key, "--out", w_dir,
+         "--trusted-comment", "timestamp:0"], true)
+    check(acc, "witness refuses to overwrite a witness without --force",
+          w2.code == 1 && w2.err.contains("already exists"),
+          clip(first_line(w2.combined), 120))
+
+    let w3: RunResult = tlog_full(acc,
+        ["witness", w_log, "--sign", key, "--out", w_dir,
+         "--trusted-comment", "timestamp:0", "--force"], true)
+    check(acc, "re-witnessing the unchanged log re-writes the same bytes",
+          w3.code == 0 && read_file(wfile) == doc_bytes,
+          clip(first_line(w3.combined), 120))
+
+    let t1: TJson = tlog_json(acc,
+        ["witness-verify", wfile, "-p", pub, "--against", w_log])
+    check(acc, "witness-verify against the same log: byte-identical",
+          t1.r.code == 0
+              && jget_str(json_object_get(t1.rep, "check"), "verdict")
+                  == "byte-identical",
+          clip(json_stringify(t1.rep), 120))
+
+    let grown: str = path_join3(w_dir, "grown.json")
+    cp(w_log, grown)
+    make_log(acc, grown, 2, "wit", 5, head_w, 1700000000, true)
+    let t2: TJson = tlog_json(acc,
+        ["witness-verify", wfile, "-p", pub, "--against", grown])
+    check(acc, "witness-verify against a grown log: held (the prefix rule)",
+          t2.r.code == 0
+              && jget_str(json_object_get(t2.rep, "check"), "verdict")
+                  == "held"
+              && jget_str(json_object_get(t2.rep, "check"), "detail")
+                  .contains("prefix"),
+          clip(json_stringify(t2.rep), 120))
+
+    let short: str = path_join3(w_dir, "short.json")
+    make_log(acc, short, 2, "wit", 1, genesis, 1700000000, false)
+    let t3: TJson = tlog_json(acc,
+        ["witness-verify", wfile, "-p", pub, "--against", short])
+    check(acc, "a log below a signed length: ROLLBACK, the evidence named",
+          t3.r.code == 1
+              && jget_str(json_object_get(t3.rep, "check"), "verdict")
+                  == "rollback"
+              && jget_str(json_object_get(t3.rep, "check"), "detail")
+                  .contains("gone under a signed promise"),
+          clip(json_stringify(t3.rep), 120))
+
+    # A well-formed fork: re-chain the tail after an evil seq 3.
+    let wf_log: str = path_join3(w_dir, "forked.json")
+    let wf: RunResult = mklog(acc,
+        ["mk_evil_mid", wf_log, "4", "wit", "1", genesis, "1700000000", "3"])
+    if wf.code != 0 {
+        check(acc, "a well-formed fork under the witness: rewritten", false,
+              "mk_evil_mid failed")
+    } else {
+        let t4: TJson = tlog_json(acc,
+            ["witness-verify", wfile, "-p", pub, "--against", wf_log])
+        check(acc, "a well-formed fork under the witness: rewritten",
+              t4.r.code == 1
+                  && jget_str(json_object_get(t4.rep, "check"), "verdict")
+                      == "rewritten",
+              clip(json_stringify(t4.rep), 120))
+    }
+
+    let tw: RunResult = mklog(acc, ["tamper_w", wfile])
+    if tw.code != 0 {
+        check(acc, "a tampered witness refuses (the signature covers the "
+              + "bytes)", false, "tamper_w failed")
+    } else {
+        let p5: RunResult = tlog(["witness-verify", wfile, "-p", pub,
+                                  "--against", w_log])
+        check(acc, "a tampered witness refuses (the signature covers the "
+              + "bytes)",
+              p5.code == 1 && p5.err.contains("does NOT verify"),
+              clip(first_line(p5.combined), 120))
+    }
+
+    let w6: RunResult = tlog_full(acc,
+        ["witness", w_log, "--sign", key, "--out", w_dir,
+         "--trusted-comment", "timestamp:0", "--force"], true)
+    check(acc, "the witness pair restored", w6.code == 0,
+          clip(first_line(w6.combined), 120))
+
+    let key2: str = path_join3(w_dir, "second.key")
+    let pub2: str = path_join3(w_dir, "second.pub")
+    sign_run(acc, ["keygen", "-f", key2, "-p", pub2, "--password-env",
+                   "HLS_SIGN_PASSWORD", "--iterations", "1000"], true)
+    let t7: TJson = tlog_json(acc,
+        ["witness-verify", wfile, "-p", pub2, "--against", w_log])
+    check(acc, "another key refuses the witness (a trust anchor is not a "
+          + "vibe)",
+          t7.r.code == 1 && t7.r.err.contains("does NOT verify"),
+          clip(first_line(t7.r.combined), 120))
+
+    let nosig: str = path_join3(w_dir, "naked.witness.json")
+    cp(wfile, nosig)
+    let p8: RunResult = tlog(["witness-verify", nosig, "-p", pub])
+    check(acc, "a witness without its signature refuses",
+          p8.code == 1 && p8.err.contains("unsigned witness"),
+          clip(first_line(p8.combined), 120))
+
+    let broken: str = path_join3(w_dir, "broken.json")
+    make_log(acc, broken, 2, "wit", 1, genesis, 1700000000, false)
+    let bad_rec: str = "{\"chain_hash\": \"" + hex64("2")
+        + "\", \"kind\": \"publish\", \"name\": \"x\", \"prev_hash\": \""
+        + hex64("1") + "\", \"seq\": 3, \"timestamp\": 1}\n"
+    write_file_ap(broken, bad_rec)
+    let w9: RunResult = tlog_full(acc,
+        ["witness", broken, "--sign", key, "--out", w_dir], true)
+    check(acc, "no witness over a broken chain (verify-before-sign)",
+          w9.code == 1 && w9.err.contains("prev_hash"),
+          clip(first_line(w9.combined), 120))
+}
+
+# tlog_full(acc, args, with_pw) — a tlog leg that needs the passphrase
+# env bracket exactly like sign_run.
+fn tlog_full(acc: Acc, args: list[str], with_pw: bool) -> RunResult
+    uses Proc {
+    if with_pw {
+        env_set_var("HLS_SIGN_PASSWORD", "gate-passphrase-107")
+    }
+    let r: RunResult = tlog(args)
+    if with_pw {
+        env_unset_var("HLS_SIGN_PASSWORD")
+    }
+    return r
+}
+
+# write_file_ap(path, text) — append (the battery's open(path, "a")).
+fn write_file_ap(path: str, text: str) -> void uses Proc {
+    sh("cat >> '" + shell_quote(path) + "' <<'HLEOF'\n"
+       + text + "HLEOF")
+}
+
+# ----------------------------------------------------------------------------
+# 6. the proofs (the record carried home)
+# ----------------------------------------------------------------------------
+
+fn section_6(acc: Acc, genesis: str, proof_schema: str) -> void
+    uses IO, Fs, Proc {
+    section("6. the proofs (the record carried home)")
+
+    let pr_dir: str = scratch(acc, "proof")
+    let pr_log: str = path_join3(pr_dir, "p.json")
+    let head_p: str = make_log(acc, pr_log, 5, "prov", 1, genesis,
+                               1700000000, false)
+    if head_p == "" {
+        check(acc, "prove by name+version finds the record at its seq",
+              false, "make_log failed")
+        return
+    }
+
+    let t1: TJson = tlog_json(acc,
+        ["prove", "prov", "1.3.0", "--log", pr_log, "--out", pr_dir])
+    check(acc, "prove by name+version finds the record at its seq",
+          t1.r.code == 0
+              && jget_int(json_object_get(t1.rep, "proof"), "seq") == 3,
+          clip(json_stringify(t1.rep), 120))
+
+    let proof_path: str = path_join3(pr_dir,
+                                     "hls-tlog-proof-prov-3.proof.json")
+    check(acc, "the proof lands versioned under the tool and the seq",
+          file_exists(proof_path), proof_path)
+
+    let pdoc: JsonValue = parse_json_or_null(read_file(proof_path))
+    let tail: JsonValue = json_object_get(pdoc, "tail")
+    check(acc, "the proof carries the record, the tail and the head",
+          json_is_object(pdoc) && jget_str(pdoc, "schema") == proof_schema
+              && jget_int(pdoc, "length") == 5
+              && jget_str(pdoc, "head") == head_p
+              && json_is_array(tail) && tail.arr.len() == 2,
+          clip(json_stringify(pdoc), 120))
+
+    let t2: TJson = tlog_json(acc, ["prove-verify", proof_path])
+    check(acc, "prove-verify offline: the tail chains to the head",
+          t2.r.code == 0 && jget_bool(t2.rep, "live") == false
+              && jget_bool(t2.rep, "verified") == true,
+          clip(json_stringify(t2.rep), 120))
+
+    let t3: TJson = tlog_json(acc,
+        ["prove-verify", proof_path, "--log", pr_log])
+    check(acc, "prove-verify --log: the record stands in the live history",
+          t3.r.code == 0 && jget_bool(t3.rep, "live") == true,
+          clip(json_stringify(t3.rep), 120))
+
+    let grown_p: str = path_join3(pr_dir, "grown.json")
+    cp(pr_log, grown_p)
+    make_log(acc, grown_p, 2, "prov", 6, head_p, 1700000000, true)
+    let t4: TJson = tlog_json(acc,
+        ["prove-verify", proof_path, "--log", grown_p])
+    check(acc, "a proof stays valid over a grown log", t4.r.code == 0,
+          clip(first_line(t4.r.combined), 120))
+
+    # Rewritten AT the record: an evil seq 3, tail re-chained after it.
+    let rw_log: str = path_join3(pr_dir, "rewritten.json")
+    let rw: RunResult = mklog(acc,
+        ["mk_evil_mid", rw_log, "5", "prov", "1", genesis, "1700000000", "3"])
+    if rw.code != 0 {
+        check(acc, "a rewritten history kills the proof (the live check)",
+              false, "mk_evil_mid failed")
+    } else {
+        let t5: TJson = tlog_json(acc,
+            ["prove-verify", proof_path, "--log", rw_log])
+        check(acc, "a rewritten history kills the proof (the live check)",
+              t5.r.code == 1 && t5.r.out.contains("rewritten"),
+              clip(first_line(t5.r.combined), 120))
+    }
+
+    let tp: RunResult = mklog(acc,
+        ["tamper_prec", proof_path, path_join3(pr_dir, "tampered.proof.json")])
+    if tp.code != 0 {
+        check(acc, "a tampered proof record refuses offline", false,
+              "tamper_prec failed")
+    } else {
+        let p6: RunResult = tlog(["prove-verify",
+                                  path_join3(pr_dir, "tampered.proof.json")])
+        check(acc, "a tampered proof record refuses offline",
+              p6.code == 1 && p6.out.contains("chain_hash"),
+              clip(first_line(p6.combined), 120))
+    }
+
+    let tt: RunResult = mklog(acc,
+        ["tamper_ptail", proof_path, path_join3(pr_dir, "tamtail.proof.json")])
+    if tt.code != 0 {
+        check(acc, "a tampered tail refuses offline", false,
+              "tamper_ptail failed")
+    } else {
+        let p7: RunResult = tlog(["prove-verify",
+                                  path_join3(pr_dir, "tamtail.proof.json")])
+        check(acc, "a tampered tail refuses offline",
+              p7.code == 1 && p7.out.contains("chain"),
+              clip(first_line(p7.combined), 120))
+    }
+
+    let garbage: str = path_join3(pr_dir, "garbage.proof.json")
+    write_file(garbage, "{\"schema\": \"hls-tlog-proof/v1\", "
+        + "\"record\": \"not-a-record\"}\n")
+    let p8: RunResult = tlog(["prove-verify", garbage])
+    check(acc, "a shapeless proof refuses",
+          p8.code == 1 && p8.out.contains("no record"),
+          clip(first_line(p8.combined), 120))
+
+    let p9: RunResult = tlog(["prove", "absent", "--log", pr_log])
+    check(acc, "proving an absent record refuses",
+          p9.code == 1 && p9.err.contains("nothing to prove"),
+          clip(first_line(p9.combined), 120))
+
+    let t10: TJson = tlog_json(acc,
+        ["prove", "--log", pr_log, "--seq", "4"])
+    check(acc, "prove --seq finds the record by position",
+          t10.r.code == 0
+              && jget_int(json_object_get(t10.rep, "proof"), "seq") == 4,
+          clip(json_stringify(t10.rep), 120))
+}
+
+# parse_json_or_null(text) — silent null on a malformed payload.
+fn parse_json_or_null(text: str) -> JsonValue {
+    let rr: Result[JsonValue, str] = json_parse_result(text)
+    if result_is_ok(rr) {
+        return result_unwrap(rr)
+    }
+    return json_null()
+}
+
+# ----------------------------------------------------------------------------
+# 7. the ledger (one definition, end to end)
+# ----------------------------------------------------------------------------
+
+fn log_lines_of(path: str) -> int uses Fs {
+    if !file_exists(path) {
+        return 0
+    }
+    return count_lines(read_file(path))
+}
+
+fn last_log_chain_hash(path: str) -> str uses Fs {
+    if !file_exists(path) {
+        return ""
+    }
+    let lines: list[str] = read_file(path).split("\n")
+    let mut i: int = lines.len() - 1
+    while i >= 0 {
+        let t: str = lines.get(i).trim()
+        if t != "" {
+            return jget_str(parse_json_or_null(t), "chain_hash")
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+fn section_7(acc: Acc) -> void uses IO, Fs, Proc {
+    section("7. the ledger (one definition, end to end)")
+
+    let log_main: str = path_join3(acc.root, ".hls-pkg-transparency.log")
+    let log_lock: str = path_join3(acc.root, ".hls-pkg-transparency.log.lock")
+    let dep_dir: str = path_join3(acc.root, "tests/_gate_s107_dep")
+
+    let rel_root: str = scratch(acc, "rel_app")
+    write_file(path_join3(rel_root, "hls-pkg.toml"),
+        "[package]\nname = \"tlog_app\"\nversion = \"1.0.7\"\n\n"
+        + "[dependencies]\ntlog_dep = { path = "
+        + "\"tests/_gate_s107_dep/main.hls\" }\n\n"
+        + "[effects]\nallowed = [\"IO\", \"Fs\"]\n")
+    write_file(path_join3(rel_root, "main.hls"),
+        "fn main() -> int uses IO {\n    println(\"x\")\n    return 0\n}\n")
+    write_file(path_join3(dep_dir, "hls-pkg.toml"),
+        "[package]\nname = \"tlog_dep\"\nversion = \"0.1.0\"\n")
+    write_file(path_join3(dep_dir, "main.hls"),
+        "fn sz() -> int uses Fs {\n    return fs_size(\"a\")\n}\n")
+
+    let had_log: bool = file_exists(log_main)
+    let had_lock_file: bool = file_exists(log_lock)
+    let before: int = log_lines_of(log_main)
+
+    let lp: RunResult = pkg_run(acc, ["lock"], rel_root)
+    check(acc, "hls-pkg lock pins the ledger fixture", lp.code == 0,
+          clip(first_line(lp.combined), 120))
+    let pp: RunResult = pkg_run(acc, ["publish"], rel_root)
+    check(acc, "hls-pkg publish records the same package", pp.code == 0,
+          clip(first_line(pp.combined), 120))
+    check(acc, "the fixture appended exactly the lock + publish records",
+          log_lines_of(log_main) == before + 2,
+          before.to_str() + " -> " + log_lines_of(log_main).to_str())
+
+    let t1: TJson = tlog_json(acc, ["verify"])
+    check(acc, "hls-tlog verify replays the REPO ledger soundly",
+          t1.r.code == 0 && jget_bool(t1.rep, "sound")
+              && jget_int(t1.rep, "records") > 0,
+          clip(json_stringify(t1.rep), 120))
+
+    let vp: RunResult = pkg_run(acc, ["log", "--verify"], "")
+    check(acc, "hls-pkg log --verify agrees on the same file",
+          vp.code == 0, clip(first_line(vp.combined), 120))
+
+    let t2: TJson = tlog_json(acc, ["summary"])
+    let head_summary: str = jget_str(json_object_get(t2.rep, "view"), "head")
+    let last: str = last_log_chain_hash(log_main)
+    check(acc, "the summary head IS the ledger's last chain hash",
+          head_summary != "" && head_summary == last,
+          head_summary + " vs " + last)
+
+    let copy_repo: str = scratch(acc, "repo_copy.json")
+    cp(log_main, copy_repo)
+    let t3: TJson = tlog_json(acc, ["gossip", log_main, copy_repo])
+    check(acc, "gossip over the repo ledger and its copy: consensus",
+          t3.r.code == 0 && jget_str(t3.rep, "verdict") == "consensus",
+          clip(json_stringify(t3.rep), 120))
+
+    let t4: TJson = tlog_json(acc, ["gossip", log_main, "--require", "1"])
+    check(acc, "a single ledger gossips isolated with --require 1",
+          t4.r.code == 0 && jget_str(t4.rep, "verdict") == "isolated",
+          clip(json_stringify(t4.rep), 120))
+
+    let t5: TJson = tlog_json(acc, ["prove", "tlog_app", "1.0.7", "--out",
+                                    acc.scratch_base])
+    let proof_repo: str = path_join3(acc.scratch_base,
+        "hls-tlog-proof-tlog_app-"
+            + jget_int(json_object_get(t5.rep, "proof"), "seq").to_str()
+            + ".proof.json")
+    check(acc, "the publish record proves by name from the live ledger",
+          t5.r.code == 0
+              && jget_str(json_object_get(
+                  json_object_get(t5.rep, "proof"), "record"), "kind")
+                  == "publish"
+              && jget_str(json_object_get(t5.rep, "proof"), "kind")
+                  == "halis-tlog-inclusion",
+          clip(json_stringify(t5.rep), 120))
+
+    let t6: TJson = tlog_json(acc,
+        ["prove-verify", proof_repo, "--log", log_main])
+    check(acc, "the repo proof verifies against the live ledger",
+          t6.r.code == 0 && jget_bool(t6.rep, "live") == true,
+          clip(json_stringify(t6.rep), 120))
+
+    # Gate scratch hygiene: the log the fixtures wrote is not left
+    # behind for the commit.
+    if !had_log && file_exists(log_main) {
+        rmrf(log_main)
+    }
+    if !had_lock_file && file_exists(log_lock) {
+        rmrf(log_lock)
+    }
+    let cache_dir: str = path_join3(acc.root, ".hls-pkg-cache")
+    if file_exists(cache_dir) {
+        sh("rmdir '" + shell_quote(cache_dir) + "' 2>/dev/null")
+    }
+    rmrf(dep_dir)
+}
+
+# ----------------------------------------------------------------------------
+# 8. the demos
+# ----------------------------------------------------------------------------
+
+fn section_8(acc: Acc) -> void uses IO, Fs, Proc {
+    section("8. the demos")
+
+    let demo: str = "examples/tlog_demo.hls"
+    let ok_test: str = "tests/ok/feat_stage107_tlog.hls"
+
+    let p1: RunResult = boot(acc, [demo])
+    check(acc, "the demo runs (interpreter)",
+          p1.code == 0 && p1.out.contains("checks passed: 6"),
+          clip(first_line(p1.combined), 120))
+    let p2: RunResult = boot(acc, [ok_test])
+    check(acc, "the ok-test runs (interpreter)",
+          p2.code == 0 && p2.out.contains("checks passed: 5"),
+          clip(first_line(p2.combined), 120))
+
+    if file_exists(hlc_path(acc)) {
+        let c1: str = scratch(acc, "demo_native.c")
+        let c2: str = scratch(acc, "ok_native.c")
+        let b1: str = scratch(acc, "demo_native")
+        let b2: str = scratch(acc, "ok_native")
+        let r1: RunResult = run_capture(hlc_path(acc), [demo, c1])
+        let l1: RunResult = run_capture("cc",
+            ["-O2", "-o", b1, c1, "-lm", "-pthread"])
+        let r2: RunResult = run_capture(hlc_path(acc), [ok_test, c2])
+        let l2: RunResult = run_capture("cc",
+            ["-O2", "-o", b2, c2, "-lm", "-pthread"])
+        if r1.code == 0 && l1.code == 0 && r2.code == 0 && l2.code == 0 {
+            let n1: RunResult = run_capture(b1, [])
+            check(acc, "the demo agrees byte for byte with the native binary",
+                  n1.code == 0 && n1.out == p1.out, "")
+            let n2: RunResult = run_capture(b2, [])
+            check(acc, "the ok-test agrees byte for byte with the native "
+                  + "binary",
+                  n2.code == 0 && n2.out == p2.out, "")
+        } else {
+            check(acc, "native compilation of the demos failed", false,
+                  clip(first_line(r1.combined) + " / "
+                       + first_line(r2.combined), 120))
+        }
+    } else {
+        println("  [note] bin/hlc not built — the native half of section 8 "
+            + "is skipped (the gate stays hermetic)")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 9. the tools
+# ----------------------------------------------------------------------------
+
+fn section_9(acc: Acc) -> void uses IO, Fs, Proc {
+    section("9. the tools")
+
+    let files: list[str] = ["examples/tlog_demo.hls",
+                            "tests/ok/feat_stage107_tlog.hls"]
+    let mut i: int = 0
+    while i < files.len() {
+        let f: str = files.get(i)
+        let original: str = read_file(f)
+        let p1f: str = scratch(acc, "fmt1.hls")
+        let p2f: str = scratch(acc, "fmt2.hls")
+        write_file(p1f, original)
+        run_capture(path_join3(acc.root, "bin/hlfmt"), ["-w", p1f])
+        cp(p1f, p2f)
+        run_capture(path_join3(acc.root, "bin/hlfmt"), ["-w", p2f])
+        let once: str = read_file(p1f)
+        let twice: str = read_file(p2f)
+        check(acc, "hlfmt: stable formatting on " + f, once == twice, "")
+        i = i + 1
+    }
+
+    let l1: RunResult = run_capture("python3",
+        ["tools/hllint.py", files.get(0)])
+    let l2: RunResult = run_capture("python3",
+        ["tools/hllint.py", files.get(1)])
+    if l1.code == 0 && l2.code == 0 {
+        check(acc, "hllint: no findings on the demo or the ok-test", true, "")
+    } else {
+        check(acc, "hllint: findings on the new sources", false,
+              clip(first_line(l1.combined) + " / "
+                   + first_line(l2.combined), 120))
+    }
+}
+
+# ----------------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Fs, Proc, Clock, Conc, Exit {
+    let acc: Acc = acc_new("tlog")
+
+    # the module constants the battery read off hltlog_parts
+    let consts: RunResult = mklog(acc, ["consts"])
+    if consts.code != 0 {
+        println("tlog-acceptance: the fixture helper did not start — "
+            + clip(first_line(consts.combined), 160))
+        return 1
+    }
+    let cl: list[str] = consts.out.trim().split("\n")
+    let genesis: str = cl.get(0).trim()
+    let view_schema: str = cl.get(1).trim()
+    let proof_schema: str = cl.get(2).trim()
+
+    section_1(acc)
+    section_2(acc, genesis, view_schema)
+    section_3(acc, path_join3(scratch(acc, "views"), "a.json"))
+    section_4(acc, genesis)
+    section_5(acc, genesis)
+    section_6(acc, genesis, proof_schema)
+    section_7(acc)
+    section_8(acc)
+    section_9(acc)
+    return finish(acc, "Stage 107 -- hls-tlog, the transparency log")
+}

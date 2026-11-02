@@ -1,0 +1,1122 @@
+# ============================================================================
+# tests/acc/semver_acceptance.hls — Stage 131 acceptance gate, in Halis
+# (the Halis twin of tests/semver_acceptance.py; same eight sections, same
+# assertions, same needles — the harness is tests/acc/harness.hls and
+# the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Eight sections over the REAL hls-pkg CLI (tools/hls-pkg.py, the
+# interface a packager drives), the REAL hpkg_semver module (the battery
+# loaded it directly; this gate reaches the same functions through one
+# small python child in the gate's scratch), REAL local git dependency
+# repos with fabricated tags, and an isolated ledger/cache/audit world
+# (the Stage 131 env overrides):
+#
+#  1. the convention  — the CLI grammar: check / cmp / bump / sat and
+#                       the refusals (exit 1 grammar, exit 2 usage)
+#  2. the grammar     — the canonical §11 chain, §10 build metadata,
+#                       numeric vs alphanumeric, the refused shapes, the
+#                       tag_version / bump_version laws
+#  3. the requirement — caret / tilde / comparators / wildcards /
+#     dialect           partials / hyphen ranges / conjunctions / the
+#                       pre-release opt-in rule, every refusal named
+#  4. the manifest    — lock and build validate BEFORE anything
+#     enforcement       resolves: own version, requirement grammar, the
+#                       green clone, the violating tag, the non-semver
+#                       tag, the manifest-less moving ref, add --version
+#  5. the publish     — a valid version publishes, an identical
+#     laws               republish is a no-op appending nothing,
+#                       different content is a hard refusal, build
+#                       metadata is not identity, the way out is a bump
+#  6. the verify      — the drift law: the edited requirement, the
+#     drift law         dropped requirement, the predates-requirements
+#                       lock entry, the tampered resolved version
+#  7. the pure-dep    — a CLEAN-and-PURE audit is recorded pure (the
+#     correction         Stage 131 correction); an unauditable dep
+#                       carries the full fail-closed set
+#  8. the corpus      — tests/ok/feat_stage131_semver.hls is
+#     showcase          hlfmt-canonical, hllint-clean, boots through the
+#                       real checker, runs green on the interpreter and
+#                       (when bin/hlc exists) matches natively
+#
+# The gate's own world is isolated exactly as the battery isolated it:
+# HLS_PKG_TRANSPARENCY_LOG / HLS_PKG_CACHE / HLS_AUDIT_LOG point into
+# the gate's scratch, set once up front (children inherit).
+# ============================================================================
+
+import "./harness.hls"
+import "std.json"
+import "std.env"
+
+# ----------------------------------------------------------------------------
+# The hpkg_semver probe helper — the battery imported the module
+# directly; the gate asks the SAME module through this child. Every
+# assertion is still made HERE, on the printed values.
+# ----------------------------------------------------------------------------
+
+fn svprobe_src() -> str {
+    return "import sys\n"
+        + "sys.path.insert(0, 'tools')\n"
+        + "sys.path.insert(0, 'tools/hpkg_parts')\n"
+        + "import hpkg_semver as SV\n"
+        + "mode = sys.argv[1]\n"
+        + "if mode == 'chain':\n"
+        + "    chain = ['1.0.0-alpha', '1.0.0-alpha.1', '1.0.0-alpha.beta',\n"
+        + "            '1.0.0-beta', '1.0.0-beta.2', '1.0.0-beta.11',\n"
+        + "            '1.0.0-rc.1', '1.0.0']\n"
+        + "    print(' '.join(str(int(SV.compare_versions(\n"
+        + "        SV.parse_version(chain[i]),\n"
+        + "        SV.parse_version(chain[i + 1])) < 0))\n"
+        + "        for i in range(len(chain) - 1)))\n"
+        + "elif mode == 'vercmp':\n"
+        + "    print(SV.compare_versions(SV.parse_version(sys.argv[2]),\n"
+        + "                              SV.parse_version(sys.argv[3])))\n"
+        + "elif mode == 'refv':\n"
+        + "    try:\n"
+        + "        SV.parse_version(sys.argv[2])\n"
+        + "        print(0)\n"
+        + "    except ValueError:\n"
+        + "        print(1)\n"
+        + "elif mode == 'verstr':\n"
+        + "    print(SV.version_string(SV.parse_version(sys.argv[2])))\n"
+        + "elif mode == 'tagv':\n"
+        + "    tv = SV.tag_version(sys.argv[2])\n"
+        + "    if tv is None:\n"
+        + "        print('NONE')\n"
+        + "    else:\n"
+        + "        pre = '.'.join(tv.prerelease) if tv.prerelease else '-'\n"
+        + "        print('%d.%d.%d.%s' % (tv.major, tv.minor, tv.patch, pre))\n"
+        + "elif mode == 'bumpv':\n"
+        + "    try:\n"
+        + "        print(SV.version_string(\n"
+        + "            SV.bump_version(SV.parse_version(sys.argv[2]),\n"
+        + "                            sys.argv[3])))\n"
+        + "    except ValueError:\n"
+        + "        print('ERR')\n"
+        + "elif mode == 'sat':\n"
+        + "    print(int(SV.requirement_holds(\n"
+        + "        SV.parse_requirement(sys.argv[2]),\n"
+        + "        SV.parse_version(sys.argv[3]))))\n"
+        + "elif mode == 'reqref':\n"
+        + "    try:\n"
+        + "        SV.parse_requirement(sys.argv[2])\n"
+        + "        print(0)\n"
+        + "    except ValueError:\n"
+        + "        print(1)\n"
+        + "elif mode == 'anynonpre':\n"
+        + "    print(int(SV.parse_requirement(sys.argv[2]).any_nonpre))\n"
+}
+
+fn svprobe(acc: Acc, args: list[str]) -> RunResult uses Fs, Proc {
+    let helper: str = scratch(acc, "svprobe.py")
+    if !file_exists(helper) {
+        write_file(helper, svprobe_src())
+    }
+    let argv: list[str] = [helper]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    return run_capture("python3", argv)
+}
+
+# ----------------------------------------------------------------------------
+# Port helpers.
+# ----------------------------------------------------------------------------
+
+# pkg_run(args, dir) — the battery's run(PKG + args, cwd=app) under the
+# gate's isolated env (set once in main); chdir for the spawn, restore.
+fn pkg_run(acc: Acc, args: list[str], dir: str) -> RunResult uses Proc {
+    let home: str = cwd_get()
+    if dir != "" {
+        env_set_current_dir(dir)
+    }
+    let argv: list[str] = ["tools/hls-pkg.py"]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    let r: RunResult = run_capture("python3", argv)
+    if dir != "" {
+        env_set_current_dir(home)
+    }
+    return r
+}
+
+fn cli_run(acc: Acc, args: list[str]) -> RunResult uses Proc {
+    return pkg_run(acc, args, "")
+}
+
+# git_in(repo, args) — the battery's git(*args, cwd=repo) with the
+# pinned -c identity.
+fn git_in(repo: str, args: list[str]) -> RunResult uses Proc {
+    let home: str = cwd_get()
+    env_set_current_dir(repo)
+    let argv: list[str] = ["-c", "user.name=gate", "-c",
+                           "user.email=gate@local"]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    let r: RunResult = run_capture("git", argv)
+    env_set_current_dir(home)
+    return r
+}
+
+# make_dep_repo(acc) — a REAL local git repo carrying a pure one-file
+# dependency: lib.hls + a manifest declaring version 1.4.2; tags
+# v1.4.0 / v2.0.0 / rel-2024 at the manifest commit; main marches on to
+# a manifest-less commit. Each call makes its own repo.
+fn make_dep_repo(acc: Acc, n: int) -> str uses IO, Fs, Proc {
+    let repo: str = scratch(acc, "dep-repo-" + n.to_str())
+    write_file(path_join3(repo, "hls-pkg.toml"),
+        "[package]\nname = \"gate-dep\"\nversion = \"1.4.2\"\n")
+    write_file(path_join3(repo, "lib.hls"),
+        "fn gate_dep_value() -> int {\n    return 42\n}\n")
+    git_in(repo, ["init", "-q"])
+    git_in(repo, ["checkout", "-q", "-b", "main"])
+    git_in(repo, ["add", "."])
+    git_in(repo, ["commit", "-q", "-m", "gate dep v1.4.2"])
+    git_in(repo, ["tag", "v1.4.0"])
+    git_in(repo, ["tag", "v2.0.0"])
+    git_in(repo, ["tag", "rel-2024"])
+    rmrf(path_join3(repo, "hls-pkg.toml"))
+    git_in(repo, ["add", "-A"])
+    git_in(repo, ["commit", "-q", "-m", "drop the manifest from main"])
+    return repo
+}
+
+# make_app(acc, name, dep_source) — an app package with one dependency
+# (the rendered dep table) and a pure effect surface.
+fn make_app(acc: Acc, name: str, dep_source: str) -> str uses Fs, Proc {
+    let app: str = scratch(acc, name)
+    write_file(path_join3(app, "hls-pkg.toml"),
+        "[package]\nname = \"" + name + "\"\nversion = \"0.3.0\"\n\n"
+        + "[dependencies]\ndep = " + dep_source + "\n\n"
+        + "[effects]\nallowed = []\n")
+    write_file(path_join3(app, "main.hls"),
+        "fn main() -> int uses IO {\n    println(\"" + name + " ok\")\n"
+        + "    return 0\n}\n")
+    return app
+}
+
+# dep_table(repo, version, pin_key, pin) — toml_dict in the battery's
+# insertion order (version == "" omits the clause; pin_key is "tag" or
+# "branch"; pin == "" omits it).
+fn dep_table(repo: str, version: str, pin_key: str, pin: str) -> str {
+    let mut inner: str = "git = \"" + repo + "\", path = \"lib.hls\""
+    if version != "" {
+        inner = inner + ", version = \"" + version + "\""
+    }
+    if pin != "" {
+        inner = inner + ", " + pin_key + " = \"" + pin + "\""
+    }
+    return "{ " + inner + " }"
+}
+
+# dep_table_path(rel) — the path-only dep table (the baddep fixture).
+fn dep_table_path(rel: str) -> str {
+    return "{ path = \"" + rel + "\" }"
+}
+
+# jget_str / jget_int — kind-guarded accessors.
+fn jget_str(v: JsonValue, key: str) -> str {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_str(x) {
+        return json_str_value(x)
+    }
+    return ""
+}
+
+# jarr_len(v, key) — the length of a list field, -1 when absent/other.
+fn jarr_len(v: JsonValue, key: str) -> int {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_array(x) {
+        return x.arr.len()
+    }
+    return -1
+}
+
+# first_pkg(lock) — lock["packages"][0].
+fn first_pkg(lock: JsonValue) -> JsonValue {
+    let pkgs: JsonValue = json_object_get(lock, "packages")
+    if json_is_array(pkgs) && pkgs.arr.len() > 0 {
+        return pkgs.arr.get(0)
+    }
+    return json_null()
+}
+
+# json_without_key(v, key) — the battery's entry.pop("requirement").
+fn json_without_key(v: JsonValue, key: str) -> JsonValue {
+    if !json_is_object(v) {
+        return v
+    }
+    let keys: list[str] = []
+    let vals: list[JsonValue] = []
+    let mut i: int = 0
+    while i < v.obj_keys.len() {
+        if v.obj_keys.get(i) != key {
+            keys.push(v.obj_keys.get(i))
+            vals.push(v.obj_vals.get(i))
+        }
+        i = i + 1
+    }
+    return json_object(keys, vals)
+}
+
+# json_with_str(v, key, val) — the battery's entry["version"] = ... .
+fn json_with_str(v: JsonValue, key: str, val: str) -> JsonValue {
+    return json_with_val(v, key, json_str(val))
+}
+
+# json_with_val(v, key, val) — set/replace an object field with any
+# JSON value (the battery's lock["packages"] = [...]).
+fn json_with_val(v: JsonValue, key: str, val: JsonValue) -> JsonValue {
+    if !json_is_object(v) {
+        return v
+    }
+    let keys: list[str] = []
+    let vals: list[JsonValue] = []
+    let mut i: int = 0
+    while i < v.obj_keys.len() {
+        if v.obj_keys.get(i) != key {
+            keys.push(v.obj_keys.get(i))
+            vals.push(v.obj_vals.get(i))
+        }
+        i = i + 1
+    }
+    keys.push(key)
+    vals.push(val)
+    return json_object(keys, vals)
+}
+
+# replace_first(s, from, to) — the battery's str.replace(..., 1).
+fn replace_first(s: str, from: str, to: str) -> str {
+    let i: int = s.find(from)
+    if i < 0 {
+        return s
+    }
+    return s.slice(0, i) + to + s.slice(i + from.len(), s.len())
+}
+
+# parse_json_or_null(text) — silent null on a malformed payload.
+fn parse_json_or_null(text: str) -> JsonValue {
+    let rr: Result[JsonValue, str] = json_parse_result(text)
+    if result_is_ok(rr) {
+        return result_unwrap(rr)
+    }
+    return json_null()
+}
+
+# nonempty_lines(path) — the battery's sum(1 for ln in f if ln.strip()).
+fn nonempty_lines(path: str) -> int uses Fs {
+    if !file_exists(path) {
+        return 0
+    }
+    let lines: list[str] = read_file(path).split("\n")
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).trim() != "" {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+# ----------------------------------------------------------------------------
+# Section 1 — the convention and the refusals
+# ----------------------------------------------------------------------------
+
+fn section_1(acc: Acc) -> void uses IO, Proc {
+    section("Section 1 — the convention and the refusals")
+
+    let p: RunResult = cli_run(acc, ["semver", "check", "1.2.3"])
+    check(acc, "check prints the canonical form for a valid version",
+          p.code == 0 && p.out.trim() == "1.2.3",
+          clip(first_line(p.combined), 80))
+
+    let p2: RunResult = cli_run(acc, ["semver", "check", "01.2.3"])
+    check(acc, "a leading zero is exit 1, and the refusal names the grammar",
+          p2.code == 1 && p2.out.contains("grammar")
+              && p2.out.contains("01.2.3"),
+          clip(first_line(p2.combined), 80))
+
+    let p3: RunResult = cli_run(acc, ["semver", "check", "1.2.3-01"])
+    check(acc, "a leading zero in a numeric pre-release identifier is "
+          + "refused too",
+          p3.code == 1 && p3.out.contains("1.2.3-01"),
+          clip(first_line(p3.combined), 80))
+
+    let p4: RunResult = cli_run(acc, ["semver", "cmp", "1.0.0-alpha",
+                                      "1.0.0"])
+    check(acc, "cmp prints -1 for alpha < release",
+          p4.code == 0 && p4.out.trim() == "-1",
+          clip(first_line(p4.combined), 80))
+
+    let p5: RunResult = cli_run(acc, ["semver", "cmp", "1.0.0", "1.0.0"])
+    check(acc, "cmp prints 0 for equal precedence",
+          p5.code == 0 && p5.out.trim() == "0",
+          clip(first_line(p5.combined), 80))
+
+    let p6: RunResult = cli_run(acc, ["semver", "cmp", "2.0.0", "1.0.0"])
+    check(acc, "cmp prints 1 for the greater version",
+          p6.code == 0 && p6.out.trim() == "1",
+          clip(first_line(p6.combined), 80))
+
+    let p7: RunResult = cli_run(acc, ["semver", "cmp", "1.0.0+a", "1.0.0+b"])
+    check(acc, "cmp ignores build metadata (spec §10)",
+          p7.code == 0 && p7.out.trim() == "0",
+          clip(first_line(p7.combined), 80))
+
+    let p8: RunResult = cli_run(acc, ["semver", "cmp", "not-a-version",
+                                      "1.0.0"])
+    check(acc, "a malformed cmp input is exit 2, named",
+          p8.code == 2 && p8.out.contains("not-a-version"),
+          clip(first_line(p8.combined), 80))
+
+    let p9: RunResult = cli_run(acc, ["semver", "bump", "minor",
+                                      "1.2.3-alpha+b"])
+    check(acc, "bump minor resets the lower components and drops the "
+          + "pre-release and build",
+          p9.code == 0 && p9.out.trim() == "1.3.0",
+          clip(first_line(p9.combined), 80))
+
+    let p10: RunResult = cli_run(acc, ["semver", "bump", "huge", "1.2.3"])
+    check(acc, "an unknown bump part is refused (argparse choices)",
+          p10.code != 0, p10.code.to_str())
+
+    let p11: RunResult = cli_run(acc, ["semver", "sat", "1.5.0", "^1.2.3"])
+    check(acc, "sat exits 0 and says so for a satisfying pair",
+          p11.code == 0 && p11.out.contains("satisfies"),
+          clip(first_line(p11.combined), 80))
+
+    let p12: RunResult = cli_run(acc, ["semver", "sat", "2.0.0", "^1.2.3"])
+    check(acc, "sat exits 1 (not a refusal — a negative verdict) for a "
+          + "non-satisfying pair",
+          p12.code == 1 && p12.out.contains("does NOT satisfy"),
+          clip(first_line(p12.combined), 80))
+
+    let p13: RunResult = cli_run(acc, ["semver", "sat", "garbage", "^1.2.3"])
+    check(acc, "a malformed version in sat is exit 2, named",
+          p13.code == 2 && p13.out.contains("garbage"),
+          clip(first_line(p13.combined), 80))
+
+    let p14: RunResult = cli_run(acc, ["semver", "sat", "1.0.0",
+                                       "1.2.3 || 2.0.0"])
+    check(acc, "'||' alternatives are refused by name (a requirement is "
+          + "one conjunction)",
+          p14.code == 2 && p14.out.contains("'||'"),
+          clip(first_line(p14.combined), 80))
+}
+
+# ----------------------------------------------------------------------------
+# Section 2 — the grammar and the precedence law
+# ----------------------------------------------------------------------------
+
+fn section_2(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 2 — the grammar and the precedence law")
+
+    let chain: RunResult = svprobe(acc, ["chain"])
+    check(acc, "the canonical §11 chain orders correctly",
+          chain.code == 0 && chain.out.trim() == "1 1 1 1 1 1 1",
+          clip(first_line(chain.out), 60))
+
+    let c1: RunResult = svprobe(acc, ["vercmp", "1.0.0+a.1", "1.0.0+b.2"])
+    check(acc, "build metadata is ignored by precedence (§10)",
+          c1.code == 0 && first_line(c1.out).trim() == "0",
+          first_line(c1.out))
+
+    let c2: RunResult = svprobe(acc, ["vercmp", "1.0.0-1", "1.0.0-alpha"])
+    check(acc, "numeric < alphanumeric (§11.4)",
+          c2.code == 0 && first_line(c2.out).trim() == "-1",
+          first_line(c2.out))
+
+    let c3: RunResult = svprobe(acc, ["vercmp", "1.0.0-alpha.1",
+                                      "1.0.0-alpha.beta"])
+    check(acc, "numeric identifiers compare numerically inside the list",
+          c3.code == 0 && first_line(c3.out).trim() == "-1",
+          first_line(c3.out))
+
+    let c4: RunResult = svprobe(acc, ["vercmp", "1.0.0-beta.2",
+                                      "1.0.0-beta.11"])
+    check(acc, "beta.2 < beta.11 — numerically, not lexicographically",
+          c4.code == 0 && first_line(c4.out).trim() == "-1",
+          first_line(c4.out))
+
+    let r1: RunResult = svprobe(acc, ["refv", "01.2.3"])
+    let r2: RunResult = svprobe(acc, ["refv", "1.02.3"])
+    let r3: RunResult = svprobe(acc, ["refv", "1.2.03"])
+    check(acc, "leading zeros are refused in every core component",
+          r1.out.trim() == "1" && r2.out.trim() == "1"
+              && r3.out.trim() == "1",
+          first_line(r1.out) + first_line(r2.out) + first_line(r3.out))
+
+    let r4: RunResult = svprobe(acc, ["refv", "1.2.3-01"])
+    let r5: RunResult = svprobe(acc, ["refv", "1.2.3-alpha.00"])
+    check(acc, "leading zeros are refused in numeric pre-release identifiers",
+          r4.out.trim() == "1" && r5.out.trim() == "1",
+          first_line(r4.out) + first_line(r5.out))
+
+    let r6: RunResult = svprobe(acc, ["refv", "1.2.3-"])
+    let r7: RunResult = svprobe(acc, ["refv", "1.2.3+"])
+    check(acc, "an empty pre-release or build clause is refused",
+          r6.out.trim() == "1" && r7.out.trim() == "1",
+          first_line(r6.out) + first_line(r7.out))
+
+    let r8: RunResult = svprobe(acc, ["refv", "1.2"])
+    let r9: RunResult = svprobe(acc, ["refv", "1"])
+    let r10: RunResult = svprobe(acc, ["refv", "v1.2.3"])
+    check(acc, "a partial or v-prefixed string is not a version (that is "
+          + "tag_version's job)",
+          r8.out.trim() == "1" && r9.out.trim() == "1"
+              && r10.out.trim() == "1",
+          first_line(r8.out) + first_line(r9.out) + first_line(r10.out))
+
+    let vs: RunResult = svprobe(acc, ["verstr", "1.2.3-a.1+b.2"])
+    check(acc, "the canonical rendering round-trips every clause",
+          vs.code == 0 && first_line(vs.out) == "1.2.3-a.1+b.2",
+          first_line(vs.out))
+
+    let tv: RunResult = svprobe(acc, ["tagv", "v1.2.3-rc.1"])
+    check(acc, "tag_version strips the v and parses the rest",
+          tv.code == 0 && first_line(tv.out) == "1.2.3.rc.1",
+          first_line(tv.out))
+
+    let tv2: RunResult = svprobe(acc, ["tagv", "V2.0.0"])
+    check(acc, "a capital V is stripped too",
+          tv2.code == 0 && first_line(tv2.out) != "NONE",
+          first_line(tv2.out))
+
+    let tv3: RunResult = svprobe(acc, ["tagv", "rel-2024"])
+    let tv4: RunResult = svprobe(acc, ["tagv", ""])
+    check(acc, "a non-semver tag is None, not an error",
+          first_line(tv3.out) == "NONE" && first_line(tv4.out) == "NONE",
+          first_line(tv3.out) + " / " + first_line(tv4.out))
+
+    let b1: RunResult = svprobe(acc, ["bumpv", "1.2.3-alpha+b", "minor"])
+    check(acc, "bump drops the pre-release and the build",
+          b1.code == 0 && first_line(b1.out) == "1.3.0",
+          first_line(b1.out))
+
+    let b2: RunResult = svprobe(acc, ["bumpv", "1.2.9", "patch"])
+    check(acc, "bump patch carries (1.2.9 -> 1.2.10, numerically above)",
+          b2.code == 0 && first_line(b2.out) == "1.2.10",
+          first_line(b2.out))
+
+    let b3: RunResult = svprobe(acc, ["bumpv", "1.2.3", "huge"])
+    check(acc, "an unknown bump part is a ValueError",
+          b3.code == 0 && first_line(b3.out) == "ERR",
+          first_line(b3.out))
+}
+
+# ----------------------------------------------------------------------------
+# Section 3 — the requirement dialect
+# ----------------------------------------------------------------------------
+
+fn sat_of(acc: Acc, req: str, ver: str) -> bool uses Fs, Proc {
+    let r: RunResult = svprobe(acc, ["sat", req, ver])
+    return r.code == 0 && first_line(r.out).trim() == "1"
+}
+
+fn section_3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 3 — the requirement dialect")
+
+    # Caret: the first non-zero component pins the range.
+    check(acc, "^1.2.3 is >=1.2.3 <2.0.0",
+          sat_of(acc, "^1.2.3", "1.2.3") && sat_of(acc, "^1.2.3", "1.9.9")
+              && !sat_of(acc, "^1.2.3", "2.0.0")
+              && !sat_of(acc, "^1.2.3", "1.2.2"),
+          "")
+    check(acc, "^0.2.3 is clamped to 0.2.x",
+          sat_of(acc, "^0.2.3", "0.2.9") && !sat_of(acc, "^0.2.3", "0.3.0"),
+          "")
+    check(acc, "^0.0.3 admits exactly the patch",
+          sat_of(acc, "^0.0.3", "0.0.3")
+              && !sat_of(acc, "^0.0.3", "0.0.4"),
+          "")
+    check(acc, "^1.2 fills the floor with zeros",
+          sat_of(acc, "^1.2", "1.2.0") && !sat_of(acc, "^1.2", "2.0.0"),
+          "")
+
+    # Tilde: patch floats, minor does not.
+    check(acc, "~1.2.3 is >=1.2.3 <1.3.0",
+          sat_of(acc, "~1.2.3", "1.2.9") && !sat_of(acc, "~1.2.3", "1.3.0"),
+          "")
+    check(acc, "~1 is >=1.0.0 <2.0.0",
+          sat_of(acc, "~1", "1.9.9") && !sat_of(acc, "~1", "2.0.0"),
+          "")
+
+    # Comparators: full bounds only.
+    check(acc, "the five comparators hold on the exact boundary the way "
+          + "the operator says",
+          sat_of(acc, ">=1.2.3", "1.2.3") && !sat_of(acc, ">1.2.3", "1.2.3")
+              && sat_of(acc, "<=1.2.3", "1.2.3")
+              && !sat_of(acc, "<1.2.3", "1.2.3")
+              && sat_of(acc, "=1.2.3", "1.2.3"),
+          "")
+
+    # Wildcards and bare partials.
+    check(acc, "wildcards range over the components they replace",
+          sat_of(acc, "*", "3.4.5") && sat_of(acc, "1.x", "1.9.9")
+              && !sat_of(acc, "1.x", "2.0.0")
+              && sat_of(acc, "1.2.*", "1.2.9")
+              && !sat_of(acc, "1.2.*", "1.3.0"),
+          "")
+    check(acc, "bare partials are the same ranges written shorter",
+          sat_of(acc, "1.2", "1.2.9") && !sat_of(acc, "1.2", "1.3.0")
+              && sat_of(acc, "1", "1.9.9") && !sat_of(acc, "1", "2.0.0"),
+          "")
+
+    # Hyphen ranges: the upper partial floats.
+    check(acc, "1.2.3 - 2.0 is >=1.2.3 <2.1.0 (the upper partial floats)",
+          sat_of(acc, "1.2.3 - 2.0", "1.5.0")
+              && sat_of(acc, "1.2.3 - 2.0", "2.0.0")
+              && !sat_of(acc, "1.2.3 - 2.0", "2.1.0"),
+          "")
+    check(acc, "a full upper bound is inclusive (<=)",
+          sat_of(acc, "1.2.3 - 2.3.4", "2.3.4")
+              && !sat_of(acc, "1.2.3 - 2.3.4", "2.3.5"),
+          "")
+
+    # Conjunctions.
+    check(acc, "space and comma separated clauses conjoin (AND)",
+          sat_of(acc, ">=1.2.0 <2.0.0", "1.5.0")
+              && !sat_of(acc, ">=1.2.0 <2.0.0", "2.0.0")
+              && sat_of(acc, ">=1.2.0,<2.0.0", "1.5.0"),
+          "")
+
+    # The pre-release opt-in rule.
+    check(acc, "^1.2.3 never pulls 1.3.0-beta by accident",
+          !sat_of(acc, "^1.2.3", "1.3.0-beta"), "")
+    check(acc, "an explicit pre-release floor opts the same core in",
+          sat_of(acc, "^1.2.3-beta", "1.2.3-beta.2"), "")
+    check(acc, "the opt-in does not leak to a different core",
+          !sat_of(acc, "^1.2.3-beta", "1.2.4-beta"), "")
+    check(acc, "a pre-release floor still admits the release above it",
+          sat_of(acc, ">=1.2.3-alpha", "1.2.3"), "")
+    check(acc, "* admits nothing pre-release",
+          !sat_of(acc, "*", "1.0.0-rc.1"), "")
+    check(acc, "=1.2.3 does not admit 1.2.3-beta (the bound must carry "
+          + "the tag)",
+          !sat_of(acc, "=1.2.3", "1.2.3-beta"), "")
+
+    # Refusals — every one names the grammar or the offending token.
+    let q1: RunResult = svprobe(acc, ["reqref", "1.2.3 || 2.0.0"])
+    check(acc, "'||' is refused", q1.out.trim() == "1", first_line(q1.out))
+    let q2: RunResult = svprobe(acc, ["reqref", ">=1.2"])
+    check(acc, "a partial after a comparator is refused",
+          q2.out.trim() == "1", first_line(q2.out))
+    let q3: RunResult = svprobe(acc, ["reqref", "^1.x"])
+    let q4: RunResult = svprobe(acc, ["reqref", "~*"])
+    check(acc, "wildcards under ^/~ are refused",
+          q3.out.trim() == "1" && q4.out.trim() == "1",
+          first_line(q3.out) + first_line(q4.out))
+    let q5: RunResult = svprobe(acc, ["reqref", "01.2"])
+    let q6: RunResult = svprobe(acc, ["reqref", "^1.02.3"])
+    check(acc, "leading zeros are refused in requirement bounds",
+          q5.out.trim() == "1" && q6.out.trim() == "1",
+          first_line(q5.out) + first_line(q6.out))
+    let q7: RunResult = svprobe(acc, ["reqref", "1.2.3 - 2.0 - 3.0"])
+    check(acc, "a hyphen range takes exactly two bounds",
+          q7.out.trim() == "1", first_line(q7.out))
+    let q8: RunResult = svprobe(acc, ["reqref", "abc"])
+    check(acc, "a non-numeric bound is refused", q8.out.trim() == "1",
+          first_line(q8.out))
+    let q9: RunResult = svprobe(acc, ["reqref", ">="])
+    check(acc, "a bare comparator with no version is refused",
+          q9.out.trim() == "1", first_line(q9.out))
+
+    let a1: RunResult = svprobe(acc, ["anynonpre", "*"])
+    let a2: RunResult = svprobe(acc, ["anynonpre", ""])
+    check(acc, "* and the empty requirement both mean 'any non-prerelease'",
+          a1.out.trim() == "1" && a2.out.trim() == "1",
+          first_line(a1.out) + first_line(a2.out))
+}
+
+# ----------------------------------------------------------------------------
+# Section 4 — the manifest enforcement (lock, build, add)
+# ----------------------------------------------------------------------------
+
+fn section_4(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 4 — the manifest enforcement (lock, build, add)")
+
+    let repo: str = make_dep_repo(acc, 1)
+    let app: str = make_app(acc, "verapp",
+                            dep_table(repo, "^1.4", "tag", "v1.4.0"))
+
+    # The package's own version is validated BEFORE anything resolves.
+    write_file(path_join3(app, "hls-pkg.toml"),
+        "[package]\nname = \"verapp\"\nversion = \"1.0\"\n\n"
+        + "[dependencies]\ndep = " + dep_table(repo, "^1.4", "tag", "v1.4.0")
+        + "\n\n[effects]\nallowed = []\n")
+    let p: RunResult = pkg_run(acc, ["lock"], app)
+    check(acc, "lock refuses a manifest whose own version is not semver, "
+          + "before resolving anything",
+          p.code == 1 && p.out.contains("package version '1.0'"),
+          clip(first_line(p.combined), 120))
+
+    write_file(path_join3(app, "hls-pkg.toml"),
+        "[package]\nname = \"verapp\"\nversion = \"0.3.0\"\n\n"
+        + "[dependencies]\ndep = " + dep_table(repo, "^1.4", "tag", "v1.4.0")
+        + "\n\n[effects]\nallowed = []\n")
+
+    # A malformed requirement is refused at the grammar, before the
+    # network (here: the clone) is touched.
+    write_file(path_join3(app, "hls-pkg.toml"),
+        "[package]\nname = \"verapp\"\nversion = \"0.3.0\"\n\n"
+        + "[dependencies]\ndep = "
+        + dep_table(repo, "^1.4..0", "tag", "v1.4.0")
+        + "\n\n[effects]\nallowed = []\n")
+    let p2: RunResult = pkg_run(acc, ["lock"], app)
+    check(acc, "lock refuses a malformed requirement by name",
+          p2.code == 1 && p2.out.contains("requirement")
+              && p2.out.contains("1.4..0"),
+          clip(first_line(p2.combined), 120))
+    write_file(path_join3(app, "hls-pkg.toml"),
+        "[package]\nname = \"verapp\"\nversion = \"0.3.0\"\n\n"
+        + "[dependencies]\ndep = " + dep_table(repo, "^1.4", "tag", "v1.4.0")
+        + "\n\n[effects]\nallowed = []\n")
+
+    # The green path: a real clone, tag v1.4.0, requirement ^1.4.
+    let p3: RunResult = pkg_run(acc, ["lock"], app)
+    check(acc, "lock resolves a semver-tagged dep that satisfies ^1.4",
+          p3.code == 0 && p3.out.contains("Wrote lockfile"),
+          clip(first_line(p3.combined), 120))
+    let lock: JsonValue = parse_json_or_null(
+        read_file(path_join3(app, "hls-pkg.lock")))
+    let entry: JsonValue = first_pkg(lock)
+    check(acc, "the lockfile records the requirement beside the pin",
+          json_is_object(entry) && jget_str(entry, "requirement") == "^1.4",
+          jget_str(entry, "requirement"))
+    check(acc, "the locked tag is v1.4.0 and the pure dep is recorded PURE "
+          + "(section 7's correction, visible in the ledger)",
+          jget_str(entry, "version") == "v1.4.0"
+              && jarr_len(entry, "effects") == 0
+              && jarr_len(entry, "transitive_effects") == 0,
+          clip(json_stringify(entry), 120))
+
+    # A satisfying tag on a different core: v2.0.0 violates ^1.4.
+    write_file(path_join3(app, "hls-pkg.toml"),
+        "[package]\nname = \"verapp\"\nversion = \"0.3.0\"\n\n"
+        + "[dependencies]\ndep = " + dep_table(repo, "^1.4", "tag", "v2.0.0")
+        + "\n\n[effects]\nallowed = []\n")
+    let p4: RunResult = pkg_run(acc, ["lock"], app)
+    check(acc, "lock refuses a tag that violates the requirement, named on "
+          + "both sides",
+          p4.code == 1 && p4.out.contains("v2.0.0")
+              && p4.out.contains("does not satisfy"),
+          clip(first_line(p4.combined), 120))
+    let old_lock: JsonValue = parse_json_or_null(
+        read_file(path_join3(app, "hls-pkg.lock")))
+    check(acc, "the refused lock wrote no new lockfile (the old one stays)",
+          !file_exists(path_join3(app, "hls-pkg.lock"))
+              || (json_is_object(old_lock)
+                  && jget_str(first_pkg(old_lock), "requirement") == "^1.4"),
+          "")
+
+    # A non-semver tag: a requirement that cannot be CHECKED is a
+    # refusal, not a warning.
+    write_file(path_join3(app, "hls-pkg.toml"),
+        "[package]\nname = \"verapp\"\nversion = \"0.3.0\"\n\n"
+        + "[dependencies]\ndep = "
+        + dep_table(repo, "^1.4", "tag", "rel-2024")
+        + "\n\n[effects]\nallowed = []\n")
+    let p5: RunResult = pkg_run(acc, ["lock"], app)
+    check(acc, "lock refuses a non-semver tag under a requirement",
+          p5.code == 1 && p5.out.contains("rel-2024")
+              && p5.out.contains("cannot be checked"),
+          clip(first_line(p5.combined), 120))
+
+    # A moving ref is judged by the dependency's own manifest version;
+    # main carries NO manifest: refusal.
+    write_file(path_join3(app, "hls-pkg.toml"),
+        "[package]\nname = \"verapp\"\nversion = \"0.3.0\"\n\n"
+        + "[dependencies]\ndep = "
+        + dep_table(repo, "^1.4", "branch", "main")
+        + "\n\n[effects]\nallowed = []\n")
+    let p6: RunResult = pkg_run(acc, ["lock"], app)
+    check(acc, "a requirement against a manifest-less moving ref is a "
+          + "refusal, named",
+          p6.code == 1 && p6.out.contains("no hls-pkg.toml"),
+          clip(first_line(p6.combined), 120))
+
+    # build: the same laws, before a single line compiles.
+    write_file(path_join3(app, "hls-pkg.toml"),
+        "[package]\nname = \"verapp\"\nversion = \"0.3\"\n\n"
+        + "[dependencies]\ndep = " + dep_table(repo, "^1.4", "tag", "v1.4.0")
+        + "\n\n[effects]\nallowed = []\n")
+    let p7: RunResult = pkg_run(acc, ["build"], app)
+    check(acc, "build refuses a non-semver own version",
+          p7.code == 1 && p7.out.contains("package version '0.3'"),
+          clip(first_line(p7.combined), 120))
+    write_file(path_join3(app, "hls-pkg.toml"),
+        "[package]\nname = \"verapp\"\nversion = \"0.3.0\"\n\n"
+        + "[dependencies]\ndep = " + dep_table(repo, ">=1.2", "tag", "v1.4.0")
+        + "\n\n[effects]\nallowed = []\n")
+    let p8: RunResult = pkg_run(acc, ["build"], app)
+    check(acc, "build refuses a dependency requirement with a partial "
+          + "after a comparator",
+          p8.code == 1 && p8.out.contains(">=1.2")
+              && p8.out.contains("ambiguous"),
+          clip(first_line(p8.combined), 120))
+    write_file(path_join3(app, "hls-pkg.toml"),
+        "[package]\nname = \"verapp\"\nversion = \"0.3.0\"\n\n"
+        + "[dependencies]\ndep = " + dep_table(repo, "^1.4", "tag", "v1.4.0")
+        + "\n\n[effects]\nallowed = []\n")
+
+    # The green build still builds (the validation is additive).
+    let p9: RunResult = pkg_run(acc, ["build"], app)
+    check(acc, "a manifest that passes the semver laws builds green",
+          p9.code == 0 && p9.out.contains("verapp ok"),
+          clip(first_line(p9.combined), 120))
+
+    # add --version: the grammar is checked at the keyboard.
+    let app2: str = scratch(acc, "addapp")
+    write_file(path_join3(app2, "hls-pkg.toml"),
+        "[package]\nname = \"addapp\"\nversion = \"0.1.0\"\n")
+    let p10: RunResult = pkg_run(acc,
+        ["add", "dep", repo, "lib.hls", "--version", "^1.4.0"], app2)
+    check(acc, "add --version records the requirement",
+          p10.code == 0 && p10.out.contains("requirement: ^1.4.0"),
+          clip(first_line(p10.combined), 120))
+    let mtext: str = read_file(path_join3(app2, "hls-pkg.toml"))
+    check(acc, "the requirement lands in the manifest's dep table",
+          mtext.contains("version = \"^1.4.0\""), "")
+    let p11: RunResult = pkg_run(acc,
+        ["add", "dep2", repo, "lib.hls", "--version", "^1.2..3"], app2)
+    check(acc, "add --version refuses a malformed requirement before "
+          + "writing anything",
+          p11.code == 1 && p11.out.contains("1.2..3"),
+          clip(first_line(p11.combined), 120))
+    let p12: RunResult = pkg_run(acc,
+        ["add", "dep3", repo, "lib.hls", "--version", "1.2.3 || 9"], app2)
+    check(acc, "add --version refuses '||' alternatives by name",
+          p12.code == 1 && p12.out.contains("'||'"),
+          clip(first_line(p12.combined), 120))
+}
+
+# ----------------------------------------------------------------------------
+# Section 5 — the publish laws
+# ----------------------------------------------------------------------------
+
+fn section_5(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 5 — the publish laws")
+
+    let app: str = scratch(acc, "pubapp")
+    write_file(path_join3(app, "hls-pkg.toml"),
+        "[package]\nname = \"pubapp\"\nversion = \"0.3.0\"\n")
+    write_file(path_join3(app, "lib.hls"),
+        "fn pub_value() -> int {\n    return 7\n}\n")
+
+    let p: RunResult = pkg_run(acc, ["publish"], app)
+    check(acc, "publish records a valid version",
+          p.code == 0 && p.out.contains("Published pubapp@0.3.0"),
+          clip(first_line(p.combined), 120))
+
+    let p2: RunResult = pkg_run(acc, ["publish"], app)
+    check(acc, "an identical republish is a no-op (the ledger is not "
+          + "spammed; CI stays idempotent)",
+          p2.code == 0 && p2.out.contains("identical content, nothing to do"),
+          clip(first_line(p2.combined), 120))
+
+    let ledger: str = path_join3(acc.scratch_base, "ledger.jsonl")
+    let seq_before: int = nonempty_lines(ledger)
+    let p3: RunResult = pkg_run(acc, ["publish"], app)
+    let seq_after: int = nonempty_lines(ledger)
+    check(acc, "the no-op really appended nothing",
+          p3.code == 0 && seq_before == seq_after,
+          seq_before.to_str() + " -> " + seq_after.to_str())
+
+    # Different content under the same name@version: hard refusal.
+    write_file(path_join3(app, "lib.hls"),
+        "fn pub_value() -> int {\n    return 8\n}\n")
+    let p4: RunResult = pkg_run(acc, ["publish"], app)
+    check(acc, "a republish with different content is a hard refusal naming "
+          + "both hashes",
+          p4.code == 1 && p4.out.contains("different content")
+              && p4.out.contains("version bump"),
+          clip(first_line(p4.combined), 120))
+
+    # Build metadata does not change the identity (spec §10).
+    write_file(path_join3(app, "hls-pkg.toml"),
+        "[package]\nname = \"pubapp\"\nversion = \"0.3.0+x1\"\n")
+    write_file(path_join3(app, "lib.hls"),
+        "fn pub_value() -> int {\n    return 7\n}\n")
+    let p5: RunResult = pkg_run(acc, ["publish"], app)
+    check(acc, "0.3.0+x1 with the original content is the same version — "
+          + "no-op",
+          p5.code == 0 && p5.out.contains("identical content, nothing to do"),
+          clip(first_line(p5.combined), 120))
+    write_file(path_join3(app, "lib.hls"),
+        "fn pub_value() -> int {\n    return 9\n}\n")
+    let p6: RunResult = pkg_run(acc, ["publish"], app)
+    check(acc, "0.3.0+x1 with different content is still a refusal (the "
+          + "identity ignores the build)",
+          p6.code == 1 && p6.out.contains("different content"),
+          clip(first_line(p6.combined), 120))
+
+    # The way out is the way semver always said: bump.
+    write_file(path_join3(app, "hls-pkg.toml"),
+        "[package]\nname = \"pubapp\"\nversion = \"0.3.1\"\n")
+    let p7: RunResult = pkg_run(acc, ["publish"], app)
+    check(acc, "a real bump publishes fine",
+          p7.code == 0 && p7.out.contains("Published pubapp@0.3.1"),
+          clip(first_line(p7.combined), 120))
+
+    # No version, or a non-semver one: refused.
+    write_file(path_join3(app, "hls-pkg.toml"),
+        "[package]\nname = \"pubapp\"\n")
+    let p8: RunResult = pkg_run(acc, ["publish"], app)
+    check(acc, "publish refuses a version-less manifest (the silent 0.0.0 "
+          + "fallback is gone)",
+          p8.code == 1 && p8.out.contains("must name its version"),
+          clip(first_line(p8.combined), 120))
+    write_file(path_join3(app, "hls-pkg.toml"),
+        "[package]\nname = \"pubapp\"\nversion = \"1.0\"\n")
+    let p9: RunResult = pkg_run(acc, ["publish"], app)
+    check(acc, "publish refuses a non-semver version",
+          p9.code == 1 && p9.out.contains("1.0"),
+          clip(first_line(p9.combined), 120))
+}
+
+# ----------------------------------------------------------------------------
+# Section 6 — the verify drift law
+# ----------------------------------------------------------------------------
+
+fn section_6(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 6 — the verify drift law")
+
+    let repo: str = make_dep_repo(acc, 2)
+    let app: str = make_app(acc, "driftapp",
+                            dep_table(repo, "^1.4", "tag", "v1.4.0"))
+    let p: RunResult = pkg_run(acc, ["lock"], app)
+    check(acc, "the drift fixture locks green", p.code == 0,
+          clip(first_line(p.combined), 120))
+
+    let p2: RunResult = pkg_run(acc, ["verify"], app)
+    check(acc, "the untouched state verifies clean",
+          p2.code == 0 && p2.out.contains("All 1 packages verified"),
+          clip(first_line(p2.combined), 120))
+
+    # Edit the requirement after the lock: drift, named on both sides.
+    let mpath: str = path_join3(app, "hls-pkg.toml")
+    write_file(mpath, replace_first(read_file(mpath), "\"^1.4\"", "\"^1.5\""))
+    let p3: RunResult = pkg_run(acc, ["verify"], app)
+    check(acc, "an edited requirement fails verification naming both texts",
+          p3.code == 1 && p3.out.contains("drift")
+              && p3.out.contains("^1.5") && p3.out.contains("^1.4"),
+          clip(first_line(p3.combined), 120))
+
+    # Removing the requirement entirely: drift, quoted as "requires
+    # None".
+    write_file(mpath, replace_first(read_file(mpath),
+                                    "version = \"^1.5\", ", ""))
+    let p4: RunResult = pkg_run(acc, ["verify"], app)
+    check(acc, "a manifest that drops the requirement fails verification",
+          p4.code == 1 && p4.out.contains("drift")
+              && p4.out.contains("None"),
+          clip(first_line(p4.combined), 120))
+
+    # The mirror case: a lockfile entry WITHOUT a requirement under a
+    # manifest that demands one (a lock predating Stage 131).
+    write_file(mpath, replace_first(read_file(mpath), "dep = { git",
+                                    "dep = { version = \"^1.4\", git"))
+    let lpath: str = path_join3(app, "hls-pkg.lock")
+    let lock: JsonValue = parse_json_or_null(read_file(lpath))
+    let dropped: JsonValue = json_without_key(first_pkg(lock), "requirement")
+    write_file(lpath, json_stringify(json_with_val(
+        json_without_key(lock, "packages"), "packages",
+        json_array_elem(dropped))))
+    let p5: RunResult = pkg_run(acc, ["verify"], app)
+    check(acc, "a lockfile entry that predates requirements fails "
+          + "verification under a demanding manifest",
+          p5.code == 1 && p5.out.contains("predates requirements"),
+          clip(first_line(p5.combined), 120))
+
+    # Tamper the lockfile's resolved version (with the requirement
+    # back in place, so the satisfaction re-check is what fires).
+    write_file(mpath, replace_first(read_file(mpath), "dep = { git",
+                                    "dep = { version = \"^1.4\", git"))
+    let lock2: JsonValue = parse_json_or_null(read_file(lpath))
+    let tampered: JsonValue = json_with_str(
+        json_with_str(first_pkg(lock2), "requirement", "^1.4"), "version",
+        "v9.9.9")
+    write_file(lpath, json_stringify(json_with_val(
+        json_without_key(lock2, "packages"), "packages",
+        json_array_elem(tampered))))
+    let p6: RunResult = pkg_run(acc, ["verify"], app)
+    check(acc, "a tampered lockfile version fails the satisfaction re-check",
+          p6.code == 1 && p6.out.contains("v9.9.9")
+              && p6.out.contains("does not satisfy"),
+          clip(first_line(p6.combined), 120))
+
+    # Restore everything and verify clean again.
+    let lock3: JsonValue = parse_json_or_null(read_file(lpath))
+    let restored: JsonValue = json_with_str(first_pkg(lock3), "version",
+                                            "v1.4.0")
+    write_file(lpath, json_stringify(json_with_val(
+        json_without_key(lock3, "packages"), "packages",
+        json_array_elem(restored))))
+    let p7: RunResult = pkg_run(acc, ["verify"], app)
+    check(acc, "the restored state verifies clean again",
+          p7.code == 0 && p7.out.contains("All 1 packages verified"),
+          clip(first_line(p7.combined), 120))
+}
+
+# json_array_elem(v) — a one-element list value.
+fn json_array_elem(v: JsonValue) -> JsonValue {
+    let items: list[JsonValue] = []
+    items.push(v)
+    return json_array(items)
+}
+
+# ----------------------------------------------------------------------------
+# Section 7 — the pure-dep correction
+# ----------------------------------------------------------------------------
+
+fn section_7(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 7 — the pure-dep correction")
+
+    # (a) The green side: a dependency that audits CLEAN and PURE is
+    # recorded as pure.
+    let repo: str = make_dep_repo(acc, 3)
+    let app: str = make_app(acc, "pureapp",
+                            dep_table(repo, "", "tag", "v1.4.0"))
+    let p: RunResult = pkg_run(acc, ["lock"], app)
+    check(acc, "a pure dep with allowed = [] locks green",
+          p.code == 0 && p.out.contains("Wrote lockfile"),
+          clip(first_line(p.combined), 120))
+    let lock: JsonValue = parse_json_or_null(
+        read_file(path_join3(app, "hls-pkg.lock")))
+    let entry: JsonValue = first_pkg(lock)
+    check(acc, "the pure dep's ledger row carries NO effects (not the "
+          + "fail-closed set)",
+          json_is_object(entry) && jarr_len(entry, "effects") == 0
+              && jarr_len(entry, "transitive_effects") == 0,
+          clip(json_stringify(entry), 120))
+
+    # (b) The fail-closed side, still closed: a dep whose audit FAILS
+    # (a syntax error, here) is recorded with the FULL effect set.
+    let baddep: str = scratch(acc, "baddep")
+    write_file(path_join3(baddep, "hls-pkg.toml"),
+        "[package]\nname = \"baddep\"\nversion = \"1.0.0\"\n")
+    write_file(path_join3(baddep, "bad.hls"), "fn broken(\n")
+    let app2: str = make_app(acc, "badapp",
+        dep_table_path("tests/.acc-scratch/semver/baddep/bad.hls"))
+    let p2: RunResult = pkg_run(acc, ["lock"], app2)
+    check(acc, "an unauditable dep fails the effect surface (fail closed, "
+          + "never pure)",
+          p2.code == 1 && p2.out.contains("Rand"),
+          clip(first_line(p2.combined), 120))
+    let lock2_path: str = path_join3(app2, "hls-pkg.lock")
+    if file_exists(lock2_path) {
+        let lock2: JsonValue = parse_json_or_null(read_file(lock2_path))
+        let te: JsonValue = json_object_get(first_pkg(lock2),
+                                            "transitive_effects")
+        # sorted(te) == sorted([Args, Clock, Exit, Fs, IO, Net, Proc, Rand])
+        let want: list[str] = ["Args", "Clock", "Exit", "Fs", "IO", "Net",
+                               "Proc", "Rand"]
+        let mut ok: bool = json_is_array(te) && te.arr.len() == want.len()
+        if ok {
+            let mut i: int = 0
+            while i < want.len() {
+                if !te.arr.get(i).sval.contains(want.get(i)) {
+                    ok = false
+                }
+                i = i + 1
+            }
+        }
+        check(acc, "the unauditable row carries exactly the fail-closed set",
+              ok, clip(json_stringify(te), 120))
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Section 8 — the corpus showcase
+# ----------------------------------------------------------------------------
+
+fn section_8(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 8 — the corpus showcase")
+
+    let showcase: str = path_join3(acc.root,
+                                   "tests/ok/feat_stage131_semver.hls")
+    let showcase_out: str = "stage 131: hls-pkg semver\n"
+        + "  semver laws OK: grammar, precedence, pre-release, bump, caret\n"
+
+    let p: RunResult = boot_check(acc, showcase)
+    check(acc, "the showcase boots through the real checker", p.code == 0,
+          clip(first_line(p.combined), 120))
+
+    let p2: RunResult = boot(acc, [showcase])
+    check(acc, "the showcase runs green on the interpreter, exact output",
+          p2.code == 0 && p2.out == showcase_out,
+          clip(first_line(p2.combined), 120))
+
+    let p3: RunResult = run_capture(path_join3(acc.root, "bin/hlfmt"),
+                                    ["--check", showcase])
+    check(acc, "the showcase is hlfmt-canonical", p3.code == 0,
+          clip(first_line(p3.combined), 120))
+
+    let p4: RunResult = run_capture("python3", ["tools/hllint.py", showcase])
+    check(acc, "the showcase is hllint-clean",
+          p4.code == 0 && p4.out.contains("no warnings"),
+          clip(first_line(p4.combined), 120))
+
+    let mut cc: str = "gcc"
+    let ccv: Option[tainted[str]] = env_var("CC")
+    if option_is_some(ccv) {
+        cc = taint_unwrap(option_unwrap(ccv))
+    }
+    if file_exists(hlc_path(acc)) && which(cc) {
+        let c_path: str = scratch(acc, "showcase.c")
+        let bin_path: str = scratch(acc, "showcase_bin")
+        let r1: RunResult = run_capture(hlc_path(acc), [showcase, c_path])
+        if r1.code != 0 {
+            check(acc, "hlc compiled the showcase", false,
+                  clip(r1.out.trim(), 120))
+        } else {
+            let r2: RunResult = run_capture(cc,
+                ["-O2", "-o", bin_path, c_path, "-lm", "-pthread"])
+            if r2.code != 0 {
+                check(acc, "gcc compiled the showcase", false,
+                      clip(r2.out.trim(), 120))
+            } else {
+                let rn: RunResult = run_capture(bin_path, [])
+                check(acc, "the showcase matches natively, byte for byte",
+                      rn.code == 0 && rn.out == showcase_out,
+                      clip(first_line(rn.combined), 120))
+            }
+        }
+    } else {
+        println("  (bin/hlc or cc not available — native differential "
+            + "skipped, interpreter legs ran)")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Fs, Proc, Exit {
+    let acc: Acc = acc_new("semver")
+
+    # the Stage 131 env overrides — the gate's own isolated world
+    env_set_var("HLS_PKG_TRANSPARENCY_LOG",
+                path_join3(acc.scratch_base, "ledger.jsonl"))
+    env_set_var("HLS_PKG_CACHE", path_join3(acc.scratch_base, "cache"))
+    env_set_var("HLS_AUDIT_LOG",
+                path_join3(acc.scratch_base, "audit-log.jsonl"))
+    section_1(acc)
+    section_2(acc)
+    section_3(acc)
+    section_4(acc)
+    section_5(acc)
+    section_6(acc)
+    section_7(acc)
+    section_8(acc)
+    return finish(acc, "Stage 131 -- semantic-versioning enforcement")
+}

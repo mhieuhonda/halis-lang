@@ -1,0 +1,1591 @@
+# ============================================================================
+# tests/acc/freeze_acceptance.hls — Stage 141 acceptance gate, in Halis
+# (the Halis twin of tests/freeze_acceptance.py; same eight sections, same
+# assertions, same needles — the harness is tests/acc/harness.hls and
+# the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Eight sections over the REAL hls-freeze CLI (tools/hls-freeze.py),
+# the REAL interpreter front-end tables (the boot lexer's keyword set,
+# the parser's effect/crate-attr vocabulary, the checker's builtin and
+# method tables — the battery imported them directly, the gate reaches
+# the same modules through one small python child in the gate's
+# scratch), disposable copies of the tree parts the tool reads, and the
+# family's ONE chain arithmetic (chain_of) recomputing every hash:
+#
+#  1. the convention — the freeze document exists, is surface version
+#                       1, stamps Stage 141 / v0.159.0-alpha, its
+#                       digest is the sha256 of the canonical surface
+#                       it carries (the gate's OWN canonicaliser), the
+#                       chain replays, the tools answer on the real
+#                       tree, both files are committed
+#  2. the syntax law  — every frozen table is exactly the live table;
+#                       the two front-ends agree; the attribute census
+#                       is the parser's live words; the method tables
+#                       row for row; the container surface DEMONSTRATED
+#                       through the real checker
+#  3. the census law  — the frozen stdlib census equals the gate's own
+#                       re-derivation canonically; the counts; the
+#                       signatures; impl methods under their keys
+#  4. the removal law — a deleted fn is REMOVED at its dotted path, a
+#                       one-front-end keyword removal is refused
+#                       outright, a both-front-end removal is drift
+#  5. the mutation    — param/ret/effects changes, a removed enum
+#     law               variant, a removed struct field, a new
+#                       deprecation — each named at its path
+#  6. the addition    — a post-freeze fn is ADDED drift, a grown
+#     law                builtin table is syntax drift, a comment-only
+#                       edit moves NO row
+#  7. the amend law   — the named refusals; a real amendment appends
+#                       exactly one record whose delta is the tool's
+#                       diff, whose chain_hash the gate recomputes
+#                       through the imported chain_of; verify green;
+#                       a second amend refused; a tampered record
+#                       breaks the replay at its line
+#  8. the report      — the frozen API document renders twice
+#     + corpus          byte-identically, embeds the digest, refuses a
+#     showcase          drifted tree; the corpus showcase boots, runs,
+#                       is hlfmt-canonical, hllint-clean, and matches
+#                       natively byte for byte
+#
+# The gate's own canonicaliser (canon) and sha live HERE in Halis —
+# written independently of the tool's, and required to agree with it,
+# exactly as the battery required of its own.
+# ============================================================================
+
+import "./harness.hls"
+import "std.json"
+import "std.sha256"
+import "std.env"
+import "std.taint"
+import "std.str"
+
+# ----------------------------------------------------------------------------
+# The gate's own canonicaliser — json.dumps(sort_keys=True,
+# separators=(",", ":"), ensure_ascii=True), independently written.
+# ----------------------------------------------------------------------------
+
+fn hex4(cp: int) -> str {
+    let digits: str = "0123456789abcdef"
+    let a: int = (cp / 4096) % 16
+    let b: int = (cp / 256) % 16
+    let c: int = (cp / 16) % 16
+    let d: int = cp % 16
+    return "\\u" + digits.slice(a, a + 1) + digits.slice(b, b + 1)
+        + digits.slice(c, c + 1) + digits.slice(d, d + 1)
+}
+
+# hex4_surro(st) — the escaped UTF-16 form of a decoded multi-byte
+# sequence (a surrogate pair above the BMP, \uXXXX twice).
+fn hex4_surro(cp: int) -> str {
+    let v: int = cp - 65536
+    let hi: int = 55296 + (v / 1024)
+    let lo: int = 56320 + (v % 1024)
+    return hex4(hi) + hex4(lo)
+}
+
+fn canon_str(s: str) -> str {
+    let mut out: str = "\""
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c == 34 {
+            out = out + "\\\""
+        } else if c == 92 {
+            out = out + "\\\\"
+        } else if c == 10 {
+            out = out + "\\n"
+        } else if c == 13 {
+            out = out + "\\r"
+        } else if c == 9 {
+            out = out + "\\t"
+        } else if c < 32 {
+            out = out + "\\u00" + hex_byte_lo(c)
+        } else if c < 128 {
+            out = out + s.slice(i, i + 1)
+        } else {
+            # ensure_ascii: decode the UTF-8 sequence, escape it
+            let mut cp: int = 0
+            let mut advance: int = 1
+            if c >= 240 {
+                cp = (c - 240) * 262144
+                    + (s.byte_at(i + 1) - 128) * 4096
+                    + (s.byte_at(i + 2) - 128) * 64
+                    + (s.byte_at(i + 3) - 128)
+                advance = 4
+            } else if c >= 224 {
+                cp = (c - 224) * 4096
+                    + (s.byte_at(i + 1) - 128) * 64
+                    + (s.byte_at(i + 2) - 128)
+                advance = 3
+            } else {
+                cp = (c - 192) * 64 + (s.byte_at(i + 1) - 128)
+                advance = 2
+            }
+            if cp > 65535 {
+                out = out + hex4_surro(cp)
+            } else {
+                out = out + hex4(cp)
+            }
+            i = i + advance
+            continue
+        }
+        i = i + 1
+    }
+    return out + "\""
+}
+
+fn hex_byte_lo(c: int) -> str {
+    let lo: int = c % 16
+    let digits: str = "0123456789abcdef"
+    return "0" + digits.slice(lo, lo + 1)
+}
+
+# sort_keys: the surface's keys are identifiers and dotted paths —
+# plain byte order is python's order for them.
+fn sort_strs(items: list[str]) -> list[str] {
+    let a: list[str] = items
+    let mut i: int = 1
+    while i < a.len() {
+        let key: str = a.get(i)
+        let mut j: int = i - 1
+        while j >= 0 && a.get(j) > key {
+            a.set(j + 1, a.get(j))
+            j = j - 1
+        }
+        a.set(j + 1, key)
+        i = i + 1
+    }
+    return a
+}
+
+fn canon(v: JsonValue) -> str {
+    if json_is_null(v) {
+        return "null"
+    }
+    if json_is_bool(v) {
+        if v.bval {
+            return "true"
+        }
+        return "false"
+    }
+    if json_is_int(v) {
+        return v.ival.to_str()
+    }
+    if json_is_float(v) {
+        return v.fval.to_str()
+    }
+    if json_is_str(v) {
+        return canon_str(v.sval)
+    }
+    if json_is_array(v) {
+        # collect + join: the O(n) shape (an accumulating concat is
+        # quadratic in Halis — see std.str's own str_join note)
+        let parts: list[str] = []
+        parts.push("[")
+        let mut i: int = 0
+        while i < v.arr.len() {
+            if i > 0 {
+                parts.push(",")
+            }
+            parts.push(canon(v.arr.get(i)))
+            i = i + 1
+        }
+        parts.push("]")
+        return str_join(parts, "")
+    }
+    # object: keys sorted
+    let keys: list[str] = sort_strs(v.obj_keys)
+    let parts: list[str] = []
+    parts.push("{")
+    let mut i: int = 0
+    while i < keys.len() {
+        if i > 0 {
+            parts.push(",")
+        }
+        let k: str = keys.get(i)
+        parts.push(canon_str(k))
+        parts.push(":")
+        parts.push(canon(json_object_get(v, k)))
+        i = i + 1
+    }
+    parts.push("}")
+    return str_join(parts, "")
+}
+
+# jget_str / jget_int / jget_bool — kind-guarded accessors.
+fn jget_str(v: JsonValue, key: str) -> str {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_str(x) {
+        return json_str_value(x)
+    }
+    return ""
+}
+
+fn jget_int(v: JsonValue, key: str) -> int {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_int(x) {
+        return json_int_value(x)
+    }
+    return -1
+}
+
+fn jget_bool(v: JsonValue, key: str) -> bool {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_bool(x) {
+        return json_bool_value(x)
+    }
+    return false
+}
+
+fn parse_json_or_null(text: str) -> JsonValue {
+    let rr: Result[JsonValue, str] = json_parse_result(text)
+    if result_is_ok(rr) {
+        return result_unwrap(rr)
+    }
+    return json_null()
+}
+
+fn json_array_elem(v: JsonValue) -> JsonValue {
+    let items: list[JsonValue] = []
+    items.push(v)
+    return json_array(items)
+}
+
+fn json_with_str(v: JsonValue, key: str, val: str) -> JsonValue {
+    return json_with_val(v, key, json_str(val))
+}
+
+fn json_with_val(v: JsonValue, key: str, val: JsonValue) -> JsonValue {
+    if !json_is_object(v) {
+        return v
+    }
+    let keys: list[str] = []
+    let vals: list[JsonValue] = []
+    let mut i: int = 0
+    while i < v.obj_keys.len() {
+        if v.obj_keys.get(i) != key {
+            keys.push(v.obj_keys.get(i))
+            vals.push(v.obj_vals.get(i))
+        }
+        i = i + 1
+    }
+    keys.push(key)
+    vals.push(val)
+    return json_object(keys, vals)
+}
+
+fn json_without_key(v: JsonValue, key: str) -> JsonValue {
+    if !json_is_object(v) {
+        return v
+    }
+    let keys: list[str] = []
+    let vals: list[JsonValue] = []
+    let mut i: int = 0
+    while i < v.obj_keys.len() {
+        if v.obj_keys.get(i) != key {
+            keys.push(v.obj_keys.get(i))
+            vals.push(v.obj_vals.get(i))
+        }
+        i = i + 1
+    }
+    return json_object(keys, vals)
+}
+
+# replace_first(s, from, to) — the battery's str.replace(..., 1).
+fn replace_first(s: str, from: str, to: str) -> str {
+    let i: int = s.find(from)
+    if i < 0 {
+        return s
+    }
+    return s.slice(0, i) + to + s.slice(i + from.len(), s.len())
+}
+
+# ----------------------------------------------------------------------------
+# The freeze probe helper — the battery imported the front-end tables
+# and ran the checker in-process; the gate asks the SAME modules
+# through this child.
+# ----------------------------------------------------------------------------
+
+fn fzprobe_src() -> str {
+    return "import sys, json\n"
+        + "sys.path.insert(0, '.')\n"
+        + "sys.path.insert(0, 'tools')\n"
+        + "sys.path.insert(0, 'tools/hltlog_parts')\n"
+        + "from tools.hlinterp.lexer import (KEYWORDS, "
+        + "RESERVED_IDENTIFIERS, TWO_CHAR, ONE_CHAR, tokenize, HLError)\n"
+        + "from tools.hlinterp.parser import Parser, CRATE_ATTRS, "
+        + "KNOWN_EFFECTS\n"
+        + "from tools.hlinterp.checker import check as checker_check\n"
+        + "from tools.hlinterp.checking.helpers import (\n"
+        + "    BUILTIN_FNS, STR_M, INT_M, FLOAT_M, BOOL_M)\n"
+        + "from hltlog_parts.hltlog_common import chain_of\n"
+        + "def canon(obj):\n"
+        + "    return json.dumps(obj, sort_keys=True, "
+        + "separators=(',', ':'), ensure_ascii=True)\n"
+        + "mode = sys.argv[1]\n"
+        + "if mode == 'syntax':\n"
+        + "    which = sys.argv[2]\n"
+        + "    tbl = {'keywords': KEYWORDS, 'reserved': "
+        + "RESERVED_IDENTIFIERS, 'two': TWO_CHAR, 'one': ONE_CHAR,\n"
+        + "        'effects': KNOWN_EFFECTS, 'attrs': CRATE_ATTRS,\n"
+        + "        'builtins': BUILTIN_FNS}[which]\n"
+        + "    print('|'.join(sorted(tbl)))\n"
+        + "elif mode == 'census':\n"
+        + "    src = b'#[zz_gate_census]\\nfn main() -> void { return }\\n'\n"
+        + "    try:\n"
+        + "        prog = Parser(tokenize(src), src).parse_program()\n"
+        + "        checker_check(prog)\n"
+        + "        print('NONE')\n"
+        + "    except HLError as e:\n"
+        + "        print(str(e))\n"
+        + "elif mode == 'mtable':\n"
+        + "    which = sys.argv[2]\n"
+        + "    if which == 'str':\n"
+        + "        tbl = {n: {'params': list(s[0]), 'ret': s[1]}\n"
+        + "               for n, s in sorted(STR_M.items())}\n"
+        + "    elif which == 'int':\n"
+        + "        tbl = {n: {'params': [], 'ret': r}\n"
+        + "               for n, r in sorted(INT_M.items())}\n"
+        + "    elif which == 'float':\n"
+        + "        tbl = {n: {'params': [], 'ret': r}\n"
+        + "               for n, r in sorted(FLOAT_M.items())}\n"
+        + "    else:\n"
+        + "        tbl = {n: {'params': [], 'ret': r}\n"
+        + "               for n, r in sorted(BOOL_M.items())}\n"
+        + "    print(canon(tbl))\n"
+        + "elif mode == 'probefile':\n"
+        + "    src = open(sys.argv[2], 'rb').read()\n"
+        + "    try:\n"
+        + "        prog = Parser(tokenize(src), src).parse_program()\n"
+        + "        checker_check(prog)\n"
+        + "        print('NONE')\n"
+        + "    except HLError as e:\n"
+        + "        print(str(e))\n"
+        + "    except Exception as ex:\n"
+        + "        print('%s: %s' % (type(ex).__name__, ex))\n"
+        + "elif mode == 'stdsurface':\n"
+        + "    import os\n"
+        + "    out = {}\n"
+        + "    def gate_fn_record(f):\n"
+        + "        rec = {'extern': bool(f.get('extern')),\n"
+        + "               'effects': sorted(f.get('effects') or []),\n"
+        + "               'generic': list(f.get('typeparams') or []),\n"
+        + "               'params': [[n, t, bool(m)] for (n, t, m) in "
+        + "f['params']],\n"
+        + "               'pure': bool(f.get('pure')), 'ret': f['ret']}\n"
+        + "        if f.get('requires') is not None:\n"
+        + "            rec['requires'] = canon(f['requires'])\n"
+        + "        if f.get('ensures') is not None:\n"
+        + "            rec['ensures'] = canon(f['ensures'])\n"
+        + "        dep = (f.get('attrs') or {}).get('deprecated')\n"
+        + "        if dep is True:\n"
+        + "            rec['deprecated'] = ''\n"
+        + "        elif isinstance(dep, (bytes, bytearray)):\n"
+        + "            rec['deprecated'] = bytes(dep).decode('utf-8', "
+        + "'replace')\n"
+        + "        elif isinstance(dep, str):\n"
+        + "            rec['deprecated'] = dep\n"
+        + "        if f.get('taint_source'):\n"
+        + "            rec['taint_source'] = True\n"
+        + "        if f.get('taint_sinks'):\n"
+        + "            rec['taint_sinks'] = sorted(f['taint_sinks'])\n"
+        + "        return rec\n"
+        + "    def gate_module_record(path):\n"
+        + "        src = open(path, 'rb').read()\n"
+        + "        prog = Parser(tokenize(src), src).parse_program()\n"
+        + "        fns = {}\n"
+        + "        for key in sorted(prog['fns']):\n"
+        + "            fns[key] = gate_fn_record(prog['fns'][key])\n"
+        + "        structs = {}\n"
+        + "        for name in sorted(prog['structs']):\n"
+        + "            s = prog['structs'][name]\n"
+        + "            structs[name] = {'generic': list(s.get('typeparams') "
+        + "or []),\n"
+        + "                'fields': [[n, t, d is not None]\n"
+        + "                           for (n, t, d) in s['fields']]}\n"
+        + "        enums = {}\n"
+        + "        for name in sorted(prog['enums']):\n"
+        + "            e = prog['enums'][name]\n"
+        + "            enums[name] = {'generic': list(e.get('typeparams') "
+        + "or []),\n"
+        + "                'variants': [[n, list(p)] for (n, p) in "
+        + "e['variants']]}\n"
+        + "        return {'fns': fns, 'structs': structs, 'enums': enums,\n"
+        + "                'imports': sorted(i['path'] for i in "
+        + "prog['imports'])}\n"
+        + "    for fam in ('std', 'core'):\n"
+        + "        base = os.path.join('.', fam)\n"
+        + "        for dirpath, dirnames, filenames in os.walk(base):\n"
+        + "            dirnames.sort()\n"
+        + "            for fn in sorted(filenames):\n"
+        + "                if not fn.endswith('.hls'):\n"
+        + "                    continue\n"
+        + "                full = os.path.join(dirpath, fn)\n"
+        + "                rel = os.path.relpath(full, '.').replace(\n"
+        + "                    os.sep, '/')\n"
+        + "                out[rel[:-4].replace('/', '.')] = "
+        + "gate_module_record(full)\n"
+        + "    print(canon(out))\n"
+        + "elif mode == 'chainof':\n"
+        + "    rec = json.loads(sys.argv[3])\n"
+        + "    print(chain_of(sys.argv[2], rec))\n"
+}
+
+fn fzprobe(acc: Acc, args: list[str]) -> RunResult uses Fs, Proc {
+    let helper: str = scratch(acc, "fzprobe.py")
+    if !file_exists(helper) {
+        write_file(helper, fzprobe_src())
+    }
+    let argv: list[str] = [helper]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    return run_capture("python3", argv)
+}
+
+# ----------------------------------------------------------------------------
+# Port helpers.
+# ----------------------------------------------------------------------------
+
+# freeze_run(args, dir) — the battery's run(TOOL + args, cwd=root).
+fn freeze_run(acc: Acc, args: list[str], dir: str) -> RunResult uses Proc {
+    let home: str = cwd_get()
+    if dir != "" {
+        env_set_current_dir(dir)
+    }
+    let argv: list[str] = ["tools/hls-freeze.py"]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    let r: RunResult = run_capture("python3", argv)
+    if dir != "" {
+        env_set_current_dir(home)
+    }
+    return r
+}
+
+# make_scratch(acc, tag) — a disposable copy of the tree parts the
+# tool reads.
+fn make_scratch(acc: Acc, tag: str) -> str uses IO, Fs, Proc {
+    let root: str = scratch(acc, "tree-" + tag)
+    let parts: list[str] = ["tools", "std", "core", "src/hlc/types.hls",
+                            "tests/api_freeze.json",
+                            "tests/api_freeze_amendments.jsonl"]
+    let mut i: int = 0
+    while i < parts.len() {
+        let part: str = parts.get(i)
+        let src: str = path_join3(acc.root, part)
+        let dst: str = path_join3(root, part)
+        let d_ok: int = mkdirs(path_dir3(dst))
+        if d_ok != 0 {
+            println("freeze-acceptance: mkdirs failed for " + dst)
+        }
+        cp(src, dst)
+        i = i + 1
+    }
+    return root
+}
+
+# collect_eq_idents(text) — the battery's
+# set(re.findall(r'==\s*"([a-z_]+)"', body)), sorted.
+fn collect_eq_idents(text: str) -> list[str] {
+    let found: list[str] = []
+    let mut i: int = 0
+    while i < text.len() - 4 {
+        if text.byte_at(i) == 61 && text.byte_at(i + 1) == 61 {
+            let mut j: int = i + 2
+            while j < text.len() && text.byte_at(j) == 32 {
+                j = j + 1
+            }
+            if j < text.len() && text.byte_at(j) == 34 {
+                let mut k: int = j + 1
+                let mut ident: str = ""
+                while k < text.len() {
+                    let c: int = text.byte_at(k)
+                    if (c >= 97 && c <= 122) || c == 95 {
+                        ident = ident + text.slice(k, k + 1)
+                        k = k + 1
+                    } else {
+                        break
+                    }
+                }
+                if ident != "" && k < text.len()
+                    && text.byte_at(k) == 34 {
+                    let mut dup: bool = false
+                    let mut m: int = 0
+                    while m < found.len() {
+                        if found.get(m) == ident {
+                            dup = true
+                        }
+                        m = m + 1
+                    }
+                    if !dup {
+                        found.push(ident)
+                    }
+                }
+                i = k
+            }
+        }
+        i = i + 1
+    }
+    return sort_strs(found)
+}
+
+# join_with(items, sep) — "|".join.
+fn join_with(items: list[str], sep: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < items.len() {
+        if i > 0 {
+            out = out + sep
+        }
+        out = out + items.get(i)
+        i = i + 1
+    }
+    return out
+}
+
+# count_dotted_fns(stdlib) — fn keys containing "." across modules.
+fn count_dotted_fns(stdlib: JsonValue) -> int {
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < stdlib.obj_vals.len() {
+        let m: JsonValue = stdlib.obj_vals.get(i)
+        let fns: JsonValue = json_object_get(m, "fns")
+        if json_is_object(fns) {
+            let mut k: int = 0
+            while k < fns.obj_keys.len() {
+                if fns.obj_keys.get(k).contains(".") {
+                    n = n + 1
+                }
+                k = k + 1
+            }
+        }
+        i = i + 1
+    }
+    return n
+}
+
+# ----------------------------------------------------------------------------
+# Section 1 — the convention
+# ----------------------------------------------------------------------------
+
+fn section_1(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 1 — the convention")
+
+    let freeze_p: str = path_join3(acc.root, "tests/api_freeze.json")
+    let chain_p: str = path_join3(acc.root,
+                                  "tests/api_freeze_amendments.jsonl")
+    check(acc, "the freeze document exists at tests/api_freeze.json",
+          file_exists(freeze_p), freeze_p)
+    let doc: JsonValue = parse_json_or_null(read_file(freeze_p))
+    check(acc, "the freeze is surface version 1",
+          json_is_object(doc) && jget_int(doc, "surface_version") == 1,
+          jget_int(doc, "surface_version").to_str())
+    check(acc, "the freeze names its tool",
+          jget_str(doc, "tool") == "hls-freeze", jget_str(doc, "tool"))
+    check(acc, "the freeze is Stage 141", jget_int(doc, "stage") == 141,
+          jget_int(doc, "stage").to_str())
+    check(acc, "the freeze stamps v0.159.0-alpha",
+          jget_str(doc, "release") == "0.159.0-alpha",
+          jget_str(doc, "release"))
+
+    let fc: str = jget_str(doc, "frozen_commit")
+    let mut fc_hex: bool = fc.len() == 40
+    if fc_hex {
+        let mut i: int = 0
+        while i < fc.len() {
+            let c: int = fc.byte_at(i)
+            if !((c >= 48 && c <= 57) || (c >= 97 && c <= 102)) {
+                fc_hex = false
+            }
+            i = i + 1
+        }
+    }
+    check(acc, "the frozen commit is a 40-hex sha", fc_hex, fc)
+
+    # The self-consistency law, through the gate's own canonicaliser.
+    let want: str = sha256_hex(canon(json_object_get(doc, "surface")))
+    check(acc, "the digest is the sha256 of the canonical surface it "
+          + "carries (gate's own canonicaliser)",
+          jget_str(doc, "digest") == want,
+          jget_str(doc, "digest") + " vs " + want)
+
+    # The chain: present, carrying the std.sha256 record, replaying.
+    check(acc, "the amendment chain exists beside the freeze",
+          file_exists(chain_p), chain_p)
+    let records: list[JsonValue] = jsonl_records(read_file(chain_p))
+    check(acc, "the chain carries exactly one amendment (the std.sha256 "
+          + "record)",
+          records.len() == 1, records.len().to_str())
+    let mut rec1_ok: bool = records.len() == 1
+    if rec1_ok {
+        rec1_ok = jget_int(records.get(0), "seq") == 1
+            && arr_has_str(json_object_get(
+                json_object_get(records.get(0), "delta"), "added"),
+                "stdlib.std.sha256")
+    }
+    check(acc, "the record is seq 1, amending in stdlib.std.sha256",
+          rec1_ok, clip(json_stringify(records.get(0)), 80))
+
+    # The tools answer on the real tree.
+    let p: RunResult = freeze_run(acc, ["status"], "")
+    check(acc, "status answers IDENTICAL on the tree",
+          p.code == 0 && p.out.contains("IDENTICAL"),
+          clip(first_line(p.combined), 120))
+    let p2: RunResult = freeze_run(acc, ["verify", "--quiet"], "")
+    check(acc, "verify is green on the tree", p2.code == 0,
+          clip(first_line(p2.combined), 120))
+
+    # The freeze travels with the repository.
+    let gl: RunResult = run_capture("git",
+        ["ls-files", "tests/api_freeze.json",
+         "tests/api_freeze_amendments.jsonl"])
+    let named: list[str] = gl.out.trim().split("\n")
+    let mut both: bool = false
+    let mut has_j: bool = false
+    let mut has_c: bool = false
+    let mut i: int = 0
+    while i < named.len() {
+        let t: str = named.get(i).trim()
+        if t == "tests/api_freeze.json" {
+            has_j = true
+        }
+        if t == "tests/api_freeze_amendments.jsonl" {
+            has_c = true
+        }
+        i = i + 1
+    }
+    both = has_j && has_c
+    check(acc, "both freeze files are committed (git ls-files names them)",
+          both, gl.out.trim())
+}
+
+# jsonl_records(text) — one parsed record per non-empty line.
+fn jsonl_records(text: str) -> list[JsonValue] {
+    let out: list[JsonValue] = []
+    let lines: list[str] = text.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let t: str = lines.get(i).trim()
+        if t != "" {
+            out.push(parse_json_or_null(t))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# arr_has_str(v, needle) — needle in v (a JSON array of strings).
+fn arr_has_str(v: JsonValue, needle: str) -> bool {
+    if !json_is_array(v) {
+        return false
+    }
+    let mut i: int = 0
+    while i < v.arr.len() {
+        if json_is_str(v.arr.get(i)) && v.arr.get(i).sval == needle {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# ----------------------------------------------------------------------------
+# Section 2 — the syntax law
+# ----------------------------------------------------------------------------
+
+# syn_list_equals_live(syn_arr, live_line) — the frozen array equals the
+# child's sorted "|"-joined line.
+fn syn_list_equals_live(syn_arr: JsonValue, live_line: str) -> bool {
+    if !json_is_array(syn_arr) {
+        return false
+    }
+    let items: list[str] = []
+    let mut i: int = 0
+    while i < syn_arr.arr.len() {
+        if !json_is_str(syn_arr.arr.get(i)) {
+            return false
+        }
+        items.push(syn_arr.arr.get(i).sval)
+        i = i + 1
+    }
+    return join_with(items, "|") == live_line
+}
+
+fn section_2(acc: Acc, syn: JsonValue) -> void uses IO, Fs, Proc {
+    section("Section 2 — the syntax law")
+
+    let sk: RunResult = fzprobe(acc, ["syntax", "keywords"])
+    check(acc, "the frozen keywords are exactly the boot lexer's set",
+          sk.code == 0
+              && syn_list_equals_live(json_object_get(syn, "keywords"),
+                                      first_line(sk.out)),
+          clip(first_line(sk.out), 120))
+
+    let sr: RunResult = fzprobe(acc, ["syntax", "reserved"])
+    check(acc, "the frozen reserved identifiers are exactly the boot set",
+          sr.code == 0
+              && syn_list_equals_live(
+                  json_object_get(syn, "reserved_identifiers"),
+                  first_line(sr.out)),
+          clip(first_line(sr.out), 120))
+
+    let s2: RunResult = fzprobe(acc, ["syntax", "two"])
+    check(acc, "the frozen two-char tokens are exactly the boot set",
+          s2.code == 0
+              && syn_list_equals_live(
+                  json_object_get(syn, "tokens_two_char"),
+                  first_line(s2.out)),
+          clip(first_line(s2.out), 120))
+
+    let s1: RunResult = fzprobe(acc, ["syntax", "one"])
+    check(acc, "the frozen one-char tokens are exactly the boot set",
+          s1.code == 0
+              && syn_list_equals_live(
+                  json_object_get(syn, "tokens_one_char"),
+                  first_line(s1.out)),
+          clip(first_line(s1.out), 120))
+
+    let se: RunResult = fzprobe(acc, ["syntax", "effects"])
+    check(acc, "the frozen effect vocabulary is exactly the parser's",
+          se.code == 0
+              && syn_list_equals_live(json_object_get(syn, "effects"),
+                                      first_line(se.out)),
+          clip(first_line(se.out), 120))
+
+    let sa: RunResult = fzprobe(acc, ["syntax", "attrs"])
+    check(acc, "the frozen crate attributes are exactly the parser's",
+          sa.code == 0
+              && syn_list_equals_live(json_object_get(syn, "crate_attrs"),
+                                      first_line(sa.out)),
+          clip(first_line(sa.out), 120))
+
+    let sb: RunResult = fzprobe(acc, ["syntax", "builtins"])
+    check(acc, "the frozen builtin fns are exactly the checker's "
+          + "BUILTIN_FNS table",
+          sb.code == 0
+              && syn_list_equals_live(json_object_get(syn, "builtin_fns"),
+                                      first_line(sb.out)),
+          clip(first_line(sb.out), 120))
+
+    # The two-front-end agreement, grepped by the gate itself.
+    let text: str = read_file(path_join3(acc.root, "src/hlc/types.hls"))
+    let anchor: str = "fn is_keyword(w: str) -> bool {"
+    let start: int = text.find(anchor)
+    let mut greppable: bool = start >= 0
+    let mut body: str = ""
+    if greppable {
+        let end: int = find_from(text, "\n}", start + anchor.len())
+        greppable = end > start
+        if greppable {
+            body = text.slice(start + anchor.len(), end)
+        }
+    }
+    check(acc, "the self-hosted keyword chain is greppable", greppable, "")
+    if greppable {
+        let selfhost: list[str] = collect_eq_idents(body)
+        let keywords_live: RunResult = fzprobe(acc, ["syntax", "keywords"])
+        let frozen_ok: bool =
+            syn_list_equals_live(json_object_get(syn, "keywords"),
+                                 first_line(keywords_live.out))
+        check(acc, "the self-hosted chain equals the boot lexer's set",
+              join_with(selfhost, "|") == first_line(keywords_live.out),
+              clip(join_with(selfhost, "|"), 120))
+        check(acc, "the frozen keywords equal the self-hosted chain",
+              frozen_ok
+                  && syn_list_equals_live(
+                      json_object_get(syn, "keywords"),
+                      join_with(selfhost, "|")),
+              "")
+    }
+
+    # The attribute census, probed live by the gate.
+    let diag: RunResult = fzprobe(acc, ["census"])
+    let diag_txt: str = first_line(diag.out)
+    check(acc, "the junk-attribute probe is refused with the known-list",
+          diag.code == 0 && diag_txt != "NONE"
+              && diag_txt.contains("known:"),
+          clip(diag_txt, 120))
+    if diag_txt.contains("known:") {
+        let cut_i: int = diag_txt.find("known:")
+        let mut tail: str = diag_txt.slice(cut_i + 6, diag_txt.len())
+        let cut: int = tail.find(" (line")
+        if cut != -1 {
+            tail = tail.slice(0, cut)
+        }
+        let mut live_raw: str = tail.trim()
+        if live_raw.len() >= 2
+            && live_raw.slice(live_raw.len() - 2, live_raw.len()) == "))" {
+            live_raw = live_raw.slice(0, live_raw.len() - 1)
+        }
+        check(acc, "the frozen attribute census is the parser's live words",
+              jget_str(syn, "fn_attr_census_raw") == live_raw,
+              clip(live_raw, 120))
+        let fn_attrs: JsonValue = json_object_get(syn, "fn_attrs")
+        let mut n_attrs: int = -1
+        if json_is_array(fn_attrs) {
+            n_attrs = fn_attrs.arr.len()
+        }
+        check(acc, "the frozen attribute vocabulary carries 16 names "
+              + "including deprecated and taint_sink",
+              n_attrs == 16 && arr_has_str(fn_attrs, "deprecated")
+                  && arr_has_str(fn_attrs, "taint_sink"),
+              n_attrs.to_str())
+    }
+
+    # The primitive method tables, imported and compared row for row.
+    let bm: JsonValue = json_object_get(syn, "builtin_methods")
+    let mt1: RunResult = fzprobe(acc, ["mtable", "str"])
+    check(acc, "the str method table is the checker's own",
+          mt1.code == 0
+              && canon(json_object_get(bm, "str")) == first_line(mt1.out),
+          "")
+    let mt2: RunResult = fzprobe(acc, ["mtable", "int"])
+    check(acc, "the int method table is the checker's own",
+          mt2.code == 0
+              && canon(json_object_get(bm, "int")) == first_line(mt2.out),
+          "")
+    let mt3: RunResult = fzprobe(acc, ["mtable", "float"])
+    check(acc, "the float method table is the checker's own",
+          mt3.code == 0
+              && canon(json_object_get(bm, "float")) == first_line(mt3.out),
+          "")
+    let mt4: RunResult = fzprobe(acc, ["mtable", "bool"])
+    check(acc, "the bool method table is the checker's own",
+          mt4.code == 0
+              && canon(json_object_get(bm, "bool")) == first_line(mt4.out),
+          "")
+
+    # The container / concurrency method surface, DEMONSTRATED: the
+    # gate's own probes through the real checker.
+    # (the probes are the battery's, verbatim — the underscore
+    # bindings are the battery's own "value computed, not used" probe
+    # shape; the checker they exercise accepts them)
+    let p1: str = write_src(acc, "s2/probe_list_push.hls",
+        "fn main() -> void {\n    let xs: list[int] = [1, 2]\n"
+        + "    xs.push(3)\n    let _n: int = xs.len()\n"
+        + "    return\n}\n")
+    let p2: str = write_src(acc, "s2/probe_list_get.hls",
+        "fn main() -> void {\n    let xs: list[int] = [1]\n"
+        + "    let _x: int = xs.get(0)\n    return\n}\n")
+    let p3: str = write_src(acc, "s2/probe_chan_recv.hls",
+        "fn main() -> void uses Conc {\n"
+        + "    let ch: Chan[int] = chan_new()\n"
+        + "    let _x: int = ch.recv()\n    return\n}\n")
+    let p4: str = write_src(acc, "s2/probe_chan_try.hls",
+        "fn main() -> void uses Conc {\n"
+        + "    let ch: Chan[int] = chan_new()\n"
+        + "    let _b: bool = ch.try_send(1)\n    return\n}\n")
+    let p5: str = write_src(acc, "s2/probe_task_join.hls",
+        "fn __work() -> int { return 7 }\n"
+        + "fn main() -> void uses Conc {\n"
+        + "    let t: Task[int] = spawn(__work)\n"
+        + "    let _x: int = t.join()\n    return\n}\n")
+    let p6: str = write_src(acc, "s2/probe_map_get_or.hls",
+        "fn main() -> void {\n"
+        + "    let m: map[str, int] = map_new()\n"
+        + "    let _x: int = m.get_or(\"k\", 1)\n    return\n}\n")
+    let p7: str = write_src(acc, "s2/probe_str_byte_at.hls",
+        "fn main() -> void {\n    let s: str = \"abc\"\n"
+        + "    let _n: int = s.byte_at(0)\n    return\n}\n")
+    let p8: str = write_src(acc, "s2/probe_list_junk.hls",
+        "fn main() -> void {\n    let xs: list[int] = [1]\n"
+        + "    let _x: int = xs.zz_gate_junk(1)\n    return\n}\n")
+    let p9: str = write_src(acc, "s2/probe_chan_junk.hls",
+        "fn main() -> void uses Conc {\n"
+        + "    let ch: Chan[int] = chan_new()\n"
+        + "    let _x: int = ch.zz_gate_junk()\n    return\n}\n")
+
+    check_probe(acc, p1, "list.push", true, bm)
+    check_probe(acc, p2, "list.get", true, bm)
+    check_probe(acc, p3, "chan.recv", true, bm)
+    check_probe(acc, p4, "chan.try_send", true, bm)
+    check_probe(acc, p5, "task.join", true, bm)
+    check_probe(acc, p6, "map.get_or", true, bm)
+    check_probe(acc, p7, "str.byte_at", true, bm)
+    check_probe(acc, p8, "list junk", false, bm)
+    check_probe(acc, p9, "chan junk", false, bm)
+}
+
+# check_probe(acc, path, label, expect_accept, bm) — one probe through
+# the real checker, plus the roster row for the named labels.
+fn check_probe(acc: Acc, path: str, label: str, expect_accept: bool,
+               bm: JsonValue) -> void uses IO, Fs, Proc {
+    let r: RunResult = fzprobe(acc, ["probefile", path])
+    let verdict: str = first_line(r.out)
+    if expect_accept {
+        check(acc, "the probe channel accepts " + label
+              + " (demonstrated, not asserted)",
+              r.code == 0 && verdict == "NONE", clip(verdict, 120))
+        if label == "list.push" || label == "chan.recv"
+            || label == "task.join" || label == "map.get_or"
+            || label == "str.byte_at" {
+            let dot: int = label.find(".")
+            let kind: str = label.slice(0, dot)
+            let name: str = label.slice(dot + 1, label.len())
+            check(acc, "the frozen roster carries " + name + " for " + kind,
+                  json_object_has(json_object_get(bm, kind), name), "")
+        }
+    } else {
+        check(acc, "the probe channel refuses " + label,
+              r.code == 0 && verdict != "NONE"
+                  && verdict.contains("no method"),
+              clip(verdict, 120))
+    }
+}
+
+# find_from(text, needle, from) — text.find(needle, from).
+fn find_from(text: str, needle: str, from: int) -> int {
+    if from >= text.len() {
+        return -1
+    }
+    let rel: int = text.slice(from, text.len()).find(needle)
+    if rel < 0 {
+        return -1
+    }
+    return from + rel
+}
+
+# ----------------------------------------------------------------------------
+# Section 3 — the census law
+# ----------------------------------------------------------------------------
+
+fn section_3(acc: Acc, stdlib_frozen: JsonValue) -> void uses IO, Fs, Proc {
+    section("Section 3 — the census law")
+
+    let live: RunResult = fzprobe(acc, ["stdsurface"])
+    check(acc, "the frozen stdlib census equals the gate's own "
+          + "re-derivation, canonically",
+          live.code == 0 && live.out.trim() != ""
+              && canon(stdlib_frozen) == live.out.trim(),
+          "canon bytes: frozen " + canon(stdlib_frozen).len().to_str()
+              + ", live " + live.out.trim().len().to_str())
+
+    let fns: int = sum_modules(stdlib_frozen, "fns")
+    let structs: int = sum_modules(stdlib_frozen, "structs")
+    let enums: int = sum_modules(stdlib_frozen, "enums")
+    let edges: int = sum_modules(stdlib_frozen, "imports")
+    check(acc, "99 modules are frozen (sha256 amended in)",
+          stdlib_frozen.obj_keys.len() == 99,
+          stdlib_frozen.obj_keys.len().to_str())
+    check(acc, "3428 stdlib fns are frozen", fns == 3428, fns.to_str())
+    check(acc, "185 stdlib structs are frozen", structs == 185,
+          structs.to_str())
+    check(acc, "36 stdlib enums are frozen", enums == 36, enums.to_str())
+    check(acc, "213 import edges are frozen", edges == 213, edges.to_str())
+
+    # Row-level spot checks.
+    let hex_mod: JsonValue = json_object_get(stdlib_frozen, "std.hex")
+    let hex_fns: JsonValue = json_object_get(hex_mod, "fns")
+    check(acc, "std.hex carries hex_byte in the freeze",
+          json_object_has(hex_fns, "hex_byte"), "")
+    if json_object_has(hex_fns, "hex_byte") {
+        let rec: JsonValue = json_object_get(hex_fns, "hex_byte")
+        let params: JsonValue = json_object_get(rec, "params")
+        let mut sig_ok: bool = json_is_array(params) && params.arr.len() == 1
+        if sig_ok {
+            let row: JsonValue = params.arr.get(0)
+            sig_ok = json_is_array(row) && row.arr.len() == 3
+                && json_is_str(row.arr.get(0)) && row.arr.get(0).sval == "b"
+                && json_is_str(row.arr.get(1)) && row.arr.get(1).sval == "int"
+                && json_is_bool(row.arr.get(2))
+                && row.arr.get(2).bval == false
+        }
+        check(acc, "hex_byte's frozen signature is (b: int) -> str",
+              sig_ok && jget_str(rec, "ret") == "str",
+              clip(json_stringify(rec), 120))
+    }
+
+    # A method-keyed fn (impl Struct.method) lands in the census.
+    let dotted: int = count_dotted_fns(stdlib_frozen)
+    check(acc, "impl methods are frozen under their Struct.method keys ("
+          + dotted.to_str() + " of them)",
+          dotted > 0, dotted.to_str())
+}
+
+# sum_modules(stdlib, key) — sum of len(m[key]) over the modules.
+fn sum_modules(stdlib: JsonValue, key: str) -> int {
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < stdlib.obj_vals.len() {
+        let x: JsonValue = json_object_get(stdlib.obj_vals.get(i), key)
+        if json_is_object(x) {
+            n = n + x.obj_keys.len()
+        } else if json_is_array(x) {
+            n = n + x.arr.len()
+        }
+        i = i + 1
+    }
+    return n
+}
+
+# ----------------------------------------------------------------------------
+# Section 4 — the removal law
+# ----------------------------------------------------------------------------
+
+fn section_4(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 4 — the removal law")
+
+    let root: str = make_scratch(acc, "removal")
+
+    # (a) a deleted stdlib fn is REMOVED at its dotted path.
+    let hex_path: str = path_join3(root, "std/hex.hls")
+    let src: str = read_file(hex_path)
+    let i: int = src.find("fn hex_byte")
+    let j: int = find_from(src, "\nfn ", i + 1)
+    check(acc, "the scratch edit finds hex_byte's span", i > 0 && j > i,
+          i.to_str() + " / " + j.to_str())
+    if i > 0 && j > i {
+        write_file(hex_path, src.slice(0, i) + src.slice(j, src.len()))
+        let p: RunResult = freeze_run(acc, ["verify", "--root", root], root)
+        check(acc, "a removed export is drift, exit 1",
+              p.code == 1 && p.out.contains("DRIFTED"),
+              clip(first_line(p.combined), 120))
+        check(acc, "the removal is named at its dotted path",
+              p.out.contains("REMOVED")
+                  && p.out.contains("stdlib.std.hex.fns.hex_byte"),
+              clip(first_line(p.combined), 120))
+        write_file(hex_path, src)
+        let p2: RunResult = freeze_run(acc,
+            ["verify", "--quiet", "--root", root], root)
+        check(acc, "the revert is green again", p2.code == 0,
+              clip(first_line(p2.combined), 120))
+    } else {
+        check(acc, "a removed export is drift, exit 1", false, "no span")
+        check(acc, "the removal is named at its dotted path", false,
+              "no span")
+        check(acc, "the revert is green again", false, "no span")
+    }
+
+    # (b) a keyword removed from BOTH front-ends is syntax drift.
+    let boot_lexer: str = path_join3(root, "tools/hlinterp/lexer.py")
+    let types_hls: str = path_join3(root, "src/hlc/types.hls")
+    let bl: str = read_file(boot_lexer)
+    let th: str = read_file(types_hls)
+    write_file(boot_lexer, replace_first(bl, "\"where\",", "\"__moved__\","))
+    let p3: RunResult = freeze_run(acc, ["verify", "--root", root], root)
+    check(acc, "a one-front-end keyword removal is refused outright (the "
+          + "agreement law fires first)",
+          p3.code == 1 && p3.out.contains("front-ends disagree"),
+          clip(first_line(p3.combined), 120))
+    write_file(boot_lexer, replace_first(bl, "\"__moved__\",", "\"where\","))
+
+    # Now both: the boot table and the self-hosted chain.
+    write_file(boot_lexer, replace_first(bl, "\"where\",", "\"__moved__\","))
+    write_file(types_hls,
+               replace_first(th, "|| w == \"where\"",
+                             "|| w == \"__moved__\""))
+    let p4: RunResult = freeze_run(acc, ["verify", "--root", root], root)
+    check(acc, "a keyword removed from both front-ends is drift",
+          p4.code == 1 && p4.out.contains("DRIFTED"),
+          clip(first_line(p4.combined), 120))
+    check(acc, "the keyword drift is named in the syntax section",
+          p4.out.contains("syntax.keywords"),
+          clip(first_line(p4.combined), 120))
+    write_file(boot_lexer, bl)
+    write_file(types_hls, th)
+}
+
+# ----------------------------------------------------------------------------
+# Section 5 — the mutation law
+# ----------------------------------------------------------------------------
+
+# expect_drift(acc, root, hex_path, restore, tag, needle) — the
+# battery's expect_drift: the verify run names the row, then the file
+# is restored and the quiet re-verify green.
+fn expect_drift(acc: Acc, root: str, hex_path: str, restore: str, tag: str,
+                needle: str) -> void uses IO, Proc {
+    let p: RunResult = freeze_run(acc, ["verify", "--root", root], root)
+    check(acc, tag + " is named at its path",
+          p.code == 1 && p.out.contains(needle),
+          clip(first_line(p.combined), 120))
+    write_file(hex_path, restore)
+    freeze_run(acc, ["verify", "--quiet", "--root", root], root)
+}
+
+fn section_5(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 5 — the mutation law")
+
+    let root: str = make_scratch(acc, "mutation")
+    let hex_path: str = path_join3(root, "std/hex.hls")
+    let src: str = read_file(hex_path)
+
+    # (a) a parameter type change.
+    write_file(hex_path, replace_first(src, "fn hex_byte(b: int) -> str",
+                                       "fn hex_byte(b: str) -> str"))
+    expect_drift(acc, root, hex_path, src, "a parameter type change",
+                 "fns.hex_byte.params")
+
+    # (b) a return type change.
+    write_file(hex_path, replace_first(src, "fn hex_byte(b: int) -> str",
+                                       "fn hex_byte(b: int) -> int"))
+    expect_drift(acc, root, hex_path, src, "a return type change",
+                 "fns.hex_byte.ret")
+
+    # (c) an effect clause change (a pure fn grows uses IO).
+    let ci: int = src.find("fn hex_byte(b: int) -> str {")
+    if ci >= 0 {
+        write_file(hex_path, src.slice(0, ci)
+            + "fn hex_byte(b: int) -> str uses IO {"
+            + src.slice(ci + "fn hex_byte(b: int) -> str {".len(),
+                        src.len()))
+        expect_drift(acc, root, hex_path, src, "an effect clause change",
+                     "fns.hex_byte.effects")
+    } else {
+        check(acc, "an effect clause change is named at its path", false,
+              "no span")
+    }
+
+    # (d) a removed enum variant.
+    let opt_path: str = path_join3(root, "core/option.hls")
+    let opt: str = read_file(opt_path)
+    let oi: int = opt.find("enum Option")
+    let mut has_enum: bool = oi >= 0
+    if has_enum {
+        has_enum = find_from(opt, "{", oi) > oi
+    }
+    check(acc, "core.option carries the Option enum", has_enum, "")
+    if has_enum {
+        # the exact variant line: None carries no payload and closes
+        # the enum body
+        check(acc, "the None variant's span is found",
+              opt.contains("    None\n}"), "")
+        if opt.contains("    None\n}") {
+            write_file(opt_path, replace_first(opt, "    None\n}", "}"))
+            let p: RunResult = freeze_run(acc, ["verify", "--root", root],
+                                          root)
+            check(acc, "a removed enum variant is named at its path",
+                  p.code == 1
+                      && p.out.contains("stdlib.core.option.enums."
+                          + "Option.variants"),
+                  clip(first_line(p.combined), 120))
+            write_file(opt_path, opt)
+        }
+    }
+
+    # (e) a removed struct field.
+    let io_path: str = path_join3(root, "std/io.hls")
+    let io_src: str = read_file(io_path)
+    let si: int = io_src.find("struct ")
+    let mut has_struct: bool = si >= 0
+    let mut brace: int = -1
+    if has_struct {
+        brace = find_from(io_src, "{", si)
+        has_struct = brace > si
+    }
+    check(acc, "std.io carries a struct", has_struct, "")
+    if has_struct {
+        let f_colon: int = find_from(io_src, ":", brace)
+        let mut f_name_start: int = brace
+        let mut k: int = brace
+        while k < f_colon {
+            if io_src.byte_at(k) == 32 {
+                f_name_start = k
+            }
+            k = k + 1
+        }
+        let mut line_end: int = find_from(io_src, ",", f_colon)
+        if line_end == -1 {
+            line_end = find_from(io_src, "}", f_colon)
+        }
+        if f_colon > f_name_start && line_end > f_colon {
+            write_file(io_path, io_src.slice(0, f_name_start + 1)
+                + io_src.slice(line_end + 1, io_src.len()))
+            let p2: RunResult = freeze_run(acc, ["verify", "--root", root],
+                                           root)
+            check(acc, "a removed struct field is named at its path",
+                  p2.code == 1 && p2.out.contains(".fields"),
+                  clip(first_line(p2.combined), 120))
+            write_file(io_path, io_src)
+        } else {
+            check(acc, "a removed struct field is named at its path", false,
+                  "no field span")
+        }
+    }
+
+    # (f) a newly-deprecated fn: the record GAINS a key.
+    let i3: int = src.find("fn hex_byte")
+    if i3 >= 0 {
+        write_file(hex_path, src.slice(0, i3)
+            + "#[deprecated(\"use hex_encode\")]\n"
+            + src.slice(i3, src.len()))
+        let p3: RunResult = freeze_run(acc, ["verify", "--root", root], root)
+        check(acc, "a new deprecation is drift at the record's path",
+              p3.code == 1 && p3.out.contains("ADDED")
+                  && p3.out.contains("fns.hex_byte.deprecated"),
+              clip(first_line(p3.combined), 120))
+        write_file(hex_path, src)
+    } else {
+        check(acc, "a new deprecation is drift at the record's path", false,
+              "no span")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Section 6 — the addition law
+# ----------------------------------------------------------------------------
+
+fn section_6(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 6 — the addition law")
+
+    let root: str = make_scratch(acc, "addition")
+    let hex_path: str = path_join3(root, "std/hex.hls")
+    let src: str = read_file(hex_path)
+
+    # (a) a new stdlib fn is ADDED drift.
+    write_file(hex_path, src + "\nfn hex_freeze_new(x: int) -> int "
+        + "{ return x + 1 }\n")
+    let p: RunResult = freeze_run(acc, ["verify", "--root", root], root)
+    check(acc, "a post-freeze addition is drift, named at its path",
+          p.code == 1 && p.out.contains("ADDED")
+              && p.out.contains("stdlib.std.hex.fns.hex_freeze_new"),
+          clip(first_line(p.combined), 120))
+    write_file(hex_path, src)
+
+    # (b) a new builtin: the checker's own table grew.
+    let helpers: str = path_join3(root,
+                                  "tools/hlinterp/checking/helpers.py")
+    let hsrc: str = read_file(helpers)
+    write_file(helpers, replace_first(hsrc,
+        "\"print\", \"println\", \"panic\", \"exit\", \"str\", \"int\", "
+            + "\"len\", \"range\",",
+        "\"print\", \"println\", \"panic\", \"exit\", \"str\", \"int\", "
+            + "\"len\", \"range\", \"zz_gate_new_builtin\","))
+    let p2: RunResult = freeze_run(acc, ["verify", "--root", root], root)
+    check(acc, "a grown builtin table is syntax drift, named",
+          p2.code == 1 && p2.out.contains("syntax.builtin_fns"),
+          clip(first_line(p2.combined), 120))
+    write_file(helpers, hsrc)
+
+    # (c) the contrast: a comment-only edit moves NO row.
+    write_file(hex_path, "# a comment the freeze must not see\n" + src)
+    let p3: RunResult = freeze_run(acc,
+        ["verify", "--quiet", "--root", root], root)
+    check(acc, "a comment-only edit is NOT drift (the contract, not the "
+          + "bytes)",
+          p3.code == 0, clip(first_line(p3.combined), 120))
+}
+
+# ----------------------------------------------------------------------------
+# Section 7 — the amend law
+# ----------------------------------------------------------------------------
+
+fn section_7(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 7 — the amend law")
+
+    let root: str = make_scratch(acc, "amend")
+    let hex_path: str = path_join3(root, "std/hex.hls")
+    let src: str = read_file(hex_path)
+    let freeze_p: str = path_join3(root, "tests/api_freeze.json")
+    let chain_p: str = path_join3(root, "tests/api_freeze_amendments.jsonl")
+    let old_digest: str = jget_str(
+        parse_json_or_null(read_file(freeze_p)), "digest")
+
+    # (a) the refusals, named.
+    let p: RunResult = freeze_run(acc,
+        ["amend", "--by", "tester", "--root", root], root)
+    check(acc, "missing --reason is a usage error", p.code == 2,
+          p.code.to_str())
+    let p2: RunResult = freeze_run(acc,
+        ["amend", "--reason", "   ", "--by", "tester", "--root", root],
+        root)
+    check(acc, "a whitespace-only reason is a named refusal",
+          p2.code == 1 && p2.out.contains("without a written reason"),
+          clip(first_line(p2.combined), 120))
+    let p3: RunResult = freeze_run(acc,
+        ["amend", "--reason", "a real reason", "--root", root], root)
+    check(acc, "missing --by is a usage error", p3.code == 2,
+          p3.code.to_str())
+    let p4: RunResult = freeze_run(acc,
+        ["amend", "--reason", "a real reason", "--by", "tester", "--root",
+         root], root)
+    check(acc, "a no-op amendment is refused (noise is how real amendments "
+          + "stop being read)",
+          p4.code == 1 && p4.out.contains("nothing to amend"),
+          clip(first_line(p4.combined), 120))
+
+    # (b) the real amendment: the drift is absorbed, exactly one
+    # record lands, the delta is the diff the tool computed.
+    write_file(hex_path, src + "\nfn hex_freeze_new(x: int) -> int "
+        + "{ return x + 1 }\n")
+    let p5: RunResult = freeze_run(acc,
+        ["amend", "--reason",
+         "std.hex grows a helper for the v0.160 formatter",
+         "--by", "mhieuhonda", "--root", root], root)
+    check(acc, "a real amendment succeeds",
+          p5.code == 0 && p5.out.contains("AMENDED"),
+          clip(first_line(p5.combined), 120))
+    let records: list[JsonValue] = jsonl_records(read_file(chain_p))
+    check(acc, "exactly one record appended (the chain carried the sha256 "
+          + "record already)",
+          records.len() == 2, records.len().to_str())
+    if records.len() == 2 {
+        let rec: JsonValue = records.get(1)
+        check(acc, "the record is seq 2", jget_int(rec, "seq") == 2,
+              jget_int(rec, "seq").to_str())
+        check(acc, "the record is an amendment",
+              jget_str(rec, "kind") == "amend", jget_str(rec, "kind"))
+        check(acc, "the record names its author",
+              jget_str(rec, "by") == "mhieuhonda", jget_str(rec, "by"))
+        check(acc, "the record carries the written reason",
+              jget_str(rec, "reason").contains("v0.160 formatter"),
+              clip(jget_str(rec, "reason"), 80))
+        check(acc, "the recorded delta is the diff the tool computed",
+              arr_has_str(json_object_get(json_object_get(rec, "delta"),
+                  "added"), "stdlib.std.hex.fns.hex_freeze_new"),
+              clip(json_stringify(json_object_get(rec, "delta")), 120))
+        check(acc, "the record's from_digest is the digest it amended away",
+              jget_str(rec, "from_digest") == old_digest
+                  && old_digest != "",
+              "")
+
+        # (c) the chain, re-derived through the family's arithmetic.
+        check(acc, "entry two chains from entry one's hash",
+              jget_str(rec, "prev_hash")
+                  == jget_str(records.get(0), "chain_hash"),
+              "")
+        let want_hash: RunResult = fzprobe(acc,
+            ["chainof", jget_str(rec, "prev_hash"), canon(rec)])
+        check(acc, "chain_hash recomputes through the imported chain_of",
+              want_hash.code == 0
+                  && jget_str(rec, "chain_hash")
+                      == first_line(want_hash.out).trim()
+                  && jget_str(rec, "chain_hash") != "",
+              clip(first_line(want_hash.out), 80))
+
+        # (d) the document moved WITH the chain.
+        let new_doc: JsonValue = parse_json_or_null(read_file(freeze_p))
+        let hex_row: JsonValue = json_object_get(
+            json_object_get(json_object_get(new_doc, "surface"), "stdlib"),
+            "std.hex")
+        check(acc, "the amended document carries the added export",
+              json_object_has(json_object_get(hex_row, "fns"),
+                              "hex_freeze_new"),
+              "")
+        check(acc, "the new digest is the record's to_digest",
+              jget_str(new_doc, "digest") == jget_str(rec, "to_digest"),
+              "")
+        check(acc, "the amended document agrees with itself (gate's own "
+              + "canonicaliser)",
+              sha256_hex(canon(json_object_get(new_doc, "surface")))
+                  == jget_str(new_doc, "digest"),
+              "")
+        let p6: RunResult = freeze_run(acc,
+            ["verify", "--quiet", "--root", root], root)
+        check(acc, "verify is green after the amendment", p6.code == 0,
+              clip(first_line(p6.combined), 120))
+    } else {
+        check(acc, "the record is seq 2", false, "no records")
+        check(acc, "the record is an amendment", false, "no records")
+        check(acc, "the record names its author", false, "no records")
+        check(acc, "the record carries the written reason", false,
+              "no records")
+        check(acc, "the recorded delta is the diff the tool computed",
+              false, "no records")
+        check(acc, "the record's from_digest is the digest it amended away",
+              false, "no records")
+        check(acc, "entry two chains from entry one's hash", false,
+              "no records")
+        check(acc, "chain_hash recomputes through the imported chain_of",
+              false, "no records")
+        check(acc, "the amended document carries the added export", false,
+              "no records")
+        check(acc, "the new digest is the record's to_digest", false,
+              "no records")
+        check(acc, "the amended document agrees with itself (gate's own "
+              + "canonicaliser)", false, "no records")
+        check(acc, "verify is green after the amendment", false, "no "
+              + "records")
+    }
+
+    # (e) a second amendment is refused — the drift is absorbed.
+    let p7: RunResult = freeze_run(acc,
+        ["amend", "--reason", "another", "--by", "tester", "--root", root],
+        root)
+    check(acc, "a second amendment with no drift is refused",
+          p7.code == 1 && p7.out.contains("nothing to amend"),
+          clip(first_line(p7.combined), 120))
+
+    # (f) a tampered record breaks the replay at its line.
+    let records2: list[JsonValue] = jsonl_records(read_file(chain_p))
+    if records2.len() == 2 {
+        let rec2: JsonValue = records2.get(1)
+        let tampered: JsonValue = json_with_str(
+            json_with_str(rec2, "reason", "a different story"),
+            "chain_hash", hex64("0"))
+        write_file(chain_p, canon(records2.get(0)) + "\n"
+            + canon(tampered) + "\n")
+        let p8: RunResult = freeze_run(acc, ["verify", "--root", root],
+                                       root)
+        check(acc, "a tampered record breaks the replay at its line",
+              p8.code == 1 && p8.out.contains("BROKEN")
+                  && p8.out.contains("record 2"),
+              clip(first_line(p8.combined), 120))
+        write_file(chain_p, canon(records2.get(0)) + "\n"
+            + canon(rec2) + "\n")
+        let p9: RunResult = freeze_run(acc,
+            ["verify", "--quiet", "--root", root], root)
+        check(acc, "the restored chain replays clean", p9.code == 0,
+              clip(first_line(p9.combined), 120))
+    } else {
+        check(acc, "a tampered record breaks the replay at its line", false,
+              "no records")
+        check(acc, "the restored chain replays clean", false, "no records")
+    }
+}
+
+# hex64(c) — "0" * 64.
+fn hex64(c: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < 64 {
+        out = out + c
+        i = i + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# Section 8 — the report + corpus showcase
+# ----------------------------------------------------------------------------
+
+fn section_8(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 8 — the report + corpus showcase")
+
+    let root: str = make_scratch(acc, "report")
+    let out1: str = scratch(acc, "api_report_1.md")
+    let out2: str = scratch(acc, "api_report_2.md")
+    let p: RunResult = freeze_run(acc,
+        ["report", "--out", out1, "--root", root], root)
+    check(acc, "the report renders from the freeze", p.code == 0,
+          clip(first_line(p.combined), 120))
+    if p.code != 0 {
+        println("    report said: " + clip(p.out, 200))
+        check(acc, "the report embeds the digest", false, "no report")
+        check(acc, "the report names the stage and the release", false,
+              "no report")
+        check(acc, "the report carries the stdlib census (std.hex row)",
+              false, "no report")
+        check(acc, "the report carries the syntax surface", false,
+              "no report")
+        check(acc, "two renders of one freeze are byte-identical", false,
+              "no report")
+    } else {
+        let r1: str = read_file(out1)
+        let doc: JsonValue = parse_json_or_null(
+            read_file(path_join3(root, "tests/api_freeze.json")))
+        check(acc, "the report embeds the digest",
+              r1.contains(jget_str(doc, "digest")), "")
+        check(acc, "the report names the stage and the release",
+              r1.contains("Stage 141") && r1.contains("v0.159.0-alpha"),
+              "")
+        check(acc, "the report carries the stdlib census (std.hex row)",
+              r1.contains("hex_byte") && r1.contains("std.hex"),
+              "")
+        check(acc, "the report carries the syntax surface",
+              r1.contains("keywords") && r1.contains("asm"),
+              "")
+        let p2: RunResult = freeze_run(acc,
+            ["report", "--out", out2, "--root", root], root)
+        check(acc, "two renders of one freeze are byte-identical",
+              p2.code == 0 && read_file(out1) == read_file(out2),
+              "")
+    }
+
+    # The verify-first refusal: a drifted tree renders nothing.
+    let hex_path: str = path_join3(root, "std/hex.hls")
+    let src: str = read_file(hex_path)
+    write_file(hex_path, src + "\nfn zz_drift(x: int) -> int "
+        + "{ return x }\n")
+    let out3: str = scratch(acc, "api_report_3.md")
+    let p3: RunResult = freeze_run(acc,
+        ["report", "--out", out3, "--root", root], root)
+    check(acc, "a report is never rendered from a drifted tree, and writes "
+          + "no file",
+          p3.code == 1 && !file_exists(out3),
+          clip(first_line(p3.combined), 120))
+    write_file(hex_path, src)
+
+    # The corpus showcase.
+    let showcase: str = path_join3(acc.root,
+                                   "tests/ok/feat_stage141_apifreeze.hls")
+    let showcase_out: str = "stage 141: api freeze\n"
+        + "  freeze laws OK: drift vocabulary, amendment, digest,\n"
+        + "  chain, count, method roster, contract, state machine\n"
+
+    let p4: RunResult = boot_check(acc, showcase)
+    check(acc, "the showcase boots through the real checker", p4.code == 0,
+          clip(first_line(p4.combined), 120))
+    let p5: RunResult = boot(acc, [showcase])
+    check(acc, "the showcase runs green on the interpreter, exact output",
+          p5.code == 0 && p5.out == showcase_out,
+          clip(first_line(p5.combined), 120))
+    let p6: RunResult = run_capture(path_join3(acc.root, "bin/hlfmt"),
+                                    ["--check", showcase])
+    check(acc, "the showcase is hlfmt-canonical", p6.code == 0,
+          clip(first_line(p6.combined), 120))
+    let p7: RunResult = run_capture("python3", ["tools/hllint.py", showcase])
+    check(acc, "the showcase is hllint-clean",
+          p7.code == 0 && p7.out.contains("no warnings"),
+          clip(first_line(p7.combined), 120))
+
+    let mut cc: str = "gcc"
+    let ccv: Option[tainted[str]] = env_var("CC")
+    if option_is_some(ccv) {
+        cc = taint_unwrap(option_unwrap(ccv))
+    }
+    if file_exists(hlc_path(acc)) && which(cc) {
+        let c_path: str = scratch(acc, "showcase.c")
+        let bin_path: str = scratch(acc, "showcase_bin")
+        let r1: RunResult = run_capture(hlc_path(acc), [showcase, c_path])
+        if r1.code != 0 {
+            check(acc, "hlc compiled the showcase", false,
+                  clip(r1.out.trim(), 120))
+        } else {
+            let r2: RunResult = run_capture(cc,
+                ["-O2", "-o", bin_path, c_path, "-lm", "-pthread"])
+            if r2.code != 0 {
+                check(acc, "gcc compiled the showcase", false,
+                      clip(r2.out.trim(), 120))
+            } else {
+                let rn: RunResult = run_capture(bin_path, [])
+                check(acc, "the showcase matches natively, byte for byte",
+                      rn.code == 0 && rn.out == showcase_out,
+                      clip(first_line(rn.combined), 120))
+            }
+        }
+    } else {
+        println("  (bin/hlc or cc not available — native differential "
+            + "skipped, interpreter legs ran)")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Fs, Proc, Exit {
+    let acc: Acc = acc_new("freeze")
+
+    let doc: JsonValue = parse_json_or_null(
+        read_file(path_join3(acc.root, "tests/api_freeze.json")))
+    let syn: JsonValue = json_object_get(
+        json_object_get(doc, "surface"), "syntax")
+    let stdlib_frozen: JsonValue = json_object_get(
+        json_object_get(doc, "surface"), "stdlib")
+
+    section_1(acc)
+    section_2(acc, syn)
+    section_3(acc, stdlib_frozen)
+    section_4(acc)
+    section_5(acc)
+    section_6(acc)
+    section_7(acc)
+    section_8(acc)
+    return finish(acc, "Stage 141 -- the API freeze")
+}

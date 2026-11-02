@@ -1,0 +1,1108 @@
+# ============================================================================
+# tests/acc/lts_acceptance.hls — Stage 132 acceptance gate, in Halis
+# (the Halis twin of tests/lts_acceptance.py; same eight sections, same
+# assertions, same needles — the harness is tests/acc/harness.hls and
+# the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Eight sections over the REAL hls-lts CLI (bin/hls-lts) and REAL
+# scratch git repositories:
+#
+#  1. the convention — the no-policy refusals name the init remedy, the
+#                       usage exits, the unknown sha, the non-repo
+#  2. the init law    — the base tag must be a >= 1.0.0 release, the
+#                       green declaration lands in .hls-lts.json, the
+#                       idempotence, status in text and --json
+#  3. the classifier  — the BUGFIX prefixes, the FEATURE set, the CHORE
+#                       set, the fail-closed law, and the diff gate (a
+#                       fix adding a std fn is a feature in disguise)
+#  4. the backport    — the dry run, the green pick with its trailers,
+#     law               the class refusals, the duplicate, the dirty
+#                       worktree, the conflicted pick
+#  5. the tag law     — the empty release, the explicit tags judged
+#                       first, the auto name, the chain law, the dry run
+#  6. the audit law   — the clean branch, the chore, the rogue commit,
+#                       the forged trailer, the ghost sha, the
+#                       unclassified, the --json report, the rollbacks
+#  7. the release     — init, backport, tag, again, audit, status, and
+#     train              the branch history exactly the backported fixes
+#  8. the corpus      — tests/ok/feat_stage132_lts.hls is
+#     showcase          hlfmt-canonical, hllint-clean, boots through the
+#                       real checker, runs green on the interpreter and
+#                       (when bin/hlc exists) matches natively
+#
+# The battery set GIT_* identity vars for every child; the gate does the
+# same once up front (children inherit the parent's env). The battery's
+# asserts in make_repo/commit became "" returns; the callers fail their
+# first leg loudly instead of dying silently.
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.json"
+import "std.env"
+import "std.taint"
+
+# ----------------------------------------------------------------------------
+# Port helpers.
+# ----------------------------------------------------------------------------
+
+fn lts_run(root: str, args: list[str], repo: str) -> RunResult uses Proc {
+    let argv: list[str] = []
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    if repo != "" {
+        argv.push("--repo")
+        argv.push(repo)
+    }
+    return run_capture(path_join3(root, "bin/hls-lts"), argv)
+}
+
+fn git_run(repo: str, args: list[str]) -> RunResult uses Proc {
+    let argv: list[str] = ["-C", repo]
+    let mut i: int = 0
+    while i < args.len() {
+        argv.push(args.get(i))
+        i = i + 1
+    }
+    return run_capture("git", argv)
+}
+
+# make_repo(acc, name, base_file) — a fresh scratch repo with one base
+# commit tagged v1.0.0; "" on failure.
+fn make_repo(acc: Acc, name: str, base_file: str) -> str uses IO, Fs, Proc {
+    let repo: str = scratch(acc, name)
+    let init: RunResult = git_run(repo, ["init", "-q", "-b", "main", "."])
+    if init.code != 0 {
+        println("lts-acceptance: git init failed in " + repo + " — "
+            + first_line(init.combined))
+        return ""
+    }
+    let seed: str = commit_file(repo, base_file, "seed line\n",
+                                "stage 1: seed the project", "")
+    if seed == "" {
+        return ""
+    }
+    let t: RunResult = git_run(repo, ["tag", "v1.0.0"])
+    if t.code != 0 {
+        return ""
+    }
+    return repo
+}
+
+# commit_file(repo, fname, content, msg, tag) — the battery's one-file
+# commit: add ONLY the named file (a blanket `git add -A` would sweep
+# the untracked .hls-lts.json into branch commits), then the commit,
+# the optional tag, and rev-parse HEAD; "" on failure.
+fn commit_file(repo: str, fname: str, content: str, msg: str,
+               tag: str) -> str uses Fs, Proc {
+    let p: str = path_join3(repo, fname)
+    mkdirs(path_dir3(p))
+    write_file(p, content)
+    let add: RunResult = git_run(repo, ["add", "--", fname])
+    if add.code != 0 {
+        return ""
+    }
+    let c: RunResult = git_run(repo,
+        ["commit", "-q", "--allow-empty-message", "-m", msg])
+    if c.code != 0 {
+        return ""
+    }
+    if tag != "" {
+        let t: RunResult = git_run(repo, ["tag", tag])
+        if t.code != 0 {
+            return ""
+        }
+    }
+    let r: RunResult = git_run(repo, ["rev-parse", "HEAD"])
+    if r.code != 0 {
+        return ""
+    }
+    return r.out.trim()
+}
+
+# branch_head(repo, branch) — "" for the battery's None.
+fn branch_head(repo: str, branch: str) -> str uses Proc {
+    let r: RunResult = git_run(repo, ["rev-parse", branch])
+    if r.code != 0 {
+        return ""
+    }
+    return r.out.trim()
+}
+
+# messages(repo, branch, base_sha) — the subjects base..branch, in
+# order, as the battery's splitlines (an empty log → an empty list
+# marker "").
+fn messages(repo: str, branch: str, base_sha: str) -> list[str] uses Proc {
+    let r: RunResult = git_run(repo,
+        ["log", "--format=%s", base_sha + ".." + branch, "--reverse"])
+    if r.code != 0 || r.out.trim() == "" {
+        let empty: list[str] = []
+        return empty
+    }
+    return r.out.trim().split("\n")
+}
+
+# load_json(acc, r) — the battery's json.loads with the counted FAIL on
+# a malformed payload.
+fn load_json(acc: Acc, r: RunResult) -> JsonValue uses IO {
+    let rr: Result[JsonValue, str] = json_parse_result(r.out)
+    if result_is_ok(rr) {
+        return result_unwrap(rr)
+    }
+    check(acc, "json is not well-formed", false, clip(r.out, 80))
+    return json_null()
+}
+
+# jget_str / jget_int — kind-guarded accessors.
+fn jget_str(v: JsonValue, key: str) -> str {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_str(x) {
+        return json_str_value(x)
+    }
+    return ""
+}
+
+fn jget_int(v: JsonValue, key: str) -> int {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_int(x) {
+        return json_int_value(x)
+    }
+    return -1
+}
+
+# hex64(c) — "0" * 40's big brother, kept for the ghost-trailer sha.
+fn hex64(c: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < 64 {
+        out = out + c
+        i = i + 1
+    }
+    return out
+}
+
+# reasons_have(data, needle) — any(needle in x for x in data["reasons"]).
+fn reasons_have(data: JsonValue, needle: str) -> bool {
+    let rs: JsonValue = json_object_get(data, "reasons")
+    if !json_is_array(rs) {
+        return false
+    }
+    let mut i: int = 0
+    while i < rs.arr.len() {
+        if json_is_str(rs.arr.get(i)) && rs.arr.get(i).sval.contains(needle) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# ----------------------------------------------------------------------------
+# Section 1 — the convention
+# ----------------------------------------------------------------------------
+
+fn section_1(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 1 — the convention")
+
+    # The no-policy refusals run against a scratch repo: the real tree
+    # declared its line with the v1.0.0 release, and the refusal this
+    # section pins belongs to a tree that has not.
+    let nopolicy: str = make_repo(acc, "no-policy", "app.txt")
+    if nopolicy == "" {
+        check(acc, "status without a policy refuses and names the init "
+              + "remedy", false, "make_repo failed")
+        return
+    }
+
+    let p: RunResult = lts_run(acc.root, ["status"], nopolicy)
+    check(acc, "status without a policy refuses and names the init remedy",
+          p.code == 1 && p.out.contains("no LTS policy declared")
+              && p.out.contains("init --tag v1.0.0"),
+          clip(first_line(p.combined), 120))
+
+    let p2: RunResult = lts_run(acc.root, ["backport", "HEAD"], nopolicy)
+    check(acc, "backport without a policy refuses, named",
+          p2.code == 1 && p2.out.contains("no LTS policy declared"),
+          clip(first_line(p2.combined), 120))
+
+    let p3: RunResult = lts_run(acc.root, ["audit"], nopolicy)
+    check(acc, "audit without a policy refuses, named",
+          p3.code == 1 && p3.out.contains("no LTS policy declared"),
+          clip(first_line(p3.combined), 120))
+
+    let p4: RunResult = lts_run(acc.root, ["nosuchcmd"], "")
+    check(acc, "an unknown subcommand is a usage error (exit 2)",
+          p4.code == 2, p4.code.to_str())
+
+    let p5: RunResult = lts_run(acc.root,
+        ["classify", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"],
+        acc.scratch_base)
+    check(acc, "classify of an unknown sha refuses, named",
+          p5.code == 1 && p5.out.contains("does not name a commit"),
+          clip(first_line(p5.combined), 120))
+
+    let p6: RunResult = lts_run(acc.root, ["init"], "")
+    check(acc, "init without --tag is a usage error (2)", p6.code == 2,
+          p6.code.to_str())
+
+    # Not a git repository at all (the battery passed a path that does
+    # not exist — built here without creating it).
+    let p7: RunResult = lts_run(acc.root, ["status"],
+        acc.scratch_base + "/not-a-repo")
+    check(acc, "a non-repo target refuses, named",
+          p7.code == 1 && p7.out.contains("not a git repository"),
+          clip(first_line(p7.combined), 120))
+}
+
+# ----------------------------------------------------------------------------
+# Section 2 — the init law
+# ----------------------------------------------------------------------------
+
+fn section_2(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 2 — the init law")
+    let r: str = make_repo(acc, "init-law", "app.txt")
+    if r == "" {
+        check(acc, "a pre-1.0 base is refused (the policy begins after "
+              + "v1.0)", false, "make_repo failed")
+        return
+    }
+
+    # The base tag must be a >= 1.0.0 release.
+    let p: RunResult = lts_run(acc.root, ["init", "--tag", "v0.9.0"], r)
+    check(acc, "a pre-1.0 base is refused (the policy begins after v1.0)",
+          p.code == 1 && p.out.contains("pre-1.0"),
+          clip(first_line(p.combined), 120))
+
+    let p2: RunResult = lts_run(acc.root, ["init", "--tag", "v1.0.0-rc.1"], r)
+    check(acc, "a pre-release base is refused (an LTS is a release)",
+          p2.code == 1 && p2.out.contains("pre-release"),
+          clip(first_line(p2.combined), 120))
+
+    let p3: RunResult = lts_run(acc.root, ["init", "--tag", "not-a-version"],
+                                r)
+    check(acc, "a non-semver base is refused, named",
+          p3.code == 1 && p3.out.contains("not a valid semantic version"),
+          clip(first_line(p3.combined), 120))
+
+    let p4: RunResult = lts_run(acc.root, ["init", "--tag", "v9.9.9"], r)
+    check(acc, "a nonexistent tag is refused, named",
+          p4.code == 1 && p4.out.contains("does not exist"),
+          clip(first_line(p4.combined), 120))
+
+    # The green declaration.
+    let p5: RunResult = lts_run(acc.root,
+        ["init", "--tag", "v1.0.0", "--branch", "release/1.0"], r)
+    check(acc, "init from v1.0.0 declares the branch",
+          p5.code == 0 && p5.out.contains("declared LTS branch"),
+          clip(first_line(p5.combined), 120))
+
+    let pol_path: str = path_join3(r, ".hls-lts.json")
+    check(acc, "the declaration lands in .hls-lts.json",
+          file_exists(pol_path), pol_path)
+
+    let pol: JsonValue = parse_json_or_null(read_file(pol_path))
+    check(acc, "the declaration names the policy, branch and base tag",
+          json_is_object(pol) && jget_str(pol, "policy") == "halis-lts-1"
+              && jget_str(pol, "branch") == "release/1.0"
+              && jget_str(pol, "base_tag") == "v1.0.0",
+          clip(json_stringify(pol), 120))
+
+    let base_sha: str = branch_head(r, "main")
+    check(acc, "the base sha is the tagged commit",
+          jget_str(pol, "base_sha") == base_sha && base_sha != "",
+          jget_str(pol, "base_sha"))
+
+    check(acc, "the branch was created at the base commit",
+          branch_head(r, "release/1.0") == base_sha, "")
+
+    # Idempotence.
+    let p6: RunResult = lts_run(acc.root,
+        ["init", "--tag", "v1.0.0", "--branch", "release/1.0"], r)
+    check(acc, "re-init with the same tag and branch is a no-op",
+          p6.code == 0 && p6.out.contains("no-op"),
+          clip(first_line(p6.combined), 120))
+
+    let p7: RunResult = lts_run(acc.root, ["init", "--tag", "v1.0.1"], r)
+    check(acc, "re-init with a different base is a refusal, named",
+          p7.code == 1 && p7.out.contains("already declared"),
+          clip(first_line(p7.combined), 120))
+
+    # Status reports the declaration.
+    let p8: RunResult = lts_run(acc.root, ["status"], r)
+    check(acc, "status prints the declaration and a clean audit",
+          p8.code == 0 && p8.out.contains("release/1.0")
+              && p8.out.contains("v1.0.0")
+              && p8.out.contains("commits since base: 0")
+              && p8.out.contains("audit: clean"),
+          clip(first_line(p8.combined), 120))
+
+    let p9: RunResult = lts_run(acc.root, ["status", "--json"], r)
+    check(acc, "status --json exits 0", p9.code == 0,
+          clip(first_line(p9.combined), 120))
+
+    let data: JsonValue = load_json(acc, p9)
+    let violations: JsonValue = json_object_get(data, "violations")
+    check(acc, "status --json carries the declaration and state",
+          json_is_object(data)
+              && jget_str(json_object_get(data, "policy"), "base_tag")
+                  == "v1.0.0"
+              && jget_int(data, "commits_since_base") == 0
+              && json_is_array(violations) && violations.arr.len() == 0,
+          clip(json_stringify(data), 120))
+}
+
+# parse_json_or_null(text) — silent null on a malformed payload.
+fn parse_json_or_null(text: str) -> JsonValue {
+    let rr: Result[JsonValue, str] = json_parse_result(text)
+    if result_is_ok(rr) {
+        return result_unwrap(rr)
+    }
+    return json_null()
+}
+
+# ----------------------------------------------------------------------------
+# Section 3 — the classifier
+# ----------------------------------------------------------------------------
+
+fn classify_class(acc: Acc, r: str, sha: str) -> JsonValue uses IO, Proc {
+    let p: RunResult = lts_run(acc.root, ["classify", sha, "--json"], r)
+    return load_json(acc, p)
+}
+
+fn section_3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 3 — the classifier")
+    let r: str = make_repo(acc, "classifier", "app.txt")
+    if r == "" {
+        check(acc, "fix: classifies BUGFIX", false, "make_repo failed")
+        return
+    }
+    # A std module and a tools file for the diff gate.
+    let seed2: str = commit_file(r, "std/alpha.hls",
+        "fn existing() -> int { return 1 }\n", "stage 1: seed the modules",
+        "")
+    let seed3: str = commit_file(r, "tools/impl.py", "def old():\n    return 1\n",
+                                 "", "")
+    if seed2 == "" || seed3 == "" {
+        check(acc, "fix: classifies BUGFIX", false, "commit failed")
+        return
+    }
+
+    # The BUGFIX prefixes.
+    let fix_sha: str = commit_file(r, "fix.txt", "one\n",
+        "fix: widget crash on empty input", "")
+    if fix_sha == "" {
+        check(acc, "fix: classifies BUGFIX", false, "commit failed")
+        return
+    }
+    let p: RunResult = lts_run(acc.root, ["classify", fix_sha], r)
+    check(acc, "fix: classifies BUGFIX",
+          p.code == 0 && p.out.contains("class:   BUGFIX"),
+          clip(first_line(p.combined), 120))
+
+    let bugfixes: list[str] = ["bugfix: restore shipped behaviour",
+                               "revert: the bad constant",
+                               "hotfix: unbreak the build",
+                               "regression: 0.149 broke str_join"]
+    let mut i: int = 0
+    while i < bugfixes.len() {
+        let subject: str = bugfixes.get(i)
+        let sha: str = commit_file(r, "notes.txt", subject + "\n", subject,
+                                   "")
+        let data: JsonValue = classify_class(acc, r, sha)
+        check(acc, subject.slice(0, subject.find(":")) + " -> BUGFIX",
+              json_is_object(data) && jget_str(data, "class") == "BUGFIX",
+              jget_str(data, "class"))
+        i = i + 1
+    }
+
+    # The FEATURE set.
+    let features: list[str] = ["feat: new widget", "feature: nicer",
+        "add: another entrypoint", "stage: 133 begins",
+        "spec: the grammar grows", "stdlib: new api",
+        "perf: rewrite the loop", "opt: tighten it",
+        "refactor: move things around"]
+    i = 0
+    while i < features.len() {
+        let subject: str = features.get(i)
+        let sha: str = commit_file(r, "notes.txt", subject + "\n", subject,
+                                   "")
+        let data: JsonValue = classify_class(acc, r, sha)
+        check(acc, subject.slice(0, subject.find(":")) + " -> FEATURE",
+              json_is_object(data) && jget_str(data, "class") == "FEATURE",
+              jget_str(data, "class"))
+        i = i + 1
+    }
+
+    # The CHORE set.
+    let chores: list[str] = ["chore: changelog", "release: 1.0.1 notes",
+        "docs: readme typo", "test: more pins",
+        "ci: cache the toolchain", "meta: meeting notes"]
+    i = 0
+    while i < chores.len() {
+        let subject: str = chores.get(i)
+        let sha: str = commit_file(r, "notes.txt", subject + "\n", subject,
+                                   "")
+        let data: JsonValue = classify_class(acc, r, sha)
+        check(acc, subject.slice(0, subject.find(":")) + " -> CHORE",
+              json_is_object(data) && jget_str(data, "class") == "CHORE",
+              jget_str(data, "class"))
+        i = i + 1
+    }
+
+    # The fail-closed law.
+    let unknowns: list[str] = ["bare message no prefix",
+        "semver: an unrecognized prefix",
+        "Stage 131 (v0.149.0-alpha): a release", ""]
+    i = 0
+    while i < unknowns.len() {
+        let subject: str = unknowns.get(i)
+        let mut note: str = subject
+        if note == "" {
+            note = "empty"
+        }
+        let sha: str = commit_file(r, "notes.txt", note + "\n", subject, "")
+        let data: JsonValue = classify_class(acc, r, sha)
+        check(acc, "fail-closed: " + clip(subject, 34) + " -> UNKNOWN",
+              json_is_object(data) && jget_str(data, "class") == "UNKNOWN",
+              jget_str(data, "class"))
+        i = i + 1
+    }
+
+    # The diff gate: a fix that adds a top-level fn in std/ is a
+    # feature in disguise.
+    let sha2: str = commit_file(r, "std/alpha.hls",
+        "fn existing() -> int { return 1 }\n"
+        + "fn brand_new_api() -> int { return 9 }\n",
+        "fix: correct the delta constant", "")
+    if sha2 == "" {
+        check(acc, "a fix adding a std fn re-classes FEATURE, reason named",
+              false, "commit failed")
+        return
+    }
+    let d1: JsonValue = classify_class(acc, r, sha2)
+    check(acc, "a fix adding a std fn re-classes FEATURE, reason named",
+          json_is_object(d1) && jget_str(d1, "class") == "FEATURE"
+              && reasons_have(d1, "brand_new_api"),
+          clip(json_stringify(d1), 120))
+
+    # A fix that edits a fn IN PLACE stays BUGFIX.
+    let sha3: str = commit_file(r, "std/alpha.hls",
+        "fn existing() -> int { return 3 }\n"
+        + "fn brand_new_api() -> int { return 9 }\n",
+        "fix: existing returns 3", "")
+    if sha3 == "" {
+        check(acc, "a fix editing a fn in place stays BUGFIX", false,
+              "commit failed")
+        return
+    }
+    let d2: JsonValue = classify_class(acc, r, sha3)
+    check(acc, "a fix editing a fn in place stays BUGFIX",
+          json_is_object(d2) && jget_str(d2, "class") == "BUGFIX",
+          jget_str(d2, "class"))
+
+    # A def in tools/ is implementation detail.
+    let sha4: str = commit_file(r, "tools/impl.py",
+        "def old():\n    return 2\n\ndef new_helper():\n    pass\n",
+        "fix: tooling repair", "")
+    if sha4 == "" {
+        check(acc, "a def in tools/ does not trip the diff gate", false,
+              "commit failed")
+        return
+    }
+    let d3: JsonValue = classify_class(acc, r, sha4)
+    check(acc, "a def in tools/ does not trip the diff gate",
+          json_is_object(d3) && jget_str(d3, "class") == "BUGFIX",
+          jget_str(d3, "class"))
+
+    # SPEC.md edits are language changes.
+    let sha5: str = commit_file(r, "SPEC.md",
+        "# the grammar\n\nmore of it\n",
+        "fix: document the real behaviour", "")
+    if sha5 == "" {
+        check(acc, "a fix touching SPEC.md re-classes FEATURE, reason named",
+              false, "commit failed")
+        return
+    }
+    let d4: JsonValue = classify_class(acc, r, sha5)
+    check(acc, "a fix touching SPEC.md re-classes FEATURE, reason named",
+          json_is_object(d4) && jget_str(d4, "class") == "FEATURE"
+              && reasons_have(d4, "SPEC.md"),
+          clip(json_stringify(d4), 120))
+}
+
+# ----------------------------------------------------------------------------
+# Section 4 — the backport law
+# ----------------------------------------------------------------------------
+
+fn section_4(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 4 — the backport law")
+    let r: str = make_repo(acc, "backport-law", "app.txt")
+    if r == "" {
+        check(acc, "the policy is declared", false, "make_repo failed")
+        return
+    }
+    let fix_sha: str = commit_file(r, "bug.txt", "fixed\n",
+        "fix: the off-by-one in the counter", "")
+    let feat_sha: str = commit_file(r, "widget.txt", "new\n",
+        "feat: the widget nobody asked for", "")
+    let chore_sha: str = commit_file(r, "notes.txt", "release notes\n",
+        "chore: changelog note", "")
+    let bare_sha: str = commit_file(r, "notes.txt", "more\n",
+        "tidy up a few things", "")
+    if fix_sha == "" || feat_sha == "" || chore_sha == "" || bare_sha == "" {
+        check(acc, "the policy is declared", false, "commit failed")
+        return
+    }
+
+    let ini: RunResult = lts_run(acc.root, ["init", "--tag", "v1.0.0"], r)
+    check(acc, "the policy is declared", ini.code == 0,
+          clip(first_line(ini.combined), 120))
+
+    # Dry run predicts and touches nothing.
+    let before: str = branch_head(r, "release/1.0")
+    let p: RunResult = lts_run(acc.root,
+        ["backport", fix_sha, "--dry-run"], r)
+    check(acc, "a dry run predicts the BUGFIX pick",
+          p.code == 0 && p.out.contains("dry run")
+              && p.out.contains("BUGFIX"),
+          clip(first_line(p.combined), 120))
+    check(acc, "the dry run touched nothing",
+          branch_head(r, "release/1.0") == before && before != "", "")
+
+    # The green path.
+    let p2: RunResult = lts_run(acc.root, ["backport", fix_sha], r)
+    check(acc, "the BUGFIX backports cleanly",
+          p2.code == 0 && p2.out.contains("applied")
+              && p2.out.contains("provenance"),
+          clip(first_line(p2.combined), 120))
+    let picked: str = branch_head(r, "release/1.0")
+    let body: RunResult = git_run(r, ["log", "-1", "--format=%B", picked])
+    check(acc, "the pick carries the Backported-from trailer",
+          body.out.contains("Backported-from: " + fix_sha),
+          clip(first_line(body.out), 120))
+    check(acc, "git's own -x provenance is preserved",
+          body.out.contains("(cherry picked from commit " + fix_sha),
+          "")
+    let cur: RunResult = git_run(r, ["rev-parse", "--abbrev-ref", "HEAD"])
+    check(acc, "the worktree returned to the branch it started on",
+          cur.out.trim() == "main", cur.out.trim())
+    let st: RunResult = git_run(r, ["status", "--porcelain", "-uno"])
+    check(acc, "the worktree is clean after the pick (the untracked policy "
+          + "file is the declaration, not dirt)",
+          st.out.trim() == "", clip(st.out.trim(), 80))
+
+    # Refusals: by class.
+    let before2: str = branch_head(r, "release/1.0")
+    let p3: RunResult = lts_run(acc.root, ["backport", feat_sha], r)
+    check(acc, "a FEATURE upstream is refused by class",
+          p3.code == 1 && p3.out.contains("REFUSED")
+              && p3.out.contains("FEATURE"),
+          clip(first_line(p3.combined), 120))
+    check(acc, "the refusal left the branch byte-identical",
+          branch_head(r, "release/1.0") == before2, "")
+
+    let p4: RunResult = lts_run(acc.root, ["backport", chore_sha], r)
+    check(acc, "a CHORE upstream is refused by class (it lands directly, "
+          + "not via backport)",
+          p4.code == 1 && p4.out.contains("CHORE"),
+          clip(first_line(p4.combined), 120))
+
+    let p5: RunResult = lts_run(acc.root, ["backport", bare_sha], r)
+    check(acc, "an UNKNOWN upstream is refused (fail-closed)",
+          p5.code == 1 && p5.out.contains("UNKNOWN"),
+          clip(first_line(p5.combined), 120))
+    check(acc, "all refusals left the branch untouched",
+          branch_head(r, "release/1.0") == before2, "")
+
+    # A duplicate pick (already applied) is refused, branch intact.
+    let p6: RunResult = lts_run(acc.root, ["backport", fix_sha], r)
+    check(acc, "a duplicate pick is refused",
+          p6.code == 1 && p6.out.contains("REFUSED"),
+          clip(first_line(p6.combined), 120))
+    check(acc, "the duplicate refusal left the branch untouched",
+          branch_head(r, "release/1.0") == before2, "")
+
+    # A dirty worktree is refused before anything happens.
+    let bug_txt: str = path_join3(r, "bug.txt")
+    write_file(bug_txt, read_file(bug_txt) + "uncommitted\n")
+    let p7: RunResult = lts_run(acc.root, ["backport", fix_sha], r)
+    check(acc, "a dirty worktree is refused, named",
+          p7.code == 1 && p7.out.contains("uncommitted"),
+          clip(first_line(p7.combined), 120))
+    rmrf(bug_txt)
+    git_run(r, ["checkout", "-q", "--", "."])
+
+    # A conflicted pick is refused with the branch byte-identical:
+    # the branch's own chore edits the same line the upstream fix
+    # edits, so git cannot apply it.
+    let br: str = branch_head(r, "release/1.0")
+    let co1: RunResult = git_run(r, ["checkout", "-q", "release/1.0"])
+    let branch_chore: str = commit_file(r, "app.txt", "branch line\n",
+        "chore: branch-side bookkeeping edit", "")
+    let co2: RunResult = git_run(r, ["checkout", "-q", "main"])
+    let conflict_sha: str = commit_file(r, "app.txt", "main line\n",
+        "fix: the same line fixed on main", "")
+    if br == "" || co1.code != 0 || co2.code != 0 || branch_chore == ""
+        || conflict_sha == "" {
+        check(acc, "a conflicted pick is refused, branch untouched", false,
+              "commit failed")
+        return
+    }
+    let p8: RunResult = lts_run(acc.root, ["backport", conflict_sha], r)
+    check(acc, "a conflicted pick is refused, branch untouched",
+          p8.code == 1 && p8.out.contains("REFUSED")
+              && p8.out.contains("untouched"),
+          clip(first_line(p8.combined), 120))
+    check(acc, "the branch ref still resolves",
+          branch_head(r, "release/1.0")
+              == git_run(r, ["rev-parse", "release/1.0"]).out.trim()
+          && branch_head(r, "release/1.0") != "",
+          "")
+    let p9: RunResult = git_run(r,
+        ["log", "--format=%s", br + "..release/1.0"])
+    check(acc, "the conflicted fix did not land",
+          !p9.out.contains("fix: the same line fixed on main"),
+          clip(first_line(p9.out), 80))
+    let st2: RunResult = git_run(r, ["status", "--porcelain", "-uno"])
+    check(acc, "no cherry-pick state was left behind", st2.out.trim() == "",
+          clip(st2.out.trim(), 80))
+}
+
+# ----------------------------------------------------------------------------
+# Section 5 — the tag law
+# ----------------------------------------------------------------------------
+
+fn section_5(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 5 — the tag law")
+    let r: str = make_repo(acc, "tag-law", "app.txt")
+    if r == "" {
+        check(acc, "tag-patch on a branch with no commits refuses, named",
+              false, "make_repo failed")
+        return
+    }
+    lts_run(acc.root, ["init", "--tag", "v1.0.0"], r)
+
+    # The empty-release law fires first.
+    let p: RunResult = lts_run(acc.root, ["tag-patch"], r)
+    check(acc, "tag-patch on a branch with no commits refuses, named",
+          p.code == 1 && p.out.contains("empty release is not a release")
+              && p.out.contains("v1.0.0"),
+          clip(first_line(p.combined), 120))
+
+    let fix_sha: str = commit_file(r, "bug.txt", "fixed\n",
+                                   "fix: the counter wrap", "")
+    if fix_sha == "" {
+        check(acc, "the fix backports", false, "commit failed")
+        return
+    }
+    let p2: RunResult = lts_run(acc.root, ["backport", fix_sha], r)
+    check(acc, "the fix backports", p2.code == 0,
+          clip(first_line(p2.combined), 120))
+
+    # Explicit tags are judged before anything is cut.
+    let p3: RunResult = lts_run(acc.root, ["tag-patch", "--tag", "v1.1.0"], r)
+    check(acc, "a minor bump is refused (an LTS is patch-only)",
+          p3.code == 1 && p3.out.contains("patch-only"),
+          clip(first_line(p3.combined), 120))
+
+    let p4: RunResult = lts_run(acc.root,
+        ["tag-patch", "--tag", "v1.0.1-pre"], r)
+    check(acc, "a pre-release tag is refused (an LTS release is a release)",
+          p4.code == 1 && p4.out.contains("pre-release"),
+          clip(first_line(p4.combined), 120))
+
+    let p5: RunResult = lts_run(acc.root, ["tag-patch", "--tag", "v1.0.3"], r)
+    check(acc, "a tag off the chain is refused with the expected name (no "
+          + "patch release exists yet, so v1.0.1 is next)",
+          p5.code == 1 && p5.out.contains("no gaps")
+              && p5.out.contains("expected v1.0.1"),
+          clip(first_line(p5.combined), 120))
+
+    let p6: RunResult = lts_run(acc.root, ["tag-patch", "--tag", "banana"], r)
+    check(acc, "a non-semver tag is refused, named",
+          p6.code == 1 && p6.out.contains("not a valid semantic version"),
+          clip(first_line(p6.combined), 120))
+
+    # The auto name.
+    let p7: RunResult = lts_run(acc.root, ["tag-patch"], r)
+    check(acc, "tag-patch cuts v1.0.1 after the backport",
+          p7.code == 0 && p7.out.contains("tagged v1.0.1"),
+          clip(first_line(p7.combined), 120))
+    let tagged: RunResult = git_run(r, ["rev-parse", "v1.0.1^{commit}"])
+    check(acc, "the tag names the branch head",
+          tagged.out.trim() == branch_head(r, "release/1.0")
+              && branch_head(r, "release/1.0") != "",
+          "")
+
+    # No commits since v1.0.1 -> refused.
+    let p8: RunResult = lts_run(acc.root, ["tag-patch"], r)
+    check(acc, "a second tag without new commits is refused",
+          p8.code == 1 && p8.out.contains("no commits since v1.0.1"),
+          clip(first_line(p8.combined), 120))
+
+    # An off-chain duplicate name is refused by the chain law (the
+    # expected next tag is named, which subsumes the duplicate).
+    let fix2: str = commit_file(r, "bug.txt", "fixed again\n",
+                                "fix: the wrap again", "")
+    if fix2 == "" {
+        check(acc, "a stale tag name is refused by the chain law", false,
+              "commit failed")
+        return
+    }
+    lts_run(acc.root, ["backport", fix2], r)
+    let p9: RunResult = lts_run(acc.root, ["tag-patch", "--tag", "v1.0.1"], r)
+    check(acc, "a stale tag name is refused by the chain law",
+          p9.code == 1 && p9.out.contains("expected v1.0.2"),
+          clip(first_line(p9.combined), 120))
+
+    # The dry run.
+    let p10: RunResult = lts_run(acc.root, ["tag-patch", "--dry-run"], r)
+    check(acc, "the dry run predicts v1.0.2 and touches nothing",
+          p10.code == 0 && p10.out.contains("dry run")
+              && p10.out.contains("v1.0.2"),
+          clip(first_line(p10.combined), 120))
+    let p11: RunResult = lts_run(acc.root, ["tag-patch"], r)
+    check(acc, "the real second release cuts v1.0.2",
+          p11.code == 0 && p11.out.contains("tagged v1.0.2"),
+          clip(first_line(p11.combined), 120))
+}
+
+# ----------------------------------------------------------------------------
+# Section 6 — the audit law
+# ----------------------------------------------------------------------------
+
+fn section_6(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 6 — the audit law")
+    let r: str = make_repo(acc, "audit-law", "app.txt")
+    if r == "" {
+        check(acc, "a branch of backports audits clean", false,
+              "make_repo failed")
+        return
+    }
+    let fix1: str = commit_file(r, "bug.txt", "one\n", "fix: the parser crash",
+                                "")
+    let feat1: str = commit_file(r, "widget.txt", "new\n",
+                                 "feat: the seasonal widget", "")
+    if fix1 == "" || feat1 == "" {
+        check(acc, "a branch of backports audits clean", false,
+              "commit failed")
+        return
+    }
+    lts_run(acc.root, ["init", "--tag", "v1.0.0"], r)
+    lts_run(acc.root, ["backport", fix1], r)
+
+    # A clean branch audits clean.
+    let p: RunResult = lts_run(acc.root, ["audit"], r)
+    check(acc, "a branch of backports audits clean",
+          p.code == 0 && p.out.contains("clean"),
+          clip(first_line(p.combined), 120))
+
+    # A chore may land directly on the branch.
+    let co1: RunResult = git_run(r, ["checkout", "-q", "release/1.0"])
+    let chore: str = commit_file(r, "notes.txt", "release notes\n",
+                                 "chore: 1.0.1 notes", "")
+    let co2: RunResult = git_run(r, ["checkout", "-q", "main"])
+    if chore == "" || co1.code != 0 || co2.code != 0 {
+        check(acc, "a chore on the branch is allowed", false,
+              "commit failed")
+        return
+    }
+    let p2: RunResult = lts_run(acc.root, ["audit"], r)
+    check(acc, "a chore on the branch is allowed",
+          p2.code == 0 && p2.out.contains("clean"),
+          clip(first_line(p2.combined), 120))
+
+    # A rogue direct commit is a violation, named.
+    let co3: RunResult = git_run(r, ["checkout", "-q", "release/1.0"])
+    let rogue: str = commit_file(r, "rogue.txt", "sneaky\n",
+                                 "feat: sneaky feature", "")
+    let co4: RunResult = git_run(r, ["checkout", "-q", "main"])
+    if rogue == "" || co3.code != 0 || co4.code != 0 {
+        check(acc, "a rogue feature commit is a violation, sha and subject "
+              + "named", false, "commit failed")
+        return
+    }
+    let p3: RunResult = lts_run(acc.root, ["audit"], r)
+    check(acc, "a rogue feature commit is a violation, sha and subject named",
+          p3.code == 1 && p3.out.contains(rogue.slice(0, 12))
+              && p3.out.contains("sneaky feature")
+              && p3.out.contains("FEATURE"),
+          clip(first_line(p3.combined), 120))
+
+    # A forged trailer naming a FEATURE upstream is a violation: the
+    # trailer is checked, not trusted.
+    let co5: RunResult = git_run(r, ["checkout", "-q", "release/1.0"])
+    let forged: str = commit_file(r, "fake.txt", "forged\n",
+        "fix: honest-looking subject\n\nBackported-from: " + feat1, "")
+    let co6: RunResult = git_run(r, ["checkout", "-q", "main"])
+    if forged == "" || co5.code != 0 || co6.code != 0 {
+        check(acc, "a forged trailer backporting a FEATURE is a violation",
+              false, "commit failed")
+        return
+    }
+    let p4: RunResult = lts_run(acc.root, ["audit"], r)
+    check(acc, "a forged trailer backporting a FEATURE is a violation",
+          p4.code == 1 && p4.out.contains(forged.slice(0, 12))
+              && p4.out.contains("FEATURE"),
+          clip(first_line(p4.combined), 120))
+
+    # A trailer naming a nonexistent sha is a violation.
+    let co7: RunResult = git_run(r, ["checkout", "-q", "release/1.0"])
+    let ghost: str = commit_file(r, "ghost.txt", "boo\n",
+        "fix: references a ghost\n\nBackported-from: " + hex64("0"), "")
+    let co8: RunResult = git_run(r, ["checkout", "-q", "main"])
+    if ghost == "" || co7.code != 0 || co8.code != 0 {
+        check(acc, "a trailer naming a nonexistent upstream is a violation",
+              false, "commit failed")
+        return
+    }
+    let p5: RunResult = lts_run(acc.root, ["audit"], r)
+    check(acc, "a trailer naming a nonexistent upstream is a violation",
+          p5.code == 1 && p5.out.contains(ghost.slice(0, 12))
+              && p5.out.contains("does not exist"),
+          clip(first_line(p5.combined), 120))
+
+    # An unclassified direct commit is a violation (fail-closed).
+    let co9: RunResult = git_run(r, ["checkout", "-q", "release/1.0"])
+    let sneaky: str = commit_file(r, "sneaky.txt", "no prefix\n",
+                                  "sneak it in without a prefix", "")
+    let co10: RunResult = git_run(r, ["checkout", "-q", "main"])
+    if sneaky == "" || co9.code != 0 || co10.code != 0 {
+        check(acc, "an unclassified direct commit is a violation "
+              + "(fail-closed)", false, "commit failed")
+        return
+    }
+    let p6: RunResult = lts_run(acc.root, ["audit"], r)
+    check(acc, "an unclassified direct commit is a violation (fail-closed)",
+          p6.code == 1 && p6.out.contains(sneaky.slice(0, 12))
+              && p6.out.contains("UNKNOWN"),
+          clip(first_line(p6.combined), 120))
+
+    # The JSON report carries every violation.
+    let p7: RunResult = lts_run(acc.root, ["audit", "--json"], r)
+    let data: JsonValue = load_json(acc, p7)
+    let violations: JsonValue = json_object_get(data, "violations")
+    let mut nvio: int = -1
+    if json_is_array(violations) {
+        nvio = violations.arr.len()
+    }
+    check(acc, "audit --json reports every violation", nvio >= 4,
+          nvio.to_str())
+
+    # Reset to the clean state; the tag law then judges the chain.
+    let anchor: str = branch_head(r, "release/1.0~5")
+    let rb: RunResult = git_run(r,
+        ["update-ref", "refs/heads/release/1.0", anchor])
+    if anchor == "" || rb.code != 0 {
+        check(acc, "rolling the branch back restores a clean audit", false,
+              "update-ref failed")
+        return
+    }
+    let p8: RunResult = lts_run(acc.root, ["audit"], r)
+    check(acc, "rolling the branch back restores a clean audit",
+          p8.code == 0 && p8.out.contains("clean"),
+          clip(first_line(p8.combined), 120))
+
+    # A tag gap is a violation.
+    let tg1: RunResult = git_run(r, ["tag", "v1.0.2", "release/1.0"])
+    if tg1.code != 0 {
+        check(acc, "a tag-chain gap is a violation, named", false,
+              "tag failed")
+        return
+    }
+    let p9: RunResult = lts_run(acc.root, ["audit"], r)
+    check(acc, "a tag-chain gap is a violation, named",
+          p9.code == 1 && p9.out.contains("gap"),
+          clip(first_line(p9.combined), 120))
+    git_run(r, ["tag", "-d", "v1.0.2"])
+
+    # An out-of-line tag (minor bump) is a violation.
+    let tg2: RunResult = git_run(r, ["tag", "v1.1.0", "release/1.0"])
+    if tg2.code != 0 {
+        check(acc, "a tag beyond the LTS line is a violation", false,
+              "tag failed")
+        return
+    }
+    let p10: RunResult = lts_run(acc.root, ["audit"], r)
+    check(acc, "a tag beyond the LTS line is a violation",
+          p10.code == 1 && p10.out.contains("beyond the LTS line"),
+          clip(first_line(p10.combined), 120))
+    git_run(r, ["tag", "-d", "v1.1.0"])
+    let p11: RunResult = lts_run(acc.root, ["audit"], r)
+    check(acc, "the audit is green again", p11.code == 0,
+          clip(first_line(p11.combined), 120))
+}
+
+# ----------------------------------------------------------------------------
+# Section 7 — the release train
+# ----------------------------------------------------------------------------
+
+fn section_7(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 7 — the release train")
+    let r: str = make_repo(acc, "train", "app.txt")
+    if r == "" {
+        check(acc, "init from v1.0.0", false, "make_repo failed")
+        return
+    }
+    let f1: str = commit_file(r, "bug.txt", "one\n",
+                              "fix: the wrap on leap days", "")
+    let f2: str = commit_file(r, "bug.txt", "two\n",
+                              "fix: the parser timeout on huge inputs", "")
+    let feat: str = commit_file(r, "widget.txt", "w\n", "feat: confetti mode",
+                                "")
+    if f1 == "" || f2 == "" || feat == "" {
+        check(acc, "init from v1.0.0", false, "commit failed")
+        return
+    }
+
+    let p: RunResult = lts_run(acc.root, ["init", "--tag", "v1.0.0"], r)
+    check(acc, "init from v1.0.0", p.code == 0,
+          clip(first_line(p.combined), 120))
+
+    let p2: RunResult = lts_run(acc.root, ["backport", f1], r)
+    check(acc, "first fix backports", p2.code == 0,
+          clip(first_line(p2.combined), 120))
+    let p3: RunResult = lts_run(acc.root, ["tag-patch"], r)
+    check(acc, "v1.0.1 cut",
+          p3.code == 0 && p3.out.contains("tagged v1.0.1"),
+          clip(first_line(p3.combined), 120))
+
+    let p4: RunResult = lts_run(acc.root, ["backport", f2], r)
+    check(acc, "second fix backports", p4.code == 0,
+          clip(first_line(p4.combined), 120))
+    let p5: RunResult = lts_run(acc.root, ["backport", feat], r)
+    check(acc, "the feature is refused on the way",
+          p5.code == 1 && p5.out.contains("FEATURE"),
+          clip(first_line(p5.combined), 120))
+    let p6: RunResult = lts_run(acc.root, ["tag-patch"], r)
+    check(acc, "v1.0.2 cut",
+          p6.code == 0 && p6.out.contains("tagged v1.0.2"),
+          clip(first_line(p6.combined), 120))
+
+    let p7: RunResult = lts_run(acc.root, ["audit"], r)
+    check(acc, "the whole train audits clean",
+          p7.code == 0 && p7.out.contains("clean"),
+          clip(first_line(p7.combined), 120))
+
+    let p8: RunResult = lts_run(acc.root, ["status"], r)
+    check(acc, "status shows the tag chain and the commit count",
+          p8.code == 0 && p8.out.contains("v1.0.0, v1.0.1, v1.0.2")
+              && p8.out.contains("commits since base: 2"),
+          clip(first_line(p8.combined), 120))
+
+    let p9: RunResult = lts_run(acc.root, ["status", "--json"], r)
+    let data: JsonValue = load_json(acc, p9)
+    let tags: JsonValue = json_object_get(data, "tags")
+    let violations: JsonValue = json_object_get(data, "violations")
+    let mut tags_ok: bool = json_is_array(tags) && tags.arr.len() == 3
+    if tags_ok {
+        tags_ok = json_is_str(tags.arr.get(0))
+            && tags.arr.get(0).sval == "v1.0.0"
+            && json_is_str(tags.arr.get(1))
+            && tags.arr.get(1).sval == "v1.0.1"
+            && json_is_str(tags.arr.get(2))
+            && tags.arr.get(2).sval == "v1.0.2"
+    }
+    check(acc, "status --json carries the chain",
+          json_is_object(data) && tags_ok
+              && json_is_array(violations) && violations.arr.len() == 0,
+          clip(json_stringify(tags), 80))
+
+    # The subjects on the branch tell the release story.
+    let base_sha: str = branch_head(r, "main~2")
+    let subs: list[str] = messages(r, "release/1.0", base_sha)
+    let mut subs_ok: bool = base_sha != "" && subs.len() == 2
+    if subs_ok {
+        subs_ok = subs.get(0) == "fix: the wrap on leap days"
+            && subs.get(1) == "fix: the parser timeout on huge inputs"
+    }
+    check(acc, "the branch history is exactly the backported fixes", subs_ok,
+          clip(str_join(subs, " | "), 120))
+}
+
+# ----------------------------------------------------------------------------
+# Section 8 — the corpus showcase
+# ----------------------------------------------------------------------------
+
+fn section_8(acc: Acc) -> void uses IO, Fs, Proc {
+    section("Section 8 — the corpus showcase")
+
+    let showcase: str = path_join3(acc.root, "tests/ok/feat_stage132_lts.hls")
+    let showcase_out: str = "stage 132: hls-lts\n"
+        + "  LTS policy OK: classifier, tag law, chain, trailer, release\n"
+
+    let p: RunResult = boot_check(acc, showcase)
+    check(acc, "the showcase boots through the real checker", p.code == 0,
+          clip(first_line(p.combined), 120))
+
+    let p2: RunResult = boot(acc, [showcase])
+    check(acc, "the showcase runs green on the interpreter, exact output",
+          p2.code == 0 && p2.out == showcase_out,
+          clip(first_line(p2.combined), 120))
+
+    let p3: RunResult = run_capture(path_join3(acc.root, "bin/hlfmt"),
+                                    ["--check", showcase])
+    check(acc, "the showcase is hlfmt-canonical", p3.code == 0,
+          clip(first_line(p3.combined), 120))
+
+    let p4: RunResult = run_capture("python3", ["tools/hllint.py", showcase])
+    check(acc, "the showcase is hllint-clean",
+          p4.code == 0 && p4.out.contains("no warnings"),
+          clip(first_line(p4.combined), 120))
+
+    let mut cc: str = "gcc"
+    let ccv: Option[tainted[str]] = env_var("CC")
+    if option_is_some(ccv) {
+        cc = taint_unwrap(option_unwrap(ccv))
+    }
+    if file_exists(hlc_path(acc)) && which(cc) {
+        let c_path: str = scratch(acc, "showcase.c")
+        let bin_path: str = scratch(acc, "showcase_bin")
+        let r1: RunResult = run_capture(hlc_path(acc), [showcase, c_path])
+        if r1.code != 0 {
+            check(acc, "hlc compiled the showcase", false,
+                  clip(r1.out.trim(), 120))
+        } else {
+            let r2: RunResult = run_capture(cc,
+                ["-O2", "-o", bin_path, c_path, "-lm", "-pthread"])
+            if r2.code != 0 {
+                check(acc, "gcc compiled the showcase", false,
+                      clip(r2.out.trim(), 120))
+            } else {
+                let rn: RunResult = run_capture(bin_path, [])
+                check(acc, "the showcase matches natively, byte for byte",
+                      rn.code == 0 && rn.out == showcase_out,
+                      clip(first_line(rn.combined), 120))
+            }
+        }
+    } else {
+        println("  (bin/hlc or cc not available — native differential "
+            + "skipped, interpreter legs ran)")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Fs, Proc, Exit {
+    # the battery's GIT_ENV — every child sees the pinned identity
+    env_set_var("GIT_AUTHOR_NAME", "lts-gate")
+    env_set_var("GIT_AUTHOR_EMAIL", "lts-gate@example.invalid")
+    env_set_var("GIT_COMMITTER_NAME", "lts-gate")
+    env_set_var("GIT_COMMITTER_EMAIL", "lts-gate@example.invalid")
+
+    let acc: Acc = acc_new("lts")
+    section_1(acc)
+    section_2(acc)
+    section_3(acc)
+    section_4(acc)
+    section_5(acc)
+    section_6(acc)
+    section_7(acc)
+    section_8(acc)
+    return finish(acc, "Stage 132 -- the LTS branch policy")
+}
