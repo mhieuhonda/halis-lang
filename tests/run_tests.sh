@@ -70,7 +70,9 @@ trap 'rm -rf "$SCRATCH"' EXIT INT TERM HUP
 
 declare -a PID_OF=()    # lane pid -> gate index
 declare -a GSTATE=()      # per gate: 0 pending, 1 pass, 2 fail
-for i in "${!GATES[@]}"; do GSTATE[$i]=0; done
+declare -a GSTART=()      # per gate: $SECONDS when its lane fired
+declare -a GELAPSED=()    # per gate: wall seconds, reported in the summary
+for i in "${!GATES[@]}"; do GSTATE[$i]=0; GELAPSED[$i]=0; done
 NEXT=0
 EMIT=0
 
@@ -81,6 +83,7 @@ launch() {
     # foreground bookkeeping, with the old driver's exact words.
     local i="$1"
     local gate="${GATES[$1]}"
+    GSTART[$i]=$SECONDS
     if [ ! -x "bin/acc-$gate" ]; then
         if ! make -s "bin/acc-$gate" >/dev/null 2>&1; then
             echo "  [FAIL] $gate (gate build failed)" > "$SCRATCH/$i.out"
@@ -111,6 +114,7 @@ while [ "${#PID_OF[@]}" -gt 0 ]; do
         wait "$pid" 2>/dev/null
         gi="${PID_OF[$pid]}"
         rc=$(cat "$SCRATCH/$gi.rc" 2>/dev/null || echo 1)
+        GELAPSED[$gi]=$((SECONDS - ${GSTART[$gi]:-0}))
         if [ "$rc" -eq 0 ]; then GSTATE[$gi]=1; else GSTATE[$gi]=2; fi
         unset "PID_OF[$pid]"
         if [ "$NEXT" -lt "${#GATES[@]}" ]; then
@@ -141,6 +145,13 @@ for i in "${!GATES[@]}"; do
     elif [ "${GSTATE[$i]}" -eq 2 ]; then FAIL=$((FAIL + 1)); fi
 done
 
+# Per-gate wall time, appended after the verdict so the replayed gate
+# blocks above stay byte-identical to the sequential run's log.
+echo "------------------------------------------"
+for i in "${!GATES[@]}"; do
+    printf "  %-26s %5ss  %s\n" "${GATES[$i]}" "${GELAPSED[$i]}" \
+        "$([ "${GSTATE[$i]}" -eq 1 ] && echo ok || echo FAIL)"
+done
 echo "=========================================="
 echo "RESULT: $PASS PASS / $FAIL FAIL (suite gates)"
 echo "=========================================="
