@@ -229,6 +229,12 @@ fn gen_method(ctx: Ctx, e: int) -> str {
         let aidx: int = ctx.exprs[e].args.get(0)
         let av: str = gen_expr(ctx, aidx)
         let af: bool = expr_fresh(ctx, aidx)
+        # Inline primitive list: the value goes straight into the flat
+        # array — no box, nothing to own.
+        let kind: int = elem_store_kind(et)
+        if kind != 0 {
+            return "hl_list_push_" + inline_list_suffix(kind) + "(" + t0 + ", " + av + ")"
+        }
         return "hl_list_push(" + t0 + ", " + gen_store_val(ctx, et, av, af) + ")"
     }
     if op == "list.get" {
@@ -243,6 +249,13 @@ fn gen_method(ctx: Ctx, e: int) -> str {
         # via inst_t(); this one was missed. Matches the interpreter,
         # which yields the element value.
         let args: str = gen_args_c(ctx, e)
+        # Inline primitive list: the typed getter reads the flat array
+        # directly; the bounds check and its message are the boxed
+        # getter's, so the interpreter sees the same law.
+        let gkind: int = elem_store_kind(inst_t(ctx, ctx.exprs[e].t))
+        if gkind != 0 {
+            return "hl_list_get_" + inline_list_suffix(gkind) + "(" + t0 + ", " + args + ", " + ctx.exprs[e].line.to_str() + "L)"
+        }
         return gen_unbox(ctx, inst_t(ctx, ctx.exprs[e].t), "hl_list_get(" + t0 + ", " + args + ", " + ctx.exprs[e].line.to_str() + "L)")
     }
     if op == "list.set" {
@@ -251,6 +264,12 @@ fn gen_method(ctx: Ctx, e: int) -> str {
         let aidx: int = ctx.exprs[e].args.get(1)
         let av: str = gen_expr(ctx, aidx)
         let af: bool = expr_fresh(ctx, aidx)
+        # Inline primitive list: the typed setter writes the flat array
+        # in place — no box, no old-element release.
+        let skind: int = elem_store_kind(et)
+        if skind != 0 {
+            return "hl_list_set_" + inline_list_suffix(skind) + "(" + t0 + ", " + ai + ", " + av + ", " + ctx.exprs[e].line.to_str() + "L)"
+        }
         return "hl_list_set(" + t0 + ", " + ai + ", " + gen_store_val(ctx, et, av, af) + ", " + ctx.exprs[e].line.to_str() + "L)"
     }
     if op == "list.pop" {
@@ -443,15 +462,26 @@ fn gen_listlit(ctx: Ctx, e: int) -> str {
     # (fresh raw / borrowed retain-wrapped / prim boxed).
     let elem: str = list_elem_t(inst_t(ctx, ctx.exprs[e].t))
     let tmp: str = fresh_tmp(ctx, "hlc_ll")
+    # Inline primitive list: born inline, elements stored raw — the
+    # same left-to-right evaluation order, no boxes on the way.
+    let lkind: int = elem_store_kind(elem)
     let block: list[str] = []
     block.push("({")
-    block.push("    hl_list* " + tmp + " = hl_list_new(" + elem_free_fn(ctx, elem) + ");")
+    if lkind != 0 {
+        block.push("    hl_list* " + tmp + " = hl_list_new_" + inline_list_suffix(lkind) + "();")
+    } else {
+        block.push("    hl_list* " + tmp + " = hl_list_new(" + elem_free_fn(ctx, elem) + ");")
+    }
     let mut i: int = 0
     while i < ctx.exprs[e].args.len() {
         let aidx: int = ctx.exprs[e].args.get(i)
         let v: str = gen_expr(ctx, aidx)
         let fresh: bool = expr_fresh(ctx, aidx)
-        block.push("    hl_list_push(" + tmp + ", " + gen_store_val(ctx, elem, v, fresh) + ");")
+        if lkind != 0 {
+            block.push("    hl_list_push_" + inline_list_suffix(lkind) + "(" + tmp + ", " + v + ");")
+        } else {
+            block.push("    hl_list_push(" + tmp + ", " + gen_store_val(ctx, elem, v, fresh) + ");")
+        }
         i = i + 1
     }
     block.push("    " + tmp + ";")
@@ -1161,6 +1191,12 @@ fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
             ctx.out.push(ind + "        " + c_type(ctx, elem) + " " + cn
             + " __attribute__((cleanup(" + cleanup_fn_for(ctx, elem) + ")))"
             + " = hl_retain(" + gen_unbox(ctx, elem, "hl_list_get(" + itn + ", " + iv + ", " + s.line.to_str() + "L)") + ");")
+        } else if elem_store_kind(elem) != 0 {
+            # Inline primitive list: the loop variable reads the flat
+            # array directly — no box, no unbox.
+            let ekind: int = elem_store_kind(elem)
+            ctx.out.push(ind + "        " + c_type(ctx, elem) + " " + cn
+            + " = hl_list_get_" + inline_list_suffix(ekind) + "(" + itn + ", " + iv + ", " + s.line.to_str() + "L);")
         } else {
             ctx.out.push(ind + "        " + c_type(ctx, elem) + " " + cn
             + " = " + gen_unbox(ctx, elem, "hl_list_get(" + itn + ", " + iv + ", " + s.line.to_str() + "L)") + ";")
@@ -1620,7 +1656,12 @@ fn gen_asm(ctx: Ctx, s: StmtN, ind: str) -> void {
                         if stk {
                             init_c = "hlc_sg_" + stack_elem_suffix(elem_t) + "(" + lst_c + ", " + idx_c + ", " + stack_cap_of(ctx, ctx.exprs[ctx.exprs[op.expr_idx].left].name).to_str() + ", " + ctx.exprs[op.expr_idx].line.to_str() + "L)"
                         } else {
-                            init_c = "(" + cty + ")(" + gen_unbox(ctx, elem_t, "hl_list_get(" + lst_c + ", " + idx_c + ", " + ctx.exprs[op.expr_idx].line.to_str() + "L)") + ")"
+                            let akind: int = elem_store_kind(elem_t)
+                            if akind != 0 {
+                                init_c = "(" + cty + ")(hl_list_get_" + inline_list_suffix(akind) + "(" + lst_c + ", " + idx_c + ", " + ctx.exprs[op.expr_idx].line.to_str() + "L))"
+                            } else {
+                                init_c = "(" + cty + ")(" + gen_unbox(ctx, elem_t, "hl_list_get(" + lst_c + ", " + idx_c + ", " + ctx.exprs[op.expr_idx].line.to_str() + "L)") + ")"
+                            }
                         }
                     }
                     temp_setters.push(jr)
@@ -1667,7 +1708,12 @@ fn gen_asm(ctx: Ctx, s: StmtN, ind: str) -> void {
                     if stk {
                         old_v = "hlc_sg_" + stack_elem_suffix(elem_t) + "(" + lst_c + ", " + idx_c + ", " + stack_cap_of(ctx, ctx.exprs[lhs_e].name).to_str() + ", " + ctx.exprs[lhs_e].line.to_str() + "L)"
                     } else {
-                        old_v = gen_unbox(ctx, elem_t, "hl_list_get(" + lst_c + ", " + idx_c + ", " + ctx.exprs[lhs_e].line.to_str() + "L)")
+                        let okind: int = elem_store_kind(elem_t)
+                        if okind != 0 {
+                            old_v = "hl_list_get_" + inline_list_suffix(okind) + "(" + lst_c + ", " + idx_c + ", " + ctx.exprs[lhs_e].line.to_str() + "L)"
+                        } else {
+                            old_v = gen_unbox(ctx, elem_t, "hl_list_get(" + lst_c + ", " + idx_c + ", " + ctx.exprs[lhs_e].line.to_str() + "L)")
+                        }
                     }
                     ctx.out.push(ind + c_t + " " + tmp + " = " + old_v + ";")
                 } else {
@@ -1864,11 +1910,19 @@ fn gen_asm(ctx: Ctx, s: StmtN, ind: str) -> void {
                 let set_suffix: str = stack_elem_suffix(list_elem_t(ctx.exprs[ctx.exprs[op.expr_idx].left].t))
                 ctx.out.push(ind + "hlc_ss_" + set_suffix + "(" + lst_c + ", " + idx_c + ", " + stack_cap_of(ctx, root_name).to_str() + ", " + val_c + ", " + ctx.exprs[op.expr_idx].line.to_str() + "L);")
             } else {
-                # hl_list_set releases the old element itself; the new value
-                # must arrive OWNED (one retain). For primitive types
-                # (int/float/bool) the runtime boxes them via hl_box_i64 etc.
-                let boxed: str = gen_store_val(ctx, elem_t, val_c, false)
-                ctx.out.push(ind + "hl_list_set(" + lst_c + ", " + idx_c + ", " + boxed + ", " + ctx.exprs[op.expr_idx].line.to_str() + "L);")
+                # Inline primitive list: the typed setter writes the flat
+                # array — no box, no old-element release. The boxed path
+                # below (pointer elements) keeps its law: hl_list_set
+                # releases the old element itself; the new value must
+                # arrive OWNED (one retain). For primitive types the
+                # runtime boxes them via hl_box_i64 etc.
+                let wkind: int = elem_store_kind(inst_t(ctx, elem_t))
+                if wkind != 0 {
+                    ctx.out.push(ind + "hl_list_set_" + inline_list_suffix(wkind) + "(" + lst_c + ", " + idx_c + ", " + val_c + ", " + ctx.exprs[op.expr_idx].line.to_str() + "L);")
+                } else {
+                    let boxed: str = gen_store_val(ctx, elem_t, val_c, false)
+                    ctx.out.push(ind + "hl_list_set(" + lst_c + ", " + idx_c + ", " + boxed + ", " + ctx.exprs[op.expr_idx].line.to_str() + "L);")
+                }
             }
         } else if wb_kind == 2 {
             ctx.out.push(ind + temp_wb_a.get(si) + " = " + val_c + ";")
@@ -2210,10 +2264,17 @@ fn gen_assign(ctx: Ctx, s: StmtN, ind: str) -> void {
         let elem_t: str = list_elem_t(ctx.exprs[ctx.exprs[tgt].left].t)
         let lst: str = gen_expr(ctx, ctx.exprs[tgt].left)
         let idx: str = gen_expr(ctx, ctx.exprs[tgt].right)
-        # hl_list_set releases the old element itself (store-then-release
-        # inside the runtime); the new value arrives owned.
-        let wrapped: str = gen_store_val(ctx, elem_t, v, fresh)
-        ctx.out.push(ind + "hl_list_set(" + lst + ", " + idx + ", " + wrapped + ", " + s.line.to_str() + "L);")
+        # Inline primitive list: the typed setter writes the flat array
+        # in place. The boxed path keeps its law: hl_list_set releases
+        # the old element itself (store-then-release inside the
+        # runtime); the new value arrives owned.
+        let akind2: int = elem_store_kind(inst_t(ctx, elem_t))
+        if akind2 != 0 {
+            ctx.out.push(ind + "hl_list_set_" + inline_list_suffix(akind2) + "(" + lst + ", " + idx + ", " + v + ", " + s.line.to_str() + "L);")
+        } else {
+            let wrapped: str = gen_store_val(ctx, elem_t, v, fresh)
+            ctx.out.push(ind + "hl_list_set(" + lst + ", " + idx + ", " + wrapped + ", " + s.line.to_str() + "L);")
+        }
     }
     flush_null_after(ctx, ind)
     clear_hoists(ctx)
