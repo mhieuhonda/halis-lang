@@ -310,6 +310,18 @@ $(BIN)/acc-%: tests/acc/%_acceptance.hls tests/acc/harness.hls $(wildcard std/*.
 	@$(BIN)/hlc tests/acc/$*_acceptance.hls $@.c
 	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
 
+# The shared gate compiler: one gcc ignition of the committed snapshot,
+# exported to every suite gate through HL_TEST_HLC1 (tests/run_tests.sh).
+# The bootstrap fixed-point law makes snapshot/hlc.c and the
+# interpreter's own emission the same bytes, so this is the binary each
+# gate would otherwise build for itself -- once per suite run instead of
+# once per gate. Explicit rule: it beats the acc-% pattern for this
+# name (no tests/acc/hlc1_acceptance.hls exists).
+$(BIN)/acc-hlc1: $(SNAP) | $(BIN)
+	@mkdir -p $(BIN)
+	@echo "[seed] cc: the shared gate compiler (one per suite run)"
+	@$(CC) $(BOOT_CFLAGS) -o $@ $< -lm -pthread
+
 # File target for the native compiler: acceptance targets declared with
 # `bin/hlc` as a prerequisite stay buildable after `make clean` or on a
 # fresh checkout, where the phony `bootstrap` goal alone is not enough.

@@ -64,6 +64,20 @@ for gate in "${GATES[@]}"; do
 done
 make -s -j"$BUILD_JOBS" "${BUILD_ARGS[@]}" >/dev/null 2>&1 || true
 
+# ---- 1b. one shared native compiler for every gate --------------------------
+# Every gate's build_hlc1 wants the same artifact: the native compiler.
+# Building it the interpreter-driven way costs a ~80s Stage-0 self-compile
+# PER GATE for bytes the fixed-point law already pins: snapshot/hlc.c IS
+# the interpreter's own emission for src/hlc.hls (make bootstrap refuses
+# any drift, and suite_01 re-proves the chain). One gcc ignition here and
+# an HL_TEST_HLC1 export replaces seven of those ignitions with one; a
+# gate run standalone (no var set) builds its own the old way.
+SHARED_HLC1=bin/acc-hlc1
+make -s "$SHARED_HLC1" >/dev/null 2>&1 || true
+if [ -x "$SHARED_HLC1" ]; then
+    export HL_TEST_HLC1="$SHARED_HLC1"
+fi
+
 # ---- 2. run phase: lanes over the gates, output replayed in gate order -----
 SCRATCH=$(mktemp -d)
 trap 'rm -rf "$SCRATCH"' EXIT INT TERM HUP
