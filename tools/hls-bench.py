@@ -1510,8 +1510,14 @@ def main():
                     help="compare the run against baseline NAME")
     ap.add_argument("--noise", dest="noise_pct", type=float,
                     default=DEFAULT_NOISE_PCT,
-                    help="noise threshold for change classification in "
-                         "%% (default: %g)" % DEFAULT_NOISE_PCT)
+                    # NOTE: no bare percent sign may survive here —
+                    # argparse runs every help string through %-formatting
+                    # against its params dict, and a stray '%' (after the
+                    # one below substitutes its default in) raised
+                    # "unsupported format character '('" on --help.
+                    # Spell the unit out; it is also clearer to read.
+                    help="noise threshold for change classification, in "
+                         "percent (default: %g)" % DEFAULT_NOISE_PCT)
     ap.add_argument("--json", default=None,
                     help="write the machine-readable report to this file")
     ap.add_argument("--list", action="store_true",
