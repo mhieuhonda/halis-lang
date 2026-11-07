@@ -148,6 +148,17 @@ BIN_LEVELS = [
     ("*", "/", "%"),
 ]
 
+# operator -> precedence tier, the flat form of BIN_LEVELS used by the
+# loop-shaped parse_binary (see the comment there).
+_BIN_OP_LEVEL = {
+    "||": 0,
+    "&&": 1,
+    "==": 2, "!=": 2,
+    "<": 3, "<=": 3, ">": 3, ">=": 3,
+    "+": 4, "-": 4,
+    "*": 5, "/": 5, "%": 5,
+}
+
 
 class Parser:
     def __init__(self, toks, src=b""):
@@ -180,7 +191,10 @@ class Parser:
         raise HLError(msg, t["line"], t["col"])
 
     def at_sym(self, v):
-        t = self.peek()
+        # the loop body of peek() inlined: at_sym runs ~370k times per
+        # compiler self-parse, and the extra call frame showed up on the
+        # profile next to the token work itself
+        t = self.toks[self.pos]
         return t["k"] == "sym" and t["v"] == v
 
     def at_kw(self, v):
@@ -1765,20 +1779,26 @@ class Parser:
     def parse_expr(self, allow_struct=True):
         return self.parse_binary(0, allow_struct)
 
+    # The precedence climber below is the loop form of the former
+    # level-chain recursion (parse_binary(level) recursing one level per
+    # BIN_LEVELS entry): identical trees for purely left-associative
+    # precedence tiers, without one Python call frame per tier per leaf —
+    # the differential suites feed ~20k expressions per gate run through
+    # here. _BIN_OP_LEVEL maps each operator to its BIN_LEVELS tier.
     def parse_binary(self, level, allow_struct):
-        if level >= len(BIN_LEVELS):
-            return self.parse_unary(allow_struct)
-        ops = BIN_LEVELS[level]
-        left = self.parse_binary(level + 1, allow_struct)
+        left = self.parse_unary(allow_struct)
+        toks = self.toks
         while True:
-            t = self.peek()
-            if t["k"] == "sym" and t["v"] in ops:
-                self.next()
-                right = self.parse_binary(level + 1, allow_struct)
-                left = {"k": "bin", "op": t["v"], "l": left, "r": right,
-                        "line": t["line"]}
-            else:
-                return left
+            t = toks[self.pos]
+            if t["k"] == "sym":
+                opl = _BIN_OP_LEVEL.get(t["v"], -1)
+                if opl >= level:
+                    self.pos += 1
+                    right = self.parse_binary(opl + 1, allow_struct)
+                    left = {"k": "bin", "op": t["v"], "l": left, "r": right,
+                            "line": t["line"]}
+                    continue
+            return left
 
     def parse_unary(self, allow_struct):
         t = self.peek()
