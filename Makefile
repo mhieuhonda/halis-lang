@@ -9,6 +9,17 @@ SNAP    = snapshot/hlc.c
 BIN     = bin
 PREFIX  ?= /usr/local
 
+# The bootstrap seed is a one-shot igniter: cc builds it, it compiles
+# src/hlc.hls once, and the fixed-point check reads the bytes. Its own
+# runtime speed is noise next to the C compile itself, and -O2 on the
+# 43k-line snapshot is the single largest cost of `make bootstrap`
+# (~17 s of the ~20 s total on a plain x86_64 box; -O1 does the same
+# job in ~7 s). The seed is NOT the compiler that ships — every
+# acceptance and differential gate exercises -O2-built programs — so
+# the ignition defaults to -O1 and keeps out of the way of CFLAGS.
+# Override BOOT_CFLAGS=-O2 to reproduce the old ignition exactly.
+BOOT_CFLAGS ?= -O1
+
 # ---- Stage 37 (v0.56.0-alpha): libcurl probe for the TLS builtin ----
 # The TLS builtin (net_tls_get) is conditionally compiled: the C
 # runtime emits a `#ifdef HL_HAVE_LIBCURL` guard around the libcurl
@@ -52,7 +63,7 @@ all: bootstrap
 bootstrap:
 	@mkdir -p $(BIN)
 	@echo "[1/3] cc: compiling the committed C snapshot..."
-	@$(CC) $(CFLAGS) -o $(BIN)/hlc $(SNAP) -lm -pthread
+	@$(CC) $(BOOT_CFLAGS) -o $(BIN)/hlc $(SNAP) -lm -pthread
 	@echo "[2/3] native hlc re-derives itself from the HLS sources..."
 	@$(BIN)/hlc $(HLC) $(BIN)/hlc_regen.c
 	@echo "[3/3] fixed-point law: the derivation must equal the snapshot..."
