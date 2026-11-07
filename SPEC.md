@@ -5646,6 +5646,13 @@ gates:
   fixes it to `bl hl_boot` (hl_boot's return value arrives in x0, the
   exit_group syscall's argument; `mov x0, x0` remains the explicit
   no-op it always was) and the gate pins the branch shape;
+* **the entry arms its own stack.** No loader on the virt boards
+  hands the image an SP (QEMU's direct entry arrives with SP=0, and
+  hl_boot's first push faulted at 0xffff...ff0 before any user code
+  ran), so both non-x86 branches load `__stack_top` — 64 KiB
+  reserved by the linker scripts, NOLOAD, 16-aligned — before the
+  call. x86-64 keeps its handoff: firmware there hands `_start` a
+  usable RSP;
 * **`hl_boot` is `__attribute__((used))`.** The definition is
   referenced ONLY from the entry's inline-asm string, invisible to the
   C compiler. Clang driving `-c` and the link in one step (zig cc)
@@ -5656,7 +5663,13 @@ gates:
   `T name(...) {` shape;
 * **the reference board is QEMU's `virt` machine**: DRAM base
   0x40000000 (the linker script's `. = 0x40000000;`), the PL011
-  console at 0x09000000, `-bios none -kernel image.elf` for the boot.
+  console at 0x09000000, plain `-kernel image.elf` for the boot (the
+  ARM boards have no `none` firmware spelling — `-bios none` reads
+  as a ROM filename and dies — and they ship no default firmware
+  either, so the direct `-kernel` path is the whole story). Every
+  allocatable note has an explicit home after `.text` in the script:
+  the cross-gcc's `--build-id` orphan, placed at the image base on
+  binutils < 2.44, used to push the entry 0x30 past the DRAM base.
   `targets/aarch64-unknown-none.ld` places `_start` first, so the
   base address IS the entry for loaders that jump there rather than
   to the ELF entry point;
@@ -5699,7 +5712,9 @@ that make it the most self-evidently integer-only of the three:
   DISASSEMBLY carries zero FP instructions (`fld/fsd/fmv.x/fcvt...`);
 * **the reference board is QEMU's riscv64 `virt` machine**: DRAM at
   0x80000000 (the script's base; the `-bios none` reset vector enters
-  there, which is why `_start` is pinned first), the NS16550A UART at
+  there, which is why `_start` is pinned first — and enters with SP=0,
+  so the riscv entry loads `__stack_top` before `call hl_boot`, the
+  same 64 KiB the aarch64 script reserves), the NS16550A UART at
   0x10000000, and — the RISC-V bonus — the **SiFive test finisher** at
   0x100000: writing `0x3333 | (code << 16)` makes QEMU exit with
   `code`, the one bare-metal run with a REAL exit code without a
