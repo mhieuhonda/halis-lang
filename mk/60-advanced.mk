@@ -170,7 +170,11 @@ opt-stats-report:
 #       fibonacci workload spins the O(n) inner loop 20,000 times:
 #       with the stack layout the count stays a small CONSTANT
 #       (<= 128: startup + print allocations only), while the #[boxed]
-#       twin of the same program allocates 1,000,000+ objects —
+#       twin of the same program still allocates heavily — tens of
+#       thousands of list headers and growth reallocs per 20k rounds
+#       (v1.1.0: lists of primitives store one flat array now, so the
+#       per-element boxes are gone; the #[stack]/#[boxed] split is the
+#       ESCAPE decision, not the element representation) —
 #       proving both the zero-allocation claim AND that the counter
 #       actually catches heap traffic.
 escape-acceptance:
@@ -220,8 +224,8 @@ escape-acceptance:
 	@$(BIN)/fib30_boxed_wrap >$(BIN)/fib30_boxed.out 2>$(BIN)/fib30_boxed.err || true
 	@BCOUNT=$$(grep -o 'HL_MALLOC_COUNT=[0-9]*' $(BIN)/fib30_boxed.err | cut -d= -f2); \
 	echo "  heap allocations with #[boxed] forced (same workload): $$BCOUNT"; \
-	if [ "$$BCOUNT" -gt 100000 ]; then \
-	  echo "  #[boxed] twin allocates 100,000+ objects — the counter catches heap traffic: OK"; \
+	if [ "$$BCOUNT" -gt 10000 ]; then \
+	  echo "  #[boxed] twin allocates 10,000+ objects — the counter catches heap traffic: OK"; \
 	else \
 	  echo "FAIL: the boxed twin should allocate heavily ($$BCOUNT)"; exit 1; \
 	fi
