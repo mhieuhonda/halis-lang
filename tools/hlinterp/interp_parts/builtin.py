@@ -9,7 +9,9 @@ from .rt import (
 
 class InterpBuiltin(object):
     def builtin(self, name, args, arg_nodes=None):
-        line = self.line
+        # Direct thread-local read (see builtin_method: the slot is
+        # always seeded before user code runs).
+        line = self._tls.line
         if name == "print":
             self.out.write(args[0])
             return None
@@ -1212,6 +1214,11 @@ class InterpBuiltin(object):
 
             def take_runner():
                 try:
+                    # Seed the fresh thread's exec state (same
+                    # discipline as the spawn runners).
+                    if not hasattr(interp._tls, "fn_stack"):
+                        interp._tls.fn_stack = []
+                        interp._tls.line = 0
                     if conc.det is not None:
                         conc.det.tramp_enter(det_node)
                     count = 0
@@ -1260,6 +1267,11 @@ class InterpBuiltin(object):
 
             def merge_runner():
                 try:
+                    # Seed the fresh thread's exec state (same
+                    # discipline as the spawn runners).
+                    if not hasattr(interp._tls, "fn_stack"):
+                        interp._tls.fn_stack = []
+                        interp._tls.line = 0
                     if conc.det is not None:
                         conc.det.tramp_enter(det_node)
                     a_done = False

@@ -30,6 +30,7 @@ Imports (Stage 6):
   `import "core.option"`      — resolves to <repo>/core/option.hls (Stage 78)
   Each file is parsed once; transitive imports are merged into one program.
 """
+import gc
 import os
 import signal
 import sys
@@ -603,6 +604,22 @@ def run_cli():
     interp = Interp(program, prog_args, sys.stdout.buffer, contracts=contracts,
                     det=det_mode or (os.environ.get("HL_DET_SCHED", "") != ""),
                     det_trace=(os.environ.get("HL_DET_TRACE", "") != ""))
+    # The program table (AST + checked shapes) is complete and pinned by
+    # now, and the executor allocates millions of short-lived dicts and
+    # lists per run. Cyclic garbage is essentially absent from that
+    # stream (env frames die by refcount when a call returns), so the
+    # generational GC only adds pause overhead to the hottest loop in
+    # the process. Freeze what is already alive (the program table) and
+    # disable collection for the run — reference counting still frees
+    # everything the executor allocates; a long-lived leak would need a
+    # reference cycle, which the env-discipline above does not create.
+    # Order matters: freeze FIRST (moves current objects out of every
+    # generation), then disable (stops new-cycle detection). The REPL
+    # path re-enables nothing — it runs one program per process, the
+    # same lifecycle.
+    gc.collect()
+    gc.freeze()
+    gc.disable()
     return interp.run()
 
 

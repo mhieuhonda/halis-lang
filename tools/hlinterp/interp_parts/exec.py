@@ -5,6 +5,7 @@ boot/interp_parts/interp.py - behavior is unchanged."""
 from .rt import (
     BreakSig, ContinueSig, HLPanic, ReturnSig, TailCallSig, f64_div, f64_mod, i64_add,
     i64_div, i64_mod, i64_mul, i64_neg, i64_sub,
+    INT64_MAX, INT64_MIN,
 )
 
 class InterpExec(object):
@@ -13,9 +14,21 @@ class InterpExec(object):
             self.exec_stmt(s, env)
 
     def exec_stmt(self, s, env):
-        self.line = s.get("line", 0)
+        # Hot path: write the thread-local line slot directly. The
+        # `line` property (a Python function call per access) is kept
+        # for the cold read sites; this write runs once per executed
+        # statement, and threading.local setattr is a C-level slot
+        # write with per-thread isolation — identical semantics, no
+        # property-call overhead.
+        self._tls.line = s.get("line", 0)
         k = s["k"]
-        if k == "let":
+        # Branch order follows the dynamic mix of a compiler-source run
+        # (expression statements and loop bodies dominate); every test
+        # is a unique interned string, so the chain costs one compare
+        # per miss.
+        if k == "expr":
+            self.eval_expr(s["e"], env)
+        elif k == "let":
             val = self.eval_expr(s["value"], env)
             # Stage 98: runtime refinement guard on the binding (the
             # parser attached "rpred"; the checker validated the
@@ -40,16 +53,42 @@ class InterpExec(object):
                 finally:
                     env.pop()
         elif k == "while":
-            while self.eval_expr(s["cond"], env):
+            cond = s["cond"]
+            body = s["body"]
+            while self.eval_expr(cond, env):
                 env.append({})
                 try:
-                    self.exec_stmts(s["body"], env)
+                    self.exec_stmts(body, env)
                 except BreakSig:
                     break
                 except ContinueSig:
                     continue
                 finally:
                     env.pop()
+        elif k == "return":
+            v = s["value"]
+            if v is not None:
+                # Stage 31 (v0.48.0-alpha): a VERIFIED tail self-call in
+                # a #[tail_call] fn raises TailCallSig instead — call_fn
+                # rebinds the parameters and re-runs the body in the
+                # SAME Python frame (the trampoline mirror of the native
+                # parameter-rebinding goto). The checker guarantees the
+                # call target is the CURRENT fn and the dataflow is
+                # primitive-only, so evaluating the argument list here
+                # has no refcount side effects.
+                fn_stack = self._tls.fn_stack
+                if fn_stack:
+                    cur = fn_stack[-1]
+                    rc = v.get("rc")
+                    # self._tail_fns: the precomputed set of fn keys with
+                    # the #[tail_call] attribute (built in InterpCore);
+                    # replaces the per-return attrs dict walk.
+                    if (rc is not None and rc[0] == "user" and rc[1] == cur
+                            and cur in self._tail_fns):
+                        args = [self.eval_expr(a, env) for a in v.get("args", [])]
+                        raise TailCallSig(cur, args, self._tls.line)
+                raise ReturnSig(self.eval_expr(v, env))
+            raise ReturnSig(None)
         elif k == "for":
             lst = self.eval_expr(s["iter"], env)
             n = len(lst)  # snapshot length once (SPEC section 5)
@@ -79,33 +118,10 @@ class InterpExec(object):
                 finally:
                     env.pop()
                 i += 1
-        elif k == "return":
-            v = s["value"]
-            if v is not None:
-                # Stage 31 (v0.48.0-alpha): a VERIFIED tail self-call in
-                # a #[tail_call] fn raises TailCallSig instead — call_fn
-                # rebinds the parameters and re-runs the body in the
-                # SAME Python frame (the trampoline mirror of the native
-                # parameter-rebinding goto). The checker guarantees the
-                # call target is the CURRENT fn and the dataflow is
-                # primitive-only, so evaluating the argument list here
-                # has no refcount side effects.
-                fn_stack = getattr(self._tls, "fn_stack", None)
-                if fn_stack:
-                    cur = fn_stack[-1] if fn_stack else None
-                    rc = v.get("rc")
-                    if (rc is not None and rc[0] == "user" and rc[1] == cur
-                            and cur in self.fns
-                            and self.fns[cur].get("attrs", {}).get("tail_call", False)):
-                        args = [self.eval_expr(a, env) for a in v.get("args", [])]
-                        raise TailCallSig(cur, args, self.line)
-            raise ReturnSig(self.eval_expr(v, env) if v is not None else None)
         elif k == "break":
             raise BreakSig()
         elif k == "continue":
             raise ContinueSig()
-        elif k == "expr":
-            self.eval_expr(s["e"], env)
         elif k == "asm":
             # Stage 27 (v0.50.0-alpha): inline-assembly statement.
             # The boot interpreter is a pure-Python reference and
@@ -137,32 +153,40 @@ class InterpExec(object):
             self.check_refine(sref, val,
                               s.get("rp_what") or "the assigned value")
         t = s["target"]
-        if t["k"] == "ident":
-            for scope in reversed(env):
-                if t["name"] in scope:
-                    scope[t["name"]][0] = val
+        tk = t["k"]
+        if tk == "ident":
+            name = t["name"]
+            i = len(env) - 1
+            while i >= 0:
+                b = env[i].get(name)
+                if b is not None:
+                    b[0] = val
                     return
-            raise HLPanic("variable does not exist: %s" % t["name"], self.line)
+                i -= 1
+            raise HLPanic("variable does not exist: %s" % name, self._tls.line)
         base = self.eval_expr(t["target"], env)
-        if t["k"] == "field":
+        if tk == "field":
             base[t["name"]] = val
-        elif t["k"] == "index":
+        elif tk == "index":
             i = self.eval_expr(t["idx"], env)
             if i < 0 or i >= len(base):
-                raise HLPanic("array access out of bounds", self.line)
+                raise HLPanic("array access out of bounds", self._tls.line)
             base[i] = val
         else:
-            raise HLPanic("invalid lvalue", self.line)
+            raise HLPanic("invalid lvalue", self._tls.line)
 
     # ---------- expressions ----------
     def eval_expr(self, e, env):
         k = e["k"]
         if k == "ident":
             name = e["name"]
-            for scope in reversed(env):
-                if name in scope:
-                    return scope[name][0]
-            raise HLPanic("variable does not exist: %s" % name, self.line)
+            i = len(env) - 1
+            while i >= 0:
+                b = env[i].get(name)
+                if b is not None:
+                    return b[0]
+                i -= 1
+            raise HLPanic("variable does not exist: %s" % name, self._tls.line)
         if k == "bin":
             return self.eval_bin(e, env)
         if k == "int" or k == "float" or k == "bool" or k == "str":
@@ -215,14 +239,18 @@ class InterpExec(object):
             lst = self.eval_expr(e["target"], env)
             i = self.eval_expr(e["idx"], env)
             if i < 0 or i >= len(lst):
-                raise HLPanic("array access out of bounds", self.line)
+                raise HLPanic("array access out of bounds", self._tls.line)
             return lst[i]
         if k == "un":
             v = self.eval_expr(e["e"], env)
             if e["op"] == "!":
                 return not v
             if type(v) is int:
-                return i64_neg(v, self.line)
+                # i64_neg inlined: only INT64_MIN overflows; the panic
+                # line and message are identical to the wrapper's.
+                if v == INT64_MIN:
+                    raise HLPanic("integer overflow", self._tls.line)
+                return -v
             return -v
         if k == "listlit":
             return [self.eval_expr(it, env) for it in e["items"]]
@@ -342,48 +370,105 @@ class InterpExec(object):
 
     def eval_bin(self, e, env):
         op = e["op"]
+        # Operand fetch is inlined here rather than delegated: bin nodes
+        # are ~40% of the evaluated compound nodes and each carries two
+        # operands, of which the majority are identifiers or constants
+        # (loop counters, string literals, flags). Handling those two
+        # kinds inline — with the exact same lookup order and panic
+        # text as eval_expr — removes one Python call frame per leaf
+        # operand without adding a dispatch layer; anything compound
+        # falls through to eval_expr as before.
+        l = e["l"]
+        kl = l["k"]
+        if kl == "ident":
+            name = l["name"]
+            i = len(env) - 1
+            while i >= 0:
+                b = env[i].get(name)
+                if b is not None:
+                    a = b[0]
+                    break
+                i -= 1
+            else:
+                raise HLPanic("variable does not exist: %s" % name,
+                              self._tls.line)
+        elif kl == "int" or kl == "str" or kl == "float" or kl == "bool":
+            a = l["v"]
+        else:
+            a = self.eval_expr(l, env)
         if op == "||":
-            if self.eval_expr(e["l"], env):
+            if a:
                 return True
             return self.eval_expr(e["r"], env)
         if op == "&&":
-            if not self.eval_expr(e["l"], env):
+            if not a:
                 return False
             return self.eval_expr(e["r"], env)
-        a = self.eval_expr(e["l"], env)
-        b = self.eval_expr(e["r"], env)
+        r = e["r"]
+        kr = r["k"]
+        if kr == "ident":
+            name = r["name"]
+            i = len(env) - 1
+            while i >= 0:
+                b = env[i].get(name)
+                if b is not None:
+                    b = b[0]
+                    break
+                i -= 1
+            else:
+                raise HLPanic("variable does not exist: %s" % name,
+                              self._tls.line)
+        elif kr == "int" or kr == "str" or kr == "float" or kr == "bool":
+            b = r["v"]
+        else:
+            b = self.eval_expr(r, env)
         if op == "==":
             return a == b
-        if op == "!=":
-            return a != b
         if op == "<":
             return a < b
+        if op == "+":
+            # Hot path: the checked int64 ops are inlined — the runtime
+            # i64_add/i64_sub/i64_mul wrappers stay for the other
+            # callers, but every compiler-source run pays a Python call
+            # per arithmetic node, so the fast path does the same
+            # bounds test inline and only the overflow raise reaches
+            # out. Identical panics, identical lines.
+            if type(a) is int:
+                r = a + b
+                if INT64_MIN <= r <= INT64_MAX:
+                    return r
+                raise HLPanic("integer overflow", self._tls.line)
+            return a + b  # float or str
+        if op == "-":
+            if type(a) is int:
+                r = a - b
+                if INT64_MIN <= r <= INT64_MAX:
+                    return r
+                raise HLPanic("integer overflow", self._tls.line)
+            return a - b
         if op == "<=":
             return a <= b
+        if op == "!=":
+            return a != b
         if op == ">":
             return a > b
         if op == ">=":
             return a >= b
-        if op == "+":
-            if type(a) is int:
-                return i64_add(a, b, self.line)
-            return a + b  # float or str
-        if op == "-":
-            if type(a) is int:
-                return i64_sub(a, b, self.line)
-            return a - b
         if op == "*":
             if type(a) is int:
-                return i64_mul(a, b, self.line)
+                r = a * b
+                if INT64_MIN <= r <= INT64_MAX:
+                    return r
+                raise HLPanic("integer overflow", self._tls.line)
             return a * b
         if op == "/":
             if type(a) is int:
-                return i64_div(a, b, self.line)
+                return i64_div(a, b, self._tls.line)
             return f64_div(a, b)
         if op == "%":
             if type(a) is int:
-                return i64_mod(a, b, self.line)
+                return i64_mod(a, b, self._tls.line)
             return f64_mod(a, b)
-        raise HLPanic("unknown operator: %s" % op, self.line)
+        raise HLPanic("unknown operator: %s" % op, self._tls.line)
 
     # ---------- builtins ----------

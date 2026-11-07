@@ -8,7 +8,10 @@ from .rt import (
 
 class InterpBuiltin_method(object):
     def builtin_method(self, op, t, args, arg_nodes=None):
-        line = self.line
+        # Direct thread-local read: every call site ran an exec_stmt
+        # on this thread first, so the slot exists; the property
+        # wrapper is a Python call we do not need at ~9M calls/run.
+        line = self._tls.line
         if op == "str.len":
             return len(t)
         if op == "str.byte_at":

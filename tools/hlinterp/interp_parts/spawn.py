@@ -39,6 +39,12 @@ class InterpSpawn(object):
 
         def runner():
             try:
+                # Seed the fresh thread's exec state: call_fn and the
+                # exec paths read tls.fn_stack / tls.line directly (no
+                # per-access property fallback on task threads).
+                if not hasattr(interp._tls, "fn_stack"):
+                    interp._tls.fn_stack = []
+                    interp._tls.line = 0
                 if conc.det is not None:
                     conc.det.tramp_enter(det_node)
                 result = interp.call_fn(fn_key, values)
@@ -123,6 +129,12 @@ class InterpSpawn(object):
 
         def runner():
             try:
+                # Seed the fresh thread's exec state: call_fn and the
+                # exec paths read tls.fn_stack / tls.line directly (no
+                # per-access property fallback on task threads).
+                if not hasattr(interp._tls, "fn_stack"):
+                    interp._tls.fn_stack = []
+                    interp._tls.line = 0
                 if conc.det is not None:
                     conc.det.tramp_enter(det_node)
                 result = interp.call_fn(fn_key, values)
@@ -205,6 +217,12 @@ class InterpSpawn(object):
 
         def runner():
             try:
+                # Seed the fresh thread's exec state: call_fn and the
+                # exec paths read tls.fn_stack / tls.line directly (no
+                # per-access property fallback on task threads).
+                if not hasattr(interp._tls, "fn_stack"):
+                    interp._tls.fn_stack = []
+                    interp._tls.line = 0
                 if conc.det is not None:
                     conc.det.tramp_enter(det_node)
                 # The generator function takes (stream, args...) and
@@ -292,6 +310,12 @@ class InterpSpawn(object):
             # process before it) — the decrement and the retire always
             # happen now, in every mode.
             try:
+                # Seed the fresh thread's exec state: call_fn and the
+                # exec paths read tls.fn_stack / tls.line directly (no
+                # per-access property fallback on task threads).
+                if not hasattr(interp._tls, "fn_stack"):
+                    interp._tls.fn_stack = []
+                    interp._tls.line = 0
                 if conc.det is not None:
                     conc.det.tramp_enter(det_node)
                 if kind == "stream_map_int":

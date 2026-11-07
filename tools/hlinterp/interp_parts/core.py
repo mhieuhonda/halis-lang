@@ -67,6 +67,37 @@ class InterpCore(object):
         # NOT re-enter it (the allocator may be broken) — it falls
         # straight through to the default report in run().
         self._in_panic_hook = False
+        # Hot-path precomputation over the (already checked, immutable)
+        # program table. Both structures exist so call_fn and the
+        # return handler stop paying per-call dict.get chains:
+        #   _fn_plan[key]  -> (is_extern, recv, param_names, body,
+        #                     param_preds, requires, ensures, ret_pred)
+        #                     with recv = (name, mut) for struct methods,
+        #                     None otherwise
+        #   _tail_fns      -> set of fn keys carrying #[tail_call]
+        self._fn_plan = {}
+        self._tail_fns = set()
+        for key, fn in self.fns.items():
+            attrs = fn.get("attrs") or {}
+            if attrs.get("tail_call", False):
+                self._tail_fns.add(key)
+            params = fn["params"]
+            if fn["struct"] is not None:
+                recv = (params[0][0], params[0][2])
+                rest = params[1:]
+            else:
+                recv = None
+                rest = params
+            self._fn_plan[key] = (
+                fn.get("extern", False),
+                recv,
+                tuple(p[0] for p in rest),
+                fn["body"],
+                fn.get("param_preds"),
+                fn.get("requires"),
+                fn.get("ensures"),
+                fn.get("ret_pred"),
+            )
 
     @property
     def line(self):
@@ -131,10 +162,14 @@ class InterpCore(object):
         return int(r) & 0xFF
 
     def call_fn(self, key, args):
-        fn = self.fns[key]
-        # Stage 15 (v0.13.0-alpha): extern fn — call via ctypes.
-        if fn.get("extern", False):
-            return self.call_extern(fn, args)
+        # The per-fn plan was precomputed in __init__ (extern flag,
+        # receiver slot, parameter names, body, contract/refinement
+        # hooks): a single tuple unpack replaces the per-call dict.get
+        # chains the original paid on every user call.
+        (is_extern, recv, param_names, body, param_preds,
+         requires, ensures, ret_pred) = self._fn_plan[key]
+        if is_extern:
+            return self.call_extern(self.fns[key], args)
         # Stage 31 (v0.48.0-alpha): #[tail_call] trampoline. The checker
         # verified every self-call is in tail position with primitive-
         # only dataflow, so a tail `return f(...)` arrives here as
@@ -143,50 +178,50 @@ class InterpCore(object):
         # native goto loop). The fn-key stack is pushed per iteration
         # so nested (non-tail) calls from the body still resolve the
         # correct "current fn".
+        tls = self._tls
+        fn_stack = tls.fn_stack
+        contracts = self.contracts
         while True:
-            env = [{}]
-            if fn["struct"] is not None:
-                sn, _, sm = fn["params"][0]
-                env[0][sn] = [args[0], sm, False]
-                params = fn["params"][1:]
+            env0 = {}
+            env = [env0]
+            if recv is not None:
+                env0[recv[0]] = [args[0], recv[1], False]
                 call_args = args[1:]
             else:
-                params = fn["params"]
                 call_args = args
-            for (pn, _, _), v in zip_strict(params, call_args):
-                env[0][pn] = [v, False, False]
+            # Zip-strict semantics without the generator: the checker
+            # guarantees call arity, so the mismatch guard is the same
+            # ValueError zip(strict=True) would raise, just earlier.
+            if len(param_names) != len(call_args):
+                raise ValueError(
+                    "zip(): iterators have different lengths "
+                    "(strict mode requires equal lengths)")
+            for i, pn in enumerate(param_names):
+                env0[pn] = [call_args[i], False, False]
             # Stage 98: refinement guards on refined parameters — the
             # callee-side boundary of the type invariant. Evaluated
             # unconditionally (refinements are always-on semantics,
             # unlike --contracts); the native compiler emits the same
             # guards at fn entry.
-            fn_preds = fn.get("param_preds") or {}
-            if fn_preds:
-                for (pn, _, _), _v in zip_strict(params, call_args):
-                    ref = fn_preds.get(pn)
+            if param_preds:
+                # Parameter order (not pred-dict order): a violation in
+                # the first refined parameter must be the one reported,
+                # exactly as the zip_strict loop reported it.
+                for pn in param_names:
+                    ref = param_preds.get(pn)
                     if ref is not None:
                         self.check_refine(
-                            ref, env[0][pn][0],
+                            ref, env0[pn][0],
                             "parameter '%s' of '%s'" % (pn, key))
             # Stage 17: runtime `requires` assertion (enabled by --contracts).
-            if self.contracts and fn.get("requires") is not None:
-                if not self._truthy(self.eval_expr(fn["requires"], env)):
+            if contracts and requires is not None:
+                if not self._truthy(self.eval_expr(requires, env)):
                     raise HLPanic("contract violation: requires of '%s' "
                                   "(function precondition failed at runtime)"
-                                  % fn["name"], self.line)
+                                  % self.fns[key]["name"], tls.line)
             try:
-                # Stage 31: lazily create the thread-local fn stack — a
-                # TASK thread starts inside the spawn trampoline and
-                # never passes through __init__, so its fresh
-                # threading.local() has no fn_stack attribute yet (the
-                # same discipline the `line` property uses with
-                # getattr defaults).
-                fn_stack = getattr(self._tls, "fn_stack", None)
-                if fn_stack is None:
-                    fn_stack = []
-                    self._tls.fn_stack = fn_stack
                 fn_stack.append(key)
-                self.exec_stmts(fn["body"], env)
+                self.exec_stmts(body, env)
             except TailCallSig as tc:
                 if tc.key == key:
                     # The verified tail self-call: rebind + loop.
@@ -198,39 +233,30 @@ class InterpCore(object):
                 return self.call_fn(tc.key, tc.args)
             except ReturnSig as r:
                 # Stage 17: runtime `ensures` assertion (enabled by --contracts).
-                if self.contracts and fn.get("ensures") is not None:
-                    env[0]["result"] = [r.value, False, False]
-                    if not self._truthy(self.eval_expr(fn["ensures"], env)):
+                if contracts and ensures is not None:
+                    env0["result"] = [r.value, False, False]
+                    if not self._truthy(self.eval_expr(ensures, env)):
                         raise HLPanic("contract violation: ensures of '%s' "
                                       "(function postcondition failed at "
-                                      "runtime)" % fn["name"], self.line) from None
+                                      "runtime)" % self.fns[key]["name"],
+                                      tls.line) from None
                 # Stage 98: return-side refinement guard — the caller
                 # may rely on the declared invariant of the refined
                 # return type.
-                fn_retpred = fn.get("ret_pred")
-                if fn_retpred is not None:
+                if ret_pred is not None:
                     self.check_refine(
-                        fn_retpred, r.value,
+                        ret_pred, r.value,
                         "return value of '%s'" % key)
                 return r.value
             finally:
-                # Deep-scan-15 fix (LOW severity / defensive): the prior
-                # `getattr(self._tls, "fn_stack", []).pop()` would raise
-                # IndexError on a fresh `[]` default if the attribute
-                # were somehow missing — which would then mask the real
-                # in-flight exception (TailCallSig / ReturnSig). The try
-                # block above guarantees the attribute exists, but be
-                # defensive: only pop when the list is non-empty.
-                _fs = getattr(self._tls, "fn_stack", None)
-                if _fs:
-                    _fs.pop()
+                fn_stack.pop()
             # Implicit void return: still check ensures (result is None).
-            if self.contracts and fn.get("ensures") is not None:
-                env[0]["result"] = [None, False, False]
-                if not self._truthy(self.eval_expr(fn["ensures"], env)):
+            if contracts and ensures is not None:
+                env0["result"] = [None, False, False]
+                if not self._truthy(self.eval_expr(ensures, env)):
                     raise HLPanic("contract violation: ensures of '%s' "
                                   "(function postcondition failed at runtime)"
-                                  % fn["name"], self.line)
+                                  % self.fns[key]["name"], tls.line)
             return None
 
     @staticmethod
