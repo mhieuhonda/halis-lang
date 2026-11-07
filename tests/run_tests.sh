@@ -69,8 +69,8 @@ SCRATCH=$(mktemp -d)
 trap 'rm -rf "$SCRATCH"' EXIT INT TERM HUP
 
 declare -a PID_OF=()    # lane pid -> gate index
-declare -a DONE=()      # per gate: 0 pending, 1 pass, 2 fail
-for i in "${!GATES[@]}"; do DONE[$i]=0; done
+declare -a GSTATE=()      # per gate: 0 pending, 1 pass, 2 fail
+for i in "${!GATES[@]}"; do GSTATE[$i]=0; done
 NEXT=0
 EMIT=0
 
@@ -85,7 +85,7 @@ launch() {
         if ! make -s "bin/acc-$gate" >/dev/null 2>&1; then
             echo "  [FAIL] $gate (gate build failed)" > "$SCRATCH/$i.out"
             echo 2 > "$SCRATCH/$i.rc"
-            DONE[$i]=2
+            GSTATE[$i]=2
             return 0
         fi
     fi
@@ -111,7 +111,7 @@ while [ "${#PID_OF[@]}" -gt 0 ]; do
         wait "$pid" 2>/dev/null
         gi="${PID_OF[$pid]}"
         rc=$(cat "$SCRATCH/$gi.rc" 2>/dev/null || echo 1)
-        if [ "$rc" -eq 0 ]; then DONE[$gi]=1; else DONE[$gi]=2; fi
+        if [ "$rc" -eq 0 ]; then GSTATE[$gi]=1; else GSTATE[$gi]=2; fi
         unset "PID_OF[$pid]"
         if [ "$NEXT" -lt "${#GATES[@]}" ]; then
             launch "$NEXT"
@@ -132,13 +132,13 @@ done
 # foreground path writes .rc immediately) is a failure by name.
 while [ "$EMIT" -lt "${#GATES[@]}" ]; do
     echo "  [FAIL] ${GATES[$EMIT]}"
-    DONE[$EMIT]=2
+    GSTATE[$EMIT]=2
     EMIT=$((EMIT + 1))
 done
 
 for i in "${!GATES[@]}"; do
-    if [ "${DONE[$i]}" -eq 1 ]; then PASS=$((PASS + 1));
-    elif [ "${DONE[$i]}" -eq 2 ]; then FAIL=$((FAIL + 1)); fi
+    if [ "${GSTATE[$i]}" -eq 1 ]; then PASS=$((PASS + 1));
+    elif [ "${GSTATE[$i]}" -eq 2 ]; then FAIL=$((FAIL + 1)); fi
 done
 
 echo "=========================================="
