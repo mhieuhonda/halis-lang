@@ -39,6 +39,16 @@ SECTIONS
         *(.text .text.*)
     }
 
+    /* The build-id orphan, given an explicit home AFTER .text so no
+     * linker version can place it at the 1 MiB base ahead of the
+     * entry (binutils < 2.44 did exactly that to the aarch64 twin). */
+    .notes : ALIGN(4)
+    {
+        *(.note.gnu.build-id)
+        *(.note.gnu.property)
+        *(.note.ABI-tag)
+    }
+
     .rodata : ALIGN(16)
     {
         *(.rodata .rodata.*)

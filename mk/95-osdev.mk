@@ -240,7 +240,9 @@ link-acceptance: $(BIN)/acc-link
 #
 # The result enters at _start (raw exit syscall), so on an x86-64 host
 # the x86_64-unknown-none image runs directly; the ARM/RISC-V images
-# boot under QEMU (`-bios none -M virt -kernel`).
+# boot under QEMU (riscv64: `-bios none -M virt -kernel`; aarch64:
+# plain `-M virt -kernel` — its boards have no `none` firmware
+# spelling, and the entry arms its own stack from the script).
 triple:
 	@test -x $(BIN)/hlc || $(MAKE) bootstrap
 	@test -n "$(TRIPLE)" || (echo "Usage: make triple TRIPLE=x86_64-unknown-none F=examples/bare_x86_64.hls [OUT=bin/bare_img]" && false)

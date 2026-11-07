@@ -8552,204 +8552,206 @@ static const hl_str HLC_LIT_5294 = { HL_RC_IMMORTAL, 15L, "    usf_main();" };
 static const hl_str HLC_LIT_5295 = { HL_RC_IMMORTAL, 52L, "__attribute__((naked, noreturn)) void _start(void) {" };
 static const hl_str HLC_LIT_5296 = { HL_RC_IMMORTAL, 44L, "        \"call hl_boot\\n\" \"movq %rax, %rdi\\n\"" };
 static const hl_str HLC_LIT_5297 = { HL_RC_IMMORTAL, 46L, "        \"movl $60, %eax\\n\" \"syscall\\n\" \"hlt\\n\"" };
-static const hl_str HLC_LIT_5298 = { HL_RC_IMMORTAL, 37L, "        \"bl hl_boot\\n\" \"mov x0, x0\\n\"" };
-static const hl_str HLC_LIT_5299 = { HL_RC_IMMORTAL, 45L, "        \"mov x8, #93\\n\" \"svc #0\\n\" \"brk #1\\n\"" };
-static const hl_str HLC_LIT_5300 = { HL_RC_IMMORTAL, 38L, "        \"call hl_boot\\n\" \"mv a0, a0\\n\"" };
-static const hl_str HLC_LIT_5301 = { HL_RC_IMMORTAL, 42L, "        \"li a7, 93\\n\" \"ecall\\n\" \"ebreak\\n\"" };
-static const hl_str HLC_LIT_5302 = { HL_RC_IMMORTAL, 32L, "        \"call hl_boot\\n\" \"ud2\\n\"" };
-static const hl_str HLC_LIT_5303 = { HL_RC_IMMORTAL, 6L, "    );" };
-static const hl_str HLC_LIT_5304 = { HL_RC_IMMORTAL, 46L, "int main(int argc, char** argv, char** envp) {" };
-static const hl_str HLC_LIT_5305 = { HL_RC_IMMORTAL, 22L, "    hl_environ = envp;" };
-static const hl_str HLC_LIT_5306 = { HL_RC_IMMORTAL, 29L, "    hl_init_args(argc, argv);" };
-static const hl_str HLC_LIT_5307 = { HL_RC_IMMORTAL, 33L, "int main(int argc, char** argv) {" };
-static const hl_str HLC_LIT_5308 = { HL_RC_IMMORTAL, 18L, "    hl_srt_init();" };
-static const hl_str HLC_LIT_5309 = { HL_RC_IMMORTAL, 18L, "    hl_det_init();" };
-static const hl_str HLC_LIT_5310 = { HL_RC_IMMORTAL, 27L, "    atexit(__hlc_pgo_dump);" };
-static const hl_str HLC_LIT_5311 = { HL_RC_IMMORTAL, 51L, "    const char* hl_sb = getenv(\"HLS_SANDBOX_ROOT\");" };
-static const hl_str HLC_LIT_5312 = { HL_RC_IMMORTAL, 54L, "    if (hl_sb && hl_sb[0]) hl_set_sandbox_root(hl_sb);" };
-static const hl_str HLC_LIT_5313 = { HL_RC_IMMORTAL, 29L, "    return (int)(usf_main());" };
-static const hl_str HLC_LIT_5314 = { HL_RC_IMMORTAL, 27L, "        \"xorq %rbp, %rbp\\n\"" };
-static const hl_str HLC_LIT_5315 = { HL_RC_IMMORTAL, 52L, "        \"movq (%rsp), %rdi\\n\" \"leaq 8(%rsp), %rsi\\n\"" };
-static const hl_str HLC_LIT_5316 = { HL_RC_IMMORTAL, 58L, "        \"leaq 16(%rsp,%rdi,8), %rdx\\n\" \"andq $-16, %rsp\\n\"" };
-static const hl_str HLC_LIT_5317 = { HL_RC_IMMORTAL, 41L, "        \"call main\\n\" \"movl %eax, %edi\\n\"" };
-static const hl_str HLC_LIT_5318 = { HL_RC_IMMORTAL, 47L, "        \"movl $231, %eax\\n\" \"syscall\\n\" \"hlt\\n\"" };
-static const hl_str HLC_LIT_5319 = { HL_RC_IMMORTAL, 42L, "        \"ldr x0, [sp]\\n\" \"add x1, sp, 8\\n\"" };
-static const hl_str HLC_LIT_5320 = { HL_RC_IMMORTAL, 42L, "        \"ldr x9, [sp]\\n\" \"add x9, x9, 1\\n\"" };
-static const hl_str HLC_LIT_5321 = { HL_RC_IMMORTAL, 34L, "        \"add x2, x1, x9, lsl #3\\n\"" };
-static const hl_str HLC_LIT_5322 = { HL_RC_IMMORTAL, 42L, "        \"mov x9, sp\\n\" \"bic sp, x9, #15\\n\"" };
-static const hl_str HLC_LIT_5323 = { HL_RC_IMMORTAL, 57L, "        \"bl main\\n\" \"mov x8, #94\\n\" \"svc #0\\n\" \"brk #1\\n\"" };
-static const hl_str HLC_LIT_5324 = { HL_RC_IMMORTAL, 43L, "        \"ld a0, 0(sp)\\n\" \"addi a1, sp, 8\\n\"" };
-static const hl_str HLC_LIT_5325 = { HL_RC_IMMORTAL, 81L, "        \"ld t0, 0(sp)\\n\" \"addi t0, t0, 1\\n\" \"slli t0, t0, 3\\n\" \"add a2, a1, t0\\n\"" };
-static const hl_str HLC_LIT_5326 = { HL_RC_IMMORTAL, 42L, "        \"andi sp, sp, -16\\n\" \"call main\\n\"" };
-static const hl_str HLC_LIT_5327 = { HL_RC_IMMORTAL, 42L, "        \"li a7, 94\\n\" \"ecall\\n\" \"ebreak\\n\"" };
-static const hl_str HLC_LIT_5328 = { HL_RC_IMMORTAL, 15L, "        \"ud2\\n\"" };
-static const hl_str HLC_LIT_5329 = { HL_RC_IMMORTAL, 5L, "core." };
-static const hl_str HLC_LIT_5330 = { HL_RC_IMMORTAL, 3L, "std" };
-static const hl_str HLC_LIT_5331 = { HL_RC_IMMORTAL, 4L, "core" };
-static const hl_str HLC_LIT_5332 = { HL_RC_IMMORTAL, 4L, ".hls" };
-static const hl_str HLC_LIT_5333 = { HL_RC_IMMORTAL, 18L, "module not found: " };
-static const hl_str HLC_LIT_5334 = { HL_RC_IMMORTAL, 6L, "--fast" };
-static const hl_str HLC_LIT_5335 = { HL_RC_IMMORTAL, 11L, "--contracts" };
-static const hl_str HLC_LIT_5336 = { HL_RC_IMMORTAL, 14L, "--pgo-generate" };
-static const hl_str HLC_LIT_5337 = { HL_RC_IMMORTAL, 9L, "--no-libc" };
-static const hl_str HLC_LIT_5338 = { HL_RC_IMMORTAL, 7L, "--debug" };
-static const hl_str HLC_LIT_5339 = { HL_RC_IMMORTAL, 9L, "--symbols" };
-static const hl_str HLC_LIT_5340 = { HL_RC_IMMORTAL, 40L, "error: --symbols expects a manifest path" };
-static const hl_str HLC_LIT_5341 = { HL_RC_IMMORTAL, 8L, "--target" };
-static const hl_str HLC_LIT_5342 = { HL_RC_IMMORTAL, 39L, "error: --target expects a target triple" };
-static const hl_str HLC_LIT_5343 = { HL_RC_IMMORTAL, 19L, "x86_64-unknown-none" };
-static const hl_str HLC_LIT_5344 = { HL_RC_IMMORTAL, 20L, "aarch64-unknown-none" };
-static const hl_str HLC_LIT_5345 = { HL_RC_IMMORTAL, 20L, "riscv64-unknown-none" };
-static const hl_str HLC_LIT_5346 = { HL_RC_IMMORTAL, 34L, "error: unknown bare-metal target '" };
-static const hl_str HLC_LIT_5347 = { HL_RC_IMMORTAL, 78L, "' (expected x86_64-unknown-none | aarch64-unknown-none | riscv64-unknown-none)" };
-static const hl_str HLC_LIT_5348 = { HL_RC_IMMORTAL, 5L, "--lto" };
-static const hl_str HLC_LIT_5349 = { HL_RC_IMMORTAL, 11L, "--lto-stats" };
-static const hl_str HLC_LIT_5350 = { HL_RC_IMMORTAL, 11L, "--opt-stats" };
-static const hl_str HLC_LIT_5351 = { HL_RC_IMMORTAL, 15L, "--lto-threshold" };
-static const hl_str HLC_LIT_5352 = { HL_RC_IMMORTAL, 51L, "error: --lto-threshold expects an integer (1..=200)" };
-static const hl_str HLC_LIT_5353 = { HL_RC_IMMORTAL, 59L, "error: --lto-threshold expects an integer in 1..=200 (got '" };
-static const hl_str HLC_LIT_5354 = { HL_RC_IMMORTAL, 16L, "--target-feature" };
-static const hl_str HLC_LIT_5355 = { HL_RC_IMMORTAL, 75L, "error: --target-feature expects a feature name (sse4.2 | avx2 | neon | rvv)" };
-static const hl_str HLC_LIT_5356 = { HL_RC_IMMORTAL, 7L, "+sse4.2" };
-static const hl_str HLC_LIT_5357 = { HL_RC_IMMORTAL, 5L, "+avx2" };
-static const hl_str HLC_LIT_5358 = { HL_RC_IMMORTAL, 5L, "+neon" };
-static const hl_str HLC_LIT_5359 = { HL_RC_IMMORTAL, 4L, "+rvv" };
-static const hl_str HLC_LIT_5360 = { HL_RC_IMMORTAL, 6L, "native" };
-static const hl_str HLC_LIT_5361 = { HL_RC_IMMORTAL, 31L, "error: unknown target feature '" };
-static const hl_str HLC_LIT_5362 = { HL_RC_IMMORTAL, 48L, "' (expected sse4.2 | avx2 | neon | rvv | native)" };
-static const hl_str HLC_LIT_5363 = { HL_RC_IMMORTAL, 9L, "--pgo-use" };
-static const hl_str HLC_LIT_5364 = { HL_RC_IMMORTAL, 44L, "error: --pgo-use expects a profile file path" };
-static const hl_str HLC_LIT_5365 = { HL_RC_IMMORTAL, 2L, "-O" };
-static const hl_str HLC_LIT_5366 = { HL_RC_IMMORTAL, 4L, "fast" };
-static const hl_str HLC_LIT_5367 = { HL_RC_IMMORTAL, 47L, "error: -O expects 'fast' (the only level today)" };
-static const hl_str HLC_LIT_5368 = { HL_RC_IMMORTAL, 7L, "--audit" };
-static const hl_str HLC_LIT_5369 = { HL_RC_IMMORTAL, 30L, "usage: hlc --audit <input.hls>" };
-static const hl_str HLC_LIT_5370 = { HL_RC_IMMORTAL, 24L, "error: cannot open file " };
-static const hl_str HLC_LIT_5371 = { HL_RC_IMMORTAL, 25L, "error: module not found: " };
-static const hl_str HLC_LIT_5372 = { HL_RC_IMMORTAL, 82L, "usage: hlc [--fast | -O fast] [--contracts] [--pgo-generate] [--pgo-use <profile>]" };
-static const hl_str HLC_LIT_5373 = { HL_RC_IMMORTAL, 95L, "              [--lto] [--lto-stats] [--lto-threshold N] [--target-feature sse4.2|avx2|neon|rvv]" };
-static const hl_str HLC_LIT_5374 = { HL_RC_IMMORTAL, 98L, "              [--no-libc] [--target x86_64-unknown-none|aarch64-unknown-none|riscv64-unknown-none]" };
-static const hl_str HLC_LIT_5375 = { HL_RC_IMMORTAL, 71L, "              [--debug] [--symbols <manifest>] <input.hls> <output.c|->" };
-static const hl_str HLC_LIT_5376 = { HL_RC_IMMORTAL, 30L, "       hlc --audit <input.hls>" };
-static const hl_str HLC_LIT_5377 = { HL_RC_IMMORTAL, 44L, "error: --no-libc is not available on target " };
-static const hl_str HLC_LIT_5378 = { HL_RC_IMMORTAL, 76L, " (the bare-metal triples build freestanding images, not hosted no-libc ones)" };
-static const hl_str HLC_LIT_5379 = { HL_RC_IMMORTAL, 51L, "error: --target-feature is not available on target " };
-static const hl_str HLC_LIT_5380 = { HL_RC_IMMORTAL, 84L, " (bare-metal targets are integer-only: SIMD intrinsics use floating-point registers)" };
-static const hl_str HLC_LIT_5381 = { HL_RC_IMMORTAL, 91L, "error: --debug needs a file output path (the C line markers must name the generated C file)" };
-static const hl_str HLC_LIT_5382 = { HL_RC_IMMORTAL, 25L, "error: cannot write file " };
-static const hl_str HLC_LIT_5383 = { HL_RC_IMMORTAL, 31L, " (the directory does not exist)" };
-static const hl_str HLC_LIT_5384 = { HL_RC_IMMORTAL, 42L, "error: --pgo-use: profile file not found: " };
-static const hl_str HLC_LIT_5385 = { HL_RC_IMMORTAL, 18L, "error: --pgo-use: " };
-static const hl_str HLC_LIT_5386 = { HL_RC_IMMORTAL, 17L, "=== LTO stats ===" };
-static const hl_str HLC_LIT_5387 = { HL_RC_IMMORTAL, 32L, "  functions in program        : " };
-static const hl_str HLC_LIT_5388 = { HL_RC_IMMORTAL, 32L, "  inline expansions (sites)   : " };
-static const hl_str HLC_LIT_5389 = { HL_RC_IMMORTAL, 32L, "  distinct callees inlined    : " };
-static const hl_str HLC_LIT_5390 = { HL_RC_IMMORTAL, 32L, "  bodies dropped (phase A+B)  : " };
-static const hl_str HLC_LIT_5391 = { HL_RC_IMMORTAL, 32L, "  inline stmt budget          : " };
-static const hl_str HLC_LIT_5392 = { HL_RC_IMMORTAL, 18L, " (--lto-threshold)" };
-static const hl_str HLC_LIT_5393 = { HL_RC_IMMORTAL, 32L, "  generic fn instantiations   : " };
-static const hl_str HLC_LIT_5394 = { HL_RC_IMMORTAL, 33L, "  generic struct instantiations: " };
-static const hl_str HLC_LIT_5395 = { HL_RC_IMMORTAL, 32L, "  generic enum instantiations : " };
-static const hl_str HLC_LIT_5396 = { HL_RC_IMMORTAL, 18L, "  inlined callees:" };
-static const hl_str HLC_LIT_5397 = { HL_RC_IMMORTAL, 17L, "=== opt-stats ===" };
-static const hl_str HLC_LIT_5398 = { HL_RC_IMMORTAL, 34L, "  functions in program          : " };
-static const hl_str HLC_LIT_5399 = { HL_RC_IMMORTAL, 33L, "  #[inline(always)] annotations: " };
-static const hl_str HLC_LIT_5400 = { HL_RC_IMMORTAL, 33L, "  #[inline(never)]  annotations: " };
-static const hl_str HLC_LIT_5401 = { HL_RC_IMMORTAL, 34L, "  #[hot]             annotations: " };
-static const hl_str HLC_LIT_5402 = { HL_RC_IMMORTAL, 34L, "  #[cold]            annotations: " };
-static const hl_str HLC_LIT_5403 = { HL_RC_IMMORTAL, 34L, "  #[irq_handler]     annotations: " };
-static const hl_str HLC_LIT_5404 = { HL_RC_IMMORTAL, 34L, "  #[no_red_zone]     annotations: " };
-static const hl_str HLC_LIT_5405 = { HL_RC_IMMORTAL, 34L, "  #[stack_size(N)]   annotations: " };
-static const hl_str HLC_LIT_5406 = { HL_RC_IMMORTAL, 34L, "  #[section(\"X\")]    annotations: " };
-static const hl_str HLC_LIT_5407 = { HL_RC_IMMORTAL, 34L, "  #[align(N)]        annotations: " };
-static const hl_str HLC_LIT_5408 = { HL_RC_IMMORTAL, 16L, "  #![stack_size(" };
-static const hl_str HLC_LIT_5409 = { HL_RC_IMMORTAL, 25L, ")]   budget: worst chain " };
-static const hl_str HLC_LIT_5410 = { HL_RC_IMMORTAL, 34L, "  #[tail_call]       annotations: " };
-static const hl_str HLC_LIT_5411 = { HL_RC_IMMORTAL, 18L, " (verified sites: " };
-static const hl_str HLC_LIT_5412 = { HL_RC_IMMORTAL, 13L, ", stack O(1))" };
-static const hl_str HLC_LIT_5413 = { HL_RC_IMMORTAL, 35L, "  PGO-derived hot (no annotation): " };
-static const hl_str HLC_LIT_5414 = { HL_RC_IMMORTAL, 36L, "  PGO-derived cold (no annotation): " };
-static const hl_str HLC_LIT_5415 = { HL_RC_IMMORTAL, 45L, "  PGO-derived static-inline (no annotation): " };
-static const hl_str HLC_LIT_5416 = { HL_RC_IMMORTAL, 56L, "  PGO profile: (none loaded; --pgo-use <file> to enable)" };
-static const hl_str HLC_LIT_5417 = { HL_RC_IMMORTAL, 34L, "  LTO inline expansions (sites) : " };
-static const hl_str HLC_LIT_5418 = { HL_RC_IMMORTAL, 33L, "  LTO distinct callees inlined : " };
-static const hl_str HLC_LIT_5419 = { HL_RC_IMMORTAL, 34L, "  LTO bodies dropped (A+B)      : " };
-static const hl_str HLC_LIT_5420 = { HL_RC_IMMORTAL, 34L, "  LTO: (disabled; --lto to enable)" };
-static const hl_str HLC_LIT_5421 = { HL_RC_IMMORTAL, 35L, "  stack-allocated list bindings  : " };
-static const hl_str HLC_LIT_5422 = { HL_RC_IMMORTAL, 35L, "  boxed (forced heap) bindings   : " };
-static const hl_str HLC_LIT_5423 = { HL_RC_IMMORTAL, 35L, "  heap (escaping) bindings       : " };
-static const hl_str HLC_LIT_5424 = { HL_RC_IMMORTAL, 35L, "  heap (push/pop) bindings       : " };
-static const hl_str HLC_LIT_5425 = { HL_RC_IMMORTAL, 35L, "  tracked list bindings          : " };
-static const hl_str HLC_LIT_5426 = { HL_RC_IMMORTAL, 25L, "  per-function decisions:" };
-static const hl_str HLC_LIT_5427 = { HL_RC_IMMORTAL, 85L, "    name                          inline      hot/cold    frame                source" };
-static const hl_str HLC_LIT_5428 = { HL_RC_IMMORTAL, 85L, "    ----                          ------      ---------   -----                ------" };
-static const hl_str HLC_LIT_5429 = { HL_RC_IMMORTAL, 6L, "ALWAYS" };
-static const hl_str HLC_LIT_5430 = { HL_RC_IMMORTAL, 5L, "NEVER" };
-static const hl_str HLC_LIT_5431 = { HL_RC_IMMORTAL, 10L, "PGO-inline" };
-static const hl_str HLC_LIT_5432 = { HL_RC_IMMORTAL, 3L, "HOT" };
-static const hl_str HLC_LIT_5433 = { HL_RC_IMMORTAL, 4L, "COLD" };
-static const hl_str HLC_LIT_5434 = { HL_RC_IMMORTAL, 7L, "PGO-hot" };
-static const hl_str HLC_LIT_5435 = { HL_RC_IMMORTAL, 8L, "PGO-cold" };
-static const hl_str HLC_LIT_5436 = { HL_RC_IMMORTAL, 4L, "irq " };
-static const hl_str HLC_LIT_5437 = { HL_RC_IMMORTAL, 12L, "no-red-zone " };
-static const hl_str HLC_LIT_5438 = { HL_RC_IMMORTAL, 7L, "stack<=" };
-static const hl_str HLC_LIT_5439 = { HL_RC_IMMORTAL, 5L, "tail(" };
-static const hl_str HLC_LIT_5440 = { HL_RC_IMMORTAL, 9L, "annotated" };
-static const hl_str HLC_LIT_5441 = { HL_RC_IMMORTAL, 3L, "PGO" };
-static const hl_str HLC_LIT_5442 = { HL_RC_IMMORTAL, 9L, "heuristic" };
-static const hl_str HLC_LIT_5443 = { HL_RC_IMMORTAL, 33L, "  verified tail calls (Stage 31):" };
-static const hl_str HLC_LIT_5444 = { HL_RC_IMMORTAL, 64L, "    name                          sites   params  ret      stack" };
-static const hl_str HLC_LIT_5445 = { HL_RC_IMMORTAL, 64L, "    ----                          -----   ------  ---      -----" };
-static const hl_str HLC_LIT_5446 = { HL_RC_IMMORTAL, 9L, " constant" };
-static const hl_str HLC_LIT_5447 = { HL_RC_IMMORTAL, 35L, "  list layout decisions (Stage 30):" };
-static const hl_str HLC_LIT_5448 = { HL_RC_IMMORTAL, 64L, "    binding                              layout     cap   reason" };
-static const hl_str HLC_LIT_5449 = { HL_RC_IMMORTAL, 63L, "    ------                              ------     ---   ------" };
-static const hl_str HLC_LIT_5450 = { HL_RC_IMMORTAL, 78L, "==============================================================================" };
-static const hl_str HLC_LIT_5451 = { HL_RC_IMMORTAL, 72L, "  function                       declared                       computed" };
-static const hl_str HLC_LIT_5452 = { HL_RC_IMMORTAL, 81L, "  Crate mode: #![freestanding] (no libc, no OS calls, std disabled, entry _start)" };
-static const hl_str HLC_LIT_5453 = { HL_RC_IMMORTAL, 57L, "  Crate mode: #![no_std] (std disabled, hosted libc kept)" };
-static const hl_str HLC_LIT_5454 = { HL_RC_IMMORTAL, 40L, "  Crate mode: std (default hosted crate)" };
-static const hl_str HLC_LIT_5455 = { HL_RC_IMMORTAL, 10L, "  Target: " };
-static const hl_str HLC_LIT_5456 = { HL_RC_IMMORTAL, 27L, " (bare-metal, integer-only)" };
-static const hl_str HLC_LIT_5457 = { HL_RC_IMMORTAL, 30L, "  Stack budget: #![stack_size(" };
-static const hl_str HLC_LIT_5458 = { HL_RC_IMMORTAL, 19L, ")] \342\200\224 worst chain " };
-static const hl_str HLC_LIT_5459 = { HL_RC_IMMORTAL, 15L, "  Boot header: " };
-static const hl_str HLC_LIT_5460 = { HL_RC_IMMORTAL, 15L, " (emitted into " };
-static const hl_str HLC_LIT_5461 = { HL_RC_IMMORTAL, 85L, "  Interrupt safety (Stage 91): every #[irq_handler] is proved to reach no allocation:" };
-static const hl_str HLC_LIT_5462 = { HL_RC_IMMORTAL, 31L, "  #[secrets(...)] annotations: " };
-static const hl_str HLC_LIT_5463 = { HL_RC_IMMORTAL, 10L, ": ct over " };
-static const hl_str HLC_LIT_5464 = { HL_RC_IMMORTAL, 16L, "  #[ct] claims: " };
-static const hl_str HLC_LIT_5465 = { HL_RC_IMMORTAL, 105L, "  Linker script: none declared (#![link_script] absent) \342\200\224 custom sections use the default linker layout" };
-static const hl_str HLC_LIT_5466 = { HL_RC_IMMORTAL, 17L, "  Linker script: " };
-static const hl_str HLC_LIT_5467 = { HL_RC_IMMORTAL, 19L, " section(s) named, " };
-static const hl_str HLC_LIT_5468 = { HL_RC_IMMORTAL, 18L, " pattern(s) placed" };
-static const hl_str HLC_LIT_5469 = { HL_RC_IMMORTAL, 27L, "  #[align(N)] annotations: " };
-static const hl_str HLC_LIT_5470 = { HL_RC_IMMORTAL, 57L, "  Capability tokens (Cap[E] parameters / cap_take calls):" };
-static const hl_str HLC_LIT_5471 = { HL_RC_IMMORTAL, 63L, "  Active effects:    IO, Fs, Clock, Args, Exit, Net, Rand, Proc" };
-static const hl_str HLC_LIT_5472 = { HL_RC_IMMORTAL, 51L, "  `uses IO` expands to: {IO, Fs, Clock, Args, Exit}" };
-static const hl_str HLC_LIT_5473 = { HL_RC_IMMORTAL, 61L, "  Net, Rand, Proc are independent effects (not part of the IO" };
-static const hl_str HLC_LIT_5474 = { HL_RC_IMMORTAL, 57L, "  family) \342\200\224 declare them explicitly to use net_lookup /" };
-static const hl_str HLC_LIT_5475 = { HL_RC_IMMORTAL, 57L, "  rand_int / rand_float / rand_seed / proc_exec builtins." };
-static const hl_str HLC_LIT_5476 = { HL_RC_IMMORTAL, 40L, "  No reserved effects (Stage 9 release)." };
-static const hl_str HLC_LIT_5477 = { HL_RC_IMMORTAL, 61L, "  Taint sources (builtins):  tainted_args, read_file_tainted," };
-static const hl_str HLC_LIT_5478 = { HL_RC_IMMORTAL, 39L, "                              read_line" };
-static const hl_str HLC_LIT_5479 = { HL_RC_IMMORTAL, 55L, "  Taint sinks (builtins):    print, println, read_file," };
-static const hl_str HLC_LIT_5480 = { HL_RC_IMMORTAL, 58L, "                            write_file, file_exists, exit," };
-static const hl_str HLC_LIT_5481 = { HL_RC_IMMORTAL, 49L, "                            net_lookup, proc_exec" };
-static const hl_str HLC_LIT_5482 = { HL_RC_IMMORTAL, 56L, "  Explicit untaint:         taint_unwrap, std.sanitize.*" };
-static const hl_str HLC_LIT_5483 = { HL_RC_IMMORTAL, 35L, "  Functions calling tainted_args():" };
-static const hl_str HLC_LIT_5484 = { HL_RC_IMMORTAL, 6L, "    - " };
-static const hl_str HLC_LIT_5485 = { HL_RC_IMMORTAL, 75L, "  No function calls tainted_args() (no argv-taint sources in this program)." };
-static const hl_str HLC_LIT_5486 = { HL_RC_IMMORTAL, 40L, "  Functions calling read_file_tainted():" };
-static const hl_str HLC_LIT_5487 = { HL_RC_IMMORTAL, 40L, "  No function calls read_file_tainted()." };
-static const hl_str HLC_LIT_5488 = { HL_RC_IMMORTAL, 32L, "  Functions calling read_line():" };
-static const hl_str HLC_LIT_5489 = { HL_RC_IMMORTAL, 32L, "  No function calls read_line()." };
-static const hl_str HLC_LIT_5490 = { HL_RC_IMMORTAL, 5L, ": -> " };
-static const hl_str HLC_LIT_5491 = { HL_RC_IMMORTAL, 56L, "  FFI taint marking (Stage 109): no extern declarations." };
-static const hl_str HLC_LIT_5492 = { HL_RC_IMMORTAL, 32L, "  FFI taint marking (Stage 109):" };
-static const hl_str HLC_LIT_5493 = { HL_RC_IMMORTAL, 69L, "    #[taint_source] externs (returns untrusted, typed tainted[ret]): " };
-static const hl_str HLC_LIT_5494 = { HL_RC_IMMORTAL, 49L, "    #[taint_sink(...)] externs (declared sinks): " };
-static const hl_str HLC_LIT_5495 = { HL_RC_IMMORTAL, 61L, "    Unmarked externs (returns TRUSTED by the taint lattice): " };
+static const hl_str HLC_LIT_5298 = { HL_RC_IMMORTAL, 47L, "        \"ldr x0, =__stack_top\\n\" \"mov sp, x0\\n\"" };
+static const hl_str HLC_LIT_5299 = { HL_RC_IMMORTAL, 37L, "        \"bl hl_boot\\n\" \"mov x0, x0\\n\"" };
+static const hl_str HLC_LIT_5300 = { HL_RC_IMMORTAL, 45L, "        \"mov x8, #93\\n\" \"svc #0\\n\" \"brk #1\\n\"" };
+static const hl_str HLC_LIT_5301 = { HL_RC_IMMORTAL, 30L, "        \"la sp, __stack_top\\n\"" };
+static const hl_str HLC_LIT_5302 = { HL_RC_IMMORTAL, 38L, "        \"call hl_boot\\n\" \"mv a0, a0\\n\"" };
+static const hl_str HLC_LIT_5303 = { HL_RC_IMMORTAL, 42L, "        \"li a7, 93\\n\" \"ecall\\n\" \"ebreak\\n\"" };
+static const hl_str HLC_LIT_5304 = { HL_RC_IMMORTAL, 32L, "        \"call hl_boot\\n\" \"ud2\\n\"" };
+static const hl_str HLC_LIT_5305 = { HL_RC_IMMORTAL, 6L, "    );" };
+static const hl_str HLC_LIT_5306 = { HL_RC_IMMORTAL, 46L, "int main(int argc, char** argv, char** envp) {" };
+static const hl_str HLC_LIT_5307 = { HL_RC_IMMORTAL, 22L, "    hl_environ = envp;" };
+static const hl_str HLC_LIT_5308 = { HL_RC_IMMORTAL, 29L, "    hl_init_args(argc, argv);" };
+static const hl_str HLC_LIT_5309 = { HL_RC_IMMORTAL, 33L, "int main(int argc, char** argv) {" };
+static const hl_str HLC_LIT_5310 = { HL_RC_IMMORTAL, 18L, "    hl_srt_init();" };
+static const hl_str HLC_LIT_5311 = { HL_RC_IMMORTAL, 18L, "    hl_det_init();" };
+static const hl_str HLC_LIT_5312 = { HL_RC_IMMORTAL, 27L, "    atexit(__hlc_pgo_dump);" };
+static const hl_str HLC_LIT_5313 = { HL_RC_IMMORTAL, 51L, "    const char* hl_sb = getenv(\"HLS_SANDBOX_ROOT\");" };
+static const hl_str HLC_LIT_5314 = { HL_RC_IMMORTAL, 54L, "    if (hl_sb && hl_sb[0]) hl_set_sandbox_root(hl_sb);" };
+static const hl_str HLC_LIT_5315 = { HL_RC_IMMORTAL, 29L, "    return (int)(usf_main());" };
+static const hl_str HLC_LIT_5316 = { HL_RC_IMMORTAL, 27L, "        \"xorq %rbp, %rbp\\n\"" };
+static const hl_str HLC_LIT_5317 = { HL_RC_IMMORTAL, 52L, "        \"movq (%rsp), %rdi\\n\" \"leaq 8(%rsp), %rsi\\n\"" };
+static const hl_str HLC_LIT_5318 = { HL_RC_IMMORTAL, 58L, "        \"leaq 16(%rsp,%rdi,8), %rdx\\n\" \"andq $-16, %rsp\\n\"" };
+static const hl_str HLC_LIT_5319 = { HL_RC_IMMORTAL, 41L, "        \"call main\\n\" \"movl %eax, %edi\\n\"" };
+static const hl_str HLC_LIT_5320 = { HL_RC_IMMORTAL, 47L, "        \"movl $231, %eax\\n\" \"syscall\\n\" \"hlt\\n\"" };
+static const hl_str HLC_LIT_5321 = { HL_RC_IMMORTAL, 42L, "        \"ldr x0, [sp]\\n\" \"add x1, sp, 8\\n\"" };
+static const hl_str HLC_LIT_5322 = { HL_RC_IMMORTAL, 42L, "        \"ldr x9, [sp]\\n\" \"add x9, x9, 1\\n\"" };
+static const hl_str HLC_LIT_5323 = { HL_RC_IMMORTAL, 34L, "        \"add x2, x1, x9, lsl #3\\n\"" };
+static const hl_str HLC_LIT_5324 = { HL_RC_IMMORTAL, 42L, "        \"mov x9, sp\\n\" \"bic sp, x9, #15\\n\"" };
+static const hl_str HLC_LIT_5325 = { HL_RC_IMMORTAL, 57L, "        \"bl main\\n\" \"mov x8, #94\\n\" \"svc #0\\n\" \"brk #1\\n\"" };
+static const hl_str HLC_LIT_5326 = { HL_RC_IMMORTAL, 43L, "        \"ld a0, 0(sp)\\n\" \"addi a1, sp, 8\\n\"" };
+static const hl_str HLC_LIT_5327 = { HL_RC_IMMORTAL, 81L, "        \"ld t0, 0(sp)\\n\" \"addi t0, t0, 1\\n\" \"slli t0, t0, 3\\n\" \"add a2, a1, t0\\n\"" };
+static const hl_str HLC_LIT_5328 = { HL_RC_IMMORTAL, 42L, "        \"andi sp, sp, -16\\n\" \"call main\\n\"" };
+static const hl_str HLC_LIT_5329 = { HL_RC_IMMORTAL, 42L, "        \"li a7, 94\\n\" \"ecall\\n\" \"ebreak\\n\"" };
+static const hl_str HLC_LIT_5330 = { HL_RC_IMMORTAL, 15L, "        \"ud2\\n\"" };
+static const hl_str HLC_LIT_5331 = { HL_RC_IMMORTAL, 5L, "core." };
+static const hl_str HLC_LIT_5332 = { HL_RC_IMMORTAL, 3L, "std" };
+static const hl_str HLC_LIT_5333 = { HL_RC_IMMORTAL, 4L, "core" };
+static const hl_str HLC_LIT_5334 = { HL_RC_IMMORTAL, 4L, ".hls" };
+static const hl_str HLC_LIT_5335 = { HL_RC_IMMORTAL, 18L, "module not found: " };
+static const hl_str HLC_LIT_5336 = { HL_RC_IMMORTAL, 6L, "--fast" };
+static const hl_str HLC_LIT_5337 = { HL_RC_IMMORTAL, 11L, "--contracts" };
+static const hl_str HLC_LIT_5338 = { HL_RC_IMMORTAL, 14L, "--pgo-generate" };
+static const hl_str HLC_LIT_5339 = { HL_RC_IMMORTAL, 9L, "--no-libc" };
+static const hl_str HLC_LIT_5340 = { HL_RC_IMMORTAL, 7L, "--debug" };
+static const hl_str HLC_LIT_5341 = { HL_RC_IMMORTAL, 9L, "--symbols" };
+static const hl_str HLC_LIT_5342 = { HL_RC_IMMORTAL, 40L, "error: --symbols expects a manifest path" };
+static const hl_str HLC_LIT_5343 = { HL_RC_IMMORTAL, 8L, "--target" };
+static const hl_str HLC_LIT_5344 = { HL_RC_IMMORTAL, 39L, "error: --target expects a target triple" };
+static const hl_str HLC_LIT_5345 = { HL_RC_IMMORTAL, 19L, "x86_64-unknown-none" };
+static const hl_str HLC_LIT_5346 = { HL_RC_IMMORTAL, 20L, "aarch64-unknown-none" };
+static const hl_str HLC_LIT_5347 = { HL_RC_IMMORTAL, 20L, "riscv64-unknown-none" };
+static const hl_str HLC_LIT_5348 = { HL_RC_IMMORTAL, 34L, "error: unknown bare-metal target '" };
+static const hl_str HLC_LIT_5349 = { HL_RC_IMMORTAL, 78L, "' (expected x86_64-unknown-none | aarch64-unknown-none | riscv64-unknown-none)" };
+static const hl_str HLC_LIT_5350 = { HL_RC_IMMORTAL, 5L, "--lto" };
+static const hl_str HLC_LIT_5351 = { HL_RC_IMMORTAL, 11L, "--lto-stats" };
+static const hl_str HLC_LIT_5352 = { HL_RC_IMMORTAL, 11L, "--opt-stats" };
+static const hl_str HLC_LIT_5353 = { HL_RC_IMMORTAL, 15L, "--lto-threshold" };
+static const hl_str HLC_LIT_5354 = { HL_RC_IMMORTAL, 51L, "error: --lto-threshold expects an integer (1..=200)" };
+static const hl_str HLC_LIT_5355 = { HL_RC_IMMORTAL, 59L, "error: --lto-threshold expects an integer in 1..=200 (got '" };
+static const hl_str HLC_LIT_5356 = { HL_RC_IMMORTAL, 16L, "--target-feature" };
+static const hl_str HLC_LIT_5357 = { HL_RC_IMMORTAL, 75L, "error: --target-feature expects a feature name (sse4.2 | avx2 | neon | rvv)" };
+static const hl_str HLC_LIT_5358 = { HL_RC_IMMORTAL, 7L, "+sse4.2" };
+static const hl_str HLC_LIT_5359 = { HL_RC_IMMORTAL, 5L, "+avx2" };
+static const hl_str HLC_LIT_5360 = { HL_RC_IMMORTAL, 5L, "+neon" };
+static const hl_str HLC_LIT_5361 = { HL_RC_IMMORTAL, 4L, "+rvv" };
+static const hl_str HLC_LIT_5362 = { HL_RC_IMMORTAL, 6L, "native" };
+static const hl_str HLC_LIT_5363 = { HL_RC_IMMORTAL, 31L, "error: unknown target feature '" };
+static const hl_str HLC_LIT_5364 = { HL_RC_IMMORTAL, 48L, "' (expected sse4.2 | avx2 | neon | rvv | native)" };
+static const hl_str HLC_LIT_5365 = { HL_RC_IMMORTAL, 9L, "--pgo-use" };
+static const hl_str HLC_LIT_5366 = { HL_RC_IMMORTAL, 44L, "error: --pgo-use expects a profile file path" };
+static const hl_str HLC_LIT_5367 = { HL_RC_IMMORTAL, 2L, "-O" };
+static const hl_str HLC_LIT_5368 = { HL_RC_IMMORTAL, 4L, "fast" };
+static const hl_str HLC_LIT_5369 = { HL_RC_IMMORTAL, 47L, "error: -O expects 'fast' (the only level today)" };
+static const hl_str HLC_LIT_5370 = { HL_RC_IMMORTAL, 7L, "--audit" };
+static const hl_str HLC_LIT_5371 = { HL_RC_IMMORTAL, 30L, "usage: hlc --audit <input.hls>" };
+static const hl_str HLC_LIT_5372 = { HL_RC_IMMORTAL, 24L, "error: cannot open file " };
+static const hl_str HLC_LIT_5373 = { HL_RC_IMMORTAL, 25L, "error: module not found: " };
+static const hl_str HLC_LIT_5374 = { HL_RC_IMMORTAL, 82L, "usage: hlc [--fast | -O fast] [--contracts] [--pgo-generate] [--pgo-use <profile>]" };
+static const hl_str HLC_LIT_5375 = { HL_RC_IMMORTAL, 95L, "              [--lto] [--lto-stats] [--lto-threshold N] [--target-feature sse4.2|avx2|neon|rvv]" };
+static const hl_str HLC_LIT_5376 = { HL_RC_IMMORTAL, 98L, "              [--no-libc] [--target x86_64-unknown-none|aarch64-unknown-none|riscv64-unknown-none]" };
+static const hl_str HLC_LIT_5377 = { HL_RC_IMMORTAL, 71L, "              [--debug] [--symbols <manifest>] <input.hls> <output.c|->" };
+static const hl_str HLC_LIT_5378 = { HL_RC_IMMORTAL, 30L, "       hlc --audit <input.hls>" };
+static const hl_str HLC_LIT_5379 = { HL_RC_IMMORTAL, 44L, "error: --no-libc is not available on target " };
+static const hl_str HLC_LIT_5380 = { HL_RC_IMMORTAL, 76L, " (the bare-metal triples build freestanding images, not hosted no-libc ones)" };
+static const hl_str HLC_LIT_5381 = { HL_RC_IMMORTAL, 51L, "error: --target-feature is not available on target " };
+static const hl_str HLC_LIT_5382 = { HL_RC_IMMORTAL, 84L, " (bare-metal targets are integer-only: SIMD intrinsics use floating-point registers)" };
+static const hl_str HLC_LIT_5383 = { HL_RC_IMMORTAL, 91L, "error: --debug needs a file output path (the C line markers must name the generated C file)" };
+static const hl_str HLC_LIT_5384 = { HL_RC_IMMORTAL, 25L, "error: cannot write file " };
+static const hl_str HLC_LIT_5385 = { HL_RC_IMMORTAL, 31L, " (the directory does not exist)" };
+static const hl_str HLC_LIT_5386 = { HL_RC_IMMORTAL, 42L, "error: --pgo-use: profile file not found: " };
+static const hl_str HLC_LIT_5387 = { HL_RC_IMMORTAL, 18L, "error: --pgo-use: " };
+static const hl_str HLC_LIT_5388 = { HL_RC_IMMORTAL, 17L, "=== LTO stats ===" };
+static const hl_str HLC_LIT_5389 = { HL_RC_IMMORTAL, 32L, "  functions in program        : " };
+static const hl_str HLC_LIT_5390 = { HL_RC_IMMORTAL, 32L, "  inline expansions (sites)   : " };
+static const hl_str HLC_LIT_5391 = { HL_RC_IMMORTAL, 32L, "  distinct callees inlined    : " };
+static const hl_str HLC_LIT_5392 = { HL_RC_IMMORTAL, 32L, "  bodies dropped (phase A+B)  : " };
+static const hl_str HLC_LIT_5393 = { HL_RC_IMMORTAL, 32L, "  inline stmt budget          : " };
+static const hl_str HLC_LIT_5394 = { HL_RC_IMMORTAL, 18L, " (--lto-threshold)" };
+static const hl_str HLC_LIT_5395 = { HL_RC_IMMORTAL, 32L, "  generic fn instantiations   : " };
+static const hl_str HLC_LIT_5396 = { HL_RC_IMMORTAL, 33L, "  generic struct instantiations: " };
+static const hl_str HLC_LIT_5397 = { HL_RC_IMMORTAL, 32L, "  generic enum instantiations : " };
+static const hl_str HLC_LIT_5398 = { HL_RC_IMMORTAL, 18L, "  inlined callees:" };
+static const hl_str HLC_LIT_5399 = { HL_RC_IMMORTAL, 17L, "=== opt-stats ===" };
+static const hl_str HLC_LIT_5400 = { HL_RC_IMMORTAL, 34L, "  functions in program          : " };
+static const hl_str HLC_LIT_5401 = { HL_RC_IMMORTAL, 33L, "  #[inline(always)] annotations: " };
+static const hl_str HLC_LIT_5402 = { HL_RC_IMMORTAL, 33L, "  #[inline(never)]  annotations: " };
+static const hl_str HLC_LIT_5403 = { HL_RC_IMMORTAL, 34L, "  #[hot]             annotations: " };
+static const hl_str HLC_LIT_5404 = { HL_RC_IMMORTAL, 34L, "  #[cold]            annotations: " };
+static const hl_str HLC_LIT_5405 = { HL_RC_IMMORTAL, 34L, "  #[irq_handler]     annotations: " };
+static const hl_str HLC_LIT_5406 = { HL_RC_IMMORTAL, 34L, "  #[no_red_zone]     annotations: " };
+static const hl_str HLC_LIT_5407 = { HL_RC_IMMORTAL, 34L, "  #[stack_size(N)]   annotations: " };
+static const hl_str HLC_LIT_5408 = { HL_RC_IMMORTAL, 34L, "  #[section(\"X\")]    annotations: " };
+static const hl_str HLC_LIT_5409 = { HL_RC_IMMORTAL, 34L, "  #[align(N)]        annotations: " };
+static const hl_str HLC_LIT_5410 = { HL_RC_IMMORTAL, 16L, "  #![stack_size(" };
+static const hl_str HLC_LIT_5411 = { HL_RC_IMMORTAL, 25L, ")]   budget: worst chain " };
+static const hl_str HLC_LIT_5412 = { HL_RC_IMMORTAL, 34L, "  #[tail_call]       annotations: " };
+static const hl_str HLC_LIT_5413 = { HL_RC_IMMORTAL, 18L, " (verified sites: " };
+static const hl_str HLC_LIT_5414 = { HL_RC_IMMORTAL, 13L, ", stack O(1))" };
+static const hl_str HLC_LIT_5415 = { HL_RC_IMMORTAL, 35L, "  PGO-derived hot (no annotation): " };
+static const hl_str HLC_LIT_5416 = { HL_RC_IMMORTAL, 36L, "  PGO-derived cold (no annotation): " };
+static const hl_str HLC_LIT_5417 = { HL_RC_IMMORTAL, 45L, "  PGO-derived static-inline (no annotation): " };
+static const hl_str HLC_LIT_5418 = { HL_RC_IMMORTAL, 56L, "  PGO profile: (none loaded; --pgo-use <file> to enable)" };
+static const hl_str HLC_LIT_5419 = { HL_RC_IMMORTAL, 34L, "  LTO inline expansions (sites) : " };
+static const hl_str HLC_LIT_5420 = { HL_RC_IMMORTAL, 33L, "  LTO distinct callees inlined : " };
+static const hl_str HLC_LIT_5421 = { HL_RC_IMMORTAL, 34L, "  LTO bodies dropped (A+B)      : " };
+static const hl_str HLC_LIT_5422 = { HL_RC_IMMORTAL, 34L, "  LTO: (disabled; --lto to enable)" };
+static const hl_str HLC_LIT_5423 = { HL_RC_IMMORTAL, 35L, "  stack-allocated list bindings  : " };
+static const hl_str HLC_LIT_5424 = { HL_RC_IMMORTAL, 35L, "  boxed (forced heap) bindings   : " };
+static const hl_str HLC_LIT_5425 = { HL_RC_IMMORTAL, 35L, "  heap (escaping) bindings       : " };
+static const hl_str HLC_LIT_5426 = { HL_RC_IMMORTAL, 35L, "  heap (push/pop) bindings       : " };
+static const hl_str HLC_LIT_5427 = { HL_RC_IMMORTAL, 35L, "  tracked list bindings          : " };
+static const hl_str HLC_LIT_5428 = { HL_RC_IMMORTAL, 25L, "  per-function decisions:" };
+static const hl_str HLC_LIT_5429 = { HL_RC_IMMORTAL, 85L, "    name                          inline      hot/cold    frame                source" };
+static const hl_str HLC_LIT_5430 = { HL_RC_IMMORTAL, 85L, "    ----                          ------      ---------   -----                ------" };
+static const hl_str HLC_LIT_5431 = { HL_RC_IMMORTAL, 6L, "ALWAYS" };
+static const hl_str HLC_LIT_5432 = { HL_RC_IMMORTAL, 5L, "NEVER" };
+static const hl_str HLC_LIT_5433 = { HL_RC_IMMORTAL, 10L, "PGO-inline" };
+static const hl_str HLC_LIT_5434 = { HL_RC_IMMORTAL, 3L, "HOT" };
+static const hl_str HLC_LIT_5435 = { HL_RC_IMMORTAL, 4L, "COLD" };
+static const hl_str HLC_LIT_5436 = { HL_RC_IMMORTAL, 7L, "PGO-hot" };
+static const hl_str HLC_LIT_5437 = { HL_RC_IMMORTAL, 8L, "PGO-cold" };
+static const hl_str HLC_LIT_5438 = { HL_RC_IMMORTAL, 4L, "irq " };
+static const hl_str HLC_LIT_5439 = { HL_RC_IMMORTAL, 12L, "no-red-zone " };
+static const hl_str HLC_LIT_5440 = { HL_RC_IMMORTAL, 7L, "stack<=" };
+static const hl_str HLC_LIT_5441 = { HL_RC_IMMORTAL, 5L, "tail(" };
+static const hl_str HLC_LIT_5442 = { HL_RC_IMMORTAL, 9L, "annotated" };
+static const hl_str HLC_LIT_5443 = { HL_RC_IMMORTAL, 3L, "PGO" };
+static const hl_str HLC_LIT_5444 = { HL_RC_IMMORTAL, 9L, "heuristic" };
+static const hl_str HLC_LIT_5445 = { HL_RC_IMMORTAL, 33L, "  verified tail calls (Stage 31):" };
+static const hl_str HLC_LIT_5446 = { HL_RC_IMMORTAL, 64L, "    name                          sites   params  ret      stack" };
+static const hl_str HLC_LIT_5447 = { HL_RC_IMMORTAL, 64L, "    ----                          -----   ------  ---      -----" };
+static const hl_str HLC_LIT_5448 = { HL_RC_IMMORTAL, 9L, " constant" };
+static const hl_str HLC_LIT_5449 = { HL_RC_IMMORTAL, 35L, "  list layout decisions (Stage 30):" };
+static const hl_str HLC_LIT_5450 = { HL_RC_IMMORTAL, 64L, "    binding                              layout     cap   reason" };
+static const hl_str HLC_LIT_5451 = { HL_RC_IMMORTAL, 63L, "    ------                              ------     ---   ------" };
+static const hl_str HLC_LIT_5452 = { HL_RC_IMMORTAL, 78L, "==============================================================================" };
+static const hl_str HLC_LIT_5453 = { HL_RC_IMMORTAL, 72L, "  function                       declared                       computed" };
+static const hl_str HLC_LIT_5454 = { HL_RC_IMMORTAL, 81L, "  Crate mode: #![freestanding] (no libc, no OS calls, std disabled, entry _start)" };
+static const hl_str HLC_LIT_5455 = { HL_RC_IMMORTAL, 57L, "  Crate mode: #![no_std] (std disabled, hosted libc kept)" };
+static const hl_str HLC_LIT_5456 = { HL_RC_IMMORTAL, 40L, "  Crate mode: std (default hosted crate)" };
+static const hl_str HLC_LIT_5457 = { HL_RC_IMMORTAL, 10L, "  Target: " };
+static const hl_str HLC_LIT_5458 = { HL_RC_IMMORTAL, 27L, " (bare-metal, integer-only)" };
+static const hl_str HLC_LIT_5459 = { HL_RC_IMMORTAL, 30L, "  Stack budget: #![stack_size(" };
+static const hl_str HLC_LIT_5460 = { HL_RC_IMMORTAL, 19L, ")] \342\200\224 worst chain " };
+static const hl_str HLC_LIT_5461 = { HL_RC_IMMORTAL, 15L, "  Boot header: " };
+static const hl_str HLC_LIT_5462 = { HL_RC_IMMORTAL, 15L, " (emitted into " };
+static const hl_str HLC_LIT_5463 = { HL_RC_IMMORTAL, 85L, "  Interrupt safety (Stage 91): every #[irq_handler] is proved to reach no allocation:" };
+static const hl_str HLC_LIT_5464 = { HL_RC_IMMORTAL, 31L, "  #[secrets(...)] annotations: " };
+static const hl_str HLC_LIT_5465 = { HL_RC_IMMORTAL, 10L, ": ct over " };
+static const hl_str HLC_LIT_5466 = { HL_RC_IMMORTAL, 16L, "  #[ct] claims: " };
+static const hl_str HLC_LIT_5467 = { HL_RC_IMMORTAL, 105L, "  Linker script: none declared (#![link_script] absent) \342\200\224 custom sections use the default linker layout" };
+static const hl_str HLC_LIT_5468 = { HL_RC_IMMORTAL, 17L, "  Linker script: " };
+static const hl_str HLC_LIT_5469 = { HL_RC_IMMORTAL, 19L, " section(s) named, " };
+static const hl_str HLC_LIT_5470 = { HL_RC_IMMORTAL, 18L, " pattern(s) placed" };
+static const hl_str HLC_LIT_5471 = { HL_RC_IMMORTAL, 27L, "  #[align(N)] annotations: " };
+static const hl_str HLC_LIT_5472 = { HL_RC_IMMORTAL, 57L, "  Capability tokens (Cap[E] parameters / cap_take calls):" };
+static const hl_str HLC_LIT_5473 = { HL_RC_IMMORTAL, 63L, "  Active effects:    IO, Fs, Clock, Args, Exit, Net, Rand, Proc" };
+static const hl_str HLC_LIT_5474 = { HL_RC_IMMORTAL, 51L, "  `uses IO` expands to: {IO, Fs, Clock, Args, Exit}" };
+static const hl_str HLC_LIT_5475 = { HL_RC_IMMORTAL, 61L, "  Net, Rand, Proc are independent effects (not part of the IO" };
+static const hl_str HLC_LIT_5476 = { HL_RC_IMMORTAL, 57L, "  family) \342\200\224 declare them explicitly to use net_lookup /" };
+static const hl_str HLC_LIT_5477 = { HL_RC_IMMORTAL, 57L, "  rand_int / rand_float / rand_seed / proc_exec builtins." };
+static const hl_str HLC_LIT_5478 = { HL_RC_IMMORTAL, 40L, "  No reserved effects (Stage 9 release)." };
+static const hl_str HLC_LIT_5479 = { HL_RC_IMMORTAL, 61L, "  Taint sources (builtins):  tainted_args, read_file_tainted," };
+static const hl_str HLC_LIT_5480 = { HL_RC_IMMORTAL, 39L, "                              read_line" };
+static const hl_str HLC_LIT_5481 = { HL_RC_IMMORTAL, 55L, "  Taint sinks (builtins):    print, println, read_file," };
+static const hl_str HLC_LIT_5482 = { HL_RC_IMMORTAL, 58L, "                            write_file, file_exists, exit," };
+static const hl_str HLC_LIT_5483 = { HL_RC_IMMORTAL, 49L, "                            net_lookup, proc_exec" };
+static const hl_str HLC_LIT_5484 = { HL_RC_IMMORTAL, 56L, "  Explicit untaint:         taint_unwrap, std.sanitize.*" };
+static const hl_str HLC_LIT_5485 = { HL_RC_IMMORTAL, 35L, "  Functions calling tainted_args():" };
+static const hl_str HLC_LIT_5486 = { HL_RC_IMMORTAL, 6L, "    - " };
+static const hl_str HLC_LIT_5487 = { HL_RC_IMMORTAL, 75L, "  No function calls tainted_args() (no argv-taint sources in this program)." };
+static const hl_str HLC_LIT_5488 = { HL_RC_IMMORTAL, 40L, "  Functions calling read_file_tainted():" };
+static const hl_str HLC_LIT_5489 = { HL_RC_IMMORTAL, 40L, "  No function calls read_file_tainted()." };
+static const hl_str HLC_LIT_5490 = { HL_RC_IMMORTAL, 32L, "  Functions calling read_line():" };
+static const hl_str HLC_LIT_5491 = { HL_RC_IMMORTAL, 32L, "  No function calls read_line()." };
+static const hl_str HLC_LIT_5492 = { HL_RC_IMMORTAL, 5L, ": -> " };
+static const hl_str HLC_LIT_5493 = { HL_RC_IMMORTAL, 56L, "  FFI taint marking (Stage 109): no extern declarations." };
+static const hl_str HLC_LIT_5494 = { HL_RC_IMMORTAL, 32L, "  FFI taint marking (Stage 109):" };
+static const hl_str HLC_LIT_5495 = { HL_RC_IMMORTAL, 69L, "    #[taint_source] externs (returns untrusted, typed tainted[ret]): " };
+static const hl_str HLC_LIT_5496 = { HL_RC_IMMORTAL, 49L, "    #[taint_sink(...)] externs (declared sinks): " };
+static const hl_str HLC_LIT_5497 = { HL_RC_IMMORTAL, 61L, "    Unmarked externs (returns TRUSTED by the taint lattice): " };
 
 typedef struct Tok Tok;
 typedef struct Binding Binding;
@@ -41853,38 +41855,40 @@ hl_list* usf_gen_program(Ctx* u_ctx_p) {
         hl_list_push(u_final, (hl_str*)&HLC_LIT_1689);
         hl_list_push(u_final, (hl_str*)&HLC_LIT_5298);
         hl_list_push(u_final, (hl_str*)&HLC_LIT_5299);
-        hl_list_push(u_final, (hl_str*)&HLC_LIT_1698);
         hl_list_push(u_final, (hl_str*)&HLC_LIT_5300);
+        hl_list_push(u_final, (hl_str*)&HLC_LIT_1698);
         hl_list_push(u_final, (hl_str*)&HLC_LIT_5301);
-        hl_list_push(u_final, (hl_str*)&HLC_LIT_1715);
         hl_list_push(u_final, (hl_str*)&HLC_LIT_5302);
-        hl_list_push(u_final, (hl_str*)&HLC_LIT_1699);
         hl_list_push(u_final, (hl_str*)&HLC_LIT_5303);
+        hl_list_push(u_final, (hl_str*)&HLC_LIT_1715);
+        hl_list_push(u_final, (hl_str*)&HLC_LIT_5304);
+        hl_list_push(u_final, (hl_str*)&HLC_LIT_1699);
+        hl_list_push(u_final, (hl_str*)&HLC_LIT_5305);
         hl_list_push(u_final, (hl_str*)&HLC_LIT_207);
         usf_finish_emission(hl_retain(u_ctx), hl_retain(u_final));
         return hl_retain(u_final);
     }
     if ((u_ctx)->f_no_libc) {
-        hl_list_push(u_final, (hl_str*)&HLC_LIT_5304);
-        hl_list_push(u_final, (hl_str*)&HLC_LIT_5305);
         hl_list_push(u_final, (hl_str*)&HLC_LIT_5306);
-    } else {
         hl_list_push(u_final, (hl_str*)&HLC_LIT_5307);
-        hl_list_push(u_final, (hl_str*)&HLC_LIT_5306);
         hl_list_push(u_final, (hl_str*)&HLC_LIT_5308);
+    } else {
         hl_list_push(u_final, (hl_str*)&HLC_LIT_5309);
+        hl_list_push(u_final, (hl_str*)&HLC_LIT_5308);
+        hl_list_push(u_final, (hl_str*)&HLC_LIT_5310);
+        hl_list_push(u_final, (hl_str*)&HLC_LIT_5311);
     }
     if (usf_has_panic_handler(hl_retain(u_ctx))) {
         hl_list_push(u_final, (hl_str*)&HLC_LIT_5292);
     }
     if ((u_ctx)->f_pgo_gen) {
-        hl_list_push(u_final, (hl_str*)&HLC_LIT_5310);
+        hl_list_push(u_final, (hl_str*)&HLC_LIT_5312);
     }
-    hl_list_push(u_final, (hl_str*)&HLC_LIT_5311);
-    hl_list_push(u_final, (hl_str*)&HLC_LIT_5312);
+    hl_list_push(u_final, (hl_str*)&HLC_LIT_5313);
+    hl_list_push(u_final, (hl_str*)&HLC_LIT_5314);
     hl_str* hlc_h_9143 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_45;
     if (hl_str_eq((u_mf)->f_ret, hlc_h_9143)) {
-        hl_list_push(u_final, (hl_str*)&HLC_LIT_5313);
+        hl_list_push(u_final, (hl_str*)&HLC_LIT_5315);
     } else {
         hl_list_push(u_final, (hl_str*)&HLC_LIT_5294);
         hl_list_push(u_final, (hl_str*)&HLC_LIT_1475);
@@ -41894,26 +41898,26 @@ hl_list* usf_gen_program(Ctx* u_ctx_p) {
         hl_list_push(u_final, (hl_str*)&HLC_LIT_5295);
         hl_list_push(u_final, (hl_str*)&HLC_LIT_4241);
         hl_list_push(u_final, (hl_str*)&HLC_LIT_1680);
-        hl_list_push(u_final, (hl_str*)&HLC_LIT_5314);
-        hl_list_push(u_final, (hl_str*)&HLC_LIT_5315);
         hl_list_push(u_final, (hl_str*)&HLC_LIT_5316);
         hl_list_push(u_final, (hl_str*)&HLC_LIT_5317);
         hl_list_push(u_final, (hl_str*)&HLC_LIT_5318);
-        hl_list_push(u_final, (hl_str*)&HLC_LIT_1689);
         hl_list_push(u_final, (hl_str*)&HLC_LIT_5319);
         hl_list_push(u_final, (hl_str*)&HLC_LIT_5320);
+        hl_list_push(u_final, (hl_str*)&HLC_LIT_1689);
         hl_list_push(u_final, (hl_str*)&HLC_LIT_5321);
         hl_list_push(u_final, (hl_str*)&HLC_LIT_5322);
         hl_list_push(u_final, (hl_str*)&HLC_LIT_5323);
-        hl_list_push(u_final, (hl_str*)&HLC_LIT_1698);
         hl_list_push(u_final, (hl_str*)&HLC_LIT_5324);
         hl_list_push(u_final, (hl_str*)&HLC_LIT_5325);
+        hl_list_push(u_final, (hl_str*)&HLC_LIT_1698);
         hl_list_push(u_final, (hl_str*)&HLC_LIT_5326);
         hl_list_push(u_final, (hl_str*)&HLC_LIT_5327);
-        hl_list_push(u_final, (hl_str*)&HLC_LIT_1715);
         hl_list_push(u_final, (hl_str*)&HLC_LIT_5328);
+        hl_list_push(u_final, (hl_str*)&HLC_LIT_5329);
+        hl_list_push(u_final, (hl_str*)&HLC_LIT_1715);
+        hl_list_push(u_final, (hl_str*)&HLC_LIT_5330);
         hl_list_push(u_final, (hl_str*)&HLC_LIT_1699);
-        hl_list_push(u_final, (hl_str*)&HLC_LIT_5303);
+        hl_list_push(u_final, (hl_str*)&HLC_LIT_5305);
         hl_list_push(u_final, (hl_str*)&HLC_LIT_207);
     }
     usf_finish_emission(hl_retain(u_ctx), hl_retain(u_final));
@@ -41929,7 +41933,7 @@ hl_list* usf_gen_enum_lines_simple(Ctx* u_ctx_p) {
     hl_list* u_names __attribute__((cleanup(hl_cleanup_list))) = hl_map_keys((u_ctx)->f_enums);
     int64_t u_i = 0;
     while ((u_i < hl_list_len(u_names))) {
-        EnumInfo* u_en __attribute__((cleanup(hl_cleanup_EnumInfo))) = ((EnumInfo*)hl_map_get_own((u_ctx)->f_enums, (hl_str*)hl_unbox_ptr(hl_list_get(u_names, u_i, 1913L)), usf_dummy_enum()));
+        EnumInfo* u_en __attribute__((cleanup(hl_cleanup_EnumInfo))) = ((EnumInfo*)hl_map_get_own((u_ctx)->f_enums, (hl_str*)hl_unbox_ptr(hl_list_get(u_names, u_i, 1925L)), usf_dummy_enum()));
         if ((hl_list_len((u_en)->f_typeparams) == 0)) {
             hl_list* u_empty_targs __attribute__((cleanup(hl_cleanup_list))) = ({
     hl_list* hlc_ll_9145 = hl_list_new(hl_str_release);
@@ -41937,7 +41941,7 @@ hl_list* usf_gen_enum_lines_simple(Ctx* u_ctx_p) {
 });
             usf_concat_lines(hl_retain(u_out), usf_gen_one_enum_full(hl_retain(u_ctx), usf_c_esc_type_name(hl_retain((u_en)->f_name)), hl_retain(u_en), hl_retain(u_empty_targs)));
         }
-        u_i = hl_add_i64(u_i, 1, 1919L);
+        u_i = hl_add_i64(u_i, 1, 1931L);
     }
     return hl_retain(u_out);
 }
@@ -42007,19 +42011,19 @@ hl_str* usf_resolve_import_path(hl_str* u_imp_p, hl_str* u_entry_dir_p, hl_str* 
     hl_str* u_entry_dir __attribute__((cleanup(hl_cleanup_str))) = u_entry_dir_p;
     hl_str* u_repo_root __attribute__((cleanup(hl_cleanup_str))) = u_repo_root_p;
     hl_str* hlc_h_9149 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_621;
-    if ((hl_str_starts_with(u_imp, hlc_h_9149) || ({ hl_str* hlc_h_9150 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5329; hl_str_starts_with(u_imp, hlc_h_9150); }))) {
-        hl_str* u_subdir __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5330;
+    if ((hl_str_starts_with(u_imp, hlc_h_9149) || ({ hl_str* hlc_h_9150 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5331; hl_str_starts_with(u_imp, hlc_h_9150); }))) {
+        hl_str* u_subdir __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5332;
         int64_t u_cut = 4;
-        hl_str* hlc_h_9151 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5329;
+        hl_str* hlc_h_9151 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5331;
         if (hl_str_starts_with(u_imp, hlc_h_9151)) {
-            { hl_str* __hl_old = u_subdir; u_subdir = (hl_str*)&HLC_LIT_5331; hl_str_release(__hl_old); }
+            { hl_str* __hl_old = u_subdir; u_subdir = (hl_str*)&HLC_LIT_5333; hl_str_release(__hl_old); }
             u_cut = 5;
         }
         hl_str* u_module_name __attribute__((cleanup(hl_cleanup_str))) = hl_str_slice(u_imp, u_cut, hl_str_len(u_imp));
         hl_str* hlc_h_9152 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_295;
         hl_str* hlc_h_9153 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(u_subdir, hlc_h_9152);
         hl_str* hlc_h_9154 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9153, u_module_name);
-        hl_str* hlc_h_9155 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5332;
+        hl_str* hlc_h_9155 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5334;
         hl_str* u_rel __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9154, hlc_h_9155);
         hl_str* u_d __attribute__((cleanup(hl_cleanup_str))) = hl_retain(u_entry_dir);
         int64_t u_tries = 0;
@@ -42115,7 +42119,7 @@ void usf_load_file_into(Ctx* u_ctx_p, hl_str* u_abs_path_p) {
         hl_str* u_resolved __attribute__((cleanup(hl_cleanup_str))) = usf_resolve_import_path(hl_retain(u_imp), hl_retain(u_file_dir), hl_retain((u_ctx)->f_repo_root));
         hl_str* hlc_h_9163 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_1;
         if (hl_str_eq(u_resolved, hlc_h_9163)) {
-            hl_str* hlc_h_9164 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5333;
+            hl_str* hlc_h_9164 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5335;
             hl_panic_at(hl_str_concat(hlc_h_9164, u_imp), 174L);
         }
         usf_load_file_into(hl_retain(u_ctx), hl_retain(u_resolved));
@@ -42162,77 +42166,77 @@ int64_t usf_main(void) {
     int64_t u_ai = 1;
     while ((u_ai < hl_list_len(u_argv))) {
         hl_str* u_tok __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_argv, u_ai, 226L)));
-        hl_str* hlc_h_9170 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5334;
+        hl_str* hlc_h_9170 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5336;
         if (hl_str_eq(u_tok, hlc_h_9170)) {
             u_fast_mode = true;
         } else {
-            hl_str* hlc_h_9171 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5335;
+            hl_str* hlc_h_9171 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5337;
             if (hl_str_eq(u_tok, hlc_h_9171)) {
                 u_contracts_mode = true;
             } else {
-                hl_str* hlc_h_9172 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5336;
+                hl_str* hlc_h_9172 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5338;
                 if (hl_str_eq(u_tok, hlc_h_9172)) {
                     u_pgo_gen = true;
                 } else {
-                    hl_str* hlc_h_9173 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5337;
+                    hl_str* hlc_h_9173 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5339;
                     if (hl_str_eq(u_tok, hlc_h_9173)) {
                         u_no_libc = true;
                     } else {
-                        hl_str* hlc_h_9174 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5338;
+                        hl_str* hlc_h_9174 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5340;
                         if (hl_str_eq(u_tok, hlc_h_9174)) {
                             u_debug_mode = true;
                         } else {
-                            hl_str* hlc_h_9175 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5339;
+                            hl_str* hlc_h_9175 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5341;
                             if (hl_str_eq(u_tok, hlc_h_9175)) {
                                 if ((hl_add_i64(u_ai, 1, 254L) >= hl_list_len(u_argv))) {
-                                    hl_println((hl_str*)&HLC_LIT_5340);
+                                    hl_println((hl_str*)&HLC_LIT_5342);
                                     return 2;
                                 }
                                 { hl_str* __hl_old = u_symbols_path; u_symbols_path = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_argv, hl_add_i64(u_ai, 1, 258L), 258L))); hl_str_release(__hl_old); }
                                 u_ai = hl_add_i64(u_ai, 1, 259L);
                             } else {
-                                hl_str* hlc_h_9176 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5341;
+                                hl_str* hlc_h_9176 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5343;
                                 if (hl_str_eq(u_tok, hlc_h_9176)) {
                                     if ((hl_add_i64(u_ai, 1, 270L) >= hl_list_len(u_argv))) {
-                                        hl_println((hl_str*)&HLC_LIT_5342);
+                                        hl_println((hl_str*)&HLC_LIT_5344);
                                         return 2;
                                     }
                                     hl_str* u_t __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_argv, hl_add_i64(u_ai, 1, 274L), 274L)));
-                                    hl_str* hlc_h_9177 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5343;
-                                    if ((((!hl_str_eq(u_t, hlc_h_9177)) && ({ hl_str* hlc_h_9178 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5344; (!hl_str_eq(u_t, hlc_h_9178)); })) && ({ hl_str* hlc_h_9179 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5345; (!hl_str_eq(u_t, hlc_h_9179)); }))) {
-                                        hl_str* hlc_h_9180 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5346;
+                                    hl_str* hlc_h_9177 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5345;
+                                    if ((((!hl_str_eq(u_t, hlc_h_9177)) && ({ hl_str* hlc_h_9178 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5346; (!hl_str_eq(u_t, hlc_h_9178)); })) && ({ hl_str* hlc_h_9179 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5347; (!hl_str_eq(u_t, hlc_h_9179)); }))) {
+                                        hl_str* hlc_h_9180 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5348;
                                         hl_str* hlc_h_9181 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9180, u_t);
-                                        hl_str* hlc_h_9182 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5347;
+                                        hl_str* hlc_h_9182 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5349;
                                         hl_println(hl_str_concat(hlc_h_9181, hlc_h_9182));
                                         return 2;
                                     }
                                     { hl_str* __hl_old = u_target_triple; u_target_triple = hl_retain(u_t); hl_str_release(__hl_old); }
                                     u_ai = hl_add_i64(u_ai, 1, 280L);
                                 } else {
-                                    hl_str* hlc_h_9183 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5348;
+                                    hl_str* hlc_h_9183 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5350;
                                     if (hl_str_eq(u_tok, hlc_h_9183)) {
                                         u_lto_mode = true;
                                     } else {
-                                        hl_str* hlc_h_9184 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5349;
+                                        hl_str* hlc_h_9184 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5351;
                                         if (hl_str_eq(u_tok, hlc_h_9184)) {
                                             u_lto_mode = true;
                                             u_lto_stats = true;
                                         } else {
-                                            hl_str* hlc_h_9185 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5350;
+                                            hl_str* hlc_h_9185 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5352;
                                             if (hl_str_eq(u_tok, hlc_h_9185)) {
                                                 u_opt_stats = true;
                                             } else {
-                                                hl_str* hlc_h_9186 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5351;
+                                                hl_str* hlc_h_9186 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5353;
                                                 if (hl_str_eq(u_tok, hlc_h_9186)) {
                                                     if ((hl_add_i64(u_ai, 1, 303L) >= hl_list_len(u_argv))) {
-                                                        hl_println((hl_str*)&HLC_LIT_5352);
+                                                        hl_println((hl_str*)&HLC_LIT_5354);
                                                         return 2;
                                                     }
                                                     hl_str* u_n_str __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_argv, hl_add_i64(u_ai, 1, 307L), 307L)));
                                                     int64_t u_n = hl_str_to_int(u_n_str);
                                                     hl_str* hlc_h_9187 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_n);
                                                     if ((((!hl_str_eq(u_n_str, hlc_h_9187)) || (u_n < 1)) || (u_n > 200))) {
-                                                        hl_str* hlc_h_9188 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5353;
+                                                        hl_str* hlc_h_9188 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5355;
                                                         hl_str* hlc_h_9189 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9188, u_n_str);
                                                         hl_str* hlc_h_9190 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_129;
                                                         hl_println(hl_str_concat(hlc_h_9189, hlc_h_9190));
@@ -42242,36 +42246,36 @@ int64_t usf_main(void) {
                                                     u_lto_threshold = u_n;
                                                     u_ai = hl_add_i64(u_ai, 1, 315L);
                                                 } else {
-                                                    hl_str* hlc_h_9191 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5354;
+                                                    hl_str* hlc_h_9191 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5356;
                                                     if (hl_str_eq(u_tok, hlc_h_9191)) {
                                                         if ((hl_add_i64(u_ai, 1, 321L) >= hl_list_len(u_argv))) {
-                                                            hl_println((hl_str*)&HLC_LIT_5355);
+                                                            hl_println((hl_str*)&HLC_LIT_5357);
                                                             return 2;
                                                         }
                                                         hl_str* u_feat __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_argv, hl_add_i64(u_ai, 1, 325L), 325L)));
-                                                        hl_str* hlc_h_9192 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5356;
+                                                        hl_str* hlc_h_9192 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5358;
                                                         if ((hl_str_eq(u_feat, hlc_h_9192) || ({ hl_str* hlc_h_9193 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_4607; hl_str_eq(u_feat, hlc_h_9193); }))) {
                                                             { hl_str* __hl_old = u_target_feature; u_target_feature = (hl_str*)&HLC_LIT_4607; hl_str_release(__hl_old); }
                                                         } else {
-                                                            hl_str* hlc_h_9194 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5357;
+                                                            hl_str* hlc_h_9194 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5359;
                                                             if ((hl_str_eq(u_feat, hlc_h_9194) || ({ hl_str* hlc_h_9195 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_4365; hl_str_eq(u_feat, hlc_h_9195); }))) {
                                                                 { hl_str* __hl_old = u_target_feature; u_target_feature = (hl_str*)&HLC_LIT_4365; hl_str_release(__hl_old); }
                                                             } else {
-                                                                hl_str* hlc_h_9196 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5358;
+                                                                hl_str* hlc_h_9196 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5360;
                                                                 if ((hl_str_eq(u_feat, hlc_h_9196) || ({ hl_str* hlc_h_9197 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_4560; hl_str_eq(u_feat, hlc_h_9197); }))) {
                                                                     { hl_str* __hl_old = u_target_feature; u_target_feature = (hl_str*)&HLC_LIT_4560; hl_str_release(__hl_old); }
                                                                 } else {
-                                                                    hl_str* hlc_h_9198 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5359;
+                                                                    hl_str* hlc_h_9198 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5361;
                                                                     if ((hl_str_eq(u_feat, hlc_h_9198) || ({ hl_str* hlc_h_9199 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_4561; hl_str_eq(u_feat, hlc_h_9199); }))) {
                                                                         { hl_str* __hl_old = u_target_feature; u_target_feature = (hl_str*)&HLC_LIT_4561; hl_str_release(__hl_old); }
                                                                     } else {
-                                                                        hl_str* hlc_h_9200 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5360;
+                                                                        hl_str* hlc_h_9200 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5362;
                                                                         if (hl_str_eq(u_feat, hlc_h_9200)) {
                                                                             { hl_str* __hl_old = u_target_feature; u_target_feature = usf_simd_detect_native_feature(); hl_str_release(__hl_old); }
                                                                         } else {
-                                                                            hl_str* hlc_h_9201 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5361;
+                                                                            hl_str* hlc_h_9201 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5363;
                                                                             hl_str* hlc_h_9202 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9201, u_feat);
-                                                                            hl_str* hlc_h_9203 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5362;
+                                                                            hl_str* hlc_h_9203 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5364;
                                                                             hl_println(hl_str_concat(hlc_h_9202, hlc_h_9203));
                                                                             return 2;
                                                                         }
@@ -42281,22 +42285,22 @@ int64_t usf_main(void) {
                                                         }
                                                         u_ai = hl_add_i64(u_ai, 1, 358L);
                                                     } else {
-                                                        hl_str* hlc_h_9204 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5363;
+                                                        hl_str* hlc_h_9204 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5365;
                                                         if (hl_str_eq(u_tok, hlc_h_9204)) {
                                                             if ((hl_add_i64(u_ai, 1, 360L) >= hl_list_len(u_argv))) {
-                                                                hl_println((hl_str*)&HLC_LIT_5364);
+                                                                hl_println((hl_str*)&HLC_LIT_5366);
                                                                 return 2;
                                                             }
                                                             { hl_str* __hl_old = u_pgo_use_path; u_pgo_use_path = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_argv, hl_add_i64(u_ai, 1, 364L), 364L))); hl_str_release(__hl_old); }
                                                             u_ai = hl_add_i64(u_ai, 1, 365L);
                                                         } else {
-                                                            hl_str* hlc_h_9205 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5365;
+                                                            hl_str* hlc_h_9205 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5367;
                                                             if (hl_str_eq(u_tok, hlc_h_9205)) {
-                                                                if (((hl_add_i64(u_ai, 1, 367L) < hl_list_len(u_argv)) && ({ hl_str* hlc_h_9206 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5366; hl_str_eq((hl_str*)hl_unbox_ptr(hl_list_get(u_argv, hl_add_i64(u_ai, 1, 367L), 367L)), hlc_h_9206); }))) {
+                                                                if (((hl_add_i64(u_ai, 1, 367L) < hl_list_len(u_argv)) && ({ hl_str* hlc_h_9206 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5368; hl_str_eq((hl_str*)hl_unbox_ptr(hl_list_get(u_argv, hl_add_i64(u_ai, 1, 367L), 367L)), hlc_h_9206); }))) {
                                                                     u_fast_mode = true;
                                                                     u_ai = hl_add_i64(u_ai, 1, 369L);
                                                                 } else {
-                                                                    hl_println((hl_str*)&HLC_LIT_5367);
+                                                                    hl_println((hl_str*)&HLC_LIT_5369);
                                                                     return 2;
                                                                 }
                                                             } else {
@@ -42318,14 +42322,14 @@ int64_t usf_main(void) {
         u_ai = hl_add_i64(u_ai, 1, 377L);
     }
     hl_str* u_audit_entry __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_1;
-    if (((hl_list_len(u_argv) >= 2) && ({ hl_str* hlc_h_9207 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5368; hl_str_eq((hl_str*)hl_unbox_ptr(hl_list_get(u_argv, 1, 384L)), hlc_h_9207); }))) {
+    if (((hl_list_len(u_argv) >= 2) && ({ hl_str* hlc_h_9207 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5370; hl_str_eq((hl_str*)hl_unbox_ptr(hl_list_get(u_argv, 1, 384L)), hlc_h_9207); }))) {
         if ((hl_list_len(u_argv) < 3)) {
-            hl_println((hl_str*)&HLC_LIT_5369);
+            hl_println((hl_str*)&HLC_LIT_5371);
             return 1;
         }
         { hl_str* __hl_old = u_audit_entry; u_audit_entry = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_argv, 2, 389L))); hl_str_release(__hl_old); }
     } else {
-        if (((hl_list_len(u_a) >= 2) && ({ hl_str* hlc_h_9208 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5368; hl_str_eq((hl_str*)hl_unbox_ptr(hl_list_get(u_a, 0, 390L)), hlc_h_9208); }))) {
+        if (((hl_list_len(u_a) >= 2) && ({ hl_str* hlc_h_9208 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5370; hl_str_eq((hl_str*)hl_unbox_ptr(hl_list_get(u_a, 0, 390L)), hlc_h_9208); }))) {
             { hl_str* __hl_old = u_audit_entry; u_audit_entry = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_a, 1, 391L))); hl_str_release(__hl_old); }
         }
     }
@@ -42333,7 +42337,7 @@ int64_t usf_main(void) {
     if ((!hl_str_eq(u_audit_entry, hlc_h_9209))) {
         hl_str* u_entry_path __attribute__((cleanup(hl_cleanup_str))) = hl_retain(u_audit_entry);
         if ((!hl_file_exists(hl_retain(u_entry_path)))) {
-            hl_str* hlc_h_9210 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5370;
+            hl_str* hlc_h_9210 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5372;
             hl_println(hl_str_concat(hlc_h_9210, u_entry_path));
             return 2;
         }
@@ -42365,7 +42369,7 @@ int64_t usf_main(void) {
             hl_str* u_resolved __attribute__((cleanup(hl_cleanup_str))) = usf_resolve_import_path(hl_retain(u_imp), hl_retain((u_ctx)->f_entry_dir), hl_retain((u_ctx)->f_repo_root));
             hl_str* hlc_h_9215 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_1;
             if (hl_str_eq(u_resolved, hlc_h_9215)) {
-                hl_str* hlc_h_9216 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5371;
+                hl_str* hlc_h_9216 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5373;
                 hl_println(hl_str_concat(hlc_h_9216, u_imp));
                 return 1;
             }
@@ -42377,34 +42381,34 @@ int64_t usf_main(void) {
         return 0;
     }
     if ((hl_list_len(u_a) < 2)) {
-        hl_println((hl_str*)&HLC_LIT_5372);
-        hl_println((hl_str*)&HLC_LIT_5373);
         hl_println((hl_str*)&HLC_LIT_5374);
         hl_println((hl_str*)&HLC_LIT_5375);
         hl_println((hl_str*)&HLC_LIT_5376);
+        hl_println((hl_str*)&HLC_LIT_5377);
+        hl_println((hl_str*)&HLC_LIT_5378);
         return 1;
     }
     hl_str* hlc_h_9217 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_1;
     if ((!hl_str_eq(u_target_triple, hlc_h_9217))) {
         if (u_no_libc) {
-            hl_str* hlc_h_9218 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5377;
+            hl_str* hlc_h_9218 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5379;
             hl_str* hlc_h_9219 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9218, u_target_triple);
-            hl_str* hlc_h_9220 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5378;
+            hl_str* hlc_h_9220 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5380;
             hl_println(hl_str_concat(hlc_h_9219, hlc_h_9220));
             return 2;
         }
         hl_str* hlc_h_9221 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_1;
         if ((!hl_str_eq(u_target_feature, hlc_h_9221))) {
-            hl_str* hlc_h_9222 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5379;
+            hl_str* hlc_h_9222 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5381;
             hl_str* hlc_h_9223 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9222, u_target_triple);
-            hl_str* hlc_h_9224 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5380;
+            hl_str* hlc_h_9224 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5382;
             hl_println(hl_str_concat(hlc_h_9223, hlc_h_9224));
             return 2;
         }
     }
     hl_str* u_entry_path_2 __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_a, 0, 458L)));
     if ((!hl_file_exists(hl_retain(u_entry_path_2)))) {
-        hl_str* hlc_h_9225 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5370;
+        hl_str* hlc_h_9225 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5372;
         hl_println(hl_str_concat(hlc_h_9225, u_entry_path_2));
         return 2;
     }
@@ -42436,22 +42440,22 @@ int64_t usf_main(void) {
       hl_str_release(__hl_old); }
     hl_str* u_out_path __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_a, 1, 488L)));
     if ((u_debug_mode && ({ hl_str* hlc_h_9230 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_293; hl_str_eq(u_out_path, hlc_h_9230); }))) {
-        hl_println((hl_str*)&HLC_LIT_5381);
+        hl_println((hl_str*)&HLC_LIT_5383);
         return 2;
     }
     hl_str* hlc_h_9231 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_293;
     if (((!hl_str_eq(u_out_path, hlc_h_9231)) && (!hl_fs_is_dir(usf_parent_dir(hl_retain(u_out_path)))))) {
-        hl_str* hlc_h_9232 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5382;
+        hl_str* hlc_h_9232 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5384;
         hl_str* hlc_h_9233 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9232, u_out_path);
-        hl_str* hlc_h_9234 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5383;
+        hl_str* hlc_h_9234 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5385;
         hl_println(hl_str_concat(hlc_h_9233, hlc_h_9234));
         return 2;
     }
     hl_str* hlc_h_9235 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_1;
     if (((!hl_str_eq(u_symbols_path, hlc_h_9235)) && (!hl_fs_is_dir(usf_parent_dir(hl_retain(u_symbols_path)))))) {
-        hl_str* hlc_h_9236 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5382;
+        hl_str* hlc_h_9236 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5384;
         hl_str* hlc_h_9237 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9236, u_symbols_path);
-        hl_str* hlc_h_9238 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5383;
+        hl_str* hlc_h_9238 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5385;
         hl_println(hl_str_concat(hlc_h_9237, hlc_h_9238));
         return 2;
     }
@@ -42470,7 +42474,7 @@ int64_t usf_main(void) {
     hl_str* hlc_h_9242 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_1;
     if ((!hl_str_eq(u_pgo_use_path, hlc_h_9242))) {
         if ((!hl_file_exists(hl_retain(u_pgo_use_path)))) {
-            hl_str* hlc_h_9243 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5384;
+            hl_str* hlc_h_9243 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5386;
             hl_println(hl_str_concat(hlc_h_9243, u_pgo_use_path));
             return 2;
         }
@@ -42478,7 +42482,7 @@ int64_t usf_main(void) {
         hl_str* u_perr __attribute__((cleanup(hl_cleanup_str))) = usf_pgo_load_profile(hl_retain(u_ctx_2), hl_retain(u_prof));
         hl_str* hlc_h_9244 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_1;
         if ((!hl_str_eq(u_perr, hlc_h_9244))) {
-            hl_str* hlc_h_9245 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5385;
+            hl_str* hlc_h_9245 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5387;
             hl_println(hl_str_concat(hlc_h_9245, u_perr));
             return 2;
         }
@@ -42496,7 +42500,7 @@ int64_t usf_main(void) {
         hl_str* u_resolved_2 __attribute__((cleanup(hl_cleanup_str))) = usf_resolve_import_path(hl_retain(u_imp_2), hl_retain((u_ctx_2)->f_entry_dir), hl_retain((u_ctx_2)->f_repo_root));
         hl_str* hlc_h_9247 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_1;
         if (hl_str_eq(u_resolved_2, hlc_h_9247)) {
-            hl_str* hlc_h_9248 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5371;
+            hl_str* hlc_h_9248 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5373;
             hl_println(hl_str_concat(hlc_h_9248, u_imp_2));
             return 1;
         }
@@ -42549,35 +42553,35 @@ void usf_print_lto_stats(Ctx* u_ctx_p) {
     int64_t u_gen_insts = hl_list_len((u_ctx)->f_fn_insts);
     int64_t u_struct_insts = hl_list_len((u_ctx)->f_struct_insts);
     int64_t u_enum_insts = hl_list_len((u_ctx)->f_enum_insts);
-    hl_println((hl_str*)&HLC_LIT_5386);
-    hl_str* hlc_h_9257 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5387;
+    hl_println((hl_str*)&HLC_LIT_5388);
+    hl_str* hlc_h_9257 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5389;
     hl_str* hlc_h_9258 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_total_fns);
     hl_println(hl_str_concat(hlc_h_9257, hlc_h_9258));
-    hl_str* hlc_h_9259 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5388;
+    hl_str* hlc_h_9259 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5390;
     hl_str* hlc_h_9260 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_inline_n);
     hl_println(hl_str_concat(hlc_h_9259, hlc_h_9260));
-    hl_str* hlc_h_9261 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5389;
+    hl_str* hlc_h_9261 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5391;
     hl_str* hlc_h_9262 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_inlined_keys);
     hl_println(hl_str_concat(hlc_h_9261, hlc_h_9262));
-    hl_str* hlc_h_9263 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5390;
+    hl_str* hlc_h_9263 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5392;
     hl_str* hlc_h_9264 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_dropped);
     hl_println(hl_str_concat(hlc_h_9263, hlc_h_9264));
-    hl_str* hlc_h_9265 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5391;
+    hl_str* hlc_h_9265 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5393;
     hl_str* hlc_h_9266 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_budget);
     hl_str* hlc_h_9267 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9265, hlc_h_9266);
-    hl_str* hlc_h_9268 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5392;
+    hl_str* hlc_h_9268 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5394;
     hl_println(hl_str_concat(hlc_h_9267, hlc_h_9268));
-    hl_str* hlc_h_9269 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5393;
+    hl_str* hlc_h_9269 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5395;
     hl_str* hlc_h_9270 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_gen_insts);
     hl_println(hl_str_concat(hlc_h_9269, hlc_h_9270));
-    hl_str* hlc_h_9271 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5394;
+    hl_str* hlc_h_9271 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5396;
     hl_str* hlc_h_9272 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_struct_insts);
     hl_println(hl_str_concat(hlc_h_9271, hlc_h_9272));
-    hl_str* hlc_h_9273 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5395;
+    hl_str* hlc_h_9273 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5397;
     hl_str* hlc_h_9274 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_enum_insts);
     hl_println(hl_str_concat(hlc_h_9273, hlc_h_9274));
     if ((u_inlined_keys > 0)) {
-        hl_println((hl_str*)&HLC_LIT_5396);
+        hl_println((hl_str*)&HLC_LIT_5398);
         int64_t u_i = 0;
         while ((u_i < u_inlined_keys)) {
             hl_str* hlc_h_9275 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_4180;
@@ -42656,42 +42660,42 @@ void usf_print_opt_stats(Ctx* u_ctx_p) {
         }
         u_i = hl_add_i64(u_i, 1, 706L);
     }
-    hl_println((hl_str*)&HLC_LIT_5397);
-    hl_str* hlc_h_9282 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5398;
+    hl_println((hl_str*)&HLC_LIT_5399);
+    hl_str* hlc_h_9282 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5400;
     hl_str* hlc_h_9283 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_total);
     hl_println(hl_str_concat(hlc_h_9282, hlc_h_9283));
-    hl_str* hlc_h_9284 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5399;
+    hl_str* hlc_h_9284 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5401;
     hl_str* hlc_h_9285 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_inline_always);
     hl_println(hl_str_concat(hlc_h_9284, hlc_h_9285));
-    hl_str* hlc_h_9286 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5400;
+    hl_str* hlc_h_9286 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5402;
     hl_str* hlc_h_9287 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_inline_never);
     hl_println(hl_str_concat(hlc_h_9286, hlc_h_9287));
-    hl_str* hlc_h_9288 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5401;
+    hl_str* hlc_h_9288 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5403;
     hl_str* hlc_h_9289 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_hot_n);
     hl_println(hl_str_concat(hlc_h_9288, hlc_h_9289));
-    hl_str* hlc_h_9290 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5402;
+    hl_str* hlc_h_9290 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5404;
     hl_str* hlc_h_9291 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_cold_n);
     hl_println(hl_str_concat(hlc_h_9290, hlc_h_9291));
-    hl_str* hlc_h_9292 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5403;
+    hl_str* hlc_h_9292 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5405;
     hl_str* hlc_h_9293 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_irq_n);
     hl_println(hl_str_concat(hlc_h_9292, hlc_h_9293));
-    hl_str* hlc_h_9294 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5404;
+    hl_str* hlc_h_9294 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5406;
     hl_str* hlc_h_9295 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_no_red_zone_n);
     hl_println(hl_str_concat(hlc_h_9294, hlc_h_9295));
-    hl_str* hlc_h_9296 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5405;
+    hl_str* hlc_h_9296 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5407;
     hl_str* hlc_h_9297 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_stack_size_n);
     hl_println(hl_str_concat(hlc_h_9296, hlc_h_9297));
-    hl_str* hlc_h_9298 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5406;
+    hl_str* hlc_h_9298 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5408;
     hl_str* hlc_h_9299 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_section_n);
     hl_println(hl_str_concat(hlc_h_9298, hlc_h_9299));
-    hl_str* hlc_h_9300 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5407;
+    hl_str* hlc_h_9300 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5409;
     hl_str* hlc_h_9301 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_align_n);
     hl_println(hl_str_concat(hlc_h_9300, hlc_h_9301));
     if (((u_ctx)->f_crate_stack_size >= 0)) {
-        hl_str* hlc_h_9302 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5408;
+        hl_str* hlc_h_9302 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5410;
         hl_str* hlc_h_9303 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64((u_ctx)->f_crate_stack_size);
         hl_str* hlc_h_9304 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9302, hlc_h_9303);
-        hl_str* hlc_h_9305 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5409;
+        hl_str* hlc_h_9305 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5411;
         hl_str* hlc_h_9306 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9304, hlc_h_9305);
         hl_str* hlc_h_9307 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64((u_ctx)->f_stack_budget_worst);
         hl_str* hlc_h_9308 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9306, hlc_h_9307);
@@ -42701,43 +42705,43 @@ void usf_print_opt_stats(Ctx* u_ctx_p) {
         hl_str* hlc_h_9312 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_57;
         hl_println(hl_str_concat(hlc_h_9311, hlc_h_9312));
     }
-    hl_str* hlc_h_9313 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5410;
+    hl_str* hlc_h_9313 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5412;
     hl_str* hlc_h_9314 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_tail_call_n);
     hl_str* hlc_h_9315 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9313, hlc_h_9314);
-    hl_str* hlc_h_9316 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5411;
+    hl_str* hlc_h_9316 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5413;
     hl_str* hlc_h_9317 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9315, hlc_h_9316);
     hl_str* hlc_h_9318 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_tail_site_n);
     hl_str* hlc_h_9319 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9317, hlc_h_9318);
-    hl_str* hlc_h_9320 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5412;
+    hl_str* hlc_h_9320 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5414;
     hl_println(hl_str_concat(hlc_h_9319, hlc_h_9320));
     if (usf_pgo_has_profile(hl_retain(u_ctx))) {
-        hl_str* hlc_h_9321 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5413;
+        hl_str* hlc_h_9321 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5415;
         hl_str* hlc_h_9322 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_pgo_hot_n);
         hl_println(hl_str_concat(hlc_h_9321, hlc_h_9322));
-        hl_str* hlc_h_9323 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5414;
+        hl_str* hlc_h_9323 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5416;
         hl_str* hlc_h_9324 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_pgo_cold_n);
         hl_println(hl_str_concat(hlc_h_9323, hlc_h_9324));
-        hl_str* hlc_h_9325 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5415;
+        hl_str* hlc_h_9325 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5417;
         hl_str* hlc_h_9326 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_pgo_inline_n);
         hl_println(hl_str_concat(hlc_h_9325, hlc_h_9326));
     } else {
-        hl_println((hl_str*)&HLC_LIT_5416);
+        hl_println((hl_str*)&HLC_LIT_5418);
     }
     if ((u_ctx)->f_lto_mode) {
         int64_t u_inlined_n = hl_list_len((u_ctx)->f_lto_inlined_report);
         int64_t u_sites = (u_ctx)->f_lto_inline_n;
         int64_t u_dropped = (u_ctx)->f_lto_dropped;
-        hl_str* hlc_h_9327 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5417;
+        hl_str* hlc_h_9327 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5419;
         hl_str* hlc_h_9328 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_sites);
         hl_println(hl_str_concat(hlc_h_9327, hlc_h_9328));
-        hl_str* hlc_h_9329 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5418;
+        hl_str* hlc_h_9329 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5420;
         hl_str* hlc_h_9330 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_inlined_n);
         hl_println(hl_str_concat(hlc_h_9329, hlc_h_9330));
-        hl_str* hlc_h_9331 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5419;
+        hl_str* hlc_h_9331 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5421;
         hl_str* hlc_h_9332 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_dropped);
         hl_println(hl_str_concat(hlc_h_9331, hlc_h_9332));
     } else {
-        hl_println((hl_str*)&HLC_LIT_5420);
+        hl_println((hl_str*)&HLC_LIT_5422);
     }
     int64_t u_lay_counts[4] __attribute__((aligned(16)));
     u_lay_counts[0] = 0;
@@ -42766,26 +42770,26 @@ void usf_print_opt_stats(Ctx* u_ctx_p) {
             }
             u_ci = hl_add_i64(u_ci, 1, 766L);
         }
-        hl_str* hlc_h_9336 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5421;
+        hl_str* hlc_h_9336 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5423;
         hl_str* hlc_h_9337 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(hlc_sg_i64(u_lay_counts, 0, 4, 768L));
         hl_println(hl_str_concat(hlc_h_9336, hlc_h_9337));
-        hl_str* hlc_h_9338 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5422;
+        hl_str* hlc_h_9338 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5424;
         hl_str* hlc_h_9339 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(hlc_sg_i64(u_lay_counts, 1, 4, 769L));
         hl_println(hl_str_concat(hlc_h_9338, hlc_h_9339));
-        hl_str* hlc_h_9340 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5423;
+        hl_str* hlc_h_9340 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5425;
         hl_str* hlc_h_9341 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(hlc_sg_i64(u_lay_counts, 2, 4, 770L));
         hl_println(hl_str_concat(hlc_h_9340, hlc_h_9341));
-        hl_str* hlc_h_9342 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5424;
+        hl_str* hlc_h_9342 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5426;
         hl_str* hlc_h_9343 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(hlc_sg_i64(u_lay_counts, 3, 4, 771L));
         hl_println(hl_str_concat(hlc_h_9342, hlc_h_9343));
-        hl_str* hlc_h_9344 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5425;
+        hl_str* hlc_h_9344 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5427;
         hl_str* hlc_h_9345 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(hl_list_len((u_ctx)->f_layout_order));
         hl_println(hl_str_concat(hlc_h_9344, hlc_h_9345));
     }
     hl_println((hl_str*)&HLC_LIT_1);
-    hl_println((hl_str*)&HLC_LIT_5426);
-    hl_println((hl_str*)&HLC_LIT_5427);
     hl_println((hl_str*)&HLC_LIT_5428);
+    hl_println((hl_str*)&HLC_LIT_5429);
+    hl_println((hl_str*)&HLC_LIT_5430);
     int64_t u_widths[4] __attribute__((aligned(16)));
     u_widths[0] = 30;
     u_widths[1] = 11;
@@ -42798,14 +42802,14 @@ void usf_print_opt_stats(Ctx* u_ctx_p) {
         hl_str* u_inline_col __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_1;
         hl_str* hlc_h_9346 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_123;
         if (hl_str_eq((u_f_2)->f_attr_inline, hlc_h_9346)) {
-            { hl_str* __hl_old = u_inline_col; u_inline_col = (hl_str*)&HLC_LIT_5429; hl_str_release(__hl_old); }
+            { hl_str* __hl_old = u_inline_col; u_inline_col = (hl_str*)&HLC_LIT_5431; hl_str_release(__hl_old); }
         } else {
             hl_str* hlc_h_9347 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_124;
             if (hl_str_eq((u_f_2)->f_attr_inline, hlc_h_9347)) {
-                { hl_str* __hl_old = u_inline_col; u_inline_col = (hl_str*)&HLC_LIT_5430; hl_str_release(__hl_old); }
+                { hl_str* __hl_old = u_inline_col; u_inline_col = (hl_str*)&HLC_LIT_5432; hl_str_release(__hl_old); }
             } else {
                 if (usf_pgo_fn_inline(hl_retain(u_ctx), hl_retain(u_key_2))) {
-                    { hl_str* __hl_old = u_inline_col; u_inline_col = (hl_str*)&HLC_LIT_5431; hl_str_release(__hl_old); }
+                    { hl_str* __hl_old = u_inline_col; u_inline_col = (hl_str*)&HLC_LIT_5433; hl_str_release(__hl_old); }
                 } else {
                     { hl_str* __hl_old = u_inline_col; u_inline_col = (hl_str*)&HLC_LIT_4068; hl_str_release(__hl_old); }
                 }
@@ -42813,16 +42817,16 @@ void usf_print_opt_stats(Ctx* u_ctx_p) {
         }
         hl_str* u_hotcold_col __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_1;
         if ((u_f_2)->f_attr_hot) {
-            { hl_str* __hl_old = u_hotcold_col; u_hotcold_col = (hl_str*)&HLC_LIT_5432; hl_str_release(__hl_old); }
+            { hl_str* __hl_old = u_hotcold_col; u_hotcold_col = (hl_str*)&HLC_LIT_5434; hl_str_release(__hl_old); }
         } else {
             if ((u_f_2)->f_attr_cold) {
-                { hl_str* __hl_old = u_hotcold_col; u_hotcold_col = (hl_str*)&HLC_LIT_5433; hl_str_release(__hl_old); }
+                { hl_str* __hl_old = u_hotcold_col; u_hotcold_col = (hl_str*)&HLC_LIT_5435; hl_str_release(__hl_old); }
             } else {
                 if (usf_pgo_fn_is_hot(hl_retain(u_ctx), hl_retain(u_key_2))) {
-                    { hl_str* __hl_old = u_hotcold_col; u_hotcold_col = (hl_str*)&HLC_LIT_5434; hl_str_release(__hl_old); }
+                    { hl_str* __hl_old = u_hotcold_col; u_hotcold_col = (hl_str*)&HLC_LIT_5436; hl_str_release(__hl_old); }
                 } else {
                     if (usf_pgo_fn_is_cold(hl_retain(u_ctx), hl_retain(u_key_2))) {
-                        { hl_str* __hl_old = u_hotcold_col; u_hotcold_col = (hl_str*)&HLC_LIT_5435; hl_str_release(__hl_old); }
+                        { hl_str* __hl_old = u_hotcold_col; u_hotcold_col = (hl_str*)&HLC_LIT_5437; hl_str_release(__hl_old); }
                     } else {
                         { hl_str* __hl_old = u_hotcold_col; u_hotcold_col = (hl_str*)&HLC_LIT_293; hl_str_release(__hl_old); }
                     }
@@ -42831,22 +42835,22 @@ void usf_print_opt_stats(Ctx* u_ctx_p) {
         }
         hl_str* u_frame_col __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_1;
         if ((u_f_2)->f_attr_irq_handler) {
-            hl_str* hlc_h_9348 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5436;
+            hl_str* hlc_h_9348 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5438;
             { hl_str* __hl_old = u_frame_col; u_frame_col = hl_str_concat(u_frame_col, hlc_h_9348); hl_str_release(__hl_old); }
         }
         if ((u_f_2)->f_attr_no_red_zone) {
-            hl_str* hlc_h_9349 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5437;
+            hl_str* hlc_h_9349 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5439;
             { hl_str* __hl_old = u_frame_col; u_frame_col = hl_str_concat(u_frame_col, hlc_h_9349); hl_str_release(__hl_old); }
         }
         if (((u_f_2)->f_attr_stack_size >= 0)) {
-            hl_str* hlc_h_9350 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5438;
+            hl_str* hlc_h_9350 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5440;
             hl_str* hlc_h_9351 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(u_frame_col, hlc_h_9350);
             hl_str* hlc_h_9352 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64((u_f_2)->f_attr_stack_size);
             { hl_str* __hl_old = u_frame_col; u_frame_col = hl_str_concat(hlc_h_9351, hlc_h_9352); hl_str_release(__hl_old); }
         }
         if ((u_f_2)->f_attr_tail_call) {
             int64_t u_tc_n = hl_map_get_i64((u_ctx)->f_tail_sites, u_key_2, 0);
-            hl_str* hlc_h_9353 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5439;
+            hl_str* hlc_h_9353 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5441;
             hl_str* hlc_h_9354 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(u_frame_col, hlc_h_9353);
             hl_str* hlc_h_9355 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_tc_n);
             hl_str* hlc_h_9356 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9354, hlc_h_9355);
@@ -42860,12 +42864,12 @@ void usf_print_opt_stats(Ctx* u_ctx_p) {
         hl_str* u_source_col __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_1;
         hl_str* hlc_h_9359 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_1;
         if ((((((((!hl_str_eq((u_f_2)->f_attr_inline, hlc_h_9359)) || (u_f_2)->f_attr_hot) || (u_f_2)->f_attr_cold) || (u_f_2)->f_attr_irq_handler) || (u_f_2)->f_attr_no_red_zone) || ((u_f_2)->f_attr_stack_size >= 0)) || (u_f_2)->f_attr_tail_call)) {
-            { hl_str* __hl_old = u_source_col; u_source_col = (hl_str*)&HLC_LIT_5440; hl_str_release(__hl_old); }
+            { hl_str* __hl_old = u_source_col; u_source_col = (hl_str*)&HLC_LIT_5442; hl_str_release(__hl_old); }
         } else {
             if (((usf_pgo_fn_is_hot(hl_retain(u_ctx), hl_retain(u_key_2)) || usf_pgo_fn_is_cold(hl_retain(u_ctx), hl_retain(u_key_2))) || usf_pgo_fn_inline(hl_retain(u_ctx), hl_retain(u_key_2)))) {
-                { hl_str* __hl_old = u_source_col; u_source_col = (hl_str*)&HLC_LIT_5441; hl_str_release(__hl_old); }
+                { hl_str* __hl_old = u_source_col; u_source_col = (hl_str*)&HLC_LIT_5443; hl_str_release(__hl_old); }
             } else {
-                { hl_str* __hl_old = u_source_col; u_source_col = (hl_str*)&HLC_LIT_5442; hl_str_release(__hl_old); }
+                { hl_str* __hl_old = u_source_col; u_source_col = (hl_str*)&HLC_LIT_5444; hl_str_release(__hl_old); }
             }
         }
         hl_str* u_padded_name __attribute__((cleanup(hl_cleanup_str))) = usf_pad_right(hl_retain(u_key_2), hlc_sg_i64(u_widths, 0, 4, 841L));
@@ -42890,9 +42894,9 @@ void usf_print_opt_stats(Ctx* u_ctx_p) {
     }
     if ((u_tail_call_n > 0)) {
         hl_println((hl_str*)&HLC_LIT_1);
-        hl_println((hl_str*)&HLC_LIT_5443);
-        hl_println((hl_str*)&HLC_LIT_5444);
         hl_println((hl_str*)&HLC_LIT_5445);
+        hl_println((hl_str*)&HLC_LIT_5446);
+        hl_println((hl_str*)&HLC_LIT_5447);
         int64_t u_tj = 0;
         while ((u_tj < hl_list_len((u_ctx)->f_fn_order))) {
             hl_str* u_key_3 __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get((u_ctx)->f_fn_order, u_tj, 860L)));
@@ -42914,7 +42918,7 @@ void usf_print_opt_stats(Ctx* u_ctx_p) {
                 hl_str* hlc_h_9381 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_90;
                 hl_str* hlc_h_9382 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9380, hlc_h_9381);
                 hl_str* hlc_h_9383 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9382, u_padded_tret);
-                hl_str* hlc_h_9384 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5446;
+                hl_str* hlc_h_9384 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5448;
                 hl_println(hl_str_concat(hlc_h_9383, hlc_h_9384));
             }
             u_tj = hl_add_i64(u_tj, 1, 871L);
@@ -42922,9 +42926,9 @@ void usf_print_opt_stats(Ctx* u_ctx_p) {
     }
     if ((hl_list_len((u_ctx)->f_layout_order) > 0)) {
         hl_println((hl_str*)&HLC_LIT_1);
-        hl_println((hl_str*)&HLC_LIT_5447);
-        hl_println((hl_str*)&HLC_LIT_5448);
         hl_println((hl_str*)&HLC_LIT_5449);
+        hl_println((hl_str*)&HLC_LIT_5450);
+        hl_println((hl_str*)&HLC_LIT_5451);
         int64_t u_lk_i = 0;
         while ((u_lk_i < hl_list_len((u_ctx)->f_layout_order))) {
             hl_str* u_lkey __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get((u_ctx)->f_layout_order, u_lk_i, 886L)));
@@ -42958,9 +42962,9 @@ void usf_print_audit(Ctx* u_ctx_p) {
     Ctx* u_ctx __attribute__((cleanup(hl_cleanup_Ctx))) = u_ctx_p;
     hl_list* u_keys __attribute__((cleanup(hl_cleanup_list))) = hl_retain((u_ctx)->f_fn_order);
     int64_t u_i = 0;
-    hl_println((hl_str*)&HLC_LIT_5450);
-    hl_println((hl_str*)&HLC_LIT_5451);
-    hl_println((hl_str*)&HLC_LIT_5450);
+    hl_println((hl_str*)&HLC_LIT_5452);
+    hl_println((hl_str*)&HLC_LIT_5453);
+    hl_println((hl_str*)&HLC_LIT_5452);
     while ((u_i < hl_list_len(u_keys))) {
         hl_str* u_key __attribute__((cleanup(hl_cleanup_str))) = hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_keys, u_i, 913L)));
         FnInfo* u_f __attribute__((cleanup(hl_cleanup_FnInfo))) = ((FnInfo*)hl_map_get_own((u_ctx)->f_fns, u_key, usf_dummy_fn()));
@@ -43014,28 +43018,28 @@ void usf_print_audit(Ctx* u_ctx_p) {
         hl_println(hl_str_concat(hlc_h_9408, u_comp_disp));
         u_i = hl_add_i64(u_i, 1, 948L);
     }
-    hl_println((hl_str*)&HLC_LIT_5450);
+    hl_println((hl_str*)&HLC_LIT_5452);
     if ((u_ctx)->f_crate_freestanding) {
-        hl_println((hl_str*)&HLC_LIT_5452);
+        hl_println((hl_str*)&HLC_LIT_5454);
     } else {
         if ((u_ctx)->f_crate_no_std) {
-            hl_println((hl_str*)&HLC_LIT_5453);
+            hl_println((hl_str*)&HLC_LIT_5455);
         } else {
-            hl_println((hl_str*)&HLC_LIT_5454);
+            hl_println((hl_str*)&HLC_LIT_5456);
         }
     }
     hl_str* hlc_h_9409 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_1;
     if ((!hl_str_eq((u_ctx)->f_target_triple, hlc_h_9409))) {
-        hl_str* hlc_h_9410 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5455;
+        hl_str* hlc_h_9410 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5457;
         hl_str* hlc_h_9411 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9410, (u_ctx)->f_target_triple);
-        hl_str* hlc_h_9412 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5456;
+        hl_str* hlc_h_9412 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5458;
         hl_println(hl_str_concat(hlc_h_9411, hlc_h_9412));
     }
     if (((u_ctx)->f_crate_stack_size >= 0)) {
-        hl_str* hlc_h_9413 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5457;
+        hl_str* hlc_h_9413 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5459;
         hl_str* hlc_h_9414 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64((u_ctx)->f_crate_stack_size);
         hl_str* hlc_h_9415 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9413, hlc_h_9414);
-        hl_str* hlc_h_9416 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5458;
+        hl_str* hlc_h_9416 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5460;
         hl_str* hlc_h_9417 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9415, hlc_h_9416);
         hl_str* hlc_h_9418 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64((u_ctx)->f_stack_budget_worst);
         hl_str* hlc_h_9419 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9417, hlc_h_9418);
@@ -43047,9 +43051,9 @@ void usf_print_audit(Ctx* u_ctx_p) {
     }
     hl_str* hlc_h_9424 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_1;
     if ((!hl_str_eq((u_ctx)->f_crate_boot_header, hlc_h_9424))) {
-        hl_str* hlc_h_9425 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5459;
+        hl_str* hlc_h_9425 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5461;
         hl_str* hlc_h_9426 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9425, (u_ctx)->f_crate_boot_header);
-        hl_str* hlc_h_9427 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5460;
+        hl_str* hlc_h_9427 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5462;
         hl_str* hlc_h_9428 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9426, hlc_h_9427);
         hl_str* hlc_h_9429 __attribute__((cleanup(hl_cleanup_str))) = usf_boot_header_section(hl_retain((u_ctx)->f_crate_boot_header));
         hl_str* hlc_h_9430 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9428, hlc_h_9429);
@@ -43057,7 +43061,7 @@ void usf_print_audit(Ctx* u_ctx_p) {
         hl_println(hl_str_concat(hlc_h_9430, hlc_h_9431));
     }
     if ((hl_list_len((u_ctx)->f_irq_proof_lines) > 0)) {
-        hl_println((hl_str*)&HLC_LIT_5461);
+        hl_println((hl_str*)&HLC_LIT_5463);
         int64_t u_irq_i = 0;
         while ((u_irq_i < hl_list_len((u_ctx)->f_irq_proof_lines))) {
             hl_str* hlc_h_9432 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_4180;
@@ -43098,7 +43102,7 @@ void usf_print_audit(Ctx* u_ctx_p) {
         u_sec_i = hl_add_i64(u_sec_i, 1, 1013L);
     }
     if ((hl_list_len(u_secret_rows) > 0)) {
-        hl_str* hlc_h_9442 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5462;
+        hl_str* hlc_h_9442 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5464;
         hl_str* hlc_h_9443 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(hl_list_len(u_secret_rows));
         hl_println(hl_str_concat(hlc_h_9442, hlc_h_9443));
         int64_t u_sec_j = 0;
@@ -43132,14 +43136,14 @@ void usf_print_audit(Ctx* u_ctx_p) {
             }
             hl_str* hlc_h_9449 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_4180;
             hl_str* hlc_h_9450 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9449, u_ckey);
-            hl_str* hlc_h_9451 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5463;
+            hl_str* hlc_h_9451 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5465;
             hl_str* hlc_h_9452 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9450, hlc_h_9451);
             hl_list_push(u_ct_rows, hl_str_concat(hlc_h_9452, u_cjoined));
         }
         u_cti = hl_add_i64(u_cti, 1, 1045L);
     }
     if ((hl_list_len(u_ct_rows) > 0)) {
-        hl_str* hlc_h_9453 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5464;
+        hl_str* hlc_h_9453 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5466;
         hl_str* hlc_h_9454 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(hl_list_len(u_ct_rows));
         hl_println(hl_str_concat(hlc_h_9453, hlc_h_9454));
         int64_t u_ctj = 0;
@@ -43150,7 +43154,7 @@ void usf_print_audit(Ctx* u_ctx_p) {
     }
     hl_str* hlc_h_9455 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_1;
     if (hl_str_eq((u_ctx)->f_crate_link_script, hlc_h_9455)) {
-        hl_println((hl_str*)&HLC_LIT_5465);
+        hl_println((hl_str*)&HLC_LIT_5467);
     } else {
         int64_t u_named = 0;
         int64_t u_aligned = 0;
@@ -43166,21 +43170,21 @@ void usf_print_audit(Ctx* u_ctx_p) {
             }
             u_si = hl_add_i64(u_si, 1, 1069L);
         }
-        hl_str* hlc_h_9457 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5466;
+        hl_str* hlc_h_9457 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5468;
         hl_str* hlc_h_9458 __attribute__((cleanup(hl_cleanup_str))) = usf_link_script_path(hl_retain(u_ctx));
         hl_str* hlc_h_9459 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9457, hlc_h_9458);
         hl_str* hlc_h_9460 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_511;
         hl_str* hlc_h_9461 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9459, hlc_h_9460);
         hl_str* hlc_h_9462 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_named);
         hl_str* hlc_h_9463 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9461, hlc_h_9462);
-        hl_str* hlc_h_9464 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5467;
+        hl_str* hlc_h_9464 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5469;
         hl_str* hlc_h_9465 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9463, hlc_h_9464);
         hl_str* hlc_h_9466 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(hl_list_len((u_ctx)->f_link_script_patterns));
         hl_str* hlc_h_9467 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9465, hlc_h_9466);
-        hl_str* hlc_h_9468 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5468;
+        hl_str* hlc_h_9468 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5470;
         hl_println(hl_str_concat(hlc_h_9467, hlc_h_9468));
         if ((u_aligned > 0)) {
-            hl_str* hlc_h_9469 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5469;
+            hl_str* hlc_h_9469 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5471;
             hl_str* hlc_h_9470 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(u_aligned);
             hl_println(hl_str_concat(hlc_h_9469, hlc_h_9470));
         }
@@ -43205,26 +43209,26 @@ void usf_print_audit(Ctx* u_ctx_p) {
         u_capi = hl_add_i64(u_capi, 1, 1088L);
     }
     if ((hl_list_len(u_cap_rows) > 0)) {
-        hl_println((hl_str*)&HLC_LIT_5470);
+        hl_println((hl_str*)&HLC_LIT_5472);
         int64_t u_capj = 0;
         while ((u_capj < hl_list_len(u_cap_rows))) {
             hl_println(hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_cap_rows, u_capj, 1094L))));
             u_capj = hl_add_i64(u_capj, 1, 1095L);
         }
     }
-    hl_println((hl_str*)&HLC_LIT_5471);
-    hl_println((hl_str*)&HLC_LIT_5472);
     hl_println((hl_str*)&HLC_LIT_5473);
     hl_println((hl_str*)&HLC_LIT_5474);
     hl_println((hl_str*)&HLC_LIT_5475);
     hl_println((hl_str*)&HLC_LIT_5476);
-    hl_println((hl_str*)&HLC_LIT_1);
     hl_println((hl_str*)&HLC_LIT_5477);
     hl_println((hl_str*)&HLC_LIT_5478);
+    hl_println((hl_str*)&HLC_LIT_1);
     hl_println((hl_str*)&HLC_LIT_5479);
     hl_println((hl_str*)&HLC_LIT_5480);
     hl_println((hl_str*)&HLC_LIT_5481);
     hl_println((hl_str*)&HLC_LIT_5482);
+    hl_println((hl_str*)&HLC_LIT_5483);
+    hl_println((hl_str*)&HLC_LIT_5484);
     hl_println((hl_str*)&HLC_LIT_1);
     hl_list* u_targs_users __attribute__((cleanup(hl_cleanup_list))) = ({
     hl_list* hlc_ll_9478 = hl_list_new(hl_str_release);
@@ -43271,37 +43275,37 @@ void usf_print_audit(Ctx* u_ctx_p) {
         u_si_2 = hl_add_i64(u_si_2, 1, 1143L);
     }
     if ((hl_list_len(u_targs_users) > 0)) {
-        hl_println((hl_str*)&HLC_LIT_5483);
+        hl_println((hl_str*)&HLC_LIT_5485);
         int64_t u_ti = 0;
         while ((u_ti < hl_list_len(u_targs_users))) {
-            hl_str* hlc_h_9485 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5484;
+            hl_str* hlc_h_9485 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5486;
             hl_println(hl_str_concat(hlc_h_9485, (hl_str*)hl_unbox_ptr(hl_list_get(u_targs_users, u_ti, 1149L))));
             u_ti = hl_add_i64(u_ti, 1, 1150L);
         }
     } else {
-        hl_println((hl_str*)&HLC_LIT_5485);
+        hl_println((hl_str*)&HLC_LIT_5487);
     }
     if ((hl_list_len(u_rft_users) > 0)) {
-        hl_println((hl_str*)&HLC_LIT_5486);
+        hl_println((hl_str*)&HLC_LIT_5488);
         int64_t u_ri = 0;
         while ((u_ri < hl_list_len(u_rft_users))) {
-            hl_str* hlc_h_9486 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5484;
+            hl_str* hlc_h_9486 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5486;
             hl_println(hl_str_concat(hlc_h_9486, (hl_str*)hl_unbox_ptr(hl_list_get(u_rft_users, u_ri, 1159L))));
             u_ri = hl_add_i64(u_ri, 1, 1160L);
         }
     } else {
-        hl_println((hl_str*)&HLC_LIT_5487);
+        hl_println((hl_str*)&HLC_LIT_5489);
     }
     if ((hl_list_len(u_rl_users) > 0)) {
-        hl_println((hl_str*)&HLC_LIT_5488);
+        hl_println((hl_str*)&HLC_LIT_5490);
         int64_t u_li = 0;
         while ((u_li < hl_list_len(u_rl_users))) {
-            hl_str* hlc_h_9487 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5484;
+            hl_str* hlc_h_9487 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5486;
             hl_println(hl_str_concat(hlc_h_9487, (hl_str*)hl_unbox_ptr(hl_list_get(u_rl_users, u_li, 1169L))));
             u_li = hl_add_i64(u_li, 1, 1170L);
         }
     } else {
-        hl_println((hl_str*)&HLC_LIT_5489);
+        hl_println((hl_str*)&HLC_LIT_5491);
     }
     hl_list* u_ffi_src_rows __attribute__((cleanup(hl_cleanup_list))) = ({
     hl_list* hlc_ll_9488 = hl_list_new(hl_str_release);
@@ -43321,24 +43325,24 @@ void usf_print_audit(Ctx* u_ctx_p) {
         FnInfo* u_ff __attribute__((cleanup(hl_cleanup_FnInfo))) = ((FnInfo*)hl_map_get_own((u_ctx)->f_fns, u_fkey, usf_dummy_fn()));
         if ((u_ff)->f_is_extern) {
             if ((u_ff)->f_attr_taint_source) {
-                hl_str* hlc_h_9491 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5484;
+                hl_str* hlc_h_9491 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5486;
                 hl_str* hlc_h_9492 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9491, u_fkey);
-                hl_str* hlc_h_9493 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5490;
+                hl_str* hlc_h_9493 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5492;
                 hl_str* hlc_h_9494 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9492, hlc_h_9493);
                 hl_list_push(u_ffi_src_rows, hl_str_concat(hlc_h_9494, (u_ff)->f_ret));
             }
             hl_str* hlc_h_9495 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_1;
             if ((!hl_str_eq((u_ff)->f_attr_taint_sinks, hlc_h_9495))) {
-                hl_str* hlc_h_9496 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5484;
+                hl_str* hlc_h_9496 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5486;
                 hl_str* hlc_h_9497 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9496, u_fkey);
                 hl_str* hlc_h_9498 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_586;
                 hl_str* hlc_h_9499 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9497, hlc_h_9498);
                 hl_list_push(u_ffi_sink_rows, hl_str_concat(hlc_h_9499, (u_ff)->f_attr_taint_sinks));
             }
             if (((!(u_ff)->f_attr_taint_source) && ({ hl_str* hlc_h_9500 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_1; hl_str_eq((u_ff)->f_attr_taint_sinks, hlc_h_9500); }))) {
-                hl_str* hlc_h_9501 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5484;
+                hl_str* hlc_h_9501 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5486;
                 hl_str* hlc_h_9502 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9501, u_fkey);
-                hl_str* hlc_h_9503 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5490;
+                hl_str* hlc_h_9503 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5492;
                 hl_str* hlc_h_9504 __attribute__((cleanup(hl_cleanup_str))) = hl_str_concat(hlc_h_9502, hlc_h_9503);
                 hl_list_push(u_ffi_plain_rows, hl_str_concat(hlc_h_9504, (u_ff)->f_ret));
             }
@@ -43346,10 +43350,10 @@ void usf_print_audit(Ctx* u_ctx_p) {
         u_fi = hl_add_i64(u_fi, 1, 1201L);
     }
     if ((hl_add_i64(hl_add_i64(hl_list_len(u_ffi_src_rows), hl_list_len(u_ffi_sink_rows), 1203L), hl_list_len(u_ffi_plain_rows), 1203L) == 0)) {
-        hl_println((hl_str*)&HLC_LIT_5491);
+        hl_println((hl_str*)&HLC_LIT_5493);
     } else {
-        hl_println((hl_str*)&HLC_LIT_5492);
-        hl_str* hlc_h_9505 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5493;
+        hl_println((hl_str*)&HLC_LIT_5494);
+        hl_str* hlc_h_9505 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5495;
         hl_str* hlc_h_9506 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(hl_list_len(u_ffi_src_rows));
         hl_println(hl_str_concat(hlc_h_9505, hlc_h_9506));
         int64_t u_fsj = 0;
@@ -43357,7 +43361,7 @@ void usf_print_audit(Ctx* u_ctx_p) {
             hl_println(hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_ffi_src_rows, u_fsj, 1210L))));
             u_fsj = hl_add_i64(u_fsj, 1, 1211L);
         }
-        hl_str* hlc_h_9507 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5494;
+        hl_str* hlc_h_9507 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5496;
         hl_str* hlc_h_9508 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(hl_list_len(u_ffi_sink_rows));
         hl_println(hl_str_concat(hlc_h_9507, hlc_h_9508));
         int64_t u_fkj = 0;
@@ -43365,7 +43369,7 @@ void usf_print_audit(Ctx* u_ctx_p) {
             hl_println(hl_retain((hl_str*)hl_unbox_ptr(hl_list_get(u_ffi_sink_rows, u_fkj, 1216L))));
             u_fkj = hl_add_i64(u_fkj, 1, 1217L);
         }
-        hl_str* hlc_h_9509 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5495;
+        hl_str* hlc_h_9509 __attribute__((cleanup(hl_cleanup_str))) = (hl_str*)&HLC_LIT_5497;
         hl_str* hlc_h_9510 __attribute__((cleanup(hl_cleanup_str))) = hl_str_from_int64(hl_list_len(u_ffi_plain_rows));
         hl_println(hl_str_concat(hlc_h_9509, hlc_h_9510));
         int64_t u_fpj = 0;

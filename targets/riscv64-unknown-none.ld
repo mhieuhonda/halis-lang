@@ -39,6 +39,19 @@ SECTIONS
         *(.text .text.*)
     }
 
+    /* Ubuntu's cross-gcc passes --build-id, so the link carries a
+     * .note.gnu.build-id orphan. On binutils < 2.44 that orphan can
+     * land at the image BASE — before .text — pushing _start off the
+     * DRAM base the triple is contracted to enter at (the aarch64
+     * twin showed the +0x30 in the wild). An explicit home AFTER
+     * .text pins the entry for every linker. */
+    .notes : ALIGN(4)
+    {
+        *(.note.gnu.build-id)
+        *(.note.gnu.property)
+        *(.note.ABI-tag)
+    }
+
     .rodata : ALIGN(16)
     {
         *(.rodata .rodata.*)
@@ -88,6 +101,19 @@ SECTIONS
         *(.sbss .sbss.*)
         *(COMMON)
         __bss_end = .;
+    }
+
+    /* The entry's stack. `-bios none` enters the image with SP=0 —
+     * only x86-64 firmware hands a naked _start a usable RSP — so the
+     * riscv entry arms its own stack from __stack_top before
+     * `call hl_boot` can push once. 64 KiB, growing down, above the
+     * image; NOLOAD keeps it out of the file and ALIGN(16) keeps the
+     * RV64 SP invariant. */
+    .stack (NOLOAD) : ALIGN(16)
+    {
+        __stack_bottom = .;
+        . += 0x10000;
+        __stack_top = .;
     }
 
     _end = .;

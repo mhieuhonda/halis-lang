@@ -22,11 +22,11 @@ ENTRY(_start)
 
 SECTIONS
 {
-    /* 0x40000000 — the DRAM base of QEMU's `virt` machine (and the
-     * usual load address of a bare AArch64 image on it): with
-     * `-bios none -kernel image.elf` the firmware loader places the
-     * segments here and the CPU fetches the first instruction from
-     * the image base. */
+    /* 0x40000000 — the DRAM base of QEMU's `virt` machine. The direct
+     * `-kernel image.elf` boot (no -bios: 8.2 has no `none` firmware
+     * spelling for ARM, it reads it as a ROM filename and dies) loads
+     * the ELF segments here and enters the ELF entry — QEMU's own DTB
+     * stays out of the image's way in that path. */
     . = 0x40000000;
 
     .text : ALIGN(16)
@@ -39,6 +39,19 @@ SECTIONS
          * order. */
         KEEP(*(.text._start))
         *(.text .text.*)
+    }
+
+    /* Ubuntu's cross-gcc passes --build-id, so the link carries a
+     * .note.gnu.build-id. On binutils < 2.44 that orphan is placed at
+     * the image BASE — before .text — which pushes _start 0x30 past
+     * the DRAM base the whole triple is contracted to enter at. An
+     * explicit home AFTER .text pins the entry at the base for every
+     * linker; 2.44+ already puts it here on its own. */
+    .notes : ALIGN(4)
+    {
+        *(.note.gnu.build-id)
+        *(.note.gnu.property)
+        *(.note.ABI-tag)
     }
 
     .rodata : ALIGN(16)
@@ -89,6 +102,19 @@ SECTIONS
         *(.sbss .sbss.*)
         *(COMMON)
         __bss_end = .;
+    }
+
+    /* The entry's stack. QEMU's virt boards enter the image with
+     * SP=0 — only x86-64 firmware hands a naked _start a usable RSP —
+     * so the aarch64 entry arms its own stack from __stack_top before
+     * `bl hl_boot` can push once. 64 KiB, growing down, above the
+     * image; NOLOAD keeps it out of the file and ALIGN(16) keeps the
+     * AAPCS64 SP invariant. */
+    .stack (NOLOAD) : ALIGN(16)
+    {
+        __stack_bottom = .;
+        . += 0x10000;
+        __stack_top = .;
     }
 
     _end = .;

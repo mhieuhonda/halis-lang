@@ -257,10 +257,12 @@ TARGETS = {
     # Stage 94 (v0.113.0-alpha): aarch64-unknown-none — the bare-metal
     # ARM triple (roadmap Stage 94). QEMU's `virt` machine is the
     # reference board: DRAM at 0x40000000, the PL011 console at
-    # 0x09000000, `-bios none -kernel image.elf` for the boot. Same
-    # shape as the x86-64 one — no libc, no crt0, integer-only (the
-    # FPU/NEON state is not saved until the kernel does it, and
-    # -mgeneral-regs-only makes the compiler refuse to emit FP).
+    # 0x09000000, plain `-kernel image.elf` for the boot (the ARM
+    # boards have no `none` firmware spelling — `-bios none` reads as
+    # a ROM filename and dies). Same shape as the x86-64 one — no
+    # libc, no crt0, integer-only (the FPU/NEON state is not saved
+    # until the kernel does it, and -mgeneral-regs-only makes the
+    # compiler refuse to emit FP).
     "aarch64-unknown-none": {
         "arch": "aarch64",
         "os": "none",
