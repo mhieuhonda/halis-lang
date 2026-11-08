@@ -156,6 +156,12 @@ class InterpExec(object):
         tk = t["k"]
         if tk == "ident":
             name = t["name"]
+            fi = t.get("fi")
+            if fi is not None:
+                b = env[fi].get(name)
+                if b is not None:
+                    b[0] = val
+                    return
             i = len(env) - 1
             while i >= 0:
                 b = env[i].get(name)
@@ -180,6 +186,13 @@ class InterpExec(object):
         k = e["k"]
         if k == "ident":
             name = e["name"]
+            fi = e.get("fi")
+            if fi is not None:
+                b = env[fi].get(name)
+                if b is not None:
+                    return b[0]
+            # Fallback (unannotated node, or the frame missed): the
+            # original chain walk, byte-exact in behaviour.
             i = len(env) - 1
             while i >= 0:
                 b = env[i].get(name)
@@ -382,16 +395,19 @@ class InterpExec(object):
         kl = l["k"]
         if kl == "ident":
             name = l["name"]
-            i = len(env) - 1
-            while i >= 0:
-                b = env[i].get(name)
-                if b is not None:
-                    a = b[0]
-                    break
-                i -= 1
-            else:
-                raise HLPanic("variable does not exist: %s" % name,
-                              self._tls.line)
+            fi = l.get("fi")
+            b = env[fi].get(name) if fi is not None else None
+            if b is None:
+                i = len(env) - 1
+                while i >= 0:
+                    b = env[i].get(name)
+                    if b is not None:
+                        break
+                    i -= 1
+                else:
+                    raise HLPanic("variable does not exist: %s" % name,
+                                  self._tls.line)
+            a = b[0]
         elif kl == "int" or kl == "str" or kl == "float" or kl == "bool":
             a = l["v"]
         else:
@@ -408,16 +424,19 @@ class InterpExec(object):
         kr = r["k"]
         if kr == "ident":
             name = r["name"]
-            i = len(env) - 1
-            while i >= 0:
-                b = env[i].get(name)
-                if b is not None:
-                    b = b[0]
-                    break
-                i -= 1
-            else:
-                raise HLPanic("variable does not exist: %s" % name,
-                              self._tls.line)
+            fi = r.get("fi")
+            b = env[fi].get(name) if fi is not None else None
+            if b is None:
+                i = len(env) - 1
+                while i >= 0:
+                    b = env[i].get(name)
+                    if b is not None:
+                        break
+                    i -= 1
+                else:
+                    raise HLPanic("variable does not exist: %s" % name,
+                                  self._tls.line)
+            b = b[0]
         elif kr == "int" or kr == "str" or kr == "float" or kr == "bool":
             b = r["v"]
         else:

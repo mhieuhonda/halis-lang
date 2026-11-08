@@ -5,6 +5,7 @@ boot/interp_parts/interp.py - behavior is unchanged."""
 from .rt import (
     ConcRuntime, HLPanic, HalisRNG, ReturnSig, TailCallSig, sys, threading, to_display,
 )
+from .resolve import annotate_program
 from ..compat import zip_strict
 
 class InterpCore(object):
@@ -14,6 +15,12 @@ class InterpCore(object):
         self.fns = program["fns"]
         self.structs = program["structs"]
         self.enums = program.get("enums", {})
+        # Static frame-index resolution: every resolvable ident node
+        # gets its absolute env-frame index (resolve.py). The eval
+        # sites treat the annotation as a pure fast path — any miss
+        # falls through to the chain walk — so this can only change
+        # speed, never results. Runs once per Interp, before execution.
+        annotate_program(program)
         self.argv = argv  # list[bytes]
         self.out = out
         # Deep-scan-10 fix: `line` is now THREAD-LOCAL. It was a plain
