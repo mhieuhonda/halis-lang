@@ -8,11 +8,22 @@ This is the SEED used to bootstrap the self-hosting cycle of Halis:
 
 Usage:
   python3 tools/hlinterp/boot.py [--check | --audit] <file.hls> [program args...]
+  python3 tools/hlinterp/boot.py [--check] --batch <list-file> <log-file>
 
 Flags:
   --check    type-check + effects-check only, no execution.
   --audit    print the capability / effect tree of every function
              (declared vs computed, with a clear OK/VIOLATION status).
+  --batch    suite-driver mode: run EVERY file named in list-file
+             inside this one process (one Python ignition instead of
+             one per file) and write one record per file, in list
+             order, to log-file:
+               <rc>\t<b64(path)>\t<b64(stdout)>\t<b64(stderr)>\n
+             Plain mode or --check only; every file runs with the
+             same cwd, env and fd-level capture a per-file spawn
+             would give it. Records land in list order regardless of
+             per-file exit codes; the process exits 0 when the log is
+             complete (the records carry the verdicts).
   --det      Stage 127: arm the deterministic scheduler — the FIFO
              baton rotation that makes a concurrent program's output
              and interleaving identical on every run (the interpreter
@@ -34,6 +45,7 @@ import gc
 import os
 import signal
 import sys
+import tempfile
 import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -267,8 +279,22 @@ def run_cli():
                         "--target-feature", "--lto-threshold")
     args = []
     i = 0
+    batch_list = None       # --batch <list-file> <log-file>
+    batch_log = None
     while i < len(argv):
         a = argv[i]
+        if a == "--batch":
+            # Two-value flag (suite driver): run EVERY file named in
+            # list-file inside this one process, write one TSV record
+            # per file to log-file (rc + base64 stdout/stderr). Only
+            # meaningful before the (absent) entry file.
+            if i + 2 >= len(argv):
+                sys.stderr.write("error: --batch needs a list file and a log file\n")
+                return 2
+            batch_list = argv[i + 1]
+            batch_log = argv[i + 2]
+            i += 3
+            continue
         if not (a.startswith("--") or a == "-O"):
             break
         args.append(a)
@@ -474,6 +500,20 @@ def run_cli():
         sys.stderr.write(
             "error: --check / --audit / --emit ir / --emit llvm / --emit lto / --opt-stats are mutually exclusive\n")
         return 2
+    # --batch: the whole list runs in THIS process (one Python ignition
+    # instead of one per file). Plain mode or --check; every other mode
+    # flag is refused — the batch path is a suite-driver vehicle, not a
+    # general entry, and silently ignoring a mode flag would lie.
+    if batch_list is not None:
+        if audit_only or emit_ir or emit_llvm or emit_lto or opt_stats:
+            sys.stderr.write("error: --batch is incompatible with mode flags "
+                             "other than --check\n")
+            return 2
+        if contracts or det_mode or fast_mode or sandbox_dir is not None:
+            sys.stderr.write("error: --batch is incompatible with --contracts / "
+                             "--det / --fast / --sandbox\n")
+            return 2
+        return run_batch(batch_list, batch_log, check_only)
     # Deep-scan-10 (continued): the entry path and the PROGRAM
     # arguments are whatever follows the leading flags — program
     # arguments are passed through VERBATIM (they may themselves look
@@ -1143,6 +1183,129 @@ def print_opt_stats(program, lto: bool = False, target_feature: str = ""):
         print("   native intrinsics under hlc --target-feature)")
     except Exception:
         pass
+    return 0
+
+
+def _run_one_batch_file(path, check_only):
+    """Run one file with fd-level capture; return (rc, out, err) bytes.
+
+    fds 1 and 2 are redirected onto temp files for the duration, so
+    EVERY writer a single-file boot.py would reach — the buffered
+    program stdout Interp writes through, panic reports, det traces,
+    proc_exec/os.system children inheriting fd 1 — lands in the same
+    capture the single-file invocation would have produced on the
+    pipe. Ordering between parent and child writes is preserved
+    because both sides share the fd, exactly as in a real run.
+    """
+    out_f = tempfile.TemporaryFile()
+    err_f = tempfile.TemporaryFile()
+    saved_out = os.dup(1)
+    saved_err = os.dup(2)
+    sys.stdout.buffer.flush()
+    sys.stderr.buffer.flush()
+    os.dup2(out_f.fileno(), 1)
+    os.dup2(err_f.fileno(), 2)
+    rc = 1
+    try:
+        try:
+            program = load_program(path)
+        except HLError as ex:
+            sys.stderr.write("compile error: %s\n" % ex)
+            rc = 1
+        except OSError:
+            sys.stderr.write("error: cannot open file %s\n" % path)
+            rc = 2
+        else:
+            try:
+                check(program)
+            except HLError as ex:
+                sys.stderr.write("compile error: %s\n" % ex)
+                rc = 1
+            else:
+                if check_only:
+                    sys.stdout.write("OK: types and effects valid\n")
+                    rc = 0
+                else:
+                    prog_args = [a.encode("utf-8", "surrogateescape")
+                                 for a in [path]]
+                    interp = Interp(program, prog_args, sys.stdout.buffer)
+                    try:
+                        rc = interp.run()
+                    except SystemExit as ex:
+                        # The program's own exit() (the exit builtin
+                        # raises SystemExit with the masked code).
+                        rc = ex.code if isinstance(ex.code, int) else 0
+                    except RecursionError:
+                        sys.stderr.write(
+                            "panic: stack overflow (recursion too deep)\n")
+                        rc = 101
+                    except MemoryError:
+                        sys.stderr.write(
+                            "panic: out of memory (program tried to "
+                            "allocate more than the host can provide)\n")
+                        rc = 101
+    except Exception as ex:
+        # Crash parity: an unexpected Python exception in a single-file
+        # boot.py prints a traceback and exits 1. Mirror the exit code;
+        # the message goes to the err capture.
+        import traceback
+        sys.stderr.write(traceback.format_exception_only(type(ex), ex)[0])
+        rc = 1
+    finally:
+        try:
+            sys.stdout.buffer.flush()
+            sys.stderr.buffer.flush()
+        except Exception:
+            pass
+        os.dup2(saved_out, 1)
+        os.dup2(saved_err, 2)
+        os.close(saved_out)
+        os.close(saved_err)
+        out_f.seek(0)
+        err_f.seek(0)
+        out_bytes = out_f.read()
+        err_bytes = err_f.read()
+        out_f.close()
+        err_f.close()
+    return rc, out_bytes, err_bytes
+
+
+def run_batch(list_path, log_path, check_only):
+    """--batch worker: one process, many files, one TSV log.
+
+    Each input line of list_path is a file path (blank lines and #-runs
+    skipped). For every file, one log line is written IN LIST ORDER:
+
+        <rc>\\t<b64(path)>\\t<b64(stdout)>\\t<b64(stderr)>\\n
+
+    base64 keeps arbitrary output bytes (non-UTF-8, tabs, newlines)
+    line-safe; the consumer decodes and compares byte-exactly, so the
+    records are the same observations a per-file spawn would make.
+    """
+    import base64 as _b64
+    try:
+        with open(list_path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        sys.stderr.write("error: cannot open batch list %s\n" % list_path)
+        return 2
+    files = []
+    for ln in raw.split(b"\n"):
+        ln = ln.strip()
+        if ln and not ln.startswith(b"#"):
+            files.append(ln.decode("utf-8", "surrogateescape"))
+    with open(log_path, "wb") as log:
+        for path in files:
+            rc, out_bytes, err_bytes = _run_one_batch_file(path, check_only)
+            log.write(b"%d\t%s\t%s\t%s\n" % (
+                rc,
+                _b64.b64encode(path.encode("utf-8", "surrogateescape")),
+                _b64.b64encode(out_bytes),
+                _b64.b64encode(err_bytes)))
+            # The interpreter builds big object graphs per file (AST,
+            # env frames); collect now so a 272-file batch holds one
+            # program's worth of memory, not 272's.
+            gc.collect()
     return 0
 
 
