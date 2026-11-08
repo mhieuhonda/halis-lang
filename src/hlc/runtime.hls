@@ -1012,7 +1012,15 @@ fn runtime_lines(fs: bool, nl: bool) -> list[str] {
     # type-specific (they must release children). elem_free / val_free ==
     # NULL means "arena mode": the container never releases its items (used
     # by the LLVM backend, which is still arena-based).
-    r.push("typedef struct { int64_t refcnt; int64_t len; char* data; } hl_str;")
+    r.push("typedef struct { int64_t refcnt; int64_t len; char* data; int64_t cap; } hl_str;")
+    # cap: the allocation slack behind data, in bytes. 0 means
+    # "exact" — the object came from a path that sized the buffer to len
+    # (slices, from_c, the immortal literals, whose positional initialisers
+    # zero the tail). concat is the only writer: when the left operand is
+    # uniquely owned it appends into the slack, growing geometrically, so
+    # the `s = s + x` builder shape stops paying a fresh alloc + full-prefix
+    # copy per round. len stays the truth; cap is a hint only consumers of
+    # that one growth path read.
     # The kind tag (v1.1.0): 0 = boxed/pointer elements (the original
     # model — every element is a heap box or an object the refcount
     # walks), 1/2/3 = int64/float/bool values stored INLINE in one
@@ -2427,6 +2435,7 @@ fn runtime_lines(fs: bool, nl: bool) -> list[str] {
     r.push("    if (!s) hl_die(\"out of memory\");")
     r.push("    s->refcnt = 1;")
     r.push("    s->len = len;")
+    r.push("    s->cap = 0;")
     r.push("    s->data = (char*)malloc((size_t)len + 1);")
     r.push("    if (!s->data) hl_die(\"out of memory\");")
     r.push("    s->data[len] = 0;")
@@ -2447,6 +2456,79 @@ fn runtime_lines(fs: bool, nl: bool) -> list[str] {
     r.push("static hl_str* hl_str_from(const char* c, int64_t len) {")
     r.push("    hl_str* s = hl_str_alloc(len);")
     r.push("    if (len > 0) memcpy(s->data, c, (size_t)len);")
+    r.push("    return s;")
+    r.push("}")
+    r.push("")
+    # Two consumed-or-dead growth variants.. hl_str_concat stays
+    # the always-fresh form (borrowed a, borrowed b, +1 owned result)
+    # and every existing call site keeps its law. The new variants take
+    # the SAME borrowed-right/+1-owned-result contract but allow the
+    # left operand's buffer to be grown in place when it is uniquely
+    # held, which is sound exactly when no live binding can observe the
+    # old value after the call:
+    #   hl_str_concat_grow — the left operand is a codegen TEMP (a fresh
+    #     expression hoisted into an hlc_h_N with a cleanup attribute);
+    #     the temp is single-use, so after this concat nothing reads it.
+    #     The fabricated +1 (refcnt 1 -> 2) is balanced by the temp's
+    #     own cleanup release.
+    #   hl_str_concat_own — the assignment shape `x = x + rhs`: the old
+    #     binding's reference is CONSUMED by the call (no __hl_old
+    #     dance), so refcnt 1 -> 1 and the returned object is the new
+    #     binding's value outright. A shared or immortal left (refcnt
+    #     != 1) falls back to a fresh copy plus the consumed release.
+    # Both exclude a == b (realloc may move the buffer out from under
+    # the borrowed right) and a negative wrapped nlen (the exact path's
+    # hl_str_alloc dies on it, as before). The `s = s + x` builder and
+    # the nested codegen concat chains were quadratic in the
+    # accumulated prefix before this — every round paid a fresh header
+    # + buffer and copied the whole left side again.
+    r.push("static hl_str* hl_str_concat_grow(hl_str* a, hl_str* b) {")
+    r.push("    if (a != b && a->refcnt == 1) {")
+    r.push("        int64_t nlen = a->len + b->len;")
+    r.push("        if (nlen >= 0) {")
+    r.push("            if (nlen > a->cap) {")
+    r.push("                int64_t ncap = nlen;")
+    r.push("                if (nlen < (INT64_MAX >> 2)) ncap = nlen + (nlen >> 1) + 16;")
+    r.push("                char* nd = (char*)realloc(a->data, (size_t)ncap + 1);")
+    r.push("                if (!nd) hl_die(\"out of memory\");")
+    r.push("                a->data = nd;")
+    r.push("                a->cap = ncap;")
+    r.push("            }")
+    r.push("            if (b->len > 0) memcpy(a->data + a->len, b->data, (size_t)b->len);")
+    r.push("            a->len = nlen;")
+    r.push("            a->data[nlen] = 0;")
+    r.push("            a->refcnt = 2;")
+    r.push("            return a;")
+    r.push("        }")
+    r.push("    }")
+    r.push("    hl_str* s = hl_str_alloc(a->len + b->len);")
+    r.push("    if (a->len > 0) memcpy(s->data, a->data, (size_t)a->len);")
+    r.push("    if (b->len > 0) memcpy(s->data + a->len, b->data, (size_t)b->len);")
+    r.push("    return s;")
+    r.push("}")
+    r.push("")
+    r.push("static hl_str* hl_str_concat_own(hl_str* a, hl_str* b) {")
+    r.push("    if (a != b && a->refcnt == 1) {")
+    r.push("        int64_t nlen = a->len + b->len;")
+    r.push("        if (nlen >= 0) {")
+    r.push("            if (nlen > a->cap) {")
+    r.push("                int64_t ncap = nlen;")
+    r.push("                if (nlen < (INT64_MAX >> 2)) ncap = nlen + (nlen >> 1) + 16;")
+    r.push("                char* nd = (char*)realloc(a->data, (size_t)ncap + 1);")
+    r.push("                if (!nd) hl_die(\"out of memory\");")
+    r.push("                a->data = nd;")
+    r.push("                a->cap = ncap;")
+    r.push("            }")
+    r.push("            if (b->len > 0) memcpy(a->data + a->len, b->data, (size_t)b->len);")
+    r.push("            a->len = nlen;")
+    r.push("            a->data[nlen] = 0;")
+    r.push("            return a;")
+    r.push("        }")
+    r.push("    }")
+    r.push("    hl_str* s = hl_str_alloc(a->len + b->len);")
+    r.push("    if (a->len > 0) memcpy(s->data, a->data, (size_t)a->len);")
+    r.push("    if (b->len > 0) memcpy(s->data + a->len, b->data, (size_t)b->len);")
+    r.push("    hl_str_release(a);")
     r.push("    return s;")
     r.push("}")
     r.push("")
@@ -2936,6 +3018,14 @@ fn runtime_lines(fs: bool, nl: bool) -> list[str] {
     r.push("")
     r.push("// ---- map[str, T]: linear-probing hash table + insertion-order array ----")
     r.push("static uint64_t hl_str_hash(hl_str* s) {")
+    r.push("    // FNV-1a over the bytes, and measured to stay: word-at-a-time")
+    r.push("    // variants (with or without a finalizer, hybrid or not) beat this")
+    r.push("    // loop on long keys but LOST end-to-end on the short-key shapes")
+    r.push("    // that dominate real tables — identifiers, JSON fields, symbol")
+    r.push("    // probes — where the branch and the wider body cost more than")
+    r.push("    // the saved multiplies. Iteration order never keys off the hash")
+    r.push("    // (the order array is insertion order), so the value stays an")
+    r.push("    // internal detail of the slot walk.")
     r.push("    uint64_t h = 1469598103934665603ULL;")
     r.push("    for (int64_t i = 0; i < s->len; i++) {")
     r.push("        h ^= (uint8_t)s->data[i];")
