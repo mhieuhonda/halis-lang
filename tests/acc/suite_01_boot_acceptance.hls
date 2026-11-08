@@ -13,7 +13,13 @@
 #                                 --check with exit 1
 #  3. Differential             — interpreter vs Stage-0-compiled native
 #                                 (byte + exit parity, per file); libcurl
-#                                 probed exactly like the shell did
+#                                 probed exactly like the shell did. The
+#                                 per-file C comes from ONE native compiler
+#                                 (HL_TEST_HLC1 from the driver, or the
+#                                 in-gate build) — the fixed-point law pins
+#                                 it byte-equal to the interpreter's own
+#                                 emission, and the interpreter itself stays
+#                                 the oracle every file runs through
 #  3b. memory stress           — the stress binary holds RSS flat under a
 #                                 256 MB address-space limit
 #
@@ -26,6 +32,7 @@
 
 import "./harness.hls"
 import "std.str"
+import "std.env"
 
 # strip_trailing_nl(s) — the `$(...)` semantics the shell compared under.
 fn strip_trailing_nl(s: str) -> str {
@@ -201,8 +208,42 @@ fn section_fail(acc: Acc) -> void uses IO, Fs, Proc {
 # 3. Self-compile + differential testing (interpreter vs native)
 # ----------------------------------------------------------------------------
 
+# build_hlc1 — the native compiler the differential leg chains through.
+# The suite driver prebuilds ONE native compiler for every gate
+# (snapshot/hlc.c under gcc) and exports its path in HL_TEST_HLC1; the
+# fixed-point law (make bootstrap, re-proven by suite_03's own cmp of
+# the interpreter's emission against the native one) makes that binary
+# produce exactly the C the interpreter-driven compile below would —
+# so sharing it saves an interpreter self-compile PER CORPUS FILE
+# (272 × ~0.7 s of Python per run) without changing what the legs
+# verify: the interpreter stays the ORACLE every file is run through,
+# the native side is still compiled and linked and run per file, and
+# the byte + exit parity law is untouched. A standalone gate run (no
+# driver, no var) falls through to the in-gate build below unchanged.
+fn build_hlc1(acc: Acc) -> str uses IO, Proc {
+    let hlc1: str = scratch(acc, "hlc1")
+    if file_exists(hlc1) {
+        return hlc1
+    }
+    let shared: str = env_get("HL_TEST_HLC1")
+    if shared != "" && file_exists(shared) {
+        return shared
+    }
+    let s1: str = scratch(acc, "hlc_nat.c")
+    let r: RunResult = run_capture("python3",
+        ["tools/hlinterp/boot.py", "src/hlc.hls", "src/hlc.hls", s1])
+    if r.code != 0 {
+        return ""
+    }
+    if run_capture("gcc", ["-O2", "-o", hlc1, s1, "-lm", "-pthread"]).code != 0 {
+        return ""
+    }
+    return hlc1
+}
+
 fn section_differential(acc: Acc) -> void uses IO, Fs, Proc {
     section("3. Self-compile + differential testing (interpreter vs native)")
+    let hlc1: str = build_hlc1(acc)
     let flags: LinkFlags = curl_link_flags()
     let files: list[str] = ok_corpus()
     let mut i: int = 0
@@ -212,9 +253,8 @@ fn section_differential(acc: Acc) -> void uses IO, Fs, Proc {
         let interp: RunResult = run_capture("python3",
             ["tools/hlinterp/boot.py", f])
         let c_path: str = scratch(acc, name + ".c")
-        let hlc: RunResult = run_capture("python3",
-            ["tools/hlinterp/boot.py", "src/hlc.hls", f, c_path])
-        if hlc.code != 0 {
+        let hlc: RunResult = run_capture(hlc1, [f, c_path])
+        if hlc1 == "" || hlc.code != 0 {
             check(acc, name, false, "hlc compile failed")
             i = i + 1
             continue
