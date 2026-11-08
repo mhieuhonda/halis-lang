@@ -23,6 +23,15 @@
 #  3b. memory stress           — the stress binary holds RSS flat under a
 #                                 256 MB address-space limit
 #
+# The interpreter legs batch: ONE `boot.py --batch` process runs the
+# whole corpus (and one more with --check for the fail corpus) and
+# writes one rc + base64(stdout) + base64(stderr) record per file, so
+# the per-file observations are the same bytes a per-file spawn would
+# capture without paying a Python ignition per probe. Sections 1 and 3
+# share the one run log — the differential compares the same interpreted
+# bytes against the native binary, exactly as the two separate runs
+# (deterministic by construction) did before.
+#
 # Shell-to-Halis notes: the old harness shared one mktemp TMP and ok/bad
 # counters; this gate keeps every probe under tests/.acc-scratch/
 # suite_01_boot/ (wiped by acc_new) and lets the harness count. The
@@ -33,6 +42,7 @@
 import "./harness.hls"
 import "std.str"
 import "std.env"
+import "std.base64"
 
 # strip_trailing_nl(s) — the `$(...)` semantics the shell compared under.
 fn strip_trailing_nl(s: str) -> str {
@@ -162,24 +172,100 @@ fn gcc_link(acc: Acc, c_src: str, bin_out: str, freestanding: bool,
 # 1. Stage-0: valid programs
 # ----------------------------------------------------------------------------
 
-fn section_ok(acc: Acc) -> void uses IO, Fs, Proc {
+# BatchLog — the decoded `boot.py --batch` records, index-aligned with
+# the corpus list the log was built from (the batch preserves list
+# order; the path field is cross-checked on every lookup).
+struct BatchLog {
+    paths: list[str],
+    rcs: list[int],
+    outs: list[str],
+    errs: list[str]
+}
+
+# batch_lookup(log, path) — the record for path (rc 2 / empty strings
+# when the batch never produced it — the caller reports a failed probe,
+# the same verdict a dead spawn would have earned).
+fn batch_lookup(log: BatchLog, path: str) -> BatchLog {
+    let mut i: int = 0
+    while i < log.paths.len() {
+        if log.paths.get(i) == path {
+            let one: BatchLog = BatchLog {
+                paths: [path],
+                rcs: [log.rcs.get(i)],
+                outs: [log.outs.get(i)],
+                errs: [log.errs.get(i)]
+            }
+            return one
+        }
+        i = i + 1
+    }
+    return BatchLog { paths: [], rcs: [2], outs: [""], errs: [""] }
+}
+
+# batch_run(acc, files, check_mode) — ONE boot.py process for the whole
+# list; the log lands under the gate's scratch world and is parsed back
+# into BatchLog. A batch that cannot even start returns an empty log
+# (rc 2 in every record) — the probes then fail by name, loudly.
+fn batch_run(acc: Acc, files: list[str], check_mode: bool) -> BatchLog
+        uses IO, Fs, Proc {
+    let list_path: str = scratch(acc, "batch_list.txt")
+    let log_path: str = scratch(acc, "batch_log.tsv")
+    let mut text: str = ""
+    let mut i: int = 0
+    while i < files.len() {
+        text = text + files.get(i) + "\n"
+        i = i + 1
+    }
+    write_file(list_path, text)
+    let argv: list[str] = ["tools/hlinterp/boot.py", "--batch",
+                           list_path, log_path]
+    if check_mode {
+        argv.push("--check")
+    }
+    let r: RunResult = run_capture("python3", argv)
+    let log: BatchLog = BatchLog { paths: [], rcs: [], outs: [], errs: [] }
+    if r.code != 0 {
+        return log
+    }
+    let raw: str = read_file(log_path)
+    let lines: list[str] = raw.split("\n")
+    let mut j: int = 0
+    while j < lines.len() {
+        let ln: str = lines.get(j)
+        if ln != "" {
+            let fields: list[str] = ln.split("\t")
+            if fields.len() == 4 {
+                log.paths.push(base64_decode(fields.get(1)))
+                log.rcs.push(parse_uint(fields.get(0)))
+                log.outs.push(base64_decode(fields.get(2)))
+                log.errs.push(base64_decode(fields.get(3)))
+            }
+        }
+        j = j + 1
+    }
+    return log
+}
+
+fn section_ok(acc: Acc, run_log: BatchLog) -> void uses IO, Fs, Proc {
     section("1. Stage-0: valid programs")
     let files: list[str] = ok_corpus()
     let mut i: int = 0
     while i < files.len() {
         let f: str = files.get(i)
         let name: str = stem(f)
-        let r: RunResult = run_capture("python3", ["tools/hlinterp/boot.py", f])
-        if r.code == 0 || r.code == 101 {
+        let rec: BatchLog = batch_lookup(run_log, f)
+        let code: int = rec.rcs.get(0)
+        let out: str = rec.outs.get(0)
+        if code == 0 || code == 101 {
             let snap: str = path_join3("tests/snapshots", name + ".txt")
             if file_exists(snap)
-                    && strip_trailing_nl(r.out) != strip_trailing_nl(read_file(snap)) {
+                    && strip_trailing_nl(out) != strip_trailing_nl(read_file(snap)) {
                 check(acc, name, false, "differs from snapshot")
             } else {
                 check(acc, name, true, "")
             }
         } else {
-            check(acc, name, false, "exit=" + r.code.to_str())
+            check(acc, name, false, "exit=" + code.to_str())
         }
         i = i + 1
     }
@@ -189,17 +275,17 @@ fn section_ok(acc: Acc) -> void uses IO, Fs, Proc {
 # 2. Stage-0: programs EXPECTED TO FAIL
 # ----------------------------------------------------------------------------
 
-fn section_fail(acc: Acc) -> void uses IO, Fs, Proc {
+fn section_fail(acc: Acc, check_log: BatchLog) -> void uses IO, Fs, Proc {
     section("2. Stage-0: programs EXPECTED TO FAIL")
     let files: list[str] = fail_corpus()
     let mut i: int = 0
     while i < files.len() {
         let f: str = files.get(i)
         let name: str = stem(f)
-        let r: RunResult = run_capture("python3",
-            ["tools/hlinterp/boot.py", "--check", f])
-        check(acc, name + " -> " + clip(first_line(r.err), 60), r.code == 1,
-              "should be rejected but exit=" + r.code.to_str())
+        let rec: BatchLog = batch_lookup(check_log, f)
+        check(acc, name + " -> " + clip(first_line(rec.errs.get(0)), 60),
+              rec.rcs.get(0) == 1,
+              "should be rejected but exit=" + rec.rcs.get(0).to_str())
         i = i + 1
     }
 }
@@ -241,7 +327,7 @@ fn build_hlc1(acc: Acc) -> str uses IO, Proc {
     return hlc1
 }
 
-fn section_differential(acc: Acc) -> void uses IO, Fs, Proc {
+fn section_differential(acc: Acc, run_log: BatchLog) -> void uses IO, Fs, Proc {
     section("3. Self-compile + differential testing (interpreter vs native)")
     let hlc1: str = build_hlc1(acc)
     let flags: LinkFlags = curl_link_flags()
@@ -250,8 +336,7 @@ fn section_differential(acc: Acc) -> void uses IO, Fs, Proc {
     while i < files.len() {
         let f: str = files.get(i)
         let name: str = stem(f)
-        let interp: RunResult = run_capture("python3",
-            ["tools/hlinterp/boot.py", f])
+        let rec: BatchLog = batch_lookup(run_log, f)
         let c_path: str = scratch(acc, name + ".c")
         let hlc: RunResult = run_capture(hlc1, [f, c_path])
         if hlc1 == "" || hlc.code != 0 {
@@ -267,13 +352,13 @@ fn section_differential(acc: Acc) -> void uses IO, Fs, Proc {
             continue
         }
         let nat: RunResult = run_capture(bin_path, [])
-        if strip_trailing_nl(interp.out) == strip_trailing_nl(nat.out)
-                && interp.code == nat.code {
+        if strip_trailing_nl(rec.outs.get(0)) == strip_trailing_nl(nat.out)
+                && rec.rcs.get(0) == nat.code {
             check(acc, name, true, "native matches interpreter")
         } else {
-            check(acc, name, false, "interp=" + interp.code.to_str()
+            check(acc, name, false, "interp=" + rec.rcs.get(0).to_str()
                 + " nat=" + nat.code.to_str()
-                + " interp head: " + clip(interp.out, 60))
+                + " interp head: " + clip(rec.outs.get(0), 60))
         }
         i = i + 1
     }
@@ -287,9 +372,23 @@ fn section_memcheck(acc: Acc) -> void uses IO, Fs, Proc {
     section("3b. Stage 8-beta memory-stress (native RSS must stay flat)")
     let stress_c: str = scratch(acc, "stress.c")
     let stress_bin: str = scratch(acc, "stress")
-    let compiled: bool = run_capture("python3",
-        ["tools/hlinterp/boot.py", "src/hlc.hls",
-         "tests/memcheck/stress_leak.hls", stress_c]).code == 0
+    # The C comes from the shared native compiler when the driver
+    # exported one (the fixed-point law makes it the same compiler the
+    # interpreted chain would drive); the interpreter fallback stays
+    # for standalone runs. The RSS law does not care which of the two
+    # byte-equal compilers emitted the file.
+    let mut compiled: bool = false
+    let shared: str = env_get("HL_TEST_HLC1")
+    if shared != "" && file_exists(shared) {
+        compiled = run_capture(shared,
+            ["tests/memcheck/stress_leak.hls", stress_c]).code == 0
+    }
+    if !compiled {
+        compiled = run_capture("python3",
+            ["tools/hlinterp/boot.py", "src/hlc.hls",
+             "tests/memcheck/stress_leak.hls", stress_c]).code == 0
+    }
+    compiled = compiled
         && run_capture("gcc",
             ["-O2", "-o", stress_bin, stress_c, "-lm", "-pthread"]).code == 0
     if !compiled {
@@ -378,9 +477,14 @@ fn parse_uint(s: str) -> int {
 
 fn main() -> int uses IO, Fs, Proc, Exit {
     let acc: Acc = acc_new("suite_01_boot")
-    section_ok(acc)
-    section_fail(acc)
-    section_differential(acc)
+    # One interpreter process per mode for the whole gate: the ok
+    # corpus runs once (sections 1 and 3 share the log), the fail
+    # corpus is checked once.
+    let run_log: BatchLog = batch_run(acc, ok_corpus(), false)
+    let check_log: BatchLog = batch_run(acc, fail_corpus(), true)
+    section_ok(acc, run_log)
+    section_fail(acc, check_log)
+    section_differential(acc, run_log)
     section_memcheck(acc)
     return finish(acc, "suite 01 -- boot (Stage-0 corpus, differential, memcheck)")
 }
