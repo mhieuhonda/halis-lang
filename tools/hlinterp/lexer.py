@@ -57,10 +57,20 @@ ONE_CHAR = set("(){}[],:.<>+-*/%!=?")
 # identifier charset the char loop accepted (ASCII letters, digits,
 # underscore — bytes outside that range never match, matching
 # _is_ident_start/_is_ident_char); _DIGITS_RE covers the digit/underscore
-# run of a numeric literal.
+# run of a numeric literal; _SP_RE swallows a whole space/tab run in one
+# regex call where the first version paid one Python iteration per byte
+# (indentation alone is a third of a typical source's bytes).
 _IDENT_RE = re.compile(rb"[A-Za-z_][A-Za-z0-9_]*")
 _DIGITS_RE = re.compile(rb"[0-9_]+")
+_SP_RE = re.compile(rb"[ \t]+")
 _WS = (32, 9, 13, 10)
+
+# Symbol tables over byte values: the per-symbol path tests ints and
+# slices against these instead of decoding `src[i:i+2]` / calling
+# chr(c) for every operator (the decode+chr pair used to run once per
+# symbol token — more symbols than identifiers in compiler source).
+_TWO_CHAR_BYTES = frozenset(t.encode("ascii") for t in TWO_CHAR)
+_ONE_CHAR_SYMS = {ord(c): c for c in ONE_CHAR}
 
 
 class HLError(Exception):
@@ -114,10 +124,10 @@ def tokenize(src):
         if c in _WS:
             if c == 32 or c == 9:
                 # fast path: runs of spaces and tabs are the common
-                # separator; a run ends at the first newline-ish byte
-                j = i + 1
-                while j < n and src[j] in (32, 9):
-                    j += 1
+                # separator; a run ends at the first newline-ish byte.
+                # One _SP_RE match replaces the per-byte Python loop.
+                m = _SP_RE.match(src, i)
+                j = m.end()
                 col += j - i
                 i = j
             elif c == 10:
@@ -340,14 +350,16 @@ def tokenize(src):
             append({"k": "str", "v": bytes(out), "line": ln, "col": cl})
             continue
         # operator / symbol
-        two = src[i:i + 2].decode("latin-1")
-        if two in TWO_CHAR:
-            append({"k": "sym", "v": two, "line": line, "col": col})
+        two = src[i:i + 2]
+        if two in _TWO_CHAR_BYTES:
+            append({"k": "sym", "v": two.decode("ascii"),
+                    "line": line, "col": col})
             i += 2
             col += 2
             continue
-        if chr(c) in ONE_CHAR:
-            append({"k": "sym", "v": chr(c), "line": line, "col": col})
+        sym = _ONE_CHAR_SYMS.get(c)
+        if sym is not None:
+            append({"k": "sym", "v": sym, "line": line, "col": col})
             i += 1
             col += 1
             continue
