@@ -21,6 +21,17 @@
 # not perfectly lane-safe yet (feat_stage38_http's in-process accept
 # is sensitive to external CPU load), so opt in (JOBS=4 on a big CI
 # runner) only when your machine has cores to spare.
+#
+# Two artifacts are built once here and exported to every gate:
+#   HL_TEST_HLC1    bin/acc-hlc1     the native compiler (gcc on the
+#                                    committed snapshot) every gate's
+#                                    build_hlc1 would otherwise ignite
+#                                    the interpreter for, and
+#   HL_TEST_HLC_SRC bin/hlc1_src.c   the Stage-0 emission itself (one
+#                                    interpreter self-compile), the
+#                                    reference side of the determinism
+#                                    legs in suites 03/05/07.
+# Standalone gate runs (no vars) build their own, the old way.
 # ============================================================================
 set -u
 cd "$(dirname "$0")/.."
@@ -76,6 +87,20 @@ SHARED_HLC1=bin/acc-hlc1
 make -s "$SHARED_HLC1" >/dev/null 2>&1 || true
 if [ -x "$SHARED_HLC1" ]; then
     export HL_TEST_HLC1="$SHARED_HLC1"
+fi
+
+# ---- 1c. one shared Stage-0 emission for the determinism legs ---------------
+# The same fixed-point law, the other direction: the interpreter's own
+# emission of src/hlc.hls, built ONCE here and exported as HL_TEST_HLC_SRC.
+# The determinism legs (suite_03's fixed point, suite_05's neon parity,
+# suite_07's three reruns) used to pay a full interpreter self-compile per
+# side — now each keeps one fresh in-gate pass and cmp's it against this
+# file. make caches the artifact, so repeat runs only re-emit when the
+# compiler source actually moved.
+SHARED_HLC_SRC=bin/hlc1_src.c
+make -s "$SHARED_HLC_SRC" >/dev/null 2>&1 || true
+if [ -f "$SHARED_HLC_SRC" ]; then
+    export HL_TEST_HLC_SRC="$SHARED_HLC_SRC"
 fi
 
 # ---- 2. run phase: lanes over the gates, output replayed in gate order -----

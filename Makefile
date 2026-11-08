@@ -322,6 +322,23 @@ $(BIN)/acc-hlc1: $(SNAP) | $(BIN)
 	@echo "[seed] cc: the shared gate compiler (one per suite run)"
 	@$(CC) $(BOOT_CFLAGS) -o $@ $< -lm -pthread
 
+# The shared Stage-0 emission: one interpreter self-compile per suite
+# run, exported through HL_TEST_HLC_SRC. Every determinism leg that
+# used to drive two interpreter self-compiles and cmp them (suite_03's
+# fixed point, suite_05's neon parity, suite_07's asm / deep-scan-17 /
+# deep-scan-18 reruns) takes this file as one side and keeps ONE fresh
+# in-gate pass as the other — the cmp now pins the fresh emission
+# against the shared one, a stronger statement than same-pure-function-
+# twice, and the fixed-point law (snapshot == Stage-0 emission) is what
+# makes the two interchangeable. The recipe lands the bytes with mv so
+# a failed compile never leaves a partial file for make to trust.
+$(BIN)/hlc1_src.c: src/hlc.hls $(wildcard src/hlc/*.hls) | $(BIN)
+	@mkdir -p $(BIN)
+	@echo "[seed] boot.py: the shared Stage-0 emission (one per suite run)"
+	@$(PYTHON) tools/hlinterp/boot.py src/hlc.hls src/hlc.hls $@.tmp \
+		&& mv -f $@.tmp $@ \
+		|| { rm -f $@.tmp; exit 1; }
+
 # File target for the native compiler: acceptance targets declared with
 # `bin/hlc` as a prerequisite stay buildable after `make clean` or on a
 # fresh checkout, where the phony `bootstrap` goal alone is not enough.
