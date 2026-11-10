@@ -246,12 +246,12 @@ serve-acceptance: $(BIN)/acc-serve
 # always produced; the binary is only produced when a cross-linker (zig
 # cc or aarch64-linux-gnu-gcc) is available.
 # Usage: make aarch64-bench [F=benchmarks/simd_bench.hls] [OUT=/tmp/simd_aarch64] [SECURITY=pac+bti]
-aarch64-bench:
+aarch64-bench: $(BIN)/hlaarch64
 	@test -x $(BIN)/hlc || $(MAKE) bootstrap
 	@test -n "$(F)" || F=benchmarks/simd_bench.hls; \
 	  if [ -z "$(OUT)" ]; then OUT=$(BIN)/aarch64_bench; fi; \
 	  if [ -z "$(SECURITY)" ]; then SECURITY=pac+bti; fi; \
-	  $(PYTHON) tools/hlaarch64.py $$F $$OUT \
+	  $(BIN)/hlaarch64 $$F $$OUT \
 	    --target aarch64-linux-gnu --target-feature neon \
 	    --security $$SECURITY --keep-c $$OUT.c
 
@@ -263,9 +263,9 @@ aarch64-bench:
 #   (c) On an AArch64 host (rare in CI), compile + run json_bench.hls
 #       with NEON intrinsics and verify it's >=20% faster than the
 #       no-NEON baseline. On non-AArch64 hosts, this is SKIPped.
-aarch64-acceptance:
+aarch64-acceptance: $(BIN)/hlaarch64
 	@echo "[Stage 25 acceptance] cross-compiling simd_bench.hls to AArch64 + NEON..."
-	@$(PYTHON) tools/hlaarch64.py benchmarks/simd_bench.hls $(BIN)/aarch64_acc \
+	@$(BIN)/hlaarch64 benchmarks/simd_bench.hls $(BIN)/aarch64_acc \
 	  --target aarch64-linux-gnu --target-feature neon \
 	  --security pac+bti --keep-c $(BIN)/aarch64_acc.c \
 	  >$(BIN)/aarch64_acc.log 2>&1; \
@@ -303,8 +303,8 @@ aarch64-acceptance:
 	@echo "ACCEPTANCE OK: Stage 25 AArch64 NEON codegen + PAC/BTI hardening verified"
 
 # aarch64-list-targets: list the AArch64 target triples + security levels.
-aarch64-list-targets:
-	@$(PYTHON) tools/hlaarch64.py --list-targets
+aarch64-list-targets: $(BIN)/hlaarch64
+	@$(BIN)/hlaarch64 --list-targets
 
 .PHONY: aarch64-bench aarch64-acceptance aarch64-list-targets
 

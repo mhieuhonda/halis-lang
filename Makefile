@@ -113,6 +113,42 @@ $(BIN)/hllint: tools/hllint.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc
 	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
 	@rm -f $@.c
 
+# The lab fleet keeps the same discipline: one rule per tool, the
+# tool's sources + std + core as prerequisites, never $(SNAP).
+$(BIN)/hlpgo: tools/hlpgo.hls $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hlpgo] hlc compiles the PGO profile tool (self-hosted)..."
+	@$(BIN)/hlc tools/hlpgo.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
+$(BIN)/hlriscv: tools/hlriscv.hls $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hlriscv] hlc compiles the RISC-V orchestrator (self-hosted)..."
+	@$(BIN)/hlc tools/hlriscv.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
+$(BIN)/hlaarch64: tools/hlaarch64.hls $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hlaarch64] hlc compiles the AArch64 orchestrator (self-hosted)..."
+	@$(BIN)/hlc tools/hlaarch64.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
+$(BIN)/ll_validate: tools/ll_validate.hls $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[ll_validate] hlc compiles the LLVM IR validator (self-hosted)..."
+	@$(BIN)/hlc tools/ll_validate.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
+# The suite gates that drive these tools build them first.
+$(BIN)/acc-suite_02_differential: $(BIN)/ll_validate
+$(BIN)/acc-suite_03_selfhost: $(BIN)/hlpgo
+$(BIN)/acc-suite_05_backends: $(BIN)/hlaarch64
+$(BIN)/acc-suite_06_advanced: $(BIN)/hlriscv
+
 # hls-lts — the LTS policy tool, in Halis (the native twin of the
 # Python hls-lts that retired; the render it pins is the committed
 # LTS.md, byte for byte).

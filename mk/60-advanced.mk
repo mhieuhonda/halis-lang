@@ -465,11 +465,11 @@ asm-attrs:
 # produced; the binary is only produced when a cross-linker (zig cc or
 # riscv64-linux-gnu-gcc) is available.
 # Usage: make riscv-bench [F=benchmarks/simd_bench.hls] [OUT=/tmp/simd_riscv]
-riscv-bench:
+riscv-bench: $(BIN)/hlriscv
 	@test -x $(BIN)/hlc || $(MAKE) bootstrap
 	@test -n "$(F)" || F=benchmarks/simd_bench.hls; \
 	  if [ -z "$(OUT)" ]; then OUT=$(BIN)/riscv_bench; fi; \
-	  $(PYTHON) tools/hlriscv.py $$F $$OUT \
+	  $(BIN)/hlriscv $$F $$OUT \
 	    --target riscv64gc-unknown-linux-gnu --target-feature rvv \
 	    --keep-c $$OUT.c
 
@@ -483,9 +483,9 @@ riscv-bench:
 #       scalar fallback in the #else branch).
 #   (e) On a RISC-V 64 host (rare in CI), compile + run simd_bench.hls
 #       with RVV intrinsics. On non-RISC-V hosts, this is SKIPped.
-riscv-acceptance:
+riscv-acceptance: $(BIN)/hlriscv
 	@echo "[Stage 26 acceptance] cross-compiling simd_bench.hls to RISC-V 64 + RVV..."
-	@$(PYTHON) tools/hlriscv.py benchmarks/simd_bench.hls $(BIN)/riscv_acc \
+	@$(BIN)/hlriscv benchmarks/simd_bench.hls $(BIN)/riscv_acc \
 	  --target riscv64gc-unknown-linux-gnu --target-feature rvv \
 	  --keep-c $(BIN)/riscv_acc.c \
 	  >$(BIN)/riscv_acc.log 2>&1; \
@@ -543,11 +543,11 @@ riscv-acceptance:
 # so the hosted riscv_demo.hls (std.simd, IO, f64x2 lanes) is no
 # longer a legal bare-metal crate.
 # Usage: make riscv-bare-metal [F=examples/freestanding_demo.hls] [OUT=/tmp/riscv_bare]
-riscv-bare-metal:
+riscv-bare-metal: $(BIN)/hlriscv
 	@test -x $(BIN)/hlc || $(MAKE) bootstrap
 	@test -n "$(F)" || F=examples/freestanding_demo.hls; \
 	  if [ -z "$(OUT)" ]; then OUT=$(BIN)/riscv_bare; fi; \
-	  $(PYTHON) tools/hlriscv.py $$F $$OUT \
+	  $(BIN)/hlriscv $$F $$OUT \
 	    --target riscv64-unknown-none --target-feature "" \
 	    --keep-c $$OUT.c
 
@@ -562,9 +562,9 @@ riscv-bare-metal:
 # still pull in libc — the linker's -ffunction-sections -fdata-sections
 # -Wl,--gc-sections strips unused helpers when the user code does not
 # call IO builtins.
-riscv-bare-acceptance:
+riscv-bare-acceptance: $(BIN)/hlriscv
 	@echo "[Stage 26 acceptance] cross-compiling examples/freestanding_demo.hls to riscv64-unknown-none (bare-metal)..."
-	@$(PYTHON) tools/hlriscv.py examples/freestanding_demo.hls $(BIN)/riscv_bare_acc \
+	@$(BIN)/hlriscv examples/freestanding_demo.hls $(BIN)/riscv_bare_acc \
 	  --target riscv64-unknown-none --target-feature "" \
 	  --keep-c $(BIN)/riscv_bare_acc.c \
 	  >$(BIN)/riscv_bare_acc.log 2>&1; \
@@ -575,7 +575,7 @@ riscv-bare-acceptance:
 	@# Stage 93 (v0.112.0-alpha): the integer-only discipline travels with
 	@# the triple — the hosted riscv demo (std.simd, f64x2 lanes) must be
 	@# REFUSED at the compiler now, with the discipline's own words.
-	@$(PYTHON) tools/hlriscv.py examples/riscv_demo.hls $(BIN)/riscv_bare_refused \
+	@$(BIN)/hlriscv examples/riscv_demo.hls $(BIN)/riscv_bare_refused \
 	  --target riscv64-unknown-none --target-feature "" \
 	  --keep-c $(BIN)/riscv_bare_refused.c \
 	  >$(BIN)/riscv_bare_refused.log 2>&1; \
@@ -620,8 +620,8 @@ riscv-bare-acceptance:
 	@echo "ACCEPTANCE OK: Stage 26 bare-metal pipeline wired up (C source + freestanding compile verified)"
 
 # riscv-list-targets: list the RISC-V target triples + features.
-riscv-list-targets:
-	@$(PYTHON) tools/hlriscv.py --list-targets
+riscv-list-targets: $(BIN)/hlriscv
+	@$(BIN)/hlriscv --list-targets
 
 .PHONY: riscv-bench riscv-acceptance riscv-list-targets riscv-bare-metal riscv-bare-acceptance
 

@@ -1,0 +1,1262 @@
+# ============================================================================
+# hlriscv.hls — Stage 26 (v0.49.0-alpha): RISC-V 64 backend helper, the
+# native Halis port of tools/hlriscv.py.
+# ----------------------------------------------------------------------------
+# Wraps the RISC-V-specific flags (RVV intrinsics, -march/-mabi, the
+# bare-metal freestanding flags) into a single convenient CLI. The Python
+# original delegated the pipeline to tools/hlcross.cross_compile; this
+# port inlines the hlcross behaviour the tool exercises (the RISC-V
+# target registry entries, the cross-linker detection order, the SKIP
+# reporting, the --dry-run preview) so the tool is fully self-hosted.
+#
+# Pipeline:
+#
+#   HLS source  --hlc-->  C source  --cross-linker-->  foreign binary
+#
+# Features:
+#   * `--target riscv64gc-unknown-linux-gnu` (default) — full Linux
+#     user-mode (RV64GC: IMAFDC), SiFive / VisionFive / QEMU riscv64.
+#   * `--target riscv64-unknown-none` — bare-metal (no OS, no libc, for
+#     OS-development work). Produces a freestanding ELF.
+#   * `--target-feature rvv` (default for the Linux target) — enable the
+#     RISC-V Vector (RVV) intrinsic fast paths for std.simd kernels.
+#     Promotes -march from rv64gc -> rv64gcv.
+#
+# Cross-linker detection order (the FIRST available wins):
+#   1. `zig cc -target <triple>`  — the universal linker.
+#   2. Target-specific cross-linkers:
+#      - riscv64gc/riscv64-unknown-linux-gnu -> riscv64-linux-gnu-gcc
+#        (then -13, -12, -cc, riscv64-unknown-linux-gnu-gcc)
+#      - riscv64-unknown-none -> riscv64-unknown-elf-gcc
+#        (then riscv64-elf-gcc, riscv64-none-elf-gcc, riscv64-linux-gnu-gcc)
+#   3. The host compiler (gcc/clang/cc) when the target triple matches the
+#      host (a NATIVE build on a RISC-V 64 host).
+#
+# When no cross-linker is available, the tool reports SKIP (exit 3) with
+# the hlcross install hint; the HLS -> C step ALWAYS succeeds first (the
+# C file is written even when linking is skipped).
+#
+# Usage (same CLI as the Python original):
+#   hlriscv <input.hls> <output.bin>
+#       [--target riscv64gc-unknown-linux-gnu|riscv64-unknown-linux-gnu|
+#                riscv64-unknown-none]
+#       [--target-feature rvv|native|""]
+#       [--linker auto|zig|gcc|clang|cc]
+#       [--keep-c PATH]
+#       [--dry-run]
+#       [--hlc bin/hlc]
+#       [--list-targets]
+#
+# Exit codes: 0 success, 1 a pipeline step failed, 2 usage error, 3 SKIP
+# (no cross-linker available — the C source was still produced).
+# ============================================================================
+
+import "std.str"
+
+# ============================================================================
+# Target registry — the three RISC-V 64 triples hlriscv accepts (the
+# hlcross.TARGETS entries for them; the argparse choices guarantee only
+# these names ever reach cross_compile, so canonical_target() is a no-op).
+# ============================================================================
+
+struct TargetSpec {
+    arch: str,               # "riscv64"
+    os: str,                 # "linux" / "none"
+    abi: str,                # "gnu" / "none"
+    binary_format: str,      # human-readable format (success + SKIP lines)
+    link_libs: list[str],    # libs appended to the link command
+    security_flags: list[str], # applied when --security auto (empty here)
+    march: str,              # -march ISA string ("" when the target has none)
+    mabi: str,               # -mabi ABI string
+    freestanding: bool,      # bare-metal: no libc, no crt0, own _start
+}
+
+# riscv64gc-unknown-linux-gnu and its alias riscv64-unknown-linux-gnu.
+# -march=rv64gc -mabi=lp64d: the standard Linux user-mode profile
+# (G = IMAFD, C = compressed; lp64d = hardware double-float ABI). The
+# V extension is enabled separately via --target-feature rvv, which
+# promotes -march from rv64gc -> rv64gcv.
+fn spec_riscv_linux() -> TargetSpec {
+    let libs: list[str] = ["-lm", "-lpthread"]
+    let sec: list[str] = []
+    let s: TargetSpec = TargetSpec {
+        arch: "riscv64",
+        os: "linux",
+        abi: "gnu",
+        binary_format: "ELF riscv64 (Little Endian, RV64GC)",
+        link_libs: libs,
+        security_flags: sec,
+        march: "rv64gc",
+        mabi: "lp64d",
+        freestanding: false
+    }
+    return s
+}
+
+# riscv64-unknown-none — bare-metal (no OS, no libc, for OS work): a
+# freestanding ELF with no libc references. RV64IMAC (I + M + A + C, no
+# F/D — a kernel does not enable the FPU until it has saved the FP
+# state), mabi=lp64 (no float ABI). The freestanding link adds
+# -nostdlib -nostartfiles -ffreestanding (plus -Wl,-T when the repo
+# ships targets/riscv64-unknown-none.ld).
+fn spec_riscv_bare() -> TargetSpec {
+    let libs: list[str] = []
+    let sec: list[str] = []
+    let s: TargetSpec = TargetSpec {
+        arch: "riscv64",
+        os: "none",
+        abi: "none",
+        binary_format: "ELF riscv64 (Little Endian, RV64IMAC, freestanding)",
+        link_libs: libs,
+        security_flags: sec,
+        march: "rv64imac",
+        mabi: "lp64",
+        freestanding: true
+    }
+    return s
+}
+
+fn get_spec(target: str) -> TargetSpec {
+    if target == "riscv64-unknown-none" {
+        return spec_riscv_bare()
+    }
+    # riscv64gc-unknown-linux-gnu + the riscv64-unknown-linux-gnu alias
+    return spec_riscv_linux()
+}
+
+# ============================================================================
+# Small text/Path helpers (byte-oriented, no closures — explicit loops).
+# ============================================================================
+
+# spaces(n) — n space characters (the argparse usage indent).
+fn spaces(n: int) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < n {
+        out = out + " "
+        i = i + 1
+    }
+    return out
+}
+
+# path_base(p) — everything after the last "/" (argparse's prog name).
+fn path_base(p: str) -> str {
+    let mut i: int = p.len() - 1
+    while i >= 0 {
+        if p.byte_at(i) == 47 {
+            return p.slice(i + 1, p.len())
+        }
+        i = i - 1
+    }
+    return p
+}
+
+# path_dir(p) — everything before the last "/"; "." for a bare name.
+fn path_dir(p: str) -> str {
+    let mut i: int = p.len() - 1
+    while i >= 0 {
+        if p.byte_at(i) == 47 {
+            if i == 0 {
+                return "/"
+            }
+            return p.slice(0, i)
+        }
+        i = i - 1
+    }
+    return "."
+}
+
+# path_join(base, rel) — base + "/" + rel without doubling a slash.
+fn path_join(base: str, rel: str) -> str {
+    if base == "" {
+        return rel
+    }
+    if base.byte_at(base.len() - 1) == 47 {
+        return base + rel
+    }
+    return base + "/" + rel
+}
+
+# push_all(dst, src) — append every element of src to dst (list[str]).
+fn push_all(dst: list[str], src: list[str]) -> void {
+    let mut i: int = 0
+    while i < src.len() {
+        dst.push(src.get(i))
+        i = i + 1
+    }
+}
+
+# shell_quote(s) — neutralise single quotes for the `sh -c` one-liners
+# (the `command -v` probe and the rm -f of the scratch C file).
+fn shell_quote(s: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c == 39 {
+            out = out + "'\\''"
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# py_repr_list(items) — the Python repr of a list[str]:
+# [] / ['a', 'b'] — what f"{base_args}" prints in the --dry-run line.
+fn py_repr_list(items: list[str]) -> str {
+    let mut out: str = "["
+    let mut i: int = 0
+    while i < items.len() {
+        if i > 0 {
+            out = out + ", "
+        }
+        out = out + "'" + items.get(i) + "'"
+        i = i + 1
+    }
+    return out + "]"
+}
+
+# ============================================================================
+# Subprocess helpers.
+# ============================================================================
+
+# capture_stdout(program, argv) — spawn with stdout piped (stdin/stderr
+# null), drain stdout to EOF, wait. Returns "" when the spawn failed or
+# the child exited non-zero (the `sh -c 'command -v X'` probe contract).
+fn capture_stdout(program: str, argv: list[str]) -> str uses Proc {
+    let pid: int = proc_spawn(program, argv, 2, 1, 2)
+    if pid < 1 {
+        return ""
+    }
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let code: int = proc_wait(pid)
+    proc_child_close(pid, 1)
+    if code != 0 {
+        return ""
+    }
+    return out
+}
+
+# which(name) — shutil.which's portable twin: `sh -c 'command -v NAME'`
+# returns the resolved PATH entry (first line), "" when not found.
+fn which(name: str) -> str uses Proc {
+    let argv: list[str] = ["-c", "command -v " + shell_quote(name)]
+    let out: str = capture_stdout("sh", argv)
+    let t: str = out.trim()
+    if t == "" {
+        return ""
+    }
+    let nl: int = t.find("\n")
+    if nl >= 0 {
+        return t.slice(0, nl)
+    }
+    return t
+}
+
+# run_inherit(program, argv) — subprocess.run(cmd) with every stdio
+# inherited: the child writes to the tool's own stdout/stderr. Returns
+# the encoded exit (0..255, 128+signal), or -1 when the spawn itself
+# failed (the caller reports it).
+fn run_inherit(program: str, argv: list[str]) -> int uses Proc {
+    let pid: int = proc_spawn(program, argv, 0, 0, 0)
+    if pid < 1 {
+        return -1
+    }
+    return proc_wait(pid)
+}
+
+# uname(flag) — `uname -m` / `uname -s`, trimmed and lowercased: the
+# platform.machine()/platform.system() pair host_triple() reads.
+fn uname(flag: str) -> str uses Proc {
+    let argv: list[str] = [flag]
+    let out: str = capture_stdout("uname", argv)
+    return str_to_lower_ascii(out.trim())
+}
+
+# ============================================================================
+# Host detection — the "native build" fallback path (hlcross.host_triple).
+# ============================================================================
+
+fn host_triple() -> str uses Proc {
+    let machine: str = uname("-m")
+    let system: str = uname("-s")
+    if system == "linux" {
+        if machine == "x86_64" || machine == "amd64" {
+            return "x86_64-linux-gnu"
+        }
+        if machine == "aarch64" || machine == "arm64" {
+            return "aarch64-linux-gnu"
+        }
+        # RISC-V 64 host (VisionFive 2, SiFive Unmatched, QEMU riscv64):
+        # the canonical 'riscv64' name and the rarely-used 'rv64'/'riscv'.
+        if machine == "riscv64" || machine == "rv64" || machine == "riscv" {
+            return "riscv64gc-unknown-linux-gnu"
+        }
+    }
+    if system == "darwin" {
+        if machine == "arm64" || machine == "aarch64" {
+            return "aarch64-apple-darwin"
+        }
+        if machine == "x86_64" || machine == "amd64" {
+            return "x86_64-apple-darwin"
+        }
+    }
+    if system.starts_with("freebsd") {
+        if machine == "x86_64" || machine == "amd64" {
+            return "x86_64-unknown-freebsd"
+        }
+    }
+    if system == "windows" {
+        return "x86_64-pc-windows-gnu"
+    }
+    return ""
+}
+
+# ============================================================================
+# Cross-linker detection (hlcross.find_target_linker, RISC-V slice).
+# ============================================================================
+
+struct Linker {
+    path: str,          # the executable to invoke ("" = not found)
+    base_args: list[str], # args before the input/output paths
+    kind: str,          # "zig" / "riscv64-linux-gnu-gcc" / "native" / ...
+}
+
+# zig_triple(target) — zig spells the bare-metal OS `freestanding`, not
+# `unknown-none`, and only rejects the wrong spelling at LINK time, so
+# translate the Rust-style triple; hosted triples pass through unchanged.
+fn zig_triple(target: str) -> str {
+    if target.ends_with("-unknown-none") {
+        return target.slice(0, target.len() - 13) + "-freestanding-none"
+    }
+    return target
+}
+
+# probe_first(names) — the first name on PATH (the _which probe order).
+fn probe_first(names: list[str]) -> str uses Proc {
+    let mut i: int = 0
+    while i < names.len() {
+        let p: str = which(names.get(i))
+        if p != "" {
+            return p
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn find_target_linker(target: str) -> Linker uses Proc {
+    # 1. zig cc — the universal linker.
+    let zig: str = which("zig")
+    if zig != "" {
+        let args: list[str] = ["cc", "-target", zig_triple(target), "-O2"]
+        let l: Linker = Linker { path: zig, base_args: args, kind: "zig" }
+        return l
+    }
+    # 2. target-specific cross-linkers.
+    # Linux user-mode: Debian/Ubuntu ships riscv64-linux-gnu-gcc.
+    if target == "riscv64gc-unknown-linux-gnu"
+        || target == "riscv64-unknown-linux-gnu" {
+        let names: list[str] = ["riscv64-linux-gnu-gcc",
+                                "riscv64-linux-gnu-gcc-13",
+                                "riscv64-linux-gnu-gcc-12",
+                                "riscv64-linux-gnu-cc",
+                                "riscv64-unknown-linux-gnu-gcc"]
+        let p: str = probe_first(names)
+        if p != "" {
+            let args: list[str] = ["-O2"]
+            let l: Linker = Linker { path: p, base_args: args,
+                                     kind: "riscv64-linux-gnu-gcc" }
+            return l
+        }
+    }
+    # Bare-metal: the riscv64-unknown-elf-gcc toolchain (the official
+    # RISC-V GNU toolchain). The last fallback (riscv64-linux-gnu-gcc)
+    # is used with -nostdlib -nostartfiles — it produces a freestanding
+    # ELF when the Linux toolchain is the only one installed.
+    if target == "riscv64-unknown-none" {
+        let names: list[str] = ["riscv64-unknown-elf-gcc",
+                                "riscv64-elf-gcc",
+                                "riscv64-none-elf-gcc",
+                                "riscv64-linux-gnu-gcc"]
+        let p: str = probe_first(names)
+        if p != "" {
+            let args: list[str] = ["-O2"]
+            let l: Linker = Linker { path: p, base_args: args,
+                                     kind: "riscv64-unknown-elf-gcc" }
+            return l
+        }
+    }
+    # 3. host compiler when target == host (native build on a RISC-V 64
+    #    host — useful for testing the pipeline end-to-end).
+    let host: str = host_triple()
+    if target == host {
+        let names: list[str] = ["gcc", "clang", "cc"]
+        let p: str = probe_first(names)
+        if p != "" {
+            let args: list[str] = ["-O2"]
+            let l: Linker = Linker { path: p, base_args: args, kind: "native" }
+            return l
+        }
+    }
+    # No cross-linker available.
+    let none: list[str] = []
+    let l: Linker = Linker { path: "", base_args: none, kind: "not-found" }
+    return l
+}
+
+# cross_linker_hint(target, kind) — the install hint printed with SKIP.
+# The not-found hint is target-independent (hlcross lists every target's
+# recipe); other kinds carry no hint.
+fn cross_linker_hint(target: str, kind: str) -> str {
+    if kind == "not-found" {
+        return "no cross-linker found for target '" + target + "'. "
+            + "Install `zig` (https://ziglang.org) for the universal "
+            + "cross-linker, or a target-specific toolchain:\n"
+            + "  - x86_64-pc-windows-gnu: apt install mingw-w64\n"
+            + "  - aarch64-apple-darwin:  install osxcross\n"
+            + "  - x86_64-unknown-freebsd: apt install freebsd-buildutils\n"
+            + "  - x86_64-pc-windows-msvc: requires Windows + MSVC build tools\n"
+            + "  - aarch64-linux-gnu:      apt install gcc-aarch64-linux-gnu\n"
+            + "  - riscv64gc-unknown-linux-gnu: apt install gcc-riscv64-linux-gnu\n"
+            + "  - riscv64-unknown-none:  build the RISC-V GNU toolchain from\n"
+            + "                            github.com/riscv-collab/riscv-gnu-toolchain\n"
+            + "                            (./configure --with-arch=rv64imac --with-abi=lp64)\n"
+            + "  - x86_64-unknown-none:   any x86-64 host gcc links the image\n"
+            + "                            (a static freestanding link needs no\n"
+            + "                            OS support); x86_64-elf-gcc for a real\n"
+            + "                            cross-toolchain\n"
+            + "  - aarch64-unknown-none:  apt install gcc-aarch64-linux-gnu\n"
+            + "                            (or the bare-metal aarch64-none-elf\n"
+            + "                            toolchain)"
+    }
+    return ""
+}
+
+# ============================================================================
+# Binary format inspection (validate the linker output) — hlcross's
+# detect_binary_format. read_file opens "rb" and Halis strings are
+# byte-transparent, so byte_at() reads the raw magic bytes.
+# ============================================================================
+
+fn detect_binary_format(path: str) -> str uses Fs {
+    if !file_exists(path) {
+        return "missing"
+    }
+    let data: str = read_file(path)
+    let n: int = data.len()
+    if n >= 4 {
+        let b0: int = data.byte_at(0)
+        let b1: int = data.byte_at(1)
+        let b2: int = data.byte_at(2)
+        let b3: int = data.byte_at(3)
+        # ELF: 0x7f 'E' 'L' 'F'; ei_class (byte 4) 1 = 32-bit else 64-bit;
+        # ei_data (byte 5) 1 = LE else BE.
+        if b0 == 127 && b1 == 69 && b2 == 76 && b3 == 70 {
+            let mut ei_class: int = 0
+            let mut ei_data: int = 0
+            if n > 4 {
+                ei_class = data.byte_at(4)
+            }
+            if n > 5 {
+                ei_data = data.byte_at(5)
+            }
+            let mut bits: str = "64-bit"
+            if ei_class == 1 {
+                bits = "32-bit"
+            }
+            let mut endian: str = "BE"
+            if ei_data == 1 {
+                endian = "LE"
+            }
+            return "ELF " + bits + " " + endian
+        }
+        # Mach-O: 0xFEEDFACE / 0xFEEDFACF (32/64-bit) or byte-reversed.
+        let is_macho: bool = (b0 == 254 && b1 == 237 && b2 == 250
+                              && (b3 == 206 || b3 == 207))
+            || (b0 == 206 && b1 == 250 && b2 == 237 && b3 == 254)
+            || (b0 == 207 && b1 == 250 && b2 == 237 && b3 == 254)
+        if is_macho {
+            if (b0 == 254 && b3 == 207)
+                || (b0 == 207 && b1 == 250 && b2 == 237 && b3 == 254) {
+                return "Mach-O 64-bit"
+            }
+            return "Mach-O 32-bit"
+        }
+    }
+    # PE/COFF: 'M' 'Z' header (DOS stub) at the start.
+    if n >= 2 && data.byte_at(0) == 77 && data.byte_at(1) == 90 {
+        return "PE COFF (Windows)"
+    }
+    return "unknown"
+}
+
+# ============================================================================
+# repo_root() — where targets/<triple>.ld lives (hlcross._repo_root is
+# dirname(dirname(abspath(__file__))); the native binary has no __file__,
+# so use argv[0]'s grandparent, falling back to the cwd).
+# ============================================================================
+
+fn repo_root() -> str uses Args, Fs, Proc {
+    let argv: list[str] = args()
+    let mut a0: str = argv.get(0)
+    if !a0.starts_with("/") {
+        a0 = path_join(cwd_get(), a0)
+    }
+    let root: str = path_dir(path_dir(a0))
+    if file_exists(path_join(root, "targets")) {
+        return root
+    }
+    let cwd: str = cwd_get()
+    if file_exists(path_join(cwd, "targets")) {
+        return cwd
+    }
+    return root
+}
+
+# ============================================================================
+# The argparse emulation — hlriscv.py's ArgumentParser surface, with the
+# exact CPython 3.12 diagnostics (exit 2): unambiguous-prefix
+# abbreviation, --opt=value, choices validation, the works.
+# ============================================================================
+
+struct OptDef {
+    name: str,            # canonical long option name ("--target")
+    takes_value: bool,    # false = store_true flag
+    choices: list[str]    # empty = unrestricted
+}
+
+# The table in add_argument order (argparse registers -h/--help first;
+# the order drives the "ambiguous option" listing).
+fn opt_table() -> list[OptDef] {
+    let no_choices: list[str] = []
+    let target_choices: list[str] = ["riscv64gc-unknown-linux-gnu",
+                                     "riscv64-unknown-linux-gnu",
+                                     "riscv64-unknown-none"]
+    let feature_choices: list[str] = ["", "rvv", "native"]
+    let linker_choices: list[str] = ["auto", "zig", "gcc", "clang", "cc"]
+    let t: list[OptDef] = []
+    t.push(OptDef { name: "--help", takes_value: false, choices: no_choices })
+    t.push(OptDef { name: "--target", takes_value: true,
+                    choices: target_choices })
+    t.push(OptDef { name: "--target-feature", takes_value: true,
+                    choices: feature_choices })
+    t.push(OptDef { name: "--linker", takes_value: true,
+                    choices: linker_choices })
+    t.push(OptDef { name: "--keep-c", takes_value: true,
+                    choices: no_choices })
+    t.push(OptDef { name: "--dry-run", takes_value: false,
+                    choices: no_choices })
+    t.push(OptDef { name: "--hlc", takes_value: true, choices: no_choices })
+    t.push(OptDef { name: "--list-targets", takes_value: false,
+                    choices: no_choices })
+    return t
+}
+
+struct Opts {
+    input: str,
+    output: str,
+    target: str,
+    target_feature: str,
+    linker: str,
+    keep_c: str,           # "" = not given (Python None); both are falsy
+    dry_run: bool,
+    hlc: str,
+    list_targets: bool
+}
+
+# usage_opt_parts() — the usage string's optional parts, in action order.
+fn usage_opt_parts() -> list[str] {
+    let p: list[str] = ["[-h]"]
+    p.push("[--target {riscv64gc-unknown-linux-gnu,"
+        + "riscv64-unknown-linux-gnu,riscv64-unknown-none}]")
+    p.push("[--target-feature {,rvv,native}]")
+    p.push("[--linker {auto,zig,gcc,clang,cc}]")
+    p.push("[--keep-c KEEP_C]")
+    p.push("[--dry-run]")
+    p.push("[--hlc HLC]")
+    p.push("[--list-targets]")
+    return p
+}
+
+# usage_lines(prog, ...) — argparse's _format_usage: a greedy wrap at
+# width 78 (the piped-terminal width CPython formats at), continuation
+# lines indented under "usage: <prog> ". The short-prog layout is the
+# only one these tools can hit (prog would need >51 chars for the other).
+fn usage_lines(prog: str, opt_parts: list[str], pos_parts: list[str]) -> list[str] {
+    let width: int = 78
+    let prefix: str = "usage: "
+    let all_parts: list[str] = []
+    push_all(all_parts, opt_parts)
+    push_all(all_parts, pos_parts)
+    let all_joined: str = join(all_parts, " ")
+    # the whole usage fits on one line
+    if prefix.len() + prog.len() + 1 + all_joined.len() <= width {
+        let one: list[str] = []
+        one.push(prefix + prog + " " + all_joined)
+        return one
+    }
+    let indent_len: int = prefix.len() + prog.len() + 1
+    let indent: str = spaces(indent_len)
+    let lines: list[str] = []
+    # group 1: [prog] + optionals, the first line carrying the prefix
+    let line: list[str] = []
+    let mut line_len: int = prefix.len() - 1
+    let g1: list[str] = [prog]
+    push_all(g1, opt_parts)
+    let mut i: int = 0
+    while i < g1.len() {
+        let part: str = g1.get(i)
+        if line_len + 1 + part.len() > width && line.len() > 0 {
+            lines.push(indent + join(line, " "))
+            # line = [] — clear in place (lists have no clear())
+            while line.len() > 0 {
+                line.pop()
+            }
+            line_len = indent_len - 1
+        }
+        line.push(part)
+        line_len = line_len + part.len() + 1
+        i = i + 1
+    }
+    if line.len() > 0 {
+        lines.push(indent + join(line, " "))
+    }
+    # the first line keeps only its content; the prefix is prepended
+    let first: str = lines.get(0).slice(indent_len,
+                                        lines.get(0).len())
+    lines.set(0, prefix + first)
+    # group 2: the positionals
+    let line2: list[str] = []
+    let mut line2_len: int = indent_len - 1
+    let mut j: int = 0
+    while j < pos_parts.len() {
+        let part: str = pos_parts.get(j)
+        if line2_len + 1 + part.len() > width && line2.len() > 0 {
+            lines.push(indent + join(line2, " "))
+            while line2.len() > 0 {
+                line2.pop()
+            }
+            line2_len = indent_len - 1
+        }
+        line2.push(part)
+        line2_len = line2_len + part.len() + 1
+        j = j + 1
+    }
+    if line2.len() > 0 {
+        lines.push(indent + join(line2, " "))
+    }
+    return lines
+}
+
+fn usage_block(prog: str) -> list[str] {
+    let pos: list[str] = ["[input]", "[output]"]
+    return usage_lines(prog, usage_opt_parts(), pos)
+}
+
+# help_body() — the fixed (prog-independent) part of --help.
+fn help_body() -> list[str] {
+    let b: list[str] = []
+    b.push("Stage 26 RISC-V 64 backend helper. Wraps hlcross with the "
+        + "right -march/-mabi +")
+    b.push("RVV flags.")
+    b.push("")
+    b.push("positional arguments:")
+    b.push("  input                 HLS source file (e.g. "
+        + "benchmarks/simd_bench.hls)")
+    b.push("  output                output binary path")
+    b.push("")
+    b.push("options:")
+    b.push("  -h, --help            show this help message and exit")
+    b.push("  --target {riscv64gc-unknown-linux-gnu,"
+        + "riscv64-unknown-linux-gnu,riscv64-unknown-none}")
+    b.push("                        target triple (default: "
+        + "riscv64gc-unknown-linux-gnu)")
+    b.push("  --target-feature {,rvv,native}")
+    b.push("                        enable std.simd intrinsic fast paths "
+        + "(default: rvv;")
+    b.push("                        pass an empty string for none). "
+        + "Ignored for the bare-")
+    b.push("                        metal target (riscv64-unknown-none)")
+    b.push("  --linker {auto,zig,gcc,clang,cc}")
+    b.push("                        linker strategy (default: auto-detect)")
+    b.push("  --keep-c KEEP_C       keep the intermediate C file at PATH")
+    b.push("  --dry-run             print the commands without "
+        + "executing them")
+    b.push("  --hlc HLC             path to the native hlc compiler "
+        + "(default: bin/hlc)")
+    b.push("  --list-targets        list the supported RISC-V target "
+        + "triples and exit")
+    return b
+}
+
+# print_help(prog) — argparse's -h: usage + body on stdout, exit 0.
+fn print_help(prog: str) -> void uses IO, Exit {
+    let u: list[str] = usage_block(prog)
+    let mut i: int = 0
+    while i < u.len() {
+        println(u.get(i))
+        i = i + 1
+    }
+    println("")
+    let b: list[str] = help_body()
+    let mut j: int = 0
+    while j < b.len() {
+        println(b.get(j))
+        j = j + 1
+    }
+    exit(0)
+}
+
+# ap_fail(prog, msg) — argparse's error(): usage on stderr, the
+# "<prog>: error: <msg>" line, exit 2.
+fn ap_fail(prog: str, msg: str) -> void uses IO, Exit {
+    let u: list[str] = usage_block(prog)
+    let mut i: int = 0
+    while i < u.len() {
+        eprintln(u.get(i))
+        i = i + 1
+    }
+    eprintln(prog + ": error: " + msg)
+    exit(2)
+}
+
+# all_digits(s) — every byte is 0-9; "" counts as all-digits (the
+# "-.5" leading-empty case).
+fn all_digits(s: str) -> bool {
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c < 48 || c > 57 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# is_negative_number(tok) — argparse's _negative_number_matcher,
+# ^-\d+$|^-\d*\.\d+$ : such tokens are values/positionals, not options.
+fn is_negative_number(tok: str) -> bool {
+    if !tok.starts_with("-") {
+        return false
+    }
+    let rest: str = tok.slice(1, tok.len())
+    if rest.len() > 0 && all_digits(rest) {
+        return true
+    }
+    let dot: int = rest.find(".")
+    if dot < 0 {
+        return false
+    }
+    let a: str = rest.slice(0, dot)
+    let b: str = rest.slice(dot + 1, rest.len())
+    if b.len() == 0 {
+        return false
+    }
+    return all_digits(a) && all_digits(b)
+}
+
+# is_optionlike(tok) — would _parse_optional classify this token as an
+# option ('O' pattern)? Such a token can never serve as an option's
+# value ("expected one argument" — an option's nargs pattern is '([A])',
+# which cannot absorb the '--' marker). "-", negative numbers and
+# space-bearing tokens are positional-class.
+fn is_optionlike(tok: str) -> bool {
+    if tok == "" {
+        return false
+    }
+    if !tok.starts_with("-") {
+        return false
+    }
+    if tok == "-" {
+        return false
+    }
+    if is_negative_number(tok) {
+        return false
+    }
+    if tok.contains(" ") {
+        return false
+    }
+    return true
+}
+
+# action_name(od) — argparse's _get_action_name: '-h/--help' for help
+# (both of its option strings), the long name for everything else.
+fn action_name(od: OptDef) -> str {
+    if od.name == "--help" {
+        return "-h/--help"
+    }
+    return od.name
+}
+
+# parse_args(argv, prog) — the CPython _parse_known_args walk, one token
+# at a time: errors fire in encounter order (exit 2), unknown options and
+# positional overflow become the trailing "unrecognized arguments" error.
+fn parse_args(argv: list[str], prog: str) -> Opts uses IO, Exit {
+    let opts: Opts = Opts {
+        input: "",
+        output: "",
+        target: "riscv64gc-unknown-linux-gnu",
+        target_feature: "rvv",
+        linker: "auto",
+        keep_c: "",
+        dry_run: false,
+        hlc: "bin/hlc",
+        list_targets: false
+    }
+    let table: list[OptDef] = opt_table()
+    let extras: list[str] = []
+    let mut pos_count: int = 0
+    let mut after_marker: bool = false
+    let mut i: int = 1
+    while i < argv.len() {
+        let a: str = argv.get(i)
+        if after_marker {
+            # everything after "--" is a positional
+            if pos_count == 0 {
+                opts.input = a
+            } else if pos_count == 1 {
+                opts.output = a
+            } else {
+                extras.push(a)
+            }
+            pos_count = pos_count + 1
+            i = i + 1
+            continue
+        }
+        if a == "--" {
+            after_marker = true
+            i = i + 1
+            continue
+        }
+        if a.starts_with("--") {
+            # long option: split at the first '=', resolve, validate
+            let mut head: str = a
+            let mut val: str = ""
+            let mut has_val: bool = false
+            let eq: int = a.find("=")
+            if eq >= 0 {
+                head = a.slice(0, eq)
+                val = a.slice(eq + 1, a.len())
+                has_val = true
+            }
+            # exact match wins outright (no ambiguity)
+            let mut chosen: int = -1
+            let mut k: int = 0
+            while k < table.len() {
+                if table.get(k).name == head {
+                    chosen = k
+                }
+                k = k + 1
+            }
+            if chosen < 0 {
+                # unambiguous-prefix abbreviation (argparse allow_abbrev)
+                let matches: list[str] = []
+                let mut m: int = 0
+                while m < table.len() {
+                    if table.get(m).name.starts_with(head) {
+                        matches.push(table.get(m).name)
+                    }
+                    m = m + 1
+                }
+                if matches.len() > 1 {
+                    ap_fail(prog, "ambiguous option: " + a + " could match "
+                        + join(matches, ", "))
+                }
+                if matches.len() == 1 {
+                    let mut r: int = 0
+                    while r < table.len() {
+                        if table.get(r).name == matches.get(0) {
+                            chosen = r
+                        }
+                        r = r + 1
+                    }
+                }
+            }
+            if chosen < 0 {
+                # not an option of this parser — an unrecognized argument
+                extras.push(a)
+                i = i + 1
+                continue
+            }
+            let o: OptDef = table.get(chosen)
+            if o.name == "--help" {
+                if has_val {
+                    ap_fail(prog, "argument -h/--help: ignored explicit "
+                        + "argument '" + val + "'")
+                }
+                print_help(prog)
+            }
+            if !o.takes_value {
+                if has_val {
+                    ap_fail(prog, "argument " + action_name(o)
+                        + ": ignored explicit argument '" + val + "'")
+                }
+                if o.name == "--dry-run" {
+                    opts.dry_run = true
+                }
+                if o.name == "--list-targets" {
+                    opts.list_targets = true
+                }
+                i = i + 1
+                continue
+            }
+            # a value option: --opt=value, or the next token when it is
+            # not itself option-like
+            let mut v: str = ""
+            if has_val {
+                v = val
+            } else {
+                if i + 1 >= argv.len() {
+                    ap_fail(prog, "argument " + action_name(o)
+                        + ": expected one argument")
+                }
+                let nxt: str = argv.get(i + 1)
+                if is_optionlike(nxt) {
+                    ap_fail(prog, "argument " + action_name(o)
+                        + ": expected one argument")
+                }
+                v = nxt
+                i = i + 1
+            }
+            # choices validation
+            if o.choices.len() > 0 {
+                let mut ok: bool = false
+                let mut c: int = 0
+                while c < o.choices.len() {
+                    if o.choices.get(c) == v {
+                        ok = true
+                    }
+                    c = c + 1
+                }
+                if !ok {
+                    ap_fail(prog, "argument " + action_name(o)
+                        + ": invalid choice: '" + v + "' (choose from "
+                        + join(o.choices, ", ") + ")")
+                }
+            }
+            if o.name == "--target" {
+                opts.target = v
+            } else if o.name == "--target-feature" {
+                opts.target_feature = v
+            } else if o.name == "--linker" {
+                opts.linker = v
+            } else if o.name == "--keep-c" {
+                opts.keep_c = v
+            } else if o.name == "--hlc" {
+                opts.hlc = v
+            }
+            i = i + 1
+            continue
+        }
+        if a.starts_with("-") && a.len() > 1 {
+            # short-option cluster: only -h exists; "-h..." fires help
+            # (an "-h=..." token carries an ignored explicit argument).
+            # Negative numbers and space-bearing tokens are positionals,
+            # not options (the _parse_optional tail).
+            if is_negative_number(a) || a.contains(" ") {
+                if pos_count == 0 {
+                    opts.input = a
+                } else if pos_count == 1 {
+                    opts.output = a
+                } else {
+                    extras.push(a)
+                }
+                pos_count = pos_count + 1
+                i = i + 1
+                continue
+            }
+            if a.byte_at(1) == 104 {
+                if a.len() > 2 && a.byte_at(2) == 61 {
+                    ap_fail(prog, "argument -h/--help: ignored explicit "
+                        + "argument '" + a.slice(3, a.len()) + "'")
+                }
+                print_help(prog)
+            }
+            extras.push(a)
+            i = i + 1
+            continue
+        }
+        # a positional ("", "-", negative numbers, plain words)
+        if pos_count == 0 {
+            opts.input = a
+        } else if pos_count == 1 {
+            opts.output = a
+        } else {
+            extras.push(a)
+        }
+        pos_count = pos_count + 1
+        i = i + 1
+    }
+    if extras.len() > 0 {
+        ap_fail(prog, "unrecognized arguments: " + join(extras, " "))
+    }
+    return opts
+}
+
+# ============================================================================
+# The orchestrator — hlcross.cross_compile, exactly the slice hlriscv.py
+# drives (security is always "auto" — RISC-V has no PAC/BTI, so the
+# auto flags are the registry's, which are empty for every RISC-V
+# target; debug is never passed).
+# ============================================================================
+
+fn cross_compile(input_hls: str, output_bin: str, target: str,
+                 linker_kind: str, keep_c: str, dry_run: bool,
+                 hlc_path: str, security: str,
+                 target_feature: str) -> int uses IO, Fs, Proc {
+    if !file_exists(input_hls) {
+        eprintln("error: input file not found: " + input_hls)
+        return 2
+    }
+    # the argparse choices already guarantee a canonical registry name
+    let spec: TargetSpec = get_spec(target)
+    # resolve the cross-linker
+    let mut linker: str = ""
+    let mut base_args: list[str] = []
+    let mut kind: str = ""
+    if linker_kind == "auto" {
+        let l: Linker = find_target_linker(target)
+        linker = l.path
+        base_args = l.base_args
+        kind = l.kind
+    } else if linker_kind == "zig" {
+        let zig: str = which("zig")
+        if zig == "" {
+            eprintln("error: --linker zig requested but zig is not installed")
+            return 2
+        }
+        linker = zig
+        let args: list[str] = ["cc", "-target", target, "-O2"]
+        base_args = args
+        kind = "zig"
+    } else {
+        # gcc / clang / cc — the host fallback
+        let p: str = which(linker_kind)
+        if p == "" {
+            eprintln("error: --linker " + linker_kind + " not found")
+            return 2
+        }
+        linker = p
+        let args: list[str] = ["-O2"]
+        base_args = args
+        kind = "host-fallback"
+    }
+    # where to write the C file
+    let mut c_path: str = output_bin + ".c"
+    if keep_c != "" {
+        c_path = keep_c
+    }
+    # dry-run: print the commands without executing them
+    if dry_run {
+        println("[dry-run] hlc " + input_hls + " " + c_path)
+        let mut lshow: str = linker
+        if lshow == "" {
+            lshow = "(none)"
+        }
+        println("[dry-run] linker: " + lshow + " "
+            + py_repr_list(base_args) + " " + c_path + " -o " + output_bin)
+        return 0
+    }
+    # step 1: HLS -> C (always works; the C backend is target-agnostic)
+    println("[1/2] hlc: compiling " + input_hls + " -> " + c_path)
+    let hlc_args: list[str] = [input_hls, c_path]
+    if spec.freestanding {
+        # the flag implies #![freestanding] and the integer-only
+        # discipline, and stamps the triple into the emitted C
+        hlc_args.push("--target")
+        hlc_args.push(target)
+    }
+    if target_feature != "" {
+        # enables the RVV intrinsic fast paths for std.simd
+        hlc_args.push("--target-feature")
+        hlc_args.push(target_feature)
+    }
+    let code: int = run_inherit(hlc_path, hlc_args)
+    if code < 0 {
+        # unreachable for the shipped bin/hlc; the Python original dies
+        # with a FileNotFoundError traceback (exit 1) here
+        eprintln("error: cannot execute " + hlc_path)
+        return 1
+    }
+    if code != 0 {
+        eprintln("error: hlc failed (exit " + code.to_str() + ")")
+        return 1
+    }
+    if !file_exists(c_path) {
+        eprintln("error: hlc did not produce " + c_path)
+        return 1
+    }
+    let c_data: str = read_file(c_path)
+    println("      C source: " + c_path + " (" + c_data.len().to_str()
+        + " bytes)")
+    # step 2: C -> foreign binary (the cross-linker step)
+    if linker == "" {
+        let hint: str = cross_linker_hint(target, kind)
+        eprintln("[2/2] SKIP: " + hint)
+        eprintln("      The C source at " + c_path + " can be copied to a "
+            + spec.binary_format + " host and compiled there with "
+            + "the platform's native cc.")
+        return 3
+    }
+    # every registry target here has binary_suffix "" (the .exe
+    # suffixes belong to the Windows triples this tool never reaches)
+    let out_path: str = output_bin + ""
+    println("[2/2] " + kind + ": linking " + c_path + " -> " + out_path)
+    # security flags: --security auto takes the target's registry flags
+    # ("" for every RISC-V target — PAC/BTI are ARM-specific)
+    let sec_flags: list[str] = []
+    if security == "auto" {
+        push_all(sec_flags, spec.security_flags)
+    } else if security == "pac+bti" {
+        sec_flags.push("-mbranch-protection=pac-ret+bti")
+    } else if security == "bti" {
+        sec_flags.push("-mbranch-protection=bti")
+    }
+    # RISC-V -march/-mabi flags. The Linux targets promote -march from
+    # rv64gc -> rv64gcv when --target-feature rvv is given (the V
+    # extension the RVV intrinsics in <riscv_vector.h> require). The
+    # bare-metal target: rv64imac/lp64 (no -march under zig — clang
+    # rejects it; -mabi alone pins the soft-float ABI), plus medany —
+    # the image links at 0x80000000, far beyond a medlow reach.
+    let arch_flags: list[str] = []
+    if target == "riscv64gc-unknown-linux-gnu"
+        || target == "riscv64-unknown-linux-gnu" {
+        let mut march: str = spec.march
+        if target_feature == "rvv" {
+            march = "rv64gcv"
+        }
+        arch_flags.push("-march=" + march)
+        arch_flags.push("-mabi=" + spec.mabi)
+    } else if target == "riscv64-unknown-none" {
+        arch_flags.push("-mcmodel=medany")
+        arch_flags.push("-mabi=" + spec.mabi)
+        if kind != "zig" {
+            arch_flags.push("-march=" + spec.march)
+        }
+    }
+    # the freestanding link: no libc, no crt0; -Wl,-T places the image
+    # when the repo ships targets/<triple>.ld
+    let freestanding_flags: list[str] = []
+    if spec.freestanding {
+        freestanding_flags.push("-nostdlib")
+        freestanding_flags.push("-nostartfiles")
+        freestanding_flags.push("-ffreestanding")
+        freestanding_flags.push("-fno-stack-protector")
+        freestanding_flags.push("-fno-pie")
+        freestanding_flags.push("-no-pie")
+        freestanding_flags.push("-ffunction-sections")
+        freestanding_flags.push("-Wl,--gc-sections")
+        let script: str = path_join(repo_root(), "targets/" + target + ".ld")
+        if file_exists(script) {
+            freestanding_flags.push("-Wl,-T," + script)
+        }
+    }
+    # assemble: linker base security arch freestanding in out libs
+    let cmd: list[str] = [linker]
+    push_all(cmd, base_args)
+    push_all(cmd, sec_flags)
+    push_all(cmd, arch_flags)
+    push_all(cmd, freestanding_flags)
+    cmd.push(c_path)
+    cmd.push("-o")
+    cmd.push(out_path)
+    push_all(cmd, spec.link_libs)
+    let cmd_args: list[str] = []
+    let mut ci: int = 1
+    while ci < cmd.len() {
+        cmd_args.push(cmd.get(ci))
+        ci = ci + 1
+    }
+    let lcode: int = run_inherit(linker, cmd_args)
+    if lcode < 0 {
+        eprintln("error: cannot execute " + linker)
+        return 1
+    }
+    if lcode != 0 {
+        eprintln("error: linker failed (exit " + lcode.to_str() + ")")
+        eprintln("      command: " + join(cmd, " "))
+        return 1
+    }
+    # a linker that exits 0 without producing the image is broken, not
+    # a success — report it instead of crashing on the size query
+    if !file_exists(out_path) {
+        eprintln("error: linker reported success but " + out_path
+            + " was not created")
+        eprintln("      command: " + join(cmd, " "))
+        return 1
+    }
+    let fmt: str = detect_binary_format(out_path)
+    let bin_data: str = read_file(out_path)
+    println("      binary: " + out_path + " (" + bin_data.len().to_str()
+        + " bytes, " + fmt + "; target: " + spec.binary_format + ")")
+    if keep_c == "" {
+        # the scratch C file is removed; --keep-c preserves it
+        proc_exec("rm -f '" + shell_quote(c_path) + "'")
+    }
+    return 0
+}
+
+# ============================================================================
+# --list-targets — the RISC-V target table (hlriscv.py's own listing).
+# ============================================================================
+
+fn cmd_list_targets() -> int uses IO {
+    println("Supported RISC-V 64 targets (Stage 26):")
+    println("  riscv64gc-unknown-linux-gnu  Linux user-mode (RV64GC: IMAFDC)")
+    println("                              SiFive / VisionFive / QEMU riscv64")
+    println("  riscv64-unknown-linux-gnu   Alias for riscv64gc-unknown-linux-gnu")
+    println("  riscv64-unknown-none        Bare-metal (no OS, no libc)")
+    println("                              For OS-development work")
+    println("")
+    println("Target features (--target-feature):")
+    println("  rvv      Enable RISC-V Vector (RVV) intrinsic fast paths")
+    println("           for std.simd (the Stage 26 RVV codegen in src/hlc.hls).")
+    println("           Promotes -march from rv64gc -> rv64gcv.")
+    println("           Only valid for the Linux target (the bare-metal target")
+    println("           uses rv64imac, no V extension).")
+    println("  native   Auto-detect the host CPU's best SIMD feature")
+    println("  (empty)  No intrinsic fast paths (scalar fallback)")
+    println("")
+    println("Bare-metal flags (riscv64-unknown-none):")
+    println("  -march=rv64imac -mabi=lp64 -nostdlib -nostartfiles -ffreestanding")
+    println("  The binary runs in QEMU with: qemu-system-riscv64 -bios none \\")
+    println("    -machine virt -kernel <binary> -nographic")
+    return 0
+}
+
+# ============================================================================
+# main — hlriscv.py's main(): parse, --list-targets, the input/output
+# guard, the bare-metal rvv strip, then cross_compile(security="auto").
+# ============================================================================
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let argv: list[str] = args()
+    let prog: str = path_base(argv.get(0))
+    let opts: Opts = parse_args(argv, prog)
+    if opts.list_targets {
+        return cmd_list_targets()
+    }
+    if opts.input == "" || opts.output == "" {
+        ap_fail(prog, "input and output are required (or use --list-targets)")
+    }
+    # the bare-metal target does NOT support the V extension (rv64imac
+    # has no V) — strip --target-feature rvv for riscv64-unknown-none
+    let mut target_feature: str = opts.target_feature
+    if opts.target == "riscv64-unknown-none" && target_feature == "rvv" {
+        target_feature = ""
+    }
+    # RISC-V has no PAC/BTI; security="auto" resolves to the registry's
+    # (empty) flags
+    return cross_compile(opts.input, opts.output, opts.target,
+                         opts.linker, opts.keep_c, opts.dry_run,
+                         opts.hlc, "auto", target_feature)
+}
