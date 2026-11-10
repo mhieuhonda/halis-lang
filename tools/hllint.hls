@@ -1,0 +1,3747 @@
+# ============================================================================
+# hllint.hls — the safety-first linter for Halis, in Halis.
+# ----------------------------------------------------------------------------
+# The Stage 14 linter grew up in Python (tools/hllint.py, 2012 lines);
+# this file is its native port — same thirteen rules, same output
+# grammar, same exit codes, same pessimistic autofix protocol — built
+# on the compiler's own front-end (tools/hlfront.hls links the real
+# lexer, parser and checker), so a lint verdict can never drift from
+# what bin/hlc itself believes about a program.
+#
+# The laws, verbatim from the Python years:
+#
+#   L001 unused-binding, L002 unused-function, L003 unused-struct-field,
+#   L004 ignored-result, L005 explicit-unwrap, L006 unnecessary-effects,
+#   L007 dead-code-after-return, L008 long-function, L009 shadowing
+#   (never fires — the checker rejects shadowing first), L010 empty-impl,
+#   L011 inline-always-large, L012 tail-call-large, L013 deprecated-call.
+#
+# The fix protocol is unchanged: every fix is planned as a byte-span
+# edit against the token stream, applied to a COPY of the source, and
+# kept only if the copy re-parses, its crate checks no worse than
+# before, every targeted warning is gone and no new one appeared. A
+# fix that cannot be located exactly is skipped with a reason, never
+# guessed. --fix loops to a fixed point (at most 8 rounds).
+#
+# Process shape: the checker and the crate loader panic on bad input
+# (the language has no exceptions), so every risky pass runs in a
+# probe child — the tool re-execs itself with a private flag and the
+# parent reads the exit code, exactly the way the acceptance gates
+# drive risky children. A probe's 101 is the old try/except HLError:
+#   --lint-run       the whole plain lint (parse may refuse)
+#   --fix-run        one fixer round's lint (entry keys + crate view)
+#   --probe-check    parse + check one file, print computed effects
+#   --probe-crate    load one crate, print the deprecation registry
+#   --probe-crate-check  load + check one crate (the fixer's net)
+#
+# Usage:
+#   hllint FILE.hls              # warnings to stdout, exit 0
+#   hllint --strict FILE.hls     # exit 1 when any warning fires
+#   hllint --rule L001 FILE.hls  # one rule only (repeatable)
+#   hllint --list                # the rule table
+#   hllint --fix FILE.hls        # apply the safe fixes, write the file
+#   hllint --diff FILE.hls       # show what --fix would do
+#
+# Exit codes: 0 ok; 1 file-not-found / parse error / strict warnings /
+# pending --diff; 2 usage error.
+# ============================================================================
+
+import "./hlfront.hls"
+import "core.result"
+import "std.str"
+import "std.base64"
+
+# ----------------------------------------------------------------------------
+# The probe runner — spawn a child, drain both pipes, wait.
+# ----------------------------------------------------------------------------
+
+struct RunRes {
+    code: int,       # -1: the spawn itself failed
+    out: str,        # captured stdout
+    err: str,        # captured stderr
+    spawned: bool
+}
+
+# run_child(argv) — spawn with stdout+stderr piped, stdin null.
+fn run_child(argv: list[str]) -> RunRes uses Proc {
+    let r: RunRes = RunRes { code: -1, out: "", err: "", spawned: false }
+    let pid: int = proc_spawn(argv.get(0), argv, 2, 1, 1)
+    if pid < 1 {
+        return r
+    }
+    r.spawned = true
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    r.code = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    r.out = out
+    r.err = err
+    return r
+}
+
+# self_argv0() — the running binary's own path (args()[0]).
+fn self_argv0() -> str uses Args {
+    let a: list[str] = args()
+    if a.len() == 0 {
+        return ""
+    }
+    return a.get(0)
+}
+
+# panic_text(err) — the interpreter-era error text of a probe's
+# panic: the first stderr line, minus the "panic: " prefix, minus the
+# compiler's leading "syntax error: " / "lex error: " / "type error: "
+# classifier (the Python linter's HLError never carried one).
+fn panic_text(err: str) -> str {
+    let lines: list[str] = err.split("\n")
+    let mut t: str = ""
+    let mut i: int = 0
+    while i < lines.len() {
+        let c: str = lines.get(i).trim()
+        if c != "" {
+            t = c
+            i = lines.len()
+        }
+        i = i + 1
+    }
+    if t.starts_with("panic: ") {
+        t = t.slice(7, t.len())
+    }
+    if t.starts_with("syntax error: ") {
+        return t.slice(14, t.len())
+    }
+    if t.starts_with("lex error: ") {
+        return t.slice(11, t.len())
+    }
+    if t.starts_with("type error: ") {
+        return t.slice(12, t.len())
+    }
+    return t
+}
+
+# ----------------------------------------------------------------------------
+# Small text helpers.
+# ----------------------------------------------------------------------------
+
+# str_in(s, hay) — membership in a string list.
+fn str_in(s: str, hay: list[str]) -> bool {
+    let mut i: int = 0
+    while i < hay.len() {
+        if hay.get(i) == s {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# str_push_unique(hay, s) — append when missing.
+fn str_push_unique(hay: list[str], s: str) -> void {
+    if !str_in(s, hay) {
+        hay.push(s)
+    }
+}
+
+# str_copy(src) — a fresh list with the same elements.
+fn str_copy(src: list[str]) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < src.len() {
+        out.push(src.get(i))
+        i = i + 1
+    }
+    return out
+}
+
+# str_remove_value(hay, s) — drop the first occurrence of s.
+fn str_remove_value(hay: list[str], s: str) -> void {
+    let mut i: int = 0
+    while i < hay.len() {
+        if hay.get(i) == s {
+            let mut j: int = i
+            while j + 1 < hay.len() {
+                hay.set(j, hay.get(j + 1))
+                j = j + 1
+            }
+            let drop: str = hay.pop()
+            return
+        }
+        i = i + 1
+    }
+}
+
+# str_sorted(src) — a copy sorted bytewise ascending.
+fn str_sorted(src: list[str]) -> list[str] {
+    let out: list[str] = str_copy(src)
+    let mut i: int = 1
+    while i < out.len() {
+        let v: str = out.get(i)
+        let mut j: int = i - 1
+        while j >= 0 && out.get(j) > v {
+            out.set(j + 1, out.get(j))
+            j = j - 1
+        }
+        out.set(j + 1, v)
+        i = i + 1
+    }
+    return out
+}
+
+# pad_right(s, n) — s padded with spaces to width n (longer stays).
+fn pad_right(s: str, n: int) -> str {
+    let mut out: str = s
+    while out.len() < n {
+        out = out + " "
+    }
+    return out
+}
+
+# after_last_dot(s) — everything after the last "." (the method short
+# name of a "Struct.method" key); the whole string when bare.
+fn after_last_dot(s: str) -> str {
+    let mut i: int = s.len() - 1
+    while i >= 0 {
+        if s.byte_at(i) == 46 {
+            return s.slice(i + 1, s.len())
+        }
+        i = i - 1
+    }
+    return s
+}
+
+# after_first_dot(s) — everything after the FIRST "." (the py linter's
+# fname.split(".", 1)[1]).
+fn after_first_dot(s: str) -> str {
+    let mut i: int = 0
+    while i < s.len() {
+        if s.byte_at(i) == 46 {
+            return s.slice(i + 1, s.len())
+        }
+        i = i + 1
+    }
+    return s
+}
+
+# ----------------------------------------------------------------------------
+# The offset lexer — the fixer's byte-span bridge.
+# ----------------------------------------------------------------------------
+# The rules walk the compiler's AST; the FIXER plans byte spans. This
+# lexer re-tokenises the source recording each kw/ident/sym token's
+# byte span directly (kind, value, off, len, line) — the same token
+# boundaries lexer.hls draws, numbers/strings/comments skipped by the
+# same laws. Every span is round-trip checked against the bytes, so a
+# table drift is a locate error, never a mangled file.
+# ----------------------------------------------------------------------------
+
+struct FTok {
+    kind: str,   # kw | ident | sym
+    value: str,
+    off: int,    # byte offset of the first byte
+    len: int,    # byte length
+    line: int    # 1-based
+}
+
+# f_lex_err(msg) — the plan-failure text the planner reports per hint.
+fn f_lex_err(msg: str) -> str {
+    return msg
+}
+
+# f_lex(src) — the kw/ident/sym token stream with byte spans, or an
+# error string (the caller turns it into a "planning failed" skip).
+fn f_lex(src: str) -> Result[list[FTok], str] {
+    let toks: list[FTok] = []
+    let n: int = src.len()
+    let mut i: int = 0
+    let mut line: int = 1
+    while i < n {
+        let c: int = src.byte_at(i)
+        # ---- whitespace --------------------------------------------------
+        if c == 32 || c == 9 {
+            i = i + 1
+        } else if c == 13 {
+            if i + 1 < n && src.byte_at(i + 1) == 10 {
+                i = i + 1
+            } else {
+                line = line + 1
+                i = i + 1
+            }
+        } else if c == 10 {
+            line = line + 1
+            i = i + 1
+        } else if c == 35 {
+            # ---- `#[` attribute sigil, `#![`, or a comment ----------------
+            if i + 1 < n && src.byte_at(i + 1) == 91 {
+                toks.push(FTok { kind: "sym", value: "#", off: i, len: 1, line: line })
+                i = i + 1
+            } else if i + 2 < n && src.byte_at(i + 1) == 33 && src.byte_at(i + 2) == 91 {
+                toks.push(FTok { kind: "sym", value: "#", off: i, len: 1, line: line })
+                toks.push(FTok { kind: "sym", value: "!", off: i + 1, len: 1, line: line })
+                i = i + 2
+            } else {
+                while i < n && src.byte_at(i) != 10 && src.byte_at(i) != 13 {
+                    i = i + 1
+                }
+            }
+        } else if is_ident_start(c) {
+            # ---- identifier / keyword --------------------------------------
+            let mut j: int = i
+            while j < n && is_ident_char(src.byte_at(j)) {
+                j = j + 1
+            }
+            let word: str = src.slice(i, j)
+            if is_keyword(word) {
+                toks.push(FTok { kind: "kw", value: word, off: i, len: j - i, line: line })
+            } else {
+                toks.push(FTok { kind: "ident", value: word, off: i, len: j - i, line: line })
+            }
+            i = j
+        } else if is_digit(c) {
+            # ---- number (skipped; boundaries per lexer.hls) ----------------
+            let mut j: int = i
+            while j < n && (is_digit(src.byte_at(j)) || src.byte_at(j) == 95) {
+                j = j + 1
+            }
+            if j < n && src.byte_at(j) == 46 && j + 1 < n && is_digit(src.byte_at(j + 1)) {
+                j = j + 1
+                while j < n && (is_digit(src.byte_at(j)) || src.byte_at(j) == 95) {
+                    j = j + 1
+                }
+            }
+            if j < n && (src.byte_at(j) == 101 || src.byte_at(j) == 69) {
+                let mut k: int = j + 1
+                if k < n && (src.byte_at(k) == 43 || src.byte_at(k) == 45) {
+                    k = k + 1
+                }
+                if k < n && is_digit(src.byte_at(k)) {
+                    j = k
+                    while j < n && (is_digit(src.byte_at(j)) || src.byte_at(j) == 95) {
+                        j = j + 1
+                    }
+                }
+            }
+            if j < n && is_ident_start(src.byte_at(j)) {
+                return Result.Err(f_lex_err("invalid numeric literal '" + src.slice(i, j + 1)
+                + "' (digits followed by letters - HLS has no hex/adjoined-letter literals)"))
+            }
+            i = j
+        } else if c == 34 {
+            # ---- string with the four escapes -------------------------------
+            let start: int = i
+            i = i + 1
+            let mut closed: bool = false
+            while i < n {
+                let ch: int = src.byte_at(i)
+                if ch == 34 {
+                    i = i + 1
+                    closed = true
+                    break
+                }
+                if ch == 92 {
+                    if i + 1 >= n {
+                        return Result.Err(f_lex_err("unterminated string"))
+                    }
+                    i = i + 2
+                } else {
+                    i = i + 1
+                }
+            }
+            if !closed {
+                return Result.Err(f_lex_err("unterminated string"))
+            }
+            if start >= 0 {
+                # the span check below only covers kw/ident/sym; strings
+                # are skipped wholesale (the fixer never locates in them)
+                let keep: int = start
+                if keep < 0 {
+                    return Result.Err(f_lex_err("unreachable"))
+                }
+            }
+        } else {
+            # ---- operator / symbol, two-char first --------------------------
+            let mut two: str = ""
+            if i + 2 <= n {
+                two = src.slice(i, i + 2)
+            }
+            if two == "->" || two == "==" || two == "!=" || two == "<=" || two == ">=" || two == "||" || two == "&&" || two == "=>" {
+                toks.push(FTok { kind: "sym", value: two, off: i, len: 2, line: line })
+                i = i + 2
+            } else if c == 40 || c == 41 || c == 123 || c == 125 || c == 91 || c == 93 || c == 44 || c == 58 || c == 46 || c == 60 || c == 62 || c == 43 || c == 45 || c == 42 || c == 47 || c == 37 || c == 33 || c == 61 || c == 63 {
+                toks.push(FTok { kind: "sym", value: chr(c), off: i, len: 1, line: line })
+                i = i + 1
+            } else {
+                return Result.Err(f_lex_err("invalid character: '" + chr(c) + "'"))
+            }
+        }
+    }
+    # ---- round-trip check: every kw/ident/sym span must re-read --------
+    let mut t: int = 0
+    while t < toks.len() {
+        let ft: FTok = toks.get(t)
+        if src.slice(ft.off, ft.off + ft.len) != ft.value {
+            return Result.Err(f_lex_err("token/offset mismatch at line "
+            + ft.line.to_str()))
+        }
+        t = t + 1
+    }
+    return Result.Ok(toks)
+}
+
+# ----------------------------------------------------------------------------
+# The fixer's byte helpers (the Python years' _line_starts,
+# _find_block_close, _absorb_line, _first_nonws, verbatim laws).
+# ----------------------------------------------------------------------------
+
+# f_line_starts(src) — the byte offset of every line start, with the
+# Stage-0 lexer's line counting: a break after \n, after a lone \r,
+# and ONCE for a \r\n pair.
+fn f_line_starts(src: str) -> list[int] {
+    let starts: list[int] = []
+    starts.push(0)
+    let n: int = src.len()
+    let mut i: int = 0
+    while i < n {
+        let c: int = src.byte_at(i)
+        if c == 10 {
+            i = i + 1
+            starts.push(i)
+        } else if c == 13 {
+            if i + 1 < n && src.byte_at(i + 1) == 10 {
+                i = i + 2
+            } else {
+                i = i + 1
+            }
+            starts.push(i)
+        } else {
+            i = i + 1
+        }
+    }
+    return starts
+}
+
+# f_find_block_close(src, start) — byte offset of the `}` closing the
+# block that contains `start`, or -1. String- and comment-aware.
+fn f_find_block_close(src: str, start: int) -> int {
+    let n: int = src.len()
+    let mut i: int = start
+    let mut depth: int = 0
+    while i < n {
+        let c: int = src.byte_at(i)
+        if c == 34 {
+            i = i + 1
+            while i < n && src.byte_at(i) != 34 {
+                if src.byte_at(i) == 92 {
+                    i = i + 1
+                }
+                i = i + 1
+            }
+            i = i + 1
+            continue
+        }
+        if c == 35 {
+            while i < n && src.byte_at(i) != 10 && src.byte_at(i) != 13 {
+                i = i + 1
+            }
+            continue
+        }
+        if c == 123 {
+            depth = depth + 1
+        } else if c == 125 {
+            if depth == 0 {
+                return i
+            }
+            depth = depth - 1
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# f_rfind_byte(src, ch, before) — the last offset of ch in src[0:before].
+fn f_rfind_byte(src: str, ch: int, before: int) -> int {
+    let mut i: int = before - 1
+    while i >= 0 {
+        if src.byte_at(i) == ch {
+            return i
+        }
+        i = i - 1
+    }
+    return -1
+}
+
+# f_find_byte(src, ch, from) — the first offset of ch at or after from.
+fn f_find_byte(src: str, ch: int, from: int) -> int {
+    let mut i: int = from
+    while i < src.len() {
+        if src.byte_at(i) == ch {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# f_is_ws(c) — the regex \s set on bytes: space, \t, \n, \r, \f, \v.
+fn f_is_ws(c: int) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13 || c == 12 || c == 11
+}
+
+# f_span_blank(src, a, b) — is src[a:b] all whitespace?
+fn f_span_blank(src: str, a: int, b: int) -> bool {
+    let mut i: int = a
+    while i < b {
+        if !f_is_ws(src.byte_at(i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# f_absorb_line(src, start, end) — grow a deletion span so a deletable
+# LINE leaves no blank behind: when the rest of the line before start
+# and after end is whitespace, swallow the whole line + its newline.
+fn f_absorb_line(src: str, start: int, end: int) -> list[int] {
+    let ls: int = f_rfind_byte(src, 10, start) + 1
+    let mut le: int = f_find_byte(src, 10, end)
+    if le == -1 {
+        le = src.len()
+    }
+    if f_span_blank(src, ls, start) && f_span_blank(src, end, le) {
+        let out: list[int] = [ls]
+        if le < src.len() {
+            out.push(le + 1)
+        } else {
+            out.push(le)
+        }
+        return out
+    }
+    let out2: list[int] = [start, end]
+    return out2
+}
+
+# f_first_nonws(src, line_starts, line) — byte offset of the first
+# non-whitespace byte of a 1-based line, or -1 when blank / missing.
+fn f_first_nonws(src: str, line_starts: list[int], line: int) -> int {
+    if line < 1 || line > line_starts.len() {
+        return -1
+    }
+    let ls: int = line_starts.get(line - 1)
+    let mut le: int = 0
+    if line < line_starts.len() {
+        le = line_starts.get(line)
+    } else {
+        le = src.len()
+    }
+    let mut j: int = ls
+    while j < le {
+        let c: int = src.byte_at(j)
+        if c != 32 && c != 9 && c != 13 {
+            return j
+        }
+        j = j + 1
+    }
+    return -1
+}
+
+# ----------------------------------------------------------------------------
+# The lint state — one Linter instance per lint pass.
+# ----------------------------------------------------------------------------
+
+struct Warn {
+    rule: str,
+    sev: str,
+    line: int,
+    msg: str
+}
+
+# Hint — the fixer's structured edit description (the Python years'
+# fix dicts, flattened). Fields are per kind; unused ones carry the
+# neutral empty value.
+struct Hint {
+    rule: str,
+    line: int,
+    kind: str,      # rename_let | rename_fn | wrap_let | drop_uses |
+                    # delete_dead | delete_span | drop_attr
+    name: str,      # rename_let: the binding
+    fname: str,     # the full fn key
+    short: str,     # the short fn name
+    ty: str,        # wrap_let: the result type text
+    is_extern: bool,
+    is_panic_handler: bool,
+    is_irq_handler: bool,
+    has_section: bool,
+    attr: str,      # drop_attr: "inline_always" | "tail_call"
+    head_kind: str, # delete_dead: the head statement's kind
+    head_name: str, # delete_dead: the head statement's name
+    span_start: int, # delete_span
+    span_end: int
+}
+
+struct LV {
+    ctx: Ctx,            # the lint view (single-file, or crate-merged
+                         # and filtered to the entry's keys)
+    entry_fns: list[str],    # the entry file's fn keys, parse order
+    entry_structs: list[str],# the entry file's struct names
+    warns: list[Warn],
+    hints: list[Hint],
+    only: list[str],    # enabled rule ids (L001..L013)
+    src: str,           # the exact bytes being linted (L010's haystack)
+    # L013: the deprecation registry (from the crate view or the
+    # entry file itself). dep: name -> message ("" = bare); the maps
+    # are built by the runner.
+    dep_names: map[str, str],   # plain fn + surviving method names
+    dep_methods: map[str, str], # deprecated method short names that
+                                # survived the ambiguity guard
+    dep_keys: list[str],        # registry fn KEYS that are deprecated
+    has_registry: bool,
+    # L006: computed effects per fn key ("" entries = pure), absent
+    # when the probe's check refused.
+    effects: map[str, str],
+    has_effects: bool
+}
+
+# li_enabled(lv, rule) — is the rule in this pass's only-set?
+fn li_enabled(lv: LV, rule: str) -> bool {
+    return str_in(rule, lv.only)
+}
+
+# li_warn(lv, rule, line, msg) — record one warning (the Python
+# linter's _warn; the only-set gate lives here).
+fn li_warn(lv: LV, rule: str, line: int, msg: str) -> void {
+    if !li_enabled(lv, rule) {
+        return
+    }
+    let mut sev: str = "warning"
+    if rule == "L008" || rule == "L009" {
+        sev = "info"
+    }
+    lv.warns.push(Warn { rule: rule, sev: sev, line: line, msg: msg })
+}
+
+# ----------------------------------------------------------------------------
+# AST walkers over the compiler's index-based AST (ExprN / StmtN).
+# ----------------------------------------------------------------------------
+
+# w_exprs_in_stmt(ctx, s) — every expr index contained in a statement
+# (the py exprs_in_stmt, incl. the BUG-DS4-21 assign-target reads and
+# the deep-scan-20 asm operands).
+fn w_exprs_in_stmt(ctx: Ctx, s: int) -> list[int] {
+    let out: list[int] = []
+    let st: StmtN = ctx.stmts.get(s)
+    if st.kind == "let" {
+        out.push(st.value)
+    } else if st.kind == "assign" {
+        out.push(st.value)
+        let tk: str = ctx.exprs.get(st.target).kind
+        if tk == "field" || tk == "index" {
+            out.push(st.target)
+        }
+    } else if st.kind == "return" {
+        if st.value >= 0 {
+            out.push(st.value)
+        }
+    } else if st.kind == "expr" {
+        out.push(st.e)
+    } else if st.kind == "if" {
+        out.push(st.cond)
+    } else if st.kind == "while" {
+        out.push(st.cond)
+    } else if st.kind == "for" {
+        out.push(st.iter)
+    } else if st.kind == "asm" {
+        let mut i: int = 0
+        while i < st.asm_operands.len() {
+            let op: AsmOperand = st.asm_operands.get(i)
+            if op.expr_idx >= 0 {
+                out.push(op.expr_idx)
+            }
+            i = i + 1
+        }
+    }
+    return out
+}
+
+# w_all_exprs(ctx, body) — every expr in a statement list, recursively
+# into nested if/while/for bodies.
+fn w_all_exprs(ctx: Ctx, body: list[int]) -> list[int] {
+    let out: list[int] = []
+    let mut i: int = 0
+    while i < body.len() {
+        let s: int = body.get(i)
+        let es: list[int] = w_exprs_in_stmt(ctx, s)
+        let mut j: int = 0
+        while j < es.len() {
+            out.push(es.get(j))
+            j = j + 1
+        }
+        let st: StmtN = ctx.stmts.get(s)
+        if st.kind == "if" {
+            let sub: list[int] = w_all_exprs(ctx, st.body)
+            let mut k: int = 0
+            while k < sub.len() {
+                out.push(sub.get(k))
+                k = k + 1
+            }
+            let sub2: list[int] = w_all_exprs(ctx, st.else_body)
+            let mut k2: int = 0
+            while k2 < sub2.len() {
+                out.push(sub2.get(k2))
+                k2 = k2 + 1
+            }
+        } else if st.kind == "while" || st.kind == "for" {
+            let sub: list[int] = w_all_exprs(ctx, st.body)
+            let mut k: int = 0
+            while k < sub.len() {
+                out.push(sub.get(k))
+                k = k + 1
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# w_walk_expr(ctx, e, mode, out) — one recursive expression walk with
+# a collection mode:
+#   "idents"   identifier REFERENCES (field/method names excluded —
+#              the deep-scan-7 law; struct-literal field names are
+#              writes, not reads)
+#   "calls"    call + method/fieldcall callee names
+#   "fields"   struct field READ names (x.field nodes)
+fn w_walk_expr(ctx: Ctx, e: int, mode: str, out: list[str]) -> void {
+    let n: ExprN = ctx.exprs.get(e)
+    if mode == "idents" && n.kind == "ident" {
+        str_push_unique(out, n.name)
+    }
+    if mode == "calls" && (n.kind == "call" || n.kind == "method" || n.kind == "fieldcall") {
+        str_push_unique(out, n.name)
+    }
+    if mode == "fields" && n.kind == "field" {
+        str_push_unique(out, n.name)
+    }
+    if n.kind == "bin" {
+        if n.left >= 0 {
+            w_walk_expr(ctx, n.left, mode, out)
+        }
+        if n.right >= 0 {
+            w_walk_expr(ctx, n.right, mode, out)
+        }
+    } else if n.kind == "un" {
+        if n.left >= 0 {
+            w_walk_expr(ctx, n.left, mode, out)
+        }
+    } else if n.kind == "call" {
+        let mut i: int = 0
+        while i < n.args.len() {
+            w_walk_expr(ctx, n.args.get(i), mode, out)
+            i = i + 1
+        }
+    } else if n.kind == "method" || n.kind == "fieldcall" {
+        if n.left >= 0 {
+            w_walk_expr(ctx, n.left, mode, out)
+        }
+        let mut i: int = 0
+        while i < n.args.len() {
+            w_walk_expr(ctx, n.args.get(i), mode, out)
+            i = i + 1
+        }
+    } else if n.kind == "field" {
+        if n.left >= 0 {
+            w_walk_expr(ctx, n.left, mode, out)
+        }
+    } else if n.kind == "index" {
+        if n.left >= 0 {
+            w_walk_expr(ctx, n.left, mode, out)
+        }
+        if n.right >= 0 {
+            w_walk_expr(ctx, n.right, mode, out)
+        }
+    } else if n.kind == "qmark" {
+        if n.left >= 0 {
+            w_walk_expr(ctx, n.left, mode, out)
+        }
+    } else if n.kind == "match" {
+        if n.left >= 0 {
+            w_walk_expr(ctx, n.left, mode, out)
+        }
+        let mut i: int = 0
+        while i < n.args.len() {
+            let arm: MatchArm = ctx.match_arms.get(n.args.get(i))
+            w_walk_expr(ctx, arm.body, mode, out)
+            i = i + 1
+        }
+    } else if n.kind == "listlit" {
+        let mut i: int = 0
+        while i < n.args.len() {
+            w_walk_expr(ctx, n.args.get(i), mode, out)
+            i = i + 1
+        }
+    } else if n.kind == "structlit" {
+        let mut i: int = 0
+        while i < n.args.len() {
+            w_walk_expr(ctx, n.args.get(i), mode, out)
+            i = i + 1
+        }
+    } else if n.kind == "enumlit" {
+        # the checker's rewrite of `Enum.Variant(...)`. A LEAF, the
+        # Python years' walk_expr blind spot kept verbatim: the old
+        # walker had no enumlit branch, so a payload's idents were
+        # invisible to it (L001 fires on `let p` whose only use rides
+        # in Result.Ok(p) — the old linter's own bytes say so).
+    }
+}
+
+# w_stmts_collected(ctx, body) — the flat statement sequence, nested
+# scopes included (the py walk_stmts_collected).
+fn w_stmts_collected(ctx: Ctx, body: list[int]) -> list[int] {
+    let out: list[int] = []
+    let mut i: int = 0
+    while i < body.len() {
+        let s: int = body.get(i)
+        out.push(s)
+        let st: StmtN = ctx.stmts.get(s)
+        if st.kind == "if" {
+            let sub: list[int] = w_stmts_collected(ctx, st.body)
+            let mut k: int = 0
+            while k < sub.len() {
+                out.push(sub.get(k))
+                k = k + 1
+            }
+            if st.else_body.len() > 0 {
+                let sub2: list[int] = w_stmts_collected(ctx, st.else_body)
+                let mut k2: int = 0
+                while k2 < sub2.len() {
+                    out.push(sub2.get(k2))
+                    k2 = k2 + 1
+                }
+            }
+        } else if st.kind == "while" || st.kind == "for" {
+            let sub: list[int] = w_stmts_collected(ctx, st.body)
+            let mut k: int = 0
+            while k < sub.len() {
+                out.push(sub.get(k))
+                k = k + 1
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# w_count_stmts(ctx, body) — statements, recursively.
+fn w_count_stmts(ctx: Ctx, body: list[int]) -> int {
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < body.len() {
+        let s: int = body.get(i)
+        n = n + 1
+        let st: StmtN = ctx.stmts.get(s)
+        if st.kind == "if" {
+            n = n + w_count_stmts(ctx, st.body)
+            if st.else_body.len() > 0 {
+                n = n + w_count_stmts(ctx, st.else_body)
+            }
+        } else if st.kind == "while" || st.kind == "for" {
+            n = n + w_count_stmts(ctx, st.body)
+        }
+        i = i + 1
+    }
+    return n
+}
+
+# w_stmts_end_in_return(ctx, body) — the last statement is a return,
+# or an if whose both branches end in return (deep-scan-12 DSS-T-11).
+fn w_stmts_end_in_return(ctx: Ctx, body: list[int]) -> bool {
+    if body.len() == 0 {
+        return false
+    }
+    let last: StmtN = ctx.stmts.get(body.get(body.len() - 1))
+    if last.kind == "return" {
+        return true
+    }
+    if last.kind == "if" {
+        let a: bool = w_stmts_end_in_return(ctx, last.body)
+        let b: bool = w_stmts_end_in_return(ctx, last.else_body)
+        return a && b
+    }
+    return false
+}
+
+# ----------------------------------------------------------------------------
+# The rules. Each mirrors its Python twin's logic and message text
+# byte for byte; the walkers above carry the deep-scan fixes the
+# Python years landed (field names are not refs, spawn targets count,
+# asm operands reference their bindings, ...).
+# ----------------------------------------------------------------------------
+
+# rule_l001 — unused-binding.
+fn rule_l001(lv: LV) -> void {
+    let ctx: Ctx = lv.ctx
+    let mut fi: int = 0
+    while fi < lv.entry_fns.len() {
+        let key: str = lv.entry_fns.get(fi)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        let refs: list[str] = []
+        let es: list[int] = w_all_exprs(ctx, f.body)
+        let mut ei: int = 0
+        while ei < es.len() {
+            w_walk_expr(ctx, es.get(ei), "idents", refs)
+            ei = ei + 1
+        }
+        let ss: list[int] = w_stmts_collected(ctx, f.body)
+        let mut si: int = 0
+        while si < ss.len() {
+            let st: StmtN = ctx.stmts.get(ss.get(si))
+            if st.kind == "let" {
+                let name: str = st.name
+                if name == "_" || name.starts_with("_") {
+                    si = si + 1
+                    continue
+                }
+                if !str_in(name, refs) {
+                    li_warn(lv, "L001", st.line,
+                        "let binding '" + name + "' is never used")
+                    if li_enabled(lv, "L001") {
+                        lv.hints.push(Hint {
+                            rule: "L001", line: st.line, kind: "rename_let",
+                            name: name, fname: key, short: "", ty: "",
+                            is_extern: false, is_panic_handler: false,
+                            is_irq_handler: false, has_section: false,
+                            attr: "", head_kind: "", head_name: "",
+                            span_start: 0, span_end: 0
+                        })
+                    }
+                }
+            }
+            si = si + 1
+        }
+        fi = fi + 1
+    }
+}
+
+# rule_l002 — unused-function (spawn targets and struct-field default
+# calls count; main and #[panic_handler] are always used).
+fn rule_l002(lv: LV) -> void {
+    let ctx: Ctx = lv.ctx
+    let called: list[str] = []
+    let mut fi: int = 0
+    while fi < lv.entry_fns.len() {
+        let key: str = lv.entry_fns.get(fi)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        let es: list[int] = w_all_exprs(ctx, f.body)
+        let mut ei: int = 0
+        while ei < es.len() {
+            w_walk_expr(ctx, es.get(ei), "calls", called)
+            ei = ei + 1
+        }
+        fi = fi + 1
+    }
+    # the spawn family + the stream combinators carry their target as
+    # a fn-NAME argument — count those too (deep-scan-20 / Stage 118)
+    let mut fi2: int = 0
+    while fi2 < lv.entry_fns.len() {
+        let key: str = lv.entry_fns.get(fi2)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        let es: list[int] = w_all_exprs(ctx, f.body)
+        let mut ei: int = 0
+        while ei < es.len() {
+            li_spawn_scan(ctx, es.get(ei), called)
+            ei = ei + 1
+        }
+        fi2 = fi2 + 1
+    }
+    # struct field DEFAULT expressions can call (deep-scan-5)
+    let mut si: int = 0
+    while si < lv.entry_structs.len() {
+        let sname: str = lv.entry_structs.get(si)
+        let sdef: StructInfo = ctx.structs.get_or(sname, dummy_struct())
+        let mut di: int = 0
+        while di < sdef.fdefaults.len() {
+            let dflt: int = sdef.fdefaults.get(di)
+            if dflt >= 0 {
+                w_walk_expr(ctx, dflt, "calls", called)
+            }
+            di = di + 1
+        }
+        si = si + 1
+    }
+    str_push_unique(called, "main")
+    let mut pi: int = 0
+    while pi < lv.entry_fns.len() {
+        let key: str = lv.entry_fns.get(pi)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        if f.attr_panic_handler {
+            str_push_unique(called, key)
+        }
+        pi = pi + 1
+    }
+    let mut wi: int = 0
+    while wi < lv.entry_fns.len() {
+        let key: str = lv.entry_fns.get(wi)
+        if key == "main" {
+            wi = wi + 1
+            continue
+        }
+        let short: str = after_last_dot(key)
+        if short.starts_with("_") {
+            wi = wi + 1
+            continue
+        }
+        if !str_in(key, called) && !str_in(short, called) {
+            let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+            li_warn(lv, "L002", 0, "function '" + key + "' is never called")
+            if li_enabled(lv, "L002") {
+                lv.hints.push(Hint {
+                    rule: "L002", line: 0, kind: "rename_fn",
+                    name: "", fname: key, short: short, ty: "",
+                    is_extern: f.is_extern,
+                    is_panic_handler: f.attr_panic_handler,
+                    is_irq_handler: f.attr_irq_handler,
+                    has_section: f.attr_section != "",
+                    attr: "", head_kind: "", head_name: "",
+                    span_start: 0, span_end: 0
+                })
+            }
+        }
+        wi = wi + 1
+    }
+}
+
+# li_spawn_scan — one expression's spawn/combinator target idents.
+fn li_spawn_scan(ctx: Ctx, e: int, called: list[str]) -> void {
+    let n: ExprN = ctx.exprs.get(e)
+    if n.kind == "call" {
+        let nm: str = n.name
+        # the checked node: the checker rewrote the args (the fn name
+        # dropped) and recorded the target in mop — the compiler's
+        # spawn_fn. The raw-argument shapes below cover the unchecked
+        # fallback (the plain single-file view).
+        if n.mop != "" && (nm == "spawn" || nm == "async_spawn" || nm == "gen_spawn" || nm == "stream_map_int" || nm == "stream_filter_int" || nm == "stream_flat_map_int" || nm == "stream_fold_int") {
+            str_push_unique(called, n.mop)
+        }
+        if nm == "spawn" || nm == "async_spawn" || nm == "gen_spawn" {
+            if n.args.len() > 0 {
+                let a: ExprN = ctx.exprs.get(n.args.get(0))
+                if a.kind == "ident" {
+                    str_push_unique(called, a.name)
+                }
+            }
+        } else if nm == "stream_map_int" || nm == "stream_filter_int" || nm == "stream_flat_map_int" {
+            if n.args.len() > 1 {
+                let a: ExprN = ctx.exprs.get(n.args.get(1))
+                if a.kind == "ident" {
+                    str_push_unique(called, a.name)
+                }
+            }
+        } else if nm == "stream_fold_int" {
+            if n.args.len() > 2 {
+                let a: ExprN = ctx.exprs.get(n.args.get(2))
+                if a.kind == "ident" {
+                    str_push_unique(called, a.name)
+                }
+            }
+        }
+    }
+    if n.kind == "bin" {
+        if n.left >= 0 {
+            li_spawn_scan(ctx, n.left, called)
+        }
+        if n.right >= 0 {
+            li_spawn_scan(ctx, n.right, called)
+        }
+    } else if n.kind == "un" {
+        if n.left >= 0 {
+            li_spawn_scan(ctx, n.left, called)
+        }
+    } else if n.kind == "call" || n.kind == "method" || n.kind == "fieldcall" {
+        if n.left >= 0 {
+            li_spawn_scan(ctx, n.left, called)
+        }
+        let mut i: int = 0
+        while i < n.args.len() {
+            li_spawn_scan(ctx, n.args.get(i), called)
+            i = i + 1
+        }
+    } else if n.kind == "field" || n.kind == "qmark" {
+        if n.left >= 0 {
+            li_spawn_scan(ctx, n.left, called)
+        }
+    } else if n.kind == "index" {
+        if n.left >= 0 {
+            li_spawn_scan(ctx, n.left, called)
+        }
+        if n.right >= 0 {
+            li_spawn_scan(ctx, n.right, called)
+        }
+    } else if n.kind == "match" {
+        if n.left >= 0 {
+            li_spawn_scan(ctx, n.left, called)
+        }
+        let mut i: int = 0
+        while i < n.args.len() {
+            let arm: MatchArm = ctx.match_arms.get(n.args.get(i))
+            li_spawn_scan(ctx, arm.body, called)
+            i = i + 1
+        }
+    } else if n.kind == "listlit" || n.kind == "structlit" {
+        let mut i: int = 0
+        while i < n.args.len() {
+            li_spawn_scan(ctx, n.args.get(i), called)
+            i = i + 1
+        }
+    }
+}
+
+# rule_l003 — unused-struct-field.
+fn rule_l003(lv: LV) -> void {
+    let ctx: Ctx = lv.ctx
+    let reads: list[str] = []
+    let mut fi: int = 0
+    while fi < lv.entry_fns.len() {
+        let key: str = lv.entry_fns.get(fi)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        let es: list[int] = w_all_exprs(ctx, f.body)
+        let mut ei: int = 0
+        while ei < es.len() {
+            w_walk_expr(ctx, es.get(ei), "fields", reads)
+            ei = ei + 1
+        }
+        fi = fi + 1
+    }
+    let mut si: int = 0
+    while si < lv.entry_structs.len() {
+        let sname: str = lv.entry_structs.get(si)
+        let sdef: StructInfo = ctx.structs.get_or(sname, dummy_struct())
+        let mut fi2: int = 0
+        while fi2 < sdef.fields.len() {
+            let fname: str = sdef.fields.get(fi2)
+            if !str_in(fname, reads) {
+                li_warn(lv, "L003", sdef.line,
+                    "struct field '" + sname + "." + fname + "' is never read")
+            }
+            fi2 = fi2 + 1
+        }
+        si = si + 1
+    }
+}
+
+# li_is_result_type(t) — Result[...] or bare Result.
+fn li_is_result_type(t: str) -> bool {
+    if t == "" {
+        return false
+    }
+    return t.starts_with("Result[") || t == "Result"
+}
+
+# rule_l004 — ignored-result (a Result-returning call as a statement).
+fn rule_l004(lv: LV) -> void {
+    let ctx: Ctx = lv.ctx
+    let rets: map[str, str] = map_new()
+    let mut fi: int = 0
+    while fi < lv.entry_fns.len() {
+        let key: str = lv.entry_fns.get(fi)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        rets.set(key, f.ret)
+        fi = fi + 1
+    }
+    let mut fi2: int = 0
+    while fi2 < lv.entry_fns.len() {
+        let key: str = lv.entry_fns.get(fi2)
+        if key.contains(".") {
+            let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+            rets.set(after_first_dot(key), f.ret)
+        }
+        fi2 = fi2 + 1
+    }
+    rets.set("read_line", "Result[str, int]")
+    rets.set("read_file_tainted", "Result[str, int]")
+    let mut fi3: int = 0
+    while fi3 < lv.entry_fns.len() {
+        let key: str = lv.entry_fns.get(fi3)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        let ss: list[int] = w_stmts_collected(ctx, f.body)
+        let mut si: int = 0
+        while si < ss.len() {
+            let st: StmtN = ctx.stmts.get(ss.get(si))
+            if st.kind != "expr" {
+                si = si + 1
+                continue
+            }
+            let n: ExprN = ctx.exprs.get(st.e)
+            if n.kind == "call" {
+                let callee: str = n.name
+                let mut rt: str = rets.get_or(callee, "")
+                if !li_is_result_type(rt) {
+                    rt = n.t
+                }
+                if li_is_result_type(rt) {
+                    li_warn(lv, "L004", st.line,
+                        "call to '" + callee + "' returns Result; result is ignored (use `?` to propagate, or bind a discard: `let _ignored: " + rt + " = ...`)")
+                    if li_enabled(lv, "L004") {
+                        lv.hints.push(Hint {
+                            rule: "L004", line: st.line, kind: "wrap_let",
+                            name: callee, fname: "", short: "", ty: rt,
+                            is_extern: false, is_panic_handler: false,
+                            is_irq_handler: false, has_section: false,
+                            attr: "", head_kind: "", head_name: "",
+                            span_start: 0, span_end: 0
+                        })
+                    }
+                }
+            } else if n.kind == "method" || n.kind == "fieldcall" {
+                let m: str = n.name
+                let mut rt: str = rets.get_or(m, "")
+                if !li_is_result_type(rt) {
+                    rt = n.t
+                }
+                if li_is_result_type(rt) {
+                    li_warn(lv, "L004", st.line,
+                        "method call '" + m + "' returns Result; result is ignored (use `?` to propagate, or bind a discard: `let _ignored: " + rt + " = ...`)")
+                    if li_enabled(lv, "L004") {
+                        lv.hints.push(Hint {
+                            rule: "L004", line: st.line, kind: "wrap_let",
+                            name: m, fname: "", short: "", ty: rt,
+                            is_extern: false, is_panic_handler: false,
+                            is_irq_handler: false, has_section: false,
+                            attr: "", head_kind: "", head_name: "",
+                            span_start: 0, span_end: 0
+                        })
+                    }
+                }
+            }
+            si = si + 1
+        }
+        fi3 = fi3 + 1
+    }
+}
+
+# rule_l005 — explicit unwrap without a prior is_ok/is_some check in
+# the same block (control-flow aware, conservative).
+fn rule_l005(lv: LV) -> void {
+    let ctx: Ctx = lv.ctx
+    let mut fi: int = 0
+    while fi < lv.entry_fns.len() {
+        let key: str = lv.entry_fns.get(fi)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        let checked: list[str] = []
+        li_l005_block(lv, ctx, f.body, checked)
+        fi = fi + 1
+    }
+}
+
+# li_l005_ok_pred / err_pred — the polarity tables (deep-scan-20).
+fn li_l005_is_ok_pred(name: str) -> bool {
+    return name == "result_is_ok" || name == "option_is_some"
+}
+
+fn li_l005_is_err_pred(name: str) -> bool {
+    return name == "result_is_err" || name == "option_is_none"
+}
+
+# li_l005_cond_var(cond) — (kind, ident) of an is_ok/is_err call cond.
+fn li_l005_cond_var(ctx: Ctx, cond: int) -> list[str] {
+    let out: list[str] = ["", ""]
+    if cond < 0 {
+        return out
+    }
+    let n: ExprN = ctx.exprs.get(cond)
+    if n.kind != "call" || n.args.len() == 0 {
+        return out
+    }
+    let a: ExprN = ctx.exprs.get(n.args.get(0))
+    if a.kind != "ident" {
+        return out
+    }
+    if li_l005_is_ok_pred(n.name) {
+        out.set(0, "ok")
+        out.set(1, a.name)
+        return out
+    }
+    if li_l005_is_err_pred(n.name) {
+        out.set(0, "err")
+        out.set(1, a.name)
+    }
+    return out
+}
+
+# li_l005_block_terminates — return / panic / exit anywhere in the run.
+fn li_l005_block_terminates(ctx: Ctx, body: list[int]) -> bool {
+    let mut i: int = 0
+    while i < body.len() {
+        let st: StmtN = ctx.stmts.get(body.get(i))
+        if st.kind == "return" {
+            return true
+        }
+        if st.kind == "expr" {
+            let n: ExprN = ctx.exprs.get(st.e)
+            if n.kind == "call" && (n.name == "panic" || n.name == "exit") {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# li_l005_scan_unwraps — flag unchecked result_unwrap/option_unwrap in
+# the exprs of one statement (deep-scan-25).
+fn li_l005_scan_unwraps(lv: LV, ctx: Ctx, e: int, checked: list[str]) -> void {
+    let n: ExprN = ctx.exprs.get(e)
+    if n.kind == "call" && (n.name == "result_unwrap" || n.name == "option_unwrap") {
+        if n.args.len() > 0 {
+            let a: ExprN = ctx.exprs.get(n.args.get(0))
+            if a.kind == "ident" {
+                if !str_in(a.name, checked) {
+                    li_warn(lv, "L005", n.line,
+                        "explicit unwrap of '" + a.name + "' without prior is_ok/is_some check in this block")
+                }
+            }
+        }
+    }
+    if n.kind == "bin" {
+        if n.left >= 0 {
+            li_l005_scan_unwraps(lv, ctx, n.left, checked)
+        }
+        if n.right >= 0 {
+            li_l005_scan_unwraps(lv, ctx, n.right, checked)
+        }
+    } else if n.kind == "un" {
+        if n.left >= 0 {
+            li_l005_scan_unwraps(lv, ctx, n.left, checked)
+        }
+    } else if n.kind == "call" || n.kind == "method" || n.kind == "fieldcall" {
+        if n.left >= 0 {
+            li_l005_scan_unwraps(lv, ctx, n.left, checked)
+        }
+        let mut i: int = 0
+        while i < n.args.len() {
+            li_l005_scan_unwraps(lv, ctx, n.args.get(i), checked)
+            i = i + 1
+        }
+    } else if n.kind == "field" || n.kind == "qmark" {
+        if n.left >= 0 {
+            li_l005_scan_unwraps(lv, ctx, n.left, checked)
+        }
+    } else if n.kind == "index" {
+        if n.left >= 0 {
+            li_l005_scan_unwraps(lv, ctx, n.left, checked)
+        }
+        if n.right >= 0 {
+            li_l005_scan_unwraps(lv, ctx, n.right, checked)
+        }
+    } else if n.kind == "match" {
+        if n.left >= 0 {
+            li_l005_scan_unwraps(lv, ctx, n.left, checked)
+        }
+        let mut i: int = 0
+        while i < n.args.len() {
+            let arm: MatchArm = ctx.match_arms.get(n.args.get(i))
+            li_l005_scan_unwraps(lv, ctx, arm.body, checked)
+            i = i + 1
+        }
+    } else if n.kind == "listlit" || n.kind == "structlit" {
+        let mut i: int = 0
+        while i < n.args.len() {
+            li_l005_scan_unwraps(lv, ctx, n.args.get(i), checked)
+            i = i + 1
+        }
+    }
+}
+
+# li_l005_block — the flow walk (branch polarity, assignment clears,
+# loops start fresh).
+fn li_l005_block(lv: LV, ctx: Ctx, body: list[int], checked: list[str]) -> void {
+    let mut i: int = 0
+    while i < body.len() {
+        let st: StmtN = ctx.stmts.get(body.get(i))
+        if st.kind == "let" {
+            let v: ExprN = ctx.exprs.get(st.value)
+            if v.kind == "call" && li_l005_is_ok_pred(v.name) && v.args.len() > 0 {
+                let a: ExprN = ctx.exprs.get(v.args.get(0))
+                if a.kind == "ident" {
+                    str_push_unique(checked, a.name)
+                }
+            }
+        } else if st.kind == "assign" {
+            let t: ExprN = ctx.exprs.get(st.target)
+            if t.kind == "ident" {
+                str_remove_value(checked, t.name)
+            }
+        } else if st.kind == "if" {
+            li_l005_scan_unwraps(lv, ctx, st.cond, checked)
+            let cv: list[str] = li_l005_cond_var(ctx, st.cond)
+            let then_checked: list[str] = str_copy(checked)
+            let else_checked: list[str] = str_copy(checked)
+            if cv.get(0) == "ok" {
+                str_push_unique(then_checked, cv.get(1))
+            } else if cv.get(0) == "err" {
+                str_push_unique(else_checked, cv.get(1))
+            }
+            li_l005_block(lv, ctx, st.body, then_checked)
+            if st.else_body.len() > 0 {
+                li_l005_block(lv, ctx, st.else_body, else_checked)
+            }
+            if cv.get(0) == "err" && li_l005_block_terminates(ctx, st.body) {
+                str_push_unique(checked, cv.get(1))
+            }
+            i = i + 1
+            continue
+        } else if st.kind == "while" {
+            li_l005_scan_unwraps(lv, ctx, st.cond, checked)
+            let fresh: list[str] = []
+            li_l005_block(lv, ctx, st.body, fresh)
+            i = i + 1
+            continue
+        } else if st.kind == "for" {
+            li_l005_scan_unwraps(lv, ctx, st.iter, checked)
+            let fresh2: list[str] = []
+            li_l005_block(lv, ctx, st.body, fresh2)
+            i = i + 1
+            continue
+        }
+        let es: list[int] = w_exprs_in_stmt(ctx, body.get(i))
+        let mut ei: int = 0
+        while ei < es.len() {
+            li_l005_scan_unwraps(lv, ctx, es.get(ei), checked)
+            ei = ei + 1
+        }
+        i = i + 1
+    }
+}
+
+# rule_l006 — unnecessary-effects (declared but computed-pure). Runs
+# only when the check probe answered.
+fn rule_l006(lv: LV) -> void {
+    if !lv.has_effects {
+        return
+    }
+    let ctx: Ctx = lv.ctx
+    let mut fi: int = 0
+    while fi < lv.entry_fns.len() {
+        let key: str = lv.entry_fns.get(fi)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        if f.effects.len() == 0 {
+            fi = fi + 1
+            continue
+        }
+        let comp: str = lv.effects.get_or(key, "")
+        if comp == "" {
+            let decl: list[str] = str_sorted(f.effects)
+            let mut uniq: list[str] = []
+            let mut di: int = 0
+            while di < decl.len() {
+                str_push_unique(uniq, decl.get(di))
+                di = di + 1
+            }
+            li_warn(lv, "L006", 0,
+                "function '" + key + "' declares effects {" + join(uniq, ", ")
+                + "} but body is pure")
+            if li_enabled(lv, "L006") {
+                lv.hints.push(Hint {
+                    rule: "L006", line: 0, kind: "drop_uses",
+                    name: "", fname: key, short: after_last_dot(key), ty: "",
+                    is_extern: f.is_extern, is_panic_handler: false,
+                    is_irq_handler: false, has_section: false,
+                    attr: "", head_kind: "", head_name: "",
+                    span_start: 0, span_end: 0
+                })
+            }
+        }
+        fi = fi + 1
+    }
+}
+
+# rule_l007 — dead-code-after-return.
+fn rule_l007(lv: LV) -> void {
+    let ctx: Ctx = lv.ctx
+    let mut fi: int = 0
+    while fi < lv.entry_fns.len() {
+        let key: str = lv.entry_fns.get(fi)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        li_l007_block(lv, ctx, f.body, key)
+        fi = fi + 1
+    }
+}
+
+# li_l007_block — one block's scan; one delete hint per dead run.
+fn li_l007_block(lv: LV, ctx: Ctx, body: list[int], fname: str) -> void {
+    let mut seen_return: bool = false
+    let mut hinted: bool = false
+    let mut i: int = 0
+    while i < body.len() {
+        let st: StmtN = ctx.stmts.get(body.get(i))
+        if seen_return {
+            if !hinted {
+                hinted = true
+                li_warn(lv, "L007", st.line,
+                    "statement after `return` is unreachable")
+                if li_enabled(lv, "L007") {
+                    lv.hints.push(Hint {
+                        rule: "L007", line: st.line, kind: "delete_dead",
+                        name: "", fname: fname, short: "", ty: "",
+                        is_extern: false, is_panic_handler: false,
+                        is_irq_handler: false, has_section: false,
+                        attr: "", head_kind: st.kind, head_name: st.name,
+                        span_start: 0, span_end: 0
+                    })
+                }
+            } else {
+                li_warn(lv, "L007", st.line,
+                    "statement after `return` is unreachable")
+            }
+        }
+        if st.kind == "return" {
+            seen_return = true
+        }
+        if st.kind == "if" {
+            li_l007_block(lv, ctx, st.body, fname)
+            if st.else_body.len() > 0 {
+                li_l007_block(lv, ctx, st.else_body, fname)
+            }
+            if w_stmts_end_in_return(ctx, st.body) && w_stmts_end_in_return(ctx, st.else_body) {
+                seen_return = true
+            }
+        } else if st.kind == "while" || st.kind == "for" {
+            li_l007_block(lv, ctx, st.body, fname)
+        }
+        i = i + 1
+    }
+}
+
+# rule_l008 — long-function (>80 statements).
+fn rule_l008(lv: LV) -> void {
+    let ctx: Ctx = lv.ctx
+    let mut fi: int = 0
+    while fi < lv.entry_fns.len() {
+        let key: str = lv.entry_fns.get(fi)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        let n: int = w_count_stmts(ctx, f.body)
+        if n > 80 {
+            li_warn(lv, "L008", 0,
+                "function '" + key + "' has " + n.to_str()
+                + " statements (refactor candidate)")
+        }
+        fi = fi + 1
+    }
+}
+
+# rule_l009 — shadowing. The checker rejects shadowing as a compile
+# error before the linter runs; the rule never fires. Kept for the
+# table and a future warn-before-error mode.
+fn rule_l009(lv: LV) -> void {
+    return
+}
+
+# rule_l010 — empty-impl. The AST does not carry impl blocks; the raw
+# source is scanned for `impl Ident [T]? { ws }` (the Python years'
+# regex, byte for byte — including its willingness to match inside a
+# comment: the parse has already accepted the file, so an `impl` in a
+# comment is exactly what the regex saw too).
+fn rule_l010(lv: LV) -> void {
+    let src: str = lv.src
+    let n: int = src.len()
+    let mut i: int = 0
+    while i + 4 < n {
+        if src.byte_at(i) == 105 && src.byte_at(i + 1) == 109
+        && src.byte_at(i + 2) == 112 && src.byte_at(i + 3) == 108 {
+            # "impl" — then \s+ Ident (\[..\])? \s* { \s* }
+            let mut j: int = i + 4
+            let mut ws: int = 0
+            while j < n && f_is_ws(src.byte_at(j)) {
+                j = j + 1
+                ws = ws + 1
+            }
+            if ws == 0 || j >= n || !is_ident_start(src.byte_at(j)) {
+                i = i + 1
+                continue
+            }
+            let name_start: int = j
+            while j < n && is_ident_char(src.byte_at(j)) {
+                j = j + 1
+            }
+            let nm: str = src.slice(name_start, j)
+            # optional [ ... ]
+            let mut k: int = j
+            while k < n && f_is_ws(src.byte_at(k)) {
+                k = k + 1
+            }
+            if k < n && src.byte_at(k) == 91 {
+                let close: int = f_find_byte(src, 93, k + 1)
+                if close == -1 {
+                    i = i + 1
+                    continue
+                }
+                k = close + 1
+                while k < n && f_is_ws(src.byte_at(k)) {
+                    k = k + 1
+                }
+            }
+            if k < n && src.byte_at(k) == 123 {
+                let mut m: int = k + 1
+                while m < n && f_is_ws(src.byte_at(m)) {
+                    m = m + 1
+                }
+                if m < n && src.byte_at(m) == 125 {
+                    # match: [i, m+1)
+                    let mut line: int = 1
+                    let mut q: int = 0
+                    while q < i {
+                        if src.byte_at(q) == 10 {
+                            line = line + 1
+                        }
+                        q = q + 1
+                    }
+                    li_warn(lv, "L010", line,
+                        "impl block for '" + nm + "' is empty")
+                    if li_enabled(lv, "L010") {
+                        lv.hints.push(Hint {
+                            rule: "L010", line: line, kind: "delete_span",
+                            name: "", fname: "", short: "", ty: "",
+                            is_extern: false, is_panic_handler: false,
+                            is_irq_handler: false, has_section: false,
+                            attr: "", head_kind: "", head_name: "",
+                            span_start: i, span_end: m + 1
+                        })
+                    }
+                    i = m + 1
+                    continue
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+# rule_l011 — #[inline(always)] on a >50-statement function.
+fn rule_l011(lv: LV) -> void {
+    let ctx: Ctx = lv.ctx
+    let mut fi: int = 0
+    while fi < lv.entry_fns.len() {
+        let key: str = lv.entry_fns.get(fi)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        if f.attr_inline != "always" {
+            fi = fi + 1
+            continue
+        }
+        let n: int = w_count_stmts(ctx, f.body)
+        if n > 50 {
+            li_warn(lv, "L011", f.line,
+                "function '" + key + "' has #[inline(always)] but " + n.to_str()
+                + " statements (>50 — likely a mistake; consider removing the annotation or using #[hot])")
+            if li_enabled(lv, "L011") {
+                lv.hints.push(Hint {
+                    rule: "L011", line: f.line, kind: "drop_attr",
+                    name: "", fname: key, short: after_last_dot(key), ty: "",
+                    is_extern: false, is_panic_handler: false,
+                    is_irq_handler: false, has_section: false,
+                    attr: "inline_always", head_kind: "", head_name: "",
+                    span_start: 0, span_end: 0
+                })
+            }
+        }
+        fi = fi + 1
+    }
+}
+
+# rule_l012 — #[tail_call] on a >30-statement function.
+fn rule_l012(lv: LV) -> void {
+    let ctx: Ctx = lv.ctx
+    let mut fi: int = 0
+    while fi < lv.entry_fns.len() {
+        let key: str = lv.entry_fns.get(fi)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        if !f.attr_tail_call {
+            fi = fi + 1
+            continue
+        }
+        let n: int = w_count_stmts(ctx, f.body)
+        if n > 30 {
+            li_warn(lv, "L012", f.line,
+                "function '" + key + "' has #[tail_call] but " + n.to_str()
+                + " statements (>30 — the loop re-runs the whole body every iteration; move the bulk into a helper the tail loop calls)")
+            if li_enabled(lv, "L012") {
+                lv.hints.push(Hint {
+                    rule: "L012", line: f.line, kind: "drop_attr",
+                    name: "", fname: key, short: after_last_dot(key), ty: "",
+                    is_extern: false, is_panic_handler: false,
+                    is_irq_handler: false, has_section: false,
+                    attr: "tail_call", head_kind: "", head_name: "",
+                    span_start: 0, span_end: 0
+                })
+            }
+        }
+        fi = fi + 1
+    }
+}
+
+# rule_l013 — deprecated-call. The registry spans the whole crate
+# (a deprecation in an imported module is exactly the case the rule
+# exists for); the call sites come from the entry file only. Honesty
+# rules: a call inside a deprecated fn is silent; a method name warns
+# only when no non-deprecated method of the same short name exists; a
+# spawn / stream-combinator target warns through the same channel
+# L002 uses.
+fn rule_l013(lv: LV) -> void {
+    if !lv.has_registry {
+        return
+    }
+    if lv.dep_keys.len() == 0 {
+        return
+    }
+    if lv.dep_names.len() == 0 {
+        return
+    }
+    let ctx: Ctx = lv.ctx
+    # dedup by (line, name): two parallel lists of marks
+    let rep_lines: list[int] = []
+    let rep_names: list[str] = []
+    let mut fi: int = 0
+    while fi < lv.entry_fns.len() {
+        let key: str = lv.entry_fns.get(fi)
+        if str_in(key, lv.dep_keys) {
+            fi = fi + 1
+            continue
+        }
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        let es: list[int] = w_all_exprs(ctx, f.body)
+        let mut ei: int = 0
+        while ei < es.len() {
+            li_l013_scan(lv, ctx, es.get(ei), rep_lines, rep_names)
+            ei = ei + 1
+        }
+        fi = fi + 1
+    }
+    # struct field DEFAULT expressions can call too (the L002 law)
+    let mut si: int = 0
+    while si < lv.entry_structs.len() {
+        let sname: str = lv.entry_structs.get(si)
+        let sdef: StructInfo = ctx.structs.get_or(sname, dummy_struct())
+        let mut di: int = 0
+        while di < sdef.fdefaults.len() {
+            let dflt: int = sdef.fdefaults.get(di)
+            if dflt >= 0 {
+                li_l013_scan(lv, ctx, dflt, rep_lines, rep_names)
+            }
+            di = di + 1
+        }
+        si = si + 1
+    }
+}
+
+# li_l013_scan — one expression's deprecated call sites.
+fn li_l013_scan(lv: LV, ctx: Ctx, e: int, rep_lines: list[int], rep_names: list[str]) -> void {
+    let n: ExprN = ctx.exprs.get(e)
+    if n.kind == "call" || n.kind == "method" || n.kind == "fieldcall" {
+        let nm: str = n.name
+        if lv.dep_names.has(nm) {
+            li_l013_site(lv, n.line, nm, rep_lines, rep_names)
+        }
+        if n.kind == "call" {
+            # the checked node carries the spawn-family target in mop
+            # (the compiler's spawn_fn); the raw shapes cover the rest
+            if n.mop != "" && (nm == "spawn" || nm == "async_spawn" || nm == "gen_spawn" || nm == "stream_map_int" || nm == "stream_filter_int" || nm == "stream_flat_map_int" || nm == "stream_fold_int") {
+                if lv.dep_names.has(n.mop) {
+                    li_l013_site(lv, n.line, n.mop, rep_lines, rep_names)
+                }
+            }
+            let mut idx: int = -1
+            if nm == "spawn" || nm == "async_spawn" || nm == "gen_spawn" {
+                idx = 0
+            } else if nm == "stream_map_int" || nm == "stream_filter_int" || nm == "stream_flat_map_int" {
+                idx = 1
+            } else if nm == "stream_fold_int" {
+                idx = 2
+            }
+            if idx >= 0 && n.args.len() > idx {
+                let a: ExprN = ctx.exprs.get(n.args.get(idx))
+                if a.kind == "ident" && lv.dep_names.has(a.name) {
+                    li_l013_site(lv, n.line, a.name, rep_lines, rep_names)
+                }
+            }
+        }
+    }
+    if n.kind == "bin" {
+        if n.left >= 0 {
+            li_l013_scan(lv, ctx, n.left, rep_lines, rep_names)
+        }
+        if n.right >= 0 {
+            li_l013_scan(lv, ctx, n.right, rep_lines, rep_names)
+        }
+    } else if n.kind == "un" {
+        if n.left >= 0 {
+            li_l013_scan(lv, ctx, n.left, rep_lines, rep_names)
+        }
+    } else if n.kind == "call" || n.kind == "method" || n.kind == "fieldcall" {
+        if n.left >= 0 {
+            li_l013_scan(lv, ctx, n.left, rep_lines, rep_names)
+        }
+        let mut i: int = 0
+        while i < n.args.len() {
+            li_l013_scan(lv, ctx, n.args.get(i), rep_lines, rep_names)
+            i = i + 1
+        }
+    } else if n.kind == "field" || n.kind == "qmark" {
+        if n.left >= 0 {
+            li_l013_scan(lv, ctx, n.left, rep_lines, rep_names)
+        }
+    } else if n.kind == "index" {
+        if n.left >= 0 {
+            li_l013_scan(lv, ctx, n.left, rep_lines, rep_names)
+        }
+        if n.right >= 0 {
+            li_l013_scan(lv, ctx, n.right, rep_lines, rep_names)
+        }
+    } else if n.kind == "match" {
+        if n.left >= 0 {
+            li_l013_scan(lv, ctx, n.left, rep_lines, rep_names)
+        }
+        let mut i: int = 0
+        while i < n.args.len() {
+            let arm: MatchArm = ctx.match_arms.get(n.args.get(i))
+            li_l013_scan(lv, ctx, arm.body, rep_lines, rep_names)
+            i = i + 1
+        }
+    } else if n.kind == "listlit" || n.kind == "structlit" {
+        let mut i: int = 0
+        while i < n.args.len() {
+            li_l013_scan(lv, ctx, n.args.get(i), rep_lines, rep_names)
+            i = i + 1
+        }
+    }
+}
+
+# li_l013_site — one (line, name) warning, deduped.
+fn li_l013_site(lv: LV, line: int, name: str, rep_lines: list[int], rep_names: list[str]) -> void {
+    let mut i: int = 0
+    while i < rep_lines.len() {
+        if rep_lines.get(i) == line && rep_names.get(i) == name {
+            return
+        }
+        i = i + 1
+    }
+    rep_lines.push(line)
+    rep_names.push(name)
+    let msg: str = lv.dep_names.get_or(name, "")
+    let is_method: bool = lv.dep_methods.has(name)
+    if msg != "" {
+        if is_method {
+            li_warn(lv, "L013", line,
+                "call to deprecated method '" + name + "': " + msg)
+        } else {
+            li_warn(lv, "L013", line,
+                "call to deprecated '" + name + "': " + msg)
+        }
+    } else {
+        if is_method {
+            li_warn(lv, "L013", line,
+                "call to deprecated method '" + name + "' (no deprecation message given)")
+        } else {
+            li_warn(lv, "L013", line,
+                "call to deprecated '" + name + "' (no deprecation message given)")
+        }
+    }
+}
+
+# ----------------------------------------------------------------------------
+# The rule table.
+# ----------------------------------------------------------------------------
+
+struct RuleDef {
+    id: str,
+    name: str,
+    sev: str,
+    fixable: bool
+}
+
+fn rule_table() -> list[RuleDef] {
+    let out: list[RuleDef] = []
+    out.push(RuleDef { id: "L001", name: "unused-binding", sev: "warning", fixable: true })
+    out.push(RuleDef { id: "L002", name: "unused-function", sev: "warning", fixable: true })
+    out.push(RuleDef { id: "L003", name: "unused-struct-field", sev: "warning", fixable: false })
+    out.push(RuleDef { id: "L004", name: "ignored-result", sev: "warning", fixable: true })
+    out.push(RuleDef { id: "L005", name: "explicit-unwrap", sev: "warning", fixable: false })
+    out.push(RuleDef { id: "L006", name: "unnecessary-effects", sev: "warning", fixable: true })
+    out.push(RuleDef { id: "L007", name: "dead-code-after-return", sev: "warning", fixable: true })
+    out.push(RuleDef { id: "L008", name: "long-function", sev: "info", fixable: false })
+    out.push(RuleDef { id: "L009", name: "shadowing", sev: "info", fixable: false })
+    out.push(RuleDef { id: "L010", name: "empty-impl", sev: "warning", fixable: true })
+    out.push(RuleDef { id: "L011", name: "inline-always-large", sev: "warning", fixable: true })
+    out.push(RuleDef { id: "L012", name: "tail-call-large", sev: "warning", fixable: true })
+    out.push(RuleDef { id: "L013", name: "deprecated-call", sev: "warning", fixable: false })
+    return out
+}
+
+# li_all_rules — every rule id in order.
+fn li_all_rules() -> list[str] {
+    let out: list[str] = []
+    let t: list[RuleDef] = rule_table()
+    let mut i: int = 0
+    while i < t.len() {
+        out.push(t.get(i).id)
+        i = i + 1
+    }
+    return out
+}
+
+# li_is_fixable(rule) — the mechanical-fix set.
+fn li_is_fixable(rule: str) -> bool {
+    let t: list[RuleDef] = rule_table()
+    let mut i: int = 0
+    while i < t.len() {
+        if t.get(i).id == rule {
+            return t.get(i).fixable
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# li_run_rules — run the enabled rules in sorted rule order (the
+# deep-scan-5 reproducible-output law).
+fn li_run_rules(lv: LV) -> void {
+    let order: list[str] = str_sorted(lv.only)
+    let mut i: int = 0
+    while i < order.len() {
+        let rid: str = order.get(i)
+        if !str_in(rid, li_all_rules()) {
+            i = i + 1
+            continue
+        }
+        if rid == "L001" {
+            rule_l001(lv)
+        } else if rid == "L002" {
+            rule_l002(lv)
+        } else if rid == "L003" {
+            rule_l003(lv)
+        } else if rid == "L004" {
+            rule_l004(lv)
+        } else if rid == "L005" {
+            rule_l005(lv)
+        } else if rid == "L006" {
+            rule_l006(lv)
+        } else if rid == "L007" {
+            rule_l007(lv)
+        } else if rid == "L008" {
+            rule_l008(lv)
+        } else if rid == "L009" {
+            rule_l009(lv)
+        } else if rid == "L010" {
+            rule_l010(lv)
+        } else if rid == "L011" {
+            rule_l011(lv)
+        } else if rid == "L012" {
+            rule_l012(lv)
+        } else if rid == "L013" {
+            rule_l013(lv)
+        }
+        i = i + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# The registry builders (L013's crate view + L006's effects).
+# ----------------------------------------------------------------------------
+
+# li_build_registry(lv, reg_ctx) — the deprecation registry from a
+# parsed crate (or the entry file itself): dep_names (plain fns +
+# surviving methods), dep_methods, dep_keys.
+fn li_build_registry(lv: LV, reg_ctx: Ctx) -> void {
+    let dep_fns: map[str, str] = map_new()
+    let dep_methods: map[str, str] = map_new()
+    let plain_methods: list[str] = []
+    let dep_keys: list[str] = []
+    let keys: list[str] = reg_ctx.fn_order
+    let mut i: int = 0
+    while i < keys.len() {
+        let key: str = keys.get(i)
+        let f: FnInfo = reg_ctx.fns.get_or(key, dummy_fn())
+        if !f.attr_deprecated {
+            if f.is_method {
+                str_push_unique(plain_methods, f.name)
+            }
+            i = i + 1
+            continue
+        }
+        str_push_unique(dep_keys, key)
+        if f.is_method {
+            dep_methods.set(f.name, f.attr_deprecated_msg)
+        } else {
+            dep_fns.set(f.name, f.attr_deprecated_msg)
+        }
+        i = i + 1
+    }
+    if dep_keys.len() == 0 {
+        lv.has_registry = true
+        return
+    }
+    # the ambiguity guard: a method short name that also exists as a
+    # NON-deprecated method somewhere in the crate stays silent
+    let mk: list[str] = dep_methods.keys()
+    let mut j: int = 0
+    while j < mk.len() {
+        let nm: str = mk.get(j)
+        if !str_in(nm, plain_methods) {
+            lv.dep_names.set(nm, dep_methods.get_or(nm, ""))
+            lv.dep_methods.set(nm, dep_methods.get_or(nm, ""))
+        }
+        j = j + 1
+    }
+    let fk: list[str] = dep_fns.keys()
+    let mut k: int = 0
+    while k < fk.len() {
+        lv.dep_names.set(fk.get(k), dep_fns.get_or(fk.get(k), ""))
+        k = k + 1
+    }
+    let mut d: int = 0
+    while d < dep_keys.len() {
+        lv.dep_keys.push(dep_keys.get(d))
+        d = d + 1
+    }
+    lv.has_registry = true
+}
+
+# li_registry_from_probe(lv, path) — spawn --probe-crate and build the
+# registry from its output; on refusal fall back to the entry file's
+# own declarations (the Python years' crate=None fallback).
+fn li_registry_from_probe(lv: LV, path: str, entry_ctx: Ctx) -> void uses Proc, Args {
+    let argv: list[str] = [self_argv0(), "--probe-crate", path]
+    let r: RunRes = run_child(argv)
+    if r.code != 0 || !r.spawned {
+        li_build_registry(lv, entry_ctx)
+        return
+    }
+    let lines: list[str] = r.out.split("\n")
+    let dep_fns: map[str, str] = map_new()
+    let dep_methods: map[str, str] = map_new()
+    let plain: list[str] = []
+    let mut i: int = 0
+    while i < lines.len() {
+        let l: str = lines.get(i)
+        if l.starts_with("D\t") {
+            let parts: list[str] = l.split("\t")
+            if parts.len() >= 3 {
+                dep_fns.set(parts.get(1), base64_decode(parts.get(2)))
+            }
+        } else if l.starts_with("DM\t") {
+            let parts: list[str] = l.split("\t")
+            if parts.len() >= 3 {
+                dep_methods.set(parts.get(1), base64_decode(parts.get(2)))
+            }
+        } else if l.starts_with("PM\t") {
+            let parts: list[str] = l.split("\t")
+            if parts.len() >= 2 {
+                str_push_unique(plain, parts.get(1))
+            }
+        }
+        i = i + 1
+    }
+    if dep_fns.len() == 0 && dep_methods.len() == 0 {
+        # no deprecations anywhere in the crate — registry empty
+        lv.has_registry = true
+        return
+    }
+    let mk: list[str] = dep_methods.keys()
+    let mut j: int = 0
+    while j < mk.len() {
+        let nm: str = mk.get(j)
+        if !str_in(nm, plain) {
+            lv.dep_names.set(nm, dep_methods.get_or(nm, ""))
+            lv.dep_methods.set(nm, dep_methods.get_or(nm, ""))
+        }
+        j = j + 1
+    }
+    let fk: list[str] = dep_fns.keys()
+    let mut k: int = 0
+    while k < fk.len() {
+        lv.dep_names.set(fk.get(k), dep_fns.get_or(fk.get(k), ""))
+        k = k + 1
+    }
+    # dep_keys: registry keys that are deprecated — the probe reports
+    # them in DK lines
+    let mut i2: int = 0
+    while i2 < lines.len() {
+        let l2: str = lines.get(i2)
+        if l2.starts_with("DK\t") {
+            let parts: list[str] = l2.split("\t")
+            if parts.len() >= 2 {
+                lv.dep_keys.push(parts.get(1))
+            }
+        }
+        i2 = i2 + 1
+    }
+    lv.has_registry = true
+}
+
+# li_effects_from_probe(lv, path) — spawn --probe-check; on success
+# fill the effects map (comma-joined per fn), else leave has_effects
+# false (the rule goes silent — the Python years' except HLError).
+fn li_effects_from_probe(lv: LV, path: str) -> void uses Proc, Args {
+    let argv: list[str] = [self_argv0(), "--probe-check", path]
+    let r: RunRes = run_child(argv)
+    if r.code != 0 || !r.spawned {
+        return
+    }
+    li_effects_of_output(lv, r.out)
+}
+
+# li_effects_from_filtered_probe(lv, path) — spawn --probe-check-enums:
+# the entry file checked against its own declarations plus every
+# crate enum (the Python years' filtered program). Any refusal — a
+# missing imported struct, a callee that lives in a module — leaves
+# the rule silent, the old except-HLError behaviour.
+fn li_effects_from_filtered_probe(lv: LV, path: str) -> void uses Proc, Args {
+    let argv: list[str] = [self_argv0(), "--probe-check-enums", path]
+    let r: RunRes = run_child(argv)
+    if r.code != 0 || !r.spawned {
+        return
+    }
+    li_effects_of_output(lv, r.out)
+}
+
+# li_effects_of_output(lv, out) — parse a probe's FX lines.
+fn li_effects_of_output(lv: LV, out: str) -> void {
+    let lines: list[str] = out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let l: str = lines.get(i)
+        if l.starts_with("FX\t") {
+            let parts: list[str] = l.split("\t")
+            if parts.len() >= 2 {
+                let mut fx: str = ""
+                if parts.len() >= 3 {
+                    fx = parts.get(2)
+                }
+                lv.effects.set(parts.get(1), fx)
+            }
+        }
+        i = i + 1
+    }
+    lv.has_effects = true
+}
+
+# ----------------------------------------------------------------------------
+# The lint pass over one view.
+# ----------------------------------------------------------------------------
+
+# li_new_lv(ctx, entry_fns, entry_structs, only, src) — a fresh pass.
+fn li_new_lv(ctx: Ctx, entry_fns: list[str], entry_structs: list[str], only: list[str], src: str) -> LV {
+    let names: map[str, str] = map_new()
+    let methods: map[str, str] = map_new()
+    let fx: map[str, str] = map_new()
+    return LV {
+        ctx: ctx,
+        entry_fns: entry_fns,
+        entry_structs: entry_structs,
+        warns: [],
+        hints: [],
+        only: only,
+        src: src,
+        dep_names: names,
+        dep_methods: methods,
+        dep_keys: [],
+        has_registry: false,
+        effects: fx,
+        has_effects: false
+    }
+}
+
+# li_run_plaint(path, only, no_crate) — the plain lint pass: parse the
+# single file, take the registry (crate probe when the file imports),
+# take the effects probe, run the rules. Prints the W protocol.
+fn li_run_plaint(path: str, only: list[str], no_crate: bool) -> void uses IO, Proc {
+    let src: str = read_file(path)
+    let ctx: Ctx = hl_parse_file(path)
+    let entry_fns: list[str] = str_copy(ctx.fn_order)
+    let entry_structs: list[str] = ctx.structs.keys()
+    let lv: LV = li_new_lv(ctx, entry_fns, entry_structs, only, src)
+    if no_crate || ctx.imports.len() == 0 {
+        li_build_registry(lv, ctx)
+    } else {
+        li_registry_from_probe(lv, path, ctx)
+    }
+    li_effects_from_probe(lv, path)
+    li_run_rules(lv)
+    li_print_pass(lv)
+}
+
+# li_run_fixt(tmp_path, only) — one fixer round's lint: entry keys from
+# the candidate parse, the crate view when the crate loads and checks
+# (probe first — a panic is a fallback, not a death), the same-file
+# view otherwise. Prints the W/H/S protocol.
+fn li_run_fixt(tmp_path: str, only: list[str]) -> void uses IO, Proc {
+    let src: str = read_file(tmp_path)
+    let entry_ctx: Ctx = hl_parse_file(tmp_path)
+    let entry_fns: list[str] = str_copy(entry_ctx.fn_order)
+    let entry_structs: list[str] = entry_ctx.structs.keys()
+    # the crate net: probe load+check; a clean probe means the merged
+    # view is safe to build in process (deterministic on the same bytes)
+    let probe: list[str] = [self_argv0(), "--probe-crate-check", tmp_path]
+    let pr: RunRes = run_child(probe)
+    let mut status: str = ""
+    let lv: LV = li_new_lv(entry_ctx, entry_fns, entry_structs, only, src)
+    if pr.code == 0 && pr.spawned {
+        let merged: Ctx = hl_load_crate(tmp_path)
+        check_program(merged)
+        let lv2: LV = li_new_lv(merged, entry_fns, entry_structs, only, src)
+        li_build_registry(lv2, merged)
+        # L006's effects come from the FILTERED view's check — the
+        # Python years' entry-only program that kept every crate enum
+        # (Result!) but pruned the imported structs and fns. A file
+        # whose own declarations lean on an imported type fails that
+        # check and the rule stays silent, exactly as it did.
+        li_effects_from_filtered_probe(lv2, tmp_path)
+        li_run_rules(lv2)
+        li_print_fix_pass(lv2, "")
+        return
+    }
+    status = panic_text(pr.err)
+    li_build_registry(lv, entry_ctx)
+    li_effects_from_probe(lv, tmp_path)
+    li_run_rules(lv)
+    li_print_fix_pass(lv, status)
+}
+
+# li_print_pass(lv) — the plain protocol: W lines only.
+fn li_print_pass(lv: LV) -> void uses IO {
+    let mut i: int = 0
+    while i < lv.warns.len() {
+        let w: Warn = lv.warns.get(i)
+        println("W\t" + w.rule + "\t" + w.sev + "\t" + w.line.to_str()
+        + "\t" + base64_encode(w.msg))
+        i = i + 1
+    }
+}
+
+# li_print_fix_pass(lv, status) — the fixer protocol: W, H and S lines.
+fn li_print_fix_pass(lv: LV, status: str) -> void uses IO {
+    li_print_pass(lv)
+    let mut i: int = 0
+    while i < lv.hints.len() {
+        let h: Hint = lv.hints.get(i)
+        println("H\t" + h.rule + "\t" + h.line.to_str() + "\t" + h.kind
+        + "\t" + h.name + "\t" + h.fname + "\t" + h.short + "\t" + h.ty
+        + "\t" + fx_flag4(h.is_extern, h.is_panic_handler, h.is_irq_handler, h.has_section)
+        + "\t" + h.attr + "\t" + h.head_kind + "\t" + h.head_name
+        + "\t" + h.span_start.to_str() + "\t" + h.span_end.to_str())
+        i = i + 1
+    }
+    println("S\t" + base64_encode(status))
+}
+
+# ----------------------------------------------------------------------------
+# The fixer — hints to byte-span edits, pessimistically.
+# ----------------------------------------------------------------------------
+
+struct Edit {
+    start: int,
+    end: int,
+    text: str,    # "" = pure deletion
+    rule: str,
+    line: int
+}
+
+struct Skip {
+    rule: str,
+    line: int,
+    reason: str
+}
+
+# fx_locate_fail — the planner's per-hint skip (the py _LocateError).
+struct PlanOut {
+    edits: list[Edit],
+    skips: list[Skip],
+    failed: str   # "" or the whole-plan failure (a lex error)
+}
+
+# fx_fn_defs(toks, short) — indices of every `fn <short>` site.
+fn fx_fn_defs(toks: list[FTok], short: str) -> list[int] {
+    let out: list[int] = []
+    let mut i: int = 0
+    while i + 1 < toks.len() {
+        let t: FTok = toks.get(i)
+        if t.kind == "kw" && t.value == "fn" {
+            let nx: FTok = toks.get(i + 1)
+            if nx.kind == "ident" && nx.value == short {
+                out.push(i)
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# fx_plan(src, hints) — plan every fixable hint against the token
+# stream. L004 wraps get per-round unique discard names.
+fn fx_plan(src: str, hints: list[Hint]) -> PlanOut {
+    let out: PlanOut = PlanOut { edits: [], skips: [], failed: "" }
+    let lexed: Result[list[FTok], str] = f_lex(src)
+    if !result_is_ok(lexed) {
+        # a tokenize failure kills the whole plan (py's _plan raises,
+        # every hint of the round is skipped with the reason)
+        let msg: str = result_unwrap_err(lexed)
+        let mut hi: int = 0
+        while hi < hints.len() {
+            out.skips.push(Skip { rule: hints.get(hi).rule,
+                line: hints.get(hi).line,
+                reason: "planning failed: " + msg })
+            hi = hi + 1
+        }
+        return out
+    }
+    let toks: list[FTok] = result_unwrap(lexed)
+    let mut wraps: int = 0
+    let mut i: int = 0
+    while i < hints.len() {
+        let h: Hint = hints.get(i)
+        if h.kind == "rename_let" {
+            fx_fix_rename_let(src, toks, h, out)
+        } else if h.kind == "rename_fn" {
+            fx_fix_rename_fn(src, toks, h, out)
+        } else if h.kind == "wrap_let" {
+            wraps = wraps + 1
+            let mut discard: str = "_ignored"
+            if wraps > 1 {
+                discard = "_ignored" + wraps.to_str()
+            }
+            fx_fix_wrap_let(src, toks, h, discard, out)
+        } else if h.kind == "drop_uses" {
+            fx_fix_drop_uses(src, toks, h, out)
+        } else if h.kind == "delete_dead" {
+            fx_fix_delete_dead(src, toks, h, out)
+        } else if h.kind == "delete_span" {
+            fx_fix_delete_span(src, toks, h, out)
+        } else if h.kind == "drop_attr" {
+            fx_fix_drop_attr(src, toks, h, out)
+        } else {
+            out.skips.push(Skip { rule: h.rule, line: h.line,
+                reason: "no fix strategy for hint kind '" + h.kind + "'" })
+        }
+        i = i + 1
+    }
+    fx_resolve_overlaps(out)
+    return out
+}
+
+# fx_resolve_overlaps(out) — drop edits overlapping a kept one,
+# longest span first (an L007 deletion subsumes smaller edits inside
+# the dead run).
+fn fx_resolve_overlaps(out: PlanOut) -> void {
+    # sort a copy of the edit list by (start asc, length desc)
+    let idx: list[int] = []
+    let mut i: int = 0
+    while i < out.edits.len() {
+        idx.push(i)
+        i = i + 1
+    }
+    # insertion sort on the index list
+    let mut a: int = 1
+    while a < idx.len() {
+        let v: int = idx.get(a)
+        let ve: Edit = out.edits.get(v)
+        let mut b: int = a - 1
+        while b >= 0 {
+            let be: Edit = out.edits.get(idx.get(b))
+            let mut swap: bool = false
+            if be.start > ve.start {
+                swap = true
+            } else if be.start == ve.start && (be.end - be.start) < (ve.end - ve.start) {
+                swap = true
+            }
+            if !swap {
+                break
+            }
+            idx.set(b + 1, idx.get(b))
+            b = b - 1
+        }
+        idx.set(b + 1, v)
+        a = a + 1
+    }
+    let kept: list[Edit] = []
+    let mut k: int = 0
+    while k < idx.len() {
+        let e: Edit = out.edits.get(idx.get(k))
+        let mut overlap: bool = false
+        let mut j: int = 0
+        while j < kept.len() {
+            let c: Edit = kept.get(j)
+            if e.start < c.end && c.start < e.end {
+                overlap = true
+                j = kept.len()
+            }
+            j = j + 1
+        }
+        if overlap {
+            out.skips.push(Skip { rule: e.rule, line: e.line,
+                reason: "overlaps another fix (subsumed)" })
+        } else {
+            kept.push(e)
+        }
+        k = k + 1
+    }
+    # replace out.edits with kept, in order
+    while out.edits.len() > 0 {
+        out.edits.pop()
+    }
+    let mut m: int = 0
+    while m < kept.len() {
+        out.edits.push(kept.get(m))
+        m = m + 1
+    }
+}
+
+# fx_fix_rename_let — L001: rename the binding and every consistent
+# occurrence inside the enclosing function.
+fn fx_fix_rename_let(src: str, toks: list[FTok], h: Hint, out: PlanOut) -> void {
+    let name: str = h.name
+    let short: str = after_last_dot(h.fname)
+    let defs: list[int] = fx_fn_defs(toks, short)
+    if defs.len() != 1 {
+        out.skips.push(Skip { rule: h.rule, line: h.line,
+            reason: "cannot uniquely locate the enclosing function '" + short + "' (" + defs.len().to_str() + " definition sites)" })
+        return
+    }
+    let b: int = defs.get(0)
+    let mut j: int = b
+    while j < toks.len() && !(toks.get(j).kind == "sym" && toks.get(j).value == "{") {
+        j = j + 1
+    }
+    if j >= toks.len() {
+        out.skips.push(Skip { rule: h.rule, line: h.line,
+            reason: "cannot find the function body" })
+        return
+    }
+    let brace_end: int = toks.get(j).off + 1
+    let close: int = f_find_block_close(src, brace_end)
+    if close < 0 {
+        out.skips.push(Skip { rule: h.rule, line: h.line,
+            reason: "cannot find the function's closing brace" })
+        return
+    }
+    let mut edits: int = 0
+    let mut i: int = b + 1
+    while i < toks.len() {
+        let t: FTok = toks.get(i)
+        if t.off >= close {
+            break
+        }
+        if t.off < brace_end {
+            i = i + 1
+            continue
+        }
+        if t.kind != "ident" || t.value != name {
+            i = i + 1
+            continue
+        }
+        let prev_dot: bool = i > 0 && toks.get(i - 1).kind == "sym" && toks.get(i - 1).value == "."
+        let nxt_colon: bool = i + 1 < toks.len() && toks.get(i + 1).kind == "sym" && toks.get(i + 1).value == ":"
+        let prev_brace: bool = i > 0 && toks.get(i - 1).kind == "sym" && (toks.get(i - 1).value == "{" || toks.get(i - 1).value == ",")
+        if prev_dot {
+            i = i + 1
+            continue
+        }
+        if nxt_colon && prev_brace {
+            i = i + 1
+            continue
+        }
+        out.edits.push(Edit { start: t.off, end: t.off + t.len,
+            text: "_" + name, rule: h.rule, line: h.line })
+        edits = edits + 1
+        i = i + 1
+    }
+    if edits == 0 {
+        out.skips.push(Skip { rule: h.rule, line: h.line,
+            reason: "no occurrences of '" + name + "' found in the function body" })
+    }
+}
+
+# fx_fix_rename_fn — L002: `fn f` -> `fn _f` at the definition site.
+fn fx_fix_rename_fn(src: str, toks: list[FTok], h: Hint, out: PlanOut) -> void {
+    if h.is_extern {
+        out.skips.push(Skip { rule: h.rule, line: h.line,
+            reason: "'" + h.short + "' is an extern declaration (the name is the C symbol)" })
+        return
+    }
+    if h.is_panic_handler || h.is_irq_handler || h.has_section {
+        out.skips.push(Skip { rule: h.rule, line: h.line,
+            reason: "'" + h.short + "' is a handler/section function (invoked outside the call graph)" })
+        return
+    }
+    let defs: list[int] = fx_fn_defs(toks, h.short)
+    if defs.len() != 1 {
+        out.skips.push(Skip { rule: h.rule, line: h.line,
+            reason: "'" + h.short + "' has " + defs.len().to_str() + " definition sites — ambiguous" })
+        return
+    }
+    let name_tok: FTok = toks.get(defs.get(0) + 1)
+    out.edits.push(Edit { start: name_tok.off, end: name_tok.off + name_tok.len,
+        text: "_" + h.short, rule: h.rule, line: h.line })
+}
+
+# fx_fix_wrap_let — L004: prefix the statement with a typed discard.
+fn fx_fix_wrap_let(src: str, toks: list[FTok], h: Hint, discard: str, out: PlanOut) -> void {
+    let ls: list[int] = f_line_starts(src)
+    let at: int = f_first_nonws(src, ls, h.line)
+    if at < 0 {
+        out.skips.push(Skip { rule: h.rule, line: h.line,
+            reason: "cannot locate statement on line " + h.line.to_str() })
+        return
+    }
+    let ty: str = h.ty
+    if ty == "" || ty.contains("\n") || ty.contains(chr(13)) {
+        out.skips.push(Skip { rule: h.rule, line: h.line,
+            reason: "no usable result type for the discard binding" })
+        return
+    }
+    out.edits.push(Edit { start: at, end: at,
+        text: "let " + discard + ": " + ty + " = ", rule: h.rule, line: h.line })
+}
+
+# fx_fix_drop_uses — L006: delete the `uses A, B` clause.
+fn fx_fix_drop_uses(src: str, toks: list[FTok], h: Hint, out: PlanOut) -> void {
+    if h.is_extern {
+        out.skips.push(Skip { rule: h.rule, line: h.line,
+            reason: "'" + h.short + "' is an extern declaration (the clause is part of the FFI contract)" })
+        return
+    }
+    let defs: list[int] = fx_fn_defs(toks, h.short)
+    if defs.len() != 1 {
+        out.skips.push(Skip { rule: h.rule, line: h.line,
+            reason: "'" + h.short + "' has " + defs.len().to_str() + " definition sites — ambiguous" })
+        return
+    }
+    let i: int = defs.get(0)
+    let n: int = toks.len()
+    let mut j: int = i + 1
+    let mut found: int = -1
+    while j < n {
+        let t: FTok = toks.get(j)
+        if t.kind == "kw" && t.value == "uses" {
+            found = j
+            j = n
+        } else if t.kind == "sym" && t.value == "{" {
+            j = n
+        }
+        j = j + 1
+    }
+    if found < 0 {
+        out.skips.push(Skip { rule: h.rule, line: h.line,
+            reason: "no `uses` clause found after `fn " + h.short + "`" })
+        return
+    }
+    let mut start: int = toks.get(found).off
+    let mut k: int = found + 1
+    let mut last: int = k
+    while k < n && toks.get(k).kind == "ident" {
+        last = k
+        k = k + 1
+        if k < n && toks.get(k).kind == "sym" && toks.get(k).value == "," {
+            k = k + 1
+        }
+    }
+    let mut end: int = toks.get(last).off + toks.get(last).len
+    if start == end {
+        out.skips.push(Skip { rule: h.rule, line: h.line,
+            reason: "`uses` clause has no effect list" })
+        return
+    }
+    if start > 0 && src.byte_at(start - 1) == 32 {
+        start = start - 1
+    } else if end < src.len() && src.byte_at(end) == 32 {
+        end = end + 1
+    }
+    out.edits.push(Edit { start: start, end: end, text: "", rule: h.rule, line: h.line })
+}
+
+# fx_stmt_start — byte offset of a dead-run head's first token.
+fn fx_stmt_start(src: str, toks: list[FTok], h: Hint) -> int {
+    let cands: list[int] = []
+    let mut i: int = 0
+    while i < toks.len() {
+        let t: FTok = toks.get(i)
+        if h.head_kind == "let" {
+            if t.kind == "kw" && t.value == "let" && t.line == h.line {
+                let mut j: int = i + 1
+                if j < toks.len() && toks.get(j).kind == "kw" && toks.get(j).value == "mut" {
+                    j = j + 1
+                }
+                if j < toks.len() && toks.get(j).kind == "ident" && toks.get(j).value == h.head_name {
+                    cands.push(i)
+                }
+            }
+        } else if h.head_kind == "return" {
+            if t.kind == "kw" && t.value == "return" && t.line == h.line {
+                cands.push(i)
+            }
+        } else if h.head_kind == "if" || h.head_kind == "while" || h.head_kind == "for" {
+            if t.kind == "kw" && t.value == h.head_kind && t.line == h.line {
+                cands.push(i)
+            }
+        } else if h.head_kind == "expr" {
+            if t.kind == "ident" && t.value == h.head_name && t.line == h.line {
+                if i + 1 < toks.len() && toks.get(i + 1).kind == "sym" && toks.get(i + 1).value == "(" {
+                    cands.push(i)
+                } else if i > 0 && toks.get(i - 1).kind == "sym" && toks.get(i - 1).value == "." {
+                    cands.push(i)
+                }
+            }
+        }
+        i = i + 1
+    }
+    if cands.len() == 1 {
+        return toks.get(cands.get(0)).off
+    }
+    let ls: list[int] = f_line_starts(src)
+    return f_first_nonws(src, ls, h.line)
+}
+
+# fx_fix_delete_dead — L007: delete the unreachable run to the block's
+# closing brace.
+fn fx_fix_delete_dead(src: str, toks: list[FTok], h: Hint, out: PlanOut) -> void {
+    let mut start: int = fx_stmt_start(src, toks, h)
+    if start < 0 {
+        out.skips.push(Skip { rule: h.rule, line: h.line,
+            reason: "cannot locate statement on line " + h.line.to_str() })
+        return
+    }
+    let ls: int = f_rfind_byte(src, 10, start) + 1
+    if f_span_blank(src, ls, start) {
+        start = ls
+    }
+    let close: int = f_find_block_close(src, start)
+    if close < 0 {
+        out.skips.push(Skip { rule: h.rule, line: h.line,
+            reason: "cannot find the block's closing brace" })
+        return
+    }
+    out.edits.push(Edit { start: start, end: close, text: "", rule: h.rule, line: h.line })
+}
+
+# fx_fix_delete_span — L010: delete the empty impl block.
+fn fx_fix_delete_span(src: str, toks: list[FTok], h: Hint, out: PlanOut) -> void {
+    if !(h.span_start >= 0 && h.span_end > h.span_start && h.span_end <= src.len()) {
+        out.skips.push(Skip { rule: h.rule, line: h.line,
+            reason: "impl span out of bounds" })
+        return
+    }
+    let span: str = src.slice(h.span_start, h.span_end)
+    let head_ok: bool = false
+    let ltrimmed: str = span.trim()
+    # the py check: span.lstrip().startswith(b"impl") and rstrip().endswith(b"}")
+    if !(ltrimmed.starts_with("impl") && ltrimmed.ends_with("}")) {
+        out.skips.push(Skip { rule: h.rule, line: h.line,
+            reason: "impl span does not look like an impl block" })
+        return
+    }
+    let absorbed: list[int] = f_absorb_line(src, h.span_start, h.span_end)
+    out.edits.push(Edit { start: absorbed.get(0), end: absorbed.get(1),
+        text: "", rule: h.rule, line: h.line })
+}
+
+# fx_fix_drop_attr — L011/L012: delete the attribute list (kept only
+# when it precedes the flagged fn).
+fn fx_fix_drop_attr(src: str, toks: list[FTok], h: Hint, out: PlanOut) -> void {
+    # match the token pattern of the attribute
+    let pat: list[str] = []
+    if h.attr == "inline_always" {
+        pat.push("sym:#")
+        pat.push("sym:[")
+        pat.push("ident:inline")
+        pat.push("sym:(")
+        pat.push("ident:always")
+        pat.push("sym:)")
+        pat.push("sym:]")
+    } else {
+        pat.push("sym:#")
+        pat.push("sym:[")
+        pat.push("ident:tail_call")
+        pat.push("sym:]")
+    }
+    let matches: list[int] = []
+    let mut i: int = 0
+    while i + pat.len() <= toks.len() {
+        let mut ok: bool = true
+        let mut d: int = 0
+        while d < pat.len() {
+            let t: FTok = toks.get(i + d)
+            let want: list[str] = pat.get(d).split(":")
+            if t.kind != want.get(0) || t.value != want.get(1) {
+                ok = false
+                d = pat.len()
+            }
+            d = d + 1
+        }
+        if ok {
+            matches.push(i)
+        }
+        i = i + 1
+    }
+    if matches.len() == 0 {
+        let mut what: str = "#[inline(always)]"
+        if h.attr != "inline_always" {
+            what = "#[tail_call]"
+        }
+        out.skips.push(Skip { rule: h.rule, line: h.line,
+            reason: "no " + what + " attribute found" })
+        return
+    }
+    let kept: list[int] = []
+    let mut m: int = 0
+    while m < matches.len() {
+        let a: int = matches.get(m)
+        let b: int = a + pat.len() - 1
+        let mut j: int = b + 1
+        while j < toks.len() && !(toks.get(j).kind == "kw" && toks.get(j).value == "fn") {
+            j = j + 1
+        }
+        if j + 1 < toks.len() && toks.get(j + 1).kind == "ident" && toks.get(j + 1).value == h.short {
+            kept.push(a)
+            kept.push(b)
+        }
+        m = m + 1
+    }
+    if kept.len() == 0 {
+        out.skips.push(Skip { rule: h.rule, line: h.line,
+            reason: "attribute does not precede `fn " + h.short + "`" })
+        return
+    }
+    let mut k: int = 0
+    while k < kept.len() {
+        let a: int = kept.get(k)
+        let b: int = kept.get(k + 1)
+        let start: int = toks.get(a).off
+        let end: int = toks.get(b).off + toks.get(b).len
+        let absorbed: list[int] = f_absorb_line(src, start, end)
+        out.edits.push(Edit { start: absorbed.get(0), end: absorbed.get(1),
+            text: "", rule: h.rule, line: h.line })
+        k = k + 2
+    }
+}
+
+# fx_apply(src, edits) — splice the edits in, right to left.
+fn fx_apply(src: str, edits: list[Edit]) -> str {
+    # sort indices by start desc
+    let idx: list[int] = []
+    let mut i: int = 0
+    while i < edits.len() {
+        idx.push(i)
+        i = i + 1
+    }
+    let mut a: int = 1
+    while a < idx.len() {
+        let v: int = idx.get(a)
+        let mut b: int = a - 1
+        while b >= 0 && edits.get(idx.get(b)).start < edits.get(v).start {
+            idx.set(b + 1, idx.get(b))
+            b = b - 1
+        }
+        idx.set(b + 1, v)
+        a = a + 1
+    }
+    let mut out: str = src
+    let mut k: int = 0
+    while k < idx.len() {
+        let e: Edit = edits.get(idx.get(k))
+        out = out.slice(0, e.start) + e.text + out.slice(e.end, out.len())
+        k = k + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# The unified diff (--diff output, difflib's format).
+# ----------------------------------------------------------------------------
+
+# diff_lines(a, b) — split keeping the line terminators.
+fn diff_lines(src: str) -> list[str] {
+    let out: list[str] = []
+    let mut cur: str = ""
+    let mut i: int = 0
+    while i < src.len() {
+        let c: int = src.byte_at(i)
+        cur = cur + chr(c)
+        if c == 10 {
+            out.push(cur)
+            cur = ""
+        }
+        i = i + 1
+    }
+    if cur != "" {
+        out.push(cur)
+    }
+    return out
+}
+
+# diff_lcs_ops(a, b) — the edit script as op codes: a list of
+# ("equal"/"del"/"ins", a_index, b_index) triples packed in three
+# parallel lists.
+fn diff_lcs_ops(a: list[str], b: list[str]) -> list[str] {
+    let ops: list[str] = []
+    let na: int = a.len()
+    let nb: int = b.len()
+    # Myers O(ND) with a trace of V arrays
+    let max_d: int = na + nb
+    if max_d == 0 {
+        return ops
+    }
+    if max_d > 4000 {
+        # very large inputs: fall back to a whole-file replace hunk
+        let mut i: int = 0
+        while i < na {
+            ops.push("del")
+            i = i + 1
+        }
+        let mut j: int = 0
+        while j < nb {
+            ops.push("ins")
+            j = j + 1
+        }
+        return ops
+    }
+    # trace[k] = the V array snapshot at step d (stored as packed list)
+    let trace: list[list[int]] = []
+    let v0: list[int] = []
+    let mut vk: int = -max_d - 1
+    while vk <= max_d + 1 {
+        v0.push(0)
+        vk = vk + 1
+    }
+    trace.push(v0)
+    let mut v: list[int] = str_int_copy(v0)
+    let mut found_d: int = -1
+    let mut done: bool = false
+    let mut d: int = 0
+    while d <= max_d && !done {
+        let snapshot: list[int] = str_int_copy(v)
+        if d > 0 {
+            trace.push(snapshot)
+        } else {
+            trace.set(0, snapshot)
+        }
+        let mut k: int = -d
+        while k <= d && !done {
+            let idx: int = k + max_d + 1
+            let mut x: int = 0
+            let down: bool = k == -d || (k != d && v.get(idx - 1) < v.get(idx + 1))
+            if down {
+                x = v.get(idx + 1)
+            } else {
+                x = v.get(idx - 1) + 1
+            }
+            let mut y: int = x - k
+            while x < na && y < nb && y >= 0 && a.get(x) == b.get(y) {
+                x = x + 1
+                y = y + 1
+            }
+            v.set(idx, x)
+            if x >= na && y >= nb {
+                found_d = d
+                done = true
+            }
+            k = k + 2
+        }
+        d = d + 1
+    }
+    if found_d < 0 {
+        return ops
+    }
+    # backtrack
+    let mut rev: list[str] = []
+    let mut x: int = na
+    let mut y: int = nb
+    let mut dd: int = found_d
+    while dd > 0 {
+        let vprev: list[int] = trace.get(dd)
+        let k: int = x - y
+        let idx: int = k + max_d + 1
+        let down: bool = k == -dd || (k != dd && vprev.get(idx - 1) < vprev.get(idx + 1))
+        let mut prev_k: int = 0
+        if down {
+            prev_k = k + 1
+        } else {
+            prev_k = k - 1
+        }
+        let prev_x: int = vprev.get(prev_k + max_d + 1)
+        let prev_y: int = prev_x - prev_k
+        while x > prev_x && y > prev_y {
+            rev.push("equal")
+            x = x - 1
+            y = y - 1
+        }
+        if down {
+            rev.push("ins")
+            y = y - 1
+        } else {
+            rev.push("del")
+            x = x - 1
+        }
+        dd = dd - 1
+    }
+    while x > 0 && y > 0 {
+        rev.push("equal")
+        x = x - 1
+        y = y - 1
+    }
+    while x > 0 {
+        rev.push("del")
+        x = x - 1
+    }
+    while y > 0 {
+        rev.push("ins")
+        y = y - 1
+    }
+    let mut r: int = rev.len() - 1
+    while r >= 0 {
+        ops.push(rev.get(r))
+        r = r - 1
+    }
+    return ops
+}
+
+# str_int_copy(src) — copy an int list.
+fn str_int_copy(src: list[int]) -> list[int] {
+    let out: list[int] = []
+    let mut i: int = 0
+    while i < src.len() {
+        out.push(src.get(i))
+        i = i + 1
+    }
+    return out
+}
+
+# diff_unified(orig: str, fixed: str, fromfile: str, tofile: str) — the
+# unified diff text (3 context lines, difflib's header format).
+fn diff_unified(orig: str, fixed: str, fromfile: str, tofile: str) -> str {
+    let a: list[str] = diff_lines(orig)
+    let b: list[str] = diff_lines(fixed)
+    let ops: list[str] = diff_lcs_ops(a, b)
+    if ops.len() == 0 {
+        return ""
+    }
+    # does anything differ?
+    let mut any: bool = false
+    let mut q: int = 0
+    while q < ops.len() {
+        if ops.get(q) != "equal" {
+            any = true
+            q = ops.len()
+        }
+        q = q + 1
+    }
+    if !any {
+        return ""
+    }
+    let mut out: str = "--- " + fromfile + "\n+++ " + tofile + "\n"
+    # group ops into hunks with 3 context lines
+    let mut i: int = 0
+    let ai: list[int] = []   # a-index of each op
+    let bi: list[int] = []   # b-index of each op
+    let mut ax: int = 0
+    let mut bx: int = 0
+    let mut q2: int = 0
+    while q2 < ops.len() {
+        ai.push(ax)
+        bi.push(bx)
+        if ops.get(q2) == "equal" {
+            ax = ax + 1
+            bx = bx + 1
+        } else if ops.get(q2) == "del" {
+            ax = ax + 1
+        } else {
+            bx = bx + 1
+        }
+        q2 = q2 + 1
+    }
+    while i < ops.len() {
+        # find the next non-equal op
+        while i < ops.len() && ops.get(i) == "equal" {
+            i = i + 1
+        }
+        if i >= ops.len() {
+            break
+        }
+        # hunk starts 3 lines of context before (bounded by 0)
+        let mut hstart: int = i - 3
+        if hstart < 0 {
+            hstart = 0
+        }
+        # extend to the end of the change cluster + 3 context
+        let mut j: int = i
+        let mut last_change: int = i
+        while j < ops.len() {
+            if ops.get(j) != "equal" {
+                last_change = j
+            } else {
+                # equal run of >= 6 ends the cluster (context 3+3)
+                let mut run: int = 0
+                let mut k: int = j
+                while k < ops.len() && ops.get(k) == "equal" {
+                    run = run + 1
+                    k = k + 1
+                }
+                if run >= 6 {
+                    j = ops.len()
+                }
+            }
+            if j >= ops.len() {
+                break
+            }
+            j = j + 1
+        }
+        let mut hend: int = last_change + 3 + 1
+        if hend > ops.len() {
+            hend = ops.len()
+        }
+        # hunk range over A and B
+        let a_from: int = ai.get(hstart)
+        let mut a_count: int = 0
+        let mut z: int = hstart
+        while z < hend && z < ops.len() {
+            if ops.get(z) == "equal" || ops.get(z) == "del" {
+                a_count = a_count + 1
+            }
+            z = z + 1
+        }
+        let mut b_count: int = 0
+        let mut z2: int = hstart
+        while z2 < hend && z2 < ops.len() {
+            if ops.get(z2) == "equal" || ops.get(z2) == "ins" {
+                b_count = b_count + 1
+            }
+            z2 = z2 + 1
+        }
+        out = out + "@@ -" + fmt_range(a_from + 1, a_count)
+        + " +" + fmt_range(bi.get(hstart) + 1, b_count) + " @@\n"
+        # emit the lines
+        let mut m: int = hstart
+        while m < hend && m < ops.len() {
+            let op: str = ops.get(m)
+            if op == "equal" {
+                out = out + " " + a.get(ai.get(m))
+            } else if op == "del" {
+                out = out + "-" + a.get(ai.get(m))
+            } else {
+                out = out + "+" + b.get(bi.get(m))
+            }
+            m = m + 1
+        }
+        i = hend
+    }
+    return out
+}
+
+# fmt_range(begin, count) — difflib's _format_range_unified: "b" when
+# count == 1, "b,c" otherwise, with the empty-range begin adjusted.
+fn fmt_range(begin: int, count: int) -> str {
+    let mut b: int = begin
+    if count == 0 {
+        b = b - 1
+    }
+    if count == 1 {
+        return b.to_str()
+    }
+    return b.to_str() + "," + count.to_str()
+}
+
+# ----------------------------------------------------------------------------
+# The fix loop driver (the Python years' Fixer.fix_source).
+# ----------------------------------------------------------------------------
+
+struct FixReport {
+    error: str,        # the round-0 parse refusal ("" = none)
+    fixed_rules: list[str],   # interleaved rule, count
+    fixed_counts: list[int],
+    skipped: list[Skip],
+    rounds: int,
+    changed: bool,
+    src: str
+}
+
+# fx_flag4 — "1"/"0" for the H protocol's flag column.
+fn fx_flag4(a: bool, b: bool, c: bool, d: bool) -> str {
+    let mut out: str = ""
+    if a {
+        out = out + "1"
+    } else {
+        out = out + "0"
+    }
+    if b {
+        out = out + "1"
+    } else {
+        out = out + "0"
+    }
+    if c {
+        out = out + "1"
+    } else {
+        out = out + "0"
+    }
+    if d {
+        out = out + "1"
+    } else {
+        out = out + "0"
+    }
+    return out
+}
+
+# fx_parse_child(out) — decode a fix-run child's protocol into
+# (warnings, hints, status). Returns false on a parse refusal.
+struct ChildLint {
+    ok: bool,
+    warns: list[Warn],
+    hints: list[Hint],
+    status: str
+}
+
+fn fx_parse_child(text: str) -> ChildLint {
+    let c: ChildLint = ChildLint { ok: true, warns: [], hints: [], status: "" }
+    let lines: list[str] = text.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let l: str = lines.get(i)
+        if l.starts_with("W\t") {
+            let parts: list[str] = l.split("\t")
+            if parts.len() >= 5 {
+                c.warns.push(Warn { rule: parts.get(1), sev: parts.get(2),
+                    line: int(parts.get(3)), msg: base64_decode(parts.get(4)) })
+            }
+        } else if l.starts_with("H\t") {
+            let parts: list[str] = l.split("\t")
+            if parts.len() >= 14 {
+                let flags: str = parts.get(8)
+                c.hints.push(Hint {
+                    rule: parts.get(1), line: int(parts.get(2)),
+                    kind: parts.get(3), name: parts.get(4), fname: parts.get(5),
+                    short: parts.get(6), ty: parts.get(7),
+                    is_extern: flags.len() > 0 && flags.byte_at(0) == 49,
+                    is_panic_handler: flags.len() > 1 && flags.byte_at(1) == 49,
+                    is_irq_handler: flags.len() > 2 && flags.byte_at(2) == 49,
+                    has_section: flags.len() > 3 && flags.byte_at(3) == 49,
+                    attr: parts.get(9), head_kind: parts.get(10),
+                    head_name: parts.get(11), span_start: int(parts.get(12)),
+                    span_end: int(parts.get(13))
+                })
+            }
+        } else if l.starts_with("S\t") {
+            let parts: list[str] = l.split("\t")
+            if parts.len() >= 2 {
+                c.status = base64_decode(parts.get(1))
+            }
+        }
+        i = i + 1
+    }
+    return c
+}
+
+# fx_count_of(items, rule, msg) — multiset count of (rule, msg).
+fn fx_count_of(items: list[Warn], rule: str, msg: str) -> int {
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < items.len() {
+        let w: Warn = items.get(i)
+        if w.rule == rule && w.msg == msg {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+# fx_verify(old, old_status, new, new_status) — would the candidate be
+# a strictly better file? (ok, why)
+fn fx_verify(old: list[Warn], old_status: str, new: list[Warn], new_status: str) -> list[str] {
+    let out: list[str] = ["", ""]
+    if new_status != "" {
+        if old_status == "" {
+            out.set(0, "no")
+            out.set(1, "fix broke the crate check: " + new_status)
+            return out
+        }
+        if new_status != old_status {
+            out.set(0, "no")
+            out.set(1, "fix changed the crate error: " + new_status)
+            return out
+        }
+    }
+    # at least one (rule, msg) count must drop
+    let mut resolved: bool = false
+    let mut i: int = 0
+    while i < old.len() {
+        let w: Warn = old.get(i)
+        if fx_count_of(new, w.rule, w.msg) < fx_count_of(old, w.rule, w.msg) {
+            resolved = true
+            i = old.len()
+        }
+        i = i + 1
+    }
+    if !resolved {
+        out.set(0, "no")
+        out.set(1, "no warning was resolved")
+        return out
+    }
+    # no new warnings on an unfixable rule
+    let mut j: int = 0
+    while j < new.len() {
+        let w: Warn = new.get(j)
+        if !li_is_fixable(w.rule) {
+            if fx_count_of(new, w.rule, w.msg) > fx_count_of(old, w.rule, w.msg) {
+                out.set(0, "no")
+                out.set(1, "fix would add new " + w.rule + " warnings")
+                return out
+            }
+        }
+        j = j + 1
+    }
+    if new.len() > old.len() {
+        out.set(0, "no")
+        out.set(1, "fix would add new warnings")
+        return out
+    }
+    out.set(0, "yes")
+    return out
+}
+
+# fx_fix_source(argv0, file, src, only, corrupt) — the fixed-point
+# loop. corrupt=true injects the white-box corruption the rollback
+# self-test drives (fn main -> fn main( on every applied round).
+fn fx_fix_source(argv0: str, file: str, src: str, only: list[str], corrupt: bool) -> FixReport uses IO, Fs, Proc, Args, Clock {
+    let rep: FixReport = FixReport { error: "", fixed_rules: [], fixed_counts: [],
+        skipped: [], rounds: 0, changed: false, src: src }
+    let tmp: str = dir_of(file) + "/.hllint-fix-" + clock_ms().to_str() + ".hls"
+    write_file(tmp, src)
+    # round 0's lint
+    let argv: list[str] = [argv0, "--fix-run", tmp]
+    let r0: RunRes = run_child(fx_with_rules(argv, only))
+    if r0.code != 0 || !r0.spawned {
+        rep.error = panic_text(r0.err)
+        rm_file(tmp)
+        return rep
+    }
+    let c0: ChildLint = fx_parse_child(r0.out)
+    let mut cur: str = src
+    let mut warns: list[Warn] = c0.warns
+    let mut hints: list[Hint] = c0.hints
+    let mut status: str = c0.status
+    let mut round: int = 0
+    while round < 8 {
+        # the fixable hints of this round
+        let fixable: list[Hint] = []
+        let mut hi: int = 0
+        while hi < hints.len() {
+            let h: Hint = hints.get(hi)
+            if li_is_fixable(h.rule) {
+                fixable.push(h)
+            }
+            hi = hi + 1
+        }
+        if fixable.len() == 0 {
+            break
+        }
+        rep.rounds = rep.rounds + 1
+        let plan: PlanOut = fx_plan(cur, fixable)
+        let mut si: int = 0
+        while si < plan.skips.len() {
+            rep.skipped.push(plan.skips.get(si))
+            si = si + 1
+        }
+        if plan.edits.len() == 0 {
+            break
+        }
+        let mut cand: str = fx_apply(cur, plan.edits)
+        if corrupt {
+            cand = str_replace_first(cand, "fn main", "fn main(")
+        }
+        if cand == cur {
+            break
+        }
+        write_file(tmp, cand)
+        let vargv: list[str] = [argv0, "--fix-run", tmp]
+        let vr: RunRes = run_child(fx_with_rules(vargv, only))
+        if vr.code != 0 || !vr.spawned {
+            let mut fi: int = 0
+            while fi < fixable.len() {
+                rep.skipped.push(Skip { rule: fixable.get(fi).rule,
+                    line: fixable.get(fi).line,
+                    reason: "rolled back: fixed source does not parse ("
+                    + panic_text(vr.err) + ")" })
+                fi = fi + 1
+            }
+            break
+        }
+        let c1: ChildLint = fx_parse_child(vr.out)
+        let verdict: list[str] = fx_verify(warns, status, c1.warns, c1.status)
+        if verdict.get(0) != "yes" {
+            let mut fi2: int = 0
+            while fi2 < fixable.len() {
+                rep.skipped.push(Skip { rule: fixable.get(fi2).rule,
+                    line: fixable.get(fi2).line,
+                    reason: "rolled back: " + verdict.get(1) })
+                fi2 = fi2 + 1
+            }
+            break
+        }
+        # commit the round: the resolved (rule, msg) pairs — the old
+        # multiset minus the new one, counted once per DISTINCT pair
+        # (the Python years' Counter subtraction)
+        let mut wi: int = 0
+        while wi < warns.len() {
+            let w: Warn = warns.get(wi)
+            # skip a pair an earlier warning already counted
+            let mut seen: bool = false
+            let mut pj: int = 0
+            while pj < wi {
+                let pw: Warn = warns.get(pj)
+                if pw.rule == w.rule && pw.msg == w.msg {
+                    seen = true
+                    pj = wi
+                }
+                pj = pj + 1
+            }
+            if !seen {
+                let dropped: int = fx_count_of(warns, w.rule, w.msg) - fx_count_of(c1.warns, w.rule, w.msg)
+                if dropped > 0 {
+                    fx_add_fixed(rep, w.rule, dropped)
+                }
+            }
+            wi = wi + 1
+        }
+        cur = cand
+        warns = c1.warns
+        hints = c1.hints
+        status = c1.status
+        if warns.len() == 0 {
+            break
+        }
+        round = round + 1
+    }
+    rm_file(tmp)
+    rep.changed = cur != src
+    rep.src = cur
+    return rep
+}
+
+# fx_with_rules(argv, only) — append a --rule flag per rule filter.
+fn fx_with_rules(argv: list[str], only: list[str]) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < argv.len() {
+        out.push(argv.get(i))
+        i = i + 1
+    }
+    if only.len() > 0 {
+        let all: list[str] = li_all_rules()
+        let mut same: bool = only.len() == all.len()
+        if same {
+            let mut j: int = 0
+            while j < all.len() {
+                if only.get(j) != all.get(j) {
+                    same = false
+                    j = all.len()
+                }
+                j = j + 1
+            }
+        }
+        if !same {
+            let mut k: int = 0
+            while k < only.len() {
+                out.push("--rule")
+                out.push(only.get(k))
+                k = k + 1
+            }
+        }
+    }
+    return out
+}
+
+# fx_add_fixed(rep, rule, n) — accumulate the per-rule fixed counts.
+fn fx_add_fixed(rep: FixReport, rule: str, n: int) -> void {
+    let mut i: int = 0
+    while i < rep.fixed_rules.len() {
+        if rep.fixed_rules.get(i) == rule {
+            rep.fixed_counts.set(i, rep.fixed_counts.get(i) + n)
+            return
+        }
+        i = i + 1
+    }
+    rep.fixed_rules.push(rule)
+    rep.fixed_counts.push(n)
+}
+
+# str_replace_first(s, from, to) — the corruption hook's replace.
+fn str_replace_first(s: str, from: str, to: str) -> str {
+    let at: int = s.find(from)
+    if at < 0 {
+        return s
+    }
+    return s.slice(0, at) + to + s.slice(at + from.len(), s.len())
+}
+
+# rm_file(path) — unlink, ignoring absence.
+fn rm_file(path: str) -> void uses Proc {
+    proc_exec("rm -f '" + path + "'")
+}
+
+# ----------------------------------------------------------------------------
+# The probe children.
+# ----------------------------------------------------------------------------
+
+# probe_check(path) — parse + check the single file; FX lines.
+fn probe_check(path: str) -> int uses IO, Fs {
+    let ctx: Ctx = hl_parse_file(path)
+    check_program(ctx)
+    li_print_fx(ctx)
+    return 0
+}
+
+# probe_check_enums(path) — the filtered view's check: the entry
+# file's own declarations plus every crate enum, nothing else
+# imported (the Python years' lint view for the fixer's L006).
+fn probe_check_enums(path: str) -> int uses IO, Fs, Proc {
+    let entry: Ctx = hl_parse_file(path)
+    let merged: Ctx = hl_load_crate(path)
+    let ek: list[str] = merged.enums.keys()
+    let mut i: int = 0
+    while i < ek.len() {
+        let k: str = ek.get(i)
+        entry.enums.set(k, merged.enums.get_or(k, dummy_enum()))
+        i = i + 1
+    }
+    check_program(entry)
+    li_print_fx(entry)
+    return 0
+}
+
+# li_print_fx(ctx) — the FX protocol lines.
+fn li_print_fx(ctx: Ctx) -> void uses IO {
+    let keys: list[str] = ctx.fn_order
+    let mut i: int = 0
+    while i < keys.len() {
+        let k: str = keys.get(i)
+        if ctx.computed_effects.has(k) {
+            println("FX\t" + k + "\t" + join(ctx.computed_effects.get_or(k, []), ","))
+        }
+        i = i + 1
+    }
+}
+
+# probe_crate(path) — load the crate; D/DM/PM/DK lines.
+fn probe_crate(path: str) -> int uses IO, Proc {
+    let ctx: Ctx = hl_load_crate(path)
+    let keys: list[str] = ctx.fn_order
+    let mut i: int = 0
+    while i < keys.len() {
+        let key: str = keys.get(i)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        if !f.attr_deprecated {
+            if f.is_method {
+                println("PM\t" + f.name)
+            }
+        } else {
+            if f.is_method {
+                println("DM\t" + f.name + "\t" + base64_encode(f.attr_deprecated_msg))
+            } else {
+                println("D\t" + f.name + "\t" + base64_encode(f.attr_deprecated_msg))
+            }
+            println("DK\t" + key)
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+# probe_crate_check(path) — load + check the crate; "OK".
+fn probe_crate_check(path: str) -> int uses IO, Proc {
+    let ctx: Ctx = hl_load_crate(path)
+    check_program(ctx)
+    println("OK")
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# main — the CLI.
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Fs, Proc, Args, Clock, Exit {
+    let argv: list[str] = args()
+    let mut strict: bool = false
+    let mut want_fix: bool = false
+    let mut want_diff: bool = false
+    let mut want_list: bool = false
+    let mut file: str = ""
+    let rules: list[str] = []
+    let mut i: int = 1
+    while i < argv.len() {
+        let a: str = argv.get(i)
+        if a == "--lint-run" || a == "--fix-run" || a == "--probe-check"
+        || a == "--probe-check-enums" || a == "--probe-crate"
+        || a == "--probe-crate-check" || a == "--selftest-rollback" {
+            # internal modes: argv = [self, MODE, path, (--rule X)...]
+            let mode: str = a
+            let mut path: str = ""
+            if i + 1 < argv.len() {
+                path = argv.get(i + 1)
+            }
+            let rest: list[str] = []
+            let mut j: int = i + 2
+            while j < argv.len() {
+                rest.push(argv.get(j))
+                j = j + 1
+            }
+            let only: list[str] = li_rules_of(rest)
+            if mode == "--lint-run" {
+                let no_crate: bool = str_in("--no-crate", rest)
+                li_run_plaint(path, only, no_crate)
+                return 0
+            }
+            if mode == "--fix-run" {
+                li_run_fixt(path, only)
+                return 0
+            }
+            if mode == "--probe-check" {
+                return probe_check(path)
+            }
+            if mode == "--probe-check-enums" {
+                return probe_check_enums(path)
+            }
+            if mode == "--probe-crate" {
+                return probe_crate(path)
+            }
+            if mode == "--probe-crate-check" {
+                return probe_crate_check(path)
+            }
+            if mode == "--selftest-rollback" {
+                let src: str = read_file(path)
+                let rep: FixReport = fx_fix_source(self_argv0(), path, src, only, true)
+                if !rep.changed && rep.error == "" {
+                    println("ROLLBACK-OK")
+                    return 0
+                }
+                println("ROLLBACK-BAD")
+                return 1
+            }
+        }
+        if a == "--strict" {
+            strict = true
+        } else if a == "--fix" {
+            want_fix = true
+        } else if a == "--diff" {
+            want_diff = true
+        } else if a == "--list" {
+            want_list = true
+        } else if a == "--rule" {
+            if i + 1 >= argv.len() {
+                println("usage: hllint [--strict] [--rule RULE] [--list] [--fix] [--diff] file")
+                println("hllint: error: argument --rule: expected one argument")
+                return 2
+            }
+            rules.push(argv.get(i + 1))
+            i = i + 1
+        } else if a == "-h" || a == "--help" {
+            println("usage: hllint [-h] [--strict] [--rule RULE] [--list] [--fix] [--diff] file")
+            return 0
+        } else if a.starts_with("--") {
+            println("usage: hllint [-h] [--strict] [--rule RULE] [--list] [--fix] [--diff] file")
+            println("hllint: error: unrecognized arguments: " + a)
+            return 2
+        } else {
+            if file != "" {
+                println("usage: hllint [-h] [--strict] [--rule RULE] [--list] [--fix] [--diff] file")
+                println("hllint: error: unrecognized arguments: " + a)
+                return 2
+            }
+            file = a
+        }
+        i = i + 1
+    }
+    if want_list {
+        println("Rules:")
+        let t: list[RuleDef] = rule_table()
+        let mut r: int = 0
+        while r < t.len() {
+            let rd: RuleDef = t.get(r)
+            let mut mark: str = ""
+            if rd.fixable {
+                mark = "  [fixable]"
+            }
+            println("  " + rd.id + "  " + pad_right(rd.name, 25) + "  " + rd.sev + mark)
+            r = r + 1
+        }
+        return 0
+    }
+    if want_fix && want_diff {
+        println("usage: hllint [-h] [--strict] [--rule RULE] [--list] [--fix] [--diff] file")
+        println("hllint: error: argument --diff: not allowed with argument --fix")
+        return 2
+    }
+    if file == "" {
+        println("usage: hllint [-h] [--strict] [--rule RULE] [--list] [--fix] [--diff] file")
+        println("hllint: error: the following arguments are required: file")
+        return 2
+    }
+    if !file_exists(file) {
+        print_err("error: file not found: " + file + "\n")
+        return 1
+    }
+    let only: list[str] = li_only_of(rules)
+    # ---- the autofix paths ---------------------------------------------
+    if want_fix || want_diff {
+        let src: str = read_file(file)
+        let rep: FixReport = fx_fix_source(self_argv0(), file, src, only, false)
+        if rep.error != "" {
+            print_err("error: " + rep.error + "\n")
+            return 1
+        }
+        if want_diff && rep.changed {
+            print(diff_unified(src, rep.src, file, file + " (fixed)"))
+            let total: int = fx_total_fixed(rep)
+            println(file + ": " + total.to_str()
+            + " warnings auto-fixable; run hllint --fix to apply")
+            return 1
+        }
+        if want_fix && rep.changed {
+            write_file(file, rep.src)
+            let total2: int = fx_total_fixed(rep)
+            let parts: str = fx_parts_fixed(rep)
+            println(file + ": fixed " + total2.to_str() + " warnings in "
+            + rep.rounds.to_str() + " round(s) (" + parts + ")")
+        }
+        let mut si: int = 0
+        while si < rep.skipped.len() {
+            let s: Skip = rep.skipped.get(si)
+            println(file + ": not auto-fixed [" + s.rule + "] line "
+            + s.line.to_str() + ": " + s.reason)
+            si = si + 1
+        }
+        # the final state — what a plain lint would say now
+        let tmp: str = dir_of(file) + "/.hllint-fix-" + clock_ms().to_str() + ".hls"
+        write_file(tmp, rep.src)
+        let fargv: list[str] = [self_argv0(), "--lint-run", tmp, "--no-crate"]
+        let fr: RunRes = run_child(fx_with_rules(fargv, only))
+        rm_file(tmp)
+        let final_warns: list[Warn] = []
+        if fr.code == 0 && fr.spawned {
+            let fc: ChildLint = fx_parse_child(fr.out)
+            let mut fw: int = 0
+            while fw < fc.warns.len() {
+                final_warns.push(fc.warns.get(fw))
+                fw = fw + 1
+            }
+        }
+        if final_warns.len() == 0 && !rep.changed && rep.skipped.len() == 0 {
+            println(file + ": no warnings")
+            return 0
+        }
+        let mut wi: int = 0
+        while wi < final_warns.len() {
+            let w: Warn = final_warns.get(wi)
+            println(file + ":" + w.line.to_str() + ": " + w.sev
+            + " [" + w.rule + "] " + w.msg)
+            wi = wi + 1
+        }
+        if strict && final_warns.len() > 0 {
+            return 1
+        }
+        return 0
+    }
+    # ---- the report-only path ------------------------------------------
+    let argv2: list[str] = [self_argv0(), "--lint-run", file]
+    let r: RunRes = run_child(fx_with_rules(argv2, only))
+    if r.code != 0 || !r.spawned {
+        print_err("error: " + panic_text(r.err) + "\n")
+        return 1
+    }
+    let c: ChildLint = fx_parse_child(r.out)
+    if c.warns.len() == 0 {
+        println(file + ": no warnings")
+        return 0
+    }
+    let mut wi: int = 0
+    while wi < c.warns.len() {
+        let w: Warn = c.warns.get(wi)
+        println(file + ":" + w.line.to_str() + ": " + w.sev
+        + " [" + w.rule + "] " + w.msg)
+        wi = wi + 1
+    }
+    if strict {
+        return 1
+    }
+    return 0
+}
+
+# print_err(s) — stderr write (the eprint builtin flushes stdout
+# first, so a combined capture keeps the caller's logical order).
+fn print_err(s: str) -> void uses IO {
+    eprint(s)
+}
+
+# li_only_of(rules) — the only-set (every rule when unfiltered).
+fn li_only_of(rules: list[str]) -> list[str] {
+    if rules.len() == 0 {
+        return li_all_rules()
+    }
+    return str_copy(rules)
+}
+
+# li_rules_of(rest) — the --rule filters of an internal-mode rest argv.
+fn li_rules_of(rest: list[str]) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i + 1 < rest.len() + 1 {
+        if i < rest.len() && rest.get(i) == "--rule" && i + 1 < rest.len() {
+            out.push(rest.get(i + 1))
+            i = i + 1
+        }
+        i = i + 1
+    }
+    if out.len() == 0 {
+        return li_all_rules()
+    }
+    return out
+}
+
+# fx_total_fixed(rep) — the sum of the per-rule counts.
+fn fx_total_fixed(rep: FixReport) -> int {
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < rep.fixed_counts.len() {
+        n = n + rep.fixed_counts.get(i)
+        i = i + 1
+    }
+    return n
+}
+
+# fx_parts_fixed(rep) — "L001 x2, L004 x1" (sorted rule ids).
+fn fx_parts_fixed(rep: FixReport) -> str {
+    let order: list[str] = str_sorted(rep.fixed_rules)
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < order.len() {
+        let rid: str = order.get(i)
+        let mut j: int = 0
+        while j < rep.fixed_rules.len() {
+            if rep.fixed_rules.get(j) == rid {
+                if out != "" {
+                    out = out + ", "
+                }
+                out = out + rid + " x" + rep.fixed_counts.get(j).to_str()
+                j = rep.fixed_rules.len()
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+
+
+

@@ -98,6 +98,21 @@ $(BIN)/hlfmt: tools/hlfmt.hls $(wildcard std/*.hls) $(wildcard core/*.hls) | $(B
 	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
 	@rm -f $@.c
 
+# hllint — the linter, in Halis (the byte-contract native twin of the
+# Python hllint that retired: same thirteen rules, same output
+# grammar, same exit codes, same pessimistic autofix). Built on the
+# compiler's own front-end — tools/hlfront.hls links the real lexer,
+# parser and checker — so a lint verdict can never drift from what
+# bin/hlc believes about a program. Same prerequisites discipline as
+# the formatter: the tool's sources + the compiler it links + std +
+# core, never $(SNAP).
+$(BIN)/hllint: tools/hllint.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hllint] hlc compiles the linter (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hllint.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
 # hls-lts — the LTS policy tool, in Halis (the native twin of the
 # Python hls-lts that retired; the render it pins is the committed
 # LTS.md, byte for byte).
@@ -304,7 +319,7 @@ snapshot-prove: $(BIN)/hls-snap
 # that has not moved yet; the harness is tests/acc/harness.hls and
 # the scratch world lives under tests/.acc-scratch/ (gitignored,
 # wiped per run). The mk/*.mk targets depend on $(BIN)/acc-<gate>.
-$(BIN)/acc-%: tests/acc/%_acceptance.hls tests/acc/harness.hls $(wildcard std/*.hls) $(BIN)/hlfmt | $(BIN)/hlc
+$(BIN)/acc-%: tests/acc/%_acceptance.hls tests/acc/harness.hls $(wildcard std/*.hls) $(BIN)/hlfmt $(BIN)/hllint | $(BIN)/hlc
 	@mkdir -p $(BIN)
 	@echo "[acc] hlc compiles the $* gate (self-hosted, no python)..."
 	@$(BIN)/hlc tests/acc/$*_acceptance.hls $@.c
@@ -463,9 +478,12 @@ opt-stats:
 fmt: $(BIN)/hlfmt
 	@$(BIN)/hlfmt $(F)
 
-# Stage 14: linter
-lint:
-	@$(PYTHON) tools/hllint.py $(F)
+# Stage 14: linter. The linter is Halis now (tools/hllint.hls, the
+# full port of the Python years, built on the compiler's own
+# front-end through tools/hlfront.hls): hlc compiles it, cc links
+# bin/hllint, no interpreter in the loop.
+lint: $(BIN)/hllint
+	@$(BIN)/hllint $(F)
 
 # Stage 14: one-shot LSP diagnostics (for non-LSP editors)
 lsp-check:

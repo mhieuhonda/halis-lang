@@ -133,7 +133,7 @@ inline-acceptance:
 	  printf '  s = s + i\n  i = i + 1\n' >> $(BIN)/l011_test.hls; \
 	done
 	@printf '  return s\n}\n\nfn main() -> int {\n  return big_inline_always(10)\n}\n' >> $(BIN)/l011_test.hls
-	@if python3 tools/hllint.py --rule L011 $(BIN)/l011_test.hls 2>&1 | grep -q "L011"; then \
+	@if $(BIN)/hllint --rule L011 $(BIN)/l011_test.hls 2>&1 | grep -q "L011"; then \
 	  echo "  hllint L011 warns on #[inline(always)] > 50 statements: OK"; \
 	else \
 	  echo "FAIL: hllint L011 did not warn on large #[inline(always)]"; exit 1; \

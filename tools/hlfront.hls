@@ -1,0 +1,253 @@
+# ============================================================================
+# tools/hlfront.hls — the toolchain's shared front-end: the compiler,
+# linked, minus its CLI.
+# ----------------------------------------------------------------------------
+# Every lab tool that needs to SEE a Halis program — the linter's rule
+# walkers, the LSP's index, the fixer's verify rounds — imports this
+# module and drives the SAME front-end bin/hlc itself is built from:
+# the real lexer, the real parser, the real checker, the real AST
+# (ExprN/StmtN) and the real computed_effects. One grammar, one
+# checker, zero drift: a tool can never disagree with the compiler
+# about what a program says, because it IS the compiler's read.
+#
+# src/hlc.hls imports its pieces in one fixed order; this module
+# imports the same pieces in the same order, all except main.hls
+# (the compiler's CLI owns `main`, and no tool ships two mains).
+# The loader family that lives in main.hls around the CLI — dir_of,
+# join_path, resolve_import_path, load_file_into — travels with the
+# tools here instead, byte for byte the same laws.
+#
+# What a tool gets:
+#
+#   hl_parse_file(path)   single-file parse, imports NOT followed —
+#                         the lint view (one file's declarations, the
+#                         file's own imports list on ctx.imports)
+#   hl_load_crate(path)   entry parse + every import loaded
+#                         transitively — the crate view (module
+#                         merge, the deprecation-registry view)
+#   hl_check(ctx)         the checker: types, effects,
+#                         ctx.computed_effects. Panics on a program
+#                         that does not check — callers that must
+#                         survive a bad program run it in a probe
+#                         child (the tool re-execs itself with a
+#                         private flag and reads the exit code).
+#
+# Usage: import "./hlfront.hls" from a tool in tools/, then build.
+# ============================================================================
+
+import "../src/hlc/types.hls"
+import "../src/hlc/lexer.hls"
+import "../src/hlc/parser.hls"
+import "../src/hlc/linkerscript.hls"
+import "../src/hlc/checker.hls"
+import "../src/hlc/proof.hls"
+import "../src/hlc/check_expr.hls"
+import "../src/hlc/check_call.hls"
+import "../src/hlc/check_match.hls"
+import "../src/hlc/runtime.hls"
+import "../src/hlc/codegen.hls"
+import "../src/hlc/bootheader.hls"
+import "../src/hlc/pgo.hls"
+import "../src/hlc/simd.hls"
+import "../src/hlc/lto.hls"
+import "../src/hlc/gen_expr.hls"
+import "../src/hlc/gen_stmt.hls"
+import "../src/hlc/gen_fn.hls"
+
+# ----------------------------------------------------------------------------
+# The loader family (main.hls's own, verbatim laws — the tool side of
+# the compiler's import resolution).
+# ----------------------------------------------------------------------------
+
+# dir_of(path) — everything before the last "/", "." when bare.
+fn dir_of(path: str) -> str {
+    let mut i: int = path.len() - 1
+    while i >= 0 {
+        if path.byte_at(i) == 47 {
+            if i == 0 {
+                return "/"
+            }
+            return path.slice(0, i)
+        }
+        i = i - 1
+    }
+    return "."
+}
+
+# join_path(dir, rel) — one slash between them, no ".." handling.
+fn join_path(dir: str, rel: str) -> str {
+    if dir == "." {
+        return rel
+    }
+    if dir.len() == 0 {
+        return rel
+    }
+    if dir.byte_at(dir.len() - 1) == 47 {
+        return dir + rel
+    }
+    return dir + "/" + rel
+}
+
+# parent_dir(dir) — everything above the last "/".
+fn parent_dir(dir: str) -> str {
+    let mut i: int = dir.len() - 1
+    while i >= 0 {
+        if dir.byte_at(i) == 47 {
+            if i == 0 {
+                return "/"
+            }
+            return dir.slice(0, i)
+        }
+        i = i - 1
+    }
+    return "."
+}
+
+# resolve_import_path(imp, entry_dir, repo_root) — the compiler's
+# resolver: std./core. walk up from the entry to the root (plus the
+# cwd anchor), anything else relative to the entry's directory. "" =
+# not found.
+fn resolve_import_path(imp: str, entry_dir: str, repo_root: str) -> str uses IO, Proc {
+    if imp.starts_with("std.") || imp.starts_with("core.") {
+        let mut subdir: str = "std"
+        let mut cut: int = 4
+        if imp.starts_with("core.") {
+            subdir = "core"
+            cut = 5
+        }
+        let module_name: str = imp.slice(cut, imp.len())
+        let rel: str = subdir + "/" + module_name + ".hls"
+        let mut d: str = entry_dir
+        let mut tries: int = 0
+        while tries < 5 {
+            let candidate: str = join_path(d, rel)
+            if file_exists(candidate) {
+                return candidate
+            }
+            let parent: str = parent_dir(d)
+            if parent == d {
+                break
+            }
+            d = parent
+            tries = tries + 1
+        }
+        let fallback: str = join_path(repo_root, rel)
+        if file_exists(fallback) {
+            return fallback
+        }
+        let cwd: str = cwd_get()
+        if cwd != "" {
+            let cwd_candidate: str = join_path(cwd, rel)
+            if file_exists(cwd_candidate) {
+                return cwd_candidate
+            }
+        }
+        return ""
+    }
+    let direct: str = join_path(entry_dir, imp)
+    if file_exists(direct) {
+        return direct
+    }
+    return ""
+}
+
+# already_loaded(ctx, path) — the circular-import guard's set.
+fn already_loaded(ctx: Ctx, path: str) -> bool {
+    let mut i: int = 0
+    while i < ctx.loaded_files.len() {
+        if ctx.loaded_files.get(i) == path {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# load_file_into(ctx, abs_path) — read, lex, parse one module into
+# the merged program, then its imports, depth-first. Same law as the
+# compiler's loader: the entry file's parse is finished before any
+# dependency loads, crate attributes lock after it, and each file
+# parses exactly once per program.
+fn load_file_into(ctx: Ctx, abs_path: str) -> void uses IO, Proc {
+    if already_loaded(ctx, abs_path) {
+        return
+    }
+    ctx.crate_attrs_done = true
+    ctx.loaded_files.push(abs_path)
+    let file_dir: str = dir_of(abs_path)
+    let saved_src: str = ctx.src
+    let saved_toks: list[Tok] = ctx.toks
+    let saved_pos: int = ctx.pos
+    let saved_imports: list[str] = ctx.imports
+    let saved_map_file: str = ctx.cur_map_file
+    ctx.cur_map_file = abs_path
+    ctx.src = read_file(abs_path)
+    ctx.toks = []
+    ctx.pos = 0
+    ctx.imports = []
+    lex(ctx)
+    parse_program(ctx)
+    let my_imports: list[str] = ctx.imports
+    let mut i: int = 0
+    while i < my_imports.len() {
+        let imp: str = my_imports.get(i)
+        let resolved: str = resolve_import_path(imp, file_dir, ctx.repo_root)
+        if resolved == "" {
+            panic("module not found: " + imp)
+        }
+        load_file_into(ctx, resolved)
+        i = i + 1
+    }
+    ctx.src = saved_src
+    ctx.toks = saved_toks
+    ctx.pos = saved_pos
+    ctx.imports = saved_imports
+    ctx.cur_map_file = saved_map_file
+}
+
+# ----------------------------------------------------------------------------
+# The two views a tool takes.
+# ----------------------------------------------------------------------------
+
+# hl_parse_file(path) — the single-file (lint) view: the entry file's
+# own declarations, imports listed but NOT followed. Panics on a
+# parse error (callers gate bad files through a probe child first).
+fn hl_parse_file(path: str) -> Ctx uses IO {
+    let src: str = read_file(path)
+    let ctx: Ctx = new_ctx(src)
+    ctx.entry_dir = dir_of(path)
+    ctx.repo_root = parent_dir(ctx.entry_dir)
+    lex(ctx)
+    parse_program(ctx)
+    return ctx
+}
+
+# hl_load_crate(path) — the crate view: the entry file plus every
+# import, transitively, merged into one program. Panics when a module
+# cannot be found (callers that must tolerate it probe first).
+fn hl_load_crate(path: str) -> Ctx uses IO, Proc {
+    let ctx: Ctx = hl_parse_file(path)
+    let entry_imports: list[str] = ctx.imports
+    let mut i: int = 0
+    while i < entry_imports.len() {
+        let imp: str = entry_imports.get(i)
+        let resolved: str = resolve_import_path(imp, ctx.entry_dir, ctx.repo_root)
+        if resolved == "" {
+            panic("module not found: " + imp)
+        }
+        load_file_into(ctx, resolved)
+        i = i + 1
+    }
+    return ctx
+}
+
+# hl_check(ctx) — the checker, in process. Populates ctx.computed_effects
+# and every ExprN.t annotation. Panics on a program that does not
+# check; tools that lint untrusted files run this inside a probe child.
+fn hl_check(ctx: Ctx) -> void uses Fs {
+    check_program(ctx)
+}
+
+# ----------------------------------------------------------------------------
+# End of tools/hlfront.hls
+# ============================================================================
