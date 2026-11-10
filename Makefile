@@ -189,6 +189,16 @@ $(BIN)/hls-rt: tools/hls-rt.hls $(wildcard std/*.hls) $(wildcard core/*.hls) | $
 	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
 	@rm -f $@.c
 
+# hls-repro — the reproducible-builds verifier, in Halis (the native
+# twin of the Python hls-repro that retired; the module-driver legs of
+# the gate import a stripped copy of this file, fn main cut).
+$(BIN)/hls-repro: tools/hls-repro.hls $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hls-repro] hlc compiles the repro verifier (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hls-repro.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
 rc-readiness: $(BIN)/hls-rc
 	@$(BIN)/hls-rc readiness
 

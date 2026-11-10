@@ -1,0 +1,4909 @@
+# ============================================================================
+# hls-repro.hls — Stage 105 (v0.124.0-alpha): reproducible-build
+# verification across distros, in Halis: the native twin of
+# tools/hls-repro.py.
+# ----------------------------------------------------------------------------
+# Usage:
+#   bin/hls-repro <entry.hls> [--builds N] [--engine auto|boot|native]
+#                 [--cc CMD] [--cflags STR] [--epoch N] [--out DIR]
+#                 [--scratch DIR] [--json] [--no-smoke]
+#   bin/hls-repro --pkg [DIR] [the same options] [--release]
+#   bin/hls-repro --verify FILE [--in DIR] [--json]
+#
+# The native twin of tools/hls-repro.py, byte for byte: same CLI grammar,
+# same exit codes (0 the builds agree / 1 a named refusal / 2 usage), same
+# stdout/stderr, same file outputs, same determinism laws (same tree ->
+# byte-identical buildinfo; the buildinfo IS the report, schema
+# "hls-buildinfo/v1").
+#
+# The claim, unchanged. A build you cannot rebuild is a build you cannot
+# trust: this tool builds the same tree N times in N isolated build roots
+# under N deliberately different environments (the five distro profiles:
+# baseline, glibc-debian, musl-alpine, bsd-sandbox, nix-long) and requires
+# the artifacts to come back byte-identical. The tree is staged
+# hermetically (exactly the module set the audit's walkers name), the
+# intermediate C is ALWAYS build/hl_repro.c (the STT_FILE lesson), the cc
+# invocation is fixed and recorded, and SOURCE_DATE_EPOCH is honored then
+# DERIVED from the tree digest otherwise. `--verify FILE` re-runs the
+# whole recipe on the current tree under a shifted profile slice and
+# compares the hashes — the cross-distro answer. --release (package mode
+# only) is the shipping gate: lockfile required, drift checked, and the
+# versioned buildinfo plus one chained transparency-log record.
+#
+# Python-free notes (the port's own laws, the deviations the report
+# names):
+#   - the .py loaded hls-audit by path for the tree walkers; the same
+#     walker law (import-graph BFS, module keys, package tree, content
+#     hashes) is INLINED here — one file, no Python tools spawned.
+#   - the .py's boot engine ran `boot.py src/hlc.hls <entry> <out.c>`;
+#     its Stage-0 emission is byte-identical to `bin/hlc <entry> <out.c>`
+#     (the fixed-point law snapshot/hlc.c pins), so both engine classes
+#     compile through bin/hlc and the buildinfo records the class it
+#     resolved. toolchain.python is recorded as "" — no interpreter is
+#     in the loop (the field stays present; the .py's value does not
+#     transfer).
+#   - the audit's compile-level gate (the .py ran the interpreter's
+#     checker over the tree before staging) runs bin/hlc over the entry
+#     here (cwd = the repo root, so the std./core. fallback of the
+#     .py's resolver holds): the same trees refuse, "unauditable:"
+#     prefixed the same way, with the native checker's message text.
+#   - git dependencies in package manifests are refused (the .py cloned
+#     them through hls-pkg's resolver); path deps are walked exactly.
+#   - the child umask and the 600s/30s subprocess timeouts of the .py
+#     have no runtime primitive here (the smoke's 15s timeout runs
+#     through the `timeout` wrapper, exit 124); neither enters any
+#     recorded byte. The transparency log's flock serialization is
+#     likewise absent (sequential callers are unaffected).
+# ============================================================================
+#
+# Exit codes: 0 when the builds agree (or --verify reproduced); 1 any
+# mismatch, input drift, an unauditable package, a missing lockfile under
+# --release, an unwritable output, or a refused verify; 2 usage errors.
+
+import "std.result"
+import "std.str"
+import "std.json"
+import "std.sha256"
+
+# ============================================================================
+# Constants (the .py's, verbatim).
+# ============================================================================
+
+fn tool_name() -> str {
+    return "hls-repro"
+}
+
+fn tool_version() -> str {
+    return "0.124.0-alpha"
+}
+
+fn schema_name() -> str {
+    return "hls-buildinfo/v1"
+}
+
+fn c_name() -> str {
+    return "hl_repro.c"
+}
+
+fn bin_name() -> str {
+    return "hl_repro"
+}
+
+fn build_dir() -> str {
+    return "build"
+}
+
+fn default_cflags() -> str {
+    return "-O2"
+}
+
+fn max_builds() -> int {
+    return 5
+}
+
+fn smoke_timeout_s() -> int {
+    return 15
+}
+
+fn manifest_name() -> str {
+    return "hls-pkg.toml"
+}
+
+fn lockfile_name() -> str {
+    return "hls-pkg.lock"
+}
+
+fn buildinfo_name() -> str {
+    return "hls-repro.buildinfo.json"
+}
+
+fn stdio_in_null() -> int {
+    return 2
+}
+
+fn stdio_pipe() -> int {
+    return 1
+}
+
+fn zero64() -> str {
+    let mut out: str = ""
+    while out.len() < 64 {
+        out = out + "0"
+    }
+    return out
+}
+
+# ============================================================================
+# The data model — build records, smoke records, the error carrier, the
+# option set.
+# ============================================================================
+
+# SmokeOut — one build's runtime smoke (the .py's dict, kept as the JVal
+# doc it becomes plus the fields the aggregation reads).
+struct SmokeOut {
+    doc: JVal,
+    status: str,
+    exit_code: int,
+    out_sha: str
+}
+
+# BuildRec — one build's record (hashes and smoke only, no machine paths
+# beyond the root pattern; env = the PROFILE's deltas, the recorded
+# claim).
+struct BuildRec {
+    index: int,
+    profile: str,
+    root_pattern: str,
+    umask: str,
+    env_k: list[str],
+    env_v: list[str],
+    c_sha: str,
+    bin_sha: str,
+    bin_size: int,
+    smoke: SmokeOut
+}
+
+# Fail — the .py's ReproError / Mismatch / VerifyFail in one carrier:
+# msg/direct (the SystemExit texts print bare), mismatch (carries
+# builds + findings), vfail (carries the fresh hashes).
+struct Fail {
+    msg: str,
+    direct: bool,
+    mismatch: bool,
+    builds: list[BuildRec],
+    findings: list[str],
+    vfail: bool,
+    fresh_c: str,
+    fresh_bin: str
+}
+
+fn rfail(msg: str) -> Fail {
+    return Fail {
+        msg: msg, direct: false, mismatch: false, builds: [],
+        findings: [], vfail: false, fresh_c: "", fresh_bin: ""
+    }
+}
+
+fn dfail(msg: str) -> Fail {
+    return Fail {
+        msg: msg, direct: true, mismatch: false, builds: [],
+        findings: [], vfail: false, fresh_c: "", fresh_bin: ""
+    }
+}
+
+fn mfail(msg: str, builds: list[BuildRec], findings: list[str]) -> Fail {
+    return Fail {
+        msg: msg, direct: false, mismatch: true, builds: builds,
+        findings: findings, vfail: false, fresh_c: "", fresh_bin: ""
+    }
+}
+
+fn vfail(msg: str, fresh_c: str, fresh_bin: str) -> Fail {
+    return Fail {
+        msg: msg, direct: false, mismatch: false, builds: [],
+        findings: [], vfail: true, fresh_c: fresh_c, fresh_bin: fresh_bin
+    }
+}
+
+# Opt — the parsed command line (the argparse twin's fields; *_raw keeps
+# the flag text until validated, *_set marks presence vs "").
+struct Opt {
+    entry: str,
+    entry_set: bool,
+    pkg: str,
+    pkg_set: bool,
+    verify: str,
+    verify_set: bool,
+    in_dir: str,
+    builds: int,
+    builds_raw: str,
+    engine: str,
+    cc: str,
+    cflags: str,
+    epoch: int,
+    epoch_raw: str,
+    epoch_set: bool,
+    out: str,
+    scratch: str,
+    scratch_given: bool,
+    keep_scratch: bool,
+    no_smoke: bool,
+    release: bool,
+    json: bool
+}
+
+# ============================================================================
+# Byte classification + hex helpers.
+# ============================================================================
+
+fn is_digit_b(c: int) -> bool {
+    return c >= 48 && c <= 57
+}
+
+fn is_alpha_b(c: int) -> bool {
+    return(c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+}
+
+fn is_ident_start_b(c: int) -> bool {
+    return is_alpha_b(c) || c == 95
+}
+
+fn is_ident_char_b(c: int) -> bool {
+    return is_ident_start_b(c) || is_digit_b(c)
+}
+
+fn is_hex_digit_b(c: int) -> bool {
+    return is_digit_b(c) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70)
+}
+
+fn hex_val_b(c: int) -> int {
+    if is_digit_b(c) {
+        return c - 48
+    }
+    if c >= 97 && c <= 102 {
+        return c - 87
+    }
+    return c - 55
+}
+
+fn hex_digit_lc(n: int) -> str {
+    if n < 10 {
+        return chr(48 + n)
+    }
+    return chr(87 + n)
+}
+
+fn hex4(n: int) -> str {
+    return hex_digit_lc(n / 4096 % 16) + hex_digit_lc(n / 256 % 16)
+    + hex_digit_lc(n / 16 % 16) + hex_digit_lc(n % 16)
+}
+
+fn hex2(n: int) -> str {
+    return hex_digit_lc(n / 16) + hex_digit_lc(n % 16)
+}
+
+fn is_ws_b(c: int) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13 || c == 12 || c == 11
+}
+
+# ============================================================================
+# Path plumbing — the os.path slice the .py uses (join / dirname /
+# basename / isabs / lexical normpath / relpath; symlink resolution is
+# lexical, matching the repo's hlfmt / hls-rt convention).
+# ============================================================================
+
+fn path_is_abs(p: str) -> bool {
+    return p.len() > 0 && p.byte_at(0) == 47
+}
+
+fn path_join2(base: str, rel: str) -> str {
+    if rel.len() == 0 {
+        if base.len() == 0 {
+            return ""
+        }
+        return base
+    }
+    if path_is_abs(rel) {
+        return rel
+    }
+    if base.len() == 0 {
+        return rel
+    }
+    if base.byte_at(base.len() - 1) == 47 {
+        return base + rel
+    }
+    return base + "/" + rel
+}
+
+fn path_dirname(p: str) -> str {
+    let n: int = p.len()
+    if n == 0 {
+        return "."
+    }
+    let mut k: int = n - 1
+    while k > 0 && p.byte_at(k) == 47 {
+        k = k - 1
+    }
+    while k >= 0 {
+        if p.byte_at(k) == 47 {
+            if k == 0 {
+                return "/"
+            }
+            return p.slice(0, k)
+        }
+        k = k - 1
+    }
+    return "."
+}
+
+fn path_basename(p: str) -> str {
+    let n: int = p.len()
+    if n == 0 {
+        return ""
+    }
+    let mut k: int = n - 1
+    while k > 0 && p.byte_at(k) == 47 {
+        k = k - 1
+    }
+    let mut j: int = k
+    while j >= 0 {
+        if p.byte_at(j) == 47 {
+            return p.slice(j + 1, k + 1)
+        }
+        j = j - 1
+    }
+    return p.slice(0, k + 1)
+}
+
+fn split_components(p: str) -> list[str] {
+    let out: list[str] = []
+    let n: int = p.len()
+    let mut i: int = 0
+    while i < n {
+        let mut j: int = i
+        while j < n && p.byte_at(j) != 47 {
+            j = j + 1
+        }
+        out.push(p.slice(i, j))
+        i = j + 1
+    }
+    return out
+}
+
+# norm_path(p) — the lexical os.path.normpath (collapse "//", resolve
+# "." and ".." without symlink knowledge, strip the trailing slash).
+fn norm_path(p: str) -> str {
+    if p == "" {
+        return "."
+    }
+    let abs: bool = path_is_abs(p)
+    let comps: list[str] = split_components(p)
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < comps.len() {
+        let c: str = comps.get(i)
+        if c == "" || c == "." {
+            i = i + 1
+            continue
+        }
+        if c == ".." {
+            if out.len() > 0 && out.get(out.len() - 1) != ".." {
+                out.pop()
+            } else if !abs {
+                out.push("..")
+            }
+            i = i + 1
+            continue
+        }
+        out.push(c)
+        i = i + 1
+    }
+    if out.len() == 0 {
+        if abs {
+            return "/"
+        }
+        return "."
+    }
+    let mut r: str = ""
+    if abs {
+        r = "/"
+    }
+    let mut j: int = 0
+    while j < out.len() {
+        r = r + out.get(j)
+        if j + 1 < out.len() {
+            r = r + "/"
+        }
+        j = j + 1
+    }
+    return r
+}
+
+# abspath_of(p) — cwd-joined, normalized (the no-symlink realpath the
+# repo's own tools use).
+fn abspath_of(p: str) -> str uses Proc {
+    let mut raw: str = p
+    if !path_is_abs(raw) {
+        raw = cwd_get() + "/" + raw
+    }
+    return norm_path(raw)
+}
+
+# relpath_of(target, base) — os.path.relpath's slice for two normalized
+# absolute paths (".." ups then the remainder; "." when identical).
+fn relpath_of(target: str, base: str) -> str {
+    let t: list[str] = split_components(norm_path(target))
+    let b: list[str] = split_components(norm_path(base))
+    let mut common: int = 0
+    while common < t.len() && common < b.len() {
+        if t.get(common) != b.get(common) {
+            break
+        }
+        common = common + 1
+    }
+    let mut out: str = ""
+    let mut up: int = common
+    while up < b.len() {
+        if out.len() > 0 {
+            out = out + "/"
+        }
+        out = out + ".."
+        up = up + 1
+    }
+    let mut down: int = common
+    while down < t.len() {
+        if out.len() > 0 {
+            out = out + "/"
+        }
+        out = out + t.get(down)
+        down = down + 1
+    }
+    if out == "" {
+        return "."
+    }
+    return out
+}
+
+# ============================================================================
+# Sorting — Python's sorted() over str lists (byte-lexicographic) and
+# the (key, sha) pair sort the tree digest feeds on.
+# ============================================================================
+
+fn merge_strs(a: list[str], b: list[str]) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    let mut j: int = 0
+    while i < a.len() && j < b.len() {
+        if !(b.get(j) < a.get(i)) {
+            out.push(a.get(i))
+            i = i + 1
+        } else {
+            out.push(b.get(j))
+            j = j + 1
+        }
+    }
+    while i < a.len() {
+        out.push(a.get(i))
+        i = i + 1
+    }
+    while j < b.len() {
+        out.push(b.get(j))
+        j = j + 1
+    }
+    return out
+}
+
+fn sort_strs(xs: list[str]) -> list[str] {
+    if xs.len() <= 1 {
+        let one: list[str] = []
+        let mut i0: int = 0
+        while i0 < xs.len() {
+            one.push(xs.get(i0))
+            i0 = i0 + 1
+        }
+        return one
+    }
+    let mid: int = xs.len() / 2
+    let left_in: list[str] = []
+    let right_in: list[str] = []
+    let mut i: int = 0
+    while i < mid {
+        left_in.push(xs.get(i))
+        i = i + 1
+    }
+    while i < xs.len() {
+        right_in.push(xs.get(i))
+        i = i + 1
+    }
+    return merge_strs(sort_strs(left_in), sort_strs(right_in))
+}
+
+fn sorted_unique(xs: list[str]) -> list[str] {
+    let s: list[str] = sort_strs(xs)
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < s.len() {
+        if out.len() == 0 || s.get(i) != out.get(out.len() - 1) {
+            out.push(s.get(i))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn list_has(xs: list[str], x: str) -> bool {
+    let mut i: int = 0
+    while i < xs.len() {
+        if xs.get(i) == x {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# KV — one (key, sha256) input pair.
+struct KV {
+    k: str,
+    v: str
+}
+
+# sort_pairs(pairs) — sorted(pairs) by key (keys are unique; Python's
+# tuple sort never reaches the second element).
+fn sort_pairs(pairs: list[KV]) -> list[KV] {
+    let out: list[KV] = []
+    let mut i: int = 0
+    while i < pairs.len() {
+        let p: KV = pairs.get(i)
+        let mut j: int = 0
+        while j < out.len() {
+            if p.k < out.get(j).k {
+                break
+            }
+            j = j + 1
+        }
+        if j == out.len() {
+            out.push(p)
+        } else {
+            out.push(out.get(out.len() - 1))
+            let mut k: int = out.len() - 2
+            while k >= j {
+                out.set(k + 1, out.get(k))
+                k = k - 1
+            }
+            out.set(j, p)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ============================================================================
+# Python-compatible JSON — the model and the three serialisations the
+# .py uses: json.dumps(doc, indent=2, sort_keys=True) (the buildinfo /
+# the --json report — the caller adds the trailing newline the .py's
+# _dump did), json.dumps(rec, sort_keys=True, separators=(",", ":"))
+# (the transparency chain hash), and json.dumps(rec, sort_keys=True)
+# (the appended log line). Escaping is ensure_ascii: control chars and
+# non-ASCII become \uXXXX (lowercase hex); \b \t \n \f \r keep their
+# short forms.
+# ============================================================================
+
+struct JVal {
+    kind: str, # "null" | "bool" | "int" | "str" | "arr" | "obj"
+    sval: str,
+    ival: int,
+    bval: bool,
+    arr: list[JVal],
+    keys: list[str],
+    vals: list[JVal]
+}
+
+fn jv_null() -> JVal {
+    return JVal {
+        kind: "null", sval: "", ival: 0, bval: false, arr: [],
+        keys: [], vals: []
+    }
+}
+
+fn jv_bool(v: bool) -> JVal {
+    return JVal {
+        kind: "bool", sval: "", ival: 0, bval: v, arr: [],
+        keys: [], vals: []
+    }
+}
+
+fn jv_int(v: int) -> JVal {
+    return JVal {
+        kind: "int", sval: "", ival: v, bval: false, arr: [],
+        keys: [], vals: []
+    }
+}
+
+fn jv_str(v: str) -> JVal {
+    return JVal {
+        kind: "str", sval: v, ival: 0, bval: false, arr: [],
+        keys: [], vals: []
+    }
+}
+
+fn jv_arr(items: list[JVal]) -> JVal {
+    return JVal {
+        kind: "arr", sval: "", ival: 0, bval: false, arr: items,
+        keys: [], vals: []
+    }
+}
+
+fn jv_obj(keys: list[str], vals: list[JVal]) -> JVal {
+    return JVal {
+        kind: "obj", sval: "", ival: 0, bval: false, arr: [],
+        keys: keys, vals: vals
+    }
+}
+
+# jv_set(doc, key, val) — set/replace one key in an object doc.
+fn jv_set(doc: JVal, key: str, val: JVal) -> void {
+    let mut i: int = 0
+    while i < doc.keys.len() {
+        if doc.keys.get(i) == key {
+            doc.vals.set(i, val)
+            return
+        }
+        i = i + 1
+    }
+    doc.keys.push(key)
+    doc.vals.push(val)
+}
+
+# jv_get(doc, key) — object key lookup on a BUILT (JVal) doc;
+# jv_null() when missing (the .get("k") law).
+fn jv_get(doc: JVal, key: str) -> JVal {
+    if doc.kind != "obj" {
+        return jv_null()
+    }
+    let mut i: int = 0
+    while i < doc.keys.len() {
+        if doc.keys.get(i) == key {
+            return doc.vals.get(i)
+        }
+        i = i + 1
+    }
+    return jv_null()
+}
+
+# utf8 codepoint at i (len 1..4); [-1, -1] on invalid UTF-8.
+fn utf8_at(s: str, i: int) -> list[int] {
+    let n: int = s.len()
+    let b0: int = s.byte_at(i)
+    if b0 < 128 {
+        return[b0, 1]
+    }
+    if b0 >= 192 && b0 < 224 && i + 1 < n {
+        let b1: int = s.byte_at(i + 1)
+        if b1 >= 128 && b1 < 192 {
+            return[(b0 - 192) * 64 + (b1 - 128), 2]
+        }
+        return[-1, -1]
+    }
+    if b0 >= 224 && b0 < 240 && i + 2 < n {
+        let b1: int = s.byte_at(i + 1)
+        let b2: int = s.byte_at(i + 2)
+        if b1 >= 128 && b1 < 192 && b2 >= 128 && b2 < 192 {
+            return[(b0 - 224) * 4096 + (b1 - 128) * 64 + (b2 - 128), 3]
+        }
+        return[-1, -1]
+    }
+    if b0 >= 240 && b0 < 248 && i + 3 < n {
+        let b1: int = s.byte_at(i + 1)
+        let b2: int = s.byte_at(i + 2)
+        let b3: int = s.byte_at(i + 3)
+        if b1 >= 128 && b1 < 192 && b2 >= 128 && b2 < 192
+        && b3 >= 128 && b3 < 192 {
+            return[(b0 - 240) * 262144 + (b1 - 128) * 4096
+            + (b2 - 128) * 64 + (b3 - 128), 4]
+        }
+        return[-1, -1]
+    }
+    return[-1, -1]
+}
+
+# py_json_escape(s) — the string body between the quotes (Python's
+# ensure_ascii).
+fn py_json_escape(s: str) -> str {
+    let mut out: str = ""
+    let n: int = s.len()
+    let mut i: int = 0
+    while i < n {
+        let c: int = s.byte_at(i)
+        if c == 34 {
+            out = out + "\\\""
+            i = i + 1
+            continue
+        }
+        if c == 92 {
+            out = out + "\\\\"
+            i = i + 1
+            continue
+        }
+        if c == 8 {
+            out = out + "\\b"
+            i = i + 1
+            continue
+        }
+        if c == 9 {
+            out = out + "\\t"
+            i = i + 1
+            continue
+        }
+        if c == 10 {
+            out = out + "\\n"
+            i = i + 1
+            continue
+        }
+        if c == 12 {
+            out = out + "\\f"
+            i = i + 1
+            continue
+        }
+        if c == 13 {
+            out = out + "\\r"
+            i = i + 1
+            continue
+        }
+        if c < 32 {
+            out = out + "\\u" + hex4(c)
+            i = i + 1
+            continue
+        }
+        if c < 127 {
+            out = out + s.slice(i, i + 1)
+            i = i + 1
+            continue
+        }
+        let cp: list[int] = utf8_at(s, i)
+        if cp.get(0) < 0 {
+            out = out + s.slice(i, i + 1)
+            i = i + 1
+            continue
+        }
+        if cp.get(0) < 65536 {
+            out = out + "\\u" + hex4(cp.get(0))
+        } else {
+            let v: int = cp.get(0) - 65536
+            let hi: int = 55296 + v / 1024
+            let lo: int = 56320 + v % 1024
+            out = out + "\\u" + hex4(hi) + "\\u" + hex4(lo)
+        }
+        i = i + cp.get(1)
+    }
+    return out
+}
+
+fn jv_scalar_text(d: JVal) -> str {
+    if d.kind == "null" {
+        return "null"
+    }
+    if d.kind == "bool" {
+        if d.bval {
+            return "true"
+        }
+        return "false"
+    }
+    if d.kind == "int" {
+        return d.ival.to_str()
+    }
+    return "\"" + py_json_escape(d.sval) + "\""
+}
+
+# jv_sorted_order(doc) — the key index order (sort_keys).
+fn jv_sorted_order(doc: JVal) -> list[int] {
+    let order: list[int] = []
+    let mut i: int = 0
+    while i < doc.keys.len() {
+        order.push(i)
+        i = i + 1
+    }
+    let mut a: int = 0
+    while a < order.len() {
+        let mut b: int = a + 1
+        while b < order.len() {
+            if doc.keys.get(order.get(b)) < doc.keys.get(order.get(a)) {
+                let t: int = order.get(a)
+                order.set(a, order.get(b))
+                order.set(b, t)
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    return order
+}
+
+# py_json_dump_at(d, indent, pretty) — the recursive serializer; pretty =
+# indent=2 with sort_keys, compact = the (",", ":") separators.
+fn py_json_dump_at(d: JVal, indent: int, pretty: bool) -> str {
+    if d.kind == "arr" {
+        if d.arr.len() == 0 {
+            return "[]"
+        }
+        let mut pad: str = ""
+        let mut k: int = 0
+        while k < indent {
+            pad = pad + "  "
+            k = k + 1
+        }
+        let in_pad: str = pad + "  "
+        if pretty {
+            let mut out: str = "[\n"
+            let mut i: int = 0
+            while i < d.arr.len() {
+                out = out + in_pad
+                + py_json_dump_at(d.arr.get(i), indent + 1, true)
+                if i + 1 < d.arr.len() {
+                    out = out + ","
+                }
+                out = out + "\n"
+                i = i + 1
+            }
+            return out + pad + "]"
+        }
+        let mut out2: str = "["
+        let mut j: int = 0
+        while j < d.arr.len() {
+            out2 = out2 + py_json_dump_at(d.arr.get(j), indent, false)
+            if j + 1 < d.arr.len() {
+                out2 = out2 + ","
+            }
+            j = j + 1
+        }
+        return out2 + "]"
+    }
+    if d.kind == "obj" {
+        if d.keys.len() == 0 {
+            return "{}"
+        }
+        let order: list[int] = jv_sorted_order(d)
+        if pretty {
+            let mut pad: str = ""
+            let mut k2: int = 0
+            while k2 < indent {
+                pad = pad + "  "
+                k2 = k2 + 1
+            }
+            let in_pad2: str = pad + "  "
+            let mut out: str = "{\n"
+            let mut j2: int = 0
+            while j2 < order.len() {
+                let idx: int = order.get(j2)
+                out = out + in_pad2 + "\""
+                + py_json_escape(d.keys.get(idx)) + "\": "
+                + py_json_dump_at(d.vals.get(idx), indent + 1, true)
+                if j2 + 1 < order.len() {
+                    out = out + ","
+                }
+                out = out + "\n"
+                j2 = j2 + 1
+            }
+            return out + pad + "}"
+        }
+        let mut out2: str = "{"
+        let mut j3: int = 0
+        while j3 < order.len() {
+            let idx2: int = order.get(j3)
+            out2 = out2 + "\"" + py_json_escape(d.keys.get(idx2))
+            + "\":" + py_json_dump_at(d.vals.get(idx2), indent, false)
+            if j3 + 1 < order.len() {
+                out2 = out2 + ","
+            }
+            j3 = j3 + 1
+        }
+        return out2 + "}"
+    }
+    return jv_scalar_text(d)
+}
+
+# py_json_dump(d) — json.dumps(d, indent=2, sort_keys=True) (the .py's
+# _dump added "\n" — the callers here do).
+fn py_json_dump(d: JVal) -> str {
+    return py_json_dump_at(d, 0, true)
+}
+
+# py_json_canon(d) — json.dumps(d, sort_keys=True, separators=(",", ":")).
+fn py_json_canon(d: JVal) -> str {
+    return py_json_dump_at(d, 0, false)
+}
+
+# py_json_line(d) — json.dumps(d, sort_keys=True) with the default
+# ", " / ": " separators — the appended transparency-log line.
+fn py_json_line(d: JVal) -> str {
+    if d.kind == "obj" && d.keys.len() > 0 {
+        let order: list[int] = jv_sorted_order(d)
+        let mut out: str = "{"
+        let mut j: int = 0
+        while j < order.len() {
+            let idx: int = order.get(j)
+            out = out + "\"" + py_json_escape(d.keys.get(idx))
+            + "\": " + py_json_line(d.vals.get(idx))
+            if j + 1 < order.len() {
+                out = out + ", "
+            }
+            j = j + 1
+        }
+        return out + "}"
+    }
+    if d.kind == "arr" && d.arr.len() > 0 {
+        let mut out2: str = "["
+        let mut k: int = 0
+        while k < d.arr.len() {
+            out2 = out2 + py_json_line(d.arr.get(k))
+            if k + 1 < d.arr.len() {
+                out2 = out2 + ", "
+            }
+            k = k + 1
+        }
+        return out2 + "]"
+    }
+    if d.kind == "arr" {
+        return "[]"
+    }
+    if d.kind == "obj" {
+        return "{}"
+    }
+    return jv_scalar_text(d)
+}
+
+# ============================================================================
+# Python-compat scalars — repr (%r), str (%s), int() parse, and the
+# JSON-value coercions the refusals print.
+# ============================================================================
+
+# py_repr_str(s) — Python's repr() of a str (single quotes).
+fn py_repr_str(s: str) -> str {
+    let mut out: str = "'"
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c == 39 {
+            out = out + "\\'"
+        } else if c == 92 {
+            out = out + "\\\\"
+        } else if c == 10 {
+            out = out + "\\n"
+        } else if c == 13 {
+            out = out + "\\r"
+        } else if c == 9 {
+            out = out + "\\t"
+        } else if c < 32 || c == 127 {
+            out = out + "\\x" + hex2(c)
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out + "'"
+}
+
+# py_repr_json(v) — %r of a parsed JSON value (None / bool / int / str;
+# the shapes the refusals name).
+fn py_repr_json(v: JVal) -> str {
+    if v.kind == "null" {
+        return "None"
+    }
+    if v.kind == "bool" {
+        if v.bval {
+            return "True"
+        }
+        return "False"
+    }
+    if v.kind == "int" {
+        return v.ival.to_str()
+    }
+    if v.kind == "str" {
+        return py_repr_str(v.sval)
+    }
+    return "None"
+}
+
+# py_str_json(v) — str() of a parsed JSON value (the bare string for
+# str, "None" for null, digits for int, "True"/"False" for bool).
+fn py_str_json(v: JVal) -> str {
+    if v.kind == "str" {
+        return v.sval
+    }
+    if v.kind == "null" {
+        return "None"
+    }
+    if v.kind == "int" {
+        return v.ival.to_str()
+    }
+    if v.kind == "bool" {
+        if v.bval {
+            return "True"
+        }
+        return "False"
+    }
+    return ""
+}
+
+# jstr_or_blank(v) — the .py's str(x or ""): null becomes "", every
+# other scalar its str().
+fn jstr_or_blank(v: JVal) -> str {
+    if v.kind == "null" {
+        return ""
+    }
+    return py_str_json(v)
+}
+
+# jv_py_repr(v) — %r of a PARSED (std.json) value — the refusal
+# texts print repr() of what json.load produced.
+fn jv_py_repr(v: JsonValue) -> str {
+    if json_is_null(v) {
+        return "None"
+    }
+    if json_is_bool(v) {
+        if json_bool_value(v) {
+            return "True"
+        }
+        return "False"
+    }
+    if json_is_int(v) {
+        return json_int_value(v).to_str()
+    }
+    if json_is_str(v) {
+        return py_repr_str(json_str_value(v))
+    }
+    return "None"
+}
+
+# jv_str_or_blank(v) — the .py's str(x or "") over a PARSED
+# (std.json) value: null becomes "", the scalar's str() otherwise.
+fn jv_str_or_blank(v: JsonValue) -> str {
+    if json_is_str(v) {
+        return json_str_value(v)
+    }
+    if json_is_null(v) {
+        return ""
+    }
+    if json_is_int(v) {
+        return json_int_value(v).to_str()
+    }
+    if json_is_bool(v) {
+        if json_bool_value(v) {
+            return "True"
+        }
+        return "False"
+    }
+    return ""
+}
+
+# jv_py_str(v) — the .py's str(x) over a parsed value: null is "None".
+fn jv_py_str(v: JsonValue) -> str {
+    if json_is_str(v) {
+        return json_str_value(v)
+    }
+    if json_is_null(v) {
+        return "None"
+    }
+    if json_is_int(v) {
+        return json_int_value(v).to_str()
+    }
+    if json_is_bool(v) {
+        if json_bool_value(v) {
+            return "True"
+        }
+        return "False"
+    }
+    return ""
+}
+
+# py_int_parse(s) — Python's int(s) for the str law: surrounding
+# whitespace, one sign, digits with single underscores between them.
+fn py_int_parse(s: str) -> Result[int, str] {
+    let t: str = s.trim()
+    if t.len() == 0 {
+        return Result.Err("empty")
+    }
+    let mut i: int = 0
+    let mut neg: bool = false
+    if t.byte_at(0) == 43 || t.byte_at(0) == 45 {
+        neg = t.byte_at(0) == 45
+        i = 1
+    }
+    if i >= t.len() {
+        return Result.Err("no digits")
+    }
+    let mut digits: str = ""
+    let mut prev_us: bool = true
+    while i < t.len() {
+        let c: int = t.byte_at(i)
+        if is_digit_b(c) {
+            digits = digits + t.slice(i, i + 1)
+            prev_us = false
+        } else if c == 95 {
+            if prev_us {
+                return Result.Err("bad underscore")
+            }
+            prev_us = true
+        } else {
+            return Result.Err("invalid char")
+        }
+        i = i + 1
+    }
+    if prev_us {
+        return Result.Err("trailing underscore")
+    }
+    if digits.len() > 18 {
+        return Result.Err("too large")
+    }
+    let mut v: int = 0
+    let mut j: int = 0
+    while j < digits.len() {
+        v = v * 10 + (digits.byte_at(j) - 48)
+        j = j + 1
+    }
+    if neg {
+        v = -v
+    }
+    return Result.Ok(v)
+}
+
+# find_from(s, needle, from) — Python's str.find(needle, start):
+# the first index >= start where needle occurs, else -1.
+fn find_from(s: str, needle: str, from: int) -> int {
+    let n: int = s.len()
+    let nl: int = needle.len()
+    if nl == 0 {
+        if from <= n {
+            return from
+        }
+        return n
+    }
+    let mut i: int = from
+    if i < 0 {
+        i = 0
+    }
+    while i + nl <= n {
+        let mut hit: bool = true
+        let mut k: int = 0
+        while k < nl {
+            if s.byte_at(i + k) != needle.byte_at(k) {
+                hit = false
+            }
+            k = k + 1
+        }
+        if hit {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# py_strip(s) — str.strip() (the trim law; whitespace = bytes <= 0x20
+# is close enough for compiler output). str_replace comes from std.str.
+fn py_strip(s: str) -> str {
+    return s.trim()
+}
+
+# py_ws_split(s) — Python's str.split() (runs of whitespace, no
+# empties) for the cflags law.
+fn py_ws_split(s: str) -> list[str] {
+    let out: list[str] = []
+    let n: int = s.len()
+    let mut i: int = 0
+    while i < n {
+        if is_ws_b(s.byte_at(i)) {
+            i = i + 1
+            continue
+        }
+        let mut j: int = i
+        while j < n && !is_ws_b(s.byte_at(j)) {
+            j = j + 1
+        }
+        out.push(s.slice(i, j))
+        i = j
+    }
+    return out
+}
+
+# py_head(s, n) — s[:n] (the [:12] / [:16] display slices).
+fn py_head(s: str, n: int) -> str {
+    if s.len() <= n {
+        return s
+    }
+    return s.slice(0, n)
+}
+
+# py_tail(s, n) — s[-n:] (the [-800:] slice).
+fn py_tail(s: str, n: int) -> str {
+    if s.len() <= n {
+        return s
+    }
+    return s.slice(s.len() - n, s.len())
+}
+
+# ============================================================================
+# The distro matrix — the five profiles, the rotation, the shifted
+# slice. Root patterns are templates ({i} = the build index).
+# ============================================================================
+
+struct Profile {
+    name: str,
+    umask: str,
+    root: str,
+    env_k: list[str],
+    env_v: list[str]
+}
+
+fn profile_list() -> list[Profile] {
+    let ps: list[Profile] = []
+    ps.push(Profile {
+        name: "baseline", umask: "022", root: "b{i}/work",
+        env_k: [], env_v: []
+    })
+    ps.push(Profile {
+        name: "glibc-debian", umask: "022",
+        root: "b{i}/debian-builder-with-a-deliberately-long-name",
+        env_k: ["LANG", "LC_ALL", "TZ", "PYTHONHASHSEED"],
+        env_v: ["de_DE.UTF-8", "de_DE.UTF-8", "Europe/Berlin", "1"]
+    })
+    ps.push(Profile {
+        name: "musl-alpine", umask: "077", root: "b{i}/a",
+        env_k: ["LANG", "LC_ALL", "TZ", "PYTHONHASHSEED"],
+        env_v: ["C", "C", "UTC", "2"]
+    })
+    ps.push(Profile {
+        name: "bsd-sandbox", umask: "002",
+        root: "b{i}/sandbox/deep/deeper/deepest",
+        env_k: ["LC_ALL", "TZ", "PYTHONHASHSEED"],
+        env_v: ["C.UTF-8", "Asia/Tokyo", "3"]
+    })
+    let long: str = "b{i}/" + "store" + "store" + "store" + "store"
+    + "store" + "store" + "store" + "store" + "store" + "store"
+    + "store" + "store" + "store" + "store" + "store" + "store"
+    ps.push(Profile {
+        name: "nix-long", umask: "027", root: long,
+        env_k: ["TZ", "LC_ALL", "PYTHONHASHSEED"],
+        env_v: ["America/New_York", "C", "4"]
+    })
+    return ps
+}
+
+# profile_for(i, offset) — the rotation; verify shifts the offset so the
+# fresh builds exercise a different slice. Cycling past the named set
+# keeps the hash seed moving (the extra builds stay meaningfully
+# different).
+fn profile_for(i: int, offset: int) -> Profile {
+    let ps: list[Profile] = profile_list()
+    let idx: int = (i + offset) % ps.len()
+    let p: Profile = ps.get(idx)
+    if i + offset >= ps.len() {
+        let seed: str = (100 + i + offset).to_str()
+        let nk: list[str] = []
+        let nv: list[str] = []
+        let mut a: int = 0
+        while a < p.env_k.len() {
+            nk.push(p.env_k.get(a))
+            if p.env_k.get(a) == "PYTHONHASHSEED" {
+                nv.push(seed)
+            } else {
+                nv.push(p.env_v.get(a))
+            }
+            a = a + 1
+        }
+        if !list_has(nk, "PYTHONHASHSEED") {
+            nk.push("PYTHONHASHSEED")
+            nv.push(seed)
+        }
+        return Profile {
+            name: p.name, umask: p.umask, root: p.root,
+            env_k: nk, env_v: nv
+        }
+    }
+    return p
+}
+
+# root_pattern_sub(pattern, i) — "{i}" substitution.
+fn root_pattern_sub(pattern: str, i: int) -> str {
+    let mut out: str = ""
+    let n: int = pattern.len()
+    let mut k: int = 0
+    while k < n {
+        if pattern.byte_at(k) == 123 && k + 2 < n
+        && pattern.byte_at(k + 1) == 105 && pattern.byte_at(k + 2) == 125 {
+            out = out + i.to_str()
+            k = k + 3
+            continue
+        }
+        out = out + pattern.slice(k, k + 1)
+        k = k + 1
+    }
+    return out
+}
+
+# ============================================================================
+# The world — the repo root, the environment snapshot and the child-env
+# discipline (each build starts from a MINIMAL env: PATH and the recipe,
+# never the shell's mood). /proc/self/environ is read before any env
+# mutation so the unset set is exactly the inherited one.
+# ============================================================================
+
+struct World {
+    root: str,
+    env_snap_k: list[str],
+    env_cur: list[str],
+    path_default: str,
+    cc_default: str,
+    epoch_raw: str,
+    epoch_set: bool,
+    log_path: str,
+    native_hlc: str,
+    hlc_src: str,
+    # set when the import walk resolved a module through the
+    # HLS_PKG_DEPS farm (boot.py's fallback — the native compiler has
+    # no such fallback, so the compile gate steps aside and the
+    # staging refusal speaks, exactly where the .py refused).
+    farm_seen: bool
+}
+
+# is_repo_root(p) — the checkout marker this tool itself depends on
+# (src/hlc.hls is a file; std/ and tools/ are directories — file_exists
+# is regular-files-only, so the dirs go through fs_is_dir).
+fn is_repo_root(p: str) -> bool uses Fs {
+    return file_exists(path_join2(p, "src/hlc.hls"))
+    && fs_is_dir(path_join2(p, "std"))
+    && fs_is_dir(path_join2(p, "tools"))
+}
+
+fn which_hit(name: str) -> str uses Fs, Proc {
+    if name == "" || name.contains("/") {
+        return ""
+    }
+    let penv: str = env_get("PATH")
+    if penv == "" {
+        return ""
+    }
+    let dirs: list[str] = penv.split(":")
+    let mut i: int = 0
+    while i < dirs.len() {
+        let mut cand: str = dirs.get(i)
+        if cand == "" {
+            cand = "."
+        }
+        let full: str = cand + "/" + name
+        if file_exists(full) {
+            return full
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# repo_root() — the .py's dirname(dirname(abspath(__file__))): this
+# binary ships in <root>/bin, so the argv[0] the caller spelled
+# normalizes back to the checkout (a bare name rides PATH; a checkout
+# nowhere in sight walks up from the cwd).
+fn repo_root() -> str uses Fs, Proc, Args {
+    let argv: list[str] = args()
+    if argv.len() > 0 && argv.get(0) != "" {
+        let binp: str = abspath_of(argv.get(0))
+        let root: str = path_dirname(path_dirname(binp))
+        if is_repo_root(root) {
+            return root
+        }
+        let hit: str = which_hit(argv.get(0))
+        if hit != "" {
+            let root2: str = path_dirname(path_dirname(abspath_of(hit)))
+            if is_repo_root(root2) {
+                return root2
+            }
+        }
+    }
+    let mut d: str = abspath_of("")
+    while true {
+        if is_repo_root(d) {
+            return d
+        }
+        let parent: str = path_dirname(d)
+        if parent == d || parent == "." {
+            return abspath_of("")
+        }
+        d = parent
+    }
+    return abspath_of("")
+}
+
+# env_snapshot() — the inherited environment's keys from
+# /proc/self/environ (read once, before any env mutation).
+fn env_snapshot() -> list[str] uses Fs {
+    let mut raw: str = ""
+    if file_exists("/proc/self/environ") {
+        raw = read_file("/proc/self/environ")
+    }
+    let entries: list[str] = raw.split(chr(0))
+    let keys: list[str] = []
+    let mut i: int = 0
+    while i < entries.len() {
+        let e: str = entries.get(i)
+        if e.len() > 0 {
+            let eq: int = e.find("=")
+            if eq > 0 {
+                keys.push(e.slice(0, eq))
+            }
+        }
+        i = i + 1
+    }
+    return keys
+}
+
+fn world_new() -> World uses Fs, Proc, Args {
+    let root: str = repo_root()
+    let snap: list[str] = env_snapshot()
+    let mut path_env: str = "/usr/bin:/bin"
+    if env_has("PATH") {
+        path_env = env_get("PATH")
+    }
+    let mut cc_env: str = "cc"
+    if env_has("CC") {
+        cc_env = env_get("CC")
+    }
+    let mut epoch_raw: str = ""
+    let mut epoch_set: bool = false
+    if env_has("SOURCE_DATE_EPOCH") {
+        epoch_raw = env_get("SOURCE_DATE_EPOCH")
+        epoch_set = true
+    }
+    let mut log_path: str = path_join2(root,
+    ".hls-pkg-transparency.log")
+    if env_has("HLS_PKG_TRANSPARENCY_LOG") {
+        log_path = env_get("HLS_PKG_TRANSPARENCY_LOG")
+    }
+    return World {
+        root: root,
+        env_snap_k: snap,
+        env_cur: snap,
+        path_default: path_env,
+        cc_default: cc_env,
+        epoch_raw: epoch_raw,
+        epoch_set: epoch_set,
+        log_path: log_path,
+        native_hlc: path_join2(root, "bin/hlc"),
+        hlc_src: path_join2(root, "src/hlc.hls"),
+        farm_seen: false
+    }
+}
+
+# apply_child_env(w, keys, vals) — sync the process env to EXACTLY the
+# desired set (children inherit it; the snapshot keys not in the recipe
+# are unset, so a build only sees PATH and the recipe).
+fn apply_child_env(w: World, keys: list[str], vals: list[str]) -> void
+uses Proc {
+    let mut i: int = 0
+    while i < w.env_cur.len() {
+        if !list_has(keys, w.env_cur.get(i)) {
+            env_unset(w.env_cur.get(i))
+        }
+        i = i + 1
+    }
+    let mut j: int = 0
+    while j < keys.len() {
+        env_set(keys.get(j), vals.get(j))
+        j = j + 1
+    }
+    let fresh: list[str] = []
+    let mut k: int = 0
+    while k < keys.len() {
+        fresh.push(keys.get(k))
+        k = k + 1
+    }
+    w.env_cur = fresh
+}
+
+# ============================================================================
+# Spawn plumbing — the .py's subprocess.run discipline (stdin closed,
+# both pipes captured), the cwd switch, the recipe env.
+# ============================================================================
+
+struct RunCap {
+    code: int,
+    out: str,
+    err: str,
+    spawned: bool
+}
+
+# spawn_cap(program, args) — fork+exec, stdin null, both pipes drained
+# to EOF, wait. code: the Python returncode law (0..255 normal,
+# negative for signal kills, -1 spawn failure).
+fn spawn_cap(program: str, args: list[str]) -> RunCap uses Proc {
+    let r: RunCap = RunCap {
+        code: -1, out: "", err: "", spawned: false
+    }
+    let pid: int = proc_spawn(program, args, stdio_in_null(), stdio_pipe(),
+    stdio_pipe())
+    if pid < 1 {
+        return r
+    }
+    r.spawned = true
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    let raw: int = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    if raw < 0 {
+        r.code = -1
+    } else if raw < 128 {
+        r.code = raw
+    } else {
+        r.code = -(raw - 128)
+    }
+    r.out = out
+    r.err = err
+    return r
+}
+
+# mkdirs(path) — mkdir -p without a shell (Result.Err on spawn failure).
+fn mkdirs(path: str) -> Result[int, Fail] uses Proc {
+    let pid: int = proc_spawn("mkdir", ["-p", path], stdio_in_null(),
+    stdio_in_null(), stdio_in_null())
+    if pid < 1 {
+        return Result.Err(rfail("cannot create the directory " + path))
+    }
+    let code: int = proc_wait(pid)
+    return Result.Ok(code)
+}
+
+# rmrf(path) — shutil.rmtree(ignore_errors=True) through rm -rf.
+fn rmrf(path: str) -> void uses Proc {
+    let pid: int = proc_spawn("rm", ["-rf", path], stdio_in_null(),
+    stdio_in_null(), stdio_in_null())
+    if pid >= 1 {
+        let _code: int = proc_wait(pid)
+    }
+}
+
+# run_recipe(w, cmd, cwd, envk, envv, what) — one subprocess of the
+# recipe: the env applied, the cwd switched, output captured for the
+# report, never inherited.
+fn run_recipe(w: World, cmd: list[str], cwd: str, envk: list[str],
+envv: list[str], what: str) -> Result[RunCap, Fail] uses Proc {
+    apply_child_env(w, envk, envv)
+    let home: str = cwd_get()
+    let rc: int = cwd_set(cwd)
+    if rc != 0 {
+        cwd_set(home)
+        return Result.Err(rfail("cannot enter the build root " + cwd))
+    }
+    let args: list[str] = []
+    let mut i: int = 1
+    while i < cmd.len() {
+        args.push(cmd.get(i))
+        i = i + 1
+    }
+    let cap: RunCap = spawn_cap(cmd.get(0), args)
+    cwd_set(home)
+    if !cap.spawned {
+        return Result.Err(rfail(what + " failed (exit -1)\n"
+        + "cannot run " + cmd.get(0)))
+    }
+    if cap.code != 0 {
+        let mut tail: str = py_strip(cap.err)
+        if tail == "" {
+            tail = py_strip(cap.out)
+        }
+        return Result.Err(rfail(what + " failed (exit "
+        + cap.code.to_str() + ")\n" + py_tail(tail, 800)))
+    }
+    return Result.Ok(cap)
+}
+
+# ============================================================================
+# The Halis source scanner — the Stage-0 lexer's law reduced to what the
+# tree walkers need: `import "path"` statements with comment and string
+# awareness (the .py's parser accepted exactly these at top level; here
+# the token pair is scanned wherever it stands, which every VALID file
+# only writes at top level).
+# ============================================================================
+
+# scan_imports(src) — the import string paths, in file order. Err
+# carries the parse failure text for broken files.
+fn scan_imports(src: str) -> Result[list[str], str] {
+    let imports: list[str] = []
+    let n: int = src.len()
+    let mut i: int = 0
+    while i < n {
+        let c: int = src.byte_at(i)
+        if is_ws_b(c) {
+            i = i + 1
+            continue
+        }
+        if c == 35 {
+            while i < n && src.byte_at(i) != 10 && src.byte_at(i) != 13 {
+                i = i + 1
+            }
+            continue
+        }
+        if is_ident_start_b(c) {
+            let mut j: int = i
+            while j < n && is_ident_char_b(src.byte_at(j)) {
+                j = j + 1
+            }
+            let word: str = src.slice(i, j)
+            if word == "import" {
+                let mut k: int = j
+                while k < n && is_ws_b(src.byte_at(k)) {
+                    k = k + 1
+                }
+                if k < n && src.byte_at(k) == 34 {
+                    let sres: Result[str, str] = scan_string(src, k)
+                    if result_is_err(sres) {
+                        return Result.Err(result_err_or(sres, "parse error"))
+                    }
+                    imports.push(result_unwrap(sres))
+                    # advance past the string
+                    i = skip_string_end(src, k)
+                    continue
+                }
+                return Result.Err("import expects a string path")
+            }
+            i = j
+            continue
+        }
+        if c == 34 {
+            let sres2: Result[str, str] = scan_string(src, i)
+            if result_is_err(sres2) {
+                return Result.Err(result_err_or(sres2, "parse error"))
+            }
+            i = skip_string_end(src, i)
+            continue
+        }
+        i = i + 1
+    }
+    return Result.Ok(imports)
+}
+
+# skip_string_end(src, i) — the index just past the string literal at i.
+fn skip_string_end(src: str, i: int) -> int {
+    let n: int = src.len()
+    let mut k: int = i + 1
+    while k < n {
+        let ch: int = src.byte_at(k)
+        if ch == 34 {
+            return k + 1
+        }
+        if ch == 92 {
+            k = k + 2
+            continue
+        }
+        k = k + 1
+    }
+    return n
+}
+
+# scan_string(src, i) — the string literal at i (decoded value).
+fn scan_string(src: str, i: int) -> Result[str, str] {
+    let n: int = src.len()
+    let mut k: int = i + 1
+    let mut out: str = ""
+    while k < n {
+        let ch: int = src.byte_at(k)
+        if ch == 34 {
+            return Result.Ok(out)
+        }
+        if ch == 92 {
+            if k + 1 >= n {
+                return Result.Err("unterminated string")
+            }
+            let e2: int = src.byte_at(k + 1)
+            if e2 == 110 {
+                out = out + "\n"
+            } else if e2 == 116 {
+                out = out + "\t"
+            } else if e2 == 92 {
+                out = out + "\\"
+            } else if e2 == 34 {
+                out = out + "\""
+            } else {
+                return Result.Err("invalid escape sequence: \\"
+                + chr(e2))
+            }
+            k = k + 2
+            continue
+        }
+        if ch < 32 {
+            return Result.Err("string contains invalid control character")
+        }
+        out = out + src.slice(k, k + 1)
+        k = k + 1
+    }
+    return Result.Err("unterminated string")
+}
+
+# resolve_import(imp, importing_file, w) — boot.py's resolver law:
+# "std."/"core." prefixes walk up five levels then fall back to the
+# repo root; other paths are relative to the importing file, confined
+# (no absolute, no ".."), then the HLS_PKG_DEPS fallback. Err carries
+# the SystemExit text verbatim (it prints bare, exit 1) or the
+# module-not-found AuditError (it prints with the "error: " prefix).
+fn resolve_import(imp: str, importing_file: str, w: World)
+-> Result[str, Fail] uses Fs, Proc {
+    let prefixes: list[str] = ["std.", "core."]
+    let subdirs: list[str] = ["std", "core"]
+    let mut pi: int = 0
+    while pi < prefixes.len() {
+        let prefix: str = prefixes.get(pi)
+        if !imp.starts_with(prefix) {
+            pi = pi + 1
+            continue
+        }
+        let module_name: str = imp.slice(prefix.len(), imp.len())
+        if module_name.len() == 0 {
+            return Result.Err(dfail("error: import path must name a module "
+            + "after '" + prefix + "': " + imp))
+        }
+        if module_name.starts_with("/") || module_name.starts_with("\\") {
+            return Result.Err(dfail("error: import path must be relative, "
+            + "got absolute: " + imp))
+        }
+        let mparts: list[str] = str_replace(module_name, "\\", "/").split("/")
+        if list_has(mparts, "..") {
+            return Result.Err(dfail("error: import path must not contain "
+            + "'..' segments: " + imp))
+        }
+        let rel: str = path_join2(subdirs.get(pi), module_name + ".hls")
+        let mut d: str = path_dirname(importing_file)
+        let mut steps: int = 0
+        while steps < 5 {
+            let cand: str = path_join2(d, rel)
+            if file_exists(cand) && !fs_is_dir(cand) {
+                return Result.Ok(cand)
+            }
+            let parent: str = path_dirname(d)
+            if parent == d {
+                break
+            }
+            d = parent
+            steps = steps + 1
+        }
+        let fallback: str = path_join2(w.root, rel)
+        if file_exists(fallback) && !fs_is_dir(fallback) {
+            return Result.Ok(fallback)
+        }
+        return Result.Err(rfail("module not found: " + imp
+        + " (imported by " + importing_file + ")"))
+    }
+    # Relative path
+    let base_dir: str = path_dirname(importing_file)
+    if path_is_abs(imp) {
+        return Result.Err(dfail("error: import path must be relative, "
+        + "got absolute: " + imp))
+    }
+    let parts: list[str] = str_replace(imp, "\\", "/").split("/")
+    if list_has(parts, "..") {
+        return Result.Err(dfail("error: import path must not contain "
+        + "'..' segments: " + imp))
+    }
+    let candidate: str = norm_path(path_join2(base_dir, imp))
+    if candidate != base_dir
+    && !candidate.starts_with(base_dir + "/") {
+        return Result.Err(dfail("error: import path escapes the importing "
+        + "file's directory: " + imp))
+    }
+    if file_exists(candidate) && !fs_is_dir(candidate) {
+        return Result.Ok(candidate)
+    }
+    let mut deps_dir: str = ""
+    if env_has("HLS_PKG_DEPS") {
+        deps_dir = env_get("HLS_PKG_DEPS")
+    }
+    if deps_dir != "" && fs_is_dir(deps_dir) {
+        let by_name: str = path_join2(deps_dir, path_basename(imp))
+        if file_exists(by_name) && !fs_is_dir(by_name) {
+            return Result.Ok(by_name)
+        }
+        let by_path: str = path_join2(deps_dir, imp)
+        if file_exists(by_path) && !fs_is_dir(by_path) {
+            return Result.Ok(by_path)
+        }
+    }
+    return Result.Err(rfail("module not found: " + imp
+    + " (imported by " + importing_file + ")"))
+}
+
+# ============================================================================
+# The compile-level gate — the .py ran the interpreter's checker over
+# each tree before anything was staged; the native twin compiles the
+# entry with bin/hlc (cwd = the repo root, so the std./core. fallback
+# of the .py's resolver is honored) and maps the failure text onto the
+# audit's law ("parse error in <file>: ..." / "unauditable: ...").
+# ============================================================================
+
+fn first_stderr_line(cap: RunCap) -> str {
+    if !cap.spawned {
+        return "cannot compile"
+    }
+    let lines: list[str] = cap.err.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if py_strip(lines.get(i)) != "" {
+            return py_strip(lines.get(i))
+        }
+        i = i + 1
+    }
+    return "compilation failed"
+}
+
+fn strip_panic(line: str) -> str {
+    let t: str = py_strip(line)
+    if t.starts_with("panic: ") {
+        return t.slice(7, t.len())
+    }
+    if t.starts_with("error: ") {
+        return t.slice(7, t.len())
+    }
+    return t
+}
+
+# audit_compile(w, entry_abs, out_c) — Ok(true) when the tree compiles;
+# Err carries the audit-shaped refusal.
+fn audit_compile(w: World, entry_abs: str, out_c: str)
+-> Result[bool, Fail] uses Fs, Proc {
+    # the gate's scratch may not exist yet (--scratch names it lazily;
+    # the .py's in-process checker never touched the disk)
+    let sres: Result[int, Fail] = mkdirs(path_dirname(out_c))
+    if result_is_err(sres) {
+        return Result.Err(result_err_or(sres, rfail("")))
+    }
+    let home: str = cwd_get()
+    cwd_set(w.root)
+    let cap: RunCap = spawn_cap(w.native_hlc, [entry_abs, out_c])
+    cwd_set(home)
+    # the in-process checker of the .py left no artifact; neither does
+    # the native gate — the gate's C is scratch plumbing, removed on
+    # every path (success and refusal alike).
+    rm_one(out_c)
+    if cap.spawned && cap.code == 0 {
+        return Result.Ok(true)
+    }
+    let mut line: str = strip_panic(first_stderr_line(cap))
+    if line == "" {
+        line = "cannot compile " + entry_abs
+    }
+    if line.starts_with("type error: ") {
+        line = line.slice(12, line.len())
+        return Result.Err(rfail("unauditable: " + line))
+    }
+    if line.starts_with("syntax error: ") {
+        return Result.Err(rfail("parse error in " + entry_abs + ": " + line))
+    }
+    return Result.Err(rfail("unauditable: " + line))
+}
+
+# package_audit_compile(w, entry_abs, pkg_dir, out_c) — the wrapper
+# contract: a library entry (no main) is audited through a generated
+# wrapper that imports the entry and declares a pure main.
+fn package_audit_compile(w: World, entry_abs: str, pkg_name: str,
+out_c: str) -> Result[bool, Fail] uses Fs, Proc {
+    let gres: Result[int, Fail] = mkdirs(path_dirname(out_c))
+    if result_is_err(gres) {
+        return Result.Err(result_err_or(gres, rfail("")))
+    }
+    let home: str = cwd_get()
+    cwd_set(w.root)
+    let direct: RunCap = spawn_cap(w.native_hlc, [entry_abs, out_c])
+    cwd_set(home)
+    rm_one(out_c)
+    if direct.spawned && direct.code == 0 {
+        return Result.Ok(true)
+    }
+    let dline: str = strip_panic(first_stderr_line(direct))
+    if dline.contains("missing main function") {
+        let entry_rel: str = relpath_of(entry_abs, path_dirname(entry_abs))
+        let wrapper: str = path_join2(path_dirname(entry_abs),
+        ".hls-audit-wrapper-0.hls")
+        write_file(wrapper, "# auto-generated by hls-audit\n"
+        + "import \"" + entry_rel + "\"\n"
+        + "fn main() -> int pure { return 0 }\n")
+        let home2: str = cwd_get()
+        cwd_set(w.root)
+        let wrapped: RunCap = spawn_cap(w.native_hlc, [wrapper, out_c])
+        cwd_set(home2)
+        let wline: str = strip_panic(first_stderr_line(wrapped))
+        rm_one(wrapper)
+        rm_one(out_c)
+        if wrapped.spawned && wrapped.code == 0 {
+            return Result.Ok(true)
+        }
+        return Result.Err(rfail("package " + pkg_name
+        + " unauditable: " + wline))
+    }
+    return Result.Err(rfail("package " + pkg_name + " unauditable: "
+    + dline))
+}
+
+fn rm_one(path: str) -> void uses Proc {
+    let pid: int = proc_spawn("rm", ["-f", path], stdio_in_null(),
+    stdio_in_null(), stdio_in_null())
+    if pid >= 1 {
+        let _code: int = proc_wait(pid)
+    }
+}
+
+# ============================================================================
+# The module graph — hls-audit's walker, one definition of the tree.
+# ============================================================================
+
+# walk_import_graph(w, entry_abs) — the import DAG, BFS from the entry
+# (the .py's queue.pop(0) law); Err carries the .py's AuditError text.
+fn walk_import_graph(w: World, entry_abs: str)
+-> Result[list[str], Fail] uses Fs, Proc {
+    let order: list[str] = []
+    let seen: list[str] = []
+    let queue: list[str] = [entry_abs]
+    while queue.len() > 0 {
+        let cur: str = queue.get(0)
+        queue.pop()
+        if list_has(seen, cur) {
+            continue
+        }
+        seen.push(cur)
+        order.push(cur)
+        if !file_exists(cur) || fs_is_dir(cur) {
+            return Result.Err(rfail("cannot read " + cur
+            + " ([Errno 2] No such file or directory: '" + cur + "')"))
+        }
+        let src: str = read_file(cur)
+        let ires: Result[list[str], str] = scan_imports(src)
+        if result_is_err(ires) {
+            return Result.Err(rfail("parse error in " + cur + ": "
+            + result_err_or(ires, "parse error")))
+        }
+        let imps: list[str] = result_unwrap(ires)
+        let mut k: int = 0
+        while k < imps.len() {
+            let rres: Result[str, Fail] = resolve_import(imps.get(k), cur, w)
+            if result_is_err(rres) {
+                return Result.Err(result_err_or(rres, rfail("")))
+            }
+            queue.push(result_unwrap(rres))
+            k = k + 1
+        }
+    }
+    return Result.Ok(order)
+}
+
+# module_key(abs_path, repo_root) — repo-relative inside the repo,
+# absolute outside.
+fn module_key(abs_path: str, repo_root: str) -> str {
+    let ap: str = norm_path(abs_path)
+    let rr: str = norm_path(repo_root)
+    if ap == rr {
+        return "."
+    }
+    if ap.starts_with(rr + "/") {
+        return relpath_of(ap, rr)
+    }
+    return ap
+}
+
+# key_to_path(key, w) — a module key back to a real filesystem path.
+fn key_to_path(key: str, w: World) -> str {
+    if path_is_abs(key) {
+        return norm_path(key)
+    }
+    return norm_path(path_join2(w.root, key))
+}
+
+# ============================================================================
+# sha256 plumbing — file, tree (hls-pkg's deterministic directory hash).
+# ============================================================================
+
+fn sha256_of_file(path: str) -> Result[str, Fail] uses Fs {
+    if !file_exists(path) || fs_is_dir(path) {
+        return Result.Err(rfail("cannot read " + path
+        + " ([Errno 2] No such file or directory: '" + path + "')"))
+    }
+    return Result.Ok(sha256_hex(read_file(path)))
+}
+
+# sha256_tree(path) — the lockfile's content hash: the FILE's sha256,
+# or the deterministic sorted directory hash.
+fn sha256_tree(path: str) -> Result[str, Fail] uses Fs {
+    if file_exists(path) && !fs_is_dir(path) {
+        return Result.Ok(sha256_hex(read_file(path)))
+    }
+    if !fs_is_dir(path) {
+        return Result.Err(rfail("cannot read " + path
+        + " ([Errno 2] No such file or directory: '" + path + "')"))
+    }
+    return Result.Ok(sha256_hex(dir_digest(path)))
+}
+
+# dir_digest(dir) — _sha256_directory: os.walk with dirs.sort() and
+# sorted(files): rel + \0 + content + \0 per file, DFS pre-order.
+fn dir_digest(dir: str) -> str uses Fs {
+    let h: str = dir_digest_acc(dir, "")
+    return h
+}
+
+fn dir_digest_acc(dir: str, prefix: str) -> str uses Fs {
+    let mut h: str = ""
+    if !fs_is_dir(dir) {
+        return h
+    }
+    let names: list[str] = fs_read_dir(dir)
+    let files: list[str] = []
+    let dirs: list[str] = []
+    let mut i: int = 0
+    while i < names.len() {
+        let full: str = path_join2(dir, names.get(i))
+        if fs_is_dir(full) {
+            dirs.push(names.get(i))
+        } else {
+            files.push(names.get(i))
+        }
+        i = i + 1
+    }
+    let sfiles: list[str] = sort_strs(files)
+    let mut f: int = 0
+    while f < sfiles.len() {
+        let rel: str = prefix + sfiles.get(f)
+        h = h + rel + chr(0)
+        + read_file(path_join2(dir, sfiles.get(f))) + chr(0)
+        f = f + 1
+    }
+    let sdirs: list[str] = sort_strs(dirs)
+    let mut d: int = 0
+    while d < sdirs.len() {
+        h = h + dir_digest_acc(path_join2(dir, sdirs.get(d)),
+        prefix + sdirs.get(d) + "/")
+        d = d + 1
+    }
+    return h
+}
+
+# ============================================================================
+# The TOML manifest — hpkg_manifest's subset (sections, key = value
+# with strings / ints / bools / lists / inline tables, comments outside
+# strings). Only [package] and [dependencies] feed the repro law.
+# ============================================================================
+
+struct Toml {
+    kind: str, # "str" | "int" | "bool" | "list" | "table" | "none"
+    sval: str,
+    ival: int,
+    bval: bool,
+    items: list[Toml],
+    keys: list[str],
+    vals: list[Toml]
+}
+
+fn toml_none() -> Toml {
+    return Toml {
+        kind: "none", sval: "", ival: 0, bval: false, items: [],
+        keys: [], vals: []
+    }
+}
+
+fn toml_str(v: str) -> Toml {
+    return Toml {
+        kind: "str", sval: v, ival: 0, bval: false, items: [],
+        keys: [], vals: []
+    }
+}
+
+fn toml_table() -> Toml {
+    return Toml {
+        kind: "table", sval: "", ival: 0, bval: false, items: [],
+        keys: [], vals: []
+    }
+}
+
+# toml_get(t, key) — one key of a table (missing -> none).
+fn toml_get(t: Toml, key: str) -> Toml {
+    let mut i: int = 0
+    while i < t.keys.len() {
+        if t.keys.get(i) == key {
+            return t.vals.get(i)
+        }
+        i = i + 1
+    }
+    return toml_none()
+}
+
+# toml_set(t, key, val) — set/replace in a table.
+fn toml_set(t: Toml, key: str, val: Toml) -> void {
+    let mut i: int = 0
+    while i < t.keys.len() {
+        if t.keys.get(i) == key {
+            t.vals.set(i, val)
+            return
+        }
+        i = i + 1
+    }
+    t.keys.push(key)
+    t.vals.push(val)
+}
+
+# strip_toml_comment(line) — a `#` comment, only OUTSIDE double-quoted
+# strings (the manifest's own law).
+fn strip_toml_comment(line: str) -> Result[str, str] {
+    let mut out: str = ""
+    let mut in_str: bool = false
+    let mut i: int = 0
+    let n: int = line.len()
+    while i < n {
+        let c: int = line.byte_at(i)
+        if in_str {
+            if c == 92 && i + 1 < n {
+                let esc: int = line.byte_at(i + 1)
+                if esc == 98 || esc == 116 || esc == 110 || esc == 102
+                || esc == 114 || esc == 34 || esc == 92 || esc == 117
+                || esc == 85 {
+                    out = out + line.slice(i, i + 2)
+                    i = i + 2
+                    continue
+                }
+                return Result.Err("invalid TOML escape sequence: \\"
+                + chr(esc))
+            }
+            if c == 34 {
+                in_str = false
+            }
+            out = out + line.slice(i, i + 1)
+            i = i + 1
+            continue
+        }
+        if c == 34 {
+            in_str = true
+            out = out + line.slice(i, i + 1)
+            i = i + 1
+            continue
+        }
+        if c == 35 {
+            break
+        }
+        out = out + line.slice(i, i + 1)
+        i = i + 1
+    }
+    return Result.Ok(out)
+}
+
+struct TomlAndNext {
+    value: Toml,
+    next: int
+}
+
+# parse_manifest(path) — the manifest tree (Err carries the "manifest
+# <path>: <why>" text the .py's AuditError carried).
+fn parse_manifest(path: str) -> Result[Toml, str] uses Fs {
+    if !file_exists(path) || fs_is_dir(path) {
+        return Result.Err("FileNotFoundError: manifest not found: " + path)
+    }
+    let src: str = read_file(path)
+    let raw_lines: list[str] = src.split("\n")
+    let lines: list[str] = []
+    let mut li: int = 0
+    while li < raw_lines.len() {
+        let sres: Result[str, str] = strip_toml_comment(raw_lines.get(li))
+        if result_is_err(sres) {
+            return Result.Err(result_err_or(sres, "bad escape"))
+        }
+        lines.push(result_unwrap(sres))
+        li = li + 1
+    }
+    let text: str = str_join(lines, "\n")
+    let root: Toml = toml_table()
+    let mut current: list[str] = []
+    let n: int = text.len()
+    let mut i: int = 0
+    while i < n {
+        while i < n && is_ws_b(text.byte_at(i)) {
+            i = i + 1
+        }
+        if i >= n {
+            break
+        }
+        if text.byte_at(i) == 91 {
+            let close: int = find_from(text, "]", i)
+            if close < 0 {
+                return Result.Err("manifest: unterminated section header "
+                + "at offset " + i.to_str())
+            }
+            let header: str = py_strip(text.slice(i + 1, close))
+            if header == "" {
+                return Result.Err("manifest: empty section header at "
+                + "offset " + i.to_str())
+            }
+            current = header.split(".")
+            i = close + 1
+            continue
+        }
+        let eq: int = find_from(text, "=", i)
+        if eq < 0 {
+            return Result.Err("manifest: expected '=' at offset "
+            + i.to_str())
+        }
+        let key: str = py_strip(text.slice(i, eq))
+        if key == "" {
+            return Result.Err("manifest: empty key at offset "
+            + i.to_str())
+        }
+        let vres: Result[TomlAndNext, str] = parse_toml_value(text, eq + 1)
+        if result_is_err(vres) {
+            return Result.Err(result_err_or(vres, "bad value"))
+        }
+        let vn: TomlAndNext = result_unwrap(vres)
+        let mut cursor: Toml = root
+        let mut s: int = 0
+        while s < current.len() {
+            let part: str = current.get(s)
+            if toml_get(cursor, part).kind != "table" {
+                toml_set(cursor, part, toml_table())
+            }
+            cursor = toml_get(cursor, part)
+            s = s + 1
+        }
+        toml_set(cursor, key, vn.value)
+        i = vn.next
+    }
+    return Result.Ok(root)
+}
+
+# parse_toml_value(text, i) — one value at i: string (with escapes),
+# list, inline table, or bare token (int / bool / str).
+fn parse_toml_value(text: str, i: int) -> Result[TomlAndNext, str] {
+    let n: int = text.len()
+    let mut i2: int = i
+    while i2 < n && is_ws_b(text.byte_at(i2)) {
+        i2 = i2 + 1
+    }
+    if i2 >= n {
+        return Result.Ok(TomlAndNext {
+            value: toml_none(), next: i2
+        })
+    }
+    let c: int = text.byte_at(i2)
+    if c == 34 {
+        return parse_toml_string(text, i2)
+    }
+    if c == 91 {
+        let items: list[Toml] = []
+        let mut j: int = i2 + 1
+        while j < n && text.byte_at(j) != 93 {
+            while j < n && (is_ws_b(text.byte_at(j))
+            || text.byte_at(j) == 44) {
+                j = j + 1
+            }
+            if j >= n || text.byte_at(j) == 93 {
+                break
+            }
+            if text.byte_at(j) == 34 {
+                let sres: Result[TomlAndNext, str] = parse_toml_string(text, j)
+                if result_is_err(sres) {
+                    return Result.Err(result_err_or(sres, "bad string"))
+                }
+                let sn: TomlAndNext = result_unwrap(sres)
+                items.push(sn.value)
+                j = sn.next
+                continue
+            }
+            let mut k: int = j
+            while k < n && text.byte_at(k) != 32 && text.byte_at(k) != 9
+            && text.byte_at(k) != 10 && text.byte_at(k) != 13
+            && text.byte_at(k) != 44 && text.byte_at(k) != 93 {
+                k = k + 1
+            }
+            items.push(bare_token(text.slice(j, k)))
+            j = k
+        }
+        if j < n {
+            j = j + 1
+        }
+        return Result.Ok(TomlAndNext {
+            value: Toml {
+                kind: "list", sval: "", ival: 0, bval: false,
+                items: items, keys: [], vals: []
+            },
+            next: j
+        })
+    }
+    if c == 123 {
+        let table: Toml = toml_table()
+        let mut j2: int = i2 + 1
+        while j2 < n && text.byte_at(j2) != 125 {
+            while j2 < n && (is_ws_b(text.byte_at(j2))
+            || text.byte_at(j2) == 44) {
+                j2 = j2 + 1
+            }
+            if j2 >= n || text.byte_at(j2) == 125 {
+                break
+            }
+            let eq: int = find_from(text, "=", j2)
+            if eq < 0 {
+                return Result.Err("manifest: expected '=' in inline table")
+            }
+            let key: str = py_strip(text.slice(j2, eq))
+            let vres: Result[TomlAndNext, str] = parse_toml_value(text,
+            eq + 1)
+            if result_is_err(vres) {
+                return Result.Err(result_err_or(vres, "bad value"))
+            }
+            let vn: TomlAndNext = result_unwrap(vres)
+            toml_set(table, key, vn.value)
+            j2 = vn.next
+        }
+        if j2 < n {
+            j2 = j2 + 1
+        }
+        return Result.Ok(TomlAndNext {
+            value: table, next: j2
+        })
+    }
+    let mut j3: int = i2
+    while j3 < n && text.byte_at(j3) != 32 && text.byte_at(j3) != 9
+    && text.byte_at(j3) != 10 && text.byte_at(j3) != 13
+    && text.byte_at(j3) != 44 && text.byte_at(j3) != 93
+    && text.byte_at(j3) != 125 && text.byte_at(j3) != 61
+    && text.byte_at(j3) != 35 {
+        j3 = j3 + 1
+    }
+    return Result.Ok(TomlAndNext {
+        value: bare_token(text.slice(i2, j3)), next: j3
+    })
+}
+
+fn bare_token(tok: str) -> Toml {
+    if tok == "true" {
+        return Toml {
+            kind: "bool", sval: "", ival: 0, bval: true, items: [],
+            keys: [], vals: []
+        }
+    }
+    if tok == "false" {
+        return Toml {
+            kind: "bool", sval: "", ival: 0, bval: false, items: [],
+            keys: [], vals: []
+        }
+    }
+    let mut all_digits: bool = tok.len() > 0
+    let mut di: int = 0
+    while di < tok.len() {
+        if !is_digit_b(tok.byte_at(di)) {
+            all_digits = false
+        }
+        di = di + 1
+    }
+    if all_digits {
+        let mut v: int = 0
+        let mut k: int = 0
+        while k < tok.len() {
+            v = v * 10 + (tok.byte_at(k) - 48)
+            k = k + 1
+        }
+        return Toml {
+            kind: "int", sval: "", ival: v, bval: false, items: [],
+            keys: [], vals: []
+        }
+    }
+    return toml_str(tok)
+}
+
+# parse_toml_string(text, i) — a double-quoted string with the escape
+# set (n t r b f " \ uXXXX UXXXXXXXX).
+fn parse_toml_string(text: str, i: int) -> Result[TomlAndNext, str] {
+    let n: int = text.len()
+    let mut j: int = i + 1
+    let mut out: str = ""
+    while j < n && text.byte_at(j) != 34 {
+        let ch: int = text.byte_at(j)
+        if ch == 92 && j + 1 < n {
+            let nxt: int = text.byte_at(j + 1)
+            if nxt == 110 {
+                out = out + "\n"
+                j = j + 2
+                continue
+            }
+            if nxt == 116 {
+                out = out + "\t"
+                j = j + 2
+                continue
+            }
+            if nxt == 114 {
+                out = out + chr(13)
+                j = j + 2
+                continue
+            }
+            if nxt == 98 {
+                out = out + chr(8)
+                j = j + 2
+                continue
+            }
+            if nxt == 102 {
+                out = out + chr(12)
+                j = j + 2
+                continue
+            }
+            if nxt == 34 {
+                out = out + "\""
+                j = j + 2
+                continue
+            }
+            if nxt == 92 {
+                out = out + "\\"
+                j = j + 2
+                continue
+            }
+            if nxt == 117 && j + 6 <= n {
+                let hexpart: str = text.slice(j + 2, j + 6)
+                let mut cp: int = 0
+                let mut hi: int = 0
+                while hi < 4 {
+                    if !is_hex_digit_b(hexpart.byte_at(hi)) {
+                        return Result.Err("invalid \\u escape at offset "
+                        + j.to_str())
+                    }
+                    cp = cp * 16 + hex_val_b(hexpart.byte_at(hi))
+                    hi = hi + 1
+                }
+                out = out + utf8_encode(cp)
+                j = j + 6
+                continue
+            }
+            if nxt == 85 && j + 10 <= n {
+                let hexpart2: str = text.slice(j + 2, j + 10)
+                let mut cp2: int = 0
+                let mut hi2: int = 0
+                while hi2 < 8 {
+                    if !is_hex_digit_b(hexpart2.byte_at(hi2)) {
+                        return Result.Err("invalid \\U escape at offset "
+                        + j.to_str())
+                    }
+                    cp2 = cp2 * 16 + hex_val_b(hexpart2.byte_at(hi2))
+                    hi2 = hi2 + 1
+                }
+                out = out + utf8_encode(cp2)
+                j = j + 10
+                continue
+            }
+            out = out + chr(nxt)
+            j = j + 2
+            continue
+        }
+        out = out + text.slice(j, j + 1)
+        j = j + 1
+    }
+    if j >= n {
+        return Result.Err("unterminated string literal at offset "
+        + i.to_str())
+    }
+    return Result.Ok(TomlAndNext {
+        value: toml_str(out), next: j + 1
+    })
+}
+
+fn utf8_encode(cp: int) -> str {
+    if cp < 128 {
+        return chr(cp)
+    }
+    if cp < 2048 {
+        return chr(192 + cp / 64) + chr(128 + cp % 64)
+    }
+    if cp < 65536 {
+        return chr(224 + cp / 4096) + chr(128 + (cp / 64) % 64)
+        + chr(128 + cp % 64)
+    }
+    return chr(240 + cp / 262144) + chr(128 + (cp / 4096) % 64)
+    + chr(128 + (cp / 64) % 64) + chr(128 + cp % 64)
+}
+
+# ============================================================================
+# The package tree — hls-audit's walkers (manifest tree, confined dep
+# resolution, content units), one definition of the tree.
+# ============================================================================
+
+struct PkgNode {
+    dir: str,
+    name: str,
+    version: str,
+    entry: str,
+    deps: list[PkgNode],
+    content_path: str
+}
+
+# confined_join(base, rel, what) — join + confine (relative only, no
+# "..", the result stays inside base); Err carries the .py's text.
+fn confined_join(base: str, rel: str, what: str) -> Result[str, Fail] {
+    if path_is_abs(rel) {
+        return Result.Err(rfail(what + ": path must be relative, got "
+        + "absolute: " + rel))
+    }
+    let parts: list[str] = str_replace(rel, "\\", "/").split("/")
+    if list_has(parts, "..") {
+        return Result.Err(rfail(what + ": path must not contain '..' "
+        + "segments: " + rel))
+    }
+    let cand: str = norm_path(path_join2(base, rel))
+    if cand != base && !cand.starts_with(base + "/") {
+        return Result.Err(rfail(what + ": path escapes the package "
+        + "directory: " + rel))
+    }
+    return Result.Ok(cand)
+}
+
+# resolve_dep(w, dep_name, source, declaring_dir) — (package_dir,
+# content_path): package-relative first, repo-root-relative second.
+fn resolve_dep(w: World, dep_name: str, source: Toml, declaring_dir: str)
+-> Result[list[str], Fail] uses Fs {
+    if source.kind != "table" {
+        return Result.Err(rfail("dependency " + dep_name
+        + ": source must be a table"))
+    }
+    if toml_get(source, "git").kind != "none" {
+        return Result.Err(rfail("dependency " + dep_name + ": git "
+        + "dependencies are not supported by the native walker — "
+        + "run hls-pkg lock first"))
+    }
+    let path_v: Toml = toml_get(source, "path")
+    if path_v.kind != "none" {
+        if path_v.kind != "str" {
+            return Result.Err(rfail("dependency " + dep_name
+            + ": path must be a string"))
+        }
+        let rel: str = path_v.sval
+        let bases: list[str] = [declaring_dir, w.root]
+        let mut bi: int = 0
+        while bi < bases.len() {
+            let cres: Result[str, Fail] = confined_join(bases.get(bi), rel,
+            "dependency " + dep_name)
+            if result_is_err(cres) {
+                return Result.Err(result_err_or(cres, rfail("")))
+            }
+            let cand: str = result_unwrap(cres)
+            if fs_is_dir(cand) {
+                return Result.Ok([norm_path(cand), norm_path(cand)])
+            }
+            if file_exists(cand) {
+                let full: str = norm_path(cand)
+                return Result.Ok([path_dirname(full), full])
+            }
+            bi = bi + 1
+        }
+        return Result.Err(rfail("dependency " + dep_name
+        + ": path not found: " + rel))
+    }
+    return Result.Err(rfail("dependency " + dep_name
+    + " has no git/path source"))
+}
+
+# walk_packages(w, pkg_dir, stack_dirs, stack_names) — the depth-first
+# manifest walk; a directory on the current stack is a cycle.
+fn walk_packages(w: World, pkg_dir: str, stack_dirs: list[str],
+stack_names: list[str]) -> Result[PkgNode, Fail] uses Fs {
+    let real: str = norm_path(pkg_dir)
+    let mut si: int = 0
+    while si < stack_dirs.len() {
+        if stack_dirs.get(si) == real {
+            # the .py's names + [nm]: the chain entries from the match,
+            # then the name the matched stack entry recorded.
+            let chain: list[str] = []
+            let mut ci: int = si
+            while ci < stack_names.len() {
+                chain.push(stack_names.get(ci))
+                ci = ci + 1
+            }
+            chain.push(stack_names.get(si))
+            return Result.Err(rfail("circular package dependency: "
+            + str_join(chain, " -> ")))
+        }
+        si = si + 1
+    }
+    let manifest_path: str = path_join2(real, manifest_name())
+    if !file_exists(manifest_path) {
+        return Result.Err(rfail("no " + manifest_name() + " in " + real))
+    }
+    let mres: Result[Toml, str] = parse_manifest(manifest_path)
+    if result_is_err(mres) {
+        return Result.Err(rfail("manifest " + manifest_path + ": "
+        + result_err_or(mres, "bad manifest")))
+    }
+    let manifest: Toml = result_unwrap(mres)
+    let pkg: Toml = toml_get(manifest, "package")
+    let name_v: Toml = toml_get(pkg, "name")
+    let mut real_name: str = path_basename(real)
+    if name_v.kind == "str" && name_v.sval != "" {
+        real_name = name_v.sval
+    }
+    let version_v: Toml = toml_get(pkg, "version")
+    let mut real_version: str = "0.0.0"
+    if version_v.kind == "str" && version_v.sval != "" {
+        real_version = version_v.sval
+    }
+    let entry_v: Toml = toml_get(pkg, "entry")
+    let mut entry: str = "main.hls"
+    if entry_v.kind == "str" && entry_v.sval != "" {
+        entry = entry_v.sval
+    }
+    let node: PkgNode = PkgNode {
+        dir: real, name: real_name, version: real_version,
+        entry: entry, deps: [], content_path: real
+    }
+    let new_dirs: list[str] = []
+    let mut di: int = 0
+    while di < stack_dirs.len() {
+        new_dirs.push(stack_dirs.get(di))
+        di = di + 1
+    }
+    new_dirs.push(real)
+    let new_names: list[str] = []
+    let mut ni: int = 0
+    while ni < stack_names.len() {
+        new_names.push(stack_names.get(ni))
+        ni = ni + 1
+    }
+    new_names.push(real_name)
+    let deps: Toml = toml_get(manifest, "dependencies")
+    if deps.kind == "none" {
+        return Result.Ok(node)
+    }
+    if deps.kind != "table" {
+        return Result.Err(rfail("package " + real_name
+        + ": [dependencies] section is corrupt"))
+    }
+    let sorted_deps: list[str] = sort_strs(deps.keys)
+    let mut dk: int = 0
+    while dk < sorted_deps.len() {
+        let dep_name: str = sorted_deps.get(dk)
+        let source: Toml = toml_get(deps, dep_name)
+        let rres: Result[list[str], Fail] = resolve_dep(w, dep_name, source,
+        real)
+        if result_is_err(rres) {
+            return Result.Err(result_err_or(rres, rfail("")))
+        }
+        let pair: list[str] = result_unwrap(rres)
+        let child_res: Result[PkgNode, Fail] = walk_packages(w, pair.get(0),
+        new_dirs, new_names)
+        if result_is_err(child_res) {
+            return Result.Err(result_err_or(child_res, rfail("")))
+        }
+        let child: PkgNode = result_unwrap(child_res)
+        child.content_path = pair.get(1)
+        node.deps.push(child)
+        dk = dk + 1
+    }
+    return Result.Ok(node)
+}
+
+# all_nodes(root) — DFS pre-order (the root first).
+fn all_nodes(root: PkgNode) -> list[PkgNode] {
+    let out: list[PkgNode] = []
+    collect_nodes(root, out)
+    return out
+}
+
+fn collect_nodes(n: PkgNode, out: list[PkgNode]) -> void {
+    out.push(n)
+    let mut i: int = 0
+    while i < n.deps.len() {
+        collect_nodes(n.deps.get(i), out)
+        i = i + 1
+    }
+}
+
+# ============================================================================
+# The tree model — the source tree (the import graph + the input set)
+# and the package tree (manifest walk + dep units + app files).
+# ============================================================================
+
+struct SourceTree {
+    pairs: list[KV],
+    rel_k: list[str],
+    rel_v: list[str],
+    digest: str,
+    entry_key: str,
+    layout: str
+}
+
+struct PkgTree {
+    pairs: list[KV],
+    dep_names: list[str],
+    dep_paths: list[str],
+    dep_shas: list[str],
+    root_dir: str,
+    digest: str,
+    name: str,
+    version: str,
+    entry: str,
+    lockfile: str,
+    drift_pkgs: list[str],
+    drift_whys: list[str],
+    unauditable: list[str]
+}
+
+# load_source_tree(w, entry_path, scratch) — the import tree of an entry
+# file, compile-gated the way the .py's audit gated it.
+fn load_source_tree(w: World, entry_path: str, scratch: str)
+-> Result[SourceTree, Fail] uses Fs, Proc {
+    let entry_abs: str = abspath_of(entry_path)
+    if !file_exists(entry_abs) || fs_is_dir(entry_abs) {
+        return Result.Err(rfail("no such file: " + entry_path))
+    }
+    let wres: Result[list[str], Fail] = walk_import_graph(w, entry_abs)
+    if result_is_err(wres) {
+        return Result.Err(result_err_or(wres, rfail("")))
+    }
+    let order: list[str] = result_unwrap(wres)
+    # the compile-level gate (the .py's _check_merged)
+    let gate: Result[bool, Fail] = audit_compile(w, entry_abs,
+    path_join2(scratch, "audit-gate.c"))
+    if result_is_err(gate) {
+        return Result.Err(result_err_or(gate, rfail("")))
+    }
+    let pairs: list[KV] = []
+    let rel_k: list[str] = []
+    let rel_v: list[str] = []
+    let entry_dir: str = path_dirname(entry_abs)
+    let mut i: int = 0
+    while i < order.len() {
+        let key: str = module_key(order.get(i), w.root)
+        let p: str = key_to_path(key, w)
+        let sres: Result[str, Fail] = sha256_of_file(p)
+        if result_is_err(sres) {
+            return Result.Err(result_err_or(sres, rfail("")))
+        }
+        pairs.push(KV {
+            k: key, v: result_unwrap(sres)
+        })
+        rel_k.push(key)
+        if path_is_abs(key) {
+            rel_v.push(relpath_of(p, entry_dir))
+        } else {
+            rel_v.push(key)
+        }
+        i = i + 1
+    }
+    let mut j: int = 0
+    while j < rel_v.len() {
+        if rel_v.get(j).starts_with("..") {
+            return Result.Err(rfail("module " + rel_k.get(j)
+            + " stages outside the tree root"))
+        }
+        j = j + 1
+    }
+    let entry_key: str = module_key(entry_abs, w.root)
+    let mut layout: str = "repo"
+    if path_is_abs(entry_key) {
+        layout = "detached"
+    }
+    return Result.Ok(SourceTree {
+        pairs: pairs, rel_k: rel_k, rel_v: rel_v,
+        digest: tree_digest(pairs),
+        entry_key: entry_key,
+        layout: layout
+    })
+}
+
+# load_package_tree(w, pkg_dir, scratch) — the manifest tree, drift
+# checked against the lockfile, every package audited fail-closed.
+fn load_package_tree(w: World, pkg_dir: str, scratch: str)
+-> Result[PkgTree, Fail] uses Fs, Proc {
+    let mut root_dir: str = abspath_of(pkg_dir)
+    if pkg_dir == "." {
+        root_dir = abspath_of(".")
+    }
+    if !fs_is_dir(root_dir) {
+        return Result.Err(rfail("not a directory: " + pkg_dir))
+    }
+    let manifest_path: str = path_join2(root_dir, manifest_name())
+    if !file_exists(manifest_path) {
+        return Result.Err(rfail("no " + manifest_name() + " in "
+        + root_dir + " (pass --pkg DIR or run inside the package)"))
+    }
+    # audit every package (the .py's audit_package): the walk, then the
+    # per-package compile gate, then drift + lockfile status.
+    let empty_dirs: list[str] = []
+    let empty_names: list[str] = []
+    let wres: Result[PkgNode, Fail] = walk_packages(w, root_dir, empty_dirs,
+    empty_names)
+    if result_is_err(wres) {
+        return Result.Err(result_err_or(wres, rfail("")))
+    }
+    let root_node: PkgNode = result_unwrap(wres)
+    let nodes: list[PkgNode] = all_nodes(root_node)
+    let unauditable: list[str] = []
+    let audited: list[str] = []
+    let mut ni: int = 0
+    while ni < nodes.len() {
+        let node: PkgNode = nodes.get(ni)
+        if list_has(audited, node.dir) {
+            ni = ni + 1
+            continue
+        }
+        audited.push(node.dir)
+        let entry_path: str = path_join2(node.dir, node.entry)
+        if !file_exists(entry_path) || fs_is_dir(entry_path) {
+            unauditable.push(node.name)
+            ni = ni + 1
+            continue
+        }
+        let gres: Result[bool, Fail] = package_audit_compile(w, entry_path,
+        node.dir, path_join2(scratch, "audit-pkg.c"))
+        if result_is_err(gres) {
+            unauditable.push(node.name)
+        }
+        ni = ni + 1
+    }
+    # lockfile drift: every TOP-LEVEL dep's recorded sha256 must still
+    # match the tree it names.
+    let lock_path: str = path_join2(root_dir, lockfile_name())
+    let mut lockfile: str = "absent"
+    let drift_pkgs: list[str] = []
+    let drift_whys: list[str] = []
+    let locked_names: list[str] = []
+    let locked_shas: list[str] = []
+    if file_exists(lock_path) {
+        lockfile = "present"
+        let lock_src: str = read_file(lock_path)
+        let lres: Result[JsonValue, str] = json_parse_result(lock_src)
+        if result_is_err(lres) {
+            return Result.Err(rfail("cannot read lockfile: "
+            + result_err_or(lres, "invalid JSON")))
+        }
+        let lock: JsonValue = result_unwrap(lres)
+        let pkgs: JsonValue = json_object_get(lock, "packages")
+        if json_is_array(pkgs) {
+            let mut pi: int = 0
+            while pi < pkgs.arr.len() {
+                let rec: JsonValue = pkgs.arr.get(pi)
+                if json_is_object(rec) {
+                    locked_names.push(jv_py_str(json_object_get(rec,
+                    "name")))
+                    locked_shas.push(jv_str_or_blank(json_object_get(rec,
+                    "sha256")))
+                }
+                pi = pi + 1
+            }
+        }
+        let mut ci: int = 0
+        while ci < root_node.deps.len() {
+            let child: PkgNode = root_node.deps.get(ci)
+            let mut found: bool = false
+            let mut was: str = ""
+            let mut lk: int = 0
+            while lk < locked_names.len() {
+                if locked_names.get(lk) == child.name {
+                    found = true
+                    was = locked_shas.get(lk)
+                }
+                lk = lk + 1
+            }
+            if !found {
+                drift_pkgs.push(child.name)
+                drift_whys.push("in the manifest but not in the lockfile")
+            } else {
+                let sres: Result[str, Fail] = sha256_tree(child.content_path)
+                if result_is_err(sres) {
+                    return Result.Err(result_err_or(sres, rfail("")))
+                }
+                let now: str = result_unwrap(sres)
+                if now != was {
+                    let mut short_was: str = py_head(was, 12)
+                    if short_was == "" {
+                        short_was = "<none>"
+                    }
+                    drift_pkgs.push(child.name)
+                    drift_whys.push("locked sha256 " + short_was
+                    + " but the tree now hashes " + py_head(now, 12)
+                    + " — re-lock")
+                }
+            }
+            ci = ci + 1
+        }
+    }
+    # The refusal order is the SBOM's documented order: drift first,
+    # then unauditable, fail-closed.
+    if drift_pkgs.len() > 0 {
+        let parts: list[str] = []
+        let mut dj: int = 0
+        while dj < drift_pkgs.len() {
+            parts.push(drift_pkgs.get(dj) + ": " + drift_whys.get(dj))
+            dj = dj + 1
+        }
+        return Result.Err(rfail("lockfile drift: "
+        + str_join(parts, "; ") + " — re-lock before repro"))
+    }
+    if unauditable.len() > 0 {
+        return Result.Err(rfail("unauditable package(s): "
+        + str_join(unauditable, ", ")
+        + " — no reproducible-build claim stamps a package nobody "
+        + "could check"))
+    }
+    # the input set: dep units + the root's own files
+    let dep_names: list[str] = []
+    let dep_paths: list[str] = []
+    let dep_shas: list[str] = []
+    let seen_dirs: list[str] = []
+    let mut n2: int = 0
+    while n2 < nodes.len() {
+        let node: PkgNode = nodes.get(n2)
+        if n2 == 0 || list_has(seen_dirs, node.dir) {
+            n2 = n2 + 1
+            continue
+        }
+        seen_dirs.push(node.dir)
+        let sres: Result[str, Fail] = sha256_tree(node.content_path)
+        if result_is_err(sres) {
+            return Result.Err(result_err_or(sres, rfail("")))
+        }
+        dep_names.push(node.name)
+        dep_paths.push(node.content_path)
+        dep_shas.push(result_unwrap(sres))
+        n2 = n2 + 1
+    }
+    let pairs: list[KV] = []
+    let mut d3: int = 0
+    while d3 < dep_names.len() {
+        pairs.push(KV {
+            k: "dep:" + dep_names.get(d3), v: dep_shas.get(d3)
+        })
+        d3 = d3 + 1
+    }
+    let app_pairs: list[KV] = package_app_files(root_dir)
+    let mut a2: int = 0
+    while a2 < app_pairs.len() {
+        pairs.push(app_pairs.get(a2))
+        a2 = a2 + 1
+    }
+    return Result.Ok(PkgTree {
+        pairs: pairs,
+        dep_names: dep_names, dep_paths: dep_paths, dep_shas: dep_shas,
+        root_dir: root_dir,
+        digest: tree_digest(pairs),
+        name: root_node.name, version: root_node.version,
+        entry: root_node.entry,
+        lockfile: lockfile,
+        drift_pkgs: drift_pkgs, drift_whys: drift_whys,
+        unauditable: unauditable
+    })
+}
+
+# package_app_files(root_dir) — the root's own files as ("app/<rel>",
+# sha) pairs (os.walk with the stage-skip law).
+fn package_app_files(root_dir: str) -> list[KV] uses Fs {
+    let out: list[KV] = []
+    collect_app_files(root_dir, "", out)
+    return out
+}
+
+fn collect_app_files(dir: str, prefix: str, out: list[KV]) -> void uses Fs {
+    if !fs_is_dir(dir) {
+        return
+    }
+    let names: list[str] = fs_read_dir(dir)
+    let files: list[str] = []
+    let dirs: list[str] = []
+    let mut i: int = 0
+    while i < names.len() {
+        let nm: str = names.get(i)
+        if is_stage_skip(nm) {
+            i = i + 1
+            continue
+        }
+        let full: str = path_join2(dir, nm)
+        if fs_is_dir(full) {
+            dirs.push(nm)
+        } else {
+            if nm.ends_with(".buildinfo.json") {
+                i = i + 1
+                continue
+            }
+            files.push(nm)
+        }
+        i = i + 1
+    }
+    let sfiles: list[str] = sort_strs(files)
+    let mut f: int = 0
+    while f < sfiles.len() {
+        let rel: str = prefix + sfiles.get(f)
+        out.push(KV {
+            k: "app/" + rel,
+            v: sha256_hex(read_file(path_join2(dir, sfiles.get(f))))
+        })
+        f = f + 1
+    }
+    let sdirs: list[str] = sort_strs(dirs)
+    let mut d: int = 0
+    while d < sdirs.len() {
+        collect_app_files(path_join2(dir, sdirs.get(d)),
+        prefix + sdirs.get(d) + "/", out)
+        d = d + 1
+    }
+}
+
+fn is_stage_skip(name: str) -> bool {
+    return name == ".hls-pkg-deps" || name == ".hls-pkg-build"
+    || name == ".hls-pkg-cache" || name == "__pycache__"
+}
+
+# tree_digest(pairs) — one digest over the input set: every module's
+# key and content hash, sorted (one flipped byte anywhere moves it, an
+# unchanged tree never does).
+fn tree_digest(pairs: list[KV]) -> str {
+    let sorted: list[KV] = sort_pairs(pairs)
+    let mut h: str = ""
+    let mut i: int = 0
+    while i < sorted.len() {
+        h = h + sorted.get(i).k + "|" + sorted.get(i).v + chr(0)
+        i = i + 1
+    }
+    return sha256_hex(h)
+}
+
+# ============================================================================
+# The recipe — epoch policy, cc version, engine resolution.
+# ============================================================================
+
+# epoch_for(w, digest, explicit_set, explicit) — explicit --epoch wins,
+# then the environment, then DERIVED from the tree digest (content,
+# not clock). Ok carries [value, which] (which: 0 --epoch, 1 env,
+# 2 derived).
+fn epoch_for(w: World, digest: str, explicit_set: bool, explicit: int)
+-> Result[list[int], Fail] {
+    if explicit_set {
+        return Result.Ok([explicit, 0])
+    }
+    if w.epoch_set {
+        let pres: Result[int, str] = py_int_parse(w.epoch_raw)
+        if result_is_err(pres) {
+            return Result.Err(rfail("SOURCE_DATE_EPOCH is not an integer: "
+            + py_repr_str(w.epoch_raw)))
+        }
+        return Result.Ok([result_unwrap(pres), 1])
+    }
+    return Result.Ok([digest_epoch(digest), 2])
+}
+
+fn epoch_source_name(which: int) -> str {
+    if which == 0 {
+        return "--epoch"
+    }
+    if which == 1 {
+        return "SOURCE_DATE_EPOCH"
+    }
+    return "derived"
+}
+
+# digest_epoch(digest) — int(tree_digest[:8], 16) % 2**31.
+fn digest_epoch(digest: str) -> int {
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < 8 && i < digest.len() {
+        v = v * 16 + hex_val_b(digest.byte_at(i))
+        i = i + 1
+    }
+    return v % 2147483648
+}
+
+# cc_locate(cc) — ENOENT pre-check: a path-bearing name must exist as
+# a regular file; a bare name must hit PATH (the .py's subprocess raised
+# FileNotFoundError before any child ran).
+fn cc_locate(cc: str) -> bool uses Fs, Proc {
+    if cc.contains("/") {
+        return file_exists(cc)
+    }
+    if cc == "" {
+        return false
+    }
+    return which_hit(cc) != ""
+}
+
+# cc_version(cc) — the first line of `cc --version` (a missing
+# compiler is a refused run).
+fn cc_version(cc: str) -> Result[str, Fail] uses Fs, Proc {
+    if !cc_locate(cc) {
+        return Result.Err(rfail("cannot run the C compiler "
+        + py_repr_str(cc) + ": [Errno 2] No such file or directory: '"
+        + cc + "'"))
+    }
+    let cap: RunCap = spawn_cap(cc, ["--version"])
+    if !cap.spawned {
+        return Result.Err(rfail("cannot run the C compiler "
+        + py_repr_str(cc) + ": [Errno 2] No such file or directory: '"
+        + cc + "'"))
+    }
+    if cap.code != 0 {
+        return Result.Err(rfail(py_repr_str(cc) + " --version failed (exit "
+        + cap.code.to_str() + ")"))
+    }
+    let mut text: str = cap.out
+    if py_strip(text) == "" {
+        text = cap.err
+    }
+    let lines: list[str] = py_strip(text).split("\n")
+    if lines.len() == 0 || py_strip(lines.get(0)) == "" {
+        return Result.Err(rfail("cannot run the C compiler "
+        + py_repr_str(cc) + ": no version output"))
+    }
+    return Result.Ok(lines.get(0))
+}
+
+# engine_resolve(w, engine) — auto -> native when bin/hlc exists, boot
+# otherwise; the RESOLVED class is what gets recorded and what verify
+# pins.
+fn engine_resolve(w: World, engine: str) -> Result[str, Fail] uses Fs {
+    if engine == "native" {
+        if !file_exists(w.native_hlc) {
+            return Result.Err(rfail("--engine native: bin/hlc does not "
+            + "exist (run make bootstrap)"))
+        }
+        return Result.Ok("native")
+    }
+    if engine == "boot" {
+        return Result.Ok("boot")
+    }
+    if file_exists(w.native_hlc) {
+        return Result.Ok("native")
+    }
+    return Result.Ok("boot")
+}
+
+# ============================================================================
+# Staging — the hermetic copy each build root receives.
+# ============================================================================
+
+# stage_source(w, root, tree) — copy exactly the audit's module set into
+# the build root, at the layout the import resolver re-derives; the
+# return is the entry's staged rel path.
+fn stage_source(w: World, root: str, tree: SourceTree) -> Result[str, Fail]
+uses Fs, Proc {
+    let mut i: int = 0
+    while i < tree.rel_v.len() {
+        let relpath: str = tree.rel_v.get(i)
+        let key: str = tree.rel_k.get(i)
+        let dst: str = path_join2(root, relpath)
+        let dres: Result[int, Fail] = mkdirs(path_dirname(dst))
+        if result_is_err(dres) {
+            return Result.Err(result_err_or(dres, rfail("")))
+        }
+        let src: str = key_to_path(key, w)
+        if !file_exists(src) {
+            return Result.Err(rfail("cannot read " + src
+            + " ([Errno 2] No such file or directory: '" + src + "')"))
+        }
+        write_file(dst, read_file(src))
+        i = i + 1
+    }
+    let mut j: int = 0
+    while j < tree.rel_k.len() {
+        if tree.rel_k.get(j) == tree.entry_key {
+            return Result.Ok(tree.rel_v.get(j))
+        }
+        j = j + 1
+    }
+    return Result.Err(rfail("module " + tree.entry_key
+    + " stages outside the tree root"))
+}
+
+# stage_package(w, root, tree) — the package into <root>/app, the dep
+# units laid out the way hls-pkg build does (a flat .hls-pkg-deps/ with
+# one name per top-level dep).
+fn stage_package(root: str, tree: PkgTree) -> Result[str, Fail]
+uses Fs, Proc {
+    let app: str = path_join2(root, "app")
+    let mres: Result[int, Fail] = mkdirs(app)
+    if result_is_err(mres) {
+        return Result.Err(result_err_or(mres, rfail("")))
+    }
+    copy_tree_contents(tree.root_dir, app)
+    let deps: str = path_join2(app, ".hls-pkg-deps")
+    let dres2: Result[int, Fail] = mkdirs(deps)
+    if result_is_err(dres2) {
+        return Result.Err(result_err_or(dres2, rfail("")))
+    }
+    let mut i: int = 0
+    while i < tree.dep_names.len() {
+        let dst: str = path_join2(deps, tree.dep_names.get(i))
+        let path: str = tree.dep_paths.get(i)
+        if fs_is_dir(path) {
+            copy_tree_contents(path, dst)
+        } else {
+            if !file_exists(path) {
+                return Result.Err(rfail("cannot read " + path
+                + " ([Errno 2] No such file or directory: '" + path
+                + "')"))
+            }
+            write_file(dst + ".hls", read_file(path))
+        }
+        i = i + 1
+    }
+    return Result.Ok(path_join2("app", tree.entry))
+}
+
+# copy_tree_contents(src, dst) — the staging copy (the package tree's
+# own working-copy noise never enters a hermetic build root).
+fn copy_tree_contents(src: str, dst: str) -> void uses Fs, Proc {
+    copy_tree_acc(src, dst, "")
+}
+
+fn copy_tree_acc(src: str, dst: str, prefix: str) -> void uses Fs, Proc {
+    if !fs_is_dir(src) {
+        return
+    }
+    let names: list[str] = fs_read_dir(src)
+    let files: list[str] = []
+    let dirs: list[str] = []
+    let mut i: int = 0
+    while i < names.len() {
+        let nm: str = names.get(i)
+        if is_stage_skip(nm) {
+            i = i + 1
+            continue
+        }
+        let full: str = path_join2(src, nm)
+        if fs_is_dir(full) {
+            dirs.push(nm)
+        } else {
+            if nm.ends_with(".buildinfo.json") {
+                i = i + 1
+                continue
+            }
+            files.push(nm)
+        }
+        i = i + 1
+    }
+    let mut f: int = 0
+    while f < files.len() {
+        let d: str = path_join2(dst, prefix + files.get(f))
+        let mres: Result[int, Fail] = mkdirs(path_dirname(d))
+        if result_is_ok(mres) {
+            let s: str = path_join2(src, files.get(f))
+            if file_exists(s) {
+                write_file(d, read_file(s))
+            }
+        }
+        f = f + 1
+    }
+    let mut g: int = 0
+    while g < dirs.len() {
+        copy_tree_acc(path_join2(src, dirs.get(g)), dst,
+        prefix + dirs.get(g) + "/")
+        g = g + 1
+    }
+}
+
+# ============================================================================
+# The build — one profile, one isolated root, one staged copy, one
+# recipe. Returns the build's record (hashes and smoke only, no
+# machine paths).
+# ============================================================================
+
+fn smoke_skipped(why: str) -> SmokeOut {
+    return SmokeOut {
+        doc: jv_obj(["status", "why"], [jv_str("skipped"), jv_str(why)]),
+        status: "skipped", exit_code: 0, out_sha: ""
+    }
+}
+
+# build_one — build index i.
+fn build_one(w: World, i: int, scratch: str, mode: str, epoch: int,
+engine: str, cc: str, cflags: str, offset: int, smoke_on: bool,
+tree_src: SourceTree, tree_pkg: PkgTree)
+-> Result[BuildRec, Fail] uses Fs, Proc, Rand {
+    let prof: Profile = profile_for(i, offset)
+    let root: str = path_join2(scratch, root_pattern_sub(prof.root, i))
+    let mres: Result[int, Fail] = mkdirs(path_join2(root, build_dir()))
+    if result_is_err(mres) {
+        return Result.Err(result_err_or(mres, rfail("")))
+    }
+    let mut staged_entry: str = ""
+    if mode == "source" {
+        let sres: Result[str, Fail] = stage_source(w, root, tree_src)
+        if result_is_err(sres) {
+            return Result.Err(result_err_or(sres, rfail("")))
+        }
+        staged_entry = result_unwrap(sres)
+    } else {
+        let pres: Result[str, Fail] = stage_package(root, tree_pkg)
+        if result_is_err(pres) {
+            return Result.Err(result_err_or(pres, rfail("")))
+        }
+        staged_entry = result_unwrap(pres)
+    }
+    # the run env: the MINIMAL base (PATH + SOURCE_DATE_EPOCH) with the
+    # profile's deltas riding on top (dict.update semantics), plus the
+    # deps farm for package mode.
+    let env_k: list[str] = ["PATH", "SOURCE_DATE_EPOCH"]
+    let env_v: list[str] = [w.path_default, epoch.to_str()]
+    let mut ei: int = 0
+    while ei < prof.env_k.len() {
+        if list_has(env_k, prof.env_k.get(ei)) {
+            let mut at: int = 0
+            while at < env_k.len() {
+                if env_k.get(at) == prof.env_k.get(ei) {
+                    env_v.set(at, prof.env_v.get(ei))
+                }
+                at = at + 1
+            }
+        } else {
+            env_k.push(prof.env_k.get(ei))
+            env_v.push(prof.env_v.get(ei))
+        }
+        ei = ei + 1
+    }
+    if mode == "package" {
+        if !list_has(env_k, "HLS_PKG_DEPS") {
+            env_k.push("HLS_PKG_DEPS")
+            env_v.push(path_join2(path_join2(root, "app"), ".hls-pkg-deps"))
+        }
+    }
+    # Both engine classes compile through bin/hlc: the boot engine's
+    # Stage-0 emission (boot.py src/hlc.hls <entry> <out.c>) is byte-
+    # identical to bin/hlc <entry> <out.c> (the fixed-point law
+    # snapshot/hlc.c pins); the buildinfo records the class it
+    # resolved.
+    let out_c: str = path_join2(build_dir(), c_name())
+    let cmd: list[str] = [w.native_hlc, staged_entry, out_c]
+    let rres: Result[RunCap, Fail] = run_recipe(w, cmd, root, env_k, env_v,
+    "the " + mode + " compile (" + engine + " engine)")
+    if result_is_err(rres) {
+        return Result.Err(result_err_or(rres, rfail("")))
+    }
+    let c_path: str = path_join2(root, out_c)
+    let csres: Result[str, Fail] = sha256_of_file(c_path)
+    if result_is_err(csres) {
+        return Result.Err(result_err_or(csres, rfail("")))
+    }
+    let c_sha: str = result_unwrap(csres)
+
+    let cc_argv: list[str] = [cc]
+    let cflag_list: list[str] = py_ws_split(cflags)
+    let mut cf: int = 0
+    while cf < cflag_list.len() {
+        cc_argv.push(cflag_list.get(cf))
+        cf = cf + 1
+    }
+    cc_argv.push("-o")
+    cc_argv.push(path_join2(build_dir(), bin_name()))
+    cc_argv.push(out_c)
+    cc_argv.push("-lm")
+    cc_argv.push("-pthread")
+    let cres: Result[RunCap, Fail] = run_recipe(w, cc_argv, root, env_k,
+    env_v, "the C compile (" + cc + ")")
+    if result_is_err(cres) {
+        return Result.Err(result_err_or(cres, rfail("")))
+    }
+    let bin_path: str = path_join2(root,
+    path_join2(build_dir(), bin_name()))
+    let bsres: Result[str, Fail] = sha256_of_file(bin_path)
+    if result_is_err(bsres) {
+        return Result.Err(result_err_or(bsres, rfail("")))
+    }
+    let bin_sha: str = result_unwrap(bsres)
+    let bin_size: int = read_file(bin_path).len()
+
+    let mut smoke: SmokeOut = smoke_skipped("--no-smoke")
+    if smoke_on {
+        let sres: Result[SmokeOut, Fail] = run_smoke(w, bin_path, root,
+        env_k, env_v)
+        if result_is_err(sres) {
+            return Result.Err(result_err_or(sres, rfail("")))
+        }
+        smoke = result_unwrap(sres)
+    }
+    return Result.Ok(BuildRec {
+        index: i, profile: prof.name, root_pattern: prof.root,
+        umask: prof.umask,
+        env_k: prof.env_k, env_v: prof.env_v,
+        c_sha: c_sha, bin_sha: bin_sha, bin_size: bin_size,
+        smoke: smoke
+    })
+}
+
+# run_smoke(w, bin_path, root, envk, envv) — run the artifact once under
+# its own profile's env (its own 15s timeout through the `timeout`
+# wrapper, exit 124; the verdict compares builds against builds, never
+# against an expectation).
+fn run_smoke(w: World, bin_path: str, root: str, envk: list[str],
+envv: list[str]) -> Result[SmokeOut, Fail] uses Proc {
+    let rel: str = path_join2(build_dir(), bin_name())
+    apply_child_env(w, envk, envv)
+    let home: str = cwd_get()
+    let rc: int = cwd_set(root)
+    if rc != 0 {
+        cwd_set(home)
+        return Result.Ok(smoke_skipped("cannot enter the build root"))
+    }
+    let cap: RunCap = spawn_cap("timeout",
+    [smoke_timeout_s().to_str(), "./" + rel])
+    cwd_set(home)
+    if !cap.spawned {
+        return Result.Ok(smoke_skipped("cannot run the smoke"))
+    }
+    if cap.code == 124 {
+        return Result.Ok(SmokeOut {
+            doc: jv_obj(["status"], [jv_str("timeout")]),
+            status: "timeout", exit_code: 0, out_sha: ""
+        })
+    }
+    let keys: list[str] = ["status", "exit", "stdout_sha256", "stdout_size"]
+    let vals: list[JVal] = [jv_str("ran"), jv_int(cap.code),
+    jv_str(sha256_hex(cap.out)), jv_int(cap.out.len())]
+    return Result.Ok(SmokeOut {
+        doc: jv_obj(keys, vals),
+        status: "ran", exit_code: cap.code, out_sha: sha256_hex(cap.out)
+    })
+}
+
+# ============================================================================
+# The diagnosis — WHY did the bytes differ.
+# ============================================================================
+
+# strings_around(data, offset) — the printable runs (>= 4) within 64
+# bytes of the offset.
+fn strings_around(data: str, offset: int) -> list[str] {
+    let mut lo: int = offset - 64
+    if lo < 0 {
+        lo = 0
+    }
+    let mut hi: int = offset + 64
+    if hi > data.len() {
+        hi = data.len()
+    }
+    let out: list[str] = []
+    let mut cur: str = ""
+    let mut i: int = lo
+    while i < hi {
+        let b: int = data.byte_at(i)
+        if b >= 32 && b < 127 {
+            cur = cur + data.slice(i, i + 1)
+        } else {
+            if cur.len() >= 4 {
+                out.push(cur)
+            }
+            cur = ""
+        }
+        i = i + 1
+    }
+    if cur.len() >= 4 {
+        out.push(cur)
+    }
+    return out
+}
+
+# diagnose(builds, c_paths, bin_paths, roots) — the leak classes in the
+# order they bite, the residual class with the printable strings around
+# the first difference as evidence.
+fn diagnose(builds: list[BuildRec], c_paths: list[str],
+bin_paths: list[str], roots: list[str]) -> list[str] uses Fs {
+    let findings: list[str] = []
+    let names: list[str] = []
+    let mut ri: int = 0
+    while ri < roots.len() {
+        names.push(path_basename(roots.get(ri)))
+        ri = ri + 1
+    }
+    # the C stage
+    let mut c_differs: bool = false
+    let mut ci: int = 1
+    while ci < builds.len() {
+        if builds.get(ci).c_sha != builds.get(0).c_sha {
+            c_differs = true
+        }
+        ci = ci + 1
+    }
+    if c_differs {
+        let mut pi: int = 0
+        while pi < c_paths.len() {
+            let c_path: str = c_paths.get(pi)
+            if !file_exists(c_path) {
+                pi = pi + 1
+                continue
+            }
+            let c_text: str = read_file(c_path)
+            let hits: list[str] = []
+            if c_text.contains("__DATE__") {
+                hits.push("__DATE__")
+            }
+            if c_text.contains("__TIME__") {
+                hits.push("__TIME__")
+            }
+            if c_text.contains("__TIMESTAMP__") {
+                hits.push("__TIMESTAMP__")
+            }
+            if hits.len() > 0 {
+                findings.push("timestamp macro in the generated C: "
+                + c_path + " (" + str_join(hits, ", ")
+                + ") — the C stage cannot be deterministic while it "
+                + "reads the wall clock")
+            }
+            let mut ni: int = 0
+            while ni < names.len() {
+                if c_text.contains(names.get(ni)) {
+                    findings.push("the build-root name "
+                    + py_repr_str(names.get(ni)) + " appears in the "
+                    + "generated C — path leakage at the compiler stage")
+                }
+                ni = ni + 1
+            }
+            pi = pi + 1
+        }
+    }
+    # the binary stage
+    let mut bin_differs: bool = false
+    let mut bi: int = 1
+    while bi < builds.len() {
+        if builds.get(bi).bin_sha != builds.get(0).bin_sha {
+            bin_differs = true
+        }
+        bi = bi + 1
+    }
+    if bin_differs {
+        let blobs: list[str] = []
+        let mut bl: int = 0
+        while bl < bin_paths.len() {
+            if file_exists(bin_paths.get(bl)) {
+                blobs.push(read_file(bin_paths.get(bl)))
+            } else {
+                blobs.push("")
+            }
+            bl = bl + 1
+        }
+        let mut all_nonempty: bool = blobs.len() > 0
+        let mut z: int = 0
+        while z < blobs.len() {
+            if blobs.get(z).len() == 0 {
+                all_nonempty = false
+            }
+            z = z + 1
+        }
+        if all_nonempty {
+            let mut minlen: int = blobs.get(0).len()
+            let mut mi: int = 1
+            while mi < blobs.len() {
+                if blobs.get(mi).len() < minlen {
+                    minlen = blobs.get(mi).len()
+                }
+                mi = mi + 1
+            }
+            let mut diffs: int = 0
+            let mut offset: int = -1
+            let mut k: int = 0
+            while k < minlen {
+                let byte_at_k: int = blobs.get(0).byte_at(k)
+                let mut varies: bool = false
+                let mut b2: int = 1
+                while b2 < blobs.len() {
+                    if blobs.get(b2).byte_at(k) != byte_at_k {
+                        varies = true
+                    }
+                    b2 = b2 + 1
+                }
+                if varies {
+                    diffs = diffs + 1
+                    if offset < 0 {
+                        offset = k
+                    }
+                }
+                k = k + 1
+            }
+            if offset < 0 {
+                offset = minlen
+            }
+            let near: list[str] = []
+            let mut nb: int = 0
+            while nb < blobs.len() {
+                let around: list[str] = strings_around(blobs.get(nb), offset)
+                let mut ai: int = 0
+                while ai < around.len() {
+                    if !list_has(near, around.get(ai)) {
+                        near.push(around.get(ai))
+                    }
+                    ai = ai + 1
+                }
+                nb = nb + 1
+            }
+            let snear: list[str] = sort_strs(near)
+            let shown: list[str] = []
+            let mut si: int = 0
+            while si < snear.len() && si < 6 {
+                shown.push(snear.get(si))
+                si = si + 1
+            }
+            let mut joined: str = str_join(shown, ", ")
+            if joined == "" {
+                joined = "(none)"
+            }
+            findings.push("the binaries differ in " + diffs.to_str()
+            + " byte(s); first at offset " + offset.to_str()
+            + " — printable strings around it: " + joined)
+            let mut same_len: bool = true
+            let lens0: int = blobs.get(0).len()
+            let mut lz: int = 0
+            while lz < blobs.len() {
+                if blobs.get(lz).len() != lens0 {
+                    same_len = false
+                }
+                lz = lz + 1
+            }
+            if same_len && diffs == 1 {
+                findings.push("a single differing byte in an otherwise "
+                + "identical binary is the symbol-table signature of a "
+                + "leaked intermediate FILE NAME (STT_FILE) — the recipe "
+                + "names the C " + c_name() + " canonically; a "
+                + "non-canonical name reached this build's compiler")
+            }
+            let mut nm: int = 0
+            while nm < names.len() {
+                let mut in_any: bool = false
+                let mut bz: int = 0
+                while bz < blobs.len() {
+                    if blobs.get(bz).contains(names.get(nm)) {
+                        in_any = true
+                    }
+                    bz = bz + 1
+                }
+                if in_any {
+                    findings.push("the build-root name "
+                    + py_repr_str(names.get(nm)) + " appears inside a "
+                    + "binary — path leakage at the assembler or linker "
+                    + "stage")
+                }
+                nm = nm + 1
+            }
+        }
+    }
+    if findings.len() == 0 {
+        findings.push("no known leak class matched — compare the artifact "
+        + "hashes and the toolchain versions recorded in the buildinfo")
+    }
+    return findings
+}
+
+# ============================================================================
+# The orchestration — N builds, one verdict, one buildinfo.
+# ============================================================================
+
+# run_builds — the pipeline: epoch -> N isolated builds -> verdict ->
+# (on agreement) the buildinfo doc. offset shifts the profile rotation
+# (verify uses a shifted slice).
+fn run_builds(w: World, o: Opt, mode: str, tree_src: SourceTree,
+tree_pkg: PkgTree, offset: int) -> Result[JVal, Fail]
+uses Fs, Proc, Rand {
+    let eres: Result[str, Fail] = engine_resolve(w, o.engine)
+    if result_is_err(eres) {
+        return Result.Err(result_err_or(eres, rfail("")))
+    }
+    let engine: str = result_unwrap(eres)
+    let mut digest: str = tree_pkg.digest
+    if mode == "source" {
+        digest = tree_src.digest
+    }
+    let epres: Result[list[int], Fail] = epoch_for(w, digest, o.epoch_set,
+    o.epoch)
+    if result_is_err(epres) {
+        return Result.Err(result_err_or(epres, rfail("")))
+    }
+    let epoch_pair: list[int] = result_unwrap(epres)
+    let epoch: int = epoch_pair.get(0)
+    let epoch_src: str = epoch_source_name(epoch_pair.get(1))
+    let cvres: Result[str, Fail] = cc_version(o.cc)
+    if result_is_err(cvres) {
+        return Result.Err(result_err_or(cvres, rfail("")))
+    }
+    let cc_ver: str = result_unwrap(cvres)
+    let mut cflags: str = py_strip(o.cflags)
+    if cflags == "" {
+        cflags = default_cflags()
+    }
+
+    let builds: list[BuildRec] = []
+    let roots: list[str] = []
+    let c_paths: list[str] = []
+    let bin_paths: list[str] = []
+    let mut i: int = 0
+    while i < o.builds {
+        let bres: Result[BuildRec, Fail] = build_one(w, i, o.scratch, mode,
+        epoch, engine, o.cc, cflags, offset, !o.no_smoke, tree_src,
+        tree_pkg)
+        if result_is_err(bres) {
+            return Result.Err(result_err_or(bres, rfail("")))
+        }
+        let rec: BuildRec = result_unwrap(bres)
+        builds.push(rec)
+        roots.push(path_join2(o.scratch,
+        root_pattern_sub(rec.root_pattern, i)))
+        let last_root: str = roots.get(roots.len() - 1)
+        c_paths.push(path_join2(last_root,
+        path_join2(build_dir(), c_name())))
+        bin_paths.push(path_join2(last_root,
+        path_join2(build_dir(), bin_name())))
+        i = i + 1
+    }
+
+    # the verdict: byte-identical C, byte-identical binary, the smoke
+    # consistent when it can be.
+    let mut c_ok: bool = true
+    let mut bin_ok: bool = true
+    let mut vi: int = 1
+    while vi < builds.len() {
+        if builds.get(vi).c_sha != builds.get(0).c_sha {
+            c_ok = false
+        }
+        if builds.get(vi).bin_sha != builds.get(0).bin_sha {
+            bin_ok = false
+        }
+        vi = vi + 1
+    }
+    let mut smoke_doc: JVal = jv_obj(["status", "why"], [jv_str("skipped"),
+    jv_str("not every build produced a runnable artifact")])
+    let mut all_ran: bool = builds.len() > 0
+    let mut all_timeout: bool = builds.len() > 0
+    let mut sm: int = 0
+    while sm < builds.len() {
+        if builds.get(sm).smoke.status != "ran" {
+            all_ran = false
+        }
+        if builds.get(sm).smoke.status != "timeout" {
+            all_timeout = false
+        }
+        sm = sm + 1
+    }
+    if all_ran {
+        let mut exits_same: bool = true
+        let mut shas_same: bool = true
+        let mut sx: int = 1
+        while sx < builds.len() {
+            if builds.get(sx).smoke.exit_code
+            != builds.get(0).smoke.exit_code {
+                exits_same = false
+            }
+            if builds.get(sx).smoke.out_sha != builds.get(0).smoke.out_sha {
+                shas_same = false
+            }
+            sx = sx + 1
+        }
+        if !exits_same || !shas_same {
+            smoke_doc = jv_obj(["status"], [jv_str("divergent")])
+        } else {
+            smoke_doc = jv_obj(["status", "exit", "stdout_sha256"],
+            [jv_str("consistent"), jv_int(builds.get(0).smoke.exit_code),
+            jv_str(builds.get(0).smoke.out_sha)])
+        }
+    } else if all_timeout {
+        smoke_doc = jv_obj(["status", "why"], [jv_str("skipped"),
+        jv_str("every run timed out")])
+    }
+
+    if !c_ok || !bin_ok {
+        let findings: list[str] = diagnose(builds, c_paths, bin_paths, roots)
+        return Result.Err(mfail("the artifacts are NOT byte-identical "
+        + "across " + builds.len().to_str() + " builds", builds, findings))
+    }
+
+    # the buildinfo (schema hls-buildinfo/v1; the dump sorts the keys)
+    let inputs: list[JVal] = []
+    let sorted_pairs: list[KV] = sort_pairs(tree_pairs(mode, tree_src,
+    tree_pkg))
+    let mut sp: int = 0
+    while sp < sorted_pairs.len() {
+        inputs.push(jv_obj(["key", "sha256"],
+        [jv_str(sorted_pairs.get(sp).k),
+        jv_str(sorted_pairs.get(sp).v)]))
+        sp = sp + 1
+    }
+    let profiles_doc: list[JVal] = []
+    let mut bp: int = 0
+    while bp < builds.len() {
+        let b: BuildRec = builds.get(bp)
+        profiles_doc.push(jv_obj(["name", "root_pattern", "umask", "env"],
+        [jv_str(b.profile), jv_str(b.root_pattern), jv_str(b.umask),
+        jv_obj(b.env_k, env_vals_as_jv(b))]))
+        bp = bp + 1
+    }
+    let builds_doc: list[JVal] = []
+    let mut bd: int = 0
+    while bd < builds.len() {
+        let b2: BuildRec = builds.get(bd)
+        builds_doc.push(jv_obj(["index", "profile", "c_sha256",
+        "binary_sha256", "binary_size", "smoke"],
+        [jv_int(b2.index), jv_str(b2.profile), jv_str(b2.c_sha),
+        jv_str(b2.bin_sha), jv_int(b2.bin_size), b2.smoke.doc]))
+        bd = bd + 1
+    }
+    let tree_keys: list[str] = ["digest", "inputs"]
+    let tree_vals: list[JVal] = [jv_str(digest), jv_arr(inputs)]
+    if mode == "source" {
+        tree_keys.push("layout")
+        tree_vals.push(jv_str(tree_src.layout))
+        let mut entry_name: str = tree_src.entry_key
+        if tree_src.layout != "repo" {
+            entry_name = path_basename(tree_src.entry_key)
+        }
+        tree_keys.push("entry")
+        tree_vals.push(jv_str(entry_name))
+    } else {
+        tree_keys.push("name")
+        tree_vals.push(jv_str(tree_pkg.name))
+        tree_keys.push("version")
+        tree_vals.push(jv_str(tree_pkg.version))
+        tree_keys.push("entry")
+        tree_vals.push(jv_str(tree_pkg.entry))
+    }
+    let info: JVal = jv_obj(
+    ["schema", "tool", "tool_version", "mode", "engine", "epoch",
+    "tree", "toolchain", "recipe", "matrix", "smoke", "builds",
+    "outputs"],
+    [jv_str(schema_name()), jv_str(tool_name()),
+    jv_str(tool_version()), jv_str(mode), jv_str(engine),
+    jv_obj(["value", "source"], [jv_int(epoch), jv_str(epoch_src)]),
+    jv_obj(tree_keys, tree_vals),
+    jv_obj(["hlc_fingerprint_sha256", "cc", "cc_command", "python"],
+    [jv_str(sha256_hex(read_file(w.hlc_src))), jv_str(cc_ver),
+    jv_str(o.cc), jv_str("")]),
+    jv_obj(["c_name", "binary_name", "cflags", "link_libs",
+    "hermetic_staging"],
+    [jv_str(path_join2(build_dir(), c_name())),
+    jv_str(path_join2(build_dir(), bin_name())), jv_str(cflags),
+    jv_arr([jv_str("-lm"), jv_str("-pthread")]), jv_bool(true)]),
+    jv_obj(["builds", "profiles"],
+    [jv_int(builds.len()), jv_arr(profiles_doc)]),
+    smoke_doc,
+    jv_arr(builds_doc),
+    jv_obj(["c_sha256", "binary_sha256", "binary_size"],
+    [jv_str(builds.get(0).c_sha), jv_str(builds.get(0).bin_sha),
+    jv_int(builds.get(0).bin_size)])])
+    return Result.Ok(info)
+}
+
+fn tree_pairs(mode: str, tree_src: SourceTree, tree_pkg: PkgTree)
+-> list[KV] {
+    if mode == "source" {
+        return tree_src.pairs
+    }
+    return tree_pkg.pairs
+}
+
+fn env_vals_as_jv(b: BuildRec) -> list[JVal] {
+    let out: list[JVal] = []
+    let mut i: int = 0
+    while i < b.env_v.len() {
+        out.push(jv_str(b.env_v.get(i)))
+        i = i + 1
+    }
+    return out
+}
+
+# ============================================================================
+# verify — the cross-environment answer.
+# ============================================================================
+
+struct VerifyOut {
+    fresh: JVal,
+    old_smoke_status: str,
+    old_stdout_sha: str
+}
+
+# verify_buildinfo(w, o, path) — shape first, the TREE second (a tree
+# that is not what the buildinfo describes refuses before anything is
+# built), the ENGINE third (fail-closed), then the fresh builds under a
+# shifted profile slice. Ok carries the fresh doc + the old smoke
+# fields the summary prints.
+fn verify_buildinfo(w: World, o: Opt, path: str)
+-> Result[VerifyOut, Fail] uses Fs, Proc, Rand {
+    if !file_exists(path) || fs_is_dir(path) {
+        return Result.Err(rfail("cannot read the buildinfo " + path
+        + ": [Errno 2] No such file or directory: '" + path + "'"))
+    }
+    let src: str = read_file(path)
+    let jres: Result[JsonValue, str] = json_parse_result(src)
+    if result_is_err(jres) {
+        return Result.Err(rfail("cannot read the buildinfo " + path + ": "
+        + result_err_or(jres, "invalid JSON")))
+    }
+    let bi: JsonValue = result_unwrap(jres)
+    if !json_is_object(bi)
+    || json_str_value(json_object_get(bi, "schema")) != schema_name() {
+        return Result.Err(rfail(path + " is not a " + schema_name()
+        + " buildinfo"))
+    }
+    let tool_v: JsonValue = json_object_get(bi, "tool")
+    if !json_is_str(tool_v) || json_str_value(tool_v) != tool_name() {
+        return Result.Err(rfail(path + " was produced by "
+        + jv_py_repr(tool_v) + ", not " + tool_name()))
+    }
+    let mode_v: JsonValue = json_object_get(bi, "mode")
+    let mode: str = jv_str_or_blank(mode_v)
+    if mode != "source" && mode != "package" {
+        return Result.Err(rfail("buildinfo names an unknown mode: "
+        + jv_py_repr(mode_v)))
+    }
+    let tree_sec: JsonValue = json_object_get(bi, "tree")
+    let empty_src: SourceTree = SourceTree {
+        pairs: [], rel_k: [], rel_v: [], digest: "", entry_key: "",
+        layout: "repo"
+    }
+    let empty_pkg: PkgTree = PkgTree {
+        pairs: [], dep_names: [], dep_paths: [], dep_shas: [],
+        root_dir: "", digest: "", name: "", version: "", entry: "",
+        lockfile: "absent", drift_pkgs: [], drift_whys: [],
+        unauditable: []
+    }
+    let mut tree_src: SourceTree = empty_src
+    let mut tree_pkg: PkgTree = empty_pkg
+    if mode == "source" {
+        let entry_rel: str = jv_str_or_blank(json_object_get(tree_sec,
+        "entry"))
+        if entry_rel == "" {
+            return Result.Err(rfail("the buildinfo names no entry"))
+        }
+        let mut entry_path: str = ""
+        if jv_str_or_blank(json_object_get(tree_sec, "layout"))
+        == "detached" {
+            if o.in_dir == "" {
+                return Result.Err(rfail("this buildinfo describes a "
+                + "detached tree — pass --in DIR (the directory holding "
+                + entry_rel + ")"))
+            }
+            entry_path = path_join2(o.in_dir, entry_rel)
+        } else {
+            entry_path = path_join2(w.root, entry_rel)
+        }
+        let lres: Result[SourceTree, Fail] = load_source_tree(w, entry_path,
+        o.scratch)
+        if result_is_err(lres) {
+            return Result.Err(result_err_or(lres, rfail("")))
+        }
+        tree_src = result_unwrap(lres)
+    } else {
+        let mut pkg_root: str = o.in_dir
+        if pkg_root == "" {
+            pkg_root = cwd_get()
+        }
+        if !file_exists(path_join2(pkg_root, manifest_name())) {
+            return Result.Err(rfail("no " + manifest_name() + " in "
+            + pkg_root + " — pass --in DIR"))
+        }
+        let pres: Result[PkgTree, Fail] = load_package_tree(w, pkg_root,
+        o.scratch)
+        if result_is_err(pres) {
+            return Result.Err(result_err_or(pres, rfail("")))
+        }
+        tree_pkg = result_unwrap(pres)
+    }
+    # the tree digest: input drift refuses BEFORE anything is built
+    let mut digest: str = tree_pkg.digest
+    if mode == "source" {
+        digest = tree_src.digest
+    }
+    let recorded: JsonValue = json_object_get(tree_sec, "digest")
+    if !json_is_str(recorded) || json_str_value(recorded) != digest {
+        return Result.Err(rfail("the tree is not what the buildinfo "
+        + "describes: digest " + py_head(digest, 12)
+        + " but the buildinfo records "
+        + py_head(jv_py_str(recorded), 12) + " — input drift"))
+    }
+    # the engine class (fail-closed)
+    let engine_v: JsonValue = json_object_get(bi, "engine")
+    let engine: str = jv_str_or_blank(engine_v)
+    if engine != "boot" && engine != "native" {
+        return Result.Err(rfail("buildinfo names an unknown engine: "
+        + jv_py_repr(engine_v)))
+    }
+    let rres: Result[str, Fail] = engine_resolve(w, o.engine)
+    if result_is_err(rres) {
+        return Result.Err(result_err_or(rres, rfail("")))
+    }
+    let resolved: str = result_unwrap(rres)
+    if engine != resolved {
+        return Result.Err(rfail("engine mismatch: the buildinfo was "
+        + "built with " + jv_py_repr(engine_v) + " and this run would "
+        + "use " + py_repr_str(resolved) + " — a buildinfo is verified "
+        + "in the engine class it names"))
+    }
+    # the recorded recipe drives the fresh builds
+    let n_v: JsonValue = json_object_get(json_object_get(bi, "matrix"),
+    "builds")
+    let mut n: int = 0
+    if json_is_int(n_v) {
+        n = json_int_value(n_v)
+    } else if json_is_bool(n_v) {
+        if json_bool_value(n_v) {
+            n = 1
+        }
+    }
+    if n < 2 || n > max_builds() {
+        return Result.Err(rfail("buildinfo names an unusable build "
+        + "count: " + jv_py_repr(n_v)))
+    }
+    o.builds = n
+    let rec_cflags: str = jv_str_or_blank(json_object_get(
+    json_object_get(bi, "recipe"), "cflags"))
+    if rec_cflags == "" {
+        o.cflags = default_cflags()
+    } else {
+        o.cflags = rec_cflags
+    }
+    let epoch_v2: JsonValue = json_object_get(json_object_get(bi, "epoch"),
+    "value")
+    if !json_is_int(epoch_v2) {
+        return Result.Err(rfail("buildinfo names no usable epoch"))
+    }
+    o.epoch = json_int_value(epoch_v2)
+    o.epoch_set = true
+    # a shifted rotation: the fresh builds exercise a DIFFERENT slice
+    let fres: Result[JVal, Fail] = run_builds(w, o, mode, tree_src,
+    tree_pkg, 1)
+    if result_is_err(fres) {
+        return Result.Err(result_err_or(fres, rfail("")))
+    }
+    let fresh: JVal = result_unwrap(fres)
+    jv_set(fresh, "verified", jv_bool(true))
+    jv_set(fresh, "verified_against_sha256", jv_str(sha256_hex(src)))
+    # the fresh hashes must equal the recorded ones
+    let old_outputs: JsonValue = json_object_get(bi, "outputs")
+    let fresh_outputs: JVal = jv_get(fresh, "outputs")
+    let old_c_v: JsonValue = json_object_get(old_outputs, "c_sha256")
+    let out_want_c: str = jv_py_str(old_c_v)
+    let fresh_c: str = py_str_json(jv_get(fresh_outputs, "c_sha256"))
+    let fresh_bin: str = py_str_json(jv_get(fresh_outputs,
+    "binary_sha256"))
+    if !json_is_str(old_c_v) || fresh_c != out_want_c {
+        return Result.Err(vfail("the C stage did not reproduce: fresh "
+        + py_head(fresh_c, 12) + ", buildinfo "
+        + py_head(jv_py_str(old_c_v), 12), fresh_c, fresh_bin))
+    }
+    let old_bin_v: JsonValue = json_object_get(old_outputs,
+    "binary_sha256")
+    let out_want_bin: str = jv_py_str(old_bin_v)
+    if !json_is_str(old_bin_v) || fresh_bin != out_want_bin {
+        return Result.Err(vfail("the binary did not reproduce: fresh "
+        + py_head(fresh_bin, 12) + ", buildinfo "
+        + py_head(jv_py_str(old_bin_v), 12), fresh_c, fresh_bin))
+    }
+    let old_smoke: JsonValue = json_object_get(bi, "smoke")
+    let old_smoke_status: str = jv_str_or_blank(json_object_get(old_smoke,
+    "status"))
+    let old_stdout_sha: str = jv_str_or_blank(json_object_get(old_smoke,
+    "stdout_sha256"))
+    let new_smoke_status: str = py_str_json(jv_get(jv_get(fresh,
+    "smoke"), "status"))
+    let new_stdout_sha: str = py_str_json(jv_get(jv_get(fresh,
+    "smoke"), "stdout_sha256"))
+    let agree: bool = old_smoke_status == "consistent"
+    && new_smoke_status == "consistent"
+    && old_stdout_sha == new_stdout_sha
+    jv_set(fresh, "smoke_agreement", jv_bool(agree))
+    return Result.Ok(VerifyOut {
+        fresh: fresh,
+        old_smoke_status: old_smoke_status,
+        old_stdout_sha: old_stdout_sha
+    })
+}
+
+# ============================================================================
+# The transparency log — hpkg_log's append, chained (the --release
+# record rides the SAME chain lock, publish and the SBOM append do).
+# The flock serialization of the .py has no runtime primitive here
+# (sequential callers are unaffected; documented deviation).
+# ============================================================================
+
+# log_next_seq(w) — the record count + 1 (the whole-file law).
+fn log_next_seq(w: World) -> int uses Fs {
+    if !file_exists(w.log_path) {
+        return 1
+    }
+    let data: str = read_file(w.log_path)
+    let mut count: int = 0
+    let mut i: int = 0
+    while i < data.len() {
+        if data.byte_at(i) == 10 {
+            count = count + 1
+        }
+        i = i + 1
+    }
+    return count + 1
+}
+
+# log_head_hash(w) — the last record's chain_hash (or 64 zeros).
+fn log_head_hash(w: World) -> str uses Fs {
+    if !file_exists(w.log_path) {
+        return zero64()
+    }
+    let data: str = read_file(w.log_path)
+    let lines: list[str] = data.split("\n")
+    let mut last: str = ""
+    let mut i: int = lines.len() - 1
+    while i >= 0 {
+        if py_strip(lines.get(i)) != "" {
+            last = lines.get(i)
+            break
+        }
+        i = i - 1
+    }
+    if last == "" {
+        return zero64()
+    }
+    let jres: Result[JsonValue, str] = json_parse_result(last)
+    if result_is_err(jres) {
+        return zero64()
+    }
+    let rec: JsonValue = result_unwrap(jres)
+    let hh: str = json_str_value(json_object_get(rec, "chain_hash"))
+    if hh == "" {
+        return zero64()
+    }
+    return hh
+}
+
+# transparency_log_append(w, keys, vals) — build the chained record,
+# append the line (json.dumps(record, sort_keys=True) + "\n"), return
+# the seq.
+fn transparency_log_append(w: World, keys: list[str], vals: list[JVal])
+-> Result[int, Fail] uses Fs, Proc, Clock {
+    let lock_path: str = w.log_path + ".lock"
+    if !file_exists(lock_path) {
+        write_file(lock_path, "")
+    }
+    let prev_hash: str = log_head_hash(w)
+    let seq: int = log_next_seq(w)
+    let ms: int = system_time_now_ms()
+    let timestamp: int = ms / 1000
+    let rk: list[str] = []
+    let rv: list[JVal] = []
+    let mut i: int = 0
+    while i < keys.len() {
+        rk.push(keys.get(i))
+        rv.push(vals.get(i))
+        i = i + 1
+    }
+    rk.push("seq")
+    rv.push(jv_int(seq))
+    rk.push("timestamp")
+    rv.push(jv_int(timestamp))
+    rk.push("prev_hash")
+    rv.push(jv_str(prev_hash))
+    let rec: JVal = jv_obj(rk, rv)
+    let canon: str = py_json_canon(rec)
+    let chain: str = sha256_hex(prev_hash + canon)
+    jv_set(rec, "chain_hash", jv_str(chain))
+    let mut existing: str = ""
+    if file_exists(w.log_path) {
+        existing = read_file(w.log_path)
+    }
+    write_file(w.log_path, existing + py_json_line(rec) + "\n")
+    return Result.Ok(seq)
+}
+
+# ============================================================================
+# The reports — the buildinfo write, the summary, the verify lines.
+# ============================================================================
+
+# default_buildinfo_path(mode, o, tree) — the .py's default: --out DIR,
+# else the package root / the entry's directory.
+fn default_buildinfo_path(mode: str, o: Opt, tree_src: SourceTree,
+tree_pkg: PkgTree, w: World) -> str {
+    let mut name: str = buildinfo_name()
+    if o.release {
+        name = "hls-repro-" + tree_pkg.name + "-" + tree_pkg.version
+        + ".buildinfo.json"
+    }
+    let mut base: str = o.out
+    if base == "" {
+        if mode == "package" {
+            base = tree_pkg.root_dir
+        } else {
+            base = path_dirname(key_to_path(tree_src.entry_key, w))
+        }
+    }
+    return path_join2(base, name)
+}
+
+# write_buildinfo(path, info) — the output directory is created when
+# missing; a directory that cannot be created or written is a refused
+# run, not a half-written claim.
+fn write_buildinfo(path: str, info: JVal) -> Result[int, Fail]
+uses Fs, Proc {
+    let mut dir: str = path_dirname(path)
+    if dir == "" {
+        dir = "."
+    }
+    let mres: Result[int, Fail] = mkdirs(dir)
+    if result_is_err(mres) || result_unwrap(mres) != 0 {
+        return Result.Err(rfail("cannot write the buildinfo " + path
+        + ": cannot create the directory " + dir))
+    }
+    write_file(path, py_json_dump(info) + "\n")
+    return Result.Ok(0)
+}
+
+# jv_int_of(v) — int value of a built JVal (0 unless kind "int").
+fn jv_int_of(v: JVal) -> int {
+    if v.kind == "int" {
+        return v.ival
+    }
+    return 0
+}
+
+# jv_bool_of(v) — bool value of a built JVal (false unless "bool").
+fn jv_bool_of(v: JVal) -> bool {
+    if v.kind == "bool" {
+        return v.bval
+    }
+    return false
+}
+
+# render_summary(info) — the human summary (the .py's exact lines).
+fn render_summary(info: JVal) -> void uses IO {
+    let matrix: JVal = jv_get(info, "matrix")
+    let profiles: JVal = jv_get(matrix, "profiles")
+    println("reproducible: "
+    + jv_int_of(jv_get(matrix, "builds")).to_str()
+    + " builds, " + profiles.arr.len().to_str() + " profiles, engine "
+    + py_str_json(jv_get(info, "engine")))
+    let tree: JVal = jv_get(info, "tree")
+    println("  tree      = "
+    + py_head(py_str_json(jv_get(tree, "digest")), 16)
+    + " ("
+    + jv_get(tree, "inputs").arr.len().to_str() + " inputs)")
+    let epoch: JVal = jv_get(info, "epoch")
+    println("  epoch     = "
+    + jv_int_of(jv_get(epoch, "value")).to_str() + " ("
+    + py_str_json(jv_get(epoch, "source")) + ")")
+    let outputs: JVal = jv_get(info, "outputs")
+    println("  c         = "
+    + py_str_json(jv_get(outputs, "c_sha256")))
+    println("  binary    = "
+    + py_str_json(jv_get(outputs, "binary_sha256")) + " ("
+    + jv_int_of(jv_get(outputs, "binary_size")).to_str()
+    + " bytes)")
+    let smoke: JVal = jv_get(info, "smoke")
+    if py_str_json(jv_get(smoke, "status")) == "consistent" {
+        println("  smoke     = consistent (exit "
+        + jv_int_of(jv_get(smoke, "exit")).to_str()
+        + ", stdout "
+        + py_head(py_str_json(jv_get(smoke, "stdout_sha256")),
+        16) + ")")
+    } else {
+        println("  smoke     = "
+        + py_str_json(jv_get(smoke, "status")))
+    }
+    let names: list[str] = []
+    let mut i: int = 0
+    while i < profiles.arr.len() {
+        names.push(py_str_json(jv_get(profiles.arr.get(i), "name")))
+        i = i + 1
+    }
+    println("  profiles  = " + str_join(names, ", "))
+}
+
+# ============================================================================
+# The CLI — argparse's grammar, usage text, and error bytes.
+# ============================================================================
+
+fn usage_block() -> str {
+    return "usage: hls-repro [-h] [--pkg [PKG]] [--verify FILE]"
+    + " [--in IN_DIR]\n"
+    + "                 [--builds BUILDS] [--engine {auto,boot,native}]"
+    + " [--cc CC]\n"
+    + "                 [--cflags CFLAGS] [--epoch EPOCH] [--out OUT]\n"
+    + "                 [--scratch SCRATCH] [--keep-scratch]"
+    + " [--no-smoke] [--release]\n"
+    + "                 [--json]\n"
+    + "                 [entry]\n"
+}
+
+fn help_text() -> str {
+    return usage_block()
+    + "\n"
+    + "reproducible-build verification across distro profiles (Stage 105)\n"
+    + "\n"
+    + "positional arguments:\n"
+    + "  entry                 the entry .hls file\n"
+    + "\n"
+    + "options:\n"
+    + "  -h, --help            show this help message and exit\n"
+    + "  --pkg [PKG]           package mode (optional DIR, default cwd)\n"
+    + "  --verify FILE         verify a buildinfo against the current tree\n"
+    + "  --in IN_DIR           the tree root for --verify (detached trees)\n"
+    + "  --builds BUILDS       builds across the profile matrix (2..5,"
+    + " default 2)\n"
+    + "  --engine {auto,boot,native}\n"
+    + "  --cc CC\n"
+    + "  --cflags CFLAGS\n"
+    + "  --epoch EPOCH\n"
+    + "  --out OUT             directory for the buildinfo file\n"
+    + "  --scratch SCRATCH     parent directory for the build roots\n"
+    + "  --keep-scratch\n"
+    + "  --no-smoke            skip the runtime smoke of the artifacts\n"
+    + "  --release             package mode: the shipping gate (lockfile"
+    + " required,\n"
+    + "                        buildinfo + transparency record)\n"
+    + "  --json                print the report instead of the summary\n"
+}
+
+# usage_error(msg) — the argparse law: the usage block, then the error
+# line, exit 2.
+fn usage_error(msg: str) -> int uses IO {
+    eprint(usage_block())
+    eprintln("hls-repro: error: " + msg)
+    return 2
+}
+
+# The known long options in argparse's add order (prefix matching is
+# argparse's allow_abbrev law; exact matches win).
+fn known_flags() -> list[str] {
+    return["--help", "--pkg", "--verify", "--in", "--builds", "--engine",
+    "--cc", "--cflags", "--epoch", "--out", "--scratch", "--keep-scratch",
+    "--no-smoke", "--release", "--json"]
+}
+
+fn value_flags() -> list[str] {
+    return["--pkg", "--verify", "--in", "--builds", "--engine", "--cc",
+    "--cflags", "--epoch", "--out", "--scratch"]
+}
+
+# looks_negative_number(tok) — argparse's negative-number rule.
+fn looks_negative_number(tok: str) -> bool {
+    if tok.len() < 2 {
+        return false
+    }
+    if tok.byte_at(0) != 45 {
+        return false
+    }
+    let mut i: int = 1
+    while i < tok.len() {
+        if !is_digit_b(tok.byte_at(i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# resolve_flag(head) — exact match, else the unique prefix. Err(2) means
+# the ambiguous error was printed; Err(0) means unknown (deferred).
+fn resolve_flag(head: str) -> Result[str, int] uses IO {
+    let known: list[str] = known_flags()
+    if list_has(known, head) {
+        return Result.Ok(head)
+    }
+    let matches: list[str] = []
+    let mut i: int = 0
+    while i < known.len() {
+        if known.get(i).starts_with(head) {
+            matches.push(known.get(i))
+        }
+        i = i + 1
+    }
+    if matches.len() == 1 {
+        return Result.Ok(matches.get(0))
+    }
+    if matches.len() > 1 {
+        usage_error("ambiguous option: " + head + " could match "
+        + str_join(matches, ", "))
+        return Result.Err(2)
+    }
+    return Result.Err(0)
+}
+
+# set_bool_flag(o, flag) — the flag mutations.
+fn set_bool_flag(o: Opt, flag: str) -> void {
+    if flag == "--keep-scratch" {
+        o.keep_scratch = true
+    }
+    if flag == "--no-smoke" {
+        o.no_smoke = true
+    }
+    if flag == "--release" {
+        o.release = true
+    }
+    if flag == "--json" {
+        o.json = true
+    }
+}
+
+# set_value_flag(o, flag, val) — the option mutations.
+fn set_value_flag(o: Opt, flag: str, val: str) -> void {
+    if flag == "--pkg" {
+        o.pkg = val
+        o.pkg_set = true
+    }
+    if flag == "--verify" {
+        o.verify = val
+        o.verify_set = true
+    }
+    if flag == "--in" {
+        o.in_dir = val
+    }
+    if flag == "--engine" {
+        o.engine = val
+    }
+    if flag == "--cc" {
+        o.cc = val
+    }
+    if flag == "--cflags" {
+        o.cflags = val
+    }
+    if flag == "--epoch" {
+        o.epoch_raw = val
+    }
+    if flag == "--out" {
+        o.out = val
+    }
+    if flag == "--scratch" {
+        o.scratch = val
+        o.scratch_given = true
+    }
+    if flag == "--builds" {
+        o.builds_raw = val
+    }
+}
+
+# parse_cli(argv) — the argparse twin (positional entry, --pkg's const,
+# --flag=value, prefix matching, deferred unknowns, immediate value /
+# choice errors). Result.Err carries the exit code (help exits 0; the
+# usage errors have already printed).
+fn parse_cli(argv: list[str]) -> Result[Opt, int] uses IO {
+    let o: Opt = Opt {
+        entry: "", entry_set: false,
+        pkg: "", pkg_set: false,
+        verify: "", verify_set: false,
+        in_dir: "",
+        builds: 2, builds_raw: "",
+        engine: "auto",
+        cc: "",
+        cflags: default_cflags(),
+        epoch: 0, epoch_raw: "", epoch_set: false,
+        out: "",
+        scratch: "", scratch_given: false,
+        keep_scratch: false, no_smoke: false, release: false, json: false
+    }
+    let extras: list[str] = []
+    let mut positional_seen: bool = false
+    let mut after_ddash: bool = false
+    let mut i: int = 1
+    while i < argv.len() {
+        let tok: str = argv.get(i)
+        if after_ddash {
+            if !positional_seen {
+                o.entry = tok
+                o.entry_set = true
+                positional_seen = true
+            } else {
+                extras.push(tok)
+            }
+            i = i + 1
+            continue
+        }
+        if tok == "--" {
+            after_ddash = true
+            i = i + 1
+            continue
+        }
+        if tok == "-h" || tok == "--help" {
+            print(help_text())
+            return Result.Err(0)
+        }
+        if tok.starts_with("--") && tok.len() > 2 {
+            let mut head: str = tok
+            let mut val: str = ""
+            let mut has_val: bool = false
+            let eq: int = tok.find("=")
+            if eq >= 0 {
+                head = tok.slice(0, eq)
+                val = tok.slice(eq + 1, tok.len())
+                has_val = true
+            }
+            let rres: Result[str, int] = resolve_flag(head)
+            if result_is_err(rres) {
+                let code: int = result_err_or(rres, 2)
+                if code != 0 {
+                    return Result.Err(code)
+                }
+                # unknown: deferred to the unrecognized-arguments error
+                extras.push(head)
+                i = i + 1
+                continue
+            }
+            let flag: str = result_unwrap(rres)
+            let is_value_flag: bool = list_has(value_flags(), flag)
+            if !is_value_flag {
+                if has_val {
+                    return Result.Err(usage_error("argument " + flag
+                    + ": ignored explicit argument '" + val + "'"))
+                }
+                set_bool_flag(o, flag)
+                i = i + 1
+                continue
+            }
+            if has_val {
+                set_value_flag(o, flag, val)
+                i = i + 1
+                continue
+            }
+            # --pkg [DIR]: the const "." when the next token is
+            # option-like
+            if flag == "--pkg" {
+                if i + 1 < argv.len() && !argv.get(i + 1).starts_with("-") {
+                    o.pkg = argv.get(i + 1)
+                    o.pkg_set = true
+                    i = i + 2
+                    continue
+                }
+                o.pkg = "."
+                o.pkg_set = true
+                i = i + 1
+                continue
+            }
+            if i + 1 >= argv.len()
+            || (argv.get(i + 1).starts_with("-")
+            && argv.get(i + 1).len() > 1
+            && !looks_negative_number(argv.get(i + 1))) {
+                return Result.Err(usage_error("argument " + flag
+                + ": expected one argument"))
+            }
+            set_value_flag(o, flag, argv.get(i + 1))
+            i = i + 2
+            continue
+        }
+        if tok.starts_with("-") && tok.len() > 1 {
+            if looks_negative_number(tok) && !positional_seen {
+                o.entry = tok
+                o.entry_set = true
+                positional_seen = true
+                i = i + 1
+                continue
+            }
+            extras.push(tok)
+            i = i + 1
+            continue
+        }
+        if !positional_seen {
+            o.entry = tok
+            o.entry_set = true
+            positional_seen = true
+            i = i + 1
+            continue
+        }
+        extras.push(tok)
+        i = i + 1
+    }
+    # the immediate int validation (argparse's invalid int value)
+    if o.builds_raw != "" {
+        let pres: Result[int, str] = py_int_parse(o.builds_raw)
+        if result_is_err(pres) {
+            return Result.Err(usage_error("argument --builds: invalid int "
+            + "value: '" + o.builds_raw + "'"))
+        }
+        o.builds = result_unwrap(pres)
+    }
+    if o.epoch_raw != "" {
+        let pres2: Result[int, str] = py_int_parse(o.epoch_raw)
+        if result_is_err(pres2) {
+            return Result.Err(usage_error("argument --epoch: invalid int "
+            + "value: '" + o.epoch_raw + "'"))
+        }
+        o.epoch = result_unwrap(pres2)
+        o.epoch_set = true
+    }
+    # the choices validation
+    if o.engine != "auto" && o.engine != "boot" && o.engine != "native" {
+        return Result.Err(usage_error("argument --engine: invalid choice: '"
+        + o.engine + "' (choose from auto, boot, native)"))
+    }
+    # the deferred unknowns
+    if extras.len() > 0 {
+        return Result.Err(usage_error("unrecognized arguments: "
+        + str_join(extras, " ")))
+    }
+    return Result.Ok(o)
+}
+
+# ============================================================================
+# main — the modes, the files, the exits.
+# ============================================================================
+
+# tmp_base() — tempfile's root: TMPDIR, then TMP, then TEMP, /tmp.
+fn tmp_base() -> str uses Proc {
+    if env_has("TMPDIR") {
+        let t: str = env_get("TMPDIR")
+        if t != "" {
+            return t
+        }
+    }
+    if env_has("TMP") {
+        let t2: str = env_get("TMP")
+        if t2 != "" {
+            return t2
+        }
+    }
+    if env_has("TEMP") {
+        let t3: str = env_get("TEMP")
+        if t3 != "" {
+            return t3
+        }
+    }
+    return "/tmp"
+}
+
+# mkdtemp_repro() — tempfile.mkdtemp(prefix="hls-repro-"): the base,
+# eight random [a-z0-9_] chars.
+fn mkdtemp_repro() -> str uses Fs, Proc, Rand {
+    let base: str = tmp_base()
+    let chars: str = "abcdefghijklmnopqrstuvwxyz0123456789_"
+    let mut name: str = base + "/hls-repro-"
+    let mut i: int = 0
+    while i < 8 {
+        let idx: int = rand_int(chars.len())
+        name = name + chars.slice(idx, idx + 1)
+        i = i + 1
+    }
+    let mres: Result[int, Fail] = mkdirs(name)
+    return name
+}
+
+# render_fail(ex, o) — the .py's three renderers on stderr; returns the
+# exit code (1) and whether the evidence is kept.
+fn render_fail(ex: Fail, o: Opt) -> int uses IO {
+    if ex.mismatch {
+        eprintln("NOT reproducible: " + ex.msg)
+        let mut b: int = 0
+        while b < ex.builds.len() {
+            let rec: BuildRec = ex.builds.get(b)
+            eprintln("  build " + rec.index.to_str() + " ("
+            + rec.profile + "): c=" + py_head(rec.c_sha, 12)
+            + " bin=" + py_head(rec.bin_sha, 12))
+            b = b + 1
+        }
+        let mut f: int = 0
+        while f < ex.findings.len() {
+            eprintln("  finding: " + ex.findings.get(f))
+            f = f + 1
+        }
+        eprintln("the build roots are kept for evidence: " + o.scratch)
+        return 1
+    }
+    if ex.vfail {
+        eprintln("verify failed: " + ex.msg)
+        eprintln("  fresh c     = " + ex.fresh_c)
+        eprintln("  fresh bin   = " + ex.fresh_bin)
+        return 1
+    }
+    if ex.direct {
+        eprintln(ex.msg)
+    } else {
+        eprintln("error: " + ex.msg)
+    }
+    return 1
+}
+
+# run(w, o) — the whole dispatch; returns (exit code, keep evidence).
+struct RunOut {
+    code: int,
+    keep_evidence: bool
+}
+
+fn run(w: World, o: Opt) -> RunOut uses IO, Fs, Proc, Clock, Rand {
+    # --verify: the cross-environment answer.
+    if o.verify_set {
+        let vres: Result[VerifyOut, Fail] = verify_buildinfo(w, o,
+        o.verify)
+        if result_is_err(vres) {
+            let ex: Fail = result_err_or(vres, rfail(""))
+            let code: int = render_fail(ex, o)
+            return RunOut {
+                code: code, keep_evidence: false
+            }
+        }
+        let vout: VerifyOut = result_unwrap(vres)
+        if o.json {
+            # the .py's print(_dump(fresh)): _dump ends in \n,
+            # print adds one more — a blank line trails the JSON.
+            println(py_json_dump(vout.fresh) + "\n")
+        } else {
+            let fresh: JVal = vout.fresh
+            let matrix: JVal = jv_get(fresh, "matrix")
+            println("verified: "
+            + jv_int_of(jv_get(matrix, "builds")).to_str()
+            + " fresh builds under a shifted profile slice reproduce "
+            + "the buildinfo's bytes")
+            println("  tree      = "
+            + py_head(py_str_json(jv_get(jv_get(fresh, "tree"),
+            "digest")), 16))
+            println("  c         = "
+            + py_str_json(jv_get(jv_get(fresh, "outputs"),
+            "c_sha256")))
+            println("  binary    = "
+            + py_str_json(jv_get(jv_get(fresh, "outputs"),
+            "binary_sha256")))
+            if jv_bool_of(jv_get(fresh, "smoke_agreement")) {
+                println("  smoke     = consistent in both runs")
+            } else if vout.old_smoke_status != "consistent"
+            || py_str_json(jv_get(jv_get(fresh, "smoke"), "status"))
+            != "consistent" {
+                println("  smoke     = skipped (either run could not "
+                + "smoke consistently)")
+            } else {
+                println("  smoke     = DIVERGED between the runs")
+            }
+        }
+        return RunOut {
+            code: 0, keep_evidence: false
+        }
+    }
+    # the tree
+    let empty_src: SourceTree = SourceTree {
+        pairs: [], rel_k: [], rel_v: [], digest: "", entry_key: "",
+        layout: "repo"
+    }
+    let empty_pkg: PkgTree = PkgTree {
+        pairs: [], dep_names: [], dep_paths: [], dep_shas: [],
+        root_dir: "", digest: "", name: "", version: "", entry: "",
+        lockfile: "absent", drift_pkgs: [], drift_whys: [],
+        unauditable: []
+    }
+    let mut tree_src: SourceTree = empty_src
+    let mut tree_pkg: PkgTree = empty_pkg
+    let mut mode: str = "source"
+    if o.pkg_set {
+        let pres: Result[PkgTree, Fail] = load_package_tree(w, o.pkg,
+        o.scratch)
+        if result_is_err(pres) {
+            let ex: Fail = result_err_or(pres, rfail(""))
+            return RunOut {
+                code: render_fail(ex, o), keep_evidence: false
+            }
+        }
+        tree_pkg = result_unwrap(pres)
+        if o.release && tree_pkg.lockfile != "present" {
+            let ex: Fail = rfail("no lockfile next to the manifest — a "
+            + "release ships pinned content: run hls-pkg lock first")
+            return RunOut {
+                code: render_fail(ex, o), keep_evidence: false
+            }
+        }
+        mode = "package"
+    } else {
+        let sres: Result[SourceTree, Fail] = load_source_tree(w, o.entry,
+        o.scratch)
+        if result_is_err(sres) {
+            let ex2: Fail = result_err_or(sres, rfail(""))
+            return RunOut {
+                code: render_fail(ex2, o), keep_evidence: false
+            }
+        }
+        tree_src = result_unwrap(sres)
+    }
+    # the builds, the verdict, the buildinfo
+    let bres: Result[JVal, Fail] = run_builds(w, o, mode, tree_src,
+    tree_pkg, 0)
+    if result_is_err(bres) {
+        let ex3: Fail = result_err_or(bres, rfail(""))
+        let code: int = render_fail(ex3, o)
+        return RunOut {
+            code: code, keep_evidence: ex3.mismatch
+        }
+    }
+    let info: JVal = result_unwrap(bres)
+    if o.release {
+        let bi_path: str = default_buildinfo_path(mode, o, tree_src,
+        tree_pkg, w)
+        let wres: Result[int, Fail] = write_buildinfo(bi_path, info)
+        if result_is_err(wres) {
+            let ex4: Fail = result_err_or(wres, rfail(""))
+            return RunOut {
+                code: render_fail(ex4, o), keep_evidence: false
+            }
+        }
+        # ONE record (kind "repro") chained into the same transparency
+        # ledger lock, publish and the SBOM append use.
+        let outputs: JVal = jv_get(info, "outputs")
+        let rec_keys: list[str] = ["kind", "name", "version",
+        "tree_sha256", "c_sha256", "binary_sha256", "buildinfo_sha256",
+        "builds", "tool_version"]
+        let rec_vals: list[JVal] = [jv_str("repro"), jv_str(tree_pkg.name),
+        jv_str(tree_pkg.version), jv_str(tree_pkg.digest),
+        jv_str(py_str_json(jv_get(outputs, "c_sha256"))),
+        jv_str(py_str_json(jv_get(outputs, "binary_sha256"))),
+        jv_str(sha256_hex(read_file(bi_path))),
+        jv_int(jv_int_of(jv_get(jv_get(info, "matrix"), "builds"))),
+        jv_str(tool_version())]
+        let lres: Result[int, Fail] = transparency_log_append(w, rec_keys,
+        rec_vals)
+        if result_is_err(lres) {
+            let ex5: Fail = result_err_or(lres, rfail(""))
+            return RunOut {
+                code: render_fail(ex5, o), keep_evidence: false
+            }
+        }
+        let seq: int = result_unwrap(lres)
+        println("wrote " + bi_path)
+        println("chained into the transparency log (seq " + seq.to_str()
+        + ")")
+        render_summary(info)
+    } else if o.json {
+        # print(_dump(info)) — the same trailing blank line law.
+        println(py_json_dump(info) + "\n")
+    } else {
+        let bi_path2: str = default_buildinfo_path(mode, o, tree_src,
+        tree_pkg, w)
+        let wres2: Result[int, Fail] = write_buildinfo(bi_path2, info)
+        if result_is_err(wres2) {
+            let ex6: Fail = result_err_or(wres2, rfail(""))
+            return RunOut {
+                code: render_fail(ex6, o), keep_evidence: false
+            }
+        }
+        println("wrote " + bi_path2)
+        render_summary(info)
+    }
+    return RunOut {
+        code: 0, keep_evidence: false
+    }
+}
+
+# main — the CLI, the mode guards (the .py's exact order), the scratch
+# default, the dispatch, the cleanup.
+fn main() -> int uses IO, Fs, Proc, Args, Exit, Clock, Rand {
+    let argv: list[str] = args()
+    let w: World = world_new()
+    let cres: Result[Opt, int] = parse_cli(argv)
+    if result_is_err(cres) {
+        # help exits 0; the usage errors have already printed (exit 2)
+        return result_err_or(cres, 2)
+    }
+    let o: Opt = result_unwrap(cres)
+    if o.cc == "" {
+        o.cc = w.cc_default
+    }
+    # the mode guards
+    let mut mode_count: int = 0
+    if o.entry_set {
+        mode_count = mode_count + 1
+    }
+    if o.pkg_set {
+        mode_count = mode_count + 1
+    }
+    if o.verify_set {
+        mode_count = mode_count + 1
+    }
+    if mode_count == 0 || mode_count > 1 {
+        eprintln("error: choose exactly one mode: an entry file, --pkg, "
+        + "or --verify FILE")
+        return 2
+    }
+    if o.verify_set && (o.release || o.epoch_set || o.out != ""
+    || o.cflags != default_cflags()) {
+        eprintln("error: --verify reproduces the recorded recipe — "
+        + "--release, --epoch, --out and --cflags do not apply")
+        return 2
+    }
+    if o.release && !o.pkg_set {
+        eprintln("error: --release is a package-mode gate")
+        return 2
+    }
+    if o.builds < 2 || o.builds > max_builds() {
+        eprintln("error: --builds must be between 2 and "
+        + max_builds().to_str())
+        return 2
+    }
+    if !o.scratch_given {
+        o.scratch = mkdtemp_repro()
+    }
+    let out: RunOut = run(w, o)
+    # the scratch is evidence on a mismatch (kept) and disposable on
+    # success — unless the caller asked to keep it.
+    if !o.keep_scratch && !out.keep_evidence {
+        rmrf(o.scratch)
+    }
+    return out.code
+}

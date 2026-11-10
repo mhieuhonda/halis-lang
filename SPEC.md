@@ -6949,20 +6949,21 @@ runs the eight-section gate (`tests/acc/sbom_acceptance.hls`, 69 checks):
 
 Lock pinned the inputs, verify proved them, audit explained them,
 the SBOM listed them for the parties who ask — and none of it said
-the BYTES come back. `tools/hls-repro.py` closes the loop: build the
+the BYTES come back. `tools/hls-repro.hls` (compiled to bin/hls-repro)
+closes the loop: build the
 same tree N times in N isolated build roots under N deliberately
 different environments and require the artifacts to come back
 byte-identical. Not "should reproduce" — did.
 
 ```
-python3 tools/hls-repro.py <entry.hls> [--builds N]
+bin/hls-repro <entry.hls> [--builds N]
                                        [--engine auto|boot|native]
                                        [--cc CMD] [--cflags STR]
                                        [--epoch N] [--out DIR]
                                        [--scratch DIR] [--json]
                                        [--no-smoke]
-python3 tools/hls-repro.py --pkg [DIR]  [the same] [--release]
-python3 tools/hls-repro.py --verify FILE [--in DIR] [--json]
+bin/hls-repro --pkg [DIR]  [the same] [--release]
+bin/hls-repro --verify FILE [--in DIR] [--json]
 ```
 
 ### 59.2. Across distros, honestly

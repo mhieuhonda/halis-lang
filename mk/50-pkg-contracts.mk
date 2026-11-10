@@ -270,28 +270,28 @@ repro:
 	@if [ -z "$(F)" ]; then echo "Usage: make repro F=<entry.hls> [BUILDS=2] [ENGINE=auto|boot|native]" && false; fi; \
 	if [ -n "$(BUILDS)" ]; then B="--builds $(BUILDS)"; else B=""; fi; \
 	if [ -n "$(ENGINE)" ]; then E="--engine $(ENGINE)"; else E=""; fi; \
-	python3 tools/hls-repro.py $(F) $$B $$E
+	$(BIN)/hls-repro $(F) $$B $$E
 
 # The same, package mode: the manifest tree, the lockfile's drift
 # check, deps staged the hls-pkg way.
 repro-pkg:
 	@if [ -z "$(D)" ]; then echo "Usage: make repro-pkg D=<pkg dir> [BUILDS=2]" && false; fi; \
 	if [ -n "$(BUILDS)" ]; then B="--builds $(BUILDS)"; else B=""; fi; \
-	python3 tools/hls-repro.py --pkg $(D) $$B
+	$(BIN)/hls-repro --pkg $(D) $$B
 
 # The shipping gate: lockfile required, versioned buildinfo
 # hls-repro-<name>-<version>.buildinfo.json written, ONE "repro"
 # record chained into the transparency log.
 repro-release:
 	@if [ -z "$(D)" ]; then echo "Usage: make repro-release D=<pkg dir>" && false; fi; \
-	python3 tools/hls-repro.py --pkg $(D) --release
+	$(BIN)/hls-repro --pkg $(D) --release
 
 # The cross-environment answer: rebuild the CURRENT tree under a
 # shifted profile slice and require the buildinfo's bytes back.
 repro-verify:
 	@if [ -z "$(BINFO)" ]; then echo "Usage: make repro-verify BINFO=<file.buildinfo.json> [IN=<tree root>]" && false; fi; \
 	if [ -n "$(IN)" ]; then I="--in $(IN)"; else I=""; fi; \
-	python3 tools/hls-repro.py --verify $(BINFO) $$I
+	$(BIN)/hls-repro --verify $(BINFO) $$I
 
 # Stage 105 acceptance gate: the recipe (two profiles, identical
 # bytes), the STT_FILE diagnoser, the epoch policy + the SBOM
