@@ -2044,7 +2044,8 @@ that claim verified instead of believed: under a steady-state
 workload, resident memory must not grow with the amount of work
 performed. The before/after page reading that `tests/memcheck/
 stress_leak.hls` prints (Stage 8-beta, suite section 3b) is a
-two-point check; `tools/hls-rss.py` is the two-instrument,
+two-point check; `tools/hls-rss.hls` (compiled to
+bin/hls-rss) is the two-instrument,
 statistical version of it, drivable over ANY Halis program.
 
 - **The two instruments.** The TIMELINE is the OS-level truth: the

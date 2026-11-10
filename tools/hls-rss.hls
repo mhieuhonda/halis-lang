@@ -1,0 +1,3191 @@
+# ============================================================================
+# hls-rss.hls — the Stage 125 RSS-stability verifier, in Halis (the
+# native twin of tools/hls-rss.py; the gates spawn this binary through
+# the same CLI the Python tool defines).
+# ----------------------------------------------------------------------------
+# Usage:
+#   bin/hls-rss workload.hls                  # verify: plan, sample, verdict
+#   bin/hls-rss --cycles 400 workload.hls     # a bigger measured plan
+#   bin/hls-rss --json r.json workload.hls    # machine-readable report
+#   bin/hls-rss --no-malloc-count w.hls       # timeline instrument only
+#   bin/hls-rss w.hls data.txt                # extra args reach the program
+#
+# The two instruments, the wire protocol, the statistics and the
+# verdict lattice are the .py's exactly (see tools/hls-rss.py's
+# docstring — the contract). What differs is only the plumbing the
+# Python interpreter used to reach the OS:
+#
+#   * the .py ran the workload under pty.openpty() so glibc
+#     line-buffers each println as it is written (the marker
+#     alignment the cycle-aligned readings depend on). The native
+#     tool has no pty builtin, so it compiles a small sampler runner
+#     (C, gcc -O2, one compile per invocation into the run's scratch
+#     dir) that does exactly that: posix_openpt + fork + exec, the
+#     child's stdout on the pty slave (ONLCR \r\n stripped), stdin on
+#     /dev/null, stderr inherited onto the runner's own stderr pipe.
+#     The runner's ticker thread samples /proc/<pid>/statm every
+#     --interval ms (post-exec pre-exit only — /proc/<pid>/exe is the
+#     witness, exactly the .py's _exe_is gate), and its reader loop
+#     parses markers and takes the cycle-aligned readings. The
+#     observations stream to the tool as one line each:
+#       P <pid> / Q <pagesize> / T <t_ms> <pages> / C <c> <t_ms> <pages>
+#       / M <c> / E M|S|A ... (protocol errors, raw payload bytes)
+#       / X (timeout) / R <rc> (Python-style: -sig for signal death)
+#   * the statistics are the .py's exactly: Theil-Sen pairwise median,
+#     stride decimation to 500 points, and the percentile bootstrap
+#     seeded from crc32(workload stem) — with the Python MT19937
+#     itself embedded (init_by_array seeding, getrandbits, _randbelow,
+#     sample's pool and set paths), so the same input data yields the
+#     byte-same interval the .py yields.
+#
+# Exit codes: 0 certified STABLE; 1 not certified (LEAK, INCONCLUSIVE,
+# program failure, protocol error); 2 usage / environment.
+# ============================================================================
+
+import "std.fmt"
+import "std.option"
+import "std.result"
+
+# ============================================================================
+# Constants — the .py's, verbatim.
+# ============================================================================
+
+fn tool_version() -> str {
+    return "0.143.0-alpha"
+}
+
+fn proto_cycle_prefix() -> str {
+    return "__HLRSS_CYCLE__ "
+}
+
+fn proto_stem() -> str {
+    return "__HLRSS_"
+}
+
+fn fit_point_cap() -> int {
+    return 500
+}
+
+fn bootstrap_pair_cap() -> int {
+    return 3000
+}
+
+fn verdict_stable() -> str {
+    return "stable"
+}
+
+fn verdict_leak() -> str {
+    return "leak"
+}
+
+fn verdict_inconclusive() -> str {
+    return "inconclusive"
+}
+
+fn verdict_word(v: str) -> str {
+    if v == "stable" {
+        return "STABLE"
+    }
+    if v == "leak" {
+        return "LEAK"
+    }
+    return "INCONCLUSIVE"
+}
+
+# ============================================================================
+# Byte helpers.
+# ============================================================================
+
+fn is_digit_b(c: int) -> bool {
+    return c >= 48 && c <= 57
+}
+
+fn is_ws_b(c: int) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12
+}
+
+fn hex_digit_lc(v: int) -> str {
+    if v < 10 {
+        return str(v)
+    }
+    let d: int = v - 10
+    if d == 0 {
+        return "a"
+    }
+    if d == 1 {
+        return "b"
+    }
+    if d == 2 {
+        return "c"
+    }
+    if d == 3 {
+        return "d"
+    }
+    if d == 4 {
+        return "e"
+    }
+    return "f"
+}
+
+fn hex_byte_lc(b: int) -> str {
+    return hex_digit_lc(int_and(int_shr(b, 4), 15)) + hex_digit_lc(int_and(b, 15))
+}
+
+fn hex_u16_lc(cp: int) -> str {
+    # four lowercase hex digits (json \uXXXX).
+    let h1: int = int_and(int_shr(cp, 12), 15)
+    let h2: int = int_and(int_shr(cp, 8), 15)
+    let h3: int = int_and(int_shr(cp, 4), 15)
+    let h4: int = int_and(cp, 15)
+    return hex_digit_lc(h1) + hex_digit_lc(h2) + hex_digit_lc(h3)
+    + hex_digit_lc(h4)
+}
+
+fn byte_of_hex(c: int) -> int {
+    if c >= 48 && c <= 57 {
+        return c - 48
+    }
+    if c >= 97 && c <= 102 {
+        return c - 87
+    }
+    if c >= 65 && c <= 70 {
+        return c - 55
+    }
+    return -1
+}
+
+# ============================================================================
+# Path helpers (the harness's path grammar, inlined).
+# ============================================================================
+
+fn path_basename(p: str) -> str {
+    let mut i: int = p.len() - 1
+    while i >= 0 {
+        if p.byte_at(i) == 47 {
+            return p.slice(i + 1, p.len())
+        }
+        i = i - 1
+    }
+    return p
+}
+
+fn path_dirname(p: str) -> str {
+    let mut i: int = p.len() - 1
+    while i >= 0 {
+        if p.byte_at(i) == 47 {
+            if i == 0 {
+                return "/"
+            }
+            return p.slice(0, i)
+        }
+        i = i - 1
+    }
+    return "."
+}
+
+fn path_join2(base: str, rel: str) -> str {
+    if base == "" {
+        return rel
+    }
+    if base.byte_at(base.len() - 1) == 47 {
+        return base + rel
+    }
+    return base + "/" + rel
+}
+
+fn path_join3(a: str, b: str, c: str) -> str {
+    return path_join2(path_join2(a, b), c)
+}
+
+fn path_is_absolute(p: str) -> bool {
+    return p.len() > 0 && p.byte_at(0) == 47
+}
+
+fn path_abs(p: str, cwd: str) -> str {
+    if path_is_absolute(p) {
+        return p
+    }
+    return path_join2(cwd, p)
+}
+
+fn path_stem(p: str) -> str {
+    let b: str = path_basename(p)
+    let mut i: int = b.len() - 1
+    while i > 0 {
+        if b.byte_at(i) == 46 {
+            return b.slice(0, i)
+        }
+        i = i - 1
+    }
+    return b
+}
+
+fn shell_quote(s: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < s.len() {
+        if s.byte_at(i) == 39 {
+            out = out + "'\\''"
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ============================================================================
+# String helpers.
+# ============================================================================
+
+fn rstrip_bytes(s: str, b: int) -> str {
+    let mut n: int = s.len()
+    while n > 0 && s.byte_at(n - 1) == b {
+        n = n - 1
+    }
+    return s.slice(0, n)
+}
+
+fn rstrip_zero_dot(s: str) -> str {
+    let mut n: int = s.len()
+    while n > 0 && s.byte_at(n - 1) == 48 {
+        n = n - 1
+    }
+    if n > 0 && s.byte_at(n - 1) == 46 {
+        n = n - 1
+    }
+    return s.slice(0, n)
+}
+
+fn strip_ws(s: str) -> str {
+    let mut a: int = 0
+    let n: int = s.len()
+    while a < n && is_ws_b(s.byte_at(a)) {
+        a = a + 1
+    }
+    let mut b: int = n
+    while b > a && is_ws_b(s.byte_at(b - 1)) {
+        b = b - 1
+    }
+    return s.slice(a, b)
+}
+
+fn int_abs_f(v: float) -> float {
+    if v < 0.0 {
+        return 0.0 - v
+    }
+    return v
+}
+
+# parse_int_py(s) — Python's int() slice: optional sign, then digits.
+# Returns Option.Some(n) or None (Python raises ValueError).
+fn parse_int_py(s: str) -> Option[int] {
+    let t: str = strip_ws(s)
+    if t.len() == 0 {
+        return Option.None
+    }
+    let mut i: int = 0
+    let mut neg: bool = false
+    if t.byte_at(0) == 43 || t.byte_at(0) == 45 {
+        neg = t.byte_at(0) == 45
+        i = 1
+    }
+    if i >= t.len() {
+        return Option.None
+    }
+    let mut v: int = 0
+    while i < t.len() {
+        if !is_digit_b(t.byte_at(i)) {
+            return Option.None
+        }
+        v = v * 10 + (t.byte_at(i) - 48)
+        i = i + 1
+    }
+    if neg {
+        return Option.Some(0 - v)
+    }
+    return Option.Some(v)
+}
+
+# parse_float_py(s) — Python's float() slice: [+-]? digits [.digits]
+# [eE[+-]digits] (also .5 forms). Returns Option.Some(x) or None.
+fn parse_float_py(s: str) -> Option[float] {
+    let t: str = strip_ws(s)
+    let n: int = t.len()
+    if n == 0 {
+        return Option.None
+    }
+    let mut i: int = 0
+    if t.byte_at(0) == 43 || t.byte_at(0) == 45 {
+        i = 1
+    }
+    let int_start: int = i
+    while i < n && is_digit_b(t.byte_at(i)) {
+        i = i + 1
+    }
+    let saw_digits: bool = i > int_start
+    if i < n && t.byte_at(i) == 46 {
+        i = i + 1
+        let frac_start: int = i
+        while i < n && is_digit_b(t.byte_at(i)) {
+            i = i + 1
+        }
+        if i > frac_start {
+            # ok — digits before or after the dot
+        }
+    }
+    let mantissa_ok: bool = saw_digits || (i > int_start
+    && t.byte_at(i - 1) == 46 && i > int_start + 1)
+    if !mantissa_ok {
+        if !saw_digits {
+            return Option.None
+        }
+    }
+    if i < n && (t.byte_at(i) == 101 || t.byte_at(i) == 69) {
+        i = i + 1
+        if i < n && (t.byte_at(i) == 43 || t.byte_at(i) == 45) {
+            i = i + 1
+        }
+        let exp_start: int = i
+        while i < n && is_digit_b(t.byte_at(i)) {
+            i = i + 1
+        }
+        if i == exp_start {
+            return Option.None
+        }
+    }
+    if i != n {
+        return Option.None
+    }
+    return Option.Some(t.to_float())
+}
+
+# ============================================================================
+# Number formatting — the Python laws the report and the JSON pin.
+# fmt_fixed(x, p) is %.<p>f (std.fmt's round-half-even formatter).
+# py_float_repr(x) is Python's repr: the shortest decimal that
+# round-trips, with ".0" forced for integral values.
+# ============================================================================
+
+fn fmt_fixed(x: float, p: int) -> str {
+    return fmt_float_with_precision(x, p)
+}
+
+fn py_float_repr(x: float) -> str {
+    if x < 0.0 {
+        return "-" + py_float_repr(0.0 - x)
+    }
+    let mut p: int = 0
+    while p <= 17 {
+        let s: str = fmt_float_with_precision(x, p)
+        if s.to_float() == x {
+            if !s.contains(".") && !s.contains("e") {
+                return s + ".0"
+            }
+            return s
+        }
+        p = p + 1
+    }
+    return x.to_str()
+}
+
+fn fmt_kib(nbytes: int) -> str {
+    return(nbytes / 1024).to_str()
+}
+
+fn fmt_pages(pages: int, page_size: int) -> str {
+    return pages.to_str() + " pages (" + fmt_kib(pages * page_size) + " KiB)"
+}
+
+# fmt_signed(v) — Python's %+d.
+fn fmt_signed(v: int) -> str {
+    if v >= 0 {
+        return "+" + v.to_str()
+    }
+    return v.to_str()
+}
+
+# fmt_slope(v, per) — the .py's fmt_slope: significant digits only.
+fn fmt_slope(v: float, per: str) -> str {
+    let a: float = int_abs_f(v)
+    let mut s: str = ""
+    if a >= 100.0 {
+        s = fmt_fixed(a, 1)
+    } else if a >= 1.0 {
+        s = fmt_fixed(a, 3)
+    } else {
+        s = rstrip_zero_dot(fmt_fixed(a, 4))
+        if s == "" || s == "0" {
+            s = "0"
+        }
+    }
+    let mut sign: str = ""
+    if v > 0.0 {
+        sign = "+"
+    } else if v == 0.0 {
+        sign = ""
+    } else {
+        sign = "-"
+    }
+    let mut out: str = sign + s
+    if per != "" {
+        out = out + " " + per
+    }
+    return out
+}
+
+# ============================================================================
+# CRC-32 (zlib.crc32, IEEE reflected) — the bootstrap's seeding law.
+# ============================================================================
+
+fn crc32_of(s: str) -> int {
+    # runtime-built table (Halis has no globals; 256*8 steps is nothing)
+    let table: list[int] = []
+    let mut i: int = 0
+    while i < 256 {
+        let mut c: int = i
+        let mut k: int = 0
+        while k < 8 {
+            if int_and(c, 1) == 1 {
+                c = int_xor(int_shr(c, 1), 3988292384)
+            } else {
+                c = int_shr(c, 1)
+            }
+            k = k + 1
+        }
+        table.push(c)
+        i = i + 1
+    }
+    let mut crc: int = -1
+    let mut j: int = 0
+    while j < s.len() {
+        let idx: int = int_and(int_xor(crc, s.byte_at(j)), 255)
+        crc = int_xor(int_shr(crc, 8), table.get(idx))
+        j = j + 1
+    }
+    return int_xor(crc, -1)
+}
+
+fn seed_of_name(name: str) -> int {
+    return crc32_of(name)
+}
+
+# ============================================================================
+# MT19937 — the Python random.Random twin (byte-verified against
+# CPython: init_by_array seeding, genrand_uint32 tempering, getrandbits,
+# _randbelow's rejection loop, and random.sample's pool and set paths).
+# ============================================================================
+
+struct Mt {
+    mt: list[int],
+    index: int
+}
+
+fn mtm(x: int) -> int {
+    return int_and(x, 4294967295)
+}
+
+fn mt_zeros() -> list[int] {
+    let l: list[int] = []
+    let mut i: int = 0
+    while i < 624 {
+        l.push(0)
+        i = i + 1
+    }
+    return l
+}
+
+fn mt_init_genrand(m: Mt, s: int) -> void {
+    m.mt.set(0, mtm(s))
+    let mut i: int = 1
+    while i < 624 {
+        let prev: int = m.mt.get(i - 1)
+        m.mt.set(i, mtm(1812433253 * int_xor(prev, int_shr(prev, 30)) + i))
+        i = i + 1
+    }
+    m.index = 624
+}
+
+fn mt_init_by_array(m: Mt, key: list[int]) -> void {
+    mt_init_genrand(m, 19650218)
+    let mut i: int = 1
+    let mut j: int = 0
+    let kl: int = key.len()
+    let mut k: int = 624
+    if kl > 624 {
+        k = kl
+    }
+    while k > 0 {
+        let prev: int = m.mt.get(i - 1)
+        let v: int = mtm(int_xor(prev, int_shr(prev, 30)) * 1664525)
+        m.mt.set(i, mtm(mtm(int_xor(m.mt.get(i), v)) + key.get(j) + j))
+        i = i + 1
+        j = j + 1
+        if i >= 624 {
+            m.mt.set(0, m.mt.get(623))
+            i = 1
+        }
+        if j >= kl {
+            j = 0
+        }
+        k = k - 1
+    }
+    let mut kk: int = 623
+    while kk > 0 {
+        let prev: int = m.mt.get(i - 1)
+        let v: int = mtm(int_xor(prev, int_shr(prev, 30)) * 1566083941)
+        m.mt.set(i, mtm(mtm(int_xor(m.mt.get(i), v)) - i))
+        i = i + 1
+        if i >= 624 {
+            m.mt.set(0, m.mt.get(623))
+            i = 1
+        }
+        kk = kk - 1
+    }
+    m.mt.set(0, 2147483648)
+    m.index = 624
+}
+
+fn mt_genrand(m: Mt) -> int {
+    if m.index >= 624 {
+        let mut kk: int = 0
+        while kk < 227 {
+            let y: int = int_or(int_and(m.mt.get(kk), 2147483648),
+            int_and(m.mt.get(kk + 1), 2147483647))
+            let mut mag: int = 0
+            if int_and(y, 1) == 1 {
+                mag = 2567483615
+            }
+            m.mt.set(kk, int_xor(int_xor(m.mt.get(kk + 397), int_shr(y, 1)), mag))
+            kk = kk + 1
+        }
+        while kk < 623 {
+            let y: int = int_or(int_and(m.mt.get(kk), 2147483648),
+            int_and(m.mt.get(kk + 1), 2147483647))
+            let mut mag: int = 0
+            if int_and(y, 1) == 1 {
+                mag = 2567483615
+            }
+            m.mt.set(kk, int_xor(int_xor(m.mt.get(kk - 227), int_shr(y, 1)), mag))
+            kk = kk + 1
+        }
+        let y: int = int_or(int_and(m.mt.get(623), 2147483648),
+        int_and(m.mt.get(0), 2147483647))
+        let mut mag: int = 0
+        if int_and(y, 1) == 1 {
+            mag = 2567483615
+        }
+        m.mt.set(623, int_xor(int_xor(m.mt.get(396), int_shr(y, 1)), mag))
+        m.index = 0
+    }
+    let mut y: int = m.mt.get(m.index)
+    m.index = m.index + 1
+    y = int_xor(y, int_shr(y, 11))
+    y = int_xor(y, int_and(int_shl(y, 7), 2636928640))
+    y = int_xor(y, int_and(int_shl(y, 15), 4022730752))
+    y = int_xor(y, int_shr(y, 18))
+    return y
+}
+
+fn mt_seed(m: Mt, s: int) -> void {
+    # CPython random_seed: key = little-endian 32-bit words of |s|,
+    # keyused = 1 even when s == 0 (one word [0]).
+    let key: list[int] = []
+    let mut v: int = s
+    if v < 0 {
+        v = 0 - v
+    }
+    let mut more: bool = true
+    while more {
+        key.push(int_and(v, 4294967295))
+        v = int_shr(v, 32)
+        if v == 0 {
+            more = false
+        }
+    }
+    mt_init_by_array(m, key)
+}
+
+fn mt_bit_length(n: int) -> int {
+    let mut b: int = 0
+    let mut v: int = n
+    while v > 0 {
+        b = b + 1
+        v = int_shr(v, 1)
+    }
+    return b
+}
+
+fn mt_getrandbits(m: Mt, k: int) -> int {
+    if k <= 0 {
+        return 0
+    }
+    return int_shr(mt_genrand(m), 32 - k)
+}
+
+fn mt_randbelow(m: Mt, n: int) -> int {
+    if n <= 0 {
+        return 0
+    }
+    let k: int = mt_bit_length(n)
+    let mut r: int = mt_getrandbits(m, k)
+    while r >= n {
+        r = mt_getrandbits(m, k)
+    }
+    return r
+}
+
+fn mt_randrange(m: Mt, n: int) -> int {
+    return mt_randbelow(m, n)
+}
+
+fn pow4_ceil(x: int) -> int {
+    let mut e: int = 0
+    let mut p: int = 1
+    while p < x {
+        p = p * 4
+        e = e + 1
+    }
+    return e
+}
+
+# mt_sample(m, n, k) — random.sample(range(n), k) exactly (CPython's
+# selection algorithm: the pool path when n <= setsize, the set path
+# otherwise — same draw order, same rejections).
+fn mt_sample(m: Mt, n: int, k: int) -> list[int] {
+    let result: list[int] = []
+    let mut setsize: int = 21
+    if k > 5 {
+        let mut p: int = 1
+        let mut e: int = 0
+        while e < pow4_ceil(k * 3) {
+            p = p * 4
+            e = e + 1
+        }
+        setsize = setsize + p
+    }
+    if n <= setsize {
+        let pool: list[int] = []
+        let mut i: int = 0
+        while i < n {
+            pool.push(i)
+            i = i + 1
+        }
+        let mut i2: int = 0
+        while i2 < k {
+            let j: int = mt_randbelow(m, n - i2)
+            result.push(pool.get(j))
+            pool.set(j, pool.get(n - i2 - 1))
+            i2 = i2 + 1
+        }
+    } else {
+        let sel: list[int] = []
+        let mut i: int = 0
+        while i < n {
+            sel.push(0)
+            i = i + 1
+        }
+        let mut i2: int = 0
+        while i2 < k {
+            let mut j: int = mt_randbelow(m, n)
+            while sel.get(j) == 1 {
+                j = mt_randbelow(m, n)
+            }
+            sel.set(j, 1)
+            result.push(j)
+            i2 = i2 + 1
+        }
+    }
+    return result
+}
+
+# ============================================================================
+# Sorting — bottom-up merge sorts (stable) for the pairwise slopes, the
+# bootstrap stats and the fit points (Python sorted's lexicographic
+# (x, y) order).
+# ============================================================================
+
+struct Pt {
+    x: int,
+    y: float
+}
+
+fn pt_le(p: Pt, q: Pt) -> bool {
+    if p.x != q.x {
+        return p.x < q.x
+    }
+    return p.y <= q.y
+}
+
+fn sort_floats(xs: list[float]) -> list[float] {
+    # bottom-up merge sort, stable (Python's list.sort is stable too).
+    let n: int = xs.len()
+    let mut cur: list[float] = []
+    let mut i: int = 0
+    while i < n {
+        cur.push(xs.get(i))
+        i = i + 1
+    }
+    let mut w: int = 1
+    while w < n {
+        let dst: list[float] = []
+        let mut lo: int = 0
+        while lo < n {
+            let mut mid: int = lo + w
+            let mut hi2: int = lo + w + w
+            if mid > n {
+                mid = n
+            }
+            if hi2 > n {
+                hi2 = n
+            }
+            let mut i1: int = lo
+            let mut i2: int = mid
+            while i1 < mid || i2 < hi2 {
+                if i1 < mid && (i2 >= hi2 || cur.get(i1) <= cur.get(i2)) {
+                    dst.push(cur.get(i1))
+                    i1 = i1 + 1
+                } else {
+                    dst.push(cur.get(i2))
+                    i2 = i2 + 1
+                }
+            }
+            lo = lo + w + w
+        }
+        cur = dst
+        w = w * 2
+    }
+    return cur
+}
+
+fn sort_points(xs: list[Pt]) -> list[Pt] {
+    # lexicographic (x, then y) — Python sorted(points) on tuples.
+    let n: int = xs.len()
+    let mut cur: list[Pt] = []
+    let mut i: int = 0
+    while i < n {
+        cur.push(xs.get(i))
+        i = i + 1
+    }
+    let mut w: int = 1
+    while w < n {
+        let dst: list[Pt] = []
+        let mut lo: int = 0
+        while lo < n {
+            let mut mid: int = lo + w
+            let mut hi2: int = lo + w + w
+            if mid > n {
+                mid = n
+            }
+            if hi2 > n {
+                hi2 = n
+            }
+            let mut i1: int = lo
+            let mut i2: int = mid
+            while i1 < mid || i2 < hi2 {
+                if i1 < mid && (i2 >= hi2 || pt_le(cur.get(i1), cur.get(i2))) {
+                    dst.push(cur.get(i1))
+                    i1 = i1 + 1
+                } else {
+                    dst.push(cur.get(i2))
+                    i2 = i2 + 1
+                }
+            }
+            lo = lo + w + w
+        }
+        cur = dst
+        w = w * 2
+    }
+    return cur
+}
+
+# ============================================================================
+# Statistics - the .py's exactly (same constants, same resample counts,
+# same MT19937 draws): Theil-Sen pairwise median, stride decimation to
+# 500 points, linear-interpolation quantiles, the seeded percentile
+# bootstrap over a random subsample of pairs when the trace is large.
+# ============================================================================
+
+struct TsOut {
+    slope: float,
+    pairs: int
+}
+
+struct CiOut {
+    lo: float,
+    hi: float
+}
+
+fn stat_median_f(sorted_xs: list[float]) -> Option[float] {
+    let n: int = sorted_xs.len()
+    if n == 0 {
+        return Option.None
+    }
+    let mid: int = n / 2
+    if n % 2 == 1 {
+        return Option.Some(sorted_xs.get(mid))
+    }
+    return Option.Some((sorted_xs.get(mid - 1) + sorted_xs.get(mid)) / 2.0)
+}
+
+fn stat_quantile_f(sorted_xs: list[float], q: float) -> Option[float] {
+    let n: int = sorted_xs.len()
+    if n == 0 {
+        return Option.None
+    }
+    if n == 1 {
+        return Option.Some(sorted_xs.get(0))
+    }
+    let pos: float = q * (n - 1).to_float()
+    let lo: int = pos.to_int()
+    let mut hi: int = lo + 1
+    if hi > n - 1 {
+        hi = n - 1
+    }
+    let frac: float = pos - lo.to_float()
+    return Option.Some(sorted_xs.get(lo) * (1.0 - frac)
+    + sorted_xs.get(hi) * frac)
+}
+
+fn stat_theil_sen(points: list[Pt]) -> Result[TsOut, str] {
+    let pts: list[Pt] = sort_points(points)
+    let slopes: list[float] = []
+    let n: int = pts.len()
+    let mut i: int = 0
+    while i < n {
+        let xi: int = pts.get(i).x
+        let yi: float = pts.get(i).y
+        let mut j: int = i + 1
+        while j < n {
+            let dx: int = pts.get(j).x - xi
+            if dx > 0 {
+                slopes.push((pts.get(j).y - yi) / dx.to_float())
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    if slopes.len() == 0 {
+        return Result.Err("theil-sen: no distinct-x pairs in data")
+    }
+    let sorted_slopes: list[float] = sort_floats(slopes)
+    let med: Option[float] = stat_median_f(sorted_slopes)
+    if option_is_none(med) {
+        return Result.Err("theil-sen: no distinct-x pairs in data")
+    }
+    let m: float = option_unwrap(med)
+    return Result.Ok(TsOut {
+        slope: m, pairs: sorted_slopes.len()
+    })
+}
+
+fn stat_decimate(points: list[Pt]) -> list[Pt] {
+    let n: int = points.len()
+    if n <= fit_point_cap() {
+        let out: list[Pt] = []
+        let mut i: int = 0
+        while i < n {
+            out.push(points.get(i))
+            i = i + 1
+        }
+        return out
+    }
+    let cap: int = fit_point_cap()
+    # step = ceil(n / (cap - 1)) as integer arithmetic.
+    let step: int = (n + cap - 2) / (cap - 1)
+    let out: list[Pt] = []
+    let mut i: int = 0
+    while i < n {
+        out.push(points.get(i))
+        i = i + step
+    }
+    if out.len() > 0 {
+        let last_kept_x: int = out.get(out.len() - 1).x
+        let last_kept_y: float = out.get(out.len() - 1).y
+        let last_x: int = points.get(n - 1).x
+        let last_y: float = points.get(n - 1).y
+        if last_kept_x != last_x || last_kept_y != last_y {
+            out.push(points.get(n - 1))
+        }
+    }
+    return out
+}
+
+fn stat_bootstrap_ci(points: list[Pt], b: int, seed: int) -> Result[CiOut, str] {
+    let rng: Mt = Mt {
+        mt: mt_zeros(), index: 0
+    }
+    mt_seed(rng, seed)
+    let n: int = points.len()
+    # all_pairs as two parallel index arrays (the .py's tuple list).
+    let pair_a: list[int] = []
+    let pair_b: list[int] = []
+    let mut i: int = 0
+    while i < n {
+        let mut j: int = i + 1
+        while j < n {
+            pair_a.push(i)
+            pair_b.push(j)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let npairs: int = pair_a.len()
+    let stats: list[float] = []
+    let mut bi: int = 0
+    while bi < b {
+        let resample: list[Pt] = []
+        let mut k: int = 0
+        while k < n {
+            resample.push(points.get(mt_randrange(rng, n)))
+            k = k + 1
+        }
+        let slopes: list[float] = []
+        if npairs > bootstrap_pair_cap() {
+            let pick: list[int] = mt_sample(rng, npairs, bootstrap_pair_cap())
+            let mut pi: int = 0
+            while pi < pick.len() {
+                let a: int = pair_a.get(pick.get(pi))
+                let bb: int = pair_b.get(pick.get(pi))
+                let dx: int = resample.get(bb).x - resample.get(a).x
+                if dx > 0 {
+                    slopes.push((resample.get(bb).y - resample.get(a).y)
+                    / dx.to_float())
+                }
+                pi = pi + 1
+            }
+        } else {
+            let mut pi: int = 0
+            while pi < npairs {
+                let a: int = pair_a.get(pi)
+                let bb: int = pair_b.get(pi)
+                let dx: int = resample.get(bb).x - resample.get(a).x
+                if dx > 0 {
+                    slopes.push((resample.get(bb).y - resample.get(a).y)
+                    / dx.to_float())
+                }
+                pi = pi + 1
+            }
+        }
+        if slopes.len() > 0 {
+            let sorted_slopes: list[float] = sort_floats(slopes)
+            let med: Option[float] = stat_median_f(sorted_slopes)
+            if option_is_some(med) {
+                stats.push(option_unwrap(med))
+            }
+        }
+        bi = bi + 1
+    }
+    let mut need: int = b / 10
+    if need < 10 {
+        need = 10
+    }
+    if stats.len() < need {
+        return Result.Err("bootstrap: too few valid resamples")
+    }
+    let sorted_stats: list[float] = sort_floats(stats)
+    let lo: Option[float] = stat_quantile_f(sorted_stats, 0.025)
+    let hi: Option[float] = stat_quantile_f(sorted_stats, 0.975)
+    if option_is_none(lo) || option_is_none(hi) {
+        return Result.Err("bootstrap: too few valid resamples")
+    }
+    return Result.Ok(CiOut {
+        lo: option_unwrap(lo), hi: option_unwrap(hi)
+    })
+}
+
+# ============================================================================
+# The interposer report parser - the .py's parse_interposer: every
+# HL_RSS_<NAME>=<n> counter line, the full key set present, and the
+# LIVE identity recomputed from the components (the verifier trusts
+# neither side's arithmetic alone). Anything else = no report.
+# ============================================================================
+
+struct Ipo {
+    ok: bool,
+    n_malloc: int,
+    n_calloc: int,
+    n_realloc: int,
+    n_realloc_null: int,
+    n_realloc_zero: int,
+    n_free: int,
+    n_foreign_free: int,
+    n_live: int,
+    n_overflow: int
+}
+
+fn ipo_empty() -> Ipo {
+    return Ipo {
+        ok: false, n_malloc: -1, n_calloc: -1, n_realloc: -1,
+        n_realloc_null: -1, n_realloc_zero: -1, n_free: -1,
+        n_foreign_free: -1, n_live: -1, n_overflow: -1
+    }
+}
+
+fn interposer_parse(stderr_bytes: str) -> Ipo {
+    let out: Ipo = ipo_empty()
+    if stderr_bytes.len() == 0 {
+        return out
+    }
+    let mut k_malloc: int = -1
+    let mut k_calloc: int = -1
+    let mut k_realloc: int = -1
+    let mut k_rn: int = -1
+    let mut k_rz: int = -1
+    let mut k_free: int = -1
+    let mut k_ff: int = -1
+    let mut k_live: int = -1
+    let mut k_ovf: int = -1
+    let lines: list[str] = stderr_bytes.split("\n")
+    let mut li: int = 0
+    while li < lines.len() {
+        let raw: str = rstrip_bytes(lines.get(li), 13)
+        if raw.starts_with("HL_RSS_") {
+            let eq: int = raw.find("=")
+            if eq < 0 {
+                return out
+            }
+            let key: str = raw.slice(7, eq)
+            let val: str = raw.slice(eq + 1, raw.len())
+            let v: Option[int] = parse_int_py(val)
+            if option_is_none(v) {
+                return out
+            }
+            let num: int = option_unwrap(v)
+            if key == "MALLOC" {
+                k_malloc = num
+            } else if key == "CALLOC" {
+                k_calloc = num
+            } else if key == "REALLOC" {
+                k_realloc = num
+            } else if key == "REALLOC_NULL" {
+                k_rn = num
+            } else if key == "REALLOC_ZERO" {
+                k_rz = num
+            } else if key == "FREE" {
+                k_free = num
+            } else if key == "FOREIGN_FREE" {
+                k_ff = num
+            } else if key == "LIVE" {
+                k_live = num
+            } else if key == "OVERFLOW" {
+                k_ovf = num
+            }
+        }
+        li = li + 1
+    }
+    if k_malloc < 0 || k_calloc < 0 || k_realloc < 0 || k_rn < 0
+    || k_rz < 0 || k_free < 0 || k_ff < 0 || k_live < 0 || k_ovf < 0 {
+        return out
+    }
+    let live: int = k_malloc + k_calloc + k_rn - k_free - k_rz
+    if live != k_live {
+        return out
+    }
+    out.ok = true
+    out.n_malloc = k_malloc
+    out.n_calloc = k_calloc
+    out.n_realloc = k_realloc
+    out.n_realloc_null = k_rn
+    out.n_realloc_zero = k_rz
+    out.n_free = k_free
+    out.n_foreign_free = k_ff
+    out.n_live = k_live
+    out.n_overflow = k_ovf
+    return out
+}
+
+# ============================================================================
+# py_str_repr(bytes) - Python repr() of the line bytes decoded
+# utf-8/replace: single quotes (double when the payload carries a
+# single quote), \\n \\r \\t escapes, \\xNN for the other
+# non-printables. The protocol-error messages embed this form.
+# ============================================================================
+
+fn py_str_repr(s: str) -> str {
+    let bs: str = chr(92)
+    let has_sq: bool = s.contains("'")
+    let has_dq: bool = s.contains("\"")
+    let mut quote: str = "'"
+    if has_sq && !has_dq {
+        quote = "\""
+    }
+    let mut out: str = quote
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c == 92 {
+            out = out + bs + bs
+        } else if c == 10 {
+            out = out + bs + "n"
+        } else if c == 13 {
+            out = out + bs + "r"
+        } else if c == 9 {
+            out = out + bs + "t"
+        } else if c == 39 && quote == "'" {
+            out = out + bs + "'"
+        } else if c < 32 || c == 127 {
+            out = out + bs + "x" + hex_byte_lc(c)
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out + quote
+}
+
+# ============================================================================
+# json_escape(s) - json.dumps(str) with ensure_ascii=True (the .py's
+# default): short escapes for \\b \\f \\n \\r \\t, \uXXXX
+# (lowercase) for the other control bytes and for every non-ASCII
+# codepoint (UTF-8 decoded; invalid bytes pass through raw).
+# ============================================================================
+
+fn json_escape(s: str) -> str {
+    let bs: str = chr(92)
+    let mut out: str = ""
+    let mut i: int = 0
+    let n: int = s.len()
+    while i < n {
+        let c: int = s.byte_at(i)
+        if c == 34 {
+            out = out + bs + "\""
+        } else if c == 92 {
+            out = out + bs + bs
+        } else if c == 8 {
+            out = out + bs + "b"
+        } else if c == 12 {
+            out = out + bs + "f"
+        } else if c == 10 {
+            out = out + bs + "n"
+        } else if c == 13 {
+            out = out + bs + "r"
+        } else if c == 9 {
+            out = out + bs + "t"
+        } else if c < 32 {
+            out = out + bs + "u00" + hex_byte_lc(c)
+        } else if c < 128 {
+            out = out + s.slice(i, i + 1)
+        } else {
+            # decode one UTF-8 sequence; invalid bytes pass through raw.
+            let mut cp: int = -1
+            let mut adv: int = 1
+            if c >= 194 && c <= 223 && i + 1 < n
+            && s.byte_at(i + 1) >= 128 && s.byte_at(i + 1) <= 191 {
+                cp = int_or(int_shl(int_and(c, 31), 6),
+                int_and(s.byte_at(i + 1), 63))
+                adv = 2
+            } else if c >= 224 && c <= 239 && i + 2 < n
+            && s.byte_at(i + 1) >= 128 && s.byte_at(i + 1) <= 191
+            && s.byte_at(i + 2) >= 128 && s.byte_at(i + 2) <= 191 {
+                cp = int_or(int_or(int_shl(int_and(c, 15), 12),
+                int_shl(int_and(s.byte_at(i + 1), 63), 6)),
+                int_and(s.byte_at(i + 2), 63))
+                adv = 3
+            } else if c >= 240 && c <= 244 && i + 3 < n
+            && s.byte_at(i + 1) >= 128 && s.byte_at(i + 1) <= 191
+            && s.byte_at(i + 2) >= 128 && s.byte_at(i + 2) <= 191
+            && s.byte_at(i + 3) >= 128 && s.byte_at(i + 3) <= 191 {
+                cp = int_or(int_or(int_or(int_shl(int_and(c, 7), 18),
+                int_shl(int_and(s.byte_at(i + 1), 63), 12)),
+                int_shl(int_and(s.byte_at(i + 2), 63), 6)),
+                int_and(s.byte_at(i + 3), 63))
+                adv = 4
+            }
+            if cp < 0 {
+                out = out + s.slice(i, i + 1)
+            } else if cp < 65536 {
+                out = out + bs + "u" + hex_u16_lc(cp)
+            } else {
+                # astral plane: surrogate pair, Python's ensure_ascii form.
+                let v: int = cp - 65536
+                let hi_s: int = 55296 + int_shr(v, 10)
+                let lo_s: int = 56320 + int_and(v, 1023)
+                out = out + bs + "u" + hex_u16_lc(hi_s)
+                + bs + "u" + hex_u16_lc(lo_s)
+            }
+            i = i + adv - 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ============================================================================
+# Process plumbing - spawn_cap (the gates' run_capture discipline),
+# and the shell one-liners for scratch directories.
+# ============================================================================
+
+struct RunCap {
+    spawned: bool,
+    code: int,
+    out: str,
+    err: str
+}
+
+fn spawn_cap(program: str, args: list[str]) -> RunCap uses Proc {
+    let r: RunCap = RunCap {
+        spawned: false, code: -1, out: "", err: ""
+    }
+    let pid: int = proc_spawn(program, args, 2, 1, 1)
+    if pid < 1 {
+        return r
+    }
+    r.spawned = true
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    r.code = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    r.out = out
+    r.err = err
+    return r
+}
+
+fn mkdirs(path: str) -> int uses Proc {
+    return proc_exec("mkdir -p '" + shell_quote(path) + "'")
+}
+
+fn rmrf(path: str) -> int uses Proc {
+    return proc_exec("rm -rf '" + shell_quote(path) + "'")
+}
+
+# ============================================================================
+# Repo-root resolution. The .py anchored on tools/hls-rss.py's own
+# location (__file__ -> ..); the native twin anchors on the binary:
+# argv[0] first (absolute against the cwd), then the true exe path
+# from /proc/self/maps (symlink-proof), then the cwd. The first
+# candidate that actually looks like the repo (tools/ + bin/) wins.
+# ============================================================================
+
+fn exe_from_maps() -> Option[str] uses Fs {
+    # The first mapping line is the binary itself; none of the leading
+    # fields (addr-range, perms, offset, dev, inode) contains a slash,
+    # so the first slash in the line starts the pathname.
+    let maps: str = read_file("/proc/self/maps")
+    let nl: int = maps.find("\n")
+    let mut first: str = maps
+    if nl >= 0 {
+        first = maps.slice(0, nl)
+    }
+    let slash: int = first.find("/")
+    if slash < 0 {
+        return Option.None
+    }
+    let p: str = first.slice(slash, first.len())
+    let mut e: int = p.len()
+    if p.ends_with(" (deleted)") {
+        e = e - 10
+    }
+    if e <= 0 {
+        return Option.None
+    }
+    return Option.Some(p.slice(0, e))
+}
+
+fn looks_like_repo(root: str) -> bool uses Fs {
+    if !file_exists(path_join2(root, "tools")) {
+        return false
+    }
+    if !file_exists(path_join2(root, "bin")) {
+        return false
+    }
+    if !file_exists(path_join2(root, "tools/rss_parts/malloc_balance_wrap.c")) {
+        return false
+    }
+    return true
+}
+
+fn repo_root(argv0: str) -> str uses Fs, Proc {
+    let cwd: str = cwd_get()
+    # candidate 1: argv[0]'s grandparent (binary in bin/ or tools/).
+    let a0: str = path_abs(argv0, cwd)
+    let p1: str = path_dirname(path_dirname(a0))
+    if looks_like_repo(p1) {
+        return p1
+    }
+    # candidate 2: the true exe path from /proc/self/maps.
+    let ex: Option[str] = exe_from_maps()
+    if option_is_some(ex) {
+        let p2: str = path_dirname(path_dirname(option_unwrap(ex)))
+        if looks_like_repo(p2) {
+            return p2
+        }
+    }
+    # candidate 3: the invoking cwd.
+    if looks_like_repo(cwd) {
+        return cwd
+    }
+    # nothing looked like the repo: fall back to argv[0]'s anchor so
+    # the "run `make bootstrap` first" refusal names the right path.
+    return p1
+}
+
+# ============================================================================
+# The sampler runner - the .py's pty.openpty() + Popen + ticker/reader
+# threads, as one C helper the tool compiles per invocation. The child
+# runs with stdout on the pty slave (glibc line-buffers it; ONLCR \r\n
+# is stripped the way the .py's reader strips it), stdin on /dev/null,
+# stderr inherited (onto the runner's own stderr pipe). The ticker
+# thread samples /proc/<pid>/statm every --interval ms, post-exec
+# pre-exit only (/proc/<pid>/exe is the witness - the .py's _exe_is
+# gate); the main thread parses the marker stream and takes the
+# cycle-aligned readings. Output protocol (stdout, one line each):
+#   P <pid>            the workload's OS pid, right after fork
+#   Q <pagesize>       the machine's page size
+#   T <t_ms> <pages>   a ticker sample
+#   C <c> <t_ms> <pages>   a cycle-aligned reading
+#   M <c>              a marker observed (reading may have failed)
+#   E M <len> <bytes>  malformed marker (payload = line[:120] bytes)
+#   E S <len> <bytes>  reserved stem in a non-record line
+#   E A <idx> <prev>   a marker that does not advance
+#   X                  the workload timed out (killed)
+#   R <rc>             the workload's exit status (Python-style -sig)
+# ============================================================================
+
+fn runner_c_src() -> str {
+    return "#define _GNU_SOURCE\n"
+    + "#include <errno.h>\n"
+    + "#include <fcntl.h>\n"
+    + "#include <poll.h>\n"
+    + "#include <pthread.h>\n"
+    + "#include <signal.h>\n"
+    + "#include <stdarg.h>\n"
+    + "#include <stdio.h>\n"
+    + "#include <stdlib.h>\n"
+    + "#include <string.h>\n"
+    + "#include <sys/wait.h>\n"
+    + "#include <time.h>\n"
+    + "#include <unistd.h>\n"
+    + "static pid_t g_child = -1;\n"
+    + "static volatile sig_atomic_t g_done = 0;\n"
+    + "static double g_t0 = 0.0;\n"
+    + "static double g_interval_ms = 10.0;\n"
+    + "static char g_bin[4096];\n"
+    + "static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;\n"
+    + "static double now_ms(void) {\n"
+    + "    struct timespec ts;\n"
+    + "    clock_gettime(CLOCK_MONOTONIC, &ts);\n"
+    + "    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;\n"
+    + "}\n"
+    + "static void emit(const char* fmt, ...) {\n"
+    + "    char line[512];\n"
+    + "    va_list ap;\n"
+    + "    va_start(ap, fmt);\n"
+    + "    int n = vsnprintf(line, sizeof line - 2, fmt, ap);\n"
+    + "    va_end(ap);\n"
+    + "    if (n < 0) return;\n"
+    + "    if ((size_t)n > sizeof line - 2) n = (int)sizeof line - 2;\n"
+    + "    line[n] = '\\n';\n"
+    + "    line[n + 1] = 0;\n"
+    + "    pthread_mutex_lock(&g_mu);\n"
+    + "    (void)write(1, line, (size_t)n + 1);\n"
+    + "    pthread_mutex_unlock(&g_mu);\n"
+    + "}\n"
+    + "static long rss_pages(pid_t pid) {\n"
+    + "    char path[64];\n"
+    + "    char buf[256];\n"
+    + "    snprintf(path, sizeof path, \"/proc/%ld/statm\", (long)pid);\n"
+    + "    int fd = open(path, O_RDONLY);\n"
+    + "    if (fd < 0) return -1;\n"
+    + "    ssize_t n = read(fd, buf, sizeof buf - 1);\n"
+    + "    close(fd);\n"
+    + "    if (n <= 0) return -1;\n"
+    + "    buf[n] = 0;\n"
+    + "    char* p = strtok(buf, \" \");\n"
+    + "    if (!p) return -1;\n"
+    + "    char* q = strtok(NULL, \" \");\n"
+    + "    if (!q) return -1;\n"
+    + "    long pages = strtol(q, NULL, 10);\n"
+    + "    return pages > 0 ? pages : -1;\n"
+    + "}\n"
+    + "static int exe_is(pid_t pid, const char* bin) {\n"
+    + "    char path[64];\n"
+    + "    char link[4096];\n"
+    + "    snprintf(path, sizeof path, \"/proc/%ld/exe\", (long)pid);\n"
+    + "    ssize_t n = readlink(path, link, sizeof link - 1);\n"
+    + "    if (n <= 0) return 0;\n"
+    + "    link[n] = 0;\n"
+    + "    return strcmp(link, bin) == 0;\n"
+    + "}\n"
+    + "static void* ticker_fn(void* arg) {\n"
+    + "    (void)arg;\n"
+    + "    while (!g_done) {\n"
+    + "        if (exe_is(g_child, g_bin)) {\n"
+    + "            long pages = rss_pages(g_child);\n"
+    + "            if (pages > 0) emit(\"T %.3f %ld\", now_ms() - g_t0, pages);\n"
+    + "        }\n"
+    + "        long ns = (long)(g_interval_ms * 1000000.0);\n"
+    + "        struct timespec ts = { ns / 1000000000L, ns % 1000000000L };\n"
+    + "        nanosleep(&ts, NULL);\n"
+    + "    }\n"
+    + "    return NULL;\n"
+    + "}\n"
+    + "int main(int argc, char** argv) {\n"
+    + "    if (argc < 4) {\n"
+    + "        fprintf(stderr, \"rssrun: usage: rssrun <interval_ms> <timeout_s> <bin> [args...]\\n\");\n"
+    + "        return 3;\n"
+    + "    }\n"
+    + "    double interval_ms = strtod(argv[1], NULL);\n"
+    + "    double timeout_s = strtod(argv[2], NULL);\n"
+    + "    const char* bin = argv[3];\n"
+    + "    snprintf(g_bin, sizeof g_bin, \"%s\", bin);\n"
+    + "    g_interval_ms = interval_ms;\n"
+    + "    int master = posix_openpt(O_RDWR | O_NOCTTY);\n"
+    + "    if (master < 0) { perror(\"posix_openpt\"); return 3; }\n"
+    + "    if (grantpt(master) != 0 || unlockpt(master) != 0) {\n"
+    + "        perror(\"grantpt\"); return 3;\n"
+    + "    }\n"
+    + "    char* slave_name = ptsname(master);\n"
+    + "    if (!slave_name) { perror(\"ptsname\"); return 3; }\n"
+    + "    int slave = open(slave_name, O_RDWR | O_NOCTTY);\n"
+    + "    if (slave < 0) { perror(\"open slave\"); return 3; }\n"
+    + "    int devnull = open(\"/dev/null\", O_RDONLY);\n"
+    + "    g_t0 = now_ms();\n"
+    + "    g_child = fork();\n"
+    + "    if (g_child == 0) {\n"
+    + "        dup2(devnull, 0);\n"
+    + "        dup2(slave, 1);\n"
+    + "        close(master);\n"
+    + "        close(slave);\n"
+    + "        if (devnull >= 0) close(devnull);\n"
+    + "        execv(bin, &argv[3]);\n"
+    + "        _exit(127);\n"
+    + "    }\n"
+    + "    close(slave);\n"
+    + "    if (devnull >= 0) close(devnull);\n"
+    + "    emit(\"P %ld\", (long)g_child);\n"
+    + "    emit(\"Q %ld\", (long)getpagesize());\n"
+    + "    pthread_t tick;\n"
+    + "    pthread_create(&tick, NULL, ticker_fn, NULL);\n"
+    + "    long last_cycle = 0;\n"
+    + "    int have_last = 0;\n"
+    + "    int protocol_error = 0;\n"
+    + "    int timed_out = 0;\n"
+    + "    char buf[65536];\n"
+    + "    while (!protocol_error) {\n"
+    + "        double remain_ms = (g_t0 + timeout_s * 1000.0) - now_ms();\n"
+    + "        if (remain_ms <= 0) { timed_out = 1; break; }\n"
+    + "        struct pollfd pf;\n"
+    + "        pf.fd = master;\n"
+    + "        pf.events = POLLIN;\n"
+    + "        pf.revents = 0;\n"
+    + "        int pr = poll(&pf, 1, (int)remain_ms);\n"
+    + "        if (pr < 0) { if (errno == EINTR) continue; break; }\n"
+    + "        if (pr == 0) { timed_out = 1; break; }\n"
+    + "        ssize_t n = read(master, buf, sizeof buf);\n"
+    + "        if (n < 0) { if (errno == EINTR) continue; break; }\n"
+    + "        if (n == 0) break;\n"
+    + "        char* p = buf;\n"
+    + "        char* end = buf + n;\n"
+    + "        while (p < end) {\n"
+    + "            char* nl = memchr(p, '\\n', (size_t)(end - p));\n"
+    + "            char* stop = nl ? nl : end;\n"
+    + "            char* e = stop;\n"
+    + "            while (e > p && e[-1] == '\\r') e--;\n"
+    + "            if (e > p) {\n"
+    + "                char saved = *e;\n"
+    + "                *e = 0;\n"
+    + "                if (memmem(p, (size_t)(e - p), \"__HLRSS_\", 8)\n"
+    + "                    && strncmp(p, \"__HLRSS_CYCLE__ \", 15) != 0) {\n"
+    + "                    long len = e - p;\n"
+    + "                    if (len > 120) len = 120;\n"
+    + "                    emit(\"E S %ld %.*s\", len, (int)len, p);\n"
+    + "                    protocol_error = 1;\n"
+    + "                } else if (strncmp(p, \"__HLRSS_CYCLE__ \", 15) == 0) {\n"
+    + "                    char payload[256];\n"
+    + "                    long pl = (e - p) - 15;\n"
+    + "                    if (pl > 240) pl = 240;\n"
+    + "                    memcpy(payload, p + 15, (size_t)pl);\n"
+    + "                    payload[pl] = 0;\n"
+    + "                    char* a = payload;\n"
+    + "                    char* b = payload + pl;\n"
+    + "                    while (a < b && (*a == ' ' || *a == '\\t' || *a == '\\r')) a++;\n"
+    + "                    while (b > a && (b[-1] == ' ' || b[-1] == '\\t' || b[-1] == '\\r')) b--;\n"
+    + "                    *b = 0;\n"
+    + "                    char* s = a;\n"
+    + "                    int ok = 1;\n"
+    + "                    if (*s == '+' || *s == '-') s++;\n"
+    + "                    if (*s == 0) ok = 0;\n"
+    + "                    while (*s) {\n"
+    + "                        if (*s < '0' || *s > '9') { ok = 0; break; }\n"
+    + "                        s++;\n"
+    + "                    }\n"
+    + "                    if (!ok) {\n"
+    + "                        long len = e - p;\n"
+    + "                        if (len > 120) len = 120;\n"
+    + "                        emit(\"E M %ld %.*s\", len, (int)len, p);\n"
+    + "                        protocol_error = 1;\n"
+    + "                    } else {\n"
+    + "                        long idx = strtol(a, NULL, 10);\n"
+    + "                        if (have_last && idx <= last_cycle) {\n"
+    + "                            emit(\"E A %ld %ld\", idx, last_cycle);\n"
+    + "                            protocol_error = 1;\n"
+    + "                        } else {\n"
+    + "                            last_cycle = idx;\n"
+    + "                            have_last = 1;\n"
+    + "                            emit(\"M %ld\", idx);\n"
+    + "                            long pages = rss_pages(g_child);\n"
+    + "                            if (pages > 0) {\n"
+    + "                                emit(\"C %ld %.3f %ld\", idx, now_ms() - g_t0, pages);\n"
+    + "                            }\n"
+    + "                        }\n"
+    + "                    }\n"
+    + "                }\n"
+    + "                *e = saved;\n"
+    + "            }\n"
+    + "            if (!nl) break;\n"
+    + "            p = nl + 1;\n"
+    + "        }\n"
+    + "        if (protocol_error) break;\n"
+    + "    }\n"
+    + "    g_done = 1;\n"
+    + "    if (timed_out || protocol_error) kill(g_child, SIGKILL);\n"
+    + "    close(master);\n"
+    + "    int wstatus = 0;\n"
+    + "    int reaped = 0;\n"
+    + "    while (!reaped) {\n"
+    + "        if (timed_out) {\n"
+    + "            if (waitpid(g_child, &wstatus, 0) == g_child) reaped = 1;\n"
+    + "            break;\n"
+    + "        }\n"
+    + "        pid_t r = waitpid(g_child, &wstatus, WNOHANG);\n"
+    + "        if (r == g_child) { reaped = 1; break; }\n"
+    + "        if (r < 0) break;\n"
+    + "        double remain_ms = (g_t0 + timeout_s * 1000.0) - now_ms();\n"
+    + "        if (remain_ms <= 0) { timed_out = 1; kill(g_child, SIGKILL); continue; }\n"
+    + "        struct timespec ts = { 0, 2 * 1000000L };\n"
+    + "        nanosleep(&ts, NULL);\n"
+    + "    }\n"
+    + "    pthread_join(tick, NULL);\n"
+    + "    if (timed_out) emit(\"X\");\n"
+    + "    long rc = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus)\n"
+    + "           : (WIFSIGNALED(wstatus) ? -(long)WTERMSIG(wstatus) : 0);\n"
+    + "    emit(\"R %ld\", rc);\n"
+    + "    return 0;\n"
+    + "}\n"
+}
+
+# The probe the .py compiles to prove the linker understands -Wl,--wrap
+# and that a wrapped allocation path still runs (verbatim source).
+fn probe_c_src() -> str {
+    return "#include <stdlib.h>\n"
+    + "int main(void) { void* p = malloc(8); free(p); return p ? 0 : 1; }\n"
+}
+
+fn wrap_flags() -> list[str] {
+    return["-Wl,--wrap=malloc", "-Wl,--wrap=calloc",
+    "-Wl,--wrap=realloc", "-Wl,--wrap=free"]
+}
+
+# ============================================================================
+# The CLI - the .py's argparse grammar: two positionals (workload, then
+# free prog_args), twelve value options, the mutually exclusive
+# --malloc-count pair, --opt=value and --opt value forms, "--" as the
+# positional separator, and the argparse error texts (exit 2).
+# ============================================================================
+
+struct Cli {
+    workload: str,
+    prog_args: list[str],
+    cycles: int,
+    warmup: int,
+    interval: float,
+    interval_str: str,
+    timeout: float,
+    timeout_str: str,
+    threshold: float,
+    threshold_time: float,
+    rss_slack: int,
+    live_slack: int,
+    bootstrap: int,
+    malloc_count: int,
+    json_path: str,
+    hlc: str,
+    cc: str
+}
+
+fn cli_flag_takes_value(head: str) -> bool {
+    if head == "--cycles" || head == "--warmup" || head == "--interval" {
+        return true
+    }
+    if head == "--timeout" || head == "--threshold" {
+        return true
+    }
+    if head == "--threshold-time" || head == "--rss-slack" {
+        return true
+    }
+    if head == "--live-slack" || head == "--bootstrap" {
+        return true
+    }
+    if head == "--json" || head == "--hlc" || head == "--cc" {
+        return true
+    }
+    return false
+}
+
+fn cli_int_flag(head: str) -> bool {
+    if head == "--cycles" || head == "--warmup" || head == "--rss-slack" {
+        return true
+    }
+    if head == "--live-slack" || head == "--bootstrap" {
+        return true
+    }
+    return false
+}
+
+# parse_cli(argv, default_hlc, default_cc) - Result[Cli, str]; the Err
+# string is the complete stderr line (already hls-rss:-prefixed).
+fn parse_cli(argv: list[str], default_hlc: str, default_cc: str)
+-> Result[Cli, str] {
+    let c: Cli = Cli {
+        workload: "",
+        prog_args: [],
+        cycles: 200,
+        warmup: -1,
+        interval: 10.0,
+        interval_str: "10.0",
+        timeout: 120.0,
+        timeout_str: "120.0",
+        threshold: 0.25,
+        threshold_time: 2.0,
+        rss_slack: 256,
+        live_slack: 0,
+        bootstrap: 1000,
+        malloc_count: 0,
+        json_path: "",
+        hlc: default_hlc,
+        cc: default_cc
+    }
+    let mut i: int = 1
+    let n: int = argv.len()
+    let mut only_positional: bool = false
+    let mut have_workload: bool = false
+    let mut saw_mc_pos: bool = false
+    let mut saw_mc_neg: bool = false
+    while i < n {
+        let tok: str = argv.get(i)
+        if only_positional {
+            if !have_workload {
+                c.workload = tok
+                have_workload = true
+            } else {
+                c.prog_args.push(tok)
+            }
+            i = i + 1
+            continue
+        }
+        if tok == "--" {
+            only_positional = true
+            i = i + 1
+            continue
+        }
+        if tok.starts_with("--") {
+            let mut head: str = tok
+            let mut val_inline: str = ""
+            let mut has_inline: bool = false
+            let eq: int = tok.find("=")
+            if eq >= 0 {
+                head = tok.slice(0, eq)
+                val_inline = tok.slice(eq + 1, tok.len())
+                has_inline = true
+            }
+            if head == "--malloc-count" {
+                if saw_mc_neg {
+                    return Result.Err("hls-rss: error: argument "
+                    + "--malloc-count: not allowed with argument "
+                    + "--no-malloc-count")
+                }
+                saw_mc_pos = true
+                c.malloc_count = 1
+                i = i + 1
+                continue
+            }
+            if head == "--no-malloc-count" {
+                if saw_mc_pos {
+                    return Result.Err("hls-rss: error: argument "
+                    + "--no-malloc-count: not allowed with argument "
+                    + "--malloc-count")
+                }
+                saw_mc_neg = true
+                c.malloc_count = 2
+                i = i + 1
+                continue
+            }
+            if !cli_flag_takes_value(head) {
+                return Result.Err("hls-rss: error: unrecognized arguments: "
+                + tok)
+            }
+            let mut value: str = val_inline
+            if !has_inline {
+                if i + 1 >= n {
+                    return Result.Err("hls-rss: error: argument " + head
+                    + ": expected one argument")
+                }
+                value = argv.get(i + 1)
+                i = i + 1
+            }
+            if head == "--json" || head == "--hlc" || head == "--cc" {
+                if head == "--json" {
+                    c.json_path = value
+                } else if head == "--hlc" {
+                    c.hlc = value
+                } else {
+                    c.cc = value
+                }
+                i = i + 1
+                continue
+            }
+            if head == "--cycles" || head == "--warmup"
+            || head == "--rss-slack" || head == "--live-slack"
+            || head == "--bootstrap" {
+                let v: Option[int] = parse_int_py(value)
+                if option_is_none(v) {
+                    return Result.Err("hls-rss: error: argument " + head
+                    + ": invalid int value: '" + value + "'")
+                }
+                let num: int = option_unwrap(v)
+                if head == "--cycles" {
+                    c.cycles = num
+                } else if head == "--warmup" {
+                    c.warmup = num
+                } else if head == "--rss-slack" {
+                    c.rss_slack = num
+                } else if head == "--live-slack" {
+                    c.live_slack = num
+                } else {
+                    c.bootstrap = num
+                }
+            } else {
+                let v: Option[float] = parse_float_py(value)
+                if option_is_none(v) {
+                    return Result.Err("hls-rss: error: argument " + head
+                    + ": invalid float value: '" + value + "'")
+                }
+                let num: float = option_unwrap(v)
+                if head == "--interval" {
+                    c.interval = num
+                    c.interval_str = value
+                } else if head == "--timeout" {
+                    c.timeout = num
+                    c.timeout_str = value
+                } else if head == "--threshold" {
+                    c.threshold = num
+                } else {
+                    c.threshold_time = num
+                }
+            }
+            i = i + 1
+            continue
+        }
+        if tok.starts_with("-") && tok.len() > 1 {
+            return Result.Err("hls-rss: error: unrecognized arguments: "
+            + tok)
+        }
+        if !have_workload {
+            c.workload = tok
+            have_workload = true
+        } else {
+            c.prog_args.push(tok)
+        }
+        i = i + 1
+    }
+    if !have_workload {
+        return Result.Err("hls-rss: error: the following arguments are "
+        + "required: workload")
+    }
+    return Result.Ok(c)
+}
+
+fn usage_text() -> str {
+    return "usage: hls-rss [-h] [--cycles N] [--warmup W]"
+    + " [--interval MS]\n"
+    + "                [--timeout S] [--threshold P]"
+    + " [--threshold-time P]\n"
+    + "                [--rss-slack P] [--live-slack N]"
+    + " [--bootstrap B]\n"
+    + "                [--malloc-count | --no-malloc-count]"
+    + " [--json FILE]\n"
+    + "                [--hlc PATH] [--cc CC]\n"
+    + "                workload [prog_args ...]"
+}
+
+fn help_text() -> str {
+    return usage_text() + "\n"
+    + "\n"
+    + "Stage 125 RSS-stability verifier: run a Halis workload\n"
+    + "natively, sample its resident memory, and certify (or refuse to\n"
+    + "certify) that the GC-free runtime keeps RSS flat as work volume\n"
+    + "grows.\n"
+    + "\n"
+    + "positional arguments:\n"
+    + "  workload              a .hls program (see the marker and argv[1]\n"
+    + "                        cycle conventions in --help of the SPEC)\n"
+    + "  prog_args             extra arguments passed to the program\n"
+    + "                        after the tool's cycle count\n"
+    + "\n"
+    + "options:\n"
+    + "  -h, --help            show this help message and exit\n"
+    + "  --cycles N            measured steady-state cycles (default 200)\n"
+    + "  --warmup W            warmup cycles before the measured phase\n"
+    + "                        (default cycles//4, at least 1)\n"
+    + "  --interval MS         RSS sampling interval in ms (default 10)\n"
+    + "  --timeout S           hard per-run timeout in seconds\n"
+    + "                        (default 120)\n"
+    + "  --threshold P         leak threshold in pages/cycle (default 0.25)\n"
+    + "  --threshold-time P    threshold in pages/s when no markers\n"
+    + "                        (default 2)\n"
+    + "  --rss-slack P         high-water slack across the two runs,\n"
+    + "                        pages (default 256)\n"
+    + "  --live-slack N        live-object slack across the two runs\n"
+    + "                        (default 0 — the balance is exact)\n"
+    + "  --bootstrap B         bootstrap resamples for the slope CI\n"
+    + "                        (default 1000)\n"
+    + "  --malloc-count        force the interposer (exit 2 if\n"
+    + "                        unsupported)\n"
+    + "  --no-malloc-count     disable the interposer (timeline only)\n"
+    + "  --json FILE           write the machine-readable report\n"
+    + "  --hlc PATH            native compiler (default bin/hlc)\n"
+    + "  --cc CC               C compiler (default $CC or gcc)"
+}
+
+# ============================================================================
+# The trace one workload run produces, and the runner-stream parser
+# that fills it (the .py's RunTrace + reader + ticker, fed by the C
+# runner's observation lines).
+# ============================================================================
+
+struct TlPt {
+    ts: str,
+    tf: float,
+    pages: int
+}
+
+struct CycPt {
+    c: int,
+    ts: str,
+    tf: float,
+    pages: int
+}
+
+struct Trace {
+    rc: int,
+    has_rc: bool,
+    timed_out: bool,
+    protocol_error: str,
+    has_protocol_error: bool,
+    timeline: list[TlPt],
+    cycle_points: list[CycPt],
+    markers: list[int],
+    interposer: Ipo,
+    stderr_tail: str,
+    elapsed_ms: int,
+    page_size: int
+}
+
+fn trace_new() -> Trace {
+    return Trace {
+        rc: 0, has_rc: false, timed_out: false,
+        protocol_error: "", has_protocol_error: false,
+        timeline: [], cycle_points: [], markers: [],
+        interposer: ipo_empty(), stderr_tail: "",
+        elapsed_ms: 0, page_size: 4096
+    }
+}
+
+fn trace_high_water(t: Trace) -> Option[int] {
+    let mut hw: int = -1
+    let mut i: int = 0
+    while i < t.timeline.len() {
+        if t.timeline.get(i).pages > hw {
+            hw = t.timeline.get(i).pages
+        }
+        i = i + 1
+    }
+    let mut j: int = 0
+    while j < t.cycle_points.len() {
+        if t.cycle_points.get(j).pages > hw {
+            hw = t.cycle_points.get(j).pages
+        }
+        j = j + 1
+    }
+    if hw < 0 {
+        return Option.None
+    }
+    return Option.Some(hw)
+}
+
+fn trace_first_pages(t: Trace) -> Option[int] {
+    if t.timeline.len() == 0 {
+        return Option.None
+    }
+    return Option.Some(t.timeline.get(0).pages)
+}
+
+fn trace_last_pages(t: Trace) -> Option[int] {
+    if t.timeline.len() == 0 {
+        return Option.None
+    }
+    return Option.Some(t.timeline.get(t.timeline.len() - 1).pages)
+}
+
+# token_at(line, k) - the k-th space-separated token (k counts from 1).
+fn token_at(line: str, k: int) -> str {
+    let mut idx: int = 0
+    let mut seen: int = 0
+    let n: int = line.len()
+    while idx < n && seen < k {
+        while idx < n && line.byte_at(idx) == 32 {
+            idx = idx + 1
+        }
+        let start: int = idx
+        while idx < n && line.byte_at(idx) != 32 {
+            idx = idx + 1
+        }
+        seen = seen + 1
+        if seen == k {
+            return line.slice(start, idx)
+        }
+    }
+    return ""
+}
+
+# feed_line(t, line) - one runner observation line into the trace.
+fn feed_line(t: Trace, line: str) -> void {
+    if line.starts_with("Q ") {
+        let v: Option[int] = parse_int_py(token_at(line, 2))
+        if option_is_some(v) {
+            t.page_size = option_unwrap(v)
+        }
+        return
+    }
+    if line.starts_with("P ") {
+        return
+    }
+    if line.starts_with("T ") {
+        let ts: str = token_at(line, 2)
+        let ps: str = token_at(line, 3)
+        let pv: Option[int] = parse_int_py(ps)
+        if ts.len() > 0 && option_is_some(pv) {
+            t.timeline.push(TlPt {
+                ts: ts, tf: ts.to_float(), pages: option_unwrap(pv)
+            })
+        }
+        return
+    }
+    if line.starts_with("C ") {
+        let cs: str = token_at(line, 2)
+        let ts: str = token_at(line, 3)
+        let ps: str = token_at(line, 4)
+        let cv: Option[int] = parse_int_py(cs)
+        let pv: Option[int] = parse_int_py(ps)
+        if option_is_some(cv) && ts.len() > 0 && option_is_some(pv) {
+            t.cycle_points.push(CycPt {
+                c: option_unwrap(cv), ts: ts, tf: ts.to_float(),
+                pages: option_unwrap(pv)
+            })
+        }
+        return
+    }
+    if line.starts_with("M ") {
+        let v: Option[int] = parse_int_py(token_at(line, 2))
+        if option_is_some(v) {
+            t.markers.push(option_unwrap(v))
+        }
+        return
+    }
+    if line.starts_with("X") {
+        t.timed_out = true
+        return
+    }
+    if line.starts_with("R ") {
+        let v: Option[int] = parse_int_py(token_at(line, 2))
+        if option_is_some(v) {
+            t.rc = option_unwrap(v)
+            t.has_rc = true
+        }
+        return
+    }
+    if line.starts_with("E M ") || line.starts_with("E S ") {
+        # "E M <len> <payload bytes>" - payload may contain spaces.
+        let mut kind: str = "M"
+        if line.starts_with("E S ") {
+            kind = "S"
+        }
+        let base: int = 4
+        let mut j: int = base
+        let n: int = line.len()
+        while j < n && line.byte_at(j) >= 48 && line.byte_at(j) <= 57 {
+            j = j + 1
+        }
+        let lens: str = line.slice(base, j)
+        let lv: Option[int] = parse_int_py(lens)
+        if option_is_none(lv) || j >= n {
+            return
+        }
+        let plen: int = option_unwrap(lv)
+        let start: int = j + 1
+        let mut end: int = start + plen
+        if end > n {
+            end = n
+        }
+        let payload: str = line.slice(start, end)
+        if !t.has_protocol_error {
+            if kind == "M" {
+                t.protocol_error = "protocol error: malformed cycle marker "
+                + py_str_repr(payload)
+                + " (expected `__HLRSS_CYCLE__ <int>`)"
+            } else {
+                t.protocol_error = "protocol error: reserved stem in a "
+                + "non-record line " + py_str_repr(payload)
+            }
+            t.has_protocol_error = true
+        }
+        return
+    }
+    if line.starts_with("E A ") {
+        let iv: Option[int] = parse_int_py(token_at(line, 3))
+        let pv: Option[int] = parse_int_py(token_at(line, 4))
+        if option_is_some(iv) && option_is_some(pv) {
+            if !t.has_protocol_error {
+                t.protocol_error = "protocol error: cycle marker "
+                + option_unwrap(iv).to_str()
+                + " does not advance (previous "
+                + option_unwrap(pv).to_str() + ")"
+                t.has_protocol_error = true
+            }
+        }
+        return
+    }
+    # anything else (runner internals) is ignored.
+}
+
+# feed_chunk(t, carry, chunk) - returns the new carry (a trailing partial
+# line). Runner lines are whole write()s, but never rely on it.
+fn feed_chunk(t: Trace, carry: str, chunk: str) -> str {
+    let data: str = carry + chunk
+    let n: int = data.len()
+    let mut i: int = 0
+    while i < n {
+        let mut nl: int = -1
+        let mut j: int = i
+        while j < n {
+            if data.byte_at(j) == 10 {
+                nl = j
+                break
+            }
+            j = j + 1
+        }
+        if nl < 0 {
+            return data.slice(i, n)
+        }
+        let line: str = data.slice(i, nl)
+        if line.len() > 0 {
+            feed_line(t, line)
+        }
+        i = nl + 1
+    }
+    return ""
+}
+
+# ============================================================================
+# run_workload - one measured run through the sampler runner.
+# fail_kind: 0 ok; 1 a VerifyError (timeout); 2 a UsageError (launch).
+# ============================================================================
+
+struct RunOut {
+    t: Trace,
+    fail_kind: int,
+    fail_msg: str
+}
+
+fn run_workload(runner: str, bin_path: str, workload_argv: list[str],
+interval_str: str, timeout_str: str) -> RunOut uses Proc, Clock {
+    let out: RunOut = RunOut {
+        t: trace_new(), fail_kind: 0, fail_msg: ""
+    }
+    let argv: list[str] = [interval_str, timeout_str, bin_path]
+    let mut i: int = 0
+    while i < workload_argv.len() {
+        argv.push(workload_argv.get(i))
+        i = i + 1
+    }
+    let t0: int = clock_ms()
+    let pid: int = proc_spawn(runner, argv, 2, 1, 1)
+    if pid < 1 {
+        out.fail_kind = 2
+        out.fail_msg = "cannot launch the workload: the sampler runner "
+        + "could not be spawned"
+        return out
+    }
+    let mut carry: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        carry = feed_chunk(out.t, carry, chunk)
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    if carry.len() > 0 {
+        feed_line(out.t, carry)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    let rc: int = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    out.t.elapsed_ms = clock_ms() - t0
+    # the last 4 KiB of stderr (panic messages, the interposer report)
+    let mut tail: str = err
+    if err.len() > 4096 {
+        tail = err.slice(err.len() - 4096, err.len())
+    }
+    out.t.stderr_tail = tail
+    out.t.interposer = interposer_parse(tail)
+    if rc != 0 || !out.t.has_rc {
+        out.fail_kind = 2
+        out.fail_msg = "cannot launch the workload: the sampler runner "
+        + "failed (" + err.trim() + ")"
+        return out
+    }
+    if out.t.timed_out {
+        out.fail_kind = 1
+        let tv: Option[float] = parse_float_py(timeout_str)
+        let mut tsecs: float = 120.0
+        if option_is_some(tv) {
+            tsecs = option_unwrap(tv)
+        }
+        out.fail_msg = "workload timed out after " + fmt_fixed(tsecs, 0) + "s"
+        return out
+    }
+    return out
+}
+
+# ============================================================================
+# The native build pipeline - the .py's probe_wrap / build_interposer /
+# compile_workload. hlc runs with cwd = the repo root (the .py's
+# subprocess cwd override, replicated through a shell wrapper because
+# proc_spawn inherits the parent's cwd); gcc runs in the invoking cwd
+# exactly as the .py's does.
+# ============================================================================
+
+# probe_wrap(cc, wrap_c, probe_dir) - compile the balance interposer,
+# link the probe with the --wrap recipe, and run it. None when the
+# toolchain cannot (the retained instrument then skips itself).
+fn probe_wrap(cc: str, wrap_c: str, probe_dir: str) -> Option[str] uses Fs, Proc {
+    let obj: str = path_join2(probe_dir, "balance.o")
+    let r1: RunCap = spawn_cap(cc, ["-O2", "-c", wrap_c, "-o", obj])
+    if !r1.spawned || r1.code != 0 {
+        return Option.None
+    }
+    let probe_c: str = path_join2(probe_dir, "probe.c")
+    write_file(probe_c, probe_c_src())
+    let probe_bin: str = path_join2(probe_dir, "probe.bin")
+    let mut link_cmd: list[str] = ["-O2", "-o", probe_bin, probe_c, obj,
+    "-lm", "-pthread"]
+    let wf: list[str] = wrap_flags()
+    let mut wi: int = 0
+    while wi < wf.len() {
+        link_cmd.push(wf.get(wi))
+        wi = wi + 1
+    }
+    let r2: RunCap = spawn_cap(cc, link_cmd)
+    if !r2.spawned || r2.code != 0 {
+        return Option.None
+    }
+    # the probe must not only link but RUN (a wrap that broke the
+    # allocation path would poison every measurement).
+    let r3: RunCap = spawn_cap(probe_bin, [])
+    if !r3.spawned {
+        return Option.None
+    }
+    return Option.Some(obj)
+}
+
+fn build_interposer(cc: str, wrap_c: str, tmpdir: str) -> Result[str, str]
+uses Proc {
+    let obj: str = path_join2(tmpdir, "malloc_balance.o")
+    let r: RunCap = spawn_cap(cc, ["-O2", "-c", wrap_c, "-o", obj])
+    if !r.spawned || r.code != 0 {
+        return Result.Err("cannot compile the balance interposer:\n"
+        + r.err)
+    }
+    return Result.Ok(obj)
+}
+
+# compile_workload(workload, cfg, tmpdir, wrap_obj, repo) - bin/hlc ->
+# C -> gcc -O2, the exact recipe every other gate uses.
+fn compile_workload(workload: str, cfg: Cli, tmpdir: str, wrap_obj: str,
+repo: str) -> Result[str, str] uses Fs, Proc {
+    let hlc: str = cfg.hlc
+    let cc: str = cfg.cc
+    if !file_exists(hlc) {
+        return Result.Err("native verification needs the native compiler "
+        + "at " + hlc + " — run `make bootstrap` first")
+    }
+    let c_path: str = path_join2(tmpdir, "workload.c")
+    let bin_path: str = path_join2(tmpdir, "workload.bin")
+    let cwd: str = cwd_get()
+    let abs_workload: str = path_abs(workload, cwd)
+    let script: str = "cd '" + shell_quote(repo) + "' && exec '"
+    + shell_quote(hlc) + "' '" + shell_quote(abs_workload) + "' '"
+    + shell_quote(c_path) + "'"
+    let r1: RunCap = spawn_cap("sh", ["-c", script])
+    if !r1.spawned {
+        return Result.Err("native verification needs the native compiler "
+        + "at " + hlc + " — run `make bootstrap` first")
+    }
+    if r1.code != 0 {
+        return Result.Err("hlc refused the workload:\n" + r1.err)
+    }
+    let mut cmd: list[str] = ["-O2", "-o", bin_path, c_path, "-lm", "-pthread"]
+    if wrap_obj != "" {
+        cmd.push(wrap_obj)
+        let wf: list[str] = wrap_flags()
+        let mut wi: int = 0
+        while wi < wf.len() {
+            cmd.push(wf.get(wi))
+            wi = wi + 1
+        }
+    }
+    let r2: RunCap = spawn_cap(cc, cmd)
+    if !r2.spawned {
+        return Result.Err("gcc refused the workload:\n" + r2.err)
+    }
+    if r2.code != 0 {
+        return Result.Err("gcc refused the workload:\n" + r2.err)
+    }
+    return Result.Ok(bin_path)
+}
+
+# build_runner(cc, tmpdir) - compile the sampler runner.
+fn build_runner(cc: str, tmpdir: str) -> Result[str, str] uses Fs, Proc {
+    let src: str = path_join2(tmpdir, "sampler_runner.c")
+    let bin_path: str = path_join2(tmpdir, "sampler_runner.bin")
+    write_file(src, runner_c_src())
+    let r: RunCap = spawn_cap(cc, ["-O2", "-o", bin_path, src, "-pthread"])
+    if !r.spawned || r.code != 0 {
+        return Result.Err("cannot compile the sampler runner:\n" + r.err)
+    }
+    return Result.Ok(bin_path)
+}
+
+# ============================================================================
+# Analysis - the two instruments, their verdicts, the composition.
+# ============================================================================
+
+struct SlopeOut {
+    mode: str,
+    verdict: str,
+    slope: float,
+    has_slope: bool,
+    ci_lo: float,
+    ci_hi: float,
+    has_ci: bool,
+    threshold: float,
+    has_threshold: bool,
+    unit: str,
+    note: str,
+    has_note: bool,
+    pairs: int,
+    points: int,
+    has_fit: bool
+}
+
+fn slope_new() -> SlopeOut {
+    return SlopeOut {
+        mode: "", verdict: verdict_inconclusive(), slope: 0.0,
+        has_slope: false, ci_lo: 0.0, ci_hi: 0.0, has_ci: false,
+        threshold: 0.0, has_threshold: false, unit: "", note: "",
+        has_note: false, pairs: 0, points: 0, has_fit: false
+    }
+}
+
+fn cfg_warmup_effective(c: Cli) -> int {
+    if c.warmup >= 0 {
+        return c.warmup
+    }
+    let w: int = c.cycles / 4
+    if w < 1 {
+        return 1
+    }
+    return w
+}
+
+fn slope_analyse(t: Trace, warmup: int, c: Cli, seed_name: str)
+-> Result[SlopeOut, str] {
+    let out: SlopeOut = slope_new()
+    if t.has_protocol_error {
+        out.verdict = verdict_inconclusive()
+        out.note = t.protocol_error
+        out.has_note = true
+        return Result.Ok(out)
+    }
+    let mut pts: list[Pt] = []
+    let mut ci: int = 0
+    while ci < t.cycle_points.len() {
+        let cp: CycPt = t.cycle_points.get(ci)
+        if cp.c >= warmup {
+            pts.push(Pt {
+                x: cp.c, y: cp.pages.to_float()
+            })
+        }
+        ci = ci + 1
+    }
+    let mut mode: str = "cycle"
+    let mut threshold: float = c.threshold
+    let mut unit: str = "page/cycle"
+    if t.cycle_points.len() < 8 && t.timeline.len() >= 8 {
+        mode = "time"
+        let frac: float = warmup.to_float()
+        / (warmup + c.cycles).to_float()
+        if t.timeline.len() > 0 {
+            let t_cut: float = t.timeline.get(t.timeline.len() - 1).tf
+            * frac
+            let fresh: list[Pt] = []
+            let mut ti: int = 0
+            while ti < t.timeline.len() {
+                let tp: TlPt = t.timeline.get(ti)
+                if tp.tf >= t_cut {
+                    fresh.push(Pt {
+                        x: tp.tf.to_int(), y: tp.pages.to_float()
+                    })
+                }
+                ti = ti + 1
+            }
+            pts = fresh
+        }
+        threshold = c.threshold_time
+        unit = "page/s"
+    }
+    out.mode = mode
+    out.unit = unit
+    out.threshold = threshold
+    out.has_threshold = true
+    if pts.len() < 8 {
+        out.verdict = verdict_inconclusive()
+        out.note = "only " + pts.len().to_str()
+        + " sampled points after the warmup split — the plan is too "
+        + "small to certify anything"
+        out.has_note = true
+        return Result.Ok(out)
+    }
+    let fit: list[Pt] = stat_decimate(pts)
+    let ts: Result[TsOut, str] = stat_theil_sen(fit)
+    if result_is_err(ts) {
+        return Result.Err(result_err_or(ts, ""))
+    }
+    let ts_v: TsOut = result_unwrap(ts)
+    let ci_r: Result[CiOut, str] = stat_bootstrap_ci(fit, c.bootstrap,
+    seed_of_name(seed_name))
+    if result_is_err(ci_r) {
+        return Result.Err(result_err_or(ci_r, ""))
+    }
+    let ci_v: CiOut = result_unwrap(ci_r)
+    out.slope = ts_v.slope
+    out.has_slope = true
+    out.ci_lo = ci_v.lo
+    out.ci_hi = ci_v.hi
+    out.has_ci = true
+    out.pairs = ts_v.pairs
+    out.points = fit.len()
+    out.has_fit = true
+    if ci_v.hi < threshold {
+        out.verdict = verdict_stable()
+        out.note = "slope CI entirely within the threshold — resident "
+        + "memory does not grow with work"
+    } else if ci_v.lo > threshold {
+        out.verdict = verdict_leak()
+        out.note = "slope CI entirely above the threshold — resident "
+        + "memory grows with the work performed"
+    } else {
+        out.verdict = verdict_inconclusive()
+        out.note = "slope CI straddles the threshold — cannot certify; "
+        + "widen the plan or raise the threshold"
+    }
+    out.has_note = true
+    return Result.Ok(out)
+}
+
+struct RetOut {
+    verdict: str,
+    live_delta: int,
+    has_live_delta: bool,
+    live_full: int,
+    has_live_full: bool,
+    live_warm: int,
+    has_live_warm: bool,
+    hw_delta: int,
+    has_hw_delta: bool,
+    hw_full: int,
+    has_hw_full: bool,
+    hw_warm: int,
+    has_hw_warm: bool,
+    note: str,
+    has_note: bool
+}
+
+fn ret_new() -> RetOut {
+    return RetOut {
+        verdict: verdict_inconclusive(), live_delta: 0,
+        has_live_delta: false, live_full: 0, has_live_full: false,
+        live_warm: 0, has_live_warm: false, hw_delta: 0,
+        has_hw_delta: false, hw_full: 0, has_hw_full: false,
+        hw_warm: 0, has_hw_warm: false, note: "", has_note: false
+    }
+}
+
+fn ret_analyse(t_full: Trace, t_warm: Trace, c: Cli) -> RetOut {
+    let out: RetOut = ret_new()
+    let a: Ipo = t_full.interposer
+    let b: Ipo = t_warm.interposer
+    if a.ok {
+        out.live_full = a.n_live
+        out.has_live_full = true
+    }
+    if b.ok {
+        out.live_warm = b.n_live
+        out.has_live_warm = true
+    }
+    let hwf: Option[int] = trace_high_water(t_full)
+    let hww: Option[int] = trace_high_water(t_warm)
+    if option_is_some(hwf) {
+        out.hw_full = option_unwrap(hwf)
+        out.has_hw_full = true
+    }
+    if option_is_some(hww) {
+        out.hw_warm = option_unwrap(hww)
+        out.has_hw_warm = true
+    }
+    if !a.ok || !b.ok {
+        out.verdict = verdict_inconclusive()
+        out.note = "the interposer report is missing from a clean run"
+        out.has_note = true
+        return out
+    }
+    if a.n_overflow > 0 || b.n_overflow > 0 {
+        out.verdict = verdict_inconclusive()
+        out.note = "the tracking table overflowed — the live balance "
+        + "degraded to event counting; refuse to certify"
+        out.has_note = true
+        return out
+    }
+    let live_delta: int = a.n_live - b.n_live
+    out.live_delta = live_delta
+    out.has_live_delta = true
+    let live_bad: bool = int_abs(live_delta) > c.live_slack
+    if !out.has_hw_full || !out.has_hw_warm {
+        out.hw_delta = 0
+        out.has_hw_delta = false
+        if live_bad && live_delta > 0 {
+            out.verdict = verdict_leak()
+            out.note = "the full plan's process holds "
+            + live_delta.to_str() + " more live objects at exit — "
+            + "retained memory grows with the work volume (no "
+            + "page-level readings: the workload outruns the sampler)"
+        } else if live_bad {
+            out.verdict = verdict_inconclusive()
+            out.note = "live balance moved the wrong way ("
+            + live_delta.to_str() + ") — not a leak, not a "
+            + "certification"
+        } else {
+            out.verdict = verdict_stable()
+            out.note = "the retained set is independent of the work "
+            + "volume — the exact-free balance, observed (no "
+            + "page-level readings: the workload outruns the sampler)"
+        }
+        out.has_note = true
+        return out
+    }
+    let hw_delta: int = out.hw_full - out.hw_warm
+    out.hw_delta = hw_delta
+    out.has_hw_delta = true
+    let hw_bad: bool = hw_delta > c.rss_slack
+    if live_bad && live_delta > 0 {
+        out.verdict = verdict_leak()
+        out.note = "the full plan's process holds "
+        + live_delta.to_str() + " more live objects at exit — "
+        + "retained memory grows with the work volume"
+    } else if live_bad {
+        out.verdict = verdict_inconclusive()
+        out.note = "live balance moved the wrong way ("
+        + live_delta.to_str() + ") — not a leak, not a certification"
+    } else if hw_bad {
+        out.verdict = verdict_inconclusive()
+        out.note = "live balances match but the high-water mark grew "
+        + hw_delta.to_str() + " pages — page-level growth without "
+        + "retained objects (fragmentation?), not a certification"
+    } else {
+        out.verdict = verdict_stable()
+        out.note = "the retained set is independent of the work volume "
+        + "— the exact-free property, observed"
+    }
+    out.has_note = true
+    return out
+}
+
+# compose - the strictest voice wins.
+fn verdict_compose(slope: SlopeOut, retained: RetOut,
+has_retained: bool) -> str {
+    if slope.verdict == verdict_leak() {
+        return verdict_leak()
+    }
+    if has_retained && retained.verdict == verdict_leak() {
+        return verdict_leak()
+    }
+    if slope.verdict == verdict_inconclusive() {
+        return verdict_inconclusive()
+    }
+    if has_retained && retained.verdict == verdict_inconclusive() {
+        return verdict_inconclusive()
+    }
+    return verdict_stable()
+}
+
+fn int_abs(v: int) -> int {
+    if v < 0 {
+        return 0 - v
+    }
+    return v
+}
+
+# ============================================================================
+# Rendering - the human report (the numbers an engineer would quote in
+# a bug report, each labelled with the instrument that produced it).
+# ============================================================================
+
+fn render_report(workload: str, c: Cli, warmup: int, skip_reason: str,
+has_skip: bool, t_a: Trace, t_b: Trace, has_b: bool, slope: SlopeOut,
+retained: RetOut, has_retained: bool, verdict: str, page_size: int)
+-> str {
+    let lines: list[str] = []
+    lines.push("hls-rss " + tool_version()
+    + " — RSS-stability verifier (Stage 125)")
+    lines.push("workload: " + path_basename(workload)
+    + " (native, gcc -O2)")
+    lines.push("plan: warmup " + warmup.to_str() + " + measured "
+    + c.cycles.to_str() + " cycles, sampler "
+    + fmt_fixed(c.interval, 0) + " ms, timeout "
+    + fmt_fixed(c.timeout, 0) + "s")
+    lines.push("")
+    # -- the timeline ------------------------------------------------------
+    lines.push("timeline (external sampler, /proc/<pid>/statm)")
+    if t_a.timeline.len() > 0 {
+        let elapsed_f: float = t_a.elapsed_ms.to_float() / 1000.0
+        lines.push("  samples:           " + t_a.timeline.len().to_str()
+        + " over " + fmt_fixed(elapsed_f, 2) + " s")
+        let hw: Option[int] = trace_high_water(t_a)
+        if option_is_some(hw) {
+            lines.push("  high-water:        "
+            + fmt_pages(option_unwrap(hw), page_size))
+        }
+        if t_a.cycle_points.len() > 0 {
+            lines.push("  cycle markers:     "
+            + t_a.markers.len().to_str() + " (0.."
+            + t_a.markers.get(t_a.markers.len() - 1).to_str() + ")")
+            let mut warm_last: int = -1
+            let mut wi: int = 0
+            while wi < t_a.cycle_points.len() {
+                if t_a.cycle_points.get(wi).c < warmup {
+                    warm_last = t_a.cycle_points.get(wi).pages
+                }
+                wi = wi + 1
+            }
+            if warm_last >= 0 {
+                lines.push("  rss at warmup end: "
+                + fmt_pages(warm_last, page_size))
+            }
+            if t_a.cycle_points.len() > 0 {
+                lines.push("  rss at end:        "
+                + fmt_pages(t_a.cycle_points.get(
+                t_a.cycle_points.len() - 1).pages, page_size))
+            }
+        } else {
+            lines.push("  cycle markers:     none (time-based analysis)")
+            let first: Option[int] = trace_first_pages(t_a)
+            let last: Option[int] = trace_last_pages(t_a)
+            if option_is_some(first) {
+                lines.push("  rss at start:      "
+                + fmt_pages(option_unwrap(first), page_size))
+            }
+            if option_is_some(last) {
+                lines.push("  rss at end:        "
+                + fmt_pages(option_unwrap(last), page_size))
+            }
+        }
+    } else {
+        lines.push("  no samples (sampler produced no readings)")
+    }
+    # -- the slope verdict -------------------------------------------------
+    if slope.has_slope {
+        lines.push("  slope:             "
+        + fmt_slope(slope.slope, slope.unit) + " [95% CI "
+        + fmt_slope(slope.ci_lo, "") + " .. "
+        + fmt_slope(slope.ci_hi, "") + "]")
+        lines.push("  threshold:         "
+        + fmt_slope(slope.threshold, slope.unit))
+    }
+    let mut vline: str = "  verdict:           " + verdict_word(slope.verdict)
+    if slope.has_note {
+        vline = vline + " — " + slope.note
+    }
+    lines.push(vline)
+    lines.push("")
+    # -- the retained set --------------------------------------------------
+    lines.push("retained (two-run, malloc interposer)")
+    if !has_retained {
+        lines.push("  skipped — " + skip_reason)
+    } else {
+        lines.push("  run A: " + (warmup + c.cycles).to_str()
+        + " cycles -> live "
+        + py_int_or_none(retained.has_live_full, retained.live_full)
+        + ", high-water "
+        + hw_repr(retained.has_hw_full, retained.hw_full, page_size))
+        lines.push("  run B: " + warmup.to_str()
+        + " cycles  -> live "
+        + py_int_or_none(retained.has_live_warm, retained.live_warm)
+        + ", high-water "
+        + hw_repr(retained.has_hw_warm, retained.hw_warm, page_size))
+        if retained.has_live_delta {
+            lines.push("  live delta:        "
+            + retained.live_delta.to_str() + " objects (slack "
+            + c.live_slack.to_str() + ")")
+            let mut ff_a: int = 0
+            if t_a.interposer.ok {
+                ff_a = t_a.interposer.n_foreign_free
+            }
+            let mut ff_b: int = 0
+            if has_b && t_b.interposer.ok {
+                ff_b = t_b.interposer.n_foreign_free
+            }
+            if ff_a > 0 || ff_b > 0 {
+                lines.push("  foreign frees:    " + ff_a.to_str() + " + "
+                + ff_b.to_str()
+                + " (libc buffers handed back to free — not balance "
+                + "events)")
+            }
+        }
+        if retained.has_hw_delta {
+            lines.push("  high-water delta:  "
+            + fmt_signed(retained.hw_delta) + " pages (slack "
+            + c.rss_slack.to_str() + ")")
+        }
+        let mut rline: str = "  verdict:           "
+        + verdict_word(retained.verdict)
+        if retained.has_note {
+            rline = rline + " — " + retained.note
+        }
+        lines.push(rline)
+    }
+    lines.push("")
+    if verdict == verdict_stable() {
+        lines.push("RSS STABLE — the runtime is leak-free under this "
+        + "workload.")
+    } else if verdict == verdict_leak() {
+        lines.push("RSS LEAK — resident memory grows with the work "
+        + "performed.")
+    } else {
+        lines.push("RSS INCONCLUSIVE — the instruments could not certify "
+        + "this run; their notes above say why.")
+    }
+    return join(lines, "\n")
+}
+
+fn py_int_or_none(has: bool, v: int) -> str {
+    if has {
+        return v.to_str()
+    }
+    return "None"
+}
+
+fn hw_repr(has: bool, v: int, page_size: int) -> str {
+    if has {
+        return fmt_pages(v, page_size)
+    }
+    return "no readings"
+}
+
+# ============================================================================
+# The --json payload - hand-rendered to the .py's exact bytes: sorted
+# keys everywhere, compact separators, Python float reprs, null for
+# the absent, \uXXXX for non-ASCII (json.dumps ensure_ascii=True).
+# ============================================================================
+
+fn jstr(s: str) -> str {
+    return "\"" + json_escape(s) + "\""
+}
+
+fn jnum_f(x: float) -> str {
+    return py_float_repr(x)
+}
+
+fn jopt_f(has: bool, v: float) -> str {
+    if has {
+        return py_float_repr(v)
+    }
+    return "null"
+}
+
+fn jopt_i(has: bool, v: int) -> str {
+    if has {
+        return v.to_str()
+    }
+    return "null"
+}
+
+fn jopt_s(has: bool, v: str) -> str {
+    if has {
+        return jstr(v)
+    }
+    return "null"
+}
+
+# round3_str(x) - Python's round(x, 3) then repr: the runner already
+# emitted %.3f digits, so parse-and-shorten reproduces it exactly.
+fn round3_str(x: float) -> str {
+    return py_float_repr(x)
+}
+
+fn json_timeline(t: Trace) -> str {
+    let parts: list[str] = []
+    let mut i: int = 0
+    while i < t.timeline.len() {
+        parts.push("[" + jnum_f(t.timeline.get(i).tf) + ","
+        + t.timeline.get(i).pages.to_str() + "]")
+        i = i + 1
+    }
+    return "[" + join(parts, ",") + "]"
+}
+
+fn json_cycle_points(t: Trace) -> str {
+    let parts: list[str] = []
+    let mut i: int = 0
+    while i < t.cycle_points.len() {
+        parts.push("[" + t.cycle_points.get(i).c.to_str() + ","
+        + jnum_f(t.cycle_points.get(i).tf) + ","
+        + t.cycle_points.get(i).pages.to_str() + "]")
+        i = i + 1
+    }
+    return "[" + join(parts, ",") + "]"
+}
+
+fn json_interposer(ipo: Ipo) -> str {
+    if !ipo.ok {
+        return "null"
+    }
+    return "{\"CALLOC\":" + ipo.n_calloc.to_str()
+    + ",\"FOREIGN_FREE\":" + ipo.n_foreign_free.to_str()
+    + ",\"FREE\":" + ipo.n_free.to_str()
+    + ",\"LIVE\":" + ipo.n_live.to_str()
+    + ",\"MALLOC\":" + ipo.n_malloc.to_str()
+    + ",\"OVERFLOW\":" + ipo.n_overflow.to_str()
+    + ",\"REALLOC\":" + ipo.n_realloc.to_str()
+    + ",\"REALLOC_NULL\":" + ipo.n_realloc_null.to_str()
+    + ",\"REALLOC_ZERO\":" + ipo.n_realloc_zero.to_str() + "}"
+}
+
+fn json_slope(s: SlopeOut) -> str {
+    let mut ci: str = "null"
+    if s.has_ci {
+        ci = "[" + jnum_f(s.ci_lo) + "," + jnum_f(s.ci_hi) + "]"
+    }
+    let mut pairs_part: str = ""
+    if s.has_fit {
+        pairs_part = ",\"pairs\":" + s.pairs.to_str()
+        + ",\"points\":" + s.points.to_str()
+    }
+    return "{\"ci\":" + ci
+    + ",\"instrument\":\"timeline\""
+    + ",\"mode\":" + jopt_s(s.mode != "", s.mode)
+    + ",\"note\":" + jopt_s(s.has_note, s.note)
+    + pairs_part
+    + ",\"slope\":" + jopt_f(s.has_slope, s.slope)
+    + ",\"threshold\":" + jopt_f(s.has_threshold, s.threshold)
+    + ",\"unit\":" + jopt_s(s.unit != "", s.unit)
+    + ",\"verdict\":" + jstr(s.verdict) + "}"
+}
+
+fn json_retained(r: RetOut) -> str {
+    return "{\"hw_delta\":" + jopt_i(r.has_hw_delta, r.hw_delta)
+    + ",\"hw_full\":" + jopt_i(r.has_hw_full, r.hw_full)
+    + ",\"hw_warm\":" + jopt_i(r.has_hw_warm, r.hw_warm)
+    + ",\"live_delta\":" + jopt_i(r.has_live_delta, r.live_delta)
+    + ",\"live_full\":" + jopt_i(r.has_live_full, r.live_full)
+    + ",\"live_warm\":" + jopt_i(r.has_live_warm, r.live_warm)
+    + ",\"note\":" + jopt_s(r.has_note, r.note)
+    + ",\"verdict\":" + jstr(r.verdict) + "}"
+}
+
+fn build_json(workload: str, c: Cli, warmup: int, skip_reason: str,
+has_skip: bool, t_a: Trace, t_b: Trace, has_b: bool, slope: SlopeOut,
+retained: RetOut, has_retained: bool, verdict: str) -> str {
+    let p: list[str] = []
+    # config
+    p.push("\"config\":{\"bootstrap\":" + c.bootstrap.to_str()
+    + ",\"cycles\":" + c.cycles.to_str()
+    + ",\"interval\":" + jnum_f(c.interval)
+    + ",\"live_slack\":" + c.live_slack.to_str()
+    + ",\"rss_slack\":" + c.rss_slack.to_str()
+    + ",\"threshold\":" + jnum_f(c.threshold)
+    + ",\"threshold_time\":" + jnum_f(c.threshold_time)
+    + ",\"timeout\":" + jnum_f(c.timeout)
+    + ",\"warmup\":" + warmup.to_str() + "}")
+    # plan
+    let mut plan_part: str = ""
+    if has_skip {
+        plan_part = ",\"retained_skip_reason\":" + jstr(skip_reason)
+    }
+    p.push("\"plan\":{\"cycles\":" + c.cycles.to_str() + plan_part
+    + ",\"warmup\":" + warmup.to_str() + "}")
+    # retained
+    let mut retained_part: str = "null"
+    if has_retained {
+        retained_part = json_retained(retained)
+    }
+    p.push("\"retained\":" + retained_part)
+    # run_a
+    p.push("\"run_a\":{\"cycle_points\":" + json_cycle_points(t_a)
+    + ",\"elapsed_s\":" + round3_str(t_a.elapsed_ms.to_float()
+    / 1000.0)
+    + ",\"interposer\":" + json_interposer(t_a.interposer)
+    + ",\"observed_markers\":" + t_a.markers.len().to_str()
+    + ",\"rc\":" + t_a.rc.to_str()
+    + ",\"requested_cycles\":" + (warmup + c.cycles).to_str()
+    + ",\"timeline\":" + json_timeline(t_a) + "}")
+    # run_b
+    if has_b {
+        let hw: Option[int] = trace_high_water(t_b)
+        p.push("\"run_b\":{\"elapsed_s\":" + round3_str(
+        t_b.elapsed_ms.to_float() / 1000.0)
+        + ",\"high_water_pages\":" + jopt_i(option_is_some(hw),
+        option_unwrap_or(hw, 0))
+        + ",\"interposer\":" + json_interposer(t_b.interposer)
+        + ",\"observed_markers\":" + t_b.markers.len().to_str()
+        + ",\"rc\":" + t_b.rc.to_str()
+        + ",\"requested_cycles\":" + warmup.to_str() + "}")
+    }
+    # slope
+    p.push("\"slope\":" + json_slope(slope))
+    # tool, verdict, version, workload
+    p.push("\"tool\":\"hls-rss\"")
+    p.push("\"verdict\":" + jstr(verdict))
+    p.push("\"version\":\"" + tool_version() + "\"")
+    p.push("\"workload\":" + jstr(path_basename(workload)))
+    return "{" + join(p, ",") + "}"
+}
+
+# ============================================================================
+# The driver - the .py's verify(): probe, compile, run A, analyse, run
+# B when cooperative, compose, render. Failures funnel through Outcome
+# (kind 1 = the .py's VerifyError, kind 2 = UsageError) so the scratch
+# directory is cleaned on every path (the .py's TemporaryDirectory
+# context manager).
+# ============================================================================
+
+struct Outcome {
+    fail_kind: int,
+    fail_msg: str,
+    report: str,
+    blob: str,
+    verdict: str
+}
+
+fn outcome_ok(report: str, blob: str, verdict: str) -> Outcome {
+    return Outcome {
+        fail_kind: 0, fail_msg: "", report: report, blob: blob,
+        verdict: verdict
+    }
+}
+
+fn outcome_fail(kind: int, msg: str) -> Outcome {
+    return Outcome {
+        fail_kind: kind, fail_msg: msg, report: "", blob: "",
+        verdict: ""
+    }
+}
+
+fn last_stderr_line(tail: str) -> str {
+    let t: str = strip_ws(tail)
+    if t.len() == 0 {
+        return ""
+    }
+    let lines: list[str] = t.split("\n")
+    return lines.get(lines.len() - 1)
+}
+
+fn markers_are_request_range(t: Trace, requested: int) -> bool {
+    if t.markers.len() != requested {
+        return false
+    }
+    let mut i: int = 0
+    while i < requested {
+        if t.markers.get(i) != i {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn argv_of(cycles_str: str, prog_args: list[str]) -> list[str] {
+    let argv: list[str] = [cycles_str]
+    let mut i: int = 0
+    while i < prog_args.len() {
+        argv.push(prog_args.get(i))
+        i = i + 1
+    }
+    return argv
+}
+
+fn verify(workload: str, c: Cli, repo: str) -> Outcome
+uses Fs, Proc, Clock {
+    if !file_exists(workload) {
+        return outcome_fail(2, "no such workload: " + workload)
+    }
+    if !file_exists("/proc/self/statm") {
+        return outcome_fail(2, "this platform has no /proc/<pid>/statm "
+        + "sampler — hls-rss cannot measure RSS here (refusing "
+        + "instead of certifying nothing)")
+    }
+    let mut tmpbase: str = "/tmp"
+    if env_has("TMPDIR") {
+        let tv: str = env_get("TMPDIR")
+        if tv != "" {
+            tmpbase = tv
+        }
+    }
+    let stamp: str = proc_pid().to_str() + "-" + clock_ms().to_str()
+    let probe_dir: str = path_join2(tmpbase, "hlrss-probe-" + stamp)
+    let run_dir: str = path_join2(tmpbase, "hlrss-" + stamp)
+    let wrap_c: str = path_join3(repo, "tools/rss_parts", "malloc_balance_wrap.c")
+    let warmup: int = cfg_warmup_effective(c)
+
+    # -- the interposer capability probe (once per invocation) -----------
+    let mut wrap_ok: bool = false
+    if c.malloc_count != 2 {
+        mkdirs(probe_dir)
+        let pw: Option[str] = probe_wrap(c.cc, wrap_c, probe_dir)
+        rmrf(probe_dir)
+        if option_is_none(pw) && c.malloc_count == 1 {
+            return outcome_fail(2, "--malloc-count forced but " + c.cc
+            + " cannot link -Wl,--wrap (GNU ld only)")
+        }
+        if option_is_some(pw) {
+            wrap_ok = true
+        }
+    }
+
+    mkdirs(run_dir)
+    let runner_r: Result[str, str] = build_runner(c.cc, run_dir)
+    if result_is_err(runner_r) {
+        rmrf(run_dir)
+        return outcome_fail(2, result_err_or(runner_r, ""))
+    }
+    let runner: str = result_unwrap(runner_r)
+
+    let mut wrap_obj: str = ""
+    if wrap_ok {
+        let bld: Result[str, str] = build_interposer(c.cc, wrap_c, run_dir)
+        if result_is_err(bld) {
+            rmrf(run_dir)
+            return outcome_fail(2, result_err_or(bld, ""))
+        }
+        wrap_obj = result_unwrap(bld)
+    }
+
+    let comp: Result[str, str] = compile_workload(workload, c, run_dir,
+    wrap_obj, repo)
+    if result_is_err(comp) {
+        rmrf(run_dir)
+        return outcome_fail(2, result_err_or(comp, ""))
+    }
+    let bin_path: str = result_unwrap(comp)
+
+    # -- run A: the full plan ---------------------------------------------
+    let argv_a: list[str] = argv_of((warmup + c.cycles).to_str(),
+    c.prog_args)
+    let run_a: RunOut = run_workload(runner, bin_path, argv_a,
+    c.interval_str, c.timeout_str)
+    if run_a.fail_kind != 0 {
+        rmrf(run_dir)
+        return outcome_fail(run_a.fail_kind, run_a.fail_msg)
+    }
+    let t_a: Trace = run_a.t
+    if t_a.has_protocol_error {
+        rmrf(run_dir)
+        return outcome_fail(1, t_a.protocol_error)
+    }
+    if t_a.rc != 0 {
+        let tail: str = strip_ws(t_a.stderr_tail)
+        let mut msg: str = "the workload exited " + t_a.rc.to_str()
+        if tail.len() > 0 {
+            msg = msg + ": " + last_stderr_line(t_a.stderr_tail)
+        }
+        rmrf(run_dir)
+        return outcome_fail(1, msg)
+    }
+
+    let requested: int = warmup + c.cycles
+    let observed: int = t_a.markers.len()
+    let cooperative: bool = markers_are_request_range(t_a, requested)
+
+    let mut skip_reason: str = ""
+    let mut has_skip: bool = false
+    let mut t_b: Trace = trace_new()
+    let mut has_b: bool = false
+    let mut retained: RetOut = ret_new()
+    let mut has_retained: bool = false
+
+    if !cooperative {
+        has_skip = true
+        skip_reason = "the workload printed " + observed.to_str()
+        + " markers, the plan asked for " + requested.to_str()
+        + " — it does not follow the argv[1] cycle convention, so "
+        + "the two-run comparison cannot isolate warmup from work"
+    } else if !wrap_ok {
+        has_skip = true
+        skip_reason = c.cc + " cannot link -Wl,--wrap — the balance "
+        + "instrument is unavailable (the timeline instrument stands "
+        + "alone)"
+    } else {
+        let argv_b: list[str] = argv_of(warmup.to_str(), c.prog_args)
+        let run_b: RunOut = run_workload(runner, bin_path, argv_b,
+        c.interval_str, c.timeout_str)
+        if run_b.fail_kind != 0 {
+            rmrf(run_dir)
+            return outcome_fail(run_b.fail_kind, run_b.fail_msg)
+        }
+        t_b = run_b.t
+        if t_b.has_protocol_error || t_b.rc != 0
+        || t_b.markers.len() != warmup || !t_b.interposer.ok {
+            has_skip = true
+            skip_reason = "run B (warmup-only) did not complete cleanly "
+            + "— the comparison is off"
+            has_b = false
+        } else {
+            has_b = true
+            retained = ret_analyse(t_a, t_b, c)
+            has_retained = true
+        }
+    }
+
+    # -- the timeline instrument ------------------------------------------
+    let seed_name: str = path_stem(path_basename(workload))
+    let slope_r: Result[SlopeOut, str] = slope_analyse(t_a, warmup, c,
+    seed_name)
+    if result_is_err(slope_r) {
+        rmrf(run_dir)
+        return outcome_fail(1, result_err_or(slope_r, ""))
+    }
+    let slope: SlopeOut = result_unwrap(slope_r)
+
+    let verdict: str = verdict_compose(slope, retained, has_retained)
+    let mut page_size: int = t_a.page_size
+    if page_size <= 0 {
+        page_size = 4096
+    }
+    let report: str = render_report(workload, c, warmup, skip_reason,
+    has_skip, t_a, t_b, has_b, slope, retained, has_retained, verdict,
+    page_size)
+    let blob: str = build_json(workload, c, warmup, skip_reason, has_skip,
+    t_a, t_b, has_b, slope, retained, has_retained, verdict)
+    rmrf(run_dir)
+    return outcome_ok(report, blob, verdict)
+}
+
+# ============================================================================
+# main - the .py's main(): parse, validate, verify, print, --json.
+# ============================================================================
+
+fn main() -> int uses IO, Fs, Proc, Clock, Args, Exit {
+    let argv: list[str] = args()
+    if argv.len() < 1 {
+        eprintln("hls-rss: error: the following arguments are required: "
+        + "workload")
+        return 2
+    }
+    # -h / --help (argparse's default behaviour).
+    let mut hi: int = 1
+    while hi < argv.len() {
+        if argv.get(hi) == "-h" || argv.get(hi) == "--help" {
+            println(help_text())
+            return 0
+        }
+        hi = hi + 1
+    }
+    let repo: str = repo_root(argv.get(0))
+    let mut default_cc: str = "gcc"
+    if env_has("CC") {
+        let ccv: str = env_get("CC")
+        if ccv != "" {
+            default_cc = ccv
+        }
+    }
+    let default_hlc: str = path_join2(repo, "bin/hlc")
+    let cli_r: Result[Cli, str] = parse_cli(argv, default_hlc, default_cc)
+    if result_is_err(cli_r) {
+        eprintln(result_err_or(cli_r, ""))
+        return 2
+    }
+    let c: Cli = result_unwrap(cli_r)
+    if !c.workload.ends_with(".hls") {
+        eprintln("hls-rss: the workload must be a .hls program")
+        return 2
+    }
+    if c.cycles < 3 {
+        eprintln("hls-rss: --cycles must be at least 3 (a slope needs "
+        + "points)")
+        return 2
+    }
+    if c.warmup >= 0 && c.warmup < 1 {
+        eprintln("hls-rss: --warmup must be at least 1")
+        return 2
+    }
+    if c.interval < 1.0 {
+        eprintln("hls-rss: --interval must be >= 1 ms")
+        return 2
+    }
+    if c.bootstrap < 100 {
+        eprintln("hls-rss: --bootstrap must be >= 100")
+        return 2
+    }
+    let outc: Outcome = verify(c.workload, c, repo)
+    if outc.fail_kind == 2 {
+        eprintln("hls-rss: " + outc.fail_msg)
+        return 2
+    }
+    if outc.fail_kind == 1 {
+        eprintln("hls-rss: " + outc.fail_msg)
+        return 1
+    }
+    println(outc.report)
+    if c.json_path != "" {
+        # The .py catches an OSError from open() with exit 2; Halis'
+        # write_file panics, so the common failure (a missing
+        # directory) is checked by hand.
+        let dir: str = path_dirname(c.json_path)
+        if dir != "" && dir != "." && !fs_is_dir(dir) {
+            eprintln("hls-rss: cannot write " + c.json_path
+            + ": [Errno 2] No such file or directory: '"
+            + c.json_path + "'")
+            return 2
+        }
+        write_file(c.json_path, outc.blob + "\n")
+    }
+    if outc.verdict == verdict_stable() {
+        return 0
+    }
+    return 1
+}

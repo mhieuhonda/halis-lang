@@ -199,6 +199,16 @@ $(BIN)/hls-repro: tools/hls-repro.hls $(wildcard std/*.hls) $(wildcard core/*.hl
 	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
 	@rm -f $@.c
 
+# hls-rss — the RSS-stability verifier, in Halis (the native twin of
+# the Python hls-rss that retired; the module-driver legs of the gate
+# import a stripped copy of this file, fn main cut).
+$(BIN)/hls-rss: tools/hls-rss.hls $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hls-rss] hlc compiles the RSS verifier (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hls-rss.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
 rc-readiness: $(BIN)/hls-rc
 	@$(BIN)/hls-rc readiness
 
@@ -680,7 +690,7 @@ bench-acceptance: $(BIN)/acc-bench bin/hlc
 # canary LEAK with both instruments firing, the match-in-concat
 # hoisting-cycle regression), and the corpus hygiene. The gate
 # compiles on bin/hlc and gcc, so the native build is a prerequisite.
-rss-acceptance: $(BIN)/acc-rss bin/hlc
+rss-acceptance: $(BIN)/acc-rss $(BIN)/hls-rss bin/hlc
 	@echo "[Stage 125 acceptance] running tests/acc/rss_acceptance.hls..."
 	@$(BIN)/acc-rss
 	@echo "ACCEPTANCE OK: Stage 125 -- GC-free runtime verification (RSS stability)"
