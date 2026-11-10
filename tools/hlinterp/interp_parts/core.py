@@ -203,8 +203,8 @@ class InterpCore(object):
                 raise ValueError(
                     "zip(): iterators have different lengths "
                     "(strict mode requires equal lengths)")
-            for i, pn in enumerate(param_names):
-                env0[pn] = [call_args[i], False, False]
+            for pn, cv in zip(param_names, call_args):
+                env0[pn] = [cv, False, False]
             # Stage 98: refinement guards on refined parameters — the
             # callee-side boundary of the type invariant. Evaluated
             # unconditionally (refinements are always-on semantics,
@@ -226,6 +226,30 @@ class InterpCore(object):
                     raise HLPanic("contract violation: requires of '%s' "
                                   "(function precondition failed at runtime)"
                                   % self.fns[key]["name"], tls.line)
+            # Single-statement `return` bodies — the getter/helper shape
+            # that dominates the compiler's own call mix — evaluate
+            # without entering exec_stmts and without raising/catching
+            # ReturnSig: the value flows straight back to the caller.
+            # Every side condition the general path enforces is either
+            # checked before (requires, param_preds) or excludes this
+            # fast path (ensures / ret_pred need the return value
+            # wrapped, so they take the general path). The line slot is
+            # written exactly as exec_stmt's return arm would, so a
+            # panic inside the value reports the same line; the
+            # #[tail_call] trampoline keeps its rebinding loop.
+            if len(body) == 1 and ensures is None and ret_pred is None:
+                s0 = body[0]
+                if s0["k"] == "return":
+                    v = s0["value"]
+                    if v is None:
+                        return None
+                    tls.line = s0["line"]
+                    rc = v.get("rc")
+                    if (rc is not None and rc[0] == "user" and rc[1] == key
+                            and key in self._tail_fns):
+                        args = [self.eval_expr(a, env) for a in v.get("args", [])]
+                        continue
+                    return self.eval_expr(v, env)
             try:
                 fn_stack.append(key)
                 self.exec_stmts(body, env)
