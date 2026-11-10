@@ -8060,7 +8060,7 @@ closes over its budget dies in-process through the Stage 81 panic path
 with the canonical message, before the overrun can become a latency
 tail. Like Stage 82 it lands as three agreeing halves: a pure-HLS
 model library (`core/rt.hls`), a runtime wiring in the hosted C
-backend, and a verifier (`tools/hls-rt.py` + the ledger instrument
+backend, and a verifier (`tools/hls-rt.hls`, compiled to bin/hls-rt, + the ledger instrument
 `tools/rt_parts/hlrt_budget_wrap.c`) that certifies — or refuses to
 certify — a whole run.
 
@@ -8179,7 +8179,7 @@ overflows panics instead of wrapping.
 
 ### 66.4. The verifier — `hls-rt`
 
-`python3 tools/hls-rt.py [--budget-allocs N] [--budget-bytes B]
+`bin/hls-rt [--budget-allocs N] [--budget-bytes B]
 [--budget-ms MS] [--warmup K] [--min-cycles N] [--no-enforce]
 [--json PATH] workload.hls [args...]` compiles the workload natively
 (bin/hlc + gcc -O2, the exact recipe every gate uses) with the

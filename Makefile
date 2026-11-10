@@ -179,6 +179,16 @@ $(BIN)/hls-sbom: tools/hls-sbom.hls $(wildcard std/*.hls) $(wildcard core/*.hls)
 	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
 	@rm -f $@.c
 
+# hls-rt — the soft-real-time verifier, in Halis (the native twin of
+# the Python hls-rt that retired; the module-driver legs of the gate
+# import a stripped copy of this file, fn main cut).
+$(BIN)/hls-rt: tools/hls-rt.hls $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hls-rt] hlc compiles the soft-RT verifier (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hls-rt.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
 rc-readiness: $(BIN)/hls-rc
 	@$(BIN)/hls-rc readiness
 
@@ -682,7 +692,7 @@ rss-acceptance: $(BIN)/acc-rss bin/hlc
 # look-alikes), the report and the statistics against hand-computed
 # values, and the differential + corpus hygiene. The gate compiles on
 # bin/hlc and gcc, so the native build is a prerequisite.
-rt-acceptance: $(BIN)/acc-rt bin/hlc
+rt-acceptance: $(BIN)/acc-rt $(BIN)/hls-rt bin/hlc
 	@echo "[Stage 126 acceptance] running tests/acc/rt_acceptance.hls..."
 	@$(BIN)/acc-rt
 	@echo "ACCEPTANCE OK: Stage 126 -- soft-real-time mode (bounded allocation per cycle)"

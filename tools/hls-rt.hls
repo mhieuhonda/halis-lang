@@ -1,0 +1,2919 @@
+# ============================================================================
+# tools/hls-rt.hls — the Stage 126 soft-real-time verifier, in Halis
+# (bounded allocation per cycle).
+# ----------------------------------------------------------------------------
+# The twin of tools/hls-rt.py (the Python years), driven through the same
+# CLI the certification gates drive; the acceptance gate
+# (tests/acc/rt_acceptance.hls) spawns this binary unchanged.
+#
+# Usage:
+#   bin/hls-rt workload.hls
+#   bin/hls-rt --budget-allocs 2000 --budget-bytes 65536 w.hls
+#   bin/hls-rt --budget-ms 50 --warmup 2 w.hls
+#   bin/hls-rt --no-enforce w.hls
+#   bin/hls-rt --json r.json w.hls data.txt
+#
+# The contract (the .py's docstring, unchanged): the workload is an
+# ordinary Halis program; a CYCLE MARKER is a line it prints once per
+# steady-state cycle, `__HLRT_CYCLE__ <i>`, strictly increasing from 0.
+# The three axes (--budget-allocs N, --budget-bytes B, --budget-ms MS; a
+# left-out axis is unchecked) are enforced two ways:
+#
+#   enforcement (in-process)  — the budgets reach the program as
+#     HLRT_BUDGET_* environment variables; the runtime rolls the
+#     instrument at every mark and kills the process at the first
+#     over-budget cycle (warmup cycles excluded). A violation is the
+#     program's own death: exit 101, the canonical message on stderr.
+#
+#   the ledger (out-of-process) — the interposer
+#     (tools/rt_parts/hlrt_budget_wrap.c, linked with GNU ld's --wrap)
+#     records every closed cycle's (allocs, bytes, live, frees, nanos)
+#     and reports the whole ledger at exit; this tool re-derives the
+#     totals from the per-cycle lines before trusting any of it, then
+#     verdicts from the ledger INDEPENDENTLY (--no-enforce judges after
+#     the fact instead of during).
+#
+# The statistics are the planner's numbers (per-axis max/median/p95 over
+# the measured window, the cycle-time jitter peak-to-peak) — integer-
+# exact, the same shapes core/rt.hls computes (rt_window_*).
+#
+# Native only, on purpose: the budgeted runtime is the runtime the
+# compiler EMITS (bin/hlc -> C -> cc -O2 + the wrap object; hlc runs
+# with cwd = the repo root so `import "std.**"` resolves where every
+# other gate resolves it). The instrument needs GNU ld's --wrap (probed
+# per invocation; unsupported -> exit 2 rather than measure nothing
+# honestly).
+#
+# Exit codes:
+#   0  certified RT BOUNDED (both legs)
+#   1  not certified: REFUSED (a violation — in-process or on the
+#      ledger), INCONCLUSIVE (too few cycles, uncovered work, protocol
+#      error, ledger inconsistency), or a program failure (non-zero
+#      exit, timeout)
+#   2  usage / environment: missing file, bad option values, no cc on
+#      PATH, no GNU --wrap
+# ============================================================================
+
+import "std.str"
+
+# ============================================================================
+# Constants.
+# ============================================================================
+
+fn tool_version() -> str {
+    return "0.144.0-alpha"
+}
+
+# The reserved protocol prefixes (the Stage 119/124/125 discipline: a
+# record line must parse exactly; a stray stem is a loud error).
+fn proto_cycle() -> str {
+    return "__HLRT_CYCLE__ "
+}
+
+fn proto_stem() -> str {
+    return "__HLRT_"
+}
+
+fn report_begin() -> str {
+    return "HLRT_REPORT_BEGIN"
+}
+
+fn report_end() -> str {
+    return "HLRT_REPORT_END"
+}
+
+fn wrap_c_rel() -> str {
+    return "tools/rt_parts/hlrt_budget_wrap.c"
+}
+
+# Verdict words (the report's and the exit code's vocabulary).
+fn verdict_bounded() -> str {
+    return "bounded"
+}
+
+fn verdict_refused() -> str {
+    return "refused"
+}
+
+fn verdict_inconclusive() -> str {
+    return "inconclusive"
+}
+
+fn verdict_word(v: str) -> str {
+    if v == verdict_bounded() {
+        return "RT BOUNDED"
+    }
+    if v == verdict_refused() {
+        return "RT REFUSED"
+    }
+    return "RT INCONCLUSIVE"
+}
+
+# ============================================================================
+# Text helpers (the Python bytes idioms the .py leans on).
+# ============================================================================
+
+# shell_quote(s) — neutralise single quotes for the child one-liners
+# (the harness.hls law; every path this tool passes is its own or the
+# user's, and the quoting makes an odd path unable to rewrite the
+# command around it).
+fn shell_quote(s: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < s.len() {
+        if s.byte_at(i) == 39 {
+            out = out + "'\\''"
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# q(s) — the quoted shell word for a path/argument.
+fn q(s: str) -> str {
+    return "'" + shell_quote(s) + "'"
+}
+
+# is_py_ws(c) — the bytes str.strip() set: space, \t, \n, \r, \v, \f.
+fn is_py_ws(c: int) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12
+}
+
+# strip_py(s) — Python's bytes.strip() on both ends.
+fn strip_py(s: str) -> str {
+    let mut a: int = 0
+    let n: int = s.len()
+    while a < n && is_py_ws(s.byte_at(a)) {
+        a = a + 1
+    }
+    let mut b: int = n
+    while b > a && is_py_ws(s.byte_at(b - 1)) {
+        b = b - 1
+    }
+    return s.slice(a, b)
+}
+
+# rstrip_cr(s) — the reader's line.rstrip(b"\r").
+fn rstrip_cr(s: str) -> str {
+    let mut b: int = s.len()
+    while b > 0 && s.byte_at(b - 1) == 13 {
+        b = b - 1
+    }
+    return s.slice(0, b)
+}
+
+# split_lines_py(s) — bytes.splitlines(): boundaries at \n, \r and
+# \r\n (the \r\n pair is ONE boundary), no trailing empty piece.
+fn split_lines_py(s: str) -> list[str] {
+    let out: list[str] = []
+    let n: int = s.len()
+    let mut i: int = 0
+    let mut start: int = 0
+    while i < n {
+        let c: int = s.byte_at(i)
+        if c == 10 {
+            out.push(s.slice(start, i))
+            i = i + 1
+            start = i
+        } else if c == 13 {
+            out.push(s.slice(start, i))
+            i = i + 1
+            if i < n && s.byte_at(i) == 10 {
+                i = i + 1
+            }
+            start = i
+        } else {
+            i = i + 1
+        }
+    }
+    if start < n {
+        out.push(s.slice(start, n))
+    }
+    return out
+}
+
+# split_first(s, sep) — bytes.partition(b"X"): [before, after]; the
+# separator absent -> [s, ""].
+fn split_first(s: str, sep: int) -> list[str] {
+    let mut i: int = 0
+    while i < s.len() {
+        if s.byte_at(i) == sep {
+            return[s.slice(0, i), s.slice(i + 1, s.len())]
+        }
+        i = i + 1
+    }
+    return[s, ""]
+}
+
+# safe_prefix(s, n) — Python's s[:n]: clamps at both ends.
+fn safe_prefix(s: str, n: int) -> str {
+    if n <= 0 {
+        return ""
+    }
+    if n >= s.len() {
+        return s
+    }
+    return s.slice(0, n)
+}
+
+# pad_left / pad_right / pad_zeros — the %Ns / %-Ns / %0Nd laws.
+fn pad_left(s: str, w: int) -> str {
+    let mut out: str = s
+    while out.len() < w {
+        out = " " + out
+    }
+    return out
+}
+
+fn pad_right(s: str, w: int) -> str {
+    let mut out: str = s
+    while out.len() < w {
+        out = out + " "
+    }
+    return out
+}
+
+fn pad_zeros(s: str, w: int) -> str {
+    let mut out: str = s
+    while out.len() < w {
+        out = "0" + out
+    }
+    return out
+}
+
+# ============================================================================
+# Exact fixed-point float rendering — %.kf with glibc's semantics (the
+# correctly rounded decimal of the double's exact binary value,
+# round-half-even), for the tool's whole numeric domain:
+# 0 <= v <= 4.5e15 with k <= 3 (every %f the report prints), computed
+# with integer arithmetic on the decomposed mantissa so not one digit
+# can drift from the C library the .py leaned on.
+# ============================================================================
+
+fn fmt_zeros(k: int) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < k {
+        out = out + "0"
+        i = i + 1
+    }
+    return out
+}
+
+# decompose(v) — v = mant * 2^e2 exactly, with mant in [2^52, 2^53)
+# (the normalized IEEE mantissa scaled to an integer). Returns
+# [mant, e2]; every step (halving/doubling, the Sterbenz subtraction,
+# the 52 fraction extractions) is exact in doubles.
+fn decompose(v: float) -> list[int] {
+    let mut x: float = v
+    let mut e: int = 0
+    while x >= 2.0 {
+        x = x / 2.0
+        e = e + 1
+    }
+    while x < 1.0 {
+        x = x * 2.0
+        e = e - 1
+    }
+    let mut m: int = 0
+    let mut f: float = x - 1.0
+    let mut i: int = 0
+    while i < 52 {
+        m = m * 2
+        f = f * 2.0
+        if f >= 1.0 {
+            m = m + 1
+            f = f - 1.0
+        }
+        i = i + 1
+    }
+    return[4503599627370496 + m, e - 52]
+}
+
+# fmt_fix(v, k) — "%.kf" % v, exact (round-half-even on the double's
+# exact binary value, the glibc/CPython law). Non-finite v renders the
+# way Python's % formatting renders it ("inf", "-inf", "nan").
+fn fmt_fix(v: float, k: int) -> str {
+    if v != v {
+        return "nan"
+    }
+    let z: float = v * 0.0
+    if z != 0.0 {
+        if v < 0.0 {
+            return "-inf"
+        }
+        return "inf"
+    }
+    if v == 0.0 {
+        return "0." + fmt_zeros(k)
+    }
+    if v < 0.0 {
+        return "-" + fmt_fix(0.0 - v, k)
+    }
+    let mut w: float = v
+    if w > 4500000000000000.0 {
+        w = 4500000000000000.0
+    }
+    let dv: list[int] = decompose(w)
+    let mant: int = dv.get(0)
+    let e2: int = dv.get(1)
+    let mut pow: int = 1
+    let mut ki: int = 0
+    while ki < k {
+        pow = pow * 10
+        ki = ki + 1
+    }
+    let mut scaled: int = 0
+    if e2 >= 0 {
+        # v >= 2^52 (past the clamp in practice; exact anyway)
+        let mut big: int = mant
+        let mut j: int = 0
+        while j < e2 {
+            big = big * 2
+            j = j + 1
+        }
+        scaled = big * pow
+    } else {
+        let num: int = mant * pow
+        let sh: int = 0 - e2
+        if sh >= 64 {
+            # num < 2^63 <= 2^(sh-1): the fraction rounds to zero
+            scaled = 0
+        } else if sh == 63 {
+            # the exact tie line is 2^62; num below it rounds to 0
+            if num > 4611686018427387904 {
+                scaled = 1
+            } else {
+                scaled = 0
+            }
+        } else {
+            let mut den: int = 1
+            let mut j2: int = 0
+            while j2 < sh {
+                den = den * 2
+                j2 = j2 + 1
+            }
+            let quot: int = num / den
+            let rem: int = num - quot * den
+            scaled = quot
+            let rem2: int = rem * 2
+            if rem2 > den {
+                scaled = quot + 1
+            } else if rem2 == den {
+                # the exact half: round to even
+                if quot % 2 == 1 {
+                    scaled = quot + 1
+                }
+            }
+        }
+    }
+    let ip: int = scaled / pow
+    let fp: int = scaled - ip * pow
+    if k == 0 {
+        return ip.to_str()
+    }
+    return ip.to_str() + "." + pad_zeros(fp.to_str(), k)
+}
+
+# py_float_repr(v) — Python's repr(float) for the JSON numbers: the
+# shortest decimal that parses back to the same double, always carrying
+# a fractional digit ("120.0", "0.5", "0.001"). The domain is the
+# tool's (|v| < 4.4e15, at most 3 fractional digits — the timeout the
+# user typed and the elapsed time rounded to milliseconds); outside it
+# the %.6f form stands in (a deviation for absurd --timeout values
+# only, never reachable through the gate).
+fn py_float_repr(v: float) -> str {
+    if v == 0.0 {
+        return "0.0"
+    }
+    if v < 0.0 {
+        return "-" + py_float_repr(0.0 - v)
+    }
+    if v >= 4400000000000000.0 {
+        return v.to_str()
+    }
+    let ti: int = v.to_int()
+    if ti.to_float() == v {
+        return ti.to_str() + ".0"
+    }
+    let mut p: int = 1
+    while p <= 3 {
+        let cand: str = fmt_fix(v, p)
+        if cand.to_float() == v {
+            return cand
+        }
+        p = p + 1
+    }
+    return fmt_fix(v, 3)
+}
+
+# ============================================================================
+# The Python repr of a decoded line — the protocol-error messages quote
+# the offending line the way %r does: UTF-8 decoded with U+FFFD
+# replacement (one per maximal invalid subpart, the CPython/WHATWG
+# rule), then quoted with the escaping repr() applies.
+# ============================================================================
+
+# utf8_decode_replace(s) — decode to codepoints; 0xFFFD for each
+# maximal invalid subpart.
+fn utf8_decode_replace(s: str) -> list[int] {
+    let out: list[int] = []
+    let n: int = s.len()
+    let mut i: int = 0
+    while i < n {
+        let b0: int = s.byte_at(i)
+        if b0 < 128 {
+            out.push(b0)
+            i = i + 1
+            continue
+        }
+        # the lead byte class: need = continuation count; [lo, hi] the
+        # second byte's legal window (overlongs, surrogates, > U+10FFFF
+        # are rejected exactly the way the decoder rejects them)
+        let mut need: int = 0
+        let mut lo: int = 0
+        let mut hi: int = 0
+        if b0 >= 194 && b0 <= 223 {
+            need = 1
+            lo = 128
+            hi = 191
+        } else if b0 == 224 {
+            need = 2
+            lo = 160
+            hi = 191
+        } else if b0 >= 225 && b0 <= 236 {
+            need = 2
+            lo = 128
+            hi = 191
+        } else if b0 == 237 {
+            need = 2
+            lo = 128
+            hi = 159
+        } else if b0 >= 238 && b0 <= 239 {
+            need = 2
+            lo = 128
+            hi = 191
+        } else if b0 == 240 {
+            need = 3
+            lo = 144
+            hi = 191
+        } else if b0 >= 241 && b0 <= 243 {
+            need = 3
+            lo = 128
+            hi = 191
+        } else if b0 == 244 {
+            need = 3
+            lo = 128
+            hi = 143
+        }
+        if need == 0 {
+            # an invalid lead byte: one replacement for it alone
+            out.push(65533)
+            i = i + 1
+            continue
+        }
+        # collect the continuation bytes of the maximal subpart
+        let mut ok: bool = true
+        let mut cp: int = 0
+        let mut took: int = 1
+        if i + 1 >= n {
+            ok = false
+        } else {
+            let b1: int = s.byte_at(i + 1)
+            if b1 < lo || b1 > hi {
+                ok = false
+            } else {
+                # the lead byte's own payload; b1 folds in as the first
+                # continuation (one *64 per continuation byte, exactly
+                # the decoder's arithmetic: (b0-192)*64 + b1 for 2-byte,
+                # ((b0-224)*64 + b1)*64 + b2 for 3-byte, and so on)
+                if b0 < 224 {
+                    cp = b0 - 192
+                } else if b0 < 240 {
+                    cp = b0 - 224
+                } else {
+                    cp = b0 - 240
+                }
+                cp = cp * 64 + (b1 - 128)
+                took = 2
+                let mut j: int = 2
+                while j <= need && ok {
+                    if i + j >= n {
+                        ok = false
+                    } else {
+                        let bj: int = s.byte_at(i + j)
+                        if bj < 128 || bj > 191 {
+                            ok = false
+                        } else {
+                            cp = cp * 64 + (bj - 128)
+                            took = j + 1
+                            j = j + 1
+                        }
+                    }
+                }
+            }
+        }
+        if ok {
+            out.push(cp)
+            i = i + need + 1
+        } else {
+            # the accepted prefix is the maximal invalid subpart: one
+            # replacement, resume at the offending byte
+            out.push(65533)
+            i = i + took
+        }
+    }
+    return out
+}
+
+# cp_is_printable(cp) — the repr() printability cut for non-ASCII
+# (printable stays raw UTF-8; the common non-printables — controls,
+# the space-like and format ranges — take \xNN/\uNNNN escapes).
+fn cp_is_printable(cp: int) -> bool {
+    if cp >= 128 && cp <= 160 {
+        return false
+    }
+    if cp == 173 {
+        return false
+    }
+    if cp >= 8192 && cp <= 8207 {
+        return false
+    }
+    if cp >= 8232 && cp <= 8239 {
+        return false
+    }
+    if cp >= 8287 && cp <= 8303 {
+        return false
+    }
+    if cp == 12288 || cp == 65279 {
+        return false
+    }
+    if cp >= 65529 && cp <= 65531 {
+        return false
+    }
+    return true
+}
+
+# utf8_encode_cp(cp) — the codepoint back to its UTF-8 bytes.
+fn utf8_encode_cp(cp: int) -> str {
+    if cp < 128 {
+        return chr(cp)
+    }
+    if cp < 2048 {
+        return chr(192 + cp / 64) + chr(128 + cp % 64)
+    }
+    if cp < 65536 {
+        return chr(224 + cp / 4096) + chr(128 + (cp / 64) % 64)
+        + chr(128 + cp % 64)
+    }
+    return chr(240 + cp / 262144) + chr(128 + (cp / 4096) % 64)
+    + chr(128 + (cp / 64) % 64) + chr(128 + cp % 64)
+}
+
+# hex_digits(v, width) — lowercase \uNNNN / \xNN escapes.
+fn hex_digits(v: int, width: int) -> str {
+    let table: str = "0123456789abcdef"
+    let mut out: str = ""
+    let mut i: int = width - 1
+    while i >= 0 {
+        let mut d: int = v
+        let mut k: int = 0
+        while k < i {
+            d = d / 16
+            k = k + 1
+        }
+        out = out + table.slice(d % 16, d % 16 + 1)
+        i = i - 1
+    }
+    return out
+}
+
+# py_repr_bytes(s) — repr(bytes.decode("utf-8", "replace")): quote
+# selection (' unless the text carries ' and no "), the printable body,
+# and the escape forms for the rest.
+fn py_repr_bytes(s: str) -> str {
+    let cps: list[int] = utf8_decode_replace(s)
+    let mut has_sq: bool = false
+    let mut has_dq: bool = false
+    let mut ci: int = 0
+    while ci < cps.len() {
+        if cps.get(ci) == 39 {
+            has_sq = true
+        }
+        if cps.get(ci) == 34 {
+            has_dq = true
+        }
+        ci = ci + 1
+    }
+    let mut body: str = ""
+    let mut i: int = 0
+    while i < cps.len() {
+        let cp: int = cps.get(i)
+        if cp == 39 {
+            if has_sq && !has_dq {
+                body = body + "\""
+            } else {
+                body = body + "\\'"
+            }
+        } else if cp == 34 {
+            if has_sq && !has_dq {
+                body = body + "\\\""
+            } else {
+                body = body + "\""
+            }
+        } else if cp == 92 {
+            body = body + "\\\\"
+        } else if cp == 10 {
+            body = body + "\\n"
+        } else if cp == 13 {
+            body = body + "\\r"
+        } else if cp == 9 {
+            body = body + "\\t"
+        } else if cp < 32 || cp == 127 {
+            body = body + "\\x" + hex_digits(cp, 2)
+        } else if cp < 128 {
+            body = body + chr(cp)
+        } else if cp_is_printable(cp) {
+            body = body + utf8_encode_cp(cp)
+        } else if cp < 256 {
+            body = body + "\\x" + hex_digits(cp, 2)
+        } else if cp < 65536 {
+            body = body + "\\u" + hex_digits(cp, 4)
+        } else {
+            body = body + "\\U" + hex_digits(cp, 8)
+        }
+        i = i + 1
+    }
+    let mut head: str = "'"
+    let mut tail: str = "'"
+    if has_sq && !has_dq {
+        head = "\""
+        tail = "\""
+    }
+    return head + body + tail
+}
+
+# ============================================================================
+# JSON rendering — json.dump(..., indent=2, ensure_ascii=True) bytes:
+# two-space nesting, the item separator folded to "," + newline, the
+# short control escapes, and \uXXXX for everything past ASCII.
+# ============================================================================
+
+fn json_escape(s: str) -> str {
+    let cps: list[int] = utf8_decode_replace(s)
+    let mut body: str = ""
+    let mut i: int = 0
+    while i < cps.len() {
+        let cp: int = cps.get(i)
+        if cp == 34 {
+            body = body + "\\\""
+        } else if cp == 92 {
+            body = body + "\\\\"
+        } else if cp == 10 {
+            body = body + "\\n"
+        } else if cp == 9 {
+            body = body + "\\t"
+        } else if cp == 13 {
+            body = body + "\\r"
+        } else if cp == 8 {
+            body = body + "\\b"
+        } else if cp == 12 {
+            body = body + "\\f"
+        } else if cp < 32 || cp == 127 {
+            body = body + "\\u" + hex_digits(cp, 4)
+        } else if cp < 128 {
+            body = body + chr(cp)
+        } else if cp < 65536 {
+            body = body + "\\u" + hex_digits(cp, 4)
+        } else {
+            # the surrogate pair an ASCII-safe dump owes an astral cp
+            let hi: int = 55296 + (cp - 65536) / 1024
+            let lo: int = 56320 + (cp - 65536) % 1024
+            body = body + "\\u" + hex_digits(hi, 4) + "\\u"
+            + hex_digits(lo, 4)
+        }
+        i = i + 1
+    }
+    return "\"" + body + "\""
+}
+
+# jindent(level) — the leading two-spaces-per-level of a nested line.
+fn jindent(level: int) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < level {
+        out = out + "  "
+        i = i + 1
+    }
+    return out
+}
+
+# jarray(items, level) — a JSON array over pre-rendered items, the
+# indent=2 layout ("[]" when empty).
+fn jarray(items: list[str], level: int) -> str {
+    if items.len() == 0 {
+        return "[]"
+    }
+    let mut out: str = "[\n"
+    let mut i: int = 0
+    while i < items.len() {
+        out = out + jindent(level + 1) + items.get(i)
+        if i + 1 < items.len() {
+            out = out + ","
+        }
+        out = out + "\n"
+        i = i + 1
+    }
+    return out + jindent(level) + "]"
+}
+
+# jobj(pairs, level) — a JSON object over pre-rendered '"k": v' pairs,
+# the indent=2 layout ("{}" when empty).
+fn jobj(pairs: list[str], level: int) -> str {
+    if pairs.len() == 0 {
+        return "{}"
+    }
+    let mut out: str = "{\n"
+    let mut i: int = 0
+    while i < pairs.len() {
+        out = out + jindent(level + 1) + pairs.get(i)
+        if i + 1 < pairs.len() {
+            out = out + ","
+        }
+        out = out + "\n"
+        i = i + 1
+    }
+    return out + jindent(level) + "}"
+}
+
+fn jpair(key: str, val: str) -> str {
+    return json_escape(key) + ": " + val
+}
+
+fn jbool(b: bool) -> str {
+    if b {
+        return "true"
+    }
+    return "false"
+}
+
+# ============================================================================
+# Integer parsing — Python's int()/float() acceptance for the ledger
+# fields and the CLI values (whitespace-trimmed, signed, single
+# underscores between digits), without the panic the to_int() builtin
+# owes a malformed string; magnitudes past i64 saturate (Python's ints
+# do not, but no real budget or cycle index lives out there).
+# ============================================================================
+
+# py_int_grammar_ok(body) — the digit/underscore grammar of int() on a
+# signless body: digits with single underscores only BETWEEN digits.
+fn py_int_grammar_ok(body: str) -> bool {
+    if body.len() == 0 {
+        return false
+    }
+    let mut i: int = 0
+    let mut prev_digit: bool = false
+    let mut prev_us: bool = false
+    while i < body.len() {
+        let c: int = body.byte_at(i)
+        if c >= 48 && c <= 57 {
+            if prev_us {
+                prev_us = false
+            }
+            prev_digit = true
+        } else if c == 95 {
+            # an underscore needs a digit on both sides
+            if !prev_digit || prev_us {
+                return false
+            }
+            prev_us = true
+            prev_digit = false
+        } else {
+            return false
+        }
+        i = i + 1
+    }
+    if prev_us {
+        return false
+    }
+    return true
+}
+
+# accumulate_digits(body) — the decimal value with i64 saturation.
+fn accumulate_digits(body: str) -> int {
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < body.len() {
+        let c: int = body.byte_at(i)
+        if c >= 48 && c <= 57 {
+            let d: int = c - 48
+            if v > 922337203685477580 || (v == 922337203685477580 && d > 7) {
+                v = 9223372036854775807
+            } else {
+                v = v * 10 + d
+            }
+        }
+        i = i + 1
+    }
+    return v
+}
+
+# parse_int_maybe(s) — [ok, value].
+fn parse_int_maybe(s: str) -> list[int] {
+    let t: str = strip_py(s)
+    if t.len() == 0 {
+        return[0, 0]
+    }
+    let mut body: str = t
+    let mut neg_mut: bool = false
+    if t.byte_at(0) == 43 || t.byte_at(0) == 45 {
+        body = t.slice(1, t.len())
+        if t.byte_at(0) == 45 {
+            neg_mut = true
+        }
+    }
+    if !py_int_grammar_ok(body) {
+        return[0, 0]
+    }
+    let v: int = accumulate_digits(body)
+    if neg_mut {
+        if v == 9223372036854775807 {
+            return[1, 0 - 9223372036854775807]
+        }
+        return[1, 0 - v]
+    }
+    return[1, v]
+}
+
+# is_negnum(s) — argparse's negative-number matcher
+# (^-\d+$|^-\d*\.\d+$): a token that starts with '-' yet may be a VALUE
+# (digits, or digits.dot.digits with either side's digits optional —
+# but never both).
+fn is_negnum(s: str) -> bool {
+    if s.len() < 2 {
+        return false
+    }
+    if s.byte_at(0) != 45 {
+        return false
+    }
+    let mut i: int = 1
+    let mut digits: int = 0
+    let mut dots: int = 0
+    let mut digits_after_dot: int = 0
+    let mut after_dot: bool = false
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c >= 48 && c <= 57 {
+            digits = digits + 1
+            if after_dot {
+                digits_after_dot = digits_after_dot + 1
+            }
+        } else if c == 46 {
+            if after_dot {
+                return false
+            }
+            dots = dots + 1
+            after_dot = true
+        } else {
+            return false
+        }
+        i = i + 1
+    }
+    if dots == 0 {
+        return digits > 0
+    }
+    if dots > 1 {
+        return false
+    }
+    return digits_after_dot > 0
+}
+
+# py_float_grammar_ok(t) — the decimal/exponent grammar of float() on a
+# trimmed body (sign, digits, one dot, one exponent with its own sign;
+# underscores between digits allowed the same way).
+fn py_float_grammar_ok(t: str) -> bool {
+    let body: str = t
+    let mut i: int = 0
+    if body.len() == 0 {
+        return false
+    }
+    if body.byte_at(0) == 43 || body.byte_at(0) == 45 {
+        i = 1
+    }
+    if i >= body.len() {
+        return false
+    }
+    let mut digits: int = 0
+    let mut dots: int = 0
+    let mut es: int = 0
+    let mut prev_digit: bool = false
+    let mut prev_us: bool = false
+    let mut exp_prev_digit: bool = false
+    let mut exp_prev_us: bool = false
+    let mut in_exp: bool = false
+    while i < body.len() {
+        let c: int = body.byte_at(i)
+        if c == 101 || c == 69 {
+            if es > 0 || in_exp {
+                return false
+            }
+            if !prev_digit && !exp_prev_digit {
+                return false
+            }
+            es = es + 1
+            in_exp = true
+            prev_us = false
+            i = i + 1
+            if i >= body.len() {
+                return false
+            }
+            let c2: int = body.byte_at(i)
+            if c2 == 43 || c2 == 45 {
+                i = i + 1
+                if i >= body.len() {
+                    return false
+                }
+            }
+            exp_prev_digit = false
+            exp_prev_us = false
+            continue
+        }
+        if c >= 48 && c <= 57 {
+            if in_exp {
+                if exp_prev_us {
+                    exp_prev_us = false
+                }
+                exp_prev_digit = true
+            } else {
+                if prev_us {
+                    prev_us = false
+                }
+                prev_digit = true
+                digits = digits + 1
+            }
+        } else if c == 46 {
+            if in_exp || dots > 0 {
+                return false
+            }
+            dots = dots + 1
+            prev_us = false
+        } else if c == 95 {
+            if in_exp {
+                if !exp_prev_digit || exp_prev_us {
+                    return false
+                }
+                exp_prev_us = true
+                exp_prev_digit = false
+            } else {
+                if !prev_digit || prev_us {
+                    return false
+                }
+                prev_us = true
+                prev_digit = false
+            }
+        } else {
+            return false
+        }
+        i = i + 1
+    }
+    if prev_us || exp_prev_us {
+        return false
+    }
+    if in_exp && !exp_prev_digit {
+        return false
+    }
+    if digits == 0 || dots > 1 {
+        return false
+    }
+    return true
+}
+
+# parse_float_maybe(s) — [ok, value]; accepts the decimal and exponent
+# forms plus inf/nan, the way float() does, then hands the text to the
+# runtime's (correctly rounded) to_float.
+fn parse_float_maybe(s: str) -> list[float] {
+    let t: str = strip_py(s)
+    if t.len() == 0 {
+        return[0.0, 0.0]
+    }
+    let low: str = lower_ascii(t)
+    if low == "inf" || low == "infinity" || low == "nan"
+    || low == "+inf" || low == "+infinity" || low == "+nan"
+    || low == "-inf" || low == "-infinity" || low == "-nan" {
+        return[1.0, t.to_float()]
+    }
+    if !py_float_grammar_ok(t) {
+        return[0.0, 0.0]
+    }
+    return[1.0, t.to_float()]
+}
+
+fn lower_ascii(s: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c >= 65 && c <= 90 {
+            out = out + chr(c + 32)
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ============================================================================
+# The protocol: marker lines in the workload's stdout.
+# ============================================================================
+
+# marker_index(line) — 2 a well-formed marker, 1 not a marker, 0 a
+# malformed record (the message rides in marker_error).
+fn marker_index(line: str) -> int {
+    if !line.starts_with(proto_cycle()) {
+        return 1
+    }
+    let payload: str = strip_py(line.slice(proto_cycle().len(), line.len()))
+    if payload.len() == 0 {
+        return 0
+    }
+    let mut i: int = 0
+    while i < payload.len() {
+        let c: int = payload.byte_at(i)
+        if c < 48 || c > 57 {
+            return 0
+        }
+        i = i + 1
+    }
+    return 2
+}
+
+fn marker_value(line: str) -> int {
+    let payload: str = strip_py(line.slice(proto_cycle().len(), line.len()))
+    return accumulate_digits(payload)
+}
+
+fn marker_error(line: str) -> str {
+    return "protocol error: malformed cycle marker "
+    + py_repr_bytes(safe_prefix(line, 120))
+    + " (expected `__HLRT_CYCLE__ <int>`)"
+}
+
+# stem_error(line) — a line that merely CONTAINS the reserved stem but
+# is not a record corrupts the stream: fail loudly, never silently drop.
+fn stem_error(line: str) -> str {
+    return "protocol error: reserved stem in a non-record line "
+    + py_repr_bytes(safe_prefix(line, 120))
+}
+
+# ============================================================================
+# The ledger: parse and re-verify the interposer's fenced report.
+# ============================================================================
+
+struct CycleRec {
+    cycle: int,
+    allocs: int,
+    bytes: int,
+    live_bytes: int,
+    frees: int,
+    nanos: int,
+}
+
+struct Ledger {
+    ok: bool, # a complete, self-consistent report was present (the
+    # parse's have_live_exit/have_overflow presence flags live only in
+    # the parse loop: ok=true implies both were seen, so the fields
+    # themselves need no shadow flags here)
+    cycles: list[CycleRec],
+    tail_allocs: int,
+    tail_bytes: int,
+    totals_allocs: int,
+    totals_bytes: int,
+    totals_frees: int,
+    live_exit: int, # the value may legitimately be negative — the
+    # .py's None is a presence question the ok flag answers
+    overflow: int,
+}
+
+fn empty_ledger() -> Ledger {
+    let cyc: list[CycleRec] = []
+    return Ledger {
+        ok: false, cycles: cyc, tail_allocs: 0, tail_bytes: 0,
+        totals_allocs: 0, totals_bytes: 0, totals_frees: 0,
+        live_exit: 0, overflow: 0
+    }
+}
+
+# parse_kv(payload) — `K=V K=V ...` -> the map with the ORIGINAL
+# (uppercase) keys and int values (the LAST occurrence winning the way
+# a dict assignment overwrites); empty fields between double spaces are
+# malformed, exactly as the .py's split sees them. ok=false is the .py's
+# None.
+struct KvParse {
+    ok: bool,
+    m: map[str, int],
+}
+
+fn parse_kv(payload: str) -> KvParse {
+    let m: map[str, int] = map_new()
+    let fields: list[str] = payload.split(" ")
+    let mut i: int = 0
+    while i < fields.len() {
+        let field: str = fields.get(i)
+        let kv: list[str] = split_first(field, 61)
+        let key: str = kv.get(0)
+        let val: str = kv.get(1)
+        if key.len() == 0 {
+            let bad: KvParse = KvParse {
+                ok: false, m: m
+            }
+            return bad
+        }
+        let iv: list[int] = parse_int_maybe(val)
+        if iv.get(0) == 0 {
+            let bad2: KvParse = KvParse {
+                ok: false, m: m
+            }
+            return bad2
+        }
+        m.set(key, iv.get(1))
+        i = i + 1
+    }
+    let good: KvParse = KvParse {
+        ok: true, m: m
+    }
+    return good
+}
+
+fn kv_has(m: map[str, int], key: str) -> bool {
+    return m.has(key)
+}
+
+fn kv_get(m: map[str, int], key: str) -> int {
+    return m.get_or(key, 0)
+}
+
+# parse_report(stderr_text) — the fenced HLRT_ report from the
+# program's stderr; the totals are RE-DERIVED from the per-cycle lines
+# (the instrument's own summary is not trusted until it agrees with its
+# ledger). Returns ok=false when no complete, self-consistent report is
+# present.
+fn parse_report(stderr_text: str) -> Ledger {
+    let led: Ledger = empty_ledger()
+    if stderr_text.len() == 0 {
+        return led
+    }
+    let lines: list[str] = split_lines_py(stderr_text)
+    let mut begin: int = -1
+    let mut bi: int = 0
+    while bi < lines.len() {
+        if lines.get(bi) == report_begin() {
+            begin = bi
+            bi = lines.len()
+        }
+        bi = bi + 1
+    }
+    let mut end: int = -1
+    let mut ei: int = 0
+    while ei < lines.len() {
+        if lines.get(ei) == report_end() {
+            end = ei
+            ei = lines.len()
+        }
+        ei = ei + 1
+    }
+    if begin < 0 || end < 0 || end < begin {
+        return led
+    }
+    let cycles: list[CycleRec] = []
+    let mut have_tail: bool = false
+    let mut tail_allocs: int = 0
+    let mut tail_bytes: int = 0
+    let mut have_totals: bool = false
+    let mut totals_allocs: int = 0
+    let mut totals_bytes: int = 0
+    let mut totals_frees: int = 0
+    let mut live_exit: int = 0
+    let mut have_live_exit: bool = false
+    let mut overflow: int = 0
+    let mut have_overflow: bool = false
+    let mut li: int = begin + 1
+    while li < end {
+        let raw: str = lines.get(li)
+        if raw.starts_with("HLRT_CYCLE=") {
+            let payload: str = raw.slice(11, raw.len())
+            let parts: list[str] = split_first(payload, 32)
+            let iv: list[int] = parse_int_maybe(parts.get(0))
+            if iv.get(0) == 0 {
+                return led
+            }
+            let kvr: KvParse = parse_kv(parts.get(1))
+            if !kvr.ok {
+                return led
+            }
+            let m: map[str, int] = kvr.m
+            if !kv_has(m, "ALLOCS") || !kv_has(m, "BYTES")
+            || !kv_has(m, "LIVE") || !kv_has(m, "FREES")
+            || !kv_has(m, "NANOS") {
+                return led
+            }
+            cycles.push(CycleRec {
+                cycle: iv.get(1),
+                allocs: kv_get(m, "ALLOCS"),
+                bytes: kv_get(m, "BYTES"),
+                live_bytes: kv_get(m, "LIVE"),
+                frees: kv_get(m, "FREES"),
+                nanos: kv_get(m, "NANOS")
+            })
+        } else if raw.starts_with("HLRT_TAIL ") {
+            let kvr2: KvParse = parse_kv(raw.slice(10, raw.len()))
+            if !kvr2.ok {
+                return led
+            }
+            let m2: map[str, int] = kvr2.m
+            if !kv_has(m2, "ALLOCS") || !kv_has(m2, "BYTES") {
+                return led
+            }
+            have_tail = true
+            tail_allocs = kv_get(m2, "ALLOCS")
+            tail_bytes = kv_get(m2, "BYTES")
+        } else if raw.starts_with("HLRT_TOTAL ") {
+            let kvr3: KvParse = parse_kv(raw.slice(11, raw.len()))
+            if !kvr3.ok {
+                return led
+            }
+            let m3: map[str, int] = kvr3.m
+            if !kv_has(m3, "ALLOCS") || !kv_has(m3, "BYTES")
+            || !kv_has(m3, "FREES") {
+                return led
+            }
+            have_totals = true
+            totals_allocs = kv_get(m3, "ALLOCS")
+            totals_bytes = kv_get(m3, "BYTES")
+            totals_frees = kv_get(m3, "FREES")
+        } else if raw.starts_with("HLRT_LIVE_EXIT=") {
+            let parts2: list[str] = split_first(raw, 61)
+            let iv2: list[int] = parse_int_maybe(parts2.get(1))
+            # a malformed line un-sets the field (the last assignment
+            # wins, the way the .py's None-assigning did), a successful
+            # one carries its value even when it is negative
+            have_live_exit = false
+            if iv2.get(0) == 1 {
+                live_exit = iv2.get(1)
+                have_live_exit = true
+            }
+        } else if raw.starts_with("HLRT_OVERFLOW=") {
+            let parts3: list[str] = split_first(raw, 61)
+            let iv3: list[int] = parse_int_maybe(parts3.get(1))
+            have_overflow = false
+            if iv3.get(0) == 1 {
+                overflow = iv3.get(1)
+                have_overflow = true
+            }
+        }
+        li = li + 1
+    }
+    if !have_tail || !have_totals || !have_live_exit || !have_overflow {
+        return led
+    }
+    # re-derive: the totals must be the ledger's sum. A report whose
+    # summary disagrees with its own lines is a broken instrument, and
+    # a broken instrument certifies nothing.
+    let mut sum_allocs: int = 0
+    let mut sum_bytes: int = 0
+    let mut si: int = 0
+    while si < cycles.len() {
+        sum_allocs = sum_allocs + cycles.get(si).allocs
+        sum_bytes = sum_bytes + cycles.get(si).bytes
+        si = si + 1
+    }
+    if sum_allocs + tail_allocs != totals_allocs {
+        return led
+    }
+    if sum_bytes + tail_bytes != totals_bytes {
+        return led
+    }
+    return Ledger {
+        ok: true, cycles: cycles,
+        tail_allocs: tail_allocs, tail_bytes: tail_bytes,
+        totals_allocs: totals_allocs, totals_bytes: totals_bytes,
+        totals_frees: totals_frees, live_exit: live_exit,
+        overflow: overflow
+    }
+}
+
+# ============================================================================
+# Statistics — the planner's numbers (max / median / p95 / jitter),
+# the same shapes core/rt.hls computes (rt_window_*), integer-exact.
+# ============================================================================
+
+# sort_ints(xs) — a stable merge sort (sorted() is order-only anyway).
+fn sort_ints(xs: list[int]) -> list[int] {
+    if xs.len() <= 1 {
+        let single: list[int] = []
+        let mut i0: int = 0
+        while i0 < xs.len() {
+            single.push(xs.get(i0))
+            i0 = i0 + 1
+        }
+        return single
+    }
+    let mid: int = xs.len() / 2
+    let left: list[int] = []
+    let mut li: int = 0
+    while li < mid {
+        left.push(xs.get(li))
+        li = li + 1
+    }
+    let right: list[int] = []
+    let mut ri: int = mid
+    while ri < xs.len() {
+        right.push(xs.get(ri))
+        ri = ri + 1
+    }
+    let a: list[int] = sort_ints(left)
+    let b: list[int] = sort_ints(right)
+    let out: list[int] = []
+    let mut ai: int = 0
+    let mut bj: int = 0
+    while ai < a.len() && bj < b.len() {
+        if a.get(ai) <= b.get(bj) {
+            out.push(a.get(ai))
+            ai = ai + 1
+        } else {
+            out.push(b.get(bj))
+            bj = bj + 1
+        }
+    }
+    while ai < a.len() {
+        out.push(a.get(ai))
+        ai = ai + 1
+    }
+    while bj < b.len() {
+        out.push(b.get(bj))
+        bj = bj + 1
+    }
+    return out
+}
+
+# median(xs) — the plain integer median (odd: the middle; even: the
+# floor of the two middles' average), rt_window_median_nanos' own
+# definition, so a plan in Halis and a report here cannot disagree.
+fn median(xs: list[int]) -> int {
+    let s: list[int] = sort_ints(xs)
+    let n: int = s.len()
+    let mid: int = n / 2
+    if n % 2 == 1 {
+        return s.get(mid)
+    }
+    return(s.get(mid - 1) + s.get(mid)) / 2
+}
+
+# p95(xs) — linear-interpolation 95th percentile (the hls-bench
+# estimator), the same float ops in the same order the .py performs.
+fn p95(xs: list[int]) -> float {
+    let s: list[int] = sort_ints(xs)
+    if s.len() == 1 {
+        return s.get(0).to_float()
+    }
+    let pos: float = 0.95 * (s.len() - 1).to_float()
+    let lo: int = pos.to_int()
+    let mut hi: int = lo + 1
+    if hi > s.len() - 1 {
+        hi = s.len() - 1
+    }
+    let frac: float = pos - lo.to_float()
+    return s.get(lo).to_float() * (1.0 - frac) + s.get(hi).to_float() * frac
+}
+
+fn list_max(xs: list[int]) -> int {
+    let mut m: int = xs.get(0)
+    let mut i: int = 1
+    while i < xs.len() {
+        if xs.get(i) > m {
+            m = xs.get(i)
+        }
+        i = i + 1
+    }
+    return m
+}
+
+fn list_min(xs: list[int]) -> int {
+    let mut m: int = xs.get(0)
+    let mut i: int = 1
+    while i < xs.len() {
+        if xs.get(i) < m {
+            m = xs.get(i)
+        }
+        i = i + 1
+    }
+    return m
+}
+
+# fmt_bytes(n) — human bytes: KiB/MiB above the k-scale, plain below.
+fn fmt_bytes(n: int) -> str {
+    if n >= 1048576 {
+        return fmt_fix(n.to_float() / 1048576.0, 2) + " MiB"
+    }
+    if n >= 1024 {
+        return fmt_fix(n.to_float() / 1024.0, 1) + " KiB"
+    }
+    return n.to_str() + " B"
+}
+
+# fmt_nanos(ns) — human nanoseconds: ms above the micro scale, us above
+# the ns scale, plain below.
+fn fmt_nanos(ns: int) -> str {
+    if ns >= 1000000 {
+        return fmt_fix(ns.to_float() / 1000000.0, 2) + " ms"
+    }
+    if ns >= 1000 {
+        return fmt_fix(ns.to_float() / 1000.0, 1) + " us"
+    }
+    return ns.to_str() + " ns"
+}
+
+# ============================================================================
+# One execution of the workload — everything the analysis needs.
+# ============================================================================
+
+struct RunRes {
+    rc: int, # Popen-style: 0..255 exit, -signum signal
+    rc_known: bool, # false -> the wait failed ("signal" in the report)
+    timed_out: bool,
+    markers: list[int],
+    protocol_error: str, # "" -> none
+    report: Ledger,
+    stderr_tail: str, # last 8 KiB (panic messages)
+    elapsed_s: float,
+}
+
+fn empty_run_res() -> RunRes {
+    let mk: list[int] = []
+    let res: RunRes = RunRes {
+        rc: 0, rc_known: true, timed_out: false, markers: mk,
+        protocol_error: "", report: empty_ledger(), stderr_tail: "",
+        elapsed_s: 0.0
+    }
+    return res
+}
+
+# ============================================================================
+# Analysis — the verdict, from the two legs.
+# ============================================================================
+
+struct Cfg {
+    workload: str,
+    budget_allocs: int,
+    budget_bytes: int,
+    budget_nanos: int,
+    warmup: int,
+    min_cycles: int,
+    enforce: bool,
+    timeout: float,
+    hlc: str,
+    cc: str,
+}
+
+# measured_cycles(run, cfg) — the ledger's closed cycles past the warmup.
+fn measured_cycles(run: RunRes, cfg: Cfg) -> list[CycleRec] {
+    let out: list[CycleRec] = []
+    if !run.report.ok {
+        return out
+    }
+    let mut i: int = 0
+    while i < run.report.cycles.len() {
+        if run.report.cycles.get(i).cycle >= cfg.warmup {
+            out.push(run.report.cycles.get(i))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# cycle_verdict(c, cfg) — one closed cycle against the plan, in the
+# canonical axis order (allocs, bytes, nanos). Returns [refused, axis].
+fn cycle_verdict(c: CycleRec, cfg: Cfg) -> list[int] {
+    if cfg.budget_allocs > 0 && c.allocs > cfg.budget_allocs {
+        return[1, 1]
+    }
+    if cfg.budget_bytes > 0 && c.bytes > cfg.budget_bytes {
+        return[1, 2]
+    }
+    if cfg.budget_nanos > 0 && c.nanos > cfg.budget_nanos {
+        return[1, 3]
+    }
+    return[0, 0]
+}
+
+# violation_message_from(c, axis, cfg) — the canonical violation line
+# the RUNTIME would have died with for this cycle, so a message never
+# names a number the ledger disagrees with.
+fn violation_message_from(c: CycleRec, axis: int, cfg: Cfg) -> str {
+    if axis == 1 {
+        return "soft real-time violation: cycle " + c.cycle.to_str()
+        + " made " + c.allocs.to_str() + " allocations (budget "
+        + cfg.budget_allocs.to_str() + ")"
+    }
+    if axis == 2 {
+        return "soft real-time violation: cycle " + c.cycle.to_str()
+        + " allocated " + c.bytes.to_str() + " bytes (budget "
+        + cfg.budget_bytes.to_str() + ")"
+    }
+    if axis == 3 {
+        return "soft real-time violation: cycle " + c.cycle.to_str()
+        + " took " + c.nanos.to_str() + " ns (deadline "
+        + cfg.budget_nanos.to_str() + " ns)"
+    }
+    return ""
+}
+
+# panic_violation_line(stderr_bytes) — the canonical
+# `panic: soft real-time violation: ...` line, if the program died of
+# one.
+fn panic_violation_line(stderr_bytes: str) -> str {
+    let lines: list[str] = split_lines_py(stderr_bytes)
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i)
+        if line.starts_with("panic: soft real-time violation:") {
+            return strip_py(line.slice(7, line.len()))
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# analyse(run, cfg) — the composed verdict. Returns [verdict, reason,
+# detail].
+fn analyse(run: RunRes, cfg: Cfg) -> list[str] {
+    let measured: list[CycleRec] = measured_cycles(run, cfg)
+
+    # Leg 1 — the program's own death. The mode was armed and the
+    # runtime killed it: that is a refusal with the runtime as witness,
+    # whatever the ledger says.
+    if run.rc_known && run.rc == 101 {
+        let panic_line: str = panic_violation_line(run.stderr_tail)
+        if panic_line != "" {
+            return[verdict_refused(), panic_line,
+            "in-process enforcement fired (exit 101)"]
+        }
+    }
+
+    # Leg 2 — the ledger. Every measured cycle inside its budget.
+    if measured.len() > 0 {
+        let mut i: int = 0
+        while i < measured.len() {
+            let vd: list[int] = cycle_verdict(measured.get(i), cfg)
+            if vd.get(0) == 1 {
+                let mut msg: str = violation_message_from(measured.get(i),
+                vd.get(1), cfg)
+                if cfg.enforce {
+                    msg = msg + " (the in-process mode should have fired "
+                    + "first — a runtime/tool disagreement is "
+                    + "itself a failure)"
+                }
+                return[verdict_refused(), msg,
+                "the ledger shows the overrun"]
+            }
+            i = i + 1
+        }
+    }
+
+    # Program failures that are not violations.
+    if run.timed_out {
+        return[verdict_refused(),
+        "workload timed out after " + fmt_fix(cfg.timeout, 0) + "s",
+        "no verdict from a dead run"]
+    }
+    if run.protocol_error != "" {
+        return[verdict_refused(), run.protocol_error,
+        "the stream is corrupt"]
+    }
+    if !run.rc_known || run.rc != 0 {
+        let mut rcs: str = "signal"
+        if run.rc_known {
+            rcs = run.rc.to_str()
+        }
+        return[verdict_refused(), "workload exited " + rcs,
+        "not a soft-real-time violation — see the stderr tail"]
+    }
+
+    # Instrument health.
+    if !run.report.ok {
+        return[verdict_inconclusive(),
+        "the instrument produced no ledger (HLRT_REPORT fence "
+        + "absent or inconsistent)", "cannot certify blind"]
+    }
+    if run.report.overflow != 0 {
+        return[verdict_inconclusive(),
+        "the instrument's tracking table overflowed — the "
+        + "ledger is incomplete", "cannot certify a partial "
+        + "ledger"]
+    }
+
+    # Coverage: the markers must describe the work.
+    if measured.len() > 0 {
+        let mut biggest: int = 0
+        let mut i2: int = 0
+        while i2 < measured.len() {
+            if measured.get(i2).allocs > biggest {
+                biggest = measured.get(i2).allocs
+            }
+            i2 = i2 + 1
+        }
+        if run.report.tail_allocs > biggest {
+            return[verdict_inconclusive(),
+            "the tail window after the last mark made "
+            + run.report.tail_allocs.to_str()
+            + " allocations — more than the biggest measured "
+            + "cycle (" + biggest.to_str() + "): the markers do "
+            + "not cover the work", "an honest gap, not a pass"]
+        }
+    }
+
+    # Sample size.
+    if measured.len() < cfg.min_cycles {
+        return[verdict_inconclusive(),
+        "only " + measured.len().to_str() + " measured cycle(s) "
+        + "after the warmup of " + cfg.warmup.to_str()
+        + " — a bound claimed from fewer than "
+        + cfg.min_cycles.to_str() + " samples is a rumour",
+        "run more cycles"]
+    }
+
+    let mut mode_word: str = "armed"
+    if !cfg.enforce {
+        mode_word = "off (--no-enforce)"
+    }
+    return[verdict_bounded(), "every measured cycle is inside its budget",
+    "in-process enforcement: " + mode_word + "; ledger: clean"]
+}
+
+# ============================================================================
+# The report.
+# ============================================================================
+
+# axis_word(v) — the plan line's axis spelling (a 0 axis is "off").
+fn axis_word(v: int) -> str {
+    if v > 0 {
+        return v.to_str()
+    }
+    return "off"
+}
+
+# render(run, cfg, verdict, reason, detail) — the text report, exactly
+# the line list the .py joins (print() adds the final newline).
+fn render(run: RunRes, cfg: Cfg, verdict: str, reason: str,
+detail: str) -> str {
+    let out: list[str] = []
+    out.push("hls-rt " + tool_version()
+    + " — soft-real-time verification (Stage 126)")
+    out.push("workload:        " + cfg.workload)
+    let mut bytes_word: str = "off"
+    if cfg.budget_bytes != 0 {
+        bytes_word = fmt_bytes(cfg.budget_bytes)
+    }
+    let mut nanos_word: str = "off"
+    if cfg.budget_nanos != 0 {
+        nanos_word = fmt_nanos(cfg.budget_nanos)
+    }
+    out.push("plan:            budget " + axis_word(cfg.budget_allocs)
+    + " allocs/cycle, " + bytes_word + "/cycle, deadline "
+    + nanos_word + "/cycle; warmup " + cfg.warmup.to_str())
+    let mut mode_word: str = "enforce"
+    if !cfg.enforce {
+        mode_word = "measure only (--no-enforce)"
+    }
+    out.push("mode:            " + mode_word)
+    let mut rcs: str = "signal"
+    if run.rc_known {
+        rcs = run.rc.to_str()
+    }
+    out.push("exit:            " + rcs + " in "
+    + fmt_fix(run.elapsed_s, 2) + "s")
+    out.push("")
+
+    let measured: list[CycleRec] = measured_cycles(run, cfg)
+    if measured.len() > 0 {
+        out.push("per-cycle ledger (measured window; allocs / bytes / "
+        + "live / time):")
+        let mut i: int = 0
+        while i < measured.len() {
+            let c: CycleRec = measured.get(i)
+            out.push("    cycle " + pad_right(c.cycle.to_str(), 4) + " "
+            + pad_left(c.allocs.to_str(), 8) + " allocs "
+            + pad_left(fmt_bytes(c.bytes), 12) + " "
+            + pad_left(fmt_bytes(c.live_bytes), 12) + " live "
+            + pad_left(fmt_nanos(c.nanos), 10))
+            i = i + 1
+        }
+        out.push("")
+        let allocs: list[int] = []
+        let bytes_l: list[int] = []
+        let nanos_l: list[int] = []
+        let mut j: int = 0
+        while j < measured.len() {
+            allocs.push(measured.get(j).allocs)
+            bytes_l.push(measured.get(j).bytes)
+            nanos_l.push(measured.get(j).nanos)
+            j = j + 1
+        }
+        out.push("measured window: " + measured.len().to_str()
+        + " cycles (warmup " + cfg.warmup.to_str() + " excluded)")
+        out.push("    allocs/cycle:  max " + list_max(allocs).to_str()
+        + "   median " + median(allocs).to_str())
+        out.push("    bytes/cycle:   max " + fmt_bytes(list_max(bytes_l))
+        + "   median " + fmt_bytes(median(bytes_l)))
+        out.push("    cycle time:    max " + fmt_nanos(list_max(nanos_l))
+        + "   median " + fmt_nanos(median(nanos_l)) + "   p95 "
+        + fmt_nanos(p95(nanos_l).to_int()) + "   jitter "
+        + fmt_nanos(list_max(nanos_l) - list_min(nanos_l)))
+        if run.report.ok {
+            out.push("    tail after the last mark: "
+            + run.report.tail_allocs.to_str() + " allocs, "
+            + fmt_bytes(run.report.tail_bytes))
+        }
+        out.push("")
+    } else if run.report.ok {
+        out.push("the ledger holds no measured cycles (warmup "
+        + cfg.warmup.to_str() + ", markers seen "
+        + run.markers.len().to_str() + ")")
+        out.push("")
+    }
+
+    out.push(verdict_word(verdict) + " — " + reason)
+    out.push("(" + detail + ")")
+    return join(out, "\n")
+}
+
+# stats_blob(run, cfg) — [has, cycles, allocs_max, allocs_median,
+# bytes_max, bytes_median, nanos_max, nanos_median, nanos_p95,
+# nanos_jitter].
+fn stats_blob(run: RunRes, cfg: Cfg) -> list[int] {
+    let measured: list[CycleRec] = measured_cycles(run, cfg)
+    if measured.len() == 0 {
+        return[0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    }
+    let allocs: list[int] = []
+    let bytes_l: list[int] = []
+    let nanos_l: list[int] = []
+    let mut i: int = 0
+    while i < measured.len() {
+        allocs.push(measured.get(i).allocs)
+        bytes_l.push(measured.get(i).bytes)
+        nanos_l.push(measured.get(i).nanos)
+        i = i + 1
+    }
+    return[1, measured.len(), list_max(allocs), median(allocs),
+    list_max(bytes_l), median(bytes_l), list_max(nanos_l),
+    median(nanos_l), p95(nanos_l).to_int(),
+    list_max(nanos_l) - list_min(nanos_l)]
+}
+
+# to_json(run, cfg, verdict, reason, detail) — the machine-readable
+# report, json.dump(..., indent=2) bytes (the file gains its trailing
+# newline from the caller).
+fn to_json(run: RunRes, cfg: Cfg, verdict: str, reason: str, detail: str)
+-> str {
+    let config_pairs: list[str] = []
+    config_pairs.push(jpair("budget_allocs", cfg.budget_allocs.to_str()))
+    config_pairs.push(jpair("budget_bytes", cfg.budget_bytes.to_str()))
+    config_pairs.push(jpair("budget_nanos", cfg.budget_nanos.to_str()))
+    config_pairs.push(jpair("warmup", cfg.warmup.to_str()))
+    config_pairs.push(jpair("min_cycles", cfg.min_cycles.to_str()))
+    config_pairs.push(jpair("enforce", jbool(cfg.enforce)))
+    config_pairs.push(jpair("timeout", py_float_repr(cfg.timeout)))
+
+    let marker_items: list[str] = []
+    let mut mi: int = 0
+    while mi < run.markers.len() {
+        marker_items.push(run.markers.get(mi).to_str())
+        mi = mi + 1
+    }
+
+    let mut ledger_val: str = "null"
+    if run.report.ok {
+        let cyc_items: list[str] = []
+        let mut ci: int = 0
+        while ci < run.report.cycles.len() {
+            let c: CycleRec = run.report.cycles.get(ci)
+            let cp: list[str] = []
+            cp.push(jpair("cycle", c.cycle.to_str()))
+            cp.push(jpair("allocs", c.allocs.to_str()))
+            cp.push(jpair("bytes", c.bytes.to_str()))
+            cp.push(jpair("live_bytes", c.live_bytes.to_str()))
+            cp.push(jpair("frees", c.frees.to_str()))
+            cp.push(jpair("nanos", c.nanos.to_str()))
+            cyc_items.push(jobj(cp, 3))
+            ci = ci + 1
+        }
+        let tail_pairs: list[str] = []
+        tail_pairs.push(jpair("allocs", run.report.tail_allocs.to_str()))
+        tail_pairs.push(jpair("bytes", run.report.tail_bytes.to_str()))
+        let total_pairs: list[str] = []
+        total_pairs.push(jpair("allocs", run.report.totals_allocs.to_str()))
+        total_pairs.push(jpair("bytes", run.report.totals_bytes.to_str()))
+        total_pairs.push(jpair("frees", run.report.totals_frees.to_str()))
+        let ledger_pairs: list[str] = []
+        ledger_pairs.push(jpair("cycles", jarray(cyc_items, 2)))
+        ledger_pairs.push(jpair("tail", jobj(tail_pairs, 2)))
+        ledger_pairs.push(jpair("totals", jobj(total_pairs, 2)))
+        ledger_pairs.push(jpair("live_exit",
+        run.report.live_exit.to_str()))
+        ledger_pairs.push(jpair("overflow",
+        run.report.overflow.to_str()))
+        ledger_val = jobj(ledger_pairs, 1)
+    }
+
+    let mut stats_val: str = "null"
+    let sb: list[int] = stats_blob(run, cfg)
+    if sb.get(0) == 1 {
+        let sp: list[str] = []
+        sp.push(jpair("cycles", sb.get(1).to_str()))
+        sp.push(jpair("allocs_max", sb.get(2).to_str()))
+        sp.push(jpair("allocs_median", sb.get(3).to_str()))
+        sp.push(jpair("bytes_max", sb.get(4).to_str()))
+        sp.push(jpair("bytes_median", sb.get(5).to_str()))
+        sp.push(jpair("nanos_max", sb.get(6).to_str()))
+        sp.push(jpair("nanos_median", sb.get(7).to_str()))
+        sp.push(jpair("nanos_p95", sb.get(8).to_str()))
+        sp.push(jpair("nanos_jitter", sb.get(9).to_str()))
+        stats_val = jobj(sp, 1)
+    }
+
+    let mut exit_val: str = "null"
+    if run.rc_known {
+        exit_val = run.rc.to_str()
+    }
+    let mut perr_val: str = "null"
+    if run.protocol_error != "" {
+        perr_val = json_escape(run.protocol_error)
+    }
+
+    let root_pairs: list[str] = []
+    root_pairs.push(jpair("tool", json_escape("hls-rt")))
+    root_pairs.push(jpair("version", json_escape(tool_version())))
+    root_pairs.push(jpair("workload", json_escape(cfg.workload)))
+    root_pairs.push(jpair("config", jobj(config_pairs, 1)))
+    root_pairs.push(jpair("exit", exit_val))
+    root_pairs.push(jpair("elapsed_s",
+    py_float_repr(round3(run.elapsed_s))))
+    root_pairs.push(jpair("observed_markers", jarray(marker_items, 1)))
+    root_pairs.push(jpair("protocol_error", perr_val))
+    root_pairs.push(jpair("ledger", ledger_val))
+    root_pairs.push(jpair("stats", stats_val))
+    root_pairs.push(jpair("verdict", json_escape(verdict)))
+    root_pairs.push(jpair("reason", json_escape(reason)))
+    root_pairs.push(jpair("detail", json_escape(detail)))
+    return jobj(root_pairs, 0)
+}
+
+# round3(x) — Python's round(x, 3): the nearest 3-decimal double.
+fn round3(x: float) -> float {
+    return fmt_fix(x, 3).to_float()
+}
+
+# ============================================================================
+# Paths and the shell — the child processes, every one of them a
+# one-liner with its stdio pinned to files (the harness's own
+# sh_run_env law), `timeout`-wrapped so the .py's subprocess deadlines
+# (hlc/gcc 300s, probes 120s/10s, workload cfg["timeout"]) live on.
+# ============================================================================
+
+# dir_of(p) — everything before the last "/" ("." for a bare name).
+fn dir_of(p: str) -> str {
+    let mut i: int = p.len() - 1
+    while i >= 0 {
+        if p.byte_at(i) == 47 {
+            if i == 0 {
+                return "/"
+            }
+            return p.slice(0, i)
+        }
+        i = i - 1
+    }
+    return "."
+}
+
+# path_normalize_abs(p) — collapse "//", "/./", "/../" on an absolute
+# path (os.path.abspath's normpath half; no symlink resolution, which
+# abspath never did either).
+fn path_normalize_abs(p: str) -> str {
+    let stack: list[str] = []
+    let mut seg: str = ""
+    let mut i: int = 0
+    let n: int = p.len()
+    while i <= n {
+        if i == n || p.byte_at(i) == 47 {
+            if seg == ".." {
+                if stack.len() > 0 {
+                    stack.pop()
+                }
+            } else if seg != "" && seg != "." {
+                stack.push(seg)
+            }
+            seg = ""
+        } else {
+            seg = seg + p.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    let mut acc: str = ""
+    let mut j: int = 0
+    while j < stack.len() {
+        acc = acc + "/" + stack.get(j)
+        j = j + 1
+    }
+    if acc == "" {
+        return "/"
+    }
+    return acc
+}
+
+# abspath_of(p) — the cwd-joined, normalized absolute path.
+fn abspath_of(p: str) -> str uses Proc {
+    if p.len() > 0 && p.byte_at(0) == 47 {
+        return path_normalize_abs(p)
+    }
+    let cwd: str = cwd_get()
+    if p == "" {
+        return path_normalize_abs(cwd)
+    }
+    let mut joined: str = cwd
+    if cwd.len() > 0 && cwd.byte_at(cwd.len() - 1) == 47 {
+        joined = cwd + p
+    } else {
+        joined = cwd + "/" + p
+    }
+    return path_normalize_abs(joined)
+}
+
+# is_repo_root(p) — the checkout marker the tool itself depends on:
+# the interposer source this verifier links into every workload.
+fn is_repo_root(p: str) -> bool uses Fs {
+    return file_exists(p + "/" + wrap_c_rel())
+}
+
+# which_hit(name) — the first PATH directory holding `name` (the
+# shutil_which law, minus the exec bit the runtime cannot ask for).
+fn which_hit(name: str) -> str uses Fs, Proc {
+    if name == "" || name.contains("/") {
+        return ""
+    }
+    let penv: str = env_get("PATH")
+    if penv == "" {
+        return ""
+    }
+    let dirs: list[str] = penv.split(":")
+    let mut i: int = 0
+    while i < dirs.len() {
+        let mut cand: str = dirs.get(i)
+        if cand == "" {
+            cand = "."
+        }
+        let full: str = cand + "/" + name
+        if file_exists(full) {
+            return full
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# repo_root() — the .py's dirname(dirname(abspath(__file__))): this
+# binary ships in <root>/bin, so the argv[0] the caller spelled (the
+# gate's "bin/hls-rt", a shell's "./bin/hls-rt", or an absolute path)
+# normalizes back to the checkout the tool belongs to; a bare name
+# rides PATH; a checkout nowhere in sight walks up from the cwd (the
+# hlfmt config law) and finally falls back to the cwd itself.
+fn repo_root() -> str uses Fs, Proc, Args {
+    let argv: list[str] = args()
+    if argv.len() > 0 && argv.get(0) != "" {
+        let binp: str = abspath_of(argv.get(0))
+        let root: str = dir_of(dir_of(binp))
+        if is_repo_root(root) {
+            return root
+        }
+        let hit: str = which_hit(argv.get(0))
+        if hit != "" {
+            let root2: str = dir_of(dir_of(abspath_of(hit)))
+            if is_repo_root(root2) {
+                return root2
+            }
+        }
+    }
+    let mut d: str = abspath_of("")
+    while true {
+        if is_repo_root(d) {
+            return d
+        }
+        let parent: str = dir_of(d)
+        if parent == d || parent == "." {
+            return abspath_of("")
+        }
+        d = parent
+    }
+    return abspath_of("")
+}
+
+# tmp_base() — tempfile.gettempdir(): the first of TMPDIR, TEMP, TMP
+# (in that order, non-empty and actually a directory), else /tmp.
+fn tmp_base() -> str uses Fs, Proc {
+    let mut cand: str = env_get("TMPDIR")
+    if cand == "" {
+        cand = env_get("TEMP")
+    }
+    if cand == "" {
+        cand = env_get("TMP")
+    }
+    if cand != "" && fs_is_dir(cand) {
+        return rstrip_slash(cand)
+    }
+    return "/tmp"
+}
+
+fn rstrip_slash(p: str) -> str {
+    let mut b: int = p.len()
+    while b > 1 && p.byte_at(b - 1) == 47 {
+        b = b - 1
+    }
+    return p.slice(0, b)
+}
+
+# name8(seed) — tempfile's 8-character random name (the
+# _RandomNameSequence alphabet: a-z, 0-9, underscore), so the
+# directories this tool births are the same LENGTH the .py's were.
+# The length is not cosmetic: the workload's argv[0] — the binary's
+# path inside this directory — is materialised by the workload's own
+# args() call, so its byte width lands in the cycle-0 ledger and the
+# live set of every cycle; a twin must spell its temp home with the
+# same 8 characters.
+fn name8(seed: int) -> str {
+    let alphabet: str = "abcdefghijklmnopqrstuvwxyz0123456789_"
+    let mut out: str = ""
+    let mut h: int = seed % 2147483647
+    if h < 0 {
+        h = 0 - h
+    }
+    let mut i: int = 0
+    while i < 8 {
+        h = (h * 1103515245 + 12345) % 2147483647
+        let d: int = (h / 58) % 37
+        out = out + alphabet.slice(d, d + 1)
+        i = i + 1
+    }
+    return out
+}
+
+# mkdtemp(prefix) — a fresh, uniquely-named directory under the temp
+# root (mkdir is the atomic reserve; the name is prefix + 8 chars,
+# tempfile's own shape).
+fn mkdtemp(prefix: str) -> str uses Fs, Proc, Clock {
+    let base: str = tmp_base()
+    let mut n: int = 0
+    while n < 4096 {
+        let seed: int = clock_ms() % 1000000007 + n * 999983
+        let cand: str = base + "/" + prefix + name8(seed)
+        # stderr silenced: a collision (or a missing mkdir) must not
+        # leak a line into this tool's own stderr — tempfile's own
+        # retries were always silent, and the rc still carries the
+        # failure for the loop.
+        let rc: int = proc_exec("mkdir " + q(cand) + " 2>/dev/null")
+        if rc == 0 {
+            return cand
+        }
+        n = n + 1
+    }
+    return base + "/" + prefix + name8(clock_ms())
+}
+
+fn rmrf(path: str) -> void uses Proc {
+    proc_exec("rm -rf " + q(path) + " 2>/dev/null")
+}
+
+# which_cc(cc) — the shutil_which PATH lookup (a usable C compiler).
+fn which_cc(cc: str) -> bool uses Fs, Proc {
+    if cc == "" {
+        return false
+    }
+    if cc.contains("/") {
+        return file_exists_quiet(cc)
+    }
+    return proc_exec("command -v " + q(cc) + " >/dev/null 2>&1") == 0
+}
+
+# file_exists_quiet(p) — file_exists for a possibly-relative path
+# (which_cc's absolute-CC form).
+fn file_exists_quiet(p: str) -> bool uses Fs {
+    return file_exists(p)
+}
+
+# run_redirected(core, out_path, err_path) — `core >out 2>err
+# </dev/null` through the shell; the encoded exit status comes home.
+fn run_redirected(core: str, out_path: str, err_path: str) -> int
+uses Proc {
+    return proc_exec(core + " >" + q(out_path) + " 2>" + q(err_path)
+    + " </dev/null")
+}
+
+# run_devnull(core) — `core >/dev/null 2>&1 </dev/null`.
+fn run_devnull(core: str) -> int uses Proc {
+    return proc_exec(core + " >/dev/null 2>&1 </dev/null")
+}
+
+# ============================================================================
+# The native build — the exact recipe every other gate uses, plus the
+# wrap.
+# ============================================================================
+
+fn wrap_flags_word() -> str {
+    return " -Wl,--wrap=malloc -Wl,--wrap=calloc"
+    + " -Wl,--wrap=realloc -Wl,--wrap=free"
+}
+
+# probe_wrap(cc, root) — compile the instrument and probe whether the
+# linker understands -Wl,--wrap (GNU ld / BFD do; ld64 does not). The
+# probe must not only link but RUN (any exit code — the .py only
+# refused on a spawn failure or a hang): a wrap that broke the
+# allocation path would poison every measurement.
+fn probe_wrap(cc: str, root: str) -> bool uses Fs, Proc, Clock {
+    let ptmp: str = mkdtemp("hlrt-probe-")
+    let ok: bool = probe_wrap_in(cc, root, ptmp)
+    rmrf(ptmp)
+    return ok
+}
+
+fn probe_wrap_in(cc: str, root: str, ptmp: str) -> bool uses Fs, Proc {
+    let obj: str = ptmp + "/budget.o"
+    let rc1: int = run_devnull("timeout -k 5 120 " + q(cc) + " -O2 -c "
+    + q(root + "/" + wrap_c_rel()) + " -o "
+    + q(obj))
+    if rc1 != 0 {
+        return false
+    }
+    let probe_c: str = ptmp + "/probe.c"
+    write_file(probe_c, "#include <stdlib.h>\n"
+    + "int main(void) { void* p = malloc(8); free(p); "
+    + "return p ? 0 : 1; }\n")
+    let probe_bin: str = ptmp + "/probe.bin"
+    let rc2: int = run_devnull("timeout -k 5 120 " + q(cc) + " -O2 -o "
+    + q(probe_bin) + " " + q(probe_c) + " "
+    + q(obj) + " -lm -pthread"
+    + wrap_flags_word())
+    if rc2 != 0 {
+        return false
+    }
+    let rc3: int = run_devnull("timeout -k 5 10 " + q(probe_bin))
+    # 124/125: the probe hung or `timeout` itself failed (the .py's
+    # TimeoutExpired); 126/127: the spawn failed (the .py's OSError).
+    # Anything else — including a nonzero probe exit — ran fine.
+    if rc3 == 124 || rc3 == 125 || rc3 == 126 || rc3 == 127 {
+        return false
+    }
+    return true
+}
+
+# build_instrument(cc, root, tmp) — compile the instrument .o into the
+# run's own temp dir (the probe already proved the toolchain can).
+# Returns [ok, message, obj_path].
+fn build_instrument(cc: str, root: str, tmp: str) -> list[str]
+uses Fs, Proc {
+    let obj: str = tmp + "/hlrt_budget.o"
+    let rc: int = run_redirected("timeout -k 5 120 " + q(cc) + " -O2 -c "
+    + q(root + "/" + wrap_c_rel()) + " -o "
+    + q(obj), tmp + "/bi.out",
+    tmp + "/bi.err")
+    if rc != 0 {
+        return["0", "cannot compile the budget instrument:\n"
+        + read_file(tmp + "/bi.err"), obj]
+    }
+    return["1", "", obj]
+}
+
+# compile_workload(cfg, root, tmp, wrap_obj) — bin/hlc -> C ->
+# gcc -O2 binary (+ the instrument). hlc runs with cwd = the repo root
+# so `import "std.**"` resolves exactly where it resolves for every
+# other gate. Returns [ok, message, bin_path].
+fn compile_workload(cfg: Cfg, root: str, tmp: str, wrap_obj: str)
+-> list[str] uses Fs, Proc {
+    if !file_exists(cfg.hlc) {
+        return["0", "native verification needs the native compiler at "
+        + cfg.hlc + " — run `make bootstrap` first", ""]
+    }
+    let c_path: str = tmp + "/workload.c"
+    let bin_path: str = tmp + "/workload.bin"
+    let abs_workload: str = abspath_of(cfg.workload)
+    let rc1: int = run_redirected("cd " + q(root) + " && "
+    + "timeout -k 5 300 " + q(cfg.hlc) + " "
+    + q(abs_workload) + " " + q(c_path),
+    tmp + "/hlc.out", tmp + "/hlc.err")
+    if rc1 == 124 {
+        return["0", "hlc: compile timed out after 300s", ""]
+    }
+    if rc1 != 0 {
+        return["0", "hlc refused the workload:\n"
+        + read_file(tmp + "/hlc.err"), ""]
+    }
+    let rc2: int = run_redirected("timeout -k 5 300 " + q(cfg.cc)
+    + " -O2 -o " + q(bin_path) + " "
+    + q(c_path) + " -lm -pthread "
+    + q(wrap_obj) + wrap_flags_word(),
+    tmp + "/gcc.out", tmp + "/gcc.err")
+    if rc2 == 124 {
+        return["0", "gcc: compile timed out after 300s", ""]
+    }
+    if rc2 != 0 {
+        return["0", "gcc refused the workload:\n"
+        + read_file(tmp + "/gcc.err"), ""]
+    }
+    return["1", "", bin_path]
+}
+
+# ============================================================================
+# The run — the workload binary once, its stdout and stderr pinned to
+# files (the .py's pty/pipe pair has no syscall surface here; a file
+# keeps the same line stream in the same order, the same stderr tail
+# law, and none of the buffer deadlock the reader thread worked
+# around), the marker scan performed over the whole stream exactly
+# where the .py's reader performed it (stop at the first protocol
+# error), and the deadline through `timeout` itself.
+# ============================================================================
+
+# timeout_duration_word(t) — the seconds word for the `timeout`
+# wrapper: finite and positive; inf (which communicate() read as "no
+# deadline") becomes a duration no run will ever reach.
+fn timeout_duration_word(t: float) -> str {
+    if t != t {
+        return "1000000000"
+    }
+    if t > 1000000000.0 {
+        return "1000000000"
+    }
+    let w: str = fmt_fix(t, 3)
+    if w == "0.000" {
+        return "0.001"
+    }
+    return w
+}
+
+# RunOutcome — run_workload's whole result: either the run happened
+# (res valid, the analyse/render path), or the run itself refused (the
+# .py's VerifyError: the message, exit 1, no report at all).
+struct RunOutcome {
+    ran: bool,
+    msg: str,
+    res: RunRes,
+}
+
+# run_workload(cfg, passthrough, bin_path, tmp) — run the binary once
+# under the mode's environment. The environment IS the mode's
+# interface: the budgets reach the runtime as HLRT_BUDGET_*, the ledger
+# switch as HLRT_REPORT, and the warmup as HLRT_WARMUP (the runtime and
+# the tool must agree on which cycles are warmup, or enforcement and
+# verdict judge different windows). --no-enforce keeps the budgets out
+# and the judgment in this process.
+fn run_workload(cfg: Cfg, passthrough: list[str], bin_path: str,
+tmp: str) -> RunOutcome uses Fs, Proc, Clock {
+    env_set("HLRT_REPORT", "1")
+    env_set("HLRT_WARMUP", cfg.warmup.to_str())
+    if cfg.enforce {
+        env_set("HLRT_BUDGET_ALLOCS", cfg.budget_allocs.to_str())
+        env_set("HLRT_BUDGET_BYTES", cfg.budget_bytes.to_str())
+        env_set("HLRT_BUDGET_NANOS", cfg.budget_nanos.to_str())
+    } else {
+        env_unset("HLRT_BUDGET_ALLOCS")
+        env_unset("HLRT_BUDGET_BYTES")
+        env_unset("HLRT_BUDGET_NANOS")
+    }
+
+    let wl_out: str = tmp + "/wl.out"
+    let wl_err: str = tmp + "/wl.err"
+    let mut with_args: str = "timeout -k 5 " + timeout_duration_word(cfg.timeout)
+    + " " + q(bin_path)
+    let mut ai: int = 0
+    while ai < passthrough.len() {
+        with_args = with_args + " " + q(passthrough.get(ai))
+        ai = ai + 1
+    }
+
+    let t0: int = instant_now_ns()
+    let rc: int = run_redirected(with_args, wl_out, wl_err)
+    let t1: int = instant_now_ns()
+    let elapsed_s: float = (t1 - t0).to_float() / 1000000000.0
+
+    # the mode never leaks past this run
+    env_unset("HLRT_REPORT")
+    env_unset("HLRT_WARMUP")
+    env_unset("HLRT_BUDGET_ALLOCS")
+    env_unset("HLRT_BUDGET_BYTES")
+    env_unset("HLRT_BUDGET_NANOS")
+
+    let stdout_text: str = read_file(wl_out)
+    let stderr_text: str = read_file(wl_err)
+
+    # the marker scan: markers advance the observed sequence; any other
+    # line is protocol-scanned then ignored. The scan stops at the
+    # first protocol error, exactly where the .py's reader returned.
+    let markers: list[int] = []
+    let mut protocol_error: str = ""
+    let mut last_cycle: int = 0
+    let mut has_last: bool = false
+    let lines: list[str] = stdout_text.split("\n")
+    let mut li: int = 0
+    while li < lines.len() {
+        let line: str = rstrip_cr(lines.get(li))
+        if line.len() == 0 {
+            li = li + 1
+            continue
+        }
+        if line.contains(proto_stem()) && !line.starts_with(proto_cycle()) {
+            protocol_error = stem_error(line)
+            break
+        }
+        let st: int = marker_index(line)
+        if st == 0 {
+            protocol_error = marker_error(line)
+            break
+        }
+        if st == 1 {
+            li = li + 1
+            continue
+        }
+        let idx: int = marker_value(line)
+        if has_last && idx <= last_cycle {
+            protocol_error = "protocol error: cycle marker "
+            + idx.to_str() + " does not advance (previous "
+            + last_cycle.to_str() + ")"
+            break
+        }
+        last_cycle = idx
+        has_last = true
+        markers.push(idx)
+        li = li + 1
+    }
+
+    # the exit status, Popen-style: 0..128 a normal exit, -signum a
+    # signal death (the shell's 128+signum encoding folded back).
+    let mut rc_known: bool = true
+    let mut rc_val: int = rc
+    if rc < 0 {
+        rc_known = false
+        rc_val = 0
+    } else if rc > 128 {
+        rc_val = 128 - rc
+    }
+
+    # the deadline: `timeout`'s own 124. A protocol error seen along
+    # the way is the .py's early kill (the stream was corrupt; the
+    # producer died for it), not a timeout verdict.
+    let timed_out: bool = false
+    if rc == 124 {
+        if protocol_error != "" {
+            rc_val = -9
+        } else {
+            let dead: RunOutcome = RunOutcome {
+                ran: false,
+                msg: "workload timed out after " + fmt_fix(cfg.timeout, 0)
+                + "s",
+                res: empty_run_res()
+            }
+            return dead
+        }
+    }
+
+    # the last 8 KiB of stderr is the tail the ledger and the panic
+    # messages live in.
+    let mut tail: str = stderr_text
+    if tail.len() > 8192 {
+        tail = tail.slice(tail.len() - 8192, tail.len())
+    }
+
+    let res: RunRes = RunRes {
+        rc: rc_val,
+        rc_known: rc_known,
+        timed_out: timed_out,
+        markers: markers,
+        protocol_error: protocol_error,
+        report: parse_report(tail),
+        stderr_tail: tail,
+        elapsed_s: elapsed_s
+    }
+    let live: RunOutcome = RunOutcome {
+        ran: true, msg: "", res: res
+    }
+    return live
+}
+
+# ============================================================================
+# The CLI — argparse's parse_known_args grammar: the known options
+# (space- or =-separated values, unambiguous abbreviations), -h/--help,
+# the `--` separator, the first positional as the workload, and
+# EVERYTHING unrecognized riding through to the program as its argv.
+# ============================================================================
+
+struct Cli {
+    ok: bool,
+    err: str,
+    help: bool,
+    workload: str,
+    have_workload: bool, # the workload positional was seen ("" is a
+    # legal value: argparse binds it, the isfile check refuses it)
+    passthrough: list[str],
+    budget_allocs: int,
+    budget_bytes: int,
+    budget_ms: int,
+    warmup: int,
+    min_cycles: int,
+    no_enforce: bool,
+    timeout: float,
+    json_path: str,
+}
+
+fn new_cli() -> Cli {
+    let pt: list[str] = []
+    return Cli {
+        ok: true, err: "", help: false, workload: "", have_workload: false,
+        passthrough: pt,
+        budget_allocs: 0, budget_bytes: 0, budget_ms: 0,
+        warmup: 0, min_cycles: 3, no_enforce: false,
+        timeout: 120.0, json_path: ""
+    }
+}
+
+# usage_block() — argparse's wrapped usage (the 78-column form a pipe
+# environment renders; COLUMNS-dependent rewraps are the one liberty).
+fn usage_block() -> str {
+    let lines: list[str] = []
+    lines.push("usage: hls-rt [-h] [--budget-allocs N] [--budget-bytes B] "
+    + "[--budget-ms MS]")
+    lines.push("              [--warmup K] [--min-cycles N] "
+    + "[--no-enforce] [--timeout S]")
+    lines.push("              [--json PATH]")
+    lines.push("              workload")
+    return join(lines, "\n")
+}
+
+# help_text() — the -h/--help block, argparse's own layout.
+fn help_text() -> str {
+    let lines: list[str] = []
+    lines.push(usage_block())
+    lines.push("")
+    lines.push("Stage 126 soft-real-time verifier: certify that a "
+    + "workload's per-cycle")
+    lines.push("allocation traffic stays inside a budget.")
+    lines.push("")
+    lines.push("positional arguments:")
+    lines.push("  workload           the .hls workload")
+    lines.push("")
+    lines.push("options:")
+    lines.push("  -h, --help         show this help message and exit")
+    lines.push("  --budget-allocs N  max heap allocations per cycle "
+    + "(0/absent = unchecked)")
+    lines.push("  --budget-bytes B   max allocated bytes per cycle "
+    + "(0/absent = unchecked)")
+    lines.push("  --budget-ms MS     max wall-clock milliseconds per "
+    + "cycle (0/absent =")
+    lines.push("                     unchecked)")
+    lines.push("  --warmup K         the first K cycles are measured but "
+    + "not enforced (default")
+    lines.push("                     0)")
+    lines.push("  --min-cycles N     measured cycles required for a "
+    + "certification (default 3)")
+    lines.push("  --no-enforce       keep the budgets out of the "
+    + "environment: measure and")
+    lines.push("                     judge from the ledger only")
+    lines.push("  --timeout S        workload timeout in seconds "
+    + "(default 120)")
+    lines.push("  --json PATH        also write a machine-readable "
+    + "report")
+    lines.push("")
+    lines.push("extra arguments after the workload reach the program "
+    + "as its argv.")
+    return join(lines, "\n")
+}
+
+# value_ok(tok) — may tok serve as an option's value? (argparse's law:
+# a dash-led token is a value only as a negative number, or "-".)
+fn value_ok(tok: str) -> bool {
+    if tok.len() == 0 {
+        return false
+    }
+    if tok.byte_at(0) != 45 {
+        return true
+    }
+    if tok == "-" {
+        return true
+    }
+    return is_negnum(tok)
+}
+
+# all_long_options() — the registration order argparse's ambiguity
+# message lists (help first: the parser adds -h/--help at construction,
+# then the add_argument order).
+fn all_long_options() -> list[str] {
+    return["--help", "--budget-allocs", "--budget-bytes", "--budget-ms",
+    "--warmup", "--min-cycles", "--no-enforce", "--timeout",
+    "--json"]
+}
+
+# OptResolve — resolve_long's answer: the canonical option (found), or
+# an ambiguity (the candidate list), or nothing (an unrecognized
+# option rides through to the program).
+struct OptResolve {
+    found: bool,
+    canonical: str,
+    ambiguous: bool,
+    ambig: str,
+}
+
+fn resolve_long(tok: str) -> OptResolve {
+    let r: OptResolve = OptResolve {
+        found: false, canonical: "", ambiguous: false, ambig: ""
+    }
+    let opts: list[str] = all_long_options()
+    let mut hits: int = 0
+    let mut first: str = ""
+    let mut list_str: str = ""
+    let mut i: int = 0
+    while i < opts.len() {
+        let opt: str = opts.get(i)
+        if opt == tok {
+            r.found = true
+            r.canonical = opt
+            return r
+        }
+        if opt.starts_with(tok) {
+            hits = hits + 1
+            if hits == 1 {
+                first = opt
+                list_str = opt
+            } else {
+                list_str = list_str + ", " + opt
+            }
+        }
+        i = i + 1
+    }
+    if hits == 1 {
+        r.found = true
+        r.canonical = first
+        return r
+    }
+    if hits > 1 {
+        r.ambiguous = true
+        r.ambig = list_str
+    }
+    return r
+}
+
+# all_options_with_short() — the full option-string list in
+# registration order (-h/--help at construction, then add_argument
+# order): the candidate list the -=X ambiguity message spells.
+fn all_options_with_short() -> str {
+    return "-h, --help, --budget-allocs, --budget-bytes, --budget-ms, "
+    + "--warmup, --min-cycles, --no-enforce, --timeout, --json"
+}
+
+# cli_err(c, msg) — record a usage error (argparse's exit-2 shape).
+fn cli_err(c: Cli, msg: str) -> Cli {
+    c.ok = false
+    c.err = msg
+    return c
+}
+
+# apply_value_option(c, canonical, val) — one known value option's
+# parse-and-store (the error messages name the CANONICAL option, the
+# way argparse reports them).
+fn apply_value_option(c: Cli, canonical: str, val: str) -> Cli {
+    if canonical == "--json" {
+        c.json_path = val
+        return c
+    }
+    if canonical == "--timeout" {
+        let fv: list[float] = parse_float_maybe(val)
+        if fv.get(0) == 0.0 {
+            return cli_err(c, "argument " + canonical
+            + ": invalid float value: " + py_repr_bytes(val))
+        }
+        c.timeout = fv.get(1)
+        return c
+    }
+    let iv: list[int] = parse_int_maybe(val)
+    if iv.get(0) == 0 {
+        return cli_err(c, "argument " + canonical + ": invalid int value: "
+        + py_repr_bytes(val))
+    }
+    if canonical == "--budget-allocs" {
+        c.budget_allocs = iv.get(1)
+    } else if canonical == "--budget-bytes" {
+        c.budget_bytes = iv.get(1)
+    } else if canonical == "--budget-ms" {
+        c.budget_ms = iv.get(1)
+    } else if canonical == "--warmup" {
+        c.warmup = iv.get(1)
+    } else {
+        c.min_cycles = iv.get(1)
+    }
+    return c
+}
+
+# parse_cli(argv) — argparse's parse_known_args: a token that is not
+# dash-led (the empty string included), a lone "-", or a negative
+# number is a POSITIONAL (the first fills the workload, the rest ride
+# through); a single-dash bundle is dissected short-option by
+# short-option, and this parser's only short option (-h) fires the
+# moment it leads the bundle; a long option takes a space- or
+# =-separated value, unambiguous abbreviations resolve, an ambiguous
+# prefix is a usage error naming the token AS TYPED, and everything
+# unrecognized rides through to the program as its argv.
+fn parse_cli(argv: list[str]) -> Cli {
+    let c: Cli = new_cli()
+    let mut i: int = 1
+    let mut dashdash: bool = false
+    while i < argv.len() {
+        let a: str = argv.get(i)
+        if dashdash {
+            # after `--` everything is a positional
+            if !c.have_workload {
+                c.workload = a
+                c.have_workload = true
+            } else {
+                c.passthrough.push(a)
+            }
+            i = i + 1
+            continue
+        }
+        if a == "--" {
+            dashdash = true
+            i = i + 1
+            continue
+        }
+        if !a.starts_with("-") || a == "-" || is_negnum(a) {
+            # a positional token (argparse's own cut)
+            if !c.have_workload {
+                c.workload = a
+                c.have_workload = true
+            } else {
+                c.passthrough.push(a)
+            }
+            i = i + 1
+            continue
+        }
+        if !a.starts_with("--") {
+            # a short-option bundle: only -h exists, and it fires the
+            # moment it leads the bundle (argparse dissects left to
+            # right and the help action exits before the rest is read)
+            if a.byte_at(1) == 104 {
+                c.help = true
+                return c
+            }
+            # `-=...`: the '=' partition leaves a bare "-" as the
+            # prefix, every option string matches it, and argparse
+            # refuses the ambiguity naming the token as typed
+            if a.byte_at(1) == 61 {
+                return cli_err(c, "ambiguous option: " + a
+                + " could match " + all_options_with_short())
+            }
+            # no short option matches the leading char: the whole
+            # bundle is an unrecognized optional and rides through
+            c.passthrough.push(a)
+            i = i + 1
+            continue
+        }
+        # a long option, possibly with an inline =value
+        let mut head: str = a
+        let mut inline_val: str = ""
+        let mut has_inline: bool = false
+        if a.len() > 2 {
+            let eq: int = a.find("=")
+            if eq >= 0 {
+                head = a.slice(0, eq)
+                inline_val = a.slice(eq + 1, a.len())
+                has_inline = true
+            }
+        }
+        let res: OptResolve = resolve_long(head)
+        if res.ambiguous {
+            return cli_err(c, "ambiguous option: " + a
+            + " could match " + res.ambig)
+        }
+        if res.found {
+            if res.canonical == "--help" {
+                if has_inline {
+                    return cli_err(c, "argument --help: ignored explicit "
+                    + "argument " + py_repr_bytes(inline_val))
+                }
+                c.help = true
+                return c
+            }
+            if res.canonical == "--no-enforce" {
+                if has_inline {
+                    return cli_err(c, "argument --no-enforce: ignored "
+                    + "explicit argument "
+                    + py_repr_bytes(inline_val))
+                }
+                c.no_enforce = true
+                i = i + 1
+                continue
+            }
+            # a value option
+            let mut val: str = ""
+            if has_inline {
+                val = inline_val
+            } else {
+                if i + 1 >= argv.len() || !value_ok(argv.get(i + 1)) {
+                    return cli_err(c, "argument " + res.canonical
+                    + ": expected one argument")
+                }
+                val = argv.get(i + 1)
+                i = i + 1
+            }
+            let c2: Cli = apply_value_option(c, res.canonical, val)
+            if !c2.ok {
+                return c2
+            }
+            i = i + 1
+            continue
+        }
+        # everything else: an unrecognized long option rides through to
+        # the program as its argv (positional-looking tokens were routed
+        # above)
+        c.passthrough.push(a)
+        i = i + 1
+    }
+    if !c.have_workload {
+        return cli_err(c, "the following arguments are required: workload")
+    }
+    return c
+}
+
+# ============================================================================
+# The verification — one run, from the temp dir's birth to its cleanup.
+# ============================================================================
+
+# write_json_report(path, text) — [ok, message]: the .py's OSError
+# refusal (exit 2) with the errno text it printed.
+fn write_json_report(path: str, text: str) -> list[str] uses Fs {
+    if fs_is_dir(path) {
+        return["0", "cannot write the json report: "
+        + "[Errno 21] Is a directory: '" + path + "'"]
+    }
+    let parent: str = dir_of(path)
+    if parent != "." && !fs_is_dir(parent) {
+        return["0", "cannot write the json report: "
+        + "[Errno 2] No such file or directory: '" + path + "'"]
+    }
+    if parent == "." && !fs_is_dir(".") {
+        return["0", "cannot write the json report: "
+        + "[Errno 2] No such file or directory: '" + path + "'"]
+    }
+    write_file(path, text + "\n")
+    return["1", ""]
+}
+
+# verify(cli, cfg, root) — the whole certification; owns the temp dir.
+fn verify(cli: Cli, cfg: Cfg, root: str) -> int
+uses IO, Fs, Proc, Clock {
+    if !probe_wrap(cfg.cc, root) {
+        eprintln("hls-rt: the linker does not support -Wl,--wrap "
+        + "(GNU ld does; this tool has no other sensor)")
+        return 2
+    }
+    let tmp: str = mkdtemp("hlrt-")
+    let code: int = verify_in(cli, cfg, root, tmp)
+    rmrf(tmp)
+    return code
+}
+
+fn verify_in(cli: Cli, cfg: Cfg, root: str, tmp: str) -> int
+uses IO, Fs, Proc, Clock {
+    let bi: list[str] = build_instrument(cfg.cc, root, tmp)
+    if bi.get(0) != "1" {
+        eprintln("hls-rt: " + bi.get(1))
+        return 2
+    }
+    let cw: list[str] = compile_workload(cfg, root, tmp, bi.get(2))
+    if cw.get(0) != "1" {
+        eprintln("hls-rt: " + cw.get(1))
+        return 2
+    }
+
+    let rw: RunOutcome = run_workload(cfg, cli.passthrough, cw.get(2), tmp)
+    if !rw.ran {
+        eprintln("hls-rt: " + rw.msg)
+        return 1
+    }
+    let run: RunRes = rw.res
+
+    let verdict: list[str] = analyse(run, cfg)
+    println(render(run, cfg, verdict.get(0), verdict.get(1),
+    verdict.get(2)))
+
+    if cli.json_path != "" {
+        let jw: list[str] = write_json_report(
+        cli.json_path,
+        to_json(run, cfg, verdict.get(0), verdict.get(1),
+        verdict.get(2)))
+        if jw.get(0) != "1" {
+            eprintln("hls-rt: " + jw.get(1))
+            return 2
+        }
+    }
+
+    if verdict.get(0) == verdict_bounded() {
+        return 0
+    }
+    return 1
+}
+
+# ============================================================================
+# main.
+# ============================================================================
+
+fn main() -> int uses IO, Fs, Proc, Clock, Args, Exit {
+    let argv: list[str] = args()
+    let cli: Cli = parse_cli(argv)
+    if cli.help {
+        println(help_text())
+        return 0
+    }
+    if !cli.ok {
+        eprintln(usage_block())
+        eprintln("hls-rt: error: " + cli.err)
+        return 2
+    }
+
+    let workload: str = cli.workload
+    if !file_exists(workload) {
+        eprintln("hls-rt: no such workload: " + workload)
+        return 2
+    }
+    if !workload.ends_with(".hls") {
+        eprintln("hls-rt: the workload must be a .hls program: "
+        + workload)
+        return 2
+    }
+    if cli.budget_allocs < 0 || cli.budget_bytes < 0 || cli.budget_ms < 0 {
+        eprintln("hls-rt: budgets must be non-negative")
+        return 2
+    }
+    if cli.budget_allocs == 0 && cli.budget_bytes == 0
+    && cli.budget_ms == 0 {
+        eprintln("hls-rt: nothing to bound — set at least one of "
+        + "--budget-allocs/--budget-bytes/--budget-ms (the "
+        + "model's rule: a budget with every axis 0 is not a "
+        + "mode)")
+        return 2
+    }
+    if cli.warmup < 0 {
+        eprintln("hls-rt: --warmup must be >= 0")
+        return 2
+    }
+    if cli.min_cycles < 1 {
+        eprintln("hls-rt: --min-cycles must be >= 1")
+        return 2
+    }
+    if cli.timeout <= 0.0 {
+        eprintln("hls-rt: --timeout must be > 0")
+        return 2
+    }
+
+    let mut cc: str = "gcc"
+    if env_has("CC") {
+        cc = env_get("CC")
+    }
+    if !which_cc(cc) {
+        eprintln("hls-rt: no C compiler (" + cc + ") — the mode is a "
+        + "property of the native runtime")
+        return 2
+    }
+
+    let root: str = repo_root()
+    # the .py's Python ints are unbounded; i64 is not. A --budget-ms
+    # past ~9.2e9 seconds would overflow the nanos product — saturate
+    # at the i64 max (any deadline past 292 years is 'off' to every
+    # real cycle the ledger will ever close).
+    let mut budget_nanos: int = 9223372036854775807
+    if cli.budget_ms <= 9223372036854 {
+        budget_nanos = cli.budget_ms * 1000000
+    }
+    let cfg: Cfg = Cfg {
+        workload: workload,
+        budget_allocs: cli.budget_allocs,
+        budget_bytes: cli.budget_bytes,
+        budget_nanos: budget_nanos,
+        warmup: cli.warmup,
+        min_cycles: cli.min_cycles,
+        enforce: !cli.no_enforce,
+        timeout: cli.timeout,
+        hlc: root + "/bin/hlc",
+        cc: cc
+    }
+    return verify(cli, cfg, root)
+}
+
+# ============================================================================
+# End of tools/hls-rt.hls
+# ============================================================================
