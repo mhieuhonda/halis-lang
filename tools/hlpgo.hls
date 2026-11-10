@@ -1,0 +1,1417 @@
+# ============================================================================
+# tools/hlpgo.hls — the PGO profile utilities (report / merge / diff), the
+# Halis twin of tools/hlpgo.py (Stage 19 perfection, v0.38.0-alpha).
+# ----------------------------------------------------------------------------
+# Three offline operations on .hlcprof text profiles, byte-compatible with
+# the Python original — same output lines, same exit codes:
+#
+#   hlpgo report <profile> [--top N]     hotness report (hottest functions
+#                                        by entry count, branch bias
+#                                        summary, loop back-edge counts)
+#   hlpgo merge  <out> <in1> <in2>...    merge profiles (per-site sums),
+#                                        always writing the v1 header
+#   hlpgo diff   <p1> <p2>               per-site delta report
+#                                        [--min-delta N]
+#
+# The profile format (see hlpgo.py, the normative spec):
+#     <site_id> <count>
+# with site ids e:fn / b:fn:n / l:fn:n, an optional "# hlcprof v1"
+# first line (v1), otherwise the headerless v0 release format.
+#
+# Fidelity notes (the port keeps the Python behaviour byte-for-byte):
+#   - dict semantics: insertion order with update-in-place, reproduced with
+#     parallel lists (lookup + add), so tie-breaking in the top-N table
+#     matches Python's stable sorted().
+#   - Python int() semantics for counts and --top/--min-delta values
+#     (surrounding whitespace, +/- sign, underscores between digits).
+#   - Python str.strip()/split(None, 1) whitespace semantics, and Python
+#     repr() quoting for the error messages.
+#   - format(x, "5.1f") is reproduced exactly: correct rounding of the
+#     binary double's decimal expansion, ties to even — the integer
+#     m*2^e decomposition of the value is rounded with int64 arithmetic
+#     (see pct_raw). std.fmt's helper rounds x*10 instead and double
+#     rounds at ties (0.35 -> "0.4" instead of Python's "0.3"), so the
+#     logic is implemented here from scratch.
+#   - argparse's subcommand grammar is reproduced: -h/--help texts,
+#     usage errors, "invalid choice", "unrecognized arguments" (extras in
+#     stream order), option abbreviations (--t -> --top), the "--"
+#     separator, negative-number-looking values, and the "=" forms.
+#
+# Known residual divergences (documented, unreachable for real profiles):
+#   - counts outside int64 (Python ints are unbounded; sums stay in range
+#     for any profile a 64-bit runtime could produce).
+#   - percentages >= 9.2e17 (needs |counts| ~ 1e16) fall back to the
+#     Display form in pct_raw().
+#   - non-ASCII bytes inside a repr()'d value: Python keeps printable
+#     Unicode; this port escapes every byte >= 0x80 as \xNN.
+#   - non-UTF-8 profile files: the Python tool dies with a traceback;
+#     this port reads them as bytes.
+#   - Unicode decimal digits in counts (int() accepts them; this parser
+#     is ASCII-digit only).
+#
+# Usage:
+#   bin/hlc tools/hlpgo.hls /tmp/hlpgo.c
+#   gcc -O2 -o bin/hlpgo /tmp/hlpgo.c -lm -pthread
+#   bin/hlpgo report path/to/foo.hlcprof [--top N]
+# ============================================================================
+
+# ============================================================================
+# Constants.
+# ============================================================================
+
+fn magic_header() -> str {
+    return "# hlcprof v1"
+}
+
+# ============================================================================
+# Python-compat primitives: whitespace, strip, repr, int().
+# ============================================================================
+
+# is_py_space — Python's str.isspace() for the ASCII range that matters:
+# space, \t, \n, \v, \f, \r.
+fn is_py_space(b: int) -> bool {
+    return b == 32 || (b >= 9 && b <= 13)
+}
+
+# py_strip — Python str.strip() over the same set.
+fn py_strip(s: str) -> str {
+    let n: int = s.len()
+    let mut a: int = 0
+    while a < n && is_py_space(s.byte_at(a)) {
+        a = a + 1
+    }
+    let mut b: int = n - 1
+    while b >= a && is_py_space(s.byte_at(b)) {
+        b = b - 1
+    }
+    if b < a {
+        return ""
+    }
+    return s.slice(a, b + 1)
+}
+
+fn is_digit_b(b: int) -> bool {
+    return b >= 48 && b <= 57
+}
+
+# hex2 — two lowercase hex digits, for repr()'s \xNN escapes.
+fn hex2(n: int) -> str {
+    let hi: int = n / 16
+    let lo: int = n % 16
+    let mut out: str = ""
+    if hi < 10 {
+        out = chr(48 + hi)
+    } else {
+        out = chr(87 + hi)
+    }
+    if lo < 10 {
+        out = out + chr(48 + lo)
+    } else {
+        out = out + chr(87 + lo)
+    }
+    return out
+}
+
+# py_repr — Python repr() for a string (ASCII domain): single quotes by
+# default, double quotes when the text contains ' but not ", \' escaping
+# when it contains both, \\ \n \t \r escapes, \xNN for the other
+# non-printables.
+fn py_repr(s: str) -> str {
+    let has_sq: bool = s.contains("'")
+    let has_dq: bool = s.contains("\"")
+    let mut quote: int = 39
+    let mut escape_sq: bool = false
+    if has_sq && has_dq {
+        escape_sq = true
+    } else if has_sq {
+        quote = 34
+    }
+    let mut out: str = ""
+    let n: int = s.len()
+    let mut i: int = 0
+    while i < n {
+        let b: int = s.byte_at(i)
+        if b == 92 {
+            out = out + "\\\\"
+        } else if b == 10 {
+            out = out + "\\n"
+        } else if b == 9 {
+            out = out + "\\t"
+        } else if b == 13 {
+            out = out + "\\r"
+        } else if escape_sq && b == 39 {
+            out = out + "\\'"
+        } else if b < 32 || b == 127 {
+            out = out + "\\x" + hex2(b)
+        } else if b >= 128 {
+            # Python keeps printable non-ASCII; this port escapes the byte
+            # (documented divergence, ASCII-only profiles are unaffected).
+            out = out + "\\x" + hex2(b)
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    let q: str = chr(quote)
+    return q + out + q
+}
+
+struct IntParse {
+    ok: bool,
+    val: int
+}
+
+# py_int — Python int(s): surrounding whitespace, optional +/-, digits
+# with single underscores strictly between digits. ASCII digits only.
+fn py_int(s: str) -> IntParse {
+    let n: int = s.len()
+    let mut i: int = 0
+    while i < n && is_py_space(s.byte_at(i)) {
+        i = i + 1
+    }
+    let mut sign: int = 1
+    if i < n {
+        let b: int = s.byte_at(i)
+        if b == 43 {
+            i = i + 1
+        } else if b == 45 {
+            sign = 0 - 1
+            i = i + 1
+        }
+    }
+    if i >= n {
+        return IntParse { ok: false, val: 0 }
+    }
+    if !is_digit_b(s.byte_at(i)) {
+        return IntParse { ok: false, val: 0 }
+    }
+    # the significant run: digits and underscores
+    let mut j: int = i
+    while j < n {
+        let b: int = s.byte_at(j)
+        if is_digit_b(b) || b == 95 {
+            j = j + 1
+        } else {
+            break
+        }
+    }
+    # only whitespace may follow the run
+    let mut k: int = j
+    while k < n {
+        if !is_py_space(s.byte_at(k)) {
+            return IntParse { ok: false, val: 0 }
+        }
+        k = k + 1
+    }
+    # every underscore must sit between two digits
+    let mut p: int = i
+    while p < j {
+        if s.byte_at(p) == 95 {
+            if p == i {
+                return IntParse { ok: false, val: 0 }
+            }
+            if !is_digit_b(s.byte_at(p - 1)) {
+                return IntParse { ok: false, val: 0 }
+            }
+            if p + 1 >= j {
+                return IntParse { ok: false, val: 0 }
+            }
+            if !is_digit_b(s.byte_at(p + 1)) {
+                return IntParse { ok: false, val: 0 }
+            }
+        }
+        p = p + 1
+    }
+    let mut val: int = 0
+    let mut q: int = i
+    while q < j {
+        let b: int = s.byte_at(q)
+        if b != 95 {
+            val = val * 10 + (b - 48)
+        }
+        q = q + 1
+    }
+    if sign < 0 {
+        val = 0 - val
+    }
+    return IntParse { ok: true, val: val }
+}
+
+# ============================================================================
+# Formatting: padding, signs, ordering, slicing.
+# ============================================================================
+
+fn pad_left_spaces(s: str, w: int) -> str {
+    let mut out: str = s
+    while out.len() < w {
+        out = " " + out
+    }
+    return out
+}
+
+fn pad_right_spaces(s: str, w: int) -> str {
+    let mut out: str = s
+    while out.len() < w {
+        out = out + " "
+    }
+    return out
+}
+
+# fmt_plus — Python's {v:+d}: always a sign for the non-negatives.
+fn fmt_plus(v: int) -> str {
+    if v >= 0 {
+        return "+" + v.to_str()
+    }
+    return v.to_str()
+}
+
+# cmp_str — Python str ordering (code points); UTF-8 byte order agrees
+# with code-point order, so a byte comparison is exact.
+fn cmp_str(a: str, b: str) -> int {
+    let mut n: int = a.len()
+    if b.len() < n {
+        n = b.len()
+    }
+    let mut i: int = 0
+    while i < n {
+        let x: int = a.byte_at(i)
+        let y: int = b.byte_at(i)
+        if x < y {
+            return -1
+        }
+        if x > y {
+            return 1
+        }
+        i = i + 1
+    }
+    if a.len() < b.len() {
+        return -1
+    }
+    if a.len() > b.len() {
+        return 1
+    }
+    return 0
+}
+
+# Stable insertion sorts (Python sorted()/list.sort() are stable; equal
+# keys keep encounter order, which the top-N tables depend on).
+
+fn sort_strs(xs: list[str]) -> list[str] {
+    let n: int = xs.len()
+    let out: list[str] = []
+    let mut k: int = 0
+    while k < n {
+        out.push("")
+        k = k + 1
+    }
+    let mut filled: int = 0
+    let mut i: int = 0
+    while i < n {
+        let v: str = xs.get(i)
+        let mut j: int = filled
+        while j > 0 && cmp_str(out.get(j - 1), v) > 0 {
+            out.set(j, out.get(j - 1))
+            j = j - 1
+        }
+        out.set(j, v)
+        filled = filled + 1
+        i = i + 1
+    }
+    return out
+}
+
+struct SiteCount {
+    sid: str,
+    count: int
+}
+
+fn sort_sites_desc(xs: list[SiteCount]) -> list[SiteCount] {
+    let n: int = xs.len()
+    let out: list[SiteCount] = []
+    let mut k: int = 0
+    while k < n {
+        out.push(SiteCount { sid: "", count: 0 })
+        k = k + 1
+    }
+    let mut filled: int = 0
+    let mut i: int = 0
+    while i < n {
+        let v: SiteCount = xs.get(i)
+        let mut j: int = filled
+        while j > 0 && out.get(j - 1).count < v.count {
+            out.set(j, out.get(j - 1))
+            j = j - 1
+        }
+        out.set(j, v)
+        filled = filled + 1
+        i = i + 1
+    }
+    return out
+}
+
+struct BranchRow {
+    n: int,
+    t: int,
+    f: int
+}
+
+fn sort_rows_by_n(xs: list[BranchRow]) -> list[BranchRow] {
+    let n: int = xs.len()
+    let out: list[BranchRow] = []
+    let mut k: int = 0
+    while k < n {
+        out.push(BranchRow { n: 0, t: 0, f: 0 })
+        k = k + 1
+    }
+    let mut filled: int = 0
+    let mut i: int = 0
+    while i < n {
+        let v: BranchRow = xs.get(i)
+        let mut j: int = filled
+        while j > 0 && out.get(j - 1).n > v.n {
+            out.set(j, out.get(j - 1))
+            j = j - 1
+        }
+        out.set(j, v)
+        filled = filled + 1
+        i = i + 1
+    }
+    return out
+}
+
+# take_items — Python's list[:n] slice (n < 0 keeps all but the last |n|).
+fn take_items(items: list[SiteCount], n: int) -> list[SiteCount] {
+    let total: int = items.len()
+    let mut lim: int = n
+    if lim < 0 {
+        lim = total + n
+        if lim < 0 {
+            lim = 0
+        }
+    }
+    if lim > total {
+        lim = total
+    }
+    let out: list[SiteCount] = []
+    let mut i: int = 0
+    while i < lim {
+        out.push(items.get(i))
+        i = i + 1
+    }
+    return out
+}
+
+# ============================================================================
+# pct_raw / fmt_5_1f — Python's format(x, ".1f") / f"{x:5.1f}", exactly.
+# ----------------------------------------------------------------------------
+# The decimal expansion of a double is finite (binary fractions), so the
+# correct 1-decimal rounding is integer arithmetic on m * 2^e:
+#
+#   x = m * 2^e  (m in [2^52, 2^53) after normalising to [1,2))
+#   x*10 = 10m / 2^(52-e)   ->  q0 = floor, r = remainder, ties to even
+#
+# The guard x < 2^-5 (0.03125) covers every x that rounds to 0.0; the
+# upper guard 9.2e17 keeps q = x*10 inside int64.
+# ============================================================================
+fn pct_raw(x: float) -> str {
+    if x < 0.0 {
+        return "-" + pct_raw(0.0 - x)
+    }
+    if x == 0.0 {
+        # -0.0 prints as "-0.0"; detect it without bit ops.
+        if 1.0 / x < 0.0 {
+            return "-0.0"
+        }
+        return "0.0"
+    }
+    if x < 0.03125 {
+        # x < 2^-5  ->  x*10 < 0.5  ->  q = 0
+        return "0.0"
+    }
+    if x >= 920000000000000000.0 {
+        # outside the int64-exact domain (needs counts ~1e16); documented
+        # fallback — unreachable for real profiles.
+        return x.to_str()
+    }
+    # normalise x into [1, 2), counting the exponent.
+    let mut e: int = 0
+    let mut xn: float = x
+    while xn >= 2.0 {
+        xn = xn / 2.0
+        e = e + 1
+    }
+    while xn < 1.0 {
+        xn = xn * 2.0
+        e = e - 1
+    }
+    # m = xn * 2^52 — exact (xn carries at most 52 fraction bits).
+    let m: int = (xn * 4503599627370496.0).to_int()
+    let d: int = 52 - e
+    if d <= 0 {
+        # x is an integer >= 2^52 here; q = 10m*2^(-d) = x*10 exactly.
+        let mut q: int = 10 * m
+        let mut k: int = 0
+        while k < 0 - d {
+            q = q * 2
+            k = k + 1
+        }
+        return (q / 10).to_str() + "." + (q % 10).to_str()
+    }
+    let mut pow2: int = 1
+    let mut k: int = 0
+    while k < d {
+        pow2 = pow2 * 2
+        k = k + 1
+    }
+    let tm: int = 10 * m
+    let q0: int = tm / pow2
+    let r: int = tm % pow2
+    let half: int = pow2 / 2
+    let mut q: int = q0
+    if r > half {
+        q = q0 + 1
+    } else if r == half {
+        if q0 % 2 == 1 {
+            q = q0 + 1
+        }
+    }
+    return (q / 10).to_str() + "." + (q % 10).to_str()
+}
+
+fn fmt_5_1f(x: float) -> str {
+    return pad_left_spaces(pct_raw(x), 5)
+}
+
+# ============================================================================
+# Profile parsing (hlpgo.py parse_profile, normative).
+# ============================================================================
+
+struct Profile {
+    ok: bool,
+    err: str,
+    sids: list[str],
+    vals: list[int],
+    version: str
+}
+
+fn bad_profile(msg: str) -> Profile {
+    return Profile {
+        ok: false, err: msg, sids: [], vals: [], version: "v0"
+    }
+}
+
+fn good_profile(sids: list[str], vals: list[int], version: str) -> Profile {
+    return Profile {
+        ok: true, err: "", sids: sids, vals: vals, version: version
+    }
+}
+
+# prof_count — counts.get(sid, 0).
+fn prof_count(p: Profile, sid: str) -> int {
+    let mut i: int = 0
+    while i < p.sids.len() {
+        if p.sids.get(i) == sid {
+            return p.vals.get(i)
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+# list_count — same lookup over parallel lists (the merge accumulator).
+fn list_count(sids: list[str], vals: list[int], sid: str) -> int {
+    let mut i: int = 0
+    while i < sids.len() {
+        if sids.get(i) == sid {
+            return vals.get(i)
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+# prof_add — counts[site] = counts.get(site, 0) + count with Python dict
+# placement: an existing key keeps its position, a new key is appended.
+fn prof_add(sids: list[str], vals: list[int], sid: str, count: int) -> void {
+    let mut i: int = 0
+    while i < sids.len() {
+        if sids.get(i) == sid {
+            vals.set(i, vals.get(i) + count)
+            return
+        }
+        i = i + 1
+    }
+    sids.push(sid)
+    vals.push(count)
+}
+
+# parse_profile — read one .hlcprof file. Version "v1" when the first
+# line (stripped) is the magic header, "v0" otherwise.
+fn parse_profile(path: str) -> Profile uses Fs {
+    if !file_exists(path) {
+        return bad_profile("profile not found: " + path)
+    }
+    let mut text: str = read_file(path)
+    let mut version: str = "v0"
+    let nl: int = text.find("\n")
+    let mut head_line: str = text
+    if nl >= 0 {
+        head_line = text.slice(0, nl)
+    }
+    if py_strip(head_line) == magic_header() {
+        version = "v1"
+        if nl >= 0 {
+            text = text.slice(nl + 1, text.len())
+        } else {
+            text = ""
+        }
+    }
+    let sids: list[str] = []
+    let vals: list[int] = []
+    let lines: list[str] = text.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let raw: str = lines.get(i)
+        let line: str = py_strip(raw)
+        if line.len() == 0 || line.starts_with("#") {
+            i = i + 1
+            continue
+        }
+        # line.split(None, 1): the first whitespace run separates the site
+        # id from the count; the remainder keeps any interior whitespace.
+        let mut ws_start: int = -1
+        let mut j: int = 0
+        while j < line.len() {
+            if is_py_space(line.byte_at(j)) {
+                ws_start = j
+                break
+            }
+            j = j + 1
+        }
+        if ws_start < 0 {
+            return bad_profile("malformed profile line in " + path
+                + ": " + py_repr(raw))
+        }
+        let mut ws_end: int = ws_start
+        while ws_end < line.len() && is_py_space(line.byte_at(ws_end)) {
+            ws_end = ws_end + 1
+        }
+        let site: str = line.slice(0, ws_start)
+        let count_str: str = line.slice(ws_end, line.len())
+        let ip: IntParse = py_int(count_str)
+        if !ip.ok {
+            return bad_profile("malformed count for site '" + site
+                + "' in " + path + ": " + py_repr(count_str))
+        }
+        prof_add(sids, vals, site, ip.val)
+        i = i + 1
+    }
+    return good_profile(sids, vals, version)
+}
+
+# ============================================================================
+# report (hlpgo.py cmd_report, normative).
+# ============================================================================
+
+fn cmd_report(path: str, top_n: int) -> int uses IO, Fs {
+    let p: Profile = parse_profile(path)
+    if !p.ok {
+        eprintln("error: " + p.err)
+        return 2
+    }
+    if p.sids.len() == 0 {
+        eprintln(path + ": empty profile (no sites)")
+        return 1
+    }
+    # entries: every site, sorted by count descending, stable (ties keep
+    # insertion order) — Python sorted(counts.items(), key=-count).
+    let items: list[SiteCount] = []
+    let mut i: int = 0
+    while i < p.sids.len() {
+        items.push(SiteCount { sid: p.sids.get(i), count: p.vals.get(i) })
+        i = i + 1
+    }
+    let entries: list[SiteCount] = sort_sites_desc(items)
+    # site classes, in dict order.
+    let fn_sites: list[str] = []
+    let branch_sites: list[str] = []
+    let loop_sites: list[str] = []
+    i = 0
+    while i < p.sids.len() {
+        let sid: str = p.sids.get(i)
+        if sid.starts_with("e:") {
+            fn_sites.push(sid)
+        }
+        if sid.starts_with("b:") {
+            branch_sites.push(sid)
+        }
+        if sid.starts_with("l:") {
+            loop_sites.push(sid)
+        }
+        i = i + 1
+    }
+    let mut total_calls: int = 0
+    i = 0
+    while i < fn_sites.len() {
+        total_calls = total_calls + prof_count(p, fn_sites.get(i))
+        i = i + 1
+    }
+    println("profile: " + path)
+    let mut fmt_note: str = "no header"
+    if p.version == "v1" {
+        fmt_note = magic_header()
+    }
+    println("format : " + p.version + " (" + fmt_note + ")")
+    println("sites  : " + p.sids.len().to_str() + " total ("
+        + fn_sites.len().to_str() + " fn, " + branch_sites.len().to_str()
+        + " branch, " + loop_sites.len().to_str() + " loop)")
+    println("calls  : " + total_calls.to_str()
+        + " (sum of fn-entry counts)")
+    println("")
+    println("top " + top_n.to_str()
+        + " hottest functions (by entry count):")
+    let fn_all: list[SiteCount] = []
+    i = 0
+    while i < entries.len() {
+        if entries.get(i).sid.starts_with("e:") {
+            fn_all.push(entries.get(i))
+        }
+        i = i + 1
+    }
+    let top_fns: list[SiteCount] = take_items(fn_all, top_n)
+    i = 0
+    while i < top_fns.len() {
+        let it: SiteCount = top_fns.get(i)
+        let fn_name: str = it.sid.slice(2, it.sid.len())
+        let mut pct: float = 0.0
+        if total_calls != 0 {
+            pct = (100.0 * it.count.to_float()) / total_calls.to_float()
+        }
+        println("  " + pad_left_spaces((i + 1).to_str(), 4) + ". "
+            + pad_left_spaces(it.count.to_str(), 12) + "  "
+            + fmt_5_1f(pct) + "%  " + fn_name)
+        i = i + 1
+    }
+    println("")
+    println("branch bias summary (true-count / false-count):")
+    # by_fn: fn -> [(n, true, false)], grouped over branch sites in dict
+    # order; the false count is inferred as max(entry - true, 0).
+    let by_names: list[str] = []
+    let by_rows: list[list[BranchRow]] = []
+    i = 0
+    while i < branch_sites.len() {
+        let sid: str = branch_sites.get(i)
+        let rest: str = sid.slice(2, sid.len())
+        # rest.rsplit(":", 1): the LAST colon splits fn / n.
+        let mut colon: int = -1
+        let mut ci: int = rest.len() - 1
+        while ci >= 0 {
+            if rest.byte_at(ci) == 58 {
+                colon = ci
+                break
+            }
+            ci = ci - 1
+        }
+        if colon < 0 {
+            i = i + 1
+            continue
+        }
+        let fn_name: str = rest.slice(0, colon)
+        let n_str: str = rest.slice(colon + 1, rest.len())
+        let np: IntParse = py_int(n_str)
+        if !np.ok {
+            i = i + 1
+            continue
+        }
+        if sid.ends_with("_f") {
+            i = i + 1
+            continue
+        }
+        let true_c: int = prof_count(p, sid)
+        let entry_c: int = prof_count(p, "e:" + fn_name)
+        let mut false_c: int = entry_c - true_c
+        if false_c < 0 {
+            false_c = 0
+        }
+        let mut bi: int = 0
+        let mut found: bool = false
+        while bi < by_names.len() {
+            if by_names.get(bi) == fn_name {
+                by_rows.get(bi).push(BranchRow { n: np.val, t: true_c, f: false_c })
+                found = true
+                break
+            }
+            bi = bi + 1
+        }
+        if !found {
+            by_names.push(fn_name)
+            let rows: list[BranchRow] = []
+            rows.push(BranchRow { n: np.val, t: true_c, f: false_c })
+            by_rows.push(rows)
+        }
+        i = i + 1
+    }
+    let sorted_fns: list[str] = sort_strs(by_names)
+    i = 0
+    while i < sorted_fns.len() {
+        let fn_name: str = sorted_fns.get(i)
+        let mut bi: int = 0
+        while bi < by_names.len() {
+            if by_names.get(bi) == fn_name {
+                break
+            }
+            bi = bi + 1
+        }
+        let rows: list[BranchRow] = sort_rows_by_n(by_rows.get(bi))
+        let mut ri: int = 0
+        while ri < rows.len() {
+            let row: BranchRow = rows.get(ri)
+            let total: int = row.t + row.f
+            if total == 0 {
+                ri = ri + 1
+                continue
+            }
+            let mut bias: str = "false"
+            if row.t >= row.f {
+                bias = "true"
+            }
+            let pct: float = (100.0 * row.t.to_float()) / total.to_float()
+            println("  " + fn_name + ":" + row.n.to_str() + "  true="
+                + pad_left_spaces(row.t.to_str(), 8) + "  false="
+                + pad_left_spaces(row.f.to_str(), 8) + "  ("
+                + fmt_5_1f(pct) + "% true, bias=" + bias + ")")
+            ri = ri + 1
+        }
+        i = i + 1
+    }
+    println("")
+    println("loop back-edge counts:")
+    let loop_all: list[SiteCount] = []
+    i = 0
+    while i < entries.len() {
+        if entries.get(i).sid.starts_with("l:") {
+            loop_all.push(entries.get(i))
+        }
+        i = i + 1
+    }
+    let top_loops: list[SiteCount] = take_items(loop_all, top_n)
+    i = 0
+    while i < top_loops.len() {
+        let it: SiteCount = top_loops.get(i)
+        println("  " + pad_left_spaces(it.count.to_str(), 12) + "  " + it.sid)
+        i = i + 1
+    }
+    return 0
+}
+
+# ============================================================================
+# merge (hlpgo.py cmd_merge, normative).
+# ============================================================================
+
+fn cmd_merge(output: str, inputs: list[str]) -> int uses IO, Fs {
+    let sids: list[str] = []
+    let vals: list[int] = []
+    let mut i: int = 0
+    while i < inputs.len() {
+        let p: Profile = parse_profile(inputs.get(i))
+        if !p.ok {
+            eprintln("error: " + p.err)
+            return 2
+        }
+        let mut j: int = 0
+        while j < p.sids.len() {
+            prof_add(sids, vals, p.sids.get(j), p.vals.get(j))
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let ordered: list[str] = sort_strs(sids)
+    let mut content: str = magic_header() + "\n"
+    let mut k: int = 0
+    while k < ordered.len() {
+        let sid: str = ordered.get(k)
+        content = content + sid + " " + list_count(sids, vals, sid).to_str() + "\n"
+        k = k + 1
+    }
+    write_file(output, content)
+    println("merged " + inputs.len().to_str() + " profile(s) ("
+        + sids.len().to_str() + " unique sites) -> " + output)
+    return 0
+}
+
+# ============================================================================
+# diff (hlpgo.py cmd_diff, normative).
+# ============================================================================
+
+fn cmd_diff(p1: str, p2: str, min_delta: int) -> int uses IO, Fs {
+    let c1: Profile = parse_profile(p1)
+    if !c1.ok {
+        eprintln("error: " + c1.err)
+        return 2
+    }
+    let c2: Profile = parse_profile(p2)
+    if !c2.ok {
+        eprintln("error: " + c2.err)
+        return 2
+    }
+    # sorted(set(c1) | set(c2)) — a fresh key list, then the byte sort.
+    let union: list[str] = []
+    let mut i: int = 0
+    while i < c1.sids.len() {
+        union.push(c1.sids.get(i))
+        i = i + 1
+    }
+    i = 0
+    while i < c2.sids.len() {
+        let sid: str = c2.sids.get(i)
+        let mut seen: bool = false
+        let mut j: int = 0
+        while j < union.len() {
+            if union.get(j) == sid {
+                seen = true
+                break
+            }
+            j = j + 1
+        }
+        if !seen {
+            union.push(sid)
+        }
+        i = i + 1
+    }
+    let all_sites: list[str] = sort_strs(union)
+    let diff_lines: list[str] = []
+    i = 0
+    while i < all_sites.len() {
+        let sid: str = all_sites.get(i)
+        let a: int = prof_count(c1, sid)
+        let b: int = prof_count(c2, sid)
+        let delta: int = b - a
+        let mut adelta: int = delta
+        if adelta < 0 {
+            adelta = 0 - adelta
+        }
+        if adelta < min_delta {
+            i = i + 1
+            continue
+        }
+        diff_lines.push("  " + pad_right_spaces(sid, 40) + "  "
+            + pad_left_spaces(a.to_str(), 10) + " -> "
+            + pad_left_spaces(b.to_str(), 10) + "  (delta "
+            + fmt_plus(delta) + ")")
+        i = i + 1
+    }
+    if diff_lines.len() == 0 {
+        println("no sites differ by >= " + min_delta.to_str()
+            + " between " + p1 + " and " + p2)
+        return 0
+    }
+    println("sites that differ by >= " + min_delta.to_str()
+        + " (" + p1 + " -> " + p2 + "):")
+    i = 0
+    while i < diff_lines.len() {
+        println(diff_lines.get(i))
+        i = i + 1
+    }
+    return 0
+}
+
+# ============================================================================
+# CLI: the argparse twin. Usage texts and error grammar byte-compatible
+# with Python argparse over this tool's grammar.
+# ============================================================================
+
+fn usage_main(prog: str) -> str {
+    return "usage: " + prog + " [-h] {report,merge,diff} ..."
+}
+
+fn usage_report(prog: str) -> str {
+    return "usage: " + prog + " report [-h] [--top TOP] profile"
+}
+
+fn usage_merge(prog: str) -> str {
+    return "usage: " + prog + " merge [-h] output inputs [inputs ...]"
+}
+
+fn usage_diff(prog: str) -> str {
+    return "usage: " + prog + " diff [-h] [--min-delta MIN_DELTA] p1 p2"
+}
+
+fn help_main(prog: str) -> str {
+    return "usage: " + prog + " [-h] {report,merge,diff} ...\n"
+        + "\n"
+        + "PGO profile utilities (Stage 19 perfection).\n"
+        + "\n"
+        + "positional arguments:\n"
+        + "  {report,merge,diff}\n"
+        + "    report             print a hotness report for a .hlcprof file\n"
+        + "    merge              merge multiple .hlcprof files into one\n"
+        + "    diff               diff two .hlcprof files (per-site delta)\n"
+        + "\n"
+        + "options:\n"
+        + "  -h, --help           show this help message and exit\n"
+}
+
+fn help_report(prog: str) -> str {
+    return "usage: " + prog + " report [-h] [--top TOP] profile\n"
+        + "\n"
+        + "positional arguments:\n"
+        + "  profile     path to .hlcprof\n"
+        + "\n"
+        + "options:\n"
+        + "  -h, --help  show this help message and exit\n"
+        + "  --top TOP   top-N entries to show (default 20)\n"
+}
+
+fn help_merge(prog: str) -> str {
+    return "usage: " + prog + " merge [-h] output inputs [inputs ...]\n"
+        + "\n"
+        + "positional arguments:\n"
+        + "  output      output path\n"
+        + "  inputs      input profiles\n"
+        + "\n"
+        + "options:\n"
+        + "  -h, --help  show this help message and exit\n"
+}
+
+fn help_diff(prog: str) -> str {
+    return "usage: " + prog + " diff [-h] [--min-delta MIN_DELTA] p1 p2\n"
+        + "\n"
+        + "positional arguments:\n"
+        + "  p1                    first profile\n"
+        + "  p2                    second profile\n"
+        + "\n"
+        + "options:\n"
+        + "  -h, --help            show this help message and exit\n"
+        + "  --min-delta MIN_DELTA\n"
+        + "                        minimum |delta| to report (default 1)\n"
+}
+
+# base_prog — Python's argparse prog default: basename(argv[0]).
+fn base_prog(argv: list[str]) -> str {
+    if argv.len() == 0 {
+        return "hlpgo.py"
+    }
+    let p: str = argv.get(0)
+    let mut i: int = p.len() - 1
+    while i >= 0 {
+        if p.byte_at(i) == 47 {
+            return p.slice(i + 1, p.len())
+        }
+        i = i - 1
+    }
+    return p
+}
+
+# cli_die — the argparse error shape: usage line, "{prog}[ ctx]: error: ...",
+# exit 2.
+fn cli_die(prog: str, ctx: str, usage: str, msg: str) -> void uses IO, Exit {
+    eprintln(usage)
+    if ctx == "" {
+        eprintln(prog + ": error: " + msg)
+    } else {
+        eprintln(prog + " " + ctx + ": error: " + msg)
+    }
+    exit(2)
+}
+
+# help_or_die — a token that resolved to the help option: either the
+# help text (stdout, exit 0) or, with an "=value" tail, argparse's
+# "ignored explicit argument" error.
+fn help_or_die(prog: str, ctx: str, usage: str, text: str, t: str) -> void uses IO, Exit {
+    let eq: int = t.find("=")
+    if eq >= 0 {
+        cli_die(prog, ctx, usage,
+            "argument -h/--help: ignored explicit argument "
+            + py_repr(t.slice(eq + 1, t.len())))
+    }
+    print(text)
+    exit(0)
+}
+
+# is_negnum — argparse's negative-number matcher ^-\d+$ | ^-\d*\.\d+$:
+# such tokens are positional/value material, not options.
+fn is_negnum(t: str) -> bool {
+    let n: int = t.len()
+    if n < 2 {
+        return false
+    }
+    if t.byte_at(0) != 45 {
+        return false
+    }
+    let mut i: int = 1
+    let mut digits: int = 0
+    while i < n {
+        let b: int = t.byte_at(i)
+        if is_digit_b(b) {
+            digits = digits + 1
+            i = i + 1
+        } else {
+            break
+        }
+    }
+    if i >= n {
+        return digits >= 1
+    }
+    if t.byte_at(i) != 46 {
+        return false
+    }
+    let mut j: int = i + 1
+    let mut fd: int = 0
+    while j < n {
+        if !is_digit_b(t.byte_at(j)) {
+            return false
+        }
+        fd = fd + 1
+        j = j + 1
+    }
+    return fd >= 1
+}
+
+# looks_option — would argparse treat the token as an optional? "-" and
+# "" are positional; "-3"/"-3.5" positional (negative numbers); every
+# other "-"-prefixed token is option-like ("--" included).
+fn looks_option(t: str) -> bool {
+    if t.len() < 2 {
+        return false
+    }
+    if t.byte_at(0) != 45 {
+        return false
+    }
+    if t == "--" {
+        return true
+    }
+    if t.byte_at(1) == 45 {
+        return true
+    }
+    if t.byte_at(1) == 104 {
+        # the -h family
+        return true
+    }
+    if is_negnum(t) {
+        return false
+    }
+    return true
+}
+
+# help_token — does this token resolve to the help option of THIS parser?
+# Single dash: the -h family. Double dash: a unique prefix of --help
+# ("--" itself only when the parser has no other long option — the
+# caller handles the ambiguous parsers separately).
+fn help_token(t: str, dash_only_option: bool) -> bool {
+    if t.len() >= 2 && t.byte_at(0) == 45 && t.byte_at(1) == 104 {
+        return true
+    }
+    if t.len() >= 3 && t.byte_at(0) == 45 && t.byte_at(1) == 45 && t != "--" {
+        let eq: int = t.find("=")
+        let mut head: str = t
+        if eq >= 0 {
+            head = t.slice(0, eq)
+        }
+        if head == "--" {
+            return dash_only_option
+        }
+        if "--help".starts_with(head) {
+            return true
+        }
+    }
+    return false
+}
+
+# join_extras — "unrecognized arguments: a b c" over main-level extras
+# (stream order) followed by sub-level extras (stream order).
+fn die_unrecognized(prog: str, pre: list[str], sub: list[str]) -> void uses IO, Exit {
+    let all: list[str] = []
+    let mut i: int = 0
+    while i < pre.len() {
+        all.push(pre.get(i))
+        i = i + 1
+    }
+    i = 0
+    while i < sub.len() {
+        all.push(sub.get(i))
+        i = i + 1
+    }
+    if all.len() == 0 {
+        return
+    }
+    eprintln(usage_main(prog))
+    eprintln(prog + ": error: unrecognized arguments: " + join(all, " "))
+    exit(2)
+}
+
+# ----------------------------------------------------------------------------
+# run_report — the report subparser.
+# ----------------------------------------------------------------------------
+fn run_report(prog: str, argv: list[str], start: int, pre: list[str]) -> int uses IO, Fs, Exit {
+    let mut top_n: int = 20
+    let mut profile: str = ""
+    let mut have_profile: bool = false
+    let mut extras: list[str] = []
+    let mut sep: bool = false
+    let mut i: int = start
+    while i < argv.len() {
+        let t: str = argv.get(i)
+        if !sep && t == "--" {
+            sep = true
+            i = i + 1
+            continue
+        }
+        if !sep && looks_option(t) {
+            if help_token(t, false) {
+                help_or_die(prog, "report", usage_report(prog), help_report(prog), t)
+            }
+            if t.byte_at(1) == 45 {
+                # long option token
+                let eq: int = t.find("=")
+                let mut head: str = t
+                if eq >= 0 {
+                    head = t.slice(0, eq)
+                }
+                if head == "--" {
+                    # "--=..." prefixes both --help and --top here
+                    cli_die(prog, "report", usage_report(prog),
+                        "ambiguous option: " + t + " could match --help, --top")
+                }
+                if "--top".starts_with(head) {
+                    if eq >= 0 {
+                        let v: str = t.slice(eq + 1, t.len())
+                        let ip: IntParse = py_int(v)
+                        if !ip.ok {
+                            cli_die(prog, "report", usage_report(prog),
+                                "argument --top: invalid int value: " + py_repr(v))
+                        }
+                        top_n = ip.val
+                    } else {
+                        if i + 1 >= argv.len() {
+                            cli_die(prog, "report", usage_report(prog),
+                                "argument --top: expected one argument")
+                        }
+                        let nt: str = argv.get(i + 1)
+                        if looks_option(nt) {
+                            cli_die(prog, "report", usage_report(prog),
+                                "argument --top: expected one argument")
+                        }
+                        let ip: IntParse = py_int(nt)
+                        if !ip.ok {
+                            cli_die(prog, "report", usage_report(prog),
+                                "argument --top: invalid int value: " + py_repr(nt))
+                        }
+                        top_n = ip.val
+                        i = i + 1
+                    }
+                    i = i + 1
+                    continue
+                }
+            }
+            extras.push(t)
+            i = i + 1
+            continue
+        }
+        # positional
+        if !have_profile {
+            profile = t
+            have_profile = true
+        } else {
+            extras.push(t)
+        }
+        i = i + 1
+    }
+    if !have_profile {
+        cli_die(prog, "report", usage_report(prog),
+            "the following arguments are required: profile")
+    }
+    die_unrecognized(prog, pre, extras)
+    return cmd_report(profile, top_n)
+}
+
+# ----------------------------------------------------------------------------
+# run_merge — the merge subparser (nargs+ inputs swallow every further
+# positional, so it never has leftover positionals).
+# ----------------------------------------------------------------------------
+fn run_merge(prog: str, argv: list[str], start: int, pre: list[str]) -> int uses IO, Fs, Exit {
+    let mut output: str = ""
+    let mut have_output: bool = false
+    let inputs: list[str] = []
+    let mut extras: list[str] = []
+    let mut sep: bool = false
+    let mut i: int = start
+    while i < argv.len() {
+        let t: str = argv.get(i)
+        if !sep && t == "--" {
+            sep = true
+            i = i + 1
+            continue
+        }
+        if !sep && looks_option(t) {
+            if help_token(t, true) {
+                # --help is merge's only long option, so a bare "--=..."
+                # also resolves to it
+                help_or_die(prog, "merge", usage_merge(prog), help_merge(prog), t)
+            }
+            extras.push(t)
+            i = i + 1
+            continue
+        }
+        # positional
+        if !have_output {
+            output = t
+            have_output = true
+        } else {
+            inputs.push(t)
+        }
+        i = i + 1
+    }
+    if !have_output {
+        cli_die(prog, "merge", usage_merge(prog),
+            "the following arguments are required: output, inputs")
+    }
+    if inputs.len() == 0 {
+        cli_die(prog, "merge", usage_merge(prog),
+            "the following arguments are required: inputs")
+    }
+    die_unrecognized(prog, pre, extras)
+    return cmd_merge(output, inputs)
+}
+
+# ----------------------------------------------------------------------------
+# run_diff — the diff subparser.
+# ----------------------------------------------------------------------------
+fn run_diff(prog: str, argv: list[str], start: int, pre: list[str]) -> int uses IO, Fs, Exit {
+    let mut min_delta: int = 1
+    let mut p1: str = ""
+    let mut p2: str = ""
+    let mut have_p1: bool = false
+    let mut have_p2: bool = false
+    let mut extras: list[str] = []
+    let mut sep: bool = false
+    let mut i: int = start
+    while i < argv.len() {
+        let t: str = argv.get(i)
+        if !sep && t == "--" {
+            sep = true
+            i = i + 1
+            continue
+        }
+        if !sep && looks_option(t) {
+            if help_token(t, false) {
+                help_or_die(prog, "diff", usage_diff(prog), help_diff(prog), t)
+            }
+            if t.byte_at(1) == 45 {
+                let eq: int = t.find("=")
+                let mut head: str = t
+                if eq >= 0 {
+                    head = t.slice(0, eq)
+                }
+                if head == "--" {
+                    cli_die(prog, "diff", usage_diff(prog),
+                        "ambiguous option: " + t + " could match --help, --min-delta")
+                }
+                if "--min-delta".starts_with(head) {
+                    if eq >= 0 {
+                        let v: str = t.slice(eq + 1, t.len())
+                        let ip: IntParse = py_int(v)
+                        if !ip.ok {
+                            cli_die(prog, "diff", usage_diff(prog),
+                                "argument --min-delta: invalid int value: " + py_repr(v))
+                        }
+                        min_delta = ip.val
+                    } else {
+                        if i + 1 >= argv.len() {
+                            cli_die(prog, "diff", usage_diff(prog),
+                                "argument --min-delta: expected one argument")
+                        }
+                        let nt: str = argv.get(i + 1)
+                        if looks_option(nt) {
+                            cli_die(prog, "diff", usage_diff(prog),
+                                "argument --min-delta: expected one argument")
+                        }
+                        let ip: IntParse = py_int(nt)
+                        if !ip.ok {
+                            cli_die(prog, "diff", usage_diff(prog),
+                                "argument --min-delta: invalid int value: " + py_repr(nt))
+                        }
+                        min_delta = ip.val
+                        i = i + 1
+                    }
+                    i = i + 1
+                    continue
+                }
+            }
+            extras.push(t)
+            i = i + 1
+            continue
+        }
+        # positional
+        if !have_p1 {
+            p1 = t
+            have_p1 = true
+        } else if !have_p2 {
+            p2 = t
+            have_p2 = true
+        } else {
+            extras.push(t)
+        }
+        i = i + 1
+    }
+    if !have_p1 {
+        cli_die(prog, "diff", usage_diff(prog),
+            "the following arguments are required: p1, p2")
+    }
+    if !have_p2 {
+        cli_die(prog, "diff", usage_diff(prog),
+            "the following arguments are required: p2")
+    }
+    die_unrecognized(prog, pre, extras)
+    return cmd_diff(p1, p2, min_delta)
+}
+
+# ============================================================================
+# main — the top-level parser: scan to the subcommand, dispatch, and the
+# main-level usage errors.
+# ============================================================================
+fn main() -> int uses IO, Fs, Args, Exit {
+    let argv: list[str] = args()
+    let prog: str = base_prog(argv)
+    let mut sep: bool = false
+    let mut cmd: str = ""
+    let pre: list[str] = []
+    let mut i: int = 1
+    while i < argv.len() {
+        let t: str = argv.get(i)
+        if !sep && t == "--" {
+            sep = true
+            i = i + 1
+            continue
+        }
+        if !sep && looks_option(t) {
+            if help_token(t, true) {
+                # --help is the only long option at this level
+                help_or_die(prog, "", usage_main(prog), help_main(prog), t)
+            }
+            pre.push(t)
+            i = i + 1
+            continue
+        }
+        # positional: the subcommand slot
+        if cmd == "" {
+            cmd = t
+            if cmd == "report" {
+                return run_report(prog, argv, i + 1, pre)
+            }
+            if cmd == "merge" {
+                return run_merge(prog, argv, i + 1, pre)
+            }
+            if cmd == "diff" {
+                return run_diff(prog, argv, i + 1, pre)
+            }
+            eprintln(usage_main(prog))
+            eprintln(prog + ": error: argument cmd: invalid choice: "
+                + py_repr(cmd) + " (choose from report, merge, diff)")
+            return 2
+        }
+        i = i + 1
+    }
+    eprintln(usage_main(prog))
+    eprintln(prog + ": error: the following arguments are required: cmd")
+    return 2
+}

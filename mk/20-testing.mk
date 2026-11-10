@@ -119,15 +119,15 @@ pgo-report: pgo $(BIN)/pgo-ratio
 #   pgo-clean                    : remove all PGO build artifacts.
 pgo-profile-report:
 	@test -n "$(F)" || (echo "Usage: make pgo-profile-report F=bin/hlc.hlcprof [--top N]" && false)
-	@python3 tools/hlpgo.py report $(F) $(if $(TOP),--top $(TOP),)
+	@$(BIN)/hlpgo report $(F) $(if $(TOP),--top $(TOP),)
 
 pgo-merge:
 	@test -n "$(OUT)" || (echo "Usage: make pgo-merge OUT=merged.hlcprof F='a.hlcprof b.hlcprof ...'" && false)
-	@python3 tools/hlpgo.py merge $(OUT) $(F)
+	@$(BIN)/hlpgo merge $(OUT) $(F)
 
 pgo-diff:
 	@test -n "$(F)" || (echo "Usage: make pgo-diff F='p1.hlcprof p2.hlcprof' [--min-delta N]" && false)
-	@python3 tools/hlpgo.py diff $(F) $(if $(MIN_DELTA),--min-delta $(MIN_DELTA),)
+	@$(BIN)/hlpgo diff $(F) $(if $(MIN_DELTA),--min-delta $(MIN_DELTA),)
 
 pgo-clean:
 	@rm -f $(BIN)/hlc_gen $(BIN)/hlc_gen.c $(BIN)/hlc_pgo $(BIN)/hlc_pgo.c \

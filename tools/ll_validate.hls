@@ -1,0 +1,1525 @@
+# ============================================================================
+# ll_validate.hls — the native Halis port of tools/ll_validate.py, the
+# structural validator for the LLVM IR text emitted by tools/llvm_emit.py.
+# ----------------------------------------------------------------------------
+# This is the guardrail that was MISSING when Stage 12-alpha shipped: the CI
+# only piped `--emit llvm` output to /dev/null, so the emitter could produce
+# structurally invalid IR (type mismatches, instructions after terminators,
+# calls to undeclared symbols, `ptr <integer>` literal operands, phi nodes
+# with dangling predecessors) and every "deep scan" still reported green.
+#
+# The port is byte-faithful to the Python original: the same defect classes
+# (V1..V8), the same messages, the same line numbers, the same exit codes
+# (0 pass / 1 failures / 2 bare invocation), the same "-"/-h/--help CLI.
+# The 13 Python `re` patterns are re-implemented by a tiny backtracking
+# regex VM compiled below (Thompson-style program: char / class / split /
+# jump / save / match instructions) — the engine replicates CPython's
+# backtracking ORDER (leftmost alternative first, greedy before lazy), so
+# every capture group lands on the same substring the Python engine picks.
+#
+# Known residual divergences (documented, all pathological for .ll input):
+#   - Python `str.strip()`/`\s` also treat Unicode whitespace; Halis works
+#     on raw bytes (ASCII semantics). Identical for ASCII .ll files.
+#   - `ln[:70]` slices bytes, not Unicode codepoints (same for ASCII).
+#   - Python `open(..., encoding="utf-8")` raises UnicodeDecodeError (exit 1
+#     traceback) on invalid UTF-8; this port validates the raw bytes.
+#   - Python text mode translates lone "\r" to "\n"; this port keeps raw
+#     bytes ("\r\n" is neutralised by .trim() on every line anyway).
+#   - A path whose PARENT is unsearchable reports errno 2 instead of 13.
+#
+# Usage (identical to the Python tool):
+#     bin/ll_validate file.ll
+#     bin/ll_validate file1.ll file2.ll ...
+#     cat file.ll | bin/ll_validate -        (read stdin)
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Character classes (ASCII semantics: the .ll dialect is ASCII).
+# ----------------------------------------------------------------------------
+
+# \w — [A-Za-z0-9_]
+fn ch_is_word(c: int) -> bool {
+    if c >= 65 && c <= 90 { return true }
+    if c >= 97 && c <= 122 { return true }
+    if c >= 48 && c <= 57 { return true }
+    if c == 95 { return true }
+    return false
+}
+
+# \s — [ \t\n\v\f\r]
+fn ch_is_space(c: int) -> bool {
+    if c == 32 { return true }
+    if c >= 9 && c <= 13 { return true }
+    return false
+}
+
+# \d — [0-9]
+fn ch_is_digit(c: int) -> bool {
+    if c >= 48 && c <= 57 { return true }
+    return false
+}
+
+# ----------------------------------------------------------------------------
+# Cls — one character class: the union of \w / \s / \d and an explicit byte
+# set, optionally negated ([^...]).
+# ----------------------------------------------------------------------------
+
+struct Cls {
+    neg: bool,
+    w: bool,          # includes \w
+    s: bool,          # includes \s
+    d: bool,          # includes \d
+    chars: str        # explicit member bytes
+}
+
+fn cls_none() -> Cls {
+    return Cls { neg: false, w: false, s: false, d: false, chars: "" }
+}
+
+fn cls_word() -> Cls {
+    return Cls { neg: false, w: true, s: false, d: false, chars: "" }
+}
+
+fn cls_space() -> Cls {
+    return Cls { neg: false, w: false, s: true, d: false, chars: "" }
+}
+
+fn cls_digit() -> Cls {
+    return Cls { neg: false, w: false, s: false, d: true, chars: "" }
+}
+
+# [\w.$-] — LLVM identifier bytes
+fn cls_sym() -> Cls {
+    return Cls { neg: false, w: true, s: false, d: false, chars: ".$-" }
+}
+
+# [\w\s]
+fn cls_wordspace() -> Cls {
+    return Cls { neg: false, w: true, s: true, d: false, chars: "" }
+}
+
+# [^,]
+fn cls_not_comma() -> Cls {
+    return Cls { neg: true, w: false, s: false, d: false, chars: "," }
+}
+
+# [^,\]]
+fn cls_not_comma_br() -> Cls {
+    return Cls { neg: true, w: false, s: false, d: false, chars: ",]" }
+}
+
+# [^"] — the class of a quoted label body
+fn cls_not_quote() -> Cls {
+    return Cls { neg: true, w: false, s: false, d: false, chars: "\"" }
+}
+
+# [0-9a-fA-F]
+fn cls_hex() -> Cls {
+    return Cls { neg: false, w: false, s: false, d: false,
+                 chars: "0123456789abcdefABCDEF" }
+}
+
+# [xX]
+fn cls_xx() -> Cls {
+    return Cls { neg: false, w: false, s: false, d: false, chars: "xX" }
+}
+
+# [eE]
+fn cls_ee() -> Cls {
+    return Cls { neg: false, w: false, s: false, d: false, chars: "eE" }
+}
+
+# [-+]
+fn cls_sign() -> Cls {
+    return Cls { neg: false, w: false, s: false, d: false, chars: "-+" }
+}
+
+# cls_has — membership test for one byte.
+fn cls_has(c: Cls, b: int) -> bool {
+    let mut inside: bool = false
+    if c.w && ch_is_word(b) { inside = true }
+    if c.s && ch_is_space(b) { inside = true }
+    if c.d && ch_is_digit(b) { inside = true }
+    let mut i: int = 0
+    while i < c.chars.len() {
+        if c.chars.byte_at(i) == b { inside = true }
+        i = i + 1
+    }
+    if c.neg { return !inside }
+    return inside
+}
+
+# ----------------------------------------------------------------------------
+# The regex VM. A compiled pattern is a flat list[Inst]; matching runs the
+# classic recursive backtracking interpreter, which reproduces CPython re's
+# exploration order (first alternative / longer repetition first).
+#
+#   op 0  char    match the byte `ch`
+#   op 1  class   match one byte in `cls`
+#   op 2  split   try pc=x first, then pc=y (captures rolled back between)
+#   op 3  jump    goto pc=x
+#   op 4  save    record the current position in capture slot `n`
+#   op 5  match   success
+#   op 6  hat     ^ (start of the subject string)
+#   op 7  dollar  $ (end, or just before a trailing "\n")
+#   op 8  dot     any byte except "\n"
+# ----------------------------------------------------------------------------
+
+struct Inst {
+    op: int,
+    ch: int,
+    cls: Cls,
+    x: int,
+    y: int,
+    n: int
+}
+
+# Caps — capture slots; group k spans slots 2k (start) and 2k+1 (end).
+struct Caps {
+    slots: list[int]
+}
+
+fn caps_new() -> Caps {
+    let s: list[int] = [-1, -1, -1, -1, -1, -1, -1, -1]
+    return Caps { slots: s }
+}
+
+fn caps_reset(caps: Caps) -> void {
+    let mut i: int = 0
+    while i < caps.slots.len() {
+        caps.slots.set(i, -1)
+        i = i + 1
+    }
+}
+
+fn caps_copy(caps: Caps) -> list[int] {
+    let out: list[int] = []
+    let mut i: int = 0
+    while i < caps.slots.len() {
+        out.push(caps.slots.get(i))
+        i = i + 1
+    }
+    return out
+}
+
+fn caps_restore(caps: Caps, saved: list[int]) -> void {
+    let mut i: int = 0
+    while i < saved.len() {
+        caps.slots.set(i, saved.get(i))
+        i = i + 1
+    }
+}
+
+# vm — run `prog` from pc at pos over s. Returns the end position of the
+# match, or -1. Captures are recorded into caps; a failed branch rolls
+# them back to its snapshot (CPython backtracking semantics).
+fn vm(prog: list[Inst], pc: int, s: str, pos: int, caps: Caps) -> int {
+    let mut my_pc: int = pc
+    let mut my_pos: int = pos
+    while true {
+        let inst: Inst = prog.get(my_pc)
+        if inst.op == 0 {
+            # char
+            if my_pos < s.len() && s.byte_at(my_pos) == inst.ch {
+                my_pc = my_pc + 1
+                my_pos = my_pos + 1
+                continue
+            }
+            return -1
+        }
+        if inst.op == 1 {
+            # class
+            if my_pos < s.len() && cls_has(inst.cls, s.byte_at(my_pos)) {
+                my_pc = my_pc + 1
+                my_pos = my_pos + 1
+                continue
+            }
+            return -1
+        }
+        if inst.op == 2 {
+            # split — first choice, then (rolled back) second choice
+            let saved: list[int] = caps_copy(caps)
+            let r: int = vm(prog, inst.x, s, my_pos, caps)
+            if r >= 0 {
+                return r
+            }
+            caps_restore(caps, saved)
+            return vm(prog, inst.y, s, my_pos, caps)
+        }
+        if inst.op == 3 {
+            # jump
+            my_pc = inst.x
+            continue
+        }
+        if inst.op == 4 {
+            # save
+            caps.slots.set(inst.n, my_pos)
+            my_pc = my_pc + 1
+            continue
+        }
+        if inst.op == 5 {
+            # match
+            return my_pos
+        }
+        if inst.op == 6 {
+            # ^ — start of the subject
+            if my_pos == 0 {
+                my_pc = my_pc + 1
+                continue
+            }
+            return -1
+        }
+        if inst.op == 7 {
+            # $ — end, or just before a trailing newline
+            if my_pos == s.len() {
+                my_pc = my_pc + 1
+                continue
+            }
+            if my_pos == s.len() - 1 && s.byte_at(my_pos) == 10 {
+                my_pc = my_pc + 1
+                continue
+            }
+            return -1
+        }
+        # op 8 — dot (any byte but "\n")
+        if my_pos < s.len() && s.byte_at(my_pos) != 10 {
+            my_pc = my_pc + 1
+            my_pos = my_pos + 1
+            continue
+        }
+        return -1
+    }
+    return -1
+}
+
+# re_match — re.compile(p).match(s): anchored at position 0 (the patterns
+# carry their own ^ where Python wrote one).
+fn re_match(prog: list[Inst], s: str, caps: Caps) -> bool {
+    caps_reset(caps)
+    if vm(prog, 0, s, 0, caps) >= 0 {
+        return true
+    }
+    return false
+}
+
+# re_search — re.compile(p).search(s): try every start position, leftmost
+# first (only the boolean outcome is ever used by the tool).
+fn re_search(prog: list[Inst], s: str, caps: Caps) -> bool {
+    let mut pos: int = 0
+    while pos <= s.len() {
+        caps_reset(caps)
+        if vm(prog, 0, s, pos, caps) >= 0 {
+            return true
+        }
+        pos = pos + 1
+    }
+    return false
+}
+
+# group_str — capture group n of the last successful match over s
+# ("" when the group did not participate, Python's None as a falsy string).
+fn group_str(caps: Caps, n: int, s: str) -> str {
+    let a: int = caps.slots.get(2 * n)
+    let b: int = caps.slots.get(2 * n + 1)
+    if a < 0 || b < 0 {
+        return ""
+    }
+    return s.slice(a, b)
+}
+
+# re_findall_group — re.compile(p).findall(s) restricted to single-group
+# patterns (both findall uses in the tool read exactly one group): every
+# non-overlapping match, left to right, empty matches advancing by one.
+fn re_findall_group(prog: list[Inst], s: str, n: int, out: list[str]) -> void {
+    let caps: Caps = caps_new()
+    let mut pos: int = 0
+    while pos <= s.len() {
+        caps_reset(caps)
+        let r: int = vm(prog, 0, s, pos, caps)
+        if r >= 0 {
+            out.push(group_str(caps, n, s))
+            if r > pos {
+                pos = r
+            } else {
+                pos = pos + 1
+            }
+        } else {
+            pos = pos + 1
+        }
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Program builders. Composite emitters below cover every quantified atom in
+# the tool's patterns (all of them are a single class or the dot); the few
+# multi-instruction optional groups / alternations are stitched by hand with
+# placeholder splits and jumps, patched once their targets are known.
+# ----------------------------------------------------------------------------
+
+fn inst_new(op: int, ch: int, cls: Cls, x: int, y: int, n: int) -> Inst {
+    return Inst { op: op, ch: ch, cls: cls, x: x, y: y, n: n }
+}
+
+fn e_char(p: list[Inst], c: int) -> void {
+    p.push(inst_new(0, c, cls_none(), -1, -1, -1))
+}
+
+fn e_lit(p: list[Inst], s: str) -> void {
+    let mut i: int = 0
+    while i < s.len() {
+        e_char(p, s.byte_at(i))
+        i = i + 1
+    }
+}
+
+fn e_hat(p: list[Inst]) -> void {
+    p.push(inst_new(6, 0, cls_none(), -1, -1, -1))
+}
+
+fn e_dollar(p: list[Inst]) -> void {
+    p.push(inst_new(7, 0, cls_none(), -1, -1, -1))
+}
+
+fn e_match(p: list[Inst]) -> void {
+    p.push(inst_new(5, 0, cls_none(), -1, -1, -1))
+}
+
+fn e_save(p: list[Inst], n: int) -> void {
+    p.push(inst_new(4, 0, cls_none(), -1, -1, n))
+}
+
+fn e_cls(p: list[Inst], cls: Cls) -> int {
+    p.push(inst_new(1, 0, cls, -1, -1, -1))
+    return p.len() - 1
+}
+
+fn e_dot(p: list[Inst]) -> int {
+    p.push(inst_new(8, 0, cls_none(), -1, -1, -1))
+    return p.len() - 1
+}
+
+fn e_split(p: list[Inst]) -> int {
+    p.push(inst_new(2, 0, cls_none(), -1, -1, -1))
+    return p.len() - 1
+}
+
+fn e_jump_ph(p: list[Inst]) -> int {
+    p.push(inst_new(3, 0, cls_none(), -1, -1, -1))
+    return p.len() - 1
+}
+
+# patch_split — set both targets of a placeholder split (x is tried first).
+fn patch_split(p: list[Inst], idx: int, x: int, y: int) -> void {
+    let it: Inst = p.get(idx)
+    p.set(idx, inst_new(it.op, it.ch, it.cls, x, y, it.n))
+}
+
+# patch_jump — set the target of a placeholder jump.
+fn patch_jump(p: list[Inst], idx: int, t: int) -> void {
+    let it: Inst = p.get(idx)
+    p.set(idx, inst_new(it.op, it.ch, it.cls, t, it.y, it.n))
+}
+
+# e_star_cls — `cls*`; greedy tries another repetition first, lazy exits.
+fn e_star_cls(p: list[Inst], cls: Cls, greedy: bool) -> void {
+    let sp: int = e_split(p)
+    let body: int = e_cls(p, cls)
+    e_jump_ph(p)
+    let jump: int = p.len() - 1
+    patch_jump(p, jump, sp)
+    let after: int = p.len()
+    if greedy {
+        patch_split(p, sp, body, after)
+    } else {
+        patch_split(p, sp, after, body)
+    }
+}
+
+# e_plus_cls — `cls+` (one mandatory body, then the star choice).
+fn e_plus_cls(p: list[Inst], cls: Cls, greedy: bool) -> void {
+    let body: int = e_cls(p, cls)
+    let sp: int = e_split(p)
+    let after: int = p.len()
+    if greedy {
+        patch_split(p, sp, body, after)
+    } else {
+        patch_split(p, sp, after, body)
+    }
+}
+
+# e_star_dot — `.*` (greedy in every pattern that uses it).
+fn e_star_dot(p: list[Inst], greedy: bool) -> void {
+    let sp: int = e_split(p)
+    let body: int = e_dot(p)
+    let jump: int = e_jump_ph(p)
+    patch_jump(p, jump, sp)
+    let after: int = p.len()
+    if greedy {
+        patch_split(p, sp, body, after)
+    } else {
+        patch_split(p, sp, after, body)
+    }
+}
+
+# ----------------------------------------------------------------------------
+# The 13 patterns of tools/ll_validate.py, in source order.
+# ----------------------------------------------------------------------------
+
+# DEFINE: ^define\s+[\w\s]*?@([\w.$-]+)\s*\(
+fn prog_define() -> list[Inst] {
+    let p: list[Inst] = []
+    e_hat(p)
+    e_lit(p, "define")
+    e_plus_cls(p, cls_space(), true)
+    e_star_cls(p, cls_wordspace(), false)
+    e_char(p, 64)
+    e_save(p, 2)
+    e_plus_cls(p, cls_sym(), true)
+    e_save(p, 3)
+    e_star_cls(p, cls_space(), true)
+    e_char(p, 40)
+    e_match(p)
+    return p
+}
+
+# DECLARE: ^declare\s+[\w\s]*?@([\w.$-]+)\s*\(
+fn prog_declare() -> list[Inst] {
+    let p: list[Inst] = []
+    e_hat(p)
+    e_lit(p, "declare")
+    e_plus_cls(p, cls_space(), true)
+    e_star_cls(p, cls_wordspace(), false)
+    e_char(p, 64)
+    e_save(p, 2)
+    e_plus_cls(p, cls_sym(), true)
+    e_save(p, 3)
+    e_star_cls(p, cls_space(), true)
+    e_char(p, 40)
+    e_match(p)
+    return p
+}
+
+# GLOBAL: ^@([\w.$-]+)\s*=
+fn prog_global() -> list[Inst] {
+    let p: list[Inst] = []
+    e_hat(p)
+    e_char(p, 64)
+    e_save(p, 2)
+    e_plus_cls(p, cls_sym(), true)
+    e_save(p, 3)
+    e_star_cls(p, cls_space(), true)
+    e_char(p, 61)
+    e_match(p)
+    return p
+}
+
+# LABEL: ^([\w.$-]+|"[^"]+"):
+fn prog_label() -> list[Inst] {
+    let p: list[Inst] = []
+    e_hat(p)
+    let s1: int = e_split(p)
+    # alternative 1: bare label
+    e_save(p, 2)
+    e_plus_cls(p, cls_sym(), true)
+    e_save(p, 3)
+    let ja: int = e_jump_ph(p)
+    # alternative 2: quoted label
+    let bstart: int = p.len()
+    e_save(p, 2)
+    e_char(p, 34)
+    e_plus_cls(p, cls_not_quote(), true)
+    e_char(p, 34)
+    e_save(p, 3)
+    let end: int = p.len()
+    patch_split(p, s1, s1 + 1, bstart)
+    patch_jump(p, ja, end)
+    e_char(p, 58)
+    e_match(p)
+    return p
+}
+
+# ALLOCA: ^\s*%([\w.$-]+)\s*=\s*alloca\s+(\w+)
+fn prog_alloca() -> list[Inst] {
+    let p: list[Inst] = []
+    e_hat(p)
+    e_star_cls(p, cls_space(), true)
+    e_char(p, 37)
+    e_save(p, 2)
+    e_plus_cls(p, cls_sym(), true)
+    e_save(p, 3)
+    e_star_cls(p, cls_space(), true)
+    e_char(p, 61)
+    e_star_cls(p, cls_space(), true)
+    e_lit(p, "alloca")
+    e_plus_cls(p, cls_space(), true)
+    e_save(p, 4)
+    e_plus_cls(p, cls_word(), true)
+    e_save(p, 5)
+    e_match(p)
+    return p
+}
+
+# STORE_SLOT: ^\s*store\s+(\w+)\s+([^,]+),\s*ptr\s+%([\w.$-]+)\s*$
+fn prog_store_slot() -> list[Inst] {
+    let p: list[Inst] = []
+    e_hat(p)
+    e_star_cls(p, cls_space(), true)
+    e_lit(p, "store")
+    e_plus_cls(p, cls_space(), true)
+    e_save(p, 2)
+    e_plus_cls(p, cls_word(), true)
+    e_save(p, 3)
+    e_plus_cls(p, cls_space(), true)
+    e_save(p, 4)
+    e_plus_cls(p, cls_not_comma(), true)
+    e_save(p, 5)
+    e_char(p, 44)
+    e_star_cls(p, cls_space(), true)
+    e_lit(p, "ptr")
+    e_plus_cls(p, cls_space(), true)
+    e_char(p, 37)
+    e_save(p, 6)
+    e_plus_cls(p, cls_sym(), true)
+    e_save(p, 7)
+    e_star_cls(p, cls_space(), true)
+    e_dollar(p)
+    e_match(p)
+    return p
+}
+
+# PHI: ^\s*%([\w.$-]+)\s*=\s*phi\s+(\w+)\s+(.*)$
+fn prog_phi() -> list[Inst] {
+    let p: list[Inst] = []
+    e_hat(p)
+    e_star_cls(p, cls_space(), true)
+    e_char(p, 37)
+    e_save(p, 2)
+    e_plus_cls(p, cls_sym(), true)
+    e_save(p, 3)
+    e_star_cls(p, cls_space(), true)
+    e_char(p, 61)
+    e_star_cls(p, cls_space(), true)
+    e_lit(p, "phi")
+    e_plus_cls(p, cls_space(), true)
+    e_save(p, 4)
+    e_plus_cls(p, cls_word(), true)
+    e_save(p, 5)
+    e_plus_cls(p, cls_space(), true)
+    e_save(p, 6)
+    e_star_dot(p, true)
+    e_save(p, 7)
+    e_dollar(p)
+    e_match(p)
+    return p
+}
+
+# PHI_EDGE: \[\s*([^,\]]+?)\s*,\s*%([\w.$-]+)\s*\]
+fn prog_phi_edge() -> list[Inst] {
+    let p: list[Inst] = []
+    e_char(p, 91)
+    e_star_cls(p, cls_space(), true)
+    e_save(p, 2)
+    e_plus_cls(p, cls_not_comma_br(), false)
+    e_save(p, 3)
+    e_star_cls(p, cls_space(), true)
+    e_char(p, 44)
+    e_star_cls(p, cls_space(), true)
+    e_char(p, 37)
+    e_save(p, 4)
+    e_plus_cls(p, cls_sym(), true)
+    e_save(p, 5)
+    e_star_cls(p, cls_space(), true)
+    e_char(p, 93)
+    e_match(p)
+    return p
+}
+
+# BR: ^\s*br\s+(?:i1\s+(?:%[\w.$-]+|true|false)\s*,\s*)?label\s+%([\w.$-]+)
+#        (?:\s*,\s*label\s+%([\w.$-]+))?
+fn prog_br() -> list[Inst] {
+    let p: list[Inst] = []
+    e_hat(p)
+    e_star_cls(p, cls_space(), true)
+    e_lit(p, "br")
+    e_plus_cls(p, cls_space(), true)
+    # optional i1-condition group
+    let s1: int = e_split(p)
+    let g1: int = p.len()
+    e_lit(p, "i1")
+    e_plus_cls(p, cls_space(), true)
+    # %sym | true | false (a 3-way alternation: %sym | (true | false))
+    let s2: int = e_split(p)
+    let a1: int = p.len()
+    e_char(p, 37)
+    e_plus_cls(p, cls_sym(), true)
+    let j2: int = e_jump_ph(p)
+    let s2b: int = e_split(p)
+    let a2: int = p.len()
+    e_lit(p, "true")
+    let j2b: int = e_jump_ph(p)
+    let a3: int = p.len()
+    e_lit(p, "false")
+    let s2end: int = p.len()
+    patch_split(p, s2, a1, s2b)
+    patch_split(p, s2b, a2, a3)
+    patch_jump(p, j2, s2end)
+    patch_jump(p, j2b, s2end)
+    e_star_cls(p, cls_space(), true)
+    e_char(p, 44)
+    e_star_cls(p, cls_space(), true)
+    let j1: int = e_jump_ph(p)
+    let g1end: int = p.len()
+    patch_split(p, s1, g1, g1end)
+    patch_jump(p, j1, g1end)
+    # the mandatory target
+    e_lit(p, "label")
+    e_plus_cls(p, cls_space(), true)
+    e_char(p, 37)
+    e_save(p, 2)
+    e_plus_cls(p, cls_sym(), true)
+    e_save(p, 3)
+    # optional second target
+    let s3: int = e_split(p)
+    let g2: int = p.len()
+    e_star_cls(p, cls_space(), true)
+    e_char(p, 44)
+    e_star_cls(p, cls_space(), true)
+    e_lit(p, "label")
+    e_plus_cls(p, cls_space(), true)
+    e_char(p, 37)
+    e_save(p, 4)
+    e_plus_cls(p, cls_sym(), true)
+    e_save(p, 5)
+    let g2end: int = p.len()
+    patch_split(p, s3, g2, g2end)
+    e_match(p)
+    return p
+}
+
+# SWITCH: ^\s*switch\s+
+fn prog_switch() -> list[Inst] {
+    let p: list[Inst] = []
+    e_hat(p)
+    e_star_cls(p, cls_space(), true)
+    e_lit(p, "switch")
+    e_plus_cls(p, cls_space(), true)
+    e_match(p)
+    return p
+}
+
+# SWITCH_CASE: ^\s*(?:0[xX][0-9a-fA-F]+|-?\d+(?:\.\d*)?(?:[eE][-+]?\d+)?)
+#              \s+[^,]+,\s*label\s+%([\w.$-]+)\s*$
+fn prog_switch_case() -> list[Inst] {
+    let p: list[Inst] = []
+    e_hat(p)
+    e_star_cls(p, cls_space(), true)
+    let sa: int = e_split(p)
+    # alternative 1: hex literal
+    let a1: int = p.len()
+    e_char(p, 48)
+    e_cls(p, cls_xx())
+    e_plus_cls(p, cls_hex(), true)
+    let ja: int = e_jump_ph(p)
+    # alternative 2: decimal / float / scientific
+    let a2: int = p.len()
+    let so: int = e_split(p)
+    e_char(p, 45)
+    let so_end: int = p.len()
+    patch_split(p, so, so + 1, so_end)
+    e_plus_cls(p, cls_digit(), true)
+    let sp: int = e_split(p)
+    e_char(p, 46)
+    e_star_cls(p, cls_digit(), true)
+    let sp_end: int = p.len()
+    patch_split(p, sp, sp + 1, sp_end)
+    let se: int = e_split(p)
+    e_cls(p, cls_ee())
+    let sem: int = e_split(p)
+    e_cls(p, cls_sign())
+    let sem_end: int = p.len()
+    patch_split(p, sem, sem + 1, sem_end)
+    e_plus_cls(p, cls_digit(), true)
+    let se_end: int = p.len()
+    patch_split(p, se, se + 1, se_end)
+    let send: int = p.len()
+    patch_split(p, sa, a1, a2)
+    patch_jump(p, ja, send)
+    # the case body
+    e_plus_cls(p, cls_space(), true)
+    e_plus_cls(p, cls_not_comma(), true)
+    e_char(p, 44)
+    e_star_cls(p, cls_space(), true)
+    e_lit(p, "label")
+    e_plus_cls(p, cls_space(), true)
+    e_char(p, 37)
+    e_save(p, 2)
+    e_plus_cls(p, cls_sym(), true)
+    e_save(p, 3)
+    e_star_cls(p, cls_space(), true)
+    e_dollar(p)
+    e_match(p)
+    return p
+}
+
+# LABEL_REF: label\s+%([\w.$-]+)
+fn prog_label_ref() -> list[Inst] {
+    let p: list[Inst] = []
+    e_lit(p, "label")
+    e_plus_cls(p, cls_space(), true)
+    e_char(p, 37)
+    e_save(p, 2)
+    e_plus_cls(p, cls_sym(), true)
+    e_save(p, 3)
+    e_match(p)
+    return p
+}
+
+# PTR_LIT: (?:^|\s|,|\()ptr\s+(?:-?\d+(?:\.\d*)?(?:[eE][-+]?\d+)?
+#          |0[xX][0-9a-fA-F]+|true|false)(?:\s|,|\)|$)
+fn prog_ptr_lit() -> list[Inst] {
+    let p: list[Inst] = []
+    # prefix: ^ | \s | ',' | '('
+    let s1: int = e_split(p)
+    e_hat(p)
+    let j1: int = e_jump_ph(p)
+    let s1b: int = e_split(p)
+    e_cls(p, cls_space())
+    let jb: int = e_jump_ph(p)
+    let s1c: int = e_split(p)
+    let comma_at: int = p.len()
+    e_char(p, 44)
+    let jc: int = e_jump_ph(p)
+    let paren_at: int = p.len()
+    e_char(p, 40)
+    let ptr_at: int = p.len()
+    patch_split(p, s1, s1 + 1, s1b)
+    patch_jump(p, j1, ptr_at)
+    patch_split(p, s1b, s1b + 1, s1c)
+    patch_jump(p, jb, ptr_at)
+    patch_split(p, s1c, comma_at, paren_at)
+    patch_jump(p, jc, ptr_at)
+    e_lit(p, "ptr")
+    e_plus_cls(p, cls_space(), true)
+    # the literal: decimal/float/scientific | hex | true | false
+    let sn: int = e_split(p)
+    let n1: int = p.len()
+    let so: int = e_split(p)
+    e_char(p, 45)
+    let so_end: int = p.len()
+    patch_split(p, so, so + 1, so_end)
+    e_plus_cls(p, cls_digit(), true)
+    let sp: int = e_split(p)
+    e_char(p, 46)
+    e_star_cls(p, cls_digit(), true)
+    let sp_end: int = p.len()
+    patch_split(p, sp, sp + 1, sp_end)
+    let se: int = e_split(p)
+    e_cls(p, cls_ee())
+    let sem: int = e_split(p)
+    e_cls(p, cls_sign())
+    let sem_end: int = p.len()
+    patch_split(p, sem, sem + 1, sem_end)
+    e_plus_cls(p, cls_digit(), true)
+    let se_end: int = p.len()
+    patch_split(p, se, se + 1, se_end)
+    let jn: int = e_jump_ph(p)
+    let sn2: int = e_split(p)
+    let n2: int = p.len()
+    e_char(p, 48)
+    e_cls(p, cls_xx())
+    e_plus_cls(p, cls_hex(), true)
+    let jn2: int = e_jump_ph(p)
+    let sn3: int = e_split(p)
+    let n3: int = p.len()
+    e_lit(p, "true")
+    let jn3: int = e_jump_ph(p)
+    let n4: int = p.len()
+    e_lit(p, "false")
+    let suf: int = p.len()
+    patch_split(p, sn, n1, sn2)
+    patch_jump(p, jn, suf)
+    patch_split(p, sn2, n2, sn3)
+    patch_jump(p, jn2, suf)
+    patch_split(p, sn3, n3, n4)
+    patch_jump(p, jn3, suf)
+    # suffix: \s | ',' | ')' | $
+    let ss1: int = e_split(p)
+    e_cls(p, cls_space())
+    let js1: int = e_jump_ph(p)
+    let ss2: int = e_split(p)
+    e_char(p, 44)
+    let js2: int = e_jump_ph(p)
+    let ss3: int = e_split(p)
+    let rparen_at: int = p.len()
+    e_char(p, 41)
+    let js3: int = e_jump_ph(p)
+    let dollar_at: int = p.len()
+    e_dollar(p)
+    let end: int = p.len()
+    patch_split(p, ss1, ss1 + 1, ss2)
+    patch_jump(p, js1, end)
+    patch_split(p, ss2, ss2 + 1, ss3)
+    patch_jump(p, js2, end)
+    patch_split(p, ss3, rparen_at, dollar_at)
+    patch_jump(p, js3, end)
+    e_match(p)
+    return p
+}
+
+# CALL: ^\s*(?:%[\w.$-]+\s*=\s*)?(?:musttail\s+|tail\s+)?(?:call|callbr)\s+
+#       (?:(\w+)\s+)?@([\w.$-]+)\((.*)\)\s*$
+fn prog_call() -> list[Inst] {
+    let p: list[Inst] = []
+    e_hat(p)
+    e_star_cls(p, cls_space(), true)
+    # optional %slot = prefix
+    let s1: int = e_split(p)
+    let g1: int = p.len()
+    e_char(p, 37)
+    e_plus_cls(p, cls_sym(), true)
+    e_star_cls(p, cls_space(), true)
+    e_char(p, 61)
+    e_star_cls(p, cls_space(), true)
+    let j1: int = e_jump_ph(p)
+    let g1end: int = p.len()
+    patch_split(p, s1, g1, g1end)
+    patch_jump(p, j1, g1end)
+    # optional musttail / tail prefix
+    let s2: int = e_split(p)
+    let g2: int = p.len()
+    let s2a: int = e_split(p)
+    let mt: int = p.len()
+    e_lit(p, "musttail")
+    let j2a: int = e_jump_ph(p)
+    let tl: int = p.len()
+    e_lit(p, "tail")
+    let s2m: int = p.len()
+    patch_split(p, s2a, mt, tl)
+    patch_jump(p, j2a, s2m)
+    e_plus_cls(p, cls_space(), true)
+    let j2: int = e_jump_ph(p)
+    let g2end: int = p.len()
+    patch_split(p, s2, g2, g2end)
+    patch_jump(p, j2, g2end)
+    # call | callbr
+    let s3: int = e_split(p)
+    let c1: int = p.len()
+    e_lit(p, "call")
+    let j3: int = e_jump_ph(p)
+    let c2: int = p.len()
+    e_lit(p, "callbr")
+    let s3end: int = p.len()
+    patch_split(p, s3, c1, c2)
+    patch_jump(p, j3, s3end)
+    e_plus_cls(p, cls_space(), true)
+    # optional return-type group
+    let s4: int = e_split(p)
+    let g4: int = p.len()
+    e_save(p, 2)
+    e_plus_cls(p, cls_word(), true)
+    e_save(p, 3)
+    e_plus_cls(p, cls_space(), true)
+    let j4: int = e_jump_ph(p)
+    let g4end: int = p.len()
+    patch_split(p, s4, g4, g4end)
+    patch_jump(p, j4, g4end)
+    # @callee(args)
+    e_char(p, 64)
+    e_save(p, 4)
+    e_plus_cls(p, cls_sym(), true)
+    e_save(p, 5)
+    e_char(p, 40)
+    e_save(p, 6)
+    e_star_dot(p, true)
+    e_save(p, 7)
+    e_char(p, 41)
+    e_star_cls(p, cls_space(), true)
+    e_dollar(p)
+    e_match(p)
+    return p
+}
+
+# Patterns — every compiled program, built once per validate() call.
+struct Patterns {
+    define: list[Inst],
+    declare: list[Inst],
+    global: list[Inst],
+    label: list[Inst],
+    alloca: list[Inst],
+    store_slot: list[Inst],
+    phi: list[Inst],
+    phi_edge: list[Inst],
+    br: list[Inst],
+    switch: list[Inst],
+    switch_case: list[Inst],
+    label_ref: list[Inst],
+    ptr_lit: list[Inst],
+    call: list[Inst]
+}
+
+fn compile_patterns() -> Patterns {
+    return Patterns {
+        define: prog_define(),
+        declare: prog_declare(),
+        global: prog_global(),
+        label: prog_label(),
+        alloca: prog_alloca(),
+        store_slot: prog_store_slot(),
+        phi: prog_phi(),
+        phi_edge: prog_phi_edge(),
+        br: prog_br(),
+        switch: prog_switch(),
+        switch_case: prog_switch_case(),
+        label_ref: prog_label_ref(),
+        ptr_lit: prog_ptr_lit(),
+        call: prog_call()
+    }
+}
+
+# ----------------------------------------------------------------------------
+# The validator (validate() in the Python original).
+# ----------------------------------------------------------------------------
+
+# Edge — a (line number, label) pair.
+struct Edge {
+    lno: int,
+    label: str
+}
+
+# FnState — the per-function walk state (validate()'s locals).
+struct FnState {
+    in_function: bool,
+    fn_name: str,
+    cur_label: str,        # "" while cur_label_set is false (Python's None)
+    cur_label_set: bool,
+    terminated: bool,
+    in_switch: bool,
+    labels: map[str, bool],
+    referenced: list[Edge],
+    phi_edges: list[Edge],
+    slot_types: map[str, str]
+}
+
+# TERMINATORS — the instruction prefixes that close a basic block.
+fn is_terminator(ln: str) -> bool {
+    let terms: list[str] = ["br ", "ret ", "unreachable", "switch ",
+                            "indirectbr ", "invoke ", "resume ",
+                            "catchret ", "cleanupret "]
+    let mut i: int = 0
+    while i < terms.len() {
+        if ln.starts_with(terms.get(i)) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# clip70 — Python's ln[:70].
+fn clip70(s: str) -> str {
+    if s.len() <= 70 {
+        return s
+    }
+    return s.slice(0, 70)
+}
+
+# block_name — cur_label for messages ("None" before the first label, the
+# way Python's "%s" % None renders it).
+fn block_name(st: FnState) -> str {
+    if st.cur_label_set {
+        return st.cur_label
+    }
+    return "None"
+}
+
+# close_fn — the end-of-function checks (V7, V6, V5).
+fn close_fn(st: FnState, errors: list[str], line_no: int) -> void {
+    if st.in_function && !st.terminated && st.cur_label_set {
+        errors.push("V7 " + st.fn_name + ": block '" + st.cur_label
+            + "' (ended at line " + line_no.to_str() + ") has no terminator")
+    }
+    let mut i: int = 0
+    while i < st.referenced.len() {
+        let e: Edge = st.referenced.get(i)
+        if !st.labels.has(e.label) {
+            errors.push("V6 " + st.fn_name + " (line " + e.lno.to_str()
+                + "): branch to unknown label '%" + e.label + "'")
+        }
+        i = i + 1
+    }
+    let mut j: int = 0
+    while j < st.phi_edges.len() {
+        let e: Edge = st.phi_edges.get(j)
+        if !st.labels.has(e.label) {
+            errors.push("V5 " + st.fn_name + " (line " + e.lno.to_str()
+                + "): phi predecessor '%" + e.label
+                + "' is not a block label of this function")
+        }
+        j = j + 1
+    }
+    st.in_function = false
+    st.fn_name = ""
+}
+
+# collect_label_refs — referenced_labels.append((line_no, g)) for every
+# LABEL_REF findall hit on the line.
+fn collect_label_refs(pats: Patterns, ln: str, line_no: int,
+                      referenced: list[Edge]) -> void {
+    let refs: list[str] = []
+    re_findall_group(pats.label_ref, ln, 1, refs)
+    let mut i: int = 0
+    while i < refs.len() {
+        referenced.push(Edge { lno: line_no, label: refs.get(i) })
+        i = i + 1
+    }
+}
+
+# validate — validate one module; return the list of report lines ([] when
+# the module passes).
+fn validate(text: str, name: str) -> list[str] {
+    let errors: list[str] = []
+    let lines: list[str] = text.split("\n")
+    let pats: Patterns = compile_patterns()
+    let caps: Caps = caps_new()
+
+    # ---- module-level symbol tables ----
+    let declared: map[str, bool] = map_new()
+    let defined: map[str, bool] = map_new()
+    let globals_: map[str, bool] = map_new()
+    let mut i: int = 0
+    while i < lines.len() {
+        let ln: str = lines.get(i)
+        if re_match(pats.declare, ln, caps) {
+            declared.set(group_str(caps, 1, ln), true)
+        } else if re_match(pats.define, ln, caps) {
+            let sym: str = group_str(caps, 1, ln)
+            if defined.has(sym) {
+                errors.push("V8 duplicate define @" + sym)
+            }
+            defined.set(sym, true)
+        } else if re_match(pats.global, ln, caps) {
+            let sym: str = group_str(caps, 1, ln)
+            if globals_.has(sym) {
+                errors.push("V8 duplicate global @" + sym)
+            }
+            globals_.set(sym, true)
+        }
+        i = i + 1
+    }
+
+    # ---- per-function structural walk ----
+    let st: FnState = FnState {
+        in_function: false,
+        fn_name: "",
+        cur_label: "",
+        cur_label_set: false,
+        terminated: false,
+        in_switch: false,
+        labels: map_new(),
+        referenced: [],
+        phi_edges: [],
+        slot_types: map_new()
+    }
+    let mut line_no: int = 0
+    i = 0
+    while i < lines.len() {
+        let raw: str = lines.get(i)
+        line_no = line_no + 1
+        let ln: str = raw.trim()
+
+        if !st.in_function {
+            if re_match(pats.define, ln, caps) {
+                st.in_function = true
+                st.fn_name = group_str(caps, 1, ln)
+                st.cur_label = ""
+                st.cur_label_set = false
+                st.in_switch = false
+                # The entry block starts OPEN (no terminator yet).
+                st.terminated = false
+                st.labels = map_new()
+                st.referenced = []
+                st.phi_edges = []
+                st.slot_types = map_new()
+            }
+            i = i + 1
+            continue
+        }
+
+        # Function end.
+        if ln == "}" {
+            close_fn(st, errors, line_no)
+            i = i + 1
+            continue
+        }
+
+        # Labels open a new block.
+        if re_match(pats.label, ln, caps) {
+            let lbl: str = group_str(caps, 1, ln)
+            if st.labels.has(lbl) {
+                errors.push("V8 " + st.fn_name + " (line " + line_no.to_str()
+                    + "): duplicate label '" + lbl + "'")
+            }
+            st.labels.set(lbl, true)
+            if !st.terminated && st.cur_label_set {
+                errors.push("V1 " + st.fn_name + " (line " + line_no.to_str()
+                    + "): label '" + lbl + "' opens while the previous block '"
+                    + st.cur_label + "' is still open (missing terminator)")
+            }
+            st.cur_label = lbl
+            st.cur_label_set = true
+            st.terminated = false
+            i = i + 1
+            continue
+        }
+
+        if ln.len() == 0 || ln.starts_with(";") {
+            i = i + 1
+            continue
+        }
+
+        # Multi-line switch case lists: consume the continuation lines
+        # until the closing "]".
+        if st.in_switch {
+            if ln == "]" {
+                st.in_switch = false
+                i = i + 1
+                continue
+            }
+            if re_match(pats.switch_case, ln, caps) {
+                collect_label_refs(pats, ln, line_no, st.referenced)
+                i = i + 1
+                continue
+            }
+            st.in_switch = false
+        }
+
+        # V1: instructions after a terminator without an intervening label.
+        if st.terminated {
+            errors.push("V1 " + st.fn_name + " (line " + line_no.to_str()
+                + "): instruction after terminator in block '"
+                + block_name(st) + "': " + clip70(ln))
+            i = i + 1
+            continue
+        }
+
+        # Track terminators.
+        if is_terminator(ln) {
+            st.terminated = true
+            if re_match(pats.br, raw, caps) {
+                let g1: str = group_str(caps, 1, raw)
+                if g1.len() > 0 {
+                    st.referenced.push(Edge { lno: line_no, label: g1 })
+                }
+                let g2: str = group_str(caps, 2, raw)
+                if g2.len() > 0 {
+                    st.referenced.push(Edge { lno: line_no, label: g2 })
+                }
+            }
+            if re_match(pats.switch, ln, caps) {
+                collect_label_refs(pats, ln, line_no, st.referenced)
+                if ln.ends_with("]") {
+                    st.in_switch = false
+                } else {
+                    st.in_switch = true
+                }
+            }
+            i = i + 1
+            continue
+        }
+
+        # Calls: check the callee exists (V2) and carries no ptr literal (V3).
+        if re_match(pats.call, ln, caps) {
+            let sym: str = group_str(caps, 2, ln)
+            if !declared.has(sym) && !defined.has(sym) {
+                if !sym.starts_with("llvm.") {
+                    errors.push("V2 " + st.fn_name + " (line "
+                        + line_no.to_str() + "): call to undeclared symbol @"
+                        + sym)
+                }
+            }
+            if re_search(pats.ptr_lit, ln, caps) {
+                errors.push("V3 " + st.fn_name + " (line " + line_no.to_str()
+                    + "): literal pointer operand (ptr <int>) in call: "
+                    + clip70(ln))
+            }
+            i = i + 1
+            continue
+        }
+
+        # V3 standalone check (e.g. store/load with ptr literal).
+        if re_search(pats.ptr_lit, ln, caps) && !ln.contains("inttoptr") {
+            errors.push("V3 " + st.fn_name + " (line " + line_no.to_str()
+                + "): literal pointer operand: " + clip70(ln))
+        }
+
+        # Alloca: record the slot type.
+        if re_match(pats.alloca, ln, caps) {
+            st.slot_types.set(group_str(caps, 1, ln), group_str(caps, 2, ln))
+            i = i + 1
+            continue
+        }
+
+        # V4: store type must match the alloca'd slot type.
+        if re_match(pats.store_slot, ln, caps) {
+            let stype: str = group_str(caps, 1, ln)
+            let slot: str = group_str(caps, 3, ln)
+            if st.slot_types.has(slot) {
+                let want: str = st.slot_types.get_or(slot, "")
+                if want != stype {
+                    errors.push("V4 " + st.fn_name + " (line "
+                        + line_no.to_str() + "): store " + stype + " into "
+                        + want + " slot " + slot + " (type mismatch)")
+                }
+            }
+            i = i + 1
+            continue
+        }
+
+        # V5: collect phi predecessors.
+        if re_match(pats.phi, ln, caps) {
+            let rest: str = group_str(caps, 3, ln)
+            let preds: list[str] = []
+            re_findall_group(pats.phi_edge, rest, 2, preds)
+            let mut r: int = 0
+            while r < preds.len() {
+                st.phi_edges.push(Edge { lno: line_no, label: preds.get(r) })
+                r = r + 1
+            }
+            i = i + 1
+            continue
+        }
+        i = i + 1
+    }
+    if st.in_function {
+        close_fn(st, errors, line_no)
+    }
+
+    if errors.len() > 0 {
+        let out: list[str] = []
+        out.push(name + ": " + errors.len().to_str() + " structural error(s)")
+        let mut k: int = 0
+        while k < errors.len() {
+            out.push(errors.get(k))
+            k = k + 1
+        }
+        return out
+    }
+    let empty: list[str] = []
+    return empty
+}
+
+# ----------------------------------------------------------------------------
+# The CLI (main() in the Python original).
+# ----------------------------------------------------------------------------
+
+# push_all — extend dst with every element of src.
+fn push_all(dst: list[str], src: list[str]) -> void {
+    let mut i: int = 0
+    while i < src.len() {
+        dst.push(src.get(i))
+        i = i + 1
+    }
+}
+
+# py_repr — Python's %r of a str: single quotes, unless the string holds a
+# single quote and no double quote (then double quotes); backslashes and
+# control characters escaped.
+fn py_repr(s: str) -> str {
+    let has_sq: bool = s.contains("'")
+    let has_dq: bool = s.contains("\"")
+    let double_wrap: bool = has_sq && !has_dq
+    let mut body: str = ""
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c == 92 {
+            # backslash
+            body = body + "\\" + "\\"
+        } else if c == 10 {
+            body = body + "\\" + "n"
+        } else if c == 13 {
+            body = body + "\\" + "r"
+        } else if c == 9 {
+            body = body + "\\" + "t"
+        } else if c == 34 && double_wrap {
+            body = body + "\\" + "\""
+        } else if c == 39 && !double_wrap {
+            body = body + "\\" + "'"
+        } else {
+            body = body + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    if double_wrap {
+        return "\"" + body + "\""
+    }
+    return "'" + body + "'"
+}
+
+# shell_quote — neutralise single quotes for the `sh -c` one-liners.
+fn shell_quote(s: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c == 39 {
+            out = out + "'\\''"
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# read_stdin_all — sys.stdin.read(): every byte up to EOF. The runtime has
+# no read-all-stdin builtin (read_line() cannot distinguish a blank line
+# from EOF), so `cat` inherits our stdin and we drain its piped stdout.
+fn read_stdin_all() -> str uses Proc {
+    let noargs: list[str] = []
+    let pid: int = proc_spawn("cat", noargs, 0, 1, 2)
+    if pid < 1 {
+        # unreachable in practice (cat is POSIX); Python in the analogous
+        # situation dies on the unreadable fd 0 — report empty input.
+        return ""
+    }
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    proc_wait(pid)
+    proc_child_close(pid, 1)
+    return out
+}
+
+# ReadOut — the open(path).read() outcome.
+struct ReadOut {
+    ok: bool,
+    text: str,
+    err: str
+}
+
+# read_module — open(path, "r", encoding="utf-8").read() with CPython's
+# OSError message shapes (the directory check first, then existence, then
+# readability — matching the EISDIR / ENOENT / EACCES errnos).
+fn read_module(path: str) -> ReadOut uses Fs, Proc {
+    if fs_is_dir(path) {
+        return ReadOut { ok: false, text: "",
+                         err: "[Errno 21] Is a directory: " + py_repr(path) }
+    }
+    if !file_exists(path) {
+        return ReadOut { ok: false, text: "",
+                         err: "[Errno 2] No such file or directory: "
+                              + py_repr(path) }
+    }
+    if proc_exec("test -r '" + shell_quote(path) + "'") != 0 {
+        return ReadOut { ok: false, text: "",
+                         err: "[Errno 13] Permission denied: " + py_repr(path) }
+    }
+    return ReadOut { ok: true, text: read_file(path), err: "" }
+}
+
+# help_doc — the module docstring the Python tool writes for -h/--help and
+# a bare invocation (sys.stdout.write(__doc__), no extra newline).
+fn help_doc() -> str {
+    let lines: list[str] = []
+    lines.push("Structural validator for the LLVM IR text emitted by tools/llvm_emit.py.")
+    lines.push("")
+    lines.push("This is the guardrail that was MISSING when Stage 12-alpha shipped: the CI")
+    lines.push("only piped `--emit llvm` output to /dev/null, so the emitter could produce")
+    lines.push("structurally invalid IR (type mismatches, instructions after terminators,")
+    lines.push("calls to undeclared symbols, `ptr <integer>` literal operands, phi nodes")
+    lines.push("with dangling predecessors) and every \"deep scan\" still reported green.")
+    lines.push("")
+    lines.push("The validator is deliberately dependency-free (pure Python) so it runs in")
+    lines.push("any CI environment. It is NOT a full LLVM parser — it checks the specific")
+    lines.push("defect classes that historically occurred:")
+    lines.push("")
+    lines.push("  V1  instructions emitted after a terminator (br/ret/unreachable) with no")
+    lines.push("      intervening label")
+    lines.push("  V2  calls to @symbols that are neither declared nor defined in the module")
+    lines.push("  V3  `ptr <plain-integer>` operand (invalid literal; boxes must be created")
+    lines.push("      via hl_box_* / inttoptr)")
+    lines.push("  V4  store type disagreeing with the alloca'd slot type (tracked per slot")
+    lines.push("      register), including the old i1-vs-i64 boolean inconsistency")
+    lines.push("  V5  phi nodes whose incoming labels are not valid block labels of the")
+    lines.push("      enclosing function")
+    lines.push("  V6  block labels referenced by branches/jumps that do not exist")
+    lines.push("  V7  `define` bodies missing a terminator on their final open block")
+    lines.push("  V8  duplicate block labels or duplicate global definitions")
+    lines.push("")
+    lines.push("Exit code: 0 if the module passes, 1 with a report otherwise.")
+    lines.push("")
+    lines.push("Usage:")
+    lines.push("    python3 tools/ll_validate.py file.ll")
+    lines.push("    python3 tools/ll_validate.py file1.ll file2.ll ...")
+    lines.push("    cat file.ll | python3 tools/ll_validate.py -        (read stdin)")
+    return join(lines, "\n") + "\n"
+}
+
+fn main() -> int uses IO, Fs, Proc, Args {
+    let argv: list[str] = args()
+    let paths: list[str] = []
+    let mut i: int = 1
+    while i < argv.len() {
+        paths.push(argv.get(i))
+        i = i + 1
+    }
+
+    # -h / --help anywhere print the doc and exit 0; a bare invocation
+    # prints it and exits 2 (the deep-scan-29 fix, kept verbatim).
+    let mut want_help: bool = false
+    i = 0
+    while i < paths.len() {
+        if paths.get(i) == "-h" || paths.get(i) == "--help" {
+            want_help = true
+        }
+        i = i + 1
+    }
+    if paths.len() == 0 || want_help {
+        print(help_doc())
+        if paths.len() > 0 {
+            return 0
+        }
+        return 2
+    }
+
+    let all_errors: list[str] = []
+    i = 0
+    while i < paths.len() {
+        let path: str = paths.get(i)
+        if path == "-" {
+            let text: str = read_stdin_all()
+            push_all(all_errors, validate(text, "<stdin>"))
+        } else {
+            let ro: ReadOut = read_module(path)
+            if !ro.ok {
+                all_errors.push(path + ": cannot read: " + ro.err)
+            } else {
+                push_all(all_errors, validate(ro.text, path))
+            }
+        }
+        i = i + 1
+    }
+
+    if all_errors.len() > 0 {
+        let mut j: int = 0
+        while j < all_errors.len() {
+            eprintln("ERROR: " + all_errors.get(j))
+            j = j + 1
+        }
+        eprintln("llvm IR validation FAILED (" + all_errors.len().to_str()
+            + " error(s))")
+        return 1
+    }
+    let mut k: int = 0
+    while k < paths.len() {
+        if paths.get(k) != "-" {
+            eprintln("OK: " + paths.get(k))
+        }
+        k = k + 1
+    }
+    return 0
+}
