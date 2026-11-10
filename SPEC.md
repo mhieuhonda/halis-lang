@@ -6788,12 +6788,13 @@ you about the tree — `hls-pkg lock` pinned it, `hls-pkg verify` proved
 it, `hls-audit` explained it — but the artifact a release actually
 SHIPS to the parties who ask "what is inside?" did not exist. The
 software supply chain has converged on two interchange formats for
-that question, and `tools/hls-sbom.py` speaks both:
+that question, and `tools/hls-sbom.hls` (compiled to
+`bin/hls-sbom`) speaks both:
 
 ```
-python3 tools/hls-sbom.py <entry.hls> [--format cdx|spdx|both]
+bin/hls-sbom <entry.hls> [--format cdx|spdx|both]
                                     [--stdout] [--out DIR]
-python3 tools/hls-sbom.py --pkg [DIR]  [--format cdx|spdx|both]
+bin/hls-sbom --pkg [DIR]  [--format cdx|spdx|both]
                                     [--stdout] [--out DIR] [--release]
 ```
 

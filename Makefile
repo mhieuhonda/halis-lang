@@ -169,6 +169,16 @@ $(BIN)/hls-rc: tools/hls-rc.hls $(wildcard std/*.hls) $(wildcard core/*.hls) | $
 	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
 	@rm -f $@.c
 
+# hls-sbom — the CycloneDX + SPDX bill of materials, in Halis (the
+# native twin of the Python hls-sbom that retired; the audit engine,
+# import resolver and parser it needs ride inside the file).
+$(BIN)/hls-sbom: tools/hls-sbom.hls $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hls-sbom] hlc compiles the SBOM generator (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hls-sbom.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
 rc-readiness: $(BIN)/hls-rc
 	@$(BIN)/hls-rc readiness
 
@@ -453,7 +463,7 @@ test:
 suite-01-boot-acceptance: $(BIN)/acc-suite_01_boot
 	@$(BIN)/acc-suite_01_boot
 
-suite-02-differential-acceptance: $(BIN)/acc-suite_02_differential
+suite-02-differential-acceptance: $(BIN)/acc-suite_02_differential $(BIN)/hls-sbom
 	@$(BIN)/acc-suite_02_differential
 
 suite-03-selfhost-acceptance: $(BIN)/acc-suite_03_selfhost

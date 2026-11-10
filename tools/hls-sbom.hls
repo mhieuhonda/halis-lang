@@ -1,0 +1,5652 @@
+# ============================================================================
+# hls-sbom.hls — the Stage 104 bill of materials (CycloneDX + SPDX),
+# in Halis: the native twin of tools/hls-sbom.py. One component set,
+# two interchange documents, content-addressed end to end.
+# ----------------------------------------------------------------------------
+# Usage:
+#   bin/hls-sbom <entry.hls> [--format cdx|spdx|both]
+#                [--stdout] [--out DIR] [--json]
+#   bin/hls-sbom --pkg [DIR] [--format cdx|spdx|both]
+#                [--stdout] [--out DIR] [--release] [--json]
+#
+# The native twin of tools/hls-sbom.py (the Python years), byte for
+# byte: same CLI grammar, same exit codes (0 the documents are made /
+# 1 a named refusal / 2 usage), same stdout/stderr, same file outputs,
+# same determinism (same tree + same SOURCE_DATE_EPOCH -> identical
+# bytes; the serialNumber and the documentNamespace are derived from
+# the component hashes, never the wall clock).
+#
+# Source mode walks the transitive `import` graph of an entry file
+# with the same loader law boot.py applies (std./core. prefixes, the
+# 5-level walk-up, relative paths, the HLS_PKG_DEPS fallback); every
+# module becomes a file component classified toolchain / dependency /
+# workspace, hashed SHA-256 over its bytes, carrying the effect split
+# (hls:kind, hls:effects:intrinsic, hls:effects:surface) of the same
+# checker fixpoint hls-audit runs. Package mode walks the transitive
+# PACKAGE tree (hls-pkg.toml manifests, nested path deps resolved
+# package-relative then repo-root-relative, a library entry audited
+# through the wrapper contract), hashes the way hls-pkg hashes (the
+# single FILE for a single-file path dep, the deterministic sorted
+# directory hash otherwise), refuses drift and unauditable packages
+# fail-closed, and --release (the shipping gate) requires a lockfile,
+# writes hls-sbom-<name>-<version>.{cdx,spdx}.json and appends ONE
+# chained record to the transparency log (kind "sbom").
+#
+# Exit codes: 0 documents produced; 1 drift / unauditable package /
+# missing lockfile under --release / unwritable output / broken tree;
+# 2 usage errors. --json prints the internal report (schema
+# "hls-sbom/v1") and never writes artifacts (unless --release).
+# Analysis-only end to end (modulo --out / --release): nothing is
+# compiled, no artifact changes.
+# ============================================================================
+
+import "std.result"
+import "std.str"
+import "std.json"
+import "std.sha256"
+
+# ============================================================================
+# Constants (the .py's, verbatim).
+# ============================================================================
+
+fn tool_name() -> str {
+    return "hls-sbom"
+}
+
+fn tool_version() -> str {
+    return "0.123.0-alpha" # the toolchain release this SBOM stamps
+}
+
+fn cdx_spec() -> str {
+    return "1.5" # CycloneDX spec version emitted
+}
+
+fn spdx_spec() -> str {
+    return "SPDX-2.3" # SPDX spec version emitted
+}
+
+fn report_schema() -> str {
+    return "hls-sbom/v1"
+}
+
+fn cdx_name() -> str {
+    return "hls-sbom.cdx.json"
+}
+
+fn spdx_name() -> str {
+    return "hls-sbom.spdx.json"
+}
+
+fn manifest_name() -> str {
+    return "hls-pkg.toml"
+}
+
+fn lockfile_name() -> str {
+    return "hls-pkg.lock"
+}
+
+fn io_family() -> list[str] {
+    return["IO", "Fs", "Clock", "Args", "Exit"]
+}
+
+# ============================================================================
+# The error model — the .py raises AuditError (message printed as
+# "hls-sbom: <msg>", exit 1) or, for the import-path guards, lets a
+# SystemExit escape (message printed bare, exit 1). Fail.direct says
+# which law applies; every fallible fn returns Result[T, Fail].
+# ============================================================================
+
+struct Fail {
+    msg: str,
+    direct: bool
+}
+
+fn fail(msg: str) -> Fail {
+    return Fail {
+        msg: msg, direct: false
+    }
+}
+
+fn dfail(msg: str) -> Fail {
+    return Fail {
+        msg: msg, direct: true
+    }
+}
+
+# ============================================================================
+# Byte classification.
+# ============================================================================
+
+fn is_digit_b(c: int) -> bool {
+    return c >= 48 && c <= 57
+}
+
+fn is_alpha_b(c: int) -> bool {
+    return(c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+}
+
+fn is_ident_start_b(c: int) -> bool {
+    return is_alpha_b(c) || c == 95
+}
+
+fn is_ident_char_b(c: int) -> bool {
+    return is_ident_start_b(c) || is_digit_b(c)
+}
+
+fn hex_val_b(c: int) -> int {
+    if is_digit_b(c) {
+        return c - 48
+    }
+    if c >= 97 && c <= 102 {
+        return c - 87
+    }
+    return c - 55
+}
+
+fn hex_digit_lc(n: int) -> str {
+    if n < 10 {
+        return chr(48 + n)
+    }
+    return chr(87 + n)
+}
+
+fn hex2(n: int) -> str {
+    return hex_digit_lc(n / 16) + hex_digit_lc(n % 16)
+}
+
+fn hex4(n: int) -> str {
+    return hex_digit_lc(n / 4096 % 16) + hex_digit_lc(n / 256 % 16)
+    + hex_digit_lc(n / 16 % 16) + hex_digit_lc(n % 16)
+}
+
+# find_from(s, needle, from) — str.find anchored at a start offset
+# (Python's src.index(needle, i) without the exception).
+fn find_from(s: str, needle: str, from: int) -> int {
+    let n: int = s.len()
+    let m: int = needle.len()
+    if m == 0 {
+        if from <= n {
+            return from
+        }
+        return -1
+    }
+    let mut i: int = from
+    if i < 0 {
+        i = 0
+    }
+    while i + m <= n {
+        let mut k: int = 0
+        let mut same: bool = true
+        while k < m {
+            if s.byte_at(i + k) != needle.byte_at(k) {
+                same = false
+                k = m
+            }
+            k = k + 1
+        }
+        if same {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# ============================================================================
+# Path plumbing — the os.path slice the .py uses (join / dirname /
+# basename / isabs / lexical normpath; symlink resolution is not
+# available in the runtime, matching the repo's own hlfmt convention —
+# the fixtures' trees contain no symlinked directories).
+# ============================================================================
+
+fn path_is_abs(p: str) -> bool {
+    return p.len() > 0 && p.byte_at(0) == 47
+}
+
+fn path_join2(base: str, rel: str) -> str {
+    if rel.len() == 0 {
+        if base.len() == 0 {
+            return ""
+        }
+        return base
+    }
+    if path_is_abs(rel) {
+        return rel
+    }
+    if base.len() == 0 {
+        return rel
+    }
+    if base.byte_at(base.len() - 1) == 47 {
+        return base + rel
+    }
+    return base + "/" + rel
+}
+
+fn path_dirname(p: str) -> str {
+    let n: int = p.len()
+    if n == 0 {
+        return "."
+    }
+    let mut k: int = n - 1
+    # strip trailing slashes (but keep the root slash)
+    while k > 0 && p.byte_at(k) == 47 {
+        k = k - 1
+    }
+    while k >= 0 {
+        if p.byte_at(k) == 47 {
+            if k == 0 {
+                return "/"
+            }
+            return p.slice(0, k)
+        }
+        k = k - 1
+    }
+    return "."
+}
+
+fn path_basename(p: str) -> str {
+    let n: int = p.len()
+    if n == 0 {
+        return ""
+    }
+    let mut k: int = n - 1
+    while k > 0 && p.byte_at(k) == 47 {
+        k = k - 1
+    }
+    let mut j: int = k
+    while j >= 0 {
+        if p.byte_at(j) == 47 {
+            return p.slice(j + 1, k + 1)
+        }
+        j = j - 1
+    }
+    return p.slice(0, k + 1)
+}
+
+# split_components(p) — "/"-separated components of a path.
+fn split_components(p: str) -> list[str] {
+    let out: list[str] = []
+    let n: int = p.len()
+    let mut i: int = 0
+    while i < n {
+        let mut j: int = i
+        while j < n && p.byte_at(j) != 47 {
+            j = j + 1
+        }
+        out.push(p.slice(i, j))
+        i = j + 1
+    }
+    return out
+}
+
+# norm_path(p) — the lexical os.path.normpath: collapse "//", resolve
+# "." and ".." WITHOUT symlink knowledge, strip the trailing slash.
+# Only used on absolute paths here (the .py normpaths join results).
+fn norm_path(p: str) -> str {
+    if p == "" {
+        return "."
+    }
+    let abs: bool = path_is_abs(p)
+    let comps: list[str] = split_components(p)
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < comps.len() {
+        let c: str = comps.get(i)
+        if c == "" || c == "." {
+            i = i + 1
+            continue
+        }
+        if c == ".." {
+            if out.len() > 0 && out.get(out.len() - 1) != ".." {
+                out.pop()
+            } else if !abs {
+                out.push("..")
+            }
+            i = i + 1
+            continue
+        }
+        out.push(c)
+        i = i + 1
+    }
+    if out.len() == 0 {
+        if abs {
+            return "/"
+        }
+        return "."
+    }
+    let mut r: str = ""
+    if abs {
+        r = "/"
+    }
+    let mut j: int = 0
+    while j < out.len() {
+        r = r + out.get(j)
+        if j + 1 < out.len() {
+            r = r + "/"
+        }
+        j = j + 1
+    }
+    return r
+}
+
+# realpath_lex(p) — abspath + lexical normpath (the no-symlink
+# realpath, the same convention hlfmt's walk uses).
+fn realpath_lex(p: str) -> str uses Proc {
+    let mut raw: str = p
+    if !path_is_abs(raw) {
+        raw = cwd_get() + "/" + raw
+    }
+    return norm_path(raw)
+}
+
+# relpath_under(p, root) — p with root+"/" stripped when p lives under
+# root (else ""). os.path.relpath's slice for the module-key law.
+fn relpath_under(p: str, root: str) -> str {
+    let prefix: str = root + "/"
+    if p == root {
+        return ""
+    }
+    if p.starts_with(prefix) {
+        return p.slice(prefix.len(), p.len())
+    }
+    return ""
+}
+
+# ============================================================================
+# Sorting — Python's sorted() over str lists (byte-lexicographic; the
+# str comparison operators are the same law).
+# ============================================================================
+
+fn merge_strs(a: list[str], b: list[str]) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    let mut j: int = 0
+    while i < a.len() && j < b.len() {
+        if !(b.get(j) < a.get(i)) {
+            out.push(a.get(i))
+            i = i + 1
+        } else {
+            out.push(b.get(j))
+            j = j + 1
+        }
+    }
+    while i < a.len() {
+        out.push(a.get(i))
+        i = i + 1
+    }
+    while j < b.len() {
+        out.push(b.get(j))
+        j = j + 1
+    }
+    return out
+}
+
+fn sort_strs(xs: list[str]) -> list[str] {
+    if xs.len() <= 1 {
+        let one: list[str] = []
+        let mut i0: int = 0
+        while i0 < xs.len() {
+            one.push(xs.get(i0))
+            i0 = i0 + 1
+        }
+        return one
+    }
+    let mid: int = xs.len() / 2
+    let left_in: list[str] = []
+    let right_in: list[str] = []
+    let mut i: int = 0
+    while i < mid {
+        left_in.push(xs.get(i))
+        i = i + 1
+    }
+    while i < xs.len() {
+        right_in.push(xs.get(i))
+        i = i + 1
+    }
+    return merge_strs(sort_strs(left_in), sort_strs(right_in))
+}
+
+# sorted_unique(xs) — sorted() over set(xs): the audit's edge lists.
+fn sorted_unique(xs: list[str]) -> list[str] {
+    let s: list[str] = sort_strs(xs)
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < s.len() {
+        if out.len() == 0 || s.get(i) != out.get(out.len() - 1) {
+            out.push(s.get(i))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# list_has(xs, x) — membership.
+fn list_has(xs: list[str], x: str) -> bool {
+    let mut i: int = 0
+    while i < xs.len() {
+        if xs.get(i) == x {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# ============================================================================
+# Effect-set helpers — effects as sorted unique str lists.
+# ============================================================================
+
+# eff_add(xs, e) — insert into the deduped (unsorted) effect set;
+# rendering sorts (eff_sorted), the .py renders sorted() too.
+fn eff_add(xs: list[str], e: str) -> void {
+    if !list_has(xs, e) {
+        xs.push(e)
+    }
+}
+
+fn eff_union(dst: list[str], src: list[str]) -> void {
+    let mut i: int = 0
+    while i < src.len() {
+        eff_add(dst, src.get(i))
+        i = i + 1
+    }
+}
+
+fn eff_sorted(xs: list[str]) -> list[str] {
+    return sorted_unique(xs)
+}
+
+# ============================================================================
+# Python-compatible JSON — the model and the two serialisations the
+# .py uses: json.dumps(doc, indent=2, sort_keys=True) + "\n" for the
+# documents / the report, and json.dumps(rec, sort_keys=True,
+# separators=(",", ":")) for the transparency-log chain hash (plus the
+# appended line's default ", " / ": " separators). Escaping is
+# ensure_ascii: control chars and everything non-ASCII become
+# \uXXXX (lowercase hex); \b \t \n \f \r use their short forms.
+# ============================================================================
+
+struct JDoc {
+    kind: str, # "null" | "bool" | "int" | "str" | "arr" | "obj"
+    sval: str,
+    ival: int,
+    bval: bool,
+    arr: list[JDoc],
+    keys: list[str],
+    vals: list[JDoc]
+}
+
+fn jd_null() -> JDoc {
+    return JDoc {
+        kind: "null", sval: "", ival: 0, bval: false, arr: [],
+        keys: [], vals: []
+    }
+}
+
+fn jd_bool(v: bool) -> JDoc {
+    return JDoc {
+        kind: "bool", sval: "", ival: 0, bval: v, arr: [],
+        keys: [], vals: []
+    }
+}
+
+fn jd_int(v: int) -> JDoc {
+    return JDoc {
+        kind: "int", sval: "", ival: v, bval: false, arr: [],
+        keys: [], vals: []
+    }
+}
+
+fn jd_str(v: str) -> JDoc {
+    return JDoc {
+        kind: "str", sval: v, ival: 0, bval: false, arr: [],
+        keys: [], vals: []
+    }
+}
+
+fn jd_arr(items: list[JDoc]) -> JDoc {
+    return JDoc {
+        kind: "arr", sval: "", ival: 0, bval: false, arr: items,
+        keys: [], vals: []
+    }
+}
+
+fn jd_obj(keys: list[str], vals: list[JDoc]) -> JDoc {
+    return JDoc {
+        kind: "obj", sval: "", ival: 0, bval: false, arr: [],
+        keys: keys, vals: vals
+    }
+}
+
+# obj_set(doc, key, val) — set/replace one key in an object doc.
+fn obj_set(doc: JDoc, key: str, val: JDoc) -> void {
+    let mut i: int = 0
+    while i < doc.keys.len() {
+        if doc.keys.get(i) == key {
+            doc.vals.set(i, val)
+            return
+        }
+        i = i + 1
+    }
+    doc.keys.push(key)
+    doc.vals.push(val)
+}
+
+# utf8 codepoint of the byte sequence at i (len 1..4), for the
+# ensure_ascii \uXXXX escapes. Returns [-1, -1] on invalid UTF-8.
+fn utf8_at(s: str, i: int) -> list[int] {
+    let n: int = s.len()
+    let b0: int = s.byte_at(i)
+    if b0 < 128 {
+        return[b0, 1]
+    }
+    if b0 >= 192 && b0 < 224 && i + 1 < n {
+        let b1: int = s.byte_at(i + 1)
+        if b1 >= 128 && b1 < 192 {
+            return[(b0 - 192) * 64 + (b1 - 128), 2]
+        }
+        return[-1, -1]
+    }
+    if b0 >= 224 && b0 < 240 && i + 2 < n {
+        let b1: int = s.byte_at(i + 1)
+        let b2: int = s.byte_at(i + 2)
+        if b1 >= 128 && b1 < 192 && b2 >= 128 && b2 < 192 {
+            return[(b0 - 224) * 4096 + (b1 - 128) * 64 + (b2 - 128), 3]
+        }
+        return[-1, -1]
+    }
+    if b0 >= 240 && b0 < 248 && i + 3 < n {
+        let b1: int = s.byte_at(i + 1)
+        let b2: int = s.byte_at(i + 2)
+        let b3: int = s.byte_at(i + 3)
+        if b1 >= 128 && b1 < 192 && b2 >= 128 && b2 < 192
+        && b3 >= 128 && b3 < 192 {
+            return[(b0 - 240) * 262144 + (b1 - 128) * 4096
+            + (b2 - 128) * 64 + (b3 - 128), 4]
+        }
+        return[-1, -1]
+    }
+    return[-1, -1]
+}
+
+# py_json_escape(s) — the string body between the quotes, Python's
+# ensure_ascii escaping (solitary surrogates pass through as their
+# codepoint value, matching CPython's lone-surrogate behaviour closely
+# enough for the documents this tool emits).
+fn py_json_escape(s: str) -> str {
+    let mut out: str = ""
+    let n: int = s.len()
+    let mut i: int = 0
+    while i < n {
+        let c: int = s.byte_at(i)
+        if c == 34 {
+            out = out + "\\\""
+            i = i + 1
+            continue
+        }
+        if c == 92 {
+            out = out + "\\\\"
+            i = i + 1
+            continue
+        }
+        if c == 8 {
+            out = out + "\\b"
+            i = i + 1
+            continue
+        }
+        if c == 9 {
+            out = out + "\\t"
+            i = i + 1
+            continue
+        }
+        if c == 10 {
+            out = out + "\\n"
+            i = i + 1
+            continue
+        }
+        if c == 12 {
+            out = out + "\\f"
+            i = i + 1
+            continue
+        }
+        if c == 13 {
+            out = out + "\\r"
+            i = i + 1
+            continue
+        }
+        if c < 32 {
+            out = out + "\\u" + hex4(c)
+            i = i + 1
+            continue
+        }
+        if c < 127 {
+            out = out + s.slice(i, i + 1)
+            i = i + 1
+            continue
+        }
+        let cp: list[int] = utf8_at(s, i)
+        if cp.get(0) < 0 {
+            # invalid UTF-8: Python would have failed to encode; emit
+            # the raw byte (never hit by the documents this tool makes)
+            out = out + s.slice(i, i + 1)
+            i = i + 1
+            continue
+        }
+        if cp.get(0) < 65536 {
+            out = out + "\\u" + hex4(cp.get(0))
+        } else {
+            # surrogate pair
+            let v: int = cp.get(0) - 65536
+            let hi: int = 55296 + v / 1024
+            let lo: int = 56320 + v % 1024
+            out = out + "\\u" + hex4(hi) + "\\u" + hex4(lo)
+        }
+        i = i + cp.get(1)
+    }
+    return out
+}
+
+# jd_scalar_text(d) — the literal for a scalar doc.
+fn jd_scalar_text(d: JDoc) -> str {
+    if d.kind == "null" {
+        return "null"
+    }
+    if d.kind == "bool" {
+        if d.bval {
+            return "true"
+        }
+        return "false"
+    }
+    if d.kind == "int" {
+        return d.ival.to_str()
+    }
+    return "\"" + py_json_escape(d.sval) + "\""
+}
+
+# py_json_dump_at(d, indent, pretty) — the recursive serializer.
+# pretty: indent=2 with sort_keys (documents / report). compact: the
+# canonical form for the chain hash (separators (",", ":")).
+fn py_json_dump_at(d: JDoc, indent: int, pretty: bool) -> str {
+    if d.kind == "arr" {
+        if d.arr.len() == 0 {
+            return "[]"
+        }
+        let mut pad: str = ""
+        let mut k: int = 0
+        while k < indent {
+            pad = pad + "  "
+            k = k + 1
+        }
+        let in_pad: str = pad + "  "
+        if pretty {
+            let mut out: str = "[\n"
+            let mut i: int = 0
+            while i < d.arr.len() {
+                out = out + in_pad
+                + py_json_dump_at(d.arr.get(i), indent + 1, true)
+                if i + 1 < d.arr.len() {
+                    out = out + ","
+                }
+                out = out + "\n"
+                i = i + 1
+            }
+            return out + pad + "]"
+        }
+        let mut out2: str = "["
+        let mut j: int = 0
+        while j < d.arr.len() {
+            out2 = out2 + py_json_dump_at(d.arr.get(j), indent, false)
+            if j + 1 < d.arr.len() {
+                out2 = out2 + ","
+            }
+            j = j + 1
+        }
+        return out2 + "]"
+    }
+    if d.kind == "obj" {
+        if d.keys.len() == 0 {
+            return "{}"
+        }
+        # sort_keys: pair keys with vals, sort by key.
+        let order: list[int] = []
+        let mut i: int = 0
+        while i < d.keys.len() {
+            order.push(i)
+            i = i + 1
+        }
+        let mut a: int = 0
+        while a < order.len() {
+            let mut b: int = a + 1
+            while b < order.len() {
+                if d.keys.get(order.get(b)) < d.keys.get(order.get(a)) {
+                    let t: int = order.get(a)
+                    order.set(a, order.get(b))
+                    order.set(b, t)
+                }
+                b = b + 1
+            }
+            a = a + 1
+        }
+        if pretty {
+            let mut pad: str = ""
+            let mut k: int = 0
+            while k < indent {
+                pad = pad + "  "
+                k = k + 1
+            }
+            let in_pad: str = pad + "  "
+            let mut out: str = "{\n"
+            let mut j: int = 0
+            while j < order.len() {
+                let idx: int = order.get(j)
+                out = out + in_pad + "\""
+                + py_json_escape(d.keys.get(idx)) + "\": "
+                + py_json_dump_at(d.vals.get(idx), indent + 1, true)
+                if j + 1 < order.len() {
+                    out = out + ","
+                }
+                out = out + "\n"
+                j = j + 1
+            }
+            return out + pad + "}"
+        }
+        let mut out2: str = "{"
+        let mut j2: int = 0
+        while j2 < order.len() {
+            let idx2: int = order.get(j2)
+            out2 = out2 + "\"" + py_json_escape(d.keys.get(idx2))
+            + "\":" + py_json_dump_at(d.vals.get(idx2), indent, false)
+            if j2 + 1 < order.len() {
+                out2 = out2 + ","
+            }
+            j2 = j2 + 1
+        }
+        return out2 + "}"
+    }
+    return jd_scalar_text(d)
+}
+
+# py_json_dump(d) — json.dumps(d, indent=2, sort_keys=True).
+fn py_json_dump(d: JDoc) -> str {
+    return py_json_dump_at(d, 0, true)
+}
+
+# py_json_canon(d) — json.dumps(d, sort_keys=True, separators=(",", ":")).
+fn py_json_canon(d: JDoc) -> str {
+    return py_json_dump_at(d, 0, false)
+}
+
+# py_json_line(d) — json.dumps(d, sort_keys=True) (default ", " / ": "
+# separators, no indent) — the appended transparency-log line.
+fn py_json_line(d: JDoc) -> str {
+    if d.kind == "obj" && d.keys.len() > 0 {
+        let order: list[int] = []
+        let mut i: int = 0
+        while i < d.keys.len() {
+            order.push(i)
+            i = i + 1
+        }
+        let mut a: int = 0
+        while a < order.len() {
+            let mut b: int = a + 1
+            while b < order.len() {
+                if d.keys.get(order.get(b)) < d.keys.get(order.get(a)) {
+                    let t: int = order.get(a)
+                    order.set(a, order.get(b))
+                    order.set(b, t)
+                }
+                b = b + 1
+            }
+            a = a + 1
+        }
+        let mut out: str = "{"
+        let mut j: int = 0
+        while j < order.len() {
+            let idx: int = order.get(j)
+            out = out + "\"" + py_json_escape(d.keys.get(idx))
+            + "\": " + py_json_line(d.vals.get(idx))
+            if j + 1 < order.len() {
+                out = out + ", "
+            }
+            j = j + 1
+        }
+        return out + "}"
+    }
+    if d.kind == "arr" && d.arr.len() > 0 {
+        let mut out2: str = "["
+        let mut k: int = 0
+        while k < d.arr.len() {
+            out2 = out2 + py_json_line(d.arr.get(k))
+            if k + 1 < d.arr.len() {
+                out2 = out2 + ", "
+            }
+            k = k + 1
+        }
+        return out2 + "]"
+    }
+    if d.kind == "arr" {
+        return "[]"
+    }
+    if d.kind == "obj" {
+        return "{}"
+    }
+    return jd_scalar_text(d)
+}
+
+# ============================================================================
+# Deterministic plumbing — the document timestamp (SOURCE_DATE_EPOCH
+# when the environment names one, else now) and the RFC 3339 render.
+# ============================================================================
+
+fn floor_div(a: int, b: int) -> int {
+    let mut q: int = a / b
+    if a % b != 0 && ((a < 0) != (b < 0)) {
+        q = q - 1
+    }
+    return q
+}
+
+struct Ymd {
+    y: int,
+    m: int,
+    d: int
+}
+
+# civil_from_days(z) — the Howard Hinnant inverse (hls-lts' own).
+fn civil_from_days(z: int) -> Ymd {
+    let zz: int = z + 719468
+    let era: int = floor_div(zz, 146097)
+    let doe: int = zz - era * 146097
+    let yoe: int = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let yy: int = yoe + era * 400
+    let doy: int = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp: int = (5 * doy + 2) / 153
+    let dd: int = doy - (153 * mp + 2) / 5 + 1
+    let mut mm: int = mp + 3
+    if mm > 12 {
+        mm = mm - 12
+    }
+    let mut y2: int = yy
+    if mm <= 2 {
+        y2 = yy + 1
+    }
+    return Ymd {
+        y: y2, m: mm, d: dd
+    }
+}
+
+fn z2(n: int) -> str {
+    if n < 10 {
+        return "0" + n.to_str()
+    }
+    return n.to_str()
+}
+
+# rfc3339_from_epoch(secs) — strftime("%Y-%m-%dT%H:%M:%SZ") over the
+# UTC datetime; years >= 1000 are naturally 4 digits, years < 1000
+# render unpadded (the glibc %Y law).
+fn rfc3339_from_epoch(secs: int) -> str {
+    let days: int = floor_div(secs, 86400)
+    let rem: int = secs - days * 86400
+    let ymd: Ymd = civil_from_days(days)
+    return ymd.y.to_str() + "-" + z2(ymd.m) + "-" + z2(ymd.d) + "T"
+    + z2(rem / 3600) + ":" + z2((rem / 60) % 60) + ":" + z2(rem % 60)
+    + "Z"
+}
+
+# py_int_parse(s) — Python's int(s) for the str law: surrounding
+# whitespace, one sign, digits with single underscores between them.
+# Result.Err(why) mirrors the ValueError path (message not used — the
+# caller prints the %r of the raw value).
+fn py_int_parse(s: str) -> Result[int, str] {
+    let t: str = s.trim()
+    if t.len() == 0 {
+        return Result.Err("empty")
+    }
+    let mut i: int = 0
+    let mut neg: bool = false
+    if t.byte_at(0) == 43 || t.byte_at(0) == 45 {
+        neg = t.byte_at(0) == 45
+        i = 1
+    }
+    if i >= t.len() {
+        return Result.Err("no digits")
+    }
+    let mut digits: str = ""
+    let mut prev_us: bool = true # a leading "_" is invalid
+    while i < t.len() {
+        let c: int = t.byte_at(i)
+        if is_digit_b(c) {
+            digits = digits + t.slice(i, i + 1)
+            prev_us = false
+        } else if c == 95 {
+            if prev_us {
+                return Result.Err("bad underscore")
+            }
+            prev_us = true
+        } else {
+            return Result.Err("invalid char")
+        }
+        i = i + 1
+    }
+    if prev_us {
+        return Result.Err("trailing underscore")
+    }
+    if digits.len() > 18 {
+        # out of the datetime range either way; the caller's range
+        # check reports it through the same error path
+        return Result.Ok(253402301000)
+    }
+    let mut v: int = 0
+    let mut j: int = 0
+    while j < digits.len() {
+        v = v * 10 + (digits.byte_at(j) - 48)
+        j = j + 1
+    }
+    if neg {
+        v = -v
+    }
+    return Result.Ok(v)
+}
+
+# py_repr_str(s) — Python's repr() of a str, single quotes.
+fn py_repr_str(s: str) -> str {
+    let mut out: str = "'"
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c == 39 {
+            out = out + "\\'"
+        } else if c == 92 {
+            out = out + "\\\\"
+        } else if c == 10 {
+            out = out + "\\n"
+        } else if c == 13 {
+            out = out + "\\r"
+        } else if c == 9 {
+            out = out + "\\t"
+        } else if c < 32 || c == 127 {
+            out = out + "\\x" + hex2(c)
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out + "'"
+}
+
+# utc_stamp() — SOURCE_DATE_EPOCH when set (the reproducible-builds
+# contract), else the wall clock now; Result.Err carries the .py's
+# AuditError text verbatim.
+fn utc_stamp() -> Result[str, Fail] uses Proc, Clock {
+    let raw: str = env_get("SOURCE_DATE_EPOCH")
+    if raw != "" || env_has("SOURCE_DATE_EPOCH") {
+        let pv: Result[int, str] = py_int_parse(raw)
+        if result_is_err(pv) {
+            return Result.Err(fail("SOURCE_DATE_EPOCH is not a unix "
+            + "timestamp: " + py_repr_str(raw)))
+        }
+        let secs: int = result_unwrap(pv)
+        # datetime's range: year 1 .. year 9999 (UTC).
+        if secs < -62135596800 || secs > 253402300799 {
+            return Result.Err(fail("SOURCE_DATE_EPOCH is not a unix "
+            + "timestamp: " + py_repr_str(raw)))
+        }
+        return Result.Ok(rfc3339_from_epoch(secs))
+    }
+    let ms: int = system_time_now_ms()
+    let secs_now: int = floor_div(ms, 1000)
+    return Result.Ok(rfc3339_from_epoch(secs_now))
+}
+
+# ============================================================================
+# The Halis source scanner — the Stage-0 lexer's law (keywords,
+# identifiers, int/float literals, strings with the four escapes, two-
+# then-one-char symbols, #[ / #![ sigils, # comments) reduced to what
+# the audit needs: token shapes good enough to find imports, fn
+# signatures, extern blocks, impl methods and call expressions, with
+# the lexer's own error text (msg (line L:C)) for broken files.
+# ============================================================================
+
+struct Tok {
+    k: str, # "kw" | "ident" | "int" | "float" | "str" | "sym"
+    v: str, # text (decoded bytes for strings)
+    line: int,
+    col: int
+}
+
+fn hl_keyword(w: str) -> bool {
+    if w == "fn" || w == "let" || w == "mut" || w == "return" {
+        return true
+    }
+    if w == "if" || w == "else" || w == "while" || w == "for" {
+        return true
+    }
+    if w == "in" || w == "break" || w == "continue" || w == "struct" {
+        return true
+    }
+    if w == "impl" || w == "import" || w == "uses" || w == "true" {
+        return true
+    }
+    if w == "false" || w == "enum" || w == "match" || w == "pure" {
+        return true
+    }
+    if w == "extern" || w == "requires" || w == "ensures" || w == "asm" {
+        return true
+    }
+    if w == "where" {
+        return true
+    }
+    return false
+}
+
+fn is_two_char_sym(s: str) -> bool {
+    return s == "->" || s == "==" || s == "!=" || s == "<=" || s == ">="
+    || s == "&&" || s == "||" || s == "=>"
+}
+
+fn is_one_char_sym(c: int) -> bool {
+    return c == 40 || c == 41 || c == 123 || c == 125 || c == 91
+    || c == 93 || c == 44 || c == 58 || c == 46 || c == 60 || c == 62
+    || c == 43 || c == 45 || c == 42 || c == 47 || c == 37 || c == 33
+    || c == 61 || c == 63
+}
+
+fn lex_msg(msg: str, line: int, col: int) -> str {
+    return msg + " (line " + line.to_str() + ":" + col.to_str() + ")"
+}
+
+# lex_msg_line(msg, line) — the col-less diagnostic shape (the .py's
+# HLError prints "(line N)" when the node carries no column).
+
+# hl_tokenize(src) — Result[Ok(tokens), Err(HLError-shaped msg)].
+fn hl_tokenize(src: str) -> Result[list[Tok], str] {
+    let toks: list[Tok] = []
+    let n: int = src.len()
+    let mut i: int = 0
+    let mut line: int = 1
+    let mut col: int = 1
+    while i < n {
+        let c: int = src.byte_at(i)
+        # ---- whitespace ----
+        if c == 32 || c == 9 || c == 13 || c == 10 {
+            if c == 10 {
+                line = line + 1
+                col = 1
+            } else if c == 13 {
+                if i + 1 < n && src.byte_at(i + 1) == 10 {
+                    col = col + 1
+                } else {
+                    line = line + 1
+                    col = 1
+                }
+            } else {
+                col = col + 1
+            }
+            i = i + 1
+            continue
+        }
+        # ---- comments / attribute sigils ----
+        if c == 35 {
+            if i + 1 < n && src.byte_at(i + 1) == 91 {
+                toks.push(Tok {
+                    k: "sym", v: "#", line: line, col: col
+                })
+                col = col + 1
+                i = i + 1
+                continue
+            }
+            if i + 2 < n && src.byte_at(i + 1) == 33
+            && src.byte_at(i + 2) == 91 {
+                toks.push(Tok {
+                    k: "sym", v: "#", line: line, col: col
+                })
+                col = col + 1
+                i = i + 1
+                toks.push(Tok {
+                    k: "sym", v: "!", line: line, col: col
+                })
+                col = col + 1
+                i = i + 1
+                continue
+            }
+            while i < n && src.byte_at(i) != 10 && src.byte_at(i) != 13 {
+                i = i + 1
+                col = col + 1
+            }
+            continue
+        }
+        # ---- identifier / keyword ----
+        if is_ident_start_b(c) {
+            let mut j: int = i
+            while j < n && is_ident_char_b(src.byte_at(j)) {
+                j = j + 1
+            }
+            let word: str = src.slice(i, j)
+            let mut kind: str = "ident"
+            if hl_keyword(word) {
+                kind = "kw"
+            }
+            toks.push(Tok {
+                k: kind, v: word, line: line, col: col
+            })
+            col = col + (j - i)
+            i = j
+            continue
+        }
+        # ---- number ----
+        if is_digit_b(c) {
+            let mut j: int = i
+            while j < n && (is_digit_b(src.byte_at(j))
+            || src.byte_at(j) == 95) {
+                j = j + 1
+            }
+            let mut is_float: bool = false
+            if j < n && src.byte_at(j) == 46 && j + 1 < n
+            && is_digit_b(src.byte_at(j + 1)) {
+                is_float = true
+                j = j + 1
+                while j < n && (is_digit_b(src.byte_at(j))
+                || src.byte_at(j) == 95) {
+                    j = j + 1
+                }
+            }
+            if j < n && (src.byte_at(j) == 101 || src.byte_at(j) == 69) {
+                let mut k: int = j + 1
+                if k < n && (src.byte_at(k) == 43 || src.byte_at(k) == 45) {
+                    k = k + 1
+                }
+                if k < n && is_digit_b(src.byte_at(k)) {
+                    is_float = true
+                    j = k
+                    while j < n && (is_digit_b(src.byte_at(j))
+                    || src.byte_at(j) == 95) {
+                        j = j + 1
+                    }
+                }
+            }
+            let raw_text: str = src.slice(i, j)
+            if j < n && is_ident_start_b(src.byte_at(j)) {
+                let mut k2: int = j
+                while k2 < n && is_ident_char_b(src.byte_at(k2)) {
+                    k2 = k2 + 1
+                }
+                return Result.Err(lex_msg("invalid numeric literal '"
+                + src.slice(i, k2) + "' (digits followed by letters — "
+                + "HLS has no hex/adjoined-letter literals)", line, col))
+            }
+            if is_float {
+                toks.push(Tok {
+                    k: "float", v: raw_text, line: line, col: col
+                })
+            } else {
+                toks.push(Tok {
+                    k: "int", v: raw_text, line: line, col: col
+                })
+            }
+            col = col + (j - i)
+            i = j
+            continue
+        }
+        # ---- string ----
+        if c == 34 {
+            let ln: int = line
+            let cl: int = col
+            i = i + 1
+            col = col + 1
+            let mut out: str = ""
+            let mut closed: bool = false
+            while i < n {
+                let ch: int = src.byte_at(i)
+                if ch == 34 {
+                    i = i + 1
+                    col = col + 1
+                    closed = true
+                    break
+                }
+                if ch == 92 {
+                    if i + 1 >= n {
+                        return Result.Err(lex_msg("unterminated string",
+                        ln, cl))
+                    }
+                    let e2: int = src.byte_at(i + 1)
+                    if e2 == 110 {
+                        out = out + "\n"
+                    } else if e2 == 116 {
+                        out = out + "\t"
+                    } else if e2 == 92 {
+                        out = out + "\\"
+                    } else if e2 == 34 {
+                        out = out + "\""
+                    } else {
+                        return Result.Err(lex_msg("invalid escape sequence: \\"
+                        + chr(e2), line, col))
+                    }
+                    i = i + 2
+                    col = col + 2
+                    continue
+                }
+                if ch < 32 {
+                    return Result.Err(lex_msg("string contains invalid "
+                    + "control character", line, col))
+                }
+                out = out + src.slice(i, i + 1)
+                i = i + 1
+                col = col + 1
+            }
+            if !closed {
+                return Result.Err(lex_msg("unterminated string", ln, cl))
+            }
+            toks.push(Tok {
+                k: "str", v: out, line: ln, col: cl
+            })
+            continue
+        }
+        # ---- symbols ----
+        if i + 1 < n {
+            let two: str = src.slice(i, i + 2)
+            if is_two_char_sym(two) {
+                toks.push(Tok {
+                    k: "sym", v: two, line: line, col: col
+                })
+                i = i + 2
+                col = col + 2
+                continue
+            }
+        }
+        if is_one_char_sym(c) {
+            let s1: str = src.slice(i, i + 1)
+            toks.push(Tok {
+                k: "sym", v: s1, line: line, col: col
+            })
+            i = i + 1
+            col = col + 1
+            continue
+        }
+        return Result.Err(lex_msg("invalid character: " + chr(c),
+        line, col))
+    }
+    return Result.Ok(toks)
+}
+
+# ============================================================================
+# The module parser — imports, fn declarations (with the parse-time
+# `uses IO` family expansion), extern blocks, impl methods, struct /
+# enum names, and each fn's body token range for the call-edge scan.
+# ============================================================================
+
+struct FnDef {
+    key: str, # fn name, or "Struct.method"
+    name: str,
+    owner: str, # "" or the impl struct name
+    is_extern: bool,
+    is_pure: bool,
+    effects: list[str], # the expanded declared set (IO -> family)
+    has_ret: bool,
+    ret: str,
+    n_params: int,
+    p0_name: str,
+    p0_type: str,
+    param_names: list[str],
+    param_types: list[str],
+    b0: int, # body token range [b0, b1) (empty for externs)
+    b1: int,
+    decl_line: int, # the fn kw line (duplicate-name diagnostics)
+    decl_col: int # 0 = the line-only message shape
+}
+
+struct FieldDef {
+    name: str,
+    ty: str
+}
+
+struct StructInfo {
+    name: str,
+    fields: list[FieldDef]
+}
+
+struct EnumInfo {
+    name: str,
+    variants: list[str]
+}
+
+struct HModule {
+    path: str,
+    toks: list[Tok],
+    imports: list[str],
+    import_lines: list[int],
+    fns: list[FnDef],
+    structs: list[str],
+    enums: list[str],
+    structs_fields: list[StructInfo],
+    enum_variants: list[EnumInfo]
+}
+
+fn fn_def_new() -> FnDef {
+    let no_eff: list[str] = []
+    return FnDef {
+        key: "", name: "", owner: "", is_extern: false, is_pure: false,
+        effects: no_eff, has_ret: false, ret: "", n_params: 0,
+        p0_name: "", p0_type: "", param_names: [], param_types: [],
+        b0: 0, b1: 0, decl_line: 0, decl_col: 0
+    }
+}
+
+# tok_sym(t) / tok_kw(t) — token shape tests.
+fn tok_is(t: Tok, k: str, v: str) -> bool {
+    return t.k == k && t.v == v
+}
+
+# skip_attr(toks, i) — index past a #[...] / #![...] attribute list
+# (returns i unchanged when toks[i] is not "#").
+fn skip_attr(toks: list[Tok], i: int) -> int {
+    if i >= toks.len() {
+        return i
+    }
+    if !tok_is(toks.get(i), "sym", "#") {
+        return i
+    }
+    let mut j: int = i + 1
+    if j < toks.len() && tok_is(toks.get(j), "sym", "!") {
+        j = j + 1
+    }
+    if j < toks.len() && tok_is(toks.get(j), "sym", "[") {
+        j = j + 1
+        let mut depth: int = 1
+        while j < toks.len() && depth > 0 {
+            if tok_is(toks.get(j), "sym", "[") {
+                depth = depth + 1
+            } else if tok_is(toks.get(j), "sym", "]") {
+                depth = depth - 1
+            }
+            j = j + 1
+        }
+    }
+    return j
+}
+
+# skip_balanced(toks, i, open, close) — index past the balanced region
+# starting at toks[i] == open (returns toks.len() if unterminated).
+fn skip_balanced(toks: list[Tok], i: int, open: str, close: str) -> int {
+    if i >= toks.len() || !tok_is(toks.get(i), "sym", open) {
+        return i
+    }
+    let mut depth: int = 1
+    let mut j: int = i + 1
+    while j < toks.len() {
+        if tok_is(toks.get(j), "sym", open) {
+            depth = depth + 1
+        } else if tok_is(toks.get(j), "sym", close) {
+            depth = depth - 1
+            if depth == 0 {
+                return j + 1
+            }
+        }
+        j = j + 1
+    }
+    return toks.len()
+}
+
+# is_typeish_end(t) — does the token end a signature clause (type /
+# refinement / contract) so a `{` / `pure` / `uses` may follow?
+fn sig_stop(t: Tok) -> bool {
+    if t.k == "kw" {
+        return t.v == "pure" || t.v == "uses" || t.v == "requires"
+        || t.v == "ensures"
+    }
+    if t.k == "sym" {
+        return t.v == "{"
+    }
+    return false
+}
+
+struct FnParse {
+    fd: FnDef,
+    next: int
+}
+
+# join_tokens(toks, a, b) — the type text over [a, b) (no separators;
+# parse_type's plain-name shape).
+fn join_tokens(toks: list[Tok], a: int, b: int) -> str {
+    let mut out: str = ""
+    let mut i: int = a
+    while i < b {
+        out = out + toks.get(i).v
+        i = i + 1
+    }
+    return out
+}
+
+# parse_params(toks, open_i) — the params inside the parens at
+# open_i: [count, first_name, first_type, close_index].
+struct ParamsOut {
+    count: int,
+    p0_name: str,
+    p0_type: str,
+    close: int,
+    names: list[str],
+    types: list[str]
+}
+
+fn parse_params(toks: list[Tok], open_i: int) -> Result[ParamsOut, str] {
+    let close: int = skip_balanced(toks, open_i, "(", ")") - 1
+    let r: ParamsOut = ParamsOut {
+        count: 0, p0_name: "", p0_type: "", close: close,
+        names: [], types: []
+    }
+    let mut i: int = open_i + 1
+    let mut depth: int = 0
+    let mut start: int = i
+    let mut any: bool = false
+    while i < close {
+        let t: Tok = toks.get(i)
+        if tok_is(t, "sym", "(") || tok_is(t, "sym", "[")
+        || tok_is(t, "sym", "{") {
+            depth = depth + 1
+        } else if tok_is(t, "sym", ")") || tok_is(t, "sym", "]")
+        || tok_is(t, "sym", "}") {
+            depth = depth - 1
+        } else if tok_is(t, "sym", ",") && depth == 0 {
+            let cr: Result[bool, str] = check_param_start(toks, start, i,
+            close)
+            if result_is_err(cr) {
+                return Result.Err(result_err_or(cr, ""))
+            }
+            if !any {
+                r.p0_name = param_name(toks, start, i)
+                r.p0_type = param_type(toks, start, i)
+            }
+            r.names.push(param_name(toks, start, i))
+            r.types.push(param_type(toks, start, i))
+            any = false
+            r.count = r.count + 1
+            start = i + 1
+        } else {
+            any = true
+        }
+        i = i + 1
+    }
+    if any {
+        let cr2: Result[bool, str] = check_param_start(toks, start, close,
+        close)
+        if result_is_err(cr2) {
+            return Result.Err(result_err_or(cr2, ""))
+        }
+        if r.count == 0 {
+            r.p0_name = param_name(toks, start, close)
+            r.p0_type = param_type(toks, start, close)
+        }
+        r.names.push(param_name(toks, start, close))
+        r.types.push(param_type(toks, start, close))
+        r.count = r.count + 1
+    }
+    return Result.Ok(r)
+}
+
+# check_param_start(toks, start, end, close) — the parser's own law
+# for one parameter segment: [mut] ident ':' type — the exact
+# eat_ident / eat_sym error shapes.
+fn check_param_start(toks: list[Tok], start: int, end: int, close: int)
+-> Result[bool, str] {
+    if start >= end {
+        if end < close {
+            let t: Tok = toks.get(end)
+            return Result.Err(lex_msg("expected identifier but got "
+            + tok_desc_of(t), t.line, t.col))
+        }
+        return Result.Ok(true)
+    }
+    let mut q: int = start
+    if q < end && tok_is(toks.get(q), "kw", "mut") {
+        q = q + 1
+    }
+    if q >= end {
+        return Result.Ok(true)
+    }
+    if toks.get(q).k != "ident" {
+        let t2: Tok = toks.get(q)
+        return Result.Err(lex_msg("expected identifier but got "
+        + tok_desc_of(t2), t2.line, t2.col))
+    }
+    if q + 1 >= end || !tok_is(toks.get(q + 1), "sym", ":") {
+        let bad_desc: str = tok_at_or_eof(toks, q + 1)
+        return Result.Err(lex_msg("expected symbol ':' but got "
+        + bad_desc, tok_line_or_last(toks, q + 1),
+        tok_col_or_last(toks, q + 1)))
+    }
+    return Result.Ok(true)
+}
+
+# param_name / param_type — the [mut] name ": type shape of one param.
+fn param_name(toks: list[Tok], a: int, b: int) -> str {
+    let mut i: int = a
+    if i < b && tok_is(toks.get(i), "kw", "mut") {
+        i = i + 1
+    }
+    if i < b && toks.get(i).k == "ident" {
+        return toks.get(i).v
+    }
+    return ""
+}
+
+fn param_type(toks: list[Tok], a: int, b: int) -> str {
+    let mut i: int = a
+    if i < b && tok_is(toks.get(i), "kw", "mut") {
+        i = i + 1
+    }
+    if i < b && toks.get(i).k == "ident" {
+        i = i + 1
+    }
+    if i < b && tok_is(toks.get(i), "sym", ":") {
+        i = i + 1
+        return join_tokens(toks, i, b)
+    }
+    return ""
+}
+
+# parse_fn_sig(toks, i, owner, is_extern) — `fn name [tp] (params)
+# [-> ret] [pure] [uses E,...] [contracts] {body}|;` starting at the
+# kw fn at toks[i]. Err carries the HLError-shaped message.
+fn parse_fn_sig(toks: list[Tok], i: int, owner: str, is_extern: bool)
+-> Result[FnParse, str] {
+    let fd: FnDef = fn_def_new()
+    let n: int = toks.len()
+    if i + 1 >= n || toks.get(i + 1).k != "ident" {
+        return Result.Err(lex_msg("expected identifier (function name)",
+        toks.get(i).line, toks.get(i).col))
+    }
+    fd.decl_line = toks.get(i).line
+    fd.decl_col = 0
+    fd.name = toks.get(i + 1).v
+    if owner == "" {
+        fd.key = fd.name
+    } else {
+        fd.key = owner + "." + fd.name
+    }
+    fd.owner = owner
+    fd.is_extern = is_extern
+    let mut j: int = i + 2
+    # type parameters
+    if j < n && tok_is(toks.get(j), "sym", "[") {
+        j = skip_balanced(toks, j, "[", "]")
+    }
+    if j >= n || !tok_is(toks.get(j), "sym", "(") {
+        return Result.Err(lex_msg("expected '(' after function name",
+        toks.get(j - 1).line, toks.get(j - 1).col))
+    }
+    let po_r: Result[ParamsOut, str] = parse_params(toks, j)
+    if result_is_err(po_r) {
+        return Result.Err(result_err_or(po_r, ""))
+    }
+    let po: ParamsOut = result_unwrap(po_r)
+    fd.n_params = po.count
+    fd.p0_name = po.p0_name
+    fd.p0_type = po.p0_type
+    fd.param_names = po.names
+    fd.param_types = po.types
+    j = po.close + 1
+    # return type
+    if j < n && tok_is(toks.get(j), "sym", "->") {
+        j = j + 1
+        let r0: int = j
+        while j < n && !sig_stop(toks.get(j)) {
+            if is_extern && tok_is(toks.get(j), "sym", ";") {
+                break
+            }
+            j = j + 1
+        }
+        fd.has_ret = true
+        fd.ret = join_tokens(toks, r0, j)
+    }
+    # pure
+    if j < n && tok_is(toks.get(j), "kw", "pure") {
+        fd.is_pure = true
+        j = j + 1
+    }
+    # uses E1, E2, ...
+    if j < n && tok_is(toks.get(j), "kw", "uses") {
+        if fd.is_pure {
+            return Result.Err(lex_msg("'pure' and 'uses' are mutually "
+            + "exclusive (a pure function declares no effects)",
+            toks.get(i).line, toks.get(i).col))
+        }
+        j = j + 1
+        let mut more: bool = true
+        let explicit: list[str] = []
+        while more {
+            more = false
+            if j >= n || toks.get(j).k != "ident" {
+                return Result.Err(lex_msg("expected an effect name",
+                toks.get(j - 1).line, toks.get(j - 1).col))
+            }
+            let eff: str = toks.get(j).v
+            if eff != "IO" && eff != "Fs" && eff != "Clock"
+            && eff != "Args" && eff != "Exit" && eff != "Net"
+            && eff != "Rand" && eff != "Proc" && eff != "Conc" {
+                return Result.Err(lex_msg("unknown effect '" + eff
+                + "'; known effects: IO, Fs, Clock, Args, Exit, Net, "
+                + "Rand, Proc, Conc", toks.get(j).line, toks.get(j).col))
+            }
+            if list_has(explicit, eff) {
+                return Result.Err(lex_msg("duplicate effect declaration: "
+                + eff, toks.get(j).line, toks.get(j).col))
+            }
+            explicit.push(eff)
+            eff_add(fd.effects, eff)
+            if eff == "IO" {
+                eff_union(fd.effects, io_family())
+            }
+            j = j + 1
+            if j < n && tok_is(toks.get(j), "sym", ",") {
+                j = j + 1
+                more = true
+            }
+        }
+    }
+    # contracts (requires / ensures) — expressions, no braces
+    while j < n && (tok_is(toks.get(j), "kw", "requires")
+    || tok_is(toks.get(j), "kw", "ensures")) {
+        j = j + 1
+        while j < n && !sig_stop(toks.get(j)) {
+            if is_extern && tok_is(toks.get(j), "sym", ";") {
+                break
+            }
+            j = j + 1
+        }
+    }
+    if is_extern {
+        if fd.effects.len() == 0 && !fd.is_pure {
+            return Result.Err(lex_msg("extern fn '" + fd.name
+            + "' must declare `uses IO` (or `pure`) — FFI is unsafe "
+            + "by default", toks.get(i).line, toks.get(i).col))
+        }
+        if j < n && tok_is(toks.get(j), "sym", ";") {
+            j = j + 1
+        }
+        fd.b0 = j
+        fd.b1 = j
+        return Result.Ok(FnParse {
+            fd: fd, next: j
+        })
+    }
+    if j >= n || !tok_is(toks.get(j), "sym", "{") {
+        return Result.Err(lex_msg("expected '{' to open the function "
+        + "body", toks.get(j - 1).line, toks.get(j - 1).col))
+    }
+    fd.b0 = j + 1
+    fd.b1 = skip_balanced(toks, j, "{", "}") - 1
+    return Result.Ok(FnParse {
+        fd: fd, next: fd.b1 + 1
+    })
+}
+
+# is_reserved_type_name — the parser's RESERVED_TYPE_NAMES.
+fn is_reserved_type_name(name: str) -> bool {
+    return name == "int" || name == "float" || name == "bool"
+    || name == "str" || name == "void" || name == "list" || name == "map"
+    || name == "tainted" || name == "true" || name == "false"
+    || name == "Chan" || name == "Task" || name == "Future"
+    || name == "Stream"
+}
+
+# parse_struct_fields(toks, i, m, name) — the field list of one
+# struct (name : type [= default]), recorded for the scanner's
+# receiver inference; the index past the closing brace on Ok.
+fn parse_struct_fields(toks: list[Tok], i: int, m: HModule, sname: str)
+-> Result[int, str] {
+    let n: int = toks.len()
+    let info: StructInfo = StructInfo {
+        name: sname, fields: []
+    }
+    let mut j: int = i + 1
+    while j < n && !tok_is(toks.get(j), "sym", "}") {
+        if j >= n || toks.get(j).k != "ident" {
+            return Result.Err(lex_msg("expected identifier",
+            tok_line_or_last(toks, j), tok_col_or_last(toks, j)))
+        }
+        let fname: str = toks.get(j).v
+        let fline: int = toks.get(j).line
+        let fcol: int = toks.get(j).col
+        let mut k: int = 0
+        while k < info.fields.len() {
+            if info.fields.get(k).name == fname {
+                return Result.Err(lex_msg("duplicate field name in struct: "
+                + fname, fline, fcol))
+            }
+            k = k + 1
+        }
+        j = j + 1
+        if j >= n || !tok_is(toks.get(j), "sym", ":") {
+            return Result.Err(lex_msg("expected symbol ':' but got "
+            + tok_at_or_eof(toks, j), tok_line_or_last(toks, j),
+            tok_col_or_last(toks, j)))
+        }
+        j = j + 1
+        let tstart: int = j
+        let mut depth: int = 0
+        while j < n {
+            let tt: Tok = toks.get(j)
+            if tok_is(tt, "sym", "[") {
+                depth = depth + 1
+            } else if tok_is(tt, "sym", "]") {
+                depth = depth - 1
+            } else if depth == 0 && (tok_is(tt, "sym", "=")
+            || tok_is(tt, "sym", ",") || tok_is(tt, "sym", "}")) {
+                break
+            }
+            j = j + 1
+        }
+        info.fields.push(FieldDef {
+            name: fname, ty: join_tokens(toks, tstart, j)
+        })
+        # the default expression (if any) — skipped whole, the scan's
+        # surface does not include the synthetic @default edges
+        if j < n && tok_is(toks.get(j), "sym", "=") {
+            j = j + 1
+            let dstart: int = j
+            let mut ddepth: int = 0
+            while j < n {
+                let dt: Tok = toks.get(j)
+                if tok_is(dt, "sym", "(") || tok_is(dt, "sym", "[")
+                || tok_is(dt, "sym", "{") {
+                    ddepth = ddepth + 1
+                } else if tok_is(dt, "sym", ")") || tok_is(dt, "sym", "]")
+                || tok_is(dt, "sym", "}") {
+                    if ddepth == 0 {
+                        break
+                    }
+                    ddepth = ddepth - 1
+                } else if ddepth == 0 && tok_is(dt, "sym", ",") {
+                    break
+                }
+                j = j + 1
+            }
+            if j == dstart {
+                return Result.Err(lex_msg("expected expression but got "
+                + tok_at_or_eof(toks, j), tok_line_or_last(toks, j),
+                tok_col_or_last(toks, j)))
+            }
+        }
+        if j < n && tok_is(toks.get(j), "sym", ",") {
+            j = j + 1
+        } else if j >= n || !tok_is(toks.get(j), "sym", "}") {
+            return Result.Err(lex_msg("expected ',' or '}' in struct "
+            + "definition", tok_line_or_last(toks, j),
+            tok_col_or_last(toks, j)))
+        }
+    }
+    if info.fields.len() == 0 {
+        return Result.Err(lex_msg("struct must have at least one field",
+        toks.get(i).line, toks.get(i).col))
+    }
+    m.structs_fields.push(info)
+    return Result.Ok(j + 1)
+}
+
+# parse_enum_variants(toks, i, m, name) — the variant list of one enum
+# (A, B(x, y)), recorded for the constructor/method disambiguation.
+fn parse_enum_variants(toks: list[Tok], i: int, m: HModule, ename: str)
+-> Result[int, str] {
+    let n: int = toks.len()
+    let info: EnumInfo = EnumInfo {
+        name: ename, variants: []
+    }
+    let mut j: int = i + 1
+    while j < n && !tok_is(toks.get(j), "sym", "}") {
+        if j >= n || toks.get(j).k != "ident" {
+            return Result.Err(lex_msg("expected identifier",
+            tok_line_or_last(toks, j), tok_col_or_last(toks, j)))
+        }
+        let vname: str = toks.get(j).v
+        let vline: int = toks.get(j).line
+        let vcol: int = toks.get(j).col
+        let mut k: int = 0
+        while k < info.variants.len() {
+            if info.variants.get(k) == vname {
+                return Result.Err(lex_msg("duplicate variant name in enum: "
+                + vname, vline, vcol))
+            }
+            k = k + 1
+        }
+        info.variants.push(vname)
+        j = j + 1
+        if j < n && tok_is(toks.get(j), "sym", "(") {
+            j = skip_balanced(toks, j, "(", ")")
+        }
+        if j < n && tok_is(toks.get(j), "sym", ",") {
+            j = j + 1
+        } else if j >= n || !tok_is(toks.get(j), "sym", "}") {
+            return Result.Err(lex_msg("expected ',' or '}' in enum "
+            + "definition", tok_line_or_last(toks, j),
+            tok_col_or_last(toks, j)))
+        }
+    }
+    if info.variants.len() == 0 {
+        return Result.Err(lex_msg("enum must have at least one variant",
+        toks.get(i).line, toks.get(i).col))
+    }
+    m.enum_variants.push(info)
+    return Result.Ok(j + 1)
+}
+
+# tok_desc_of(t) — the parser's _desc(): "'v'" for a real token.
+fn tok_desc_of(t: Tok) -> str {
+    return "'" + t.v + "'"
+}
+
+# tok_at_or_eof(toks, j) — the token at j, or a synthetic end-of-file
+# description when j is past the end (the parser's peek-at-eof law).
+fn tok_at_or_eof(toks: list[Tok], j: int) -> str {
+    if j < 0 || j >= toks.len() {
+        return "end of file"
+    }
+    return "'" + toks.get(j).v + "'"
+}
+
+# tok_line_or_last(toks, j) — the diagnostic line for position j.
+fn tok_line_or_last(toks: list[Tok], j: int) -> int {
+    if toks.len() == 0 {
+        return 1
+    }
+    if j < 0 {
+        return toks.get(0).line
+    }
+    if j >= toks.len() {
+        return toks.get(toks.len() - 1).line
+    }
+    return toks.get(j).line
+}
+
+# tok_col_or_last(toks, j) — the diagnostic column for position j.
+fn tok_col_or_last(toks: list[Tok], j: int) -> int {
+    if toks.len() == 0 {
+        return 1
+    }
+    if j < 0 {
+        return toks.get(0).col
+    }
+    if j >= toks.len() {
+        return toks.get(toks.len() - 1).col
+    }
+    return toks.get(j).col
+}
+
+# parse_hmodule(path, src) — one .hls file's audit shape.
+fn parse_hmodule(path: str, src: str) -> Result[HModule, str] {
+    let tr: Result[list[Tok], str] = hl_tokenize(src)
+    if result_is_err(tr) {
+        return Result.Err(result_err_or(tr, ""))
+    }
+    let toks: list[Tok] = result_unwrap(tr)
+    let m: HModule = HModule {
+        path: path, toks: toks, imports: [], import_lines: [], fns: [],
+        structs: [], enums: [], structs_fields: [], enum_variants: []
+    }
+    let n: int = toks.len()
+    let mut i: int = 0
+    while i < n {
+        let skipped: int = skip_attr(toks, i)
+        if skipped != i {
+            i = skipped
+            continue
+        }
+        let t: Tok = toks.get(i)
+        if tok_is(t, "kw", "import") {
+            if i + 1 >= n || toks.get(i + 1).k != "str" {
+                return Result.Err(lex_msg("import expects a string path",
+                t.line, t.col))
+            }
+            m.imports.push(toks.get(i + 1).v)
+            m.import_lines.push(t.line)
+            i = i + 2
+            continue
+        }
+        if tok_is(t, "kw", "struct") || tok_is(t, "kw", "enum") {
+            if i + 1 >= n || toks.get(i + 1).k != "ident" {
+                return Result.Err(lex_msg("expected identifier",
+                t.line, t.col))
+            }
+            let name: str = toks.get(i + 1).v
+            if t.v == "struct" {
+                m.structs.push(name)
+            } else {
+                m.enums.push(name)
+            }
+            let mut j: int = i + 2
+            if j < n && tok_is(toks.get(j), "sym", "[") {
+                j = skip_balanced(toks, j, "[", "]")
+            }
+            if j < n && tok_is(toks.get(j), "sym", "{") {
+                if t.v == "struct" {
+                    let fr: Result[int, str] = parse_struct_fields(toks, j,
+                    m, name)
+                    if result_is_err(fr) {
+                        return Result.Err(result_err_or(fr, ""))
+                    }
+                    j = result_unwrap(fr)
+                } else {
+                    let er: Result[int, str] = parse_enum_variants(toks, j,
+                    m, name)
+                    if result_is_err(er) {
+                        return Result.Err(result_err_or(er, ""))
+                    }
+                    j = result_unwrap(er)
+                }
+            }
+            # the parser's reserved / duplicate-name laws fire with the
+            # CURRENT token (the one after the declaration) in position.
+            let mut dl: int = t.line
+            let mut dc: int = t.col
+            if j < n {
+                dl = toks.get(j).line
+                dc = toks.get(j).col
+            }
+            if is_reserved_type_name(name) {
+                return Result.Err(lex_msg("type name '" + name
+                + "' is reserved (collides with a primitive type)", dl, dc))
+            }
+            let mut dup_count: int = 0
+            let mut si: int = 0
+            while si < m.structs.len() {
+                if m.structs.get(si) == name {
+                    dup_count = dup_count + 1
+                }
+                si = si + 1
+            }
+            let mut ei: int = 0
+            while ei < m.enums.len() {
+                if m.enums.get(ei) == name {
+                    dup_count = dup_count + 1
+                }
+                ei = ei + 1
+            }
+            if dup_count > 1 {
+                return Result.Err(lex_msg("duplicate type name: " + name,
+                dl, dc))
+            }
+            i = j
+            continue
+        }
+        if tok_is(t, "kw", "impl") {
+            if i + 1 >= n || toks.get(i + 1).k != "ident" {
+                return Result.Err(lex_msg("expected identifier",
+                t.line, t.col))
+            }
+            let sname: str = toks.get(i + 1).v
+            let mut j: int = i + 2
+            if j >= n || !tok_is(toks.get(j), "sym", "{") {
+                return Result.Err(lex_msg("expected '{' after impl name",
+                t.line, t.col))
+            }
+            j = j + 1
+            while j < n && !tok_is(toks.get(j), "sym", "}") {
+                let sk: int = skip_attr(toks, j)
+                if sk != j {
+                    j = sk
+                    continue
+                }
+                if !tok_is(toks.get(j), "kw", "fn") {
+                    return Result.Err(lex_msg("only fn definitions allowed "
+                    + "inside impl", toks.get(j).line, toks.get(j).col))
+                }
+                let fnline: int = toks.get(j).line
+                let fncol: int = toks.get(j).col
+                let pr: Result[FnParse, str] = parse_fn_sig(toks, j,
+                sname, false)
+                if result_is_err(pr) {
+                    return Result.Err(result_err_or(pr, ""))
+                }
+                let fp: FnParse = result_unwrap(pr)
+                fp.fd.decl_line = fnline
+                fp.fd.decl_col = fncol
+                m.fns.push(fp.fd)
+                j = fp.next
+            }
+            i = j + 1
+            continue
+        }
+        if tok_is(t, "kw", "extern") {
+            if i + 1 >= n || toks.get(i + 1).k != "str" {
+                return Result.Err(lex_msg("expected ABI string (e.g. \"C\" "
+                + "or \"js\") after 'extern'", t.line, t.col))
+            }
+            let abi: str = toks.get(i + 1).v
+            if abi != "C" && abi != "js" {
+                return Result.Err(lex_msg("unsupported ABI '" + abi
+                + "'; only \"C\" and \"js\" are supported",
+                toks.get(i + 1).line, toks.get(i + 1).col))
+            }
+            let mut j: int = i + 2
+            if j >= n || !tok_is(toks.get(j), "sym", "{") {
+                return Result.Err(lex_msg("expected '{' after extern ABI",
+                t.line, t.col))
+            }
+            j = j + 1
+            while j < n && !tok_is(toks.get(j), "sym", "}") {
+                let sk: int = skip_attr(toks, j)
+                if sk != j {
+                    j = sk
+                    continue
+                }
+                if !tok_is(toks.get(j), "kw", "fn") {
+                    return Result.Err(lex_msg("extern block can only "
+                    + "contain fn declarations",
+                    toks.get(j).line, toks.get(j).col))
+                }
+                let pr: Result[FnParse, str] = parse_fn_sig(toks, j, "",
+                true)
+                if result_is_err(pr) {
+                    return Result.Err(result_err_or(pr, ""))
+                }
+                let fp: FnParse = result_unwrap(pr)
+                m.fns.push(fp.fd)
+                j = fp.next
+            }
+            i = j + 1
+            continue
+        }
+        if tok_is(t, "kw", "fn") {
+            let pr: Result[FnParse, str] = parse_fn_sig(toks, i, "", false)
+            if result_is_err(pr) {
+                return Result.Err(result_err_or(pr, ""))
+            }
+            let fp: FnParse = result_unwrap(pr)
+            # the duplicate-name law fires at the CURRENT token — the
+            # one after the whole duplicate fn.
+            if fp.next < n {
+                fp.fd.decl_line = toks.get(fp.next).line
+                fp.fd.decl_col = toks.get(fp.next).col
+            }
+            m.fns.push(fp.fd)
+            i = fp.next
+            continue
+        }
+        return Result.Err(lex_msg("only struct/enum/impl/fn/import/extern "
+        + "declarations allowed at top level", t.line, t.col))
+    }
+    # the parser's own intra-file duplicate law
+    let seen_keys: map[str, bool] = map_new()
+    let mut fi: int = 0
+    while fi < m.fns.len() {
+        let fd: FnDef = m.fns.get(fi)
+        if seen_keys.has(fd.key) {
+            if fd.owner != "" {
+                return Result.Err(lex_msg("duplicate method name: " + fd.key,
+                fd.decl_line, fd.decl_col))
+            }
+            return Result.Err(lex_msg("duplicate function name: "
+            + fd.name, fd.decl_line, fd.decl_col))
+        }
+        seen_keys.set(fd.key, true)
+        fi = fi + 1
+    }
+    return Result.Ok(m)
+}
+
+# ============================================================================
+# The environment / filesystem slice — env vars, the wall clock, file
+# tests, whole-file reads, and the repo root (the .py's __file__ law:
+# this binary ships in <root>/bin, so argv[0] normalizes back to the
+# checkout the tool belongs to; a checkout nowhere in sight walks up
+# from the cwd, hlfmt's config law).
+# ============================================================================
+
+fn is_file_h(p: str) -> bool uses Fs {
+    return file_exists(p) && !fs_is_dir(p)
+}
+
+fn is_dir_h(p: str) -> bool uses Fs {
+    return fs_is_dir(p)
+}
+
+fn read_or(p: str, default_value: str) -> str uses Fs {
+    if file_exists(p) {
+        return read_file(p)
+    }
+    return default_value
+}
+
+fn sha256_file_h(p: str) -> str uses Fs {
+    return sha256_hex(read_or(p, ""))
+}
+
+# is_repo_root(p) — the checkout marker: the std/ + core/ module
+# families and the spec, the three trees the tool's own resolution
+# law depends on.
+fn is_repo_root(p: str) -> bool uses Fs {
+    return file_exists(p + "/std/str.hls")
+    && file_exists(p + "/core/option.hls")
+    && file_exists(p + "/SPEC.md")
+}
+
+# which_hit(name) — the first PATH directory holding `name`.
+fn which_hit(name: str) -> str uses Fs, Proc {
+    if name == "" || name.contains("/") {
+        return ""
+    }
+    let penv: str = env_get("PATH")
+    if penv == "" {
+        return ""
+    }
+    let dirs: list[str] = penv.split(":")
+    let mut i: int = 0
+    while i < dirs.len() {
+        let mut cand: str = dirs.get(i)
+        if cand == "" {
+            cand = "."
+        }
+        let full: str = cand + "/" + name
+        if file_exists(full) {
+            return full
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn repo_root() -> str uses Fs, Proc, Args {
+    let argv: list[str] = args()
+    if argv.len() > 0 && argv.get(0) != "" {
+        let binp: str = realpath_lex(argv.get(0))
+        let root: str = path_dirname(path_dirname(binp))
+        if is_repo_root(root) {
+            return root
+        }
+        let hit: str = which_hit(argv.get(0))
+        if hit != "" {
+            let root2: str = path_dirname(path_dirname(realpath_lex(hit)))
+            if is_repo_root(root2) {
+                return root2
+            }
+        }
+    }
+    let mut d: str = realpath_lex("")
+    let mut guard: int = 0
+    while guard < 128 {
+        if is_repo_root(d) {
+            return d
+        }
+        let parent: str = path_dirname(d)
+        if parent == d || parent == "." {
+            return realpath_lex("")
+        }
+        d = parent
+        guard = guard + 1
+    }
+    return realpath_lex("")
+}
+
+# transparency_log_path() — hpkg_common's law: the
+# HLS_PKG_TRANSPARENCY_LOG override, else <repo>/.hls-pkg-transparency.log.
+fn transparency_log_path() -> str uses Fs, Proc, Args {
+    let over: str = env_get("HLS_PKG_TRANSPARENCY_LOG")
+    if over != "" || env_has("HLS_PKG_TRANSPARENCY_LOG") {
+        return over
+    }
+    return repo_root() + "/.hls-pkg-transparency.log"
+}
+
+fn pkg_cache_dir() -> str uses Fs, Proc, Args {
+    let over: str = env_get("HLS_PKG_CACHE")
+    if over != "" || env_has("HLS_PKG_CACHE") {
+        return over
+    }
+    return repo_root() + "/.hls-pkg-cache"
+}
+
+# ============================================================================
+# The builtin fn registry (the checker's BUILTIN_FNS) and the builtin
+# effect table (BUILTIN_EFFECTS) — the exact tables the interpreter's
+# fixpoint unions over, verbatim.
+# ============================================================================
+
+fn is_builtin_fn(name: str) -> bool {
+    if name == "print" || name == "println" || name == "eprint"
+    || name == "eprintln" || name == "isatty" || name == "panic"
+    || name == "exit" || name == "str" || name == "int" || name == "len"
+    || name == "range" || name == "map_new" || name == "chr"
+    || name == "read_file" || name == "write_file" || name == "args"
+    || name == "clock_ms" || name == "file_exists" {
+        return true
+    }
+    if name == "fs_read_dir" || name == "fs_size" || name == "fs_is_dir"
+    || name == "fs_set_perms" || name == "net_tcp_connect"
+    || name == "net_tcp_listen" || name == "net_tcp_accept"
+    || name == "net_read" || name == "net_write" || name == "net_close"
+    || name == "net_udp_open" || name == "net_udp_send_to"
+    || name == "net_udp_recv_from" || name == "net_tls_get" {
+        return true
+    }
+    if name == "drop" || name == "clone" || name == "take"
+    || name == "tainted_args" || name == "taint_mark"
+    || name == "taint_unwrap" || name == "read_file_tainted"
+    || name == "read_line" || name == "net_lookup" || name == "rand_int"
+    || name == "rand_float" || name == "rand_seed" || name == "proc_exec" {
+        return true
+    }
+    if name == "chan_new" || name == "chan_new_bounded" || name == "spawn"
+    || name == "select" || name == "async_spawn" || name == "await"
+    || name == "future_ready" || name == "future_poll"
+    || name == "future_select" {
+        return true
+    }
+    if name == "stream_new" || name == "stream_send"
+    || name == "stream_recv" || name == "stream_try_recv"
+    || name == "stream_len" || name == "stream_close"
+    || name == "stream_map_int" || name == "stream_filter_int"
+    || name == "stream_take_int" || name == "stream_fold_int"
+    || name == "stream_merge_int" || name == "stream_flat_map_int"
+    || name == "gen_spawn" || name == "join" {
+        return true
+    }
+    if name == "has_feature" || name == "simd_cpu_supports"
+    || name == "int_and" || name == "int_or" || name == "int_xor"
+    || name == "int_not" || name == "int_shl" || name == "int_shr"
+    || name == "int_sar" || name == "int_popcount" || name == "int_clz"
+    || name == "int_ctz" {
+        return true
+    }
+    if name == "thread_sleep_ms" || name == "thread_yield"
+    || name == "thread_current_id" || name == "proc_spawn"
+    || name == "proc_wait" || name == "proc_kill"
+    || name == "proc_child_write" || name == "proc_child_read"
+    || name == "proc_child_close" {
+        return true
+    }
+    if name == "env_get" || name == "env_has" || name == "env_set"
+    || name == "env_unset" || name == "cwd_get" || name == "cwd_set"
+    || name == "args_os" || name == "instant_now_ns"
+    || name == "system_time_now_ms" {
+        return true
+    }
+    if name == "math_sin" || name == "math_cos" || name == "math_tan"
+    || name == "math_asin" || name == "math_acos" || name == "math_atan"
+    || name == "math_atan2" || name == "math_sinh" || name == "math_cosh"
+    || name == "math_tanh" || name == "math_exp" || name == "math_log"
+    || name == "math_log10" || name == "math_log2" || name == "math_pow"
+    || name == "math_sqrt" || name == "math_cbrt" || name == "math_hypot"
+    || name == "math_fmod" || name == "math_copysign"
+    || name == "math_erf" || name == "math_erfc" || name == "math_tgamma"
+    || name == "math_lgamma" || name == "math_isnan" || name == "math_isinf"
+    || name == "math_isfinite" || name == "math_signbit" {
+        return true
+    }
+    if name == "proc_pid" || name == "sys_hostname" || name == "cap_take"
+    || name == "cap_effect_name" {
+        return true
+    }
+    return false
+}
+
+# builtin_effects_of(name) — the effect set of an effectful builtin
+# (BUILTIN_EFFECTS verbatim; pure builtins yield the empty set).
+fn builtin_effects_of(name: str) -> list[str] {
+    if name == "print" || name == "println" || name == "eprint"
+    || name == "eprintln" || name == "isatty" || name == "read_line" {
+        return["IO"]
+    }
+    if name == "proc_pid" || name == "sys_hostname" || name == "proc_exec"
+    || name == "proc_spawn" || name == "proc_wait" || name == "proc_kill"
+    || name == "proc_child_write" || name == "proc_child_read"
+    || name == "proc_child_close" || name == "env_get" || name == "env_has"
+    || name == "env_set" || name == "env_unset" || name == "cwd_get"
+    || name == "cwd_set" || name == "args_os" {
+        return["Proc"]
+    }
+    if name == "read_file" || name == "write_file" || name == "file_exists"
+    || name == "fs_read_dir" || name == "fs_size" || name == "fs_is_dir"
+    || name == "fs_set_perms" || name == "read_file_tainted" {
+        return["Fs"]
+    }
+    if name == "clock_ms" || name == "instant_now_ns"
+    || name == "system_time_now_ms" {
+        return["Clock"]
+    }
+    if name == "args" || name == "tainted_args" {
+        return["Args"]
+    }
+    if name == "exit" {
+        return["Exit"]
+    }
+    if name == "net_lookup" || name == "net_tcp_connect"
+    || name == "net_tcp_listen" || name == "net_tcp_accept"
+    || name == "net_read" || name == "net_write" || name == "net_close"
+    || name == "net_udp_open" || name == "net_udp_send_to"
+    || name == "net_udp_recv_from" || name == "net_tls_get" {
+        return["Net"]
+    }
+    if name == "rand_int" || name == "rand_float" || name == "rand_seed" {
+        return["Rand"]
+    }
+    if name == "thread_sleep_ms" {
+        return["Clock", "Conc"]
+    }
+    if name == "chan_new" || name == "chan_new_bounded" || name == "spawn"
+    || name == "select" || name == "async_spawn" || name == "await"
+    || name == "future_ready" || name == "future_poll"
+    || name == "future_select" || name == "stream_new"
+    || name == "stream_send" || name == "stream_recv"
+    || name == "stream_try_recv" || name == "stream_len"
+    || name == "stream_close" || name == "stream_map_int"
+    || name == "stream_filter_int" || name == "stream_take_int"
+    || name == "stream_fold_int" || name == "stream_merge_int"
+    || name == "stream_flat_map_int" || name == "gen_spawn"
+    || name == "thread_yield" || name == "thread_current_id" {
+        return["Conc"]
+    }
+    return[]
+}
+
+# builtin_method_effect(op) — the method-level effect entries
+# ("chan.send" .. "task.join"); "" when the method carries none.
+fn builtin_method_effects(op: str) -> list[str] {
+    if op == "chan.send" || op == "chan.try_send" || op == "chan.recv"
+    || op == "chan.recv_or" || op == "chan.len" || op == "task.join" {
+        return["Conc"]
+    }
+    return[]
+}
+
+# builtin_ret_type(name) — the return types the call-shape inference
+# needs for method receivers (builtins whose results get a method
+# called on them in audited trees); "" when unknown.
+fn builtin_ret_type(name: str) -> str {
+    if name == "clock_ms" || name == "fs_size" || name == "rand_int"
+    || name == "proc_exec" || name == "proc_pid" || name == "len"
+    || name == "int_popcount" || name == "int_clz" || name == "int_ctz"
+    || name == "thread_current_id" || name == "proc_wait"
+    || name == "proc_spawn" || name == "net_tcp_connect"
+    || name == "net_tcp_listen" || name == "net_tcp_accept"
+    || name == "net_udp_open" || name == "int" {
+        return "int"
+    }
+    if name == "file_exists" || name == "fs_is_dir" || name == "env_has"
+    || name == "isatty" || name == "has_feature"
+    || name == "simd_cpu_supports" || name == "math_isnan"
+    || name == "math_isinf" || name == "math_isfinite"
+    || name == "math_signbit" || name == "net_write" {
+        return "bool"
+    }
+    if name == "net_lookup" || name == "read_file" || name == "read_line"
+    || name == "sys_hostname" || name == "env_get" || name == "str"
+    || name == "chr" || name == "net_read" || name == "net_udp_recv_from"
+    || name == "net_tls_get" || name == "read_file_tainted" {
+        return "str"
+    }
+    if name == "args" || name == "args_os" || name == "fs_read_dir" {
+        return "list[str]"
+    }
+    return ""
+}
+
+# is_spawn_family(name) — the builtins whose FIRST argument is a
+# function name (the edge set gains the target fn, deep-scan-10).
+fn is_spawn_family(name: str) -> bool {
+    return name == "spawn" || name == "async_spawn" || name == "gen_spawn"
+    || name == "stream_map_int" || name == "stream_filter_int"
+    || name == "stream_take_int" || name == "stream_fold_int"
+    || name == "stream_merge_int" || name == "stream_flat_map_int"
+}
+
+# ============================================================================
+# Import resolution — boot.py's own law, verbatim: the std./core.
+# walk-up (5 levels) + repo-root fallback, confined relative paths,
+# and the HLS_PKG_DEPS farm as the last resort. Err(Fail.direct)
+# mirrors the SystemExit messages the interpreter lets escape bare
+# (exit 1, no tool prefix); Ok("") means "not found".
+# ============================================================================
+
+fn resolve_import(import_path: str, importing_file: str, root: str)
+-> Result[str, Fail] uses Fs, Proc {
+    if import_path.starts_with("std.") || import_path.starts_with("core.") {
+        let mut prefix: str = "std."
+        let mut subdir: str = "std"
+        if import_path.starts_with("core.") {
+            prefix = "core."
+            subdir = "core"
+        }
+        let module_name: str = import_path.slice(prefix.len(), import_path.len())
+        if module_name == "" {
+            return Result.Err(dfail("error: import path must name a module "
+            + "after '" + prefix + "': " + import_path))
+        }
+        if module_name.byte_at(0) == 47 || module_name.byte_at(0) == 92 {
+            return Result.Err(dfail("error: import path must be relative, "
+            + "got absolute: " + import_path))
+        }
+        let mparts: list[str] = str_replace(module_name, "\\", "/").split("/")
+        if list_has(mparts, "..") {
+            return Result.Err(dfail("error: import path must not contain "
+            + "'..' segments: " + import_path))
+        }
+        let rel: str = subdir + "/" + module_name + ".hls"
+        let mut d: str = path_dirname(importing_file)
+        let mut steps: int = 0
+        while steps < 5 {
+            let cand: str = path_join2(d, rel)
+            if is_file_h(cand) {
+                return Result.Ok(cand)
+            }
+            let parent: str = path_dirname(d)
+            if parent == d {
+                steps = 5
+            } else {
+                d = parent
+            }
+            steps = steps + 1
+        }
+        let fb: str = path_join2(root, rel)
+        if is_file_h(fb) {
+            return Result.Ok(fb)
+        }
+        return Result.Ok("")
+    }
+    # Relative path
+    let base_dir: str = path_dirname(importing_file)
+    if path_is_abs(import_path) {
+        return Result.Err(dfail("error: import path must be relative, got "
+        + "absolute: " + import_path))
+    }
+    let parts: list[str] = str_replace(import_path, "\\", "/").split("/")
+    if list_has(parts, "..") {
+        return Result.Err(dfail("error: import path must not contain "
+        + "'..' segments: " + import_path))
+    }
+    let candidate: str = norm_path(path_join2(base_dir, import_path))
+    if candidate != base_dir
+    && !candidate.starts_with(base_dir + "/") {
+        return Result.Err(dfail("error: import path escapes the importing "
+        + "file's directory: " + import_path))
+    }
+    if is_file_h(candidate) {
+        return Result.Ok(candidate)
+    }
+    let deps_dir: str = env_get("HLS_PKG_DEPS")
+    if deps_dir != "" && is_dir_h(deps_dir) {
+        let cand2: str = path_join2(deps_dir, path_basename(import_path))
+        if is_file_h(cand2) {
+            return Result.Ok(cand2)
+        }
+        let cand3: str = path_join2(deps_dir, import_path)
+        if is_file_h(cand3) {
+            return Result.Ok(cand3)
+        }
+    }
+    return Result.Ok("")
+}
+
+# ============================================================================
+# The import-graph walk — the audit's _walk_import_graph: BFS from the
+# entry, edges realpath -> sorted unique kid realpaths, per-module parse
+# with the .py's exact error wrappers.
+# ============================================================================
+
+struct WalkOut {
+    order: list[str],
+    modules: list[HModule],
+    edges: map[str, list[str]]
+}
+
+fn walk_import_graph(entry_abs: str, root: str) -> Result[WalkOut, Fail]
+uses Fs, Proc {
+    let queue: list[str] = [entry_abs]
+    let order: list[str] = []
+    let modules: list[HModule] = []
+    let edges: map[str, list[str]] = map_new()
+    let seen: map[str, bool] = map_new()
+    let mut qi: int = 0
+    while qi < queue.len() {
+        let cur: str = queue.get(qi)
+        qi = qi + 1
+        if seen.has(cur) {
+            continue
+        }
+        seen.set(cur, true)
+        if !is_file_h(cur) {
+            return Result.Err(fail("cannot read " + cur
+            + " ([Errno 2] No such file or directory: '" + cur + "')"))
+        }
+        let src: str = read_file(cur)
+        let pm: Result[HModule, str] = parse_hmodule(cur, src)
+        if result_is_err(pm) {
+            return Result.Err(fail("parse error in " + cur + ": "
+            + result_err_or(pm, "")))
+        }
+        let module: HModule = result_unwrap(pm)
+        order.push(cur)
+        modules.push(module)
+        let kids: list[str] = []
+        let mut ii: int = 0
+        while ii < module.imports.len() {
+            let imp: str = module.imports.get(ii)
+            let rr: Result[str, Fail] = resolve_import(imp, cur, root)
+            if result_is_err(rr) {
+                return Result.Err(result_err_or(rr, fail("")))
+            }
+            let resolved: str = result_unwrap(rr)
+            if resolved == "" {
+                return Result.Err(fail("module not found: " + imp
+                + " (imported by " + cur + ")"))
+            }
+            let kid: str = realpath_lex(resolved)
+            kids.push(kid)
+            queue.push(kid)
+            ii = ii + 1
+        }
+        edges.set(cur, sorted_unique(kids))
+    }
+    return Result.Ok(WalkOut {
+        order: order, modules: modules, edges: edges
+    })
+}
+
+# ============================================================================
+# The merged program — load_program's duplicate laws plus the call-edge
+# scan (the checker's edges map) and the effects fixpoint
+# (check_effects), reduced to what the audit's report consumes.
+# ============================================================================
+
+struct FnRef {
+    fd: FnDef,
+    mod_idx: int
+}
+
+fn fn_ref_new() -> FnRef {
+    return FnRef {
+        fd: fn_def_new(), mod_idx: 0
+    }
+}
+
+struct MergedProg {
+    modules: list[HModule],
+    paths: list[str],
+    edges: map[str, list[str]], # module realpath -> kids
+    fns: map[str, FnRef], # fn key -> ref
+    struct_fields: map[str, str], # "Struct.field" -> type text
+    enums: map[str, list[str]], # enum name -> variant names
+    call_edges: map[str, list[str]] # fn key -> callee edge names
+}
+
+# register_module_fns — one module's fns/types into the merged maps,
+# with the audit's duplicate-function law (BFS order).
+fn register_module_fns(prog: MergedProg, module: HModule, mod_idx: int)
+-> Result[bool, Fail] {
+    let mut fi: int = 0
+    while fi < module.fns.len() {
+        let fd: FnDef = module.fns.get(fi)
+        if prog.fns.has(fd.key) {
+            return Result.Err(fail("duplicate function across modules: "
+            + fd.key))
+        }
+        prog.fns.set(fd.key, FnRef {
+            fd: fd, mod_idx: mod_idx
+        })
+        fi = fi + 1
+    }
+    let mut si: int = 0
+    while si < module.structs_fields.len() {
+        let sinfo: StructInfo = module.structs_fields.get(si)
+        let mut fj: int = 0
+        while fj < sinfo.fields.len() {
+            let fld: FieldDef = sinfo.fields.get(fj)
+            prog.struct_fields.set(sinfo.name + "." + fld.name, fld.ty)
+            fj = fj + 1
+        }
+        si = si + 1
+    }
+    let mut ei: int = 0
+    while ei < module.enum_variants.len() {
+        let einfo: EnumInfo = module.enum_variants.get(ei)
+        prog.enums.set(einfo.name, einfo.variants)
+        ei = ei + 1
+    }
+    return Result.Ok(true)
+}
+
+# check_type_dupes — load_program's cross-module type collision law
+# (unauditable-wrapped in the .py: the HLError passes _check_merged).
+fn check_type_dupes(prog: MergedProg) -> Result[bool, Fail] {
+    let types: map[str, bool] = map_new()
+    let mut mi: int = 0
+    while mi < prog.modules.len() {
+        let module: HModule = prog.modules.get(mi)
+        let mut si: int = 0
+        while si < module.structs_fields.len() {
+            let nm: str = module.structs_fields.get(si).name
+            if types.has(nm) {
+                return Result.Err(fail("unauditable: duplicate type name "
+                + "across modules: " + nm))
+            }
+            types.set(nm, true)
+            si = si + 1
+        }
+        let mut ei: int = 0
+        while ei < module.enum_variants.len() {
+            let nm2: str = module.enum_variants.get(ei).name
+            if types.has(nm2) {
+                return Result.Err(fail("unauditable: duplicate type name "
+                + "across modules: " + nm2))
+            }
+            types.set(nm2, true)
+            ei = ei + 1
+        }
+        mi = mi + 1
+    }
+    return Result.Ok(true)
+}
+
+# dfs_cycle — one node of load_program's DFS: a node on the current
+# path is a cycle (the error names the re-entered file).
+fn dfs_cycle(edges: map[str, list[str]], node: str, path: list[str],
+done: map[str, bool]) -> str {
+    if list_has(path, node) {
+        return node
+    }
+    if done.has(node) {
+        return ""
+    }
+    path.push(node)
+    if edges.has(node) {
+        let kids: list[str] = edges.get_or(node, [])
+        let mut kj: int = 0
+        while kj < kids.len() {
+            let r: str = dfs_cycle(edges, kids.get(kj), path, done)
+            if r != "" {
+                return r
+            }
+            kj = kj + 1
+        }
+    }
+    done.set(node, true)
+    path.pop()
+    return ""
+}
+
+# detect_cycle — load_program's circular-import law (DFS from the entry).
+fn detect_cycle(prog: MergedProg, entry_abs: str) -> Result[bool, Fail] {
+    let path: list[str] = []
+    let done: map[str, bool] = map_new()
+    let hit: str = dfs_cycle(prog.edges, entry_abs, path, done)
+    if hit != "" {
+        return Result.Err(fail("unauditable: circular import detected: "
+        + hit + " (line 0)"))
+    }
+    return Result.Ok(true)
+}
+
+# type_base_of(t) — the type's base name ("Box[int]" -> "Box").
+fn type_base_of(t: str) -> str {
+    let at: int = t.find("[")
+    if at < 0 {
+        return t
+    }
+    return t.slice(0, at)
+}
+
+# scan_fn_body — the checker's call-edge law for one fn body: plain
+# calls (builtin first, then user fns), spawn-family targets, method
+# calls resolved through the lightweight receiver inference (let/param
+# annotations, call return types, one field hop; enum constructors
+# carry no edge), and the asm! blocks skipped whole. Err carries the
+# "function does not exist" text (the checker's own diagnostic shape).
+fn scan_fn_body(prog: MergedProg, module: HModule, fd: FnDef)
+-> Result[list[str], str] {
+    let callees: list[str] = []
+    let toks: list[Tok] = module.toks
+    let vars: map[str, str] = map_new()
+    let mut pi: int = 0
+    while pi < fd.param_names.len() {
+        vars.set(fd.param_names.get(pi), fd.param_types.get(pi))
+        pi = pi + 1
+    }
+    let mut i: int = fd.b0
+    while i < fd.b1 {
+        let t: Tok = toks.get(i)
+        # let [mut] name : type = <expr>
+        if tok_is(t, "kw", "let") {
+            let mut j: int = i + 1
+            if j < fd.b1 && tok_is(toks.get(j), "kw", "mut") {
+                j = j + 1
+            }
+            if j + 1 < fd.b1 && toks.get(j).k == "ident"
+            && tok_is(toks.get(j + 1), "sym", ":") {
+                let vname: str = toks.get(j).v
+                j = j + 2
+                let tstart: int = j
+                let mut depth: int = 0
+                while j < fd.b1 {
+                    let tt: Tok = toks.get(j)
+                    if tok_is(tt, "sym", "[") {
+                        depth = depth + 1
+                    } else if tok_is(tt, "sym", "]") {
+                        depth = depth - 1
+                    } else if tok_is(tt, "sym", "=") && depth == 0 {
+                        j = fd.b1
+                    }
+                    if j == fd.b1 {
+                        break
+                    }
+                    j = j + 1
+                }
+                vars.set(vname, join_tokens(toks, tstart, j))
+            }
+            i = i + 1
+            continue
+        }
+        # for name : type in <expr>
+        if tok_is(t, "kw", "for") {
+            let mut j: int = i + 1
+            if j + 1 < fd.b1 && toks.get(j).k == "ident"
+            && tok_is(toks.get(j + 1), "sym", ":") {
+                let vname: str = toks.get(j).v
+                j = j + 2
+                let tstart: int = j
+                while j < fd.b1 && !tok_is(toks.get(j), "kw", "in") {
+                    j = j + 1
+                }
+                vars.set(vname, join_tokens(toks, tstart, j))
+            }
+            i = i + 1
+            continue
+        }
+        # asm! (...) — skipped whole
+        if tok_is(t, "kw", "asm") && i + 1 < fd.b1
+        && tok_is(toks.get(i + 1), "sym", "!") && i + 2 < fd.b1
+        && tok_is(toks.get(i + 2), "sym", "(") {
+            i = skip_balanced(toks, i + 2, "(", ")")
+            continue
+        }
+        # plain call: ident "("
+        if t.k == "ident" && i + 1 < fd.b1
+        && tok_is(toks.get(i + 1), "sym", "(") {
+            let name: str = t.v
+            if is_builtin_fn(name) {
+                if !list_has(callees, "b:" + name) {
+                    callees.push("b:" + name)
+                }
+                if is_spawn_family(name) && i + 2 < fd.b1
+                && toks.get(i + 2).k == "ident" {
+                    let target: str = toks.get(i + 2).v
+                    if !list_has(callees, target) {
+                        callees.push(target)
+                    }
+                }
+            } else if prog.fns.has(name) {
+                if !list_has(callees, name) {
+                    callees.push(name)
+                }
+            } else {
+                return Result.Err("function does not exist: " + name
+                + " (line " + t.line.to_str() + ")")
+            }
+            i = i + 1
+            continue
+        }
+        # method call: "." ident "("
+        if tok_is(t, "sym", ".") && i + 2 < fd.b1
+        && toks.get(i + 1).k == "ident"
+        && tok_is(toks.get(i + 2), "sym", "(") {
+            let mname: str = toks.get(i + 1).v
+            let recv: str = receiver_type_of(prog, toks, fd.b0, i, vars)
+            let edge: str = method_edge_of(prog, recv, mname)
+            if edge != "" && !list_has(callees, edge) {
+                callees.push(edge)
+            }
+            i = i + 2
+            continue
+        }
+        i = i + 1
+    }
+    return Result.Ok(callees)
+}
+
+# receiver_type_of — the type of the expression ending at toks[i-1].
+fn receiver_type_of(prog: MergedProg, toks: list[Tok], b0: int, dot_at: int,
+vars: map[str, str]) -> str {
+    if dot_at <= b0 {
+        return ""
+    }
+    let prev: Tok = toks.get(dot_at - 1)
+    if prev.k == "ident" {
+        if vars.has(prev.v) {
+            return vars.get_or(prev.v, "")
+        }
+        return ""
+    }
+    if tok_is(prev, "sym", ")") {
+        # a call (or parenthesised expr): find the matching "("
+        let mut depth: int = 0
+        let mut j: int = dot_at - 1
+        while j >= b0 {
+            let tt: Tok = toks.get(j)
+            if tok_is(tt, "sym", ")") {
+                depth = depth + 1
+            } else if tok_is(tt, "sym", "(") {
+                depth = depth - 1
+                if depth == 0 {
+                    if j > b0 && toks.get(j - 1).k == "ident" {
+                        let callee: str = toks.get(j - 1).v
+                        if prog.fns.has(callee) {
+                            return prog.fns.get_or(callee, fn_ref_new()).fd.ret
+                        }
+                        return builtin_ret_type(callee)
+                    }
+                    return ""
+                }
+            }
+            j = j - 1
+        }
+        return ""
+    }
+    return ""
+}
+
+# method_edge_of — the edge a "<recv>.<name>(...)" call contributes:
+# user struct methods by key, the chan/task builtin methods by op
+# name, nothing for primitives / enum constructors / unknown receivers.
+fn method_edge_of(prog: MergedProg, recv: str, mname: str) -> str {
+    if recv == "" {
+        return ""
+    }
+    let base: str = type_base_of(recv)
+    if base == "str" || base == "int" || base == "float" || base == "bool"
+    || base == "list" || base == "map" || base == "Future"
+    || base == "Stream" || base == "Cap" || base == "tainted" {
+        return ""
+    }
+    if base == "Chan" {
+        let op: str = "chan." + mname
+        if builtin_method_effects(op).len() > 0 {
+            return "b:" + op
+        }
+        return ""
+    }
+    if base == "Task" {
+        if mname == "join" {
+            return "b:task.join"
+        }
+        return ""
+    }
+    let key: str = base + "." + mname
+    if prog.fns.has(key) {
+        return key
+    }
+    return ""
+}
+
+# enum_ctor_shape — is "<ident>.<name>(" an enum constructor (the
+# receiver ident names an enum and no local shadows it)? The scanner
+# consults this before charging a method edge when the receiver is a
+# bare ident that is NOT a known variable.
+
+# build_edges — scan every fn body in the merged program, in merged
+# load order (deps first, the entry last — load_program's order).
+fn build_edges(prog: MergedProg) -> Result[bool, str] {
+    let call_edges: map[str, list[str]] = map_new()
+    let keys: list[str] = prog.fns.keys()
+    let mut ki: int = 0
+    while ki < keys.len() {
+        let key: str = keys.get(ki)
+        let ref: FnRef = prog.fns.get_or(key, fn_ref_new())
+        let module: HModule = prog.modules.get(ref.mod_idx)
+        let cr: Result[list[str], str] = scan_fn_body(prog, module, ref.fd)
+        if result_is_err(cr) {
+            return Result.Err(result_err_or(cr, ""))
+        }
+        call_edges.set(key, result_unwrap(cr))
+        ki = ki + 1
+    }
+    prog.call_edges = call_edges
+    return Result.Ok(true)
+}
+
+# fixpoint_effects — check_effects verbatim: eff[key] starts empty and
+# unions in each callee's effects (builtin table, extern declared set,
+# or the callee's own computed set) until nothing changes.
+fn fixpoint_effects(prog: MergedProg) -> map[str, list[str]] {
+    let eff: map[str, list[str]] = map_new()
+    let keys: list[str] = prog.call_edges.keys()
+    let mut ki: int = 0
+    while ki < keys.len() {
+        eff.set(keys.get(ki), [])
+        ki = ki + 1
+    }
+    let mut changed: bool = true
+    while changed {
+        changed = false
+        let mut kj: int = 0
+        while kj < keys.len() {
+            let key: str = keys.get(kj)
+            let callees: list[str] = prog.call_edges.get_or(key, [])
+            let acc: list[str] = eff.get_or(key, [])
+            let mut ci: int = 0
+            while ci < callees.len() {
+                let c: str = callees.get(ci)
+                let mut add: list[str] = []
+                if c.starts_with("b:") {
+                    let opname: str = c.slice(2, c.len())
+                    if builtin_method_effects(opname).len() > 0 {
+                        add = builtin_method_effects(opname)
+                    } else {
+                        add = builtin_effects_of(opname)
+                    }
+                } else if prog.fns.has(c) {
+                    let callee_fd: FnDef = prog.fns.get_or(c, fn_ref_new()).fd
+                    if callee_fd.is_extern {
+                        add = callee_fd.effects
+                    } else {
+                        add = eff.get_or(c, [])
+                    }
+                }
+                let before: int = acc.len()
+                eff_union(acc, add)
+                if acc.len() != before {
+                    changed = true
+                }
+                ci = ci + 1
+            }
+            kj = kj + 1
+        }
+    }
+    return eff
+}
+
+# intrinsic_of — _intrinsic_effects: the effects a fn performs ITSELF
+# (builtin calls in its body + the declared effects of externs it
+# calls) — no transitive closure.
+fn intrinsic_of(prog: MergedProg, key: str) -> list[str] {
+    let out: list[str] = []
+    if !prog.call_edges.has(key) {
+        return out
+    }
+    let callees: list[str] = prog.call_edges.get_or(key, [])
+    let mut ci: int = 0
+    while ci < callees.len() {
+        let c: str = callees.get(ci)
+        if c.starts_with("b:") {
+            let opname: str = c.slice(2, c.len())
+            if builtin_method_effects(opname).len() > 0 {
+                eff_union(out, builtin_method_effects(opname))
+            } else {
+                eff_union(out, builtin_effects_of(opname))
+            }
+        } else if prog.fns.has(c) {
+            let callee_fd: FnDef = prog.fns.get_or(c, fn_ref_new()).fd
+            if callee_fd.is_extern {
+                eff_union(out, callee_fd.effects)
+            }
+        }
+        ci = ci + 1
+    }
+    return out
+}
+
+# ============================================================================
+# Module identity — the audit's module key (repo-relative inside the
+# repo, absolute outside), the toolchain / dependency / workspace
+# classification, and the key -> path round trip.
+# ============================================================================
+
+fn module_key(path: str, root: str) -> str {
+    let rel: str = relpath_under(path, root)
+    if rel != "" {
+        return rel
+    }
+    return path
+}
+
+fn classify_module(path: str, root: str) -> str uses Proc {
+    if path.starts_with(root + "/std/") || path.starts_with(root + "/core/") {
+        return "toolchain"
+    }
+    let deps_dir: str = env_get("HLS_PKG_DEPS")
+    if deps_dir != "" {
+        let dd: str = realpath_lex(deps_dir)
+        if path.starts_with(dd + "/") {
+            return "dependency"
+        }
+    }
+    return "workspace"
+}
+
+fn key_to_path(key: str, root: str) -> str uses Proc {
+    if path_is_abs(key) {
+        return realpath_lex(key)
+    }
+    return realpath_lex(path_join2(root, key))
+}
+
+# ============================================================================
+# The source-mode audit — audit_source's SBOM-relevant subset: the
+# module census (key / kind / intrinsic / surface), the root key, the
+# import edges, and the program surface.
+# ============================================================================
+
+struct ModInfo {
+    key: str,
+    kind: str,
+    intrinsic: list[str],
+    surface: list[str],
+    path: str
+}
+
+struct SrcAudit {
+    root_key: str,
+    root_path: str,
+    modules: list[ModInfo],
+    edge_srcs: list[str],
+    edge_kids: list[list[str]],
+    program_surface: list[str]
+}
+
+# merged_prog_of(walk) — the merged program over a walked import graph
+# (BFS order), with the duplicate / cycle / missing-main laws.
+fn merged_prog_of(walk: WalkOut, want_main: bool, entry_abs: str)
+-> Result[MergedProg, Fail] {
+    let prog: MergedProg = MergedProg {
+        modules: walk.modules, paths: walk.order, edges: walk.edges,
+        fns: map_new(), struct_fields: map_new(), enums: map_new(),
+        call_edges: map_new()
+    }
+    let mut mi: int = 0
+    while mi < walk.modules.len() {
+        let rr: Result[bool, Fail] = register_module_fns(prog,
+        walk.modules.get(mi), mi)
+        if result_is_err(rr) {
+            return Result.Err(result_err_or(rr, fail("")))
+        }
+        mi = mi + 1
+    }
+    let td: Result[bool, Fail] = check_type_dupes(prog)
+    if result_is_err(td) {
+        return Result.Err(result_err_or(td, fail("")))
+    }
+    let dc: Result[bool, Fail] = detect_cycle(prog, entry_abs)
+    if result_is_err(dc) {
+        return Result.Err(result_err_or(dc, fail("")))
+    }
+    if want_main && !prog.fns.has("main") {
+        return Result.Err(fail("unauditable: missing main function "
+        + "(line 1)"))
+    }
+    let be: Result[bool, str] = build_edges(prog)
+    if result_is_err(be) {
+        return Result.Err(fail("unauditable: " + result_err_or(be, "")))
+    }
+    return Result.Ok(prog)
+}
+
+# module_fn_keys(module) — the module's fn keys in declaration order.
+fn module_fn_keys(module: HModule) -> list[str] {
+    let keys: list[str] = []
+    let mut i: int = 0
+    while i < module.fns.len() {
+        keys.push(module.fns.get(i).key)
+        i = i + 1
+    }
+    return keys
+}
+
+# audit_source(entry_path, root) — the SBOM's component set from an
+# entry file's import tree, the .py's sbom_source over audit_source.
+fn audit_source(entry_path: str, root: str) -> Result[SrcAudit, Fail]
+uses Fs, Proc, Args {
+    let entry_abs: str = realpath_lex(entry_path)
+    if !is_file_h(entry_abs) {
+        return Result.Err(fail("no such file: " + entry_path))
+    }
+    let wr: Result[WalkOut, Fail] = walk_import_graph(entry_abs, root)
+    if result_is_err(wr) {
+        return Result.Err(result_err_or(wr, fail("")))
+    }
+    let walk: WalkOut = result_unwrap(wr)
+    let mr: Result[MergedProg, Fail] = merged_prog_of(walk, true, entry_abs)
+    if result_is_err(mr) {
+        return Result.Err(result_err_or(mr, fail("")))
+    }
+    let prog: MergedProg = result_unwrap(mr)
+    let eff: map[str, list[str]] = fixpoint_effects(prog)
+    let modules: list[ModInfo] = []
+    let mut mi: int = 0
+    while mi < walk.modules.len() {
+        let module: HModule = walk.modules.get(mi)
+        let keys: list[str] = module_fn_keys(module)
+        let intrinsic: list[str] = []
+        let surface: list[str] = []
+        let mut ki: int = 0
+        while ki < keys.len() {
+            eff_union(intrinsic, intrinsic_of(prog, keys.get(ki)))
+            eff_union(surface, eff.get_or(keys.get(ki), []))
+            ki = ki + 1
+        }
+        modules.push(ModInfo {
+            key: module_key(walk.order.get(mi), root),
+            kind: classify_module(walk.order.get(mi), root),
+            intrinsic: eff_sorted(intrinsic),
+            surface: eff_sorted(surface),
+            path: walk.order.get(mi)
+        })
+        mi = mi + 1
+    }
+    let program_surface: list[str] = []
+    let mut si: int = 0
+    while si < modules.len() {
+        eff_union(program_surface, modules.get(si).surface)
+        si = si + 1
+    }
+    # edges: one entry per module, keyed by module KEY (the .py's
+    # sorted(r["edges"].items()) over the key-keyed edge map), the kid
+    # list in the walk's realpath-sorted order.
+    let edge_srcs: list[str] = []
+    let edge_kids: list[list[str]] = []
+    let key_of: map[str, str] = map_new()
+    let mod_keys: list[str] = []
+    let mut pi: int = 0
+    while pi < walk.order.len() {
+        let mk: str = module_key(walk.order.get(pi), root)
+        key_of.set(walk.order.get(pi), mk)
+        mod_keys.push(mk)
+        pi = pi + 1
+    }
+    let sorted_keys: list[str] = sort_strs(mod_keys)
+    let mut ei: int = 0
+    while ei < sorted_keys.len() {
+        let srckey: str = sorted_keys.get(ei)
+        let mut srcpath: str = ""
+        let mut sp: int = 0
+        while sp < walk.order.len() {
+            if key_of.get_or(walk.order.get(sp), "") == srckey {
+                srcpath = walk.order.get(sp)
+            }
+            sp = sp + 1
+        }
+        let kid_keys: list[str] = []
+        if walk.edges.has(srcpath) {
+            let kids: list[str] = walk.edges.get_or(srcpath, [])
+            let mut kp: int = 0
+            while kp < kids.len() {
+                kid_keys.push(key_of.get_or(kids.get(kp), ""))
+                kp = kp + 1
+            }
+        }
+        edge_srcs.push(srckey)
+        edge_kids.push(kid_keys)
+        ei = ei + 1
+    }
+    return Result.Ok(SrcAudit {
+        root_key: module_key(entry_abs, root),
+        root_path: entry_abs,
+        modules: modules,
+        edge_srcs: edge_srcs,
+        edge_kids: edge_kids,
+        program_surface: eff_sorted(program_surface)
+    })
+}
+
+# ============================================================================
+# The TOML manifest parser — hpkg_manifest.parse_manifest's subset with
+# its error texts (strings with escapes, ints, floats, bools, lists,
+# inline tables, section trees, comment stripping outside strings).
+# ============================================================================
+
+struct TomlVal {
+    kind: str, # "none"|"str"|"int"|"float"|"bool"|"list"|"table"
+    sval: str,
+    ival: int,
+    bval: bool,
+    items: list[TomlVal],
+    keys: list[str],
+    vals: list[TomlVal]
+}
+
+fn toml_none() -> TomlVal {
+    return TomlVal {
+        kind: "none", sval: "", ival: 0, bval: false, items: [],
+        keys: [], vals: []
+    }
+}
+
+fn toml_table() -> TomlVal {
+    return TomlVal {
+        kind: "table", sval: "", ival: 0, bval: false, items: [],
+        keys: [], vals: []
+    }
+}
+
+# toml_get(doc, key) — one key of a table (none when absent).
+fn toml_get(doc: TomlVal, key: str) -> TomlVal {
+    let mut i: int = 0
+    while i < doc.keys.len() {
+        if doc.keys.get(i) == key {
+            return doc.vals.get(i)
+        }
+        i = i + 1
+    }
+    return toml_none()
+}
+
+# toml_set(doc, key, val) — insert or replace one key of a table.
+fn toml_set(doc: TomlVal, key: str, val: TomlVal) -> void {
+    let mut i: int = 0
+    while i < doc.keys.len() {
+        if doc.keys.get(i) == key {
+            doc.vals.set(i, val)
+            return
+        }
+        i = i + 1
+    }
+    doc.keys.push(key)
+    doc.vals.push(val)
+}
+
+# strip_toml_comment(line) — the strict outside-string comment strip.
+fn strip_toml_comment(line: str) -> Result[str, str] {
+    let mut out: str = ""
+    let mut in_str: bool = false
+    let n: int = line.len()
+    let mut i: int = 0
+    while i < n {
+        let c: int = line.byte_at(i)
+        if in_str {
+            if c == 92 && i + 1 < n {
+                let esc: int = line.byte_at(i + 1)
+                if esc == 98 || esc == 116 || esc == 110 || esc == 102
+                || esc == 114 || esc == 34 || esc == 92 || esc == 117
+                || esc == 85 {
+                    out = out + line.slice(i, i + 2)
+                    i = i + 2
+                    continue
+                }
+                return Result.Err("invalid TOML escape sequence: \\"
+                + chr(esc) + " (TOML only allows \\b, \\t, \\n, \\f, "
+                + "\\r, \\\", \\uXXXX, \\UXXXXXXXX)")
+            }
+            if c == 34 {
+                in_str = false
+            }
+            out = out + line.slice(i, i + 1)
+            i = i + 1
+            continue
+        }
+        if c == 34 {
+            in_str = true
+            out = out + line.slice(i, i + 1)
+            i = i + 1
+            continue
+        }
+        if c == 35 {
+            break
+        }
+        out = out + line.slice(i, i + 1)
+        i = i + 1
+    }
+    return Result.Ok(out)
+}
+
+# toml_is_int_token(tok) — Python's int(tok) acceptance (sign, digits,
+# underscores between digits).
+fn toml_is_int_token(tok: str) -> bool {
+    let t: str = tok.trim()
+    if t.len() == 0 {
+        return false
+    }
+    let mut i: int = 0
+    if t.byte_at(0) == 43 || t.byte_at(0) == 45 {
+        i = 1
+    }
+    if i >= t.len() {
+        return false
+    }
+    let mut prev_us: bool = true
+    while i < t.len() {
+        let c: int = t.byte_at(i)
+        if is_digit_b(c) {
+            prev_us = false
+        } else if c == 95 {
+            if prev_us {
+                return false
+            }
+            prev_us = true
+        } else {
+            return false
+        }
+        i = i + 1
+    }
+    if prev_us {
+        return false
+    }
+    return true
+}
+
+# toml_is_float_token(tok) — Python's float(tok) acceptance subset.
+fn toml_is_float_token(tok: str) -> bool {
+    if tok.len() == 0 {
+        return false
+    }
+    let mut saw_digit: bool = false
+    let mut saw_dot_exp: bool = false
+    let mut i: int = 0
+    if tok.byte_at(0) == 43 || tok.byte_at(0) == 45 {
+        i = 1
+    }
+    while i < tok.len() {
+        let c: int = tok.byte_at(i)
+        if is_digit_b(c) {
+            saw_digit = true
+        } else if c == 46 || c == 101 || c == 69 {
+            saw_dot_exp = true
+        } else if c != 43 && c != 45 && c != 95 {
+            return false
+        }
+        i = i + 1
+    }
+    return saw_digit && saw_dot_exp
+}
+
+# parse_toml_value(src, i) — _parse_value: (value, next index).
+fn parse_toml_value(src: str, i: int) -> Result[TomlPair, str] {
+    let n: int = src.len()
+    let mut j: int = i
+    while j < n && (src.byte_at(j) == 32 || src.byte_at(j) == 9
+    || src.byte_at(j) == 13 || src.byte_at(j) == 10) {
+        j = j + 1
+    }
+    if j >= n {
+        return Result.Ok(TomlPair {
+            val: toml_none(), next: j
+        })
+    }
+    let c: int = src.byte_at(j)
+    if c == 34 {
+        # string with escape decoding
+        let mut k: int = j + 1
+        let mut out: str = ""
+        while k < n && src.byte_at(k) != 34 {
+            if src.byte_at(k) == 92 && k + 1 < n {
+                let nxt: int = src.byte_at(k + 1)
+                if nxt == 110 {
+                    out = out + "\n"
+                    k = k + 2
+                    continue
+                }
+                if nxt == 116 {
+                    out = out + "\t"
+                    k = k + 2
+                    continue
+                }
+                if nxt == 114 {
+                    out = out + chr(13)
+                    k = k + 2
+                    continue
+                }
+                if nxt == 98 {
+                    out = out + chr(8)
+                    k = k + 2
+                    continue
+                }
+                if nxt == 102 {
+                    out = out + chr(12)
+                    k = k + 2
+                    continue
+                }
+                if nxt == 34 {
+                    out = out + "\""
+                    k = k + 2
+                    continue
+                }
+                if nxt == 92 {
+                    out = out + "\\"
+                    k = k + 2
+                    continue
+                }
+                if nxt == 117 && k + 6 <= n {
+                    let cp: int = hex4_val(src.slice(k + 2, k + 6))
+                    out = out + utf8_encode(cp)
+                    k = k + 6
+                    continue
+                }
+                if nxt == 85 && k + 10 <= n {
+                    let cp2: int = hex8_val(src.slice(k + 2, k + 10))
+                    out = out + utf8_encode(cp2)
+                    k = k + 10
+                    continue
+                }
+                out = out + chr(nxt)
+                k = k + 2
+                continue
+            }
+            out = out + src.slice(k, k + 1)
+            k = k + 1
+        }
+        if k >= n {
+            return Result.Err("unterminated string literal at offset "
+            + j.to_str())
+        }
+        return Result.Ok(TomlPair {
+            val: TomlVal {
+                kind: "str", sval: out, ival: 0, bval: false, items: [],
+                keys: [], vals: []
+            },
+            next: k + 1
+        })
+    }
+    if c == 91 {
+        # list
+        let items: list[TomlVal] = []
+        let mut k: int = j + 1
+        while k < n && src.byte_at(k) != 93 {
+            while k < n && (src.byte_at(k) == 32 || src.byte_at(k) == 9
+            || src.byte_at(k) == 13 || src.byte_at(k) == 10
+            || src.byte_at(k) == 44) {
+                k = k + 1
+            }
+            if k >= n || src.byte_at(k) == 93 {
+                break
+            }
+            if src.byte_at(k) == 34 {
+                let pair: Result[TomlPair, str] = parse_toml_value(src, k)
+                if result_is_err(pair) {
+                    return Result.Err(result_err_or(pair, ""))
+                }
+                items.push(result_unwrap(pair).val)
+                k = result_unwrap(pair).next
+            } else {
+                let s0: int = k
+                while k < n && src.byte_at(k) != 32 && src.byte_at(k) != 9
+                && src.byte_at(k) != 13 && src.byte_at(k) != 10
+                && src.byte_at(k) != 44 && src.byte_at(k) != 93 {
+                    k = k + 1
+                }
+                let tok: str = src.slice(s0, k)
+                if tok != "" {
+                    items.push(toml_bare_value(tok))
+                }
+            }
+        }
+        return Result.Ok(TomlPair {
+            val: TomlVal {
+                kind: "list", sval: "", ival: 0, bval: false,
+                items: items, keys: [], vals: []
+            },
+            next: k + 1
+        })
+    }
+    if c == 123 {
+        # inline table
+        let table: TomlVal = toml_table()
+        let mut k: int = j + 1
+        while k < n && src.byte_at(k) != 125 {
+            while k < n && (src.byte_at(k) == 32 || src.byte_at(k) == 9
+            || src.byte_at(k) == 13 || src.byte_at(k) == 10
+            || src.byte_at(k) == 44) {
+                k = k + 1
+            }
+            if k >= n || src.byte_at(k) == 125 {
+                break
+            }
+            let eq: int = find_from(src, "=", k)
+            if eq < 0 {
+                return Result.Err("substring not found")
+            }
+            let key: str = src.slice(k, eq).trim()
+            let pair2: Result[TomlPair, str] = parse_toml_value(src, eq + 1)
+            if result_is_err(pair2) {
+                return Result.Err(result_err_or(pair2, ""))
+            }
+            toml_set(table, key, result_unwrap(pair2).val)
+            k = result_unwrap(pair2).next
+        }
+        return Result.Ok(TomlPair {
+            val: table, next: k + 1
+        })
+    }
+    # bare token
+    let s0: int = j
+    while j < n && src.byte_at(j) != 32 && src.byte_at(j) != 9
+    && src.byte_at(j) != 13 && src.byte_at(j) != 10
+    && src.byte_at(j) != 44 && src.byte_at(j) != 93
+    && src.byte_at(j) != 125 && src.byte_at(j) != 61
+    && src.byte_at(j) != 35 {
+        j = j + 1
+    }
+    let tok: str = src.slice(s0, j)
+    return Result.Ok(TomlPair {
+        val: toml_bare_value(tok), next: j
+    })
+}
+
+struct TomlPair {
+    val: TomlVal,
+    next: int
+}
+
+# toml_bare_value(tok) — true/false/int/float/bare string.
+fn toml_bare_value(tok: str) -> TomlVal {
+    if tok == "true" {
+        return TomlVal {
+            kind: "bool", sval: "", ival: 0, bval: true, items: [],
+            keys: [], vals: []
+        }
+    }
+    if tok == "false" {
+        return TomlVal {
+            kind: "bool", sval: "", ival: 0, bval: false, items: [],
+            keys: [], vals: []
+        }
+    }
+    if toml_is_int_token(tok) {
+        return TomlVal {
+            kind: "int", sval: "", ival: parse_int_clean(tok), bval: false,
+            items: [], keys: [], vals: []
+        }
+    }
+    if toml_is_float_token(tok) {
+        return TomlVal {
+            kind: "float", sval: tok, ival: 0, bval: false, items: [],
+            keys: [], vals: []
+        }
+    }
+    return TomlVal {
+        kind: "str", sval: tok, ival: 0, bval: false, items: [],
+        keys: [], vals: []
+    }
+}
+
+# parse_int_clean — the digits of a signed int token (underscores out).
+fn parse_int_clean(tok: str) -> int {
+    let mut neg: bool = false
+    let mut i: int = 0
+    if tok.len() > 0 && (tok.byte_at(0) == 43 || tok.byte_at(0) == 45) {
+        neg = tok.byte_at(0) == 45
+        i = 1
+    }
+    let mut v: int = 0
+    while i < tok.len() {
+        let c: int = tok.byte_at(i)
+        if is_digit_b(c) {
+            v = v * 10 + (c - 48)
+        }
+        i = i + 1
+    }
+    if neg {
+        return -v
+    }
+    return v
+}
+
+# hex4_val / hex8_val — \uXXXX / \UXXXXXXXX payloads.
+fn hex4_val(s: str) -> int {
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < s.len() && i < 4 {
+        v = v * 16 + hex_val_b(s.byte_at(i))
+        i = i + 1
+    }
+    return v
+}
+
+fn hex8_val(s: str) -> int {
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < s.len() && i < 8 {
+        v = v * 16 + hex_val_b(s.byte_at(i))
+        i = i + 1
+    }
+    return v
+}
+
+# utf8_encode(cp) — the codepoint as UTF-8 bytes.
+fn utf8_encode(cp: int) -> str {
+    if cp < 0 {
+        return ""
+    }
+    if cp < 128 {
+        return chr(cp)
+    }
+    if cp < 2048 {
+        return chr(192 + cp / 64) + chr(128 + cp % 64)
+    }
+    if cp < 65536 {
+        return chr(224 + cp / 4096) + chr(128 + (cp / 64) % 64)
+        + chr(128 + cp % 64)
+    }
+    return chr(240 + cp / 262144) + chr(128 + (cp / 4096) % 64)
+    + chr(128 + (cp / 64) % 64) + chr(128 + cp % 64)
+}
+
+# parse_manifest(path) — the tree of sections and keys.
+fn parse_manifest(path: str) -> Result[TomlVal, str] uses Fs {
+    if !is_file_h(path) {
+        return Result.Err("manifest not found: " + path)
+    }
+    let raw: str = read_file(path)
+    let lines: list[str] = raw.split("\n")
+    let mut src: str = ""
+    let mut li: int = 0
+    while li < lines.len() {
+        let sr: Result[str, str] = strip_toml_comment(lines.get(li))
+        if result_is_err(sr) {
+            return Result.Err("manifest: " + result_err_or(sr, "")
+            + " (in line: " + py_repr_str(lines.get(li)) + ")")
+        }
+        src = src + result_unwrap(sr)
+        if li + 1 < lines.len() {
+            src = src + "\n"
+        }
+        li = li + 1
+    }
+    let result: TomlVal = toml_table()
+    let mut current_section: str = ""
+    let n: int = src.len()
+    let mut i: int = 0
+    while i < n {
+        while i < n && (src.byte_at(i) == 32 || src.byte_at(i) == 9
+        || src.byte_at(i) == 13 || src.byte_at(i) == 10) {
+            i = i + 1
+        }
+        if i >= n {
+            break
+        }
+        if src.byte_at(i) == 91 {
+            let j: int = find_from(src, "]", i)
+            if j < 0 {
+                return Result.Err("substring not found")
+            }
+            current_section = src.slice(i + 1, j).trim()
+            if current_section == "" {
+                return Result.Err("manifest: empty section header at "
+                + "offset " + i.to_str())
+            }
+            let cursor: Result[TomlVal, str] = section_cursor(result,
+            current_section, true)
+            if result_is_err(cursor) {
+                return Result.Err(result_err_or(cursor, ""))
+            }
+            i = j + 1
+            continue
+        }
+        let eq: int = find_from(src, "=", i)
+        if eq < 0 {
+            return Result.Err("substring not found")
+        }
+        let key: str = src.slice(i, eq).trim()
+        if key == "" {
+            return Result.Err("manifest: empty key at offset "
+            + i.to_str())
+        }
+        let pv: Result[TomlPair, str] = parse_toml_value(src, eq + 1)
+        if result_is_err(pv) {
+            return Result.Err(result_err_or(pv, ""))
+        }
+        let pair: TomlPair = result_unwrap(pv)
+        if current_section == "" {
+            toml_set(result, key, pair.val)
+        } else {
+            let cursor2: Result[TomlVal, str] = section_cursor(result,
+            current_section, false)
+            if result_is_err(cursor2) {
+                return Result.Err(result_err_or(cursor2, ""))
+            }
+            toml_set(result_unwrap(cursor2), key, pair.val)
+        }
+        i = pair.next
+    }
+    return Result.Ok(result)
+}
+
+# section_cursor(doc, section, creating) — walk to (creating) the
+# section table, with the shadowing laws.
+fn section_cursor(doc: TomlVal, section: str, creating: bool)
+-> Result[TomlVal, str] {
+    let parts: list[str] = section.split(".")
+    let mut cursor: TomlVal = doc
+    let mut i: int = 0
+    while i < parts.len() {
+        let p: str = parts.get(i)
+        if cursor.kind != "table" {
+            let mut msg: str = "manifest: section [" + section
+            + "] shadows a non-table value"
+            if creating {
+                msg = msg + " (a key under [" + section
+                + "] was already set)"
+            }
+            return Result.Err(msg)
+        }
+        let nxt: TomlVal = toml_get(cursor, p)
+        if nxt.kind == "none" {
+            let fresh: TomlVal = toml_table()
+            toml_set(cursor, p, fresh)
+            cursor = fresh
+        } else {
+            cursor = nxt
+        }
+        i = i + 1
+    }
+    if cursor.kind != "table" {
+        return Result.Err("manifest: cannot set key under non-table "
+        + "section [" + section + "]")
+    }
+    return Result.Ok(cursor)
+}
+
+# ============================================================================
+# hls-pkg's content hashing — sha256_file for a single file, else
+# hpkg_cmds._sha256_directory's deterministic walk: os.walk top-down
+# (dirs sorted, files sorted per directory), each file contributing
+# rel + \0 + bytes + \0 to one SHA-256. The SBOM's directory hashes
+# are the lockfile's hashes, byte for byte.
+# ============================================================================
+
+fn sha256_tree(path: str) -> str uses Fs {
+    if is_file_h(path) {
+        return sha256_hex(read_or(path, ""))
+    }
+    return sha256_hex(dir_hash_text(path, ""))
+}
+
+fn dir_hash_text(dir: str, prefix: str) -> str uses Fs {
+    if !is_dir_h(dir) {
+        return ""
+    }
+    let names: list[str] = fs_read_dir(dir)
+    let files: list[str] = []
+    let dirs: list[str] = []
+    let mut ni: int = 0
+    while ni < names.len() {
+        let nm: str = names.get(ni)
+        if is_dir_h(path_join2(dir, nm)) {
+            dirs.push(nm)
+        } else {
+            files.push(nm)
+        }
+        ni = ni + 1
+    }
+    let mut h: str = ""
+    let sfiles: list[str] = sort_strs(files)
+    let mut fi: int = 0
+    while fi < sfiles.len() {
+        h = h + prefix + sfiles.get(fi) + chr(0)
+        + read_or(path_join2(dir, sfiles.get(fi)), "") + chr(0)
+        fi = fi + 1
+    }
+    let sdirs: list[str] = sort_strs(dirs)
+    let mut di: int = 0
+    while di < sdirs.len() {
+        h = h + dir_hash_text(path_join2(dir, sdirs.get(di)),
+        prefix + sdirs.get(di) + "/")
+        di = di + 1
+    }
+    return h
+}
+
+# ============================================================================
+# Subprocess capture — the repo's spawn_cap discipline (both pipes
+# drained, waited, closed), for the git dependency resolver.
+# ============================================================================
+
+struct RunCap {
+    code: int,
+    out: str,
+    err: str
+}
+
+fn spawn_cap(program: str, argv: list[str]) -> RunCap uses Proc {
+    let r: RunCap = RunCap {
+        code: -1, out: "", err: ""
+    }
+    let pid: int = proc_spawn(program, argv, 2, 1, 1)
+    if pid < 1 {
+        return r
+    }
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    r.code = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    r.out = out
+    r.err = err
+    return r
+}
+
+# ============================================================================
+# Dependency resolution — hls-audit's _confined_join / _resolve_dep
+# over hpkg_deps.resolve_dependency (git deps through the cache and
+# git itself; path deps package-relative first, repo-root-relative
+# second, both confined).
+# ============================================================================
+
+# valid_dep_name(name) — hpkg_util's [A-Za-z0-9._-]+, no leading '.'
+# or '-' (dependency names become cache directory components).
+fn valid_dep_name(name: str) -> bool {
+    if name == "" {
+        return false
+    }
+    let b0: int = name.byte_at(0)
+    if b0 == 46 || b0 == 45 {
+        return false
+    }
+    let mut i: int = 0
+    while i < name.len() {
+        let c: int = name.byte_at(i)
+        if !is_alpha_b(c) && !is_digit_b(c) && c != 46 && c != 95
+        && c != 45 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# confined_join(base, rel, what) — hls-audit's _confined_join: join +
+# confine (relative only, no '..' segments, result stays inside base).
+fn confined_join(base: str, rel: str, what: str) -> Result[str, Fail] {
+    if path_is_abs(rel) {
+        return Result.Err(fail(what + ": path must be relative, got "
+        + "absolute: " + rel))
+    }
+    let parts: list[str] = str_replace(rel, "\\", "/").split("/")
+    if list_has(parts, "..") {
+        return Result.Err(fail(what + ": path must not contain '..' "
+        + "segments: " + rel))
+    }
+    let cand: str = norm_path(path_join2(base, rel))
+    if cand != base && !cand.starts_with(base + "/") {
+        return Result.Err(fail(what + ": path escapes the package "
+        + "directory: " + rel))
+    }
+    return Result.Ok(cand)
+}
+
+# toml_text_of(v) — Python's str() of a parsed TOML value (the
+# manifest's name/version/path/git/ref coercions).
+fn toml_text_of(v: TomlVal) -> str {
+    if v.kind == "str" {
+        return v.sval
+    }
+    if v.kind == "int" {
+        return v.ival.to_str()
+    }
+    if v.kind == "bool" {
+        if v.bval {
+            return "True"
+        }
+        return "False"
+    }
+    return ""
+}
+
+struct DepOut {
+    dir: str, # what we audit
+    content: str # what the lockfile hashes
+}
+
+# resolve_dep — one manifest dependency to (package dir, content path).
+fn resolve_dep(dep_name: str, source: TomlVal, declaring_dir: str,
+root: str) -> Result[DepOut, Fail] uses Fs, Proc, Args {
+    if source.kind != "table" {
+        return Result.Err(fail("dependency " + dep_name
+        + ": source must be a table"))
+    }
+    let git_v: TomlVal = toml_get(source, "git")
+    if git_v.kind != "none" {
+        # Git dependency — hpkg_deps.resolve_dependency's law: clone
+        # into the cache (name/URL-hash), fetch + checkout the ref,
+        # confine the inner path.
+        if git_v.kind != "str" {
+            return Result.Err(fail("dependency " + dep_name
+            + " git URL must be a string"))
+        }
+        if !valid_dep_name(dep_name) {
+            return Result.Err(fail("invalid dependency name: '"
+            + dep_name + "' (allowed: letters, digits, '.', '_', '-'; "
+            + "must not start with '.' or '-')"))
+        }
+        let repo_url: str = git_v.sval
+        if repo_url == "" {
+            return Result.Err(fail("dependency " + dep_name
+            + " git URL must not be empty"))
+        }
+        if repo_url.byte_at(0) == 45 {
+            return Result.Err(fail("dependency " + dep_name
+            + " git URL must not start with '-' (git option injection): '"
+            + repo_url + "'"))
+        }
+        let cache: str = pkg_cache_dir()
+        proc_exec("mkdir -p '" + cache + "'")
+        let repo_hash: str = sha256_hex(repo_url).slice(0, 12)
+        let clone_dir: str = path_join2(path_join2(cache, dep_name),
+        repo_hash)
+        if !is_dir_h(clone_dir) {
+            let gc: RunCap = spawn_cap("git", ["clone", "--quiet", "--",
+            repo_url, clone_dir])
+            if gc.code != 0 {
+                return Result.Err(fail("dependency " + dep_name
+                + ": failed to clone git repository (exit "
+                + gc.code.to_str() + ")"))
+            }
+        }
+        let ref_v: TomlVal = toml_get(source, "tag")
+        let mut ref: str = ""
+        if ref_v.kind != "none" {
+            ref = toml_text_of(ref_v)
+        }
+        if ref == "" {
+            let br_v: TomlVal = toml_get(source, "branch")
+            if br_v.kind != "none" {
+                ref = toml_text_of(br_v)
+            }
+        }
+        if ref == "" {
+            ref = "main"
+        }
+        let gf: RunCap = spawn_cap("git", ["-C", clone_dir, "fetch",
+        "--quiet", "origin", "--", ref])
+        if gf.code != 0 {
+            return Result.Err(fail("dependency " + dep_name
+            + ": failed to fetch/checkout git ref '" + ref + "'"))
+        }
+        let gk: RunCap = spawn_cap("git", ["-C", clone_dir, "checkout",
+        "--quiet", ref])
+        if gk.code != 0 {
+            return Result.Err(fail("dependency " + dep_name
+            + ": failed to fetch/checkout git ref '" + ref + "'"))
+        }
+        let path_v: TomlVal = toml_get(source, "path")
+        let mut full: str = clone_dir
+        if path_v.kind != "none" && toml_text_of(path_v) != "" {
+            let cr: Result[str, Fail] = confined_join(clone_dir,
+            toml_text_of(path_v), "dependency " + dep_name)
+            if result_is_err(cr) {
+                return Result.Err(result_err_or(cr, fail("")))
+            }
+            full = result_unwrap(cr)
+        }
+        if is_dir_h(full) || is_file_h(full) {
+            if is_file_h(full) {
+                return Result.Ok(DepOut {
+                    dir: path_dirname(full), content: full
+                })
+            }
+            return Result.Ok(DepOut {
+                dir: full, content: full
+            })
+        }
+        return Result.Err(fail("dependency " + dep_name
+        + ": path not found in repo: " + full))
+    }
+    let path_v2: TomlVal = toml_get(source, "path")
+    if path_v2.kind != "none" {
+        let rel: str = toml_text_of(path_v2)
+        let bases: list[str] = [declaring_dir, root]
+        let mut bi: int = 0
+        while bi < bases.len() {
+            let cr: Result[str, Fail] = confined_join(bases.get(bi), rel,
+            "dependency " + dep_name)
+            if result_is_err(cr) {
+                return Result.Err(result_err_or(cr, fail("")))
+            }
+            let cand: str = result_unwrap(cr)
+            if is_dir_h(cand) {
+                let rp: str = realpath_lex(cand)
+                return Result.Ok(DepOut {
+                    dir: rp, content: rp
+                })
+            }
+            if is_file_h(cand) {
+                let full: str = realpath_lex(cand)
+                return Result.Ok(DepOut {
+                    dir: path_dirname(full), content: full
+                })
+            }
+            bi = bi + 1
+        }
+        return Result.Err(fail("dependency " + dep_name
+        + ": path not found: " + rel))
+    }
+    return Result.Err(fail("dependency " + dep_name
+    + " has no git/path source"))
+}
+
+# ============================================================================
+# The package TREE walk — hls-audit's _walk_packages: depth-first over
+# the manifest's sorted [dependencies], each edge instantiating its own
+# subtree (a diamond prints both paths), a directory on the current
+# stack a cycle (refused with the chain that closes it), the audit
+# result cached per directory so a shared package is checked once.
+# ============================================================================
+
+struct PkgAudit {
+    declared: list[str],
+    surface: list[str],
+    intrinsic: list[str],
+    wrapper: bool,
+    entry: str,
+    fns: int,
+    failed: bool,
+    why: str
+}
+
+fn pkg_audit_full(why: str) -> PkgAudit {
+    # fail-closed: the full effect set (ALL_EFFECTS), never pure
+    let effs: list[str] = []
+    effs.push("Args")
+    effs.push("Clock")
+    effs.push("Conc")
+    effs.push("Exit")
+    effs.push("Fs")
+    effs.push("IO")
+    effs.push("Net")
+    effs.push("Proc")
+    effs.push("Rand")
+    return PkgAudit {
+        declared: effs, surface: effs, intrinsic: effs, wrapper: false,
+        entry: "", fns: 0, failed: true, why: why
+    }
+}
+
+struct PkgNode {
+    dir: str,
+    name: str,
+    version: str,
+    manifest: TomlVal,
+    deps: list[PkgNode],
+    depth: int,
+    audit: PkgAudit,
+    has_audit: bool,
+    shared: bool,
+    src_kind: str, # how the parent named this package
+    content_path: str # what the lockfile hashes
+}
+
+fn pkg_node_new(dir: str, name: str, version: str, manifest: TomlVal,
+depth: int) -> PkgNode {
+    return PkgNode {
+        dir: dir, name: name, version: version, manifest: manifest,
+        deps: [], depth: depth, audit: pkg_audit_full(""),
+        has_audit: false, shared: false, src_kind: "root",
+        content_path: dir
+    }
+}
+
+# walk_packages(pkg_dir, root, stack_dirs, stack_names, cache) — one
+# package subtree. Err(Fail) mirrors the AuditError texts.
+fn walk_packages(pkg_dir: str, root: str, stack_dirs: list[str],
+stack_names: list[str], cache: map[str, PkgNode])
+-> Result[PkgNode, Fail] uses Fs, Proc, Args {
+    let real: str = realpath_lex(pkg_dir)
+    let mut si: int = 0
+    while si < stack_dirs.len() {
+        if stack_dirs.get(si) == real {
+            let chain: list[str] = []
+            let mut cj: int = si
+            while cj < stack_names.len() {
+                chain.push(stack_names.get(cj))
+                cj = cj + 1
+            }
+            chain.push(stack_names.get(si))
+            return Result.Err(fail("circular package dependency: "
+            + join(chain, " -> ")))
+        }
+        si = si + 1
+    }
+    let manifest_path: str = path_join2(real, manifest_name())
+    if !is_file_h(manifest_path) {
+        return Result.Err(fail("no hls-pkg.toml in " + real))
+    }
+    let mr: Result[TomlVal, str] = parse_manifest(manifest_path)
+    if result_is_err(mr) {
+        return Result.Err(fail("manifest " + manifest_path + ": "
+        + result_err_or(mr, "")))
+    }
+    let manifest: TomlVal = result_unwrap(mr)
+    let pkg_sec: TomlVal = toml_get(manifest, "package")
+    if pkg_sec.kind != "table" && pkg_sec.kind != "none" {
+        return Result.Err(fail("manifest " + manifest_path
+        + ": 'package' section is not a table"))
+    }
+    let name_v: TomlVal = toml_get(pkg_sec, "name")
+    let mut name: str = toml_text_of(name_v)
+    if name == "" {
+        name = path_basename(real)
+    }
+    let version_v: TomlVal = toml_get(pkg_sec, "version")
+    let mut version: str = toml_text_of(version_v)
+    if version == "" {
+        version = "0.0.0"
+    }
+    let node: PkgNode = pkg_node_new(real, name, version, manifest,
+    stack_dirs.len())
+    if cache.has(real) {
+        let prior: PkgNode = cache.get_or(real, node)
+        node.audit = prior.audit
+        node.has_audit = prior.has_audit
+        node.shared = true
+        return Result.Ok(node)
+    }
+    stack_dirs.push(real)
+    stack_names.push(name)
+    let deps_sec: TomlVal = toml_get(manifest, "dependencies")
+    if deps_sec.kind != "table" && deps_sec.kind != "none" {
+        stack_dirs.pop()
+        stack_names.pop()
+        return Result.Err(fail("package " + name
+        + ": [dependencies] section is corrupt"))
+    }
+    let dep_names: list[str] = sort_strs(deps_sec.keys)
+    let mut di: int = 0
+    while di < dep_names.len() {
+        let dep_name: str = dep_names.get(di)
+        let source: TomlVal = toml_get(deps_sec, dep_name)
+        let dr: Result[DepOut, Fail] = resolve_dep(dep_name, source, real,
+        root)
+        if result_is_err(dr) {
+            return Result.Err(result_err_or(dr, fail("")))
+        }
+        let dep: DepOut = result_unwrap(dr)
+        let cr: Result[PkgNode, Fail] = walk_packages(dep.dir, root,
+        stack_dirs, stack_names, cache)
+        if result_is_err(cr) {
+            return Result.Err(result_err_or(cr, fail("")))
+        }
+        let child: PkgNode = result_unwrap(cr)
+        if toml_get(source, "git").kind != "none" {
+            child.src_kind = "git"
+        } else {
+            child.src_kind = "path"
+        }
+        child.content_path = dep.content
+        node.deps.push(child)
+        di = di + 1
+    }
+    stack_dirs.pop()
+    stack_names.pop()
+    return Result.Ok(node)
+}
+
+# all_nodes(root) — pre-order: the node, then each dep's subtree.
+fn all_nodes(root: PkgNode) -> list[PkgNode] {
+    let out: list[PkgNode] = []
+    all_nodes_into(root, out)
+    return out
+}
+
+fn all_nodes_into(node: PkgNode, out: list[PkgNode]) -> void {
+    out.push(node)
+    let mut i: int = 0
+    while i < node.deps.len() {
+        all_nodes_into(node.deps.get(i), out)
+        i = i + 1
+    }
+}
+
+# ============================================================================
+# The per-package audit — _audit_one_package: the entry through the
+# real checker (the merged program + the effects fixpoint), a library
+# entry (no main) through the wrapper contract hls-pkg lock uses (a
+# generated wrapper imports the entry and declares a pure main),
+# intrinsic charged only to package-local files.
+# ============================================================================
+
+struct EntryAudit {
+    prog: MergedProg,
+    walk: WalkOut,
+    from_wrapper: bool
+}
+
+# check_entry(entry_path, root, want_main) — the merged check of one
+# entry file (Err(Fail.msg) is the .py's "unauditable: <inner>" text).
+fn check_entry(entry_path: str, root: str)
+-> Result[EntryAudit, Fail] uses Fs, Proc, Args {
+    let entry_abs: str = realpath_lex(entry_path)
+    let wr: Result[WalkOut, Fail] = walk_import_graph(entry_abs, root)
+    if result_is_err(wr) {
+        return Result.Err(result_err_or(wr, fail("")))
+    }
+    let walk: WalkOut = result_unwrap(wr)
+    let mr: Result[MergedProg, Fail] = merged_prog_of(walk, true,
+    entry_abs)
+    if result_is_err(mr) {
+        return Result.Err(result_err_or(mr, fail("")))
+    }
+    return Result.Ok(EntryAudit {
+        prog: result_unwrap(mr), walk: walk, from_wrapper: false
+    })
+}
+
+# audit_one_package(node) — the package's audit record.
+fn audit_one_package(node: PkgNode, root: str) -> Result[PkgAudit, Fail]
+uses Fs, Proc, Args {
+    if node.has_audit {
+        return Result.Ok(node.audit)
+    }
+    let pkg_sec: TomlVal = toml_get(node.manifest, "package")
+    let entry_v: TomlVal = toml_get(pkg_sec, "entry")
+    let mut entry: str = toml_text_of(entry_v)
+    if entry == "" {
+        entry = "main.hls"
+    }
+    let entry_path: str = path_join2(node.dir, entry)
+    if !is_file_h(entry_path) {
+        return Result.Err(fail("package " + node.name
+        + ": entry not found: " + entry))
+    }
+    let direct: Result[EntryAudit, Fail] = check_entry(entry_path, root)
+    if result_is_err(direct) {
+        let msg: str = result_err_or(direct, fail("")).msg
+        if !msg.contains("missing main function") {
+            return Result.Err(fail("package " + node.name
+            + " unauditable: " + msg))
+        }
+        # a library entry: the wrapper contract
+        let wrapper_path: str = node.dir
+        + "/.hls-audit-wrapper-" + proc_pid().to_str() + ".hls"
+        let wtext: str = "# auto-generated by hls-audit\n"
+        + "import \"" + entry + "\"\n"
+        + "fn main() -> int pure { return 0 }\n"
+        write_file(wrapper_path, wtext)
+        let wr: Result[EntryAudit, Fail] = check_entry(wrapper_path, root)
+        proc_exec("rm -f '" + wrapper_path + "'")
+        if result_is_err(wr) {
+            return Result.Err(fail("package " + node.name
+            + " unauditable: " + result_err_or(wr, fail("")).msg))
+        }
+        let ea: EntryAudit = result_unwrap(wr)
+        return Result.Ok(package_audit_of(node, ea, entry, true))
+    }
+    let ea2: EntryAudit = result_unwrap(direct)
+    return Result.Ok(package_audit_of(node, ea2, entry, false))
+}
+
+# package_audit_of(node, ea, entry, wrapper_used) — declared / surface
+# over the merged program, intrinsic over package-local files only.
+fn package_audit_of(node: PkgNode, ea: EntryAudit, entry: str,
+wrapper_used: bool) -> PkgAudit {
+    let prog: MergedProg = ea.prog
+    let walk: WalkOut = ea.walk
+    let eff: map[str, list[str]] = fixpoint_effects(prog)
+    let all_keys: list[str] = prog.fns.keys()
+    let declared: list[str] = []
+    let surface: list[str] = []
+    let mut ki: int = 0
+    while ki < all_keys.len() {
+        let fd: FnDef = prog.fns.get_or(all_keys.get(ki),
+        fn_ref_new()).fd
+        eff_union(declared, fd.effects)
+        eff_union(surface, eff.get_or(all_keys.get(ki), []))
+        ki = ki + 1
+    }
+    let intrinsic: list[str] = []
+    let mut mi: int = 0
+    while mi < walk.order.len() {
+        let mp: str = walk.order.get(mi)
+        if mp == node.dir || mp.starts_with(node.dir + "/") {
+            let keys: list[str] = module_fn_keys(walk.modules.get(mi))
+            let mut kj: int = 0
+            while kj < keys.len() {
+                eff_union(intrinsic, intrinsic_of(prog, keys.get(kj)))
+                kj = kj + 1
+            }
+        }
+        mi = mi + 1
+    }
+    return PkgAudit {
+        declared: eff_sorted(declared), surface: eff_sorted(surface),
+        intrinsic: eff_sorted(intrinsic), wrapper: wrapper_used,
+        entry: entry, fns: all_keys.len(), failed: false, why: ""
+    }
+}
+
+# ============================================================================
+# Package mode — hls-audit's audit_package: walk the tree, audit every
+# unique package (fail-closed: a node that cannot be audited is
+# recorded with the full effect set and named), check the lockfile
+# drift for every top-level dependency, and return the report the
+# SBOM consumes (the package census, the root surface, the drift /
+# unauditable names, the lockfile status).
+# ============================================================================
+
+struct PkgRec {
+    name: str,
+    version: str,
+    depth: int,
+    source: str,
+    surface: list[str]
+}
+
+struct PkgAuditReport {
+    lockfile: str, # "absent" | "present"
+    drift_names: list[str],
+    unaudit_names: list[str],
+    packages: list[PkgRec],
+    root_name: str,
+    root_version: str,
+    root_surface: list[str],
+    root_dir: str
+}
+
+# lock_locked_map(lock_path) — the lockfile's name -> sha256 map
+# (only string sha256 values; the .py's p.get("sha256")).
+fn lock_locked_map(lock_path: str) -> Result[map[str, str], Fail] uses Fs {
+    let locked: map[str, str] = map_new()
+    let text: str = read_or(lock_path, "")
+    let pr: Result[JsonValue, str] = json_parse_result(text)
+    if result_is_err(pr) {
+        return Result.Err(fail("cannot read lockfile: "
+        + result_err_or(pr, "")))
+    }
+    let lock: JsonValue = result_unwrap(pr)
+    let pkgs: JsonValue = json_object_get(lock, "packages")
+    if json_is_array(pkgs) {
+        let mut i: int = 0
+        while i < pkgs.arr.len() {
+            let p: JsonValue = pkgs.arr.get(i)
+            if json_is_object(p) {
+                let nm: JsonValue = json_object_get(p, "name")
+                let sha: JsonValue = json_object_get(p, "sha256")
+                if json_is_str(nm) && json_is_str(sha) {
+                    locked.set(json_str_value(nm), json_str_value(sha))
+                } else if json_is_str(nm) {
+                    locked.set(json_str_value(nm), "")
+                }
+            }
+            i = i + 1
+        }
+    }
+    return Result.Ok(locked)
+}
+
+# audit_package(root_dir, root) — the package-tree audit report.
+fn audit_package(root_dir: str, root: str)
+-> Result[PkgAuditReport, Fail] uses Fs, Proc, Args {
+    let rp: str = realpath_lex(root_dir)
+    if !is_dir_h(rp) {
+        return Result.Err(fail("not a directory: " + rp))
+    }
+    let empty_cache: map[str, PkgNode] = map_new()
+    let wr: Result[PkgNode, Fail] = walk_packages(rp, root, [], [],
+    empty_cache)
+    if result_is_err(wr) {
+        return Result.Err(result_err_or(wr, fail("")))
+    }
+    let root_node: PkgNode = result_unwrap(wr)
+    let nodes: list[PkgNode] = all_nodes(root_node)
+
+    # Audit every unique package; failures are recorded fail-closed.
+    let audited: map[str, bool] = map_new()
+    let unaudit_names: list[str] = []
+    let mut ni: int = 0
+    while ni < nodes.len() {
+        let node: PkgNode = nodes.get(ni)
+        if audited.has(node.dir) {
+            ni = ni + 1
+            continue
+        }
+        let ar: Result[PkgAudit, Fail] = audit_one_package(node, root)
+        if result_is_err(ar) {
+            let why: str = result_err_or(ar, fail("")).msg
+            node.audit = pkg_audit_full(why)
+            node.has_audit = true
+            unaudit_names.push(node.name)
+        } else {
+            node.audit = result_unwrap(ar)
+            node.has_audit = true
+        }
+        audited.set(node.dir, true)
+        ni = ni + 1
+    }
+
+    # Lockfile drift: every top-level dep's recorded sha256 must still
+    # match the tree it names.
+    let lock_path: str = path_join2(rp, lockfile_name())
+    let mut lockfile: str = "absent"
+    let drift_names: list[str] = []
+    if is_file_h(lock_path) {
+        lockfile = "present"
+        let lm: Result[map[str, str], Fail] = lock_locked_map(lock_path)
+        if result_is_err(lm) {
+            return Result.Err(result_err_or(lm, fail("")))
+        }
+        let locked: map[str, str] = result_unwrap(lm)
+        let mut ci: int = 0
+        while ci < root_node.deps.len() {
+            let child: PkgNode = root_node.deps.get(ci)
+            if !locked.has(child.name) {
+                drift_names.push(child.name)
+            } else {
+                let was: str = locked.get_or(child.name, "")
+                let now: str = sha256_tree(child.content_path)
+                if now != was {
+                    drift_names.push(child.name)
+                }
+            }
+            ci = ci + 1
+        }
+    }
+
+    # The package census (pre-order), the SBOM's component set.
+    let packages: list[PkgRec] = []
+    let mut pi: int = 0
+    while pi < nodes.len() {
+        let node: PkgNode = nodes.get(pi)
+        packages.push(PkgRec {
+            name: node.name, version: node.version, depth: node.depth,
+            source: node.src_kind, surface: node.audit.surface
+        })
+        pi = pi + 1
+    }
+    return Result.Ok(PkgAuditReport {
+        lockfile: lockfile,
+        drift_names: drift_names,
+        unaudit_names: unaudit_names,
+        packages: packages,
+        root_name: root_node.name,
+        root_version: root_node.version,
+        root_surface: root_node.audit.surface,
+        root_dir: rp
+    })
+}
+
+# ============================================================================
+# Deterministic document plumbing — the set digest, the content-derived
+# serial UUID, the purl / SPDXID sanitizers.
+# ============================================================================
+
+# set_digest(lines) — one SHA-256 over every line in sorted order,
+# each line + \0 (two documents describing the same tree share it).
+fn set_digest(lines: list[str]) -> str {
+    let sorted_lines: list[str] = sort_strs(lines)
+    let mut h: str = ""
+    let mut i: int = 0
+    while i < sorted_lines.len() {
+        h = h + sorted_lines.get(i) + chr(0)
+        i = i + 1
+    }
+    return sha256_hex(h)
+}
+
+# uuid_from_digest(hex32) — a UUID v4-shaped string derived from a hex
+# digest (version + variant nibbles forced), deterministic.
+fn uuid_from_digest(hex32: str) -> str {
+    let h: list[str] = []
+    let mut i: int = 0
+    while i < 32 {
+        h.push(hex32.slice(i, i + 1))
+        i = i + 1
+    }
+    h.set(12, "4")
+    let nib: int = hex_val_b(h.get(16).byte_at(0))
+    let variants: list[str] = ["8", "9", "a", "b"]
+    h.set(16, variants.get(nib % 4))
+    let s: str = join(h, "")
+    return s.slice(0, 8) + "-" + s.slice(8, 12) + "-" + s.slice(12, 16)
+    + "-" + s.slice(16, 20) + "-" + s.slice(20, 32)
+}
+
+# purl_safe(s) — the _PURL_SAFE test: ^[A-Za-z0-9._-]+$.
+fn purl_safe(s: str) -> bool {
+    if s == "" {
+        return false
+    }
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if !is_alpha_b(c) && !is_digit_b(c) && c != 46 && c != 95
+        && c != 45 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# purl(name, version) — the generic purl, "" when the name is unsafe
+# (the .py's None).
+fn purl(name: str, version: str) -> str {
+    if !purl_safe(name) {
+        return ""
+    }
+    let mut base: str = "pkg:generic/halis/" + name
+    if version != "" && purl_safe(version) {
+        base = base + "@" + version
+    }
+    return base
+}
+
+# spdx_id(prefix, key) — the SPDXID sanitizer: [^A-Za-z0-9.-] -> "-".
+fn spdx_id(prefix: str, key: str) -> str {
+    let mut out: str = "SPDXRef-" + prefix + "-"
+    let mut i: int = 0
+    while i < key.len() {
+        let c: int = key.byte_at(i)
+        if is_alpha_b(c) || is_digit_b(c) || c == 46 || c == 45 {
+            out = out + key.slice(i, i + 1)
+        } else {
+            out = out + "-"
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ref_name(ref) — "hls:module:<name>" / "hls:pkg:<name>" -> <name>
+# (the .py's ref.split(":", 2)[-1]).
+fn ref_name(ref: str) -> str {
+    let mut colons: int = 0
+    let mut i: int = 0
+    while i < ref.len() {
+        if ref.byte_at(i) == 58 {
+            colons = colons + 1
+            if colons == 2 {
+                return ref.slice(i + 1, ref.len())
+            }
+        }
+        i = i + 1
+    }
+    return ref
+}
+
+# ============================================================================
+# The SBOM component sets — one struct, two documents, the report. The
+# root component, the components underneath (walk order), the
+# dependency edges (sorted), the set digest, and the mode's extras.
+# ============================================================================
+
+struct SbomSet {
+    digest: str,
+    root_comp: JDoc,
+    components: list[JDoc],
+    dependencies: list[JDoc],
+    pkg_mode: bool,
+    lockfile: str, # "absent" | "present"; unused in source
+    root_name: str,
+    root_sha: str,
+    pkg_version: str # package mode's root version
+}
+
+# hashes_doc(sha) — the single SHA-256 hash entry.
+fn hashes_doc(sha: str) -> JDoc {
+    return jd_arr([jd_obj(["alg", "content"],
+    [jd_str("SHA-256"), jd_str(sha)])])
+}
+
+# prop_doc(name, value) — one CycloneDX property.
+fn prop_doc(name: str, value: str) -> JDoc {
+    return jd_obj(["name", "value"], [jd_str(name), jd_str(value)])
+}
+
+# props_doc3(kind, intrinsic, surface) — the source-mode property set.
+fn props_doc3(kind: str, intrinsic: str, surface: str) -> JDoc {
+    return jd_arr([prop_doc("hls:kind", kind),
+    prop_doc("hls:effects:intrinsic", intrinsic),
+    prop_doc("hls:effects:surface", surface)])
+}
+
+# comp_doc — one file component (source mode).
+fn comp_doc(bom_ref: str, name: str, sha: str, props: JDoc,
+version: str) -> JDoc {
+    let keys: list[str] = ["bom-ref", "type", "name", "hashes",
+    "properties"]
+    let vals: list[JDoc] = [jd_str(bom_ref), jd_str("file"), jd_str(name),
+    hashes_doc(sha), props]
+    if version != "" {
+        keys.push("version")
+        vals.push(jd_str(version))
+    }
+    return jd_obj(keys, vals)
+}
+
+# sbom_source(entry_path, root) — the component set from an entry
+# file's import tree.
+fn sbom_source(entry_path: str, root: str) -> Result[SbomSet, Fail]
+uses Fs, Proc, Args {
+    let ar: Result[SrcAudit, Fail] = audit_source(entry_path, root)
+    if result_is_err(ar) {
+        return Result.Err(result_err_or(ar, fail("")))
+    }
+    let au: SrcAudit = result_unwrap(ar)
+
+    let lines: list[str] = []
+    let mut li: int = 0
+    while li < au.modules.len() {
+        let m: ModInfo = au.modules.get(li)
+        lines.push(m.key + "|" + sha256_file_h(key_to_path(m.key, root)))
+        li = li + 1
+    }
+    let digest: str = set_digest(lines)
+
+    let comps: list[JDoc] = []
+    let mut ci: int = 0
+    while ci < au.modules.len() {
+        let m2: ModInfo = au.modules.get(ci)
+        if m2.key == au.root_key {
+            ci = ci + 1
+            continue
+        }
+        let mut version: str = ""
+        if m2.kind == "toolchain" {
+            version = tool_version()
+        }
+        comps.push(comp_doc("hls:module:" + m2.key, m2.key,
+        sha256_file_h(key_to_path(m2.key, root)),
+        props_doc3(m2.kind, join(m2.intrinsic, ", "),
+        join(m2.surface, ", ")), version))
+        ci = ci + 1
+    }
+
+    # the root module's intrinsic (the entry is the metadata component)
+    let root_intrinsic: list[str] = []
+    let mut ri: int = 0
+    while ri < au.modules.len() {
+        if au.modules.get(ri).key == au.root_key {
+            let rm: ModInfo = au.modules.get(ri)
+            let mut x: int = 0
+            while x < rm.intrinsic.len() {
+                root_intrinsic.push(rm.intrinsic.get(x))
+                x = x + 1
+            }
+        }
+        ri = ri + 1
+    }
+    let root_comp: JDoc = jd_obj(["bom-ref", "type", "name", "hashes",
+    "properties"],
+    [jd_str("hls:module:" + au.root_key), jd_str("application"),
+    jd_str(au.root_key), hashes_doc(sha256_file_h(au.root_path)),
+    props_doc3("workspace", join(root_intrinsic, ", "),
+    join(au.program_surface, ", "))])
+
+    let dependencies: list[JDoc] = []
+    let mut ei: int = 0
+    while ei < au.edge_srcs.len() {
+        let src: str = au.edge_srcs.get(ei)
+        let kids: list[JDoc] = []
+        let kid_list: list[str] = au.edge_kids.get(ei)
+        let mut ki: int = 0
+        while ki < kid_list.len() {
+            kids.push(jd_str("hls:module:" + kid_list.get(ki)))
+            ki = ki + 1
+        }
+        dependencies.push(jd_obj(["ref", "dependsOn"],
+        [jd_str("hls:module:" + src), jd_arr(kids)]))
+        ei = ei + 1
+    }
+
+    return Result.Ok(SbomSet {
+        digest: digest,
+        root_comp: root_comp,
+        components: comps,
+        dependencies: dependencies,
+        pkg_mode: false,
+        lockfile: "",
+        root_name: au.root_key,
+        root_sha: sha256_file_h(au.root_path),
+        pkg_version: ""
+    })
+}
+
+# pkg_comp_doc — one library component (package mode).
+fn pkg_comp_doc(bom_ref: str, name: str, version: str, sha: str,
+kind: str, depth: int, surface: str) -> JDoc {
+    let props: JDoc = jd_arr([prop_doc("hls:kind", kind),
+    prop_doc("hls:depth", depth.to_str()),
+    prop_doc("hls:effects:surface", surface)])
+    let keys: list[str] = ["bom-ref", "type", "name", "version", "hashes",
+    "properties"]
+    let vals: list[JDoc] = [jd_str(bom_ref), jd_str("library"),
+    jd_str(name), jd_str(version), hashes_doc(sha), props]
+    let p: str = purl(name, version)
+    if p != "" {
+        keys.push("purl")
+        vals.push(jd_str(p))
+    }
+    return jd_obj(keys, vals)
+}
+
+# sbom_package(root_dir, root) — the component set from a package tree
+# (drift + fail-closed refused; lockfile hashes canonical for top-level
+# deps when a lock exists).
+fn sbom_package(root_dir: str, root: str) -> Result[SbomSet, Fail]
+uses Fs, Proc, Args {
+    let ar: Result[PkgAuditReport, Fail] = audit_package(root_dir, root)
+    if result_is_err(ar) {
+        return Result.Err(result_err_or(ar, fail("")))
+    }
+    let r: PkgAuditReport = result_unwrap(ar)
+    if r.drift_names.len() > 0 {
+        return Result.Err(fail("drift between the lockfile and the tree ("
+        + join(sorted_unique(r.drift_names), ", ")
+        + ") — re-lock; an SBOM of drifted content is a lie"))
+    }
+    if r.unaudit_names.len() > 0 {
+        return Result.Err(fail("unauditable package(s) in the tree ("
+        + join(sorted_unique(r.unaudit_names), ", ")
+        + ") — fail closed; no SBOM stamps a package nobody could "
+        + "check"))
+    }
+
+    # Second walk with the SAME walker for the node identities the
+    # audit report abstracts away (dirs + content paths).
+    let empty_cache: map[str, PkgNode] = map_new()
+    let wr: Result[PkgNode, Fail] = walk_packages(r.root_dir, root, [],
+    [], empty_cache)
+    if result_is_err(wr) {
+        return Result.Err(result_err_or(wr, fail("")))
+    }
+    let root_node: PkgNode = result_unwrap(wr)
+    let nodes: list[PkgNode] = all_nodes(root_node)
+    let hash_of: map[str, str] = map_new()
+    let mut ni: int = 0
+    while ni < nodes.len() {
+        let node: PkgNode = nodes.get(ni)
+        if !hash_of.has(node.name) {
+            hash_of.set(node.name, sha256_tree(node.content_path))
+        }
+        ni = ni + 1
+    }
+
+    # When a lockfile exists, its hashes are canonical for the
+    # TOP-LEVEL deps (the audit just proved they still match).
+    let locked: map[str, str] = map_new()
+    let lock_path: str = path_join2(r.root_dir, lockfile_name())
+    if is_file_h(lock_path) {
+        let lm: Result[map[str, str], Fail] = lock_locked_map(lock_path)
+        if result_is_err(lm) {
+            return Result.Err(result_err_or(lm, fail("")))
+        }
+        let lm2: map[str, str] = result_unwrap(lm)
+        let lkeys: list[str] = lm2.keys()
+        let mut lki: int = 0
+        while lki < lkeys.len() {
+            locked.set(lkeys.get(lki), lm2.get_or(lkeys.get(lki), ""))
+            lki = lki + 1
+        }
+    }
+
+    let lines: list[str] = []
+    let mut pi: int = 0
+    while pi < r.packages.len() {
+        let p: PkgRec = r.packages.get(pi)
+        lines.push(p.name + "|" + hash_of.get_or(p.name, ""))
+        pi = pi + 1
+    }
+    let digest: str = set_digest(lines)
+
+    let comps: list[JDoc] = []
+    let comp_names: list[str] = []
+    let mut cmi: int = 1
+    while cmi < r.packages.len() {
+        let p2: PkgRec = r.packages.get(cmi)
+        if list_has(comp_names, p2.name) {
+            cmi = cmi + 1
+            continue
+        }
+        let mut sha: str = hash_of.get_or(p2.name, "")
+        if locked.has(p2.name) && locked.get_or(p2.name, "") != "" {
+            sha = locked.get_or(p2.name, "")
+        }
+        comps.push(pkg_comp_doc("hls:pkg:" + p2.name, p2.name,
+        p2.version, sha, p2.source, p2.depth, join(p2.surface, ", ")))
+        comp_names.push(p2.name)
+        cmi = cmi + 1
+    }
+
+    let root_props: JDoc = jd_arr([prop_doc("hls:kind", "root"),
+    prop_doc("hls:effects:surface", join(r.root_surface, ", "))])
+    let root_keys: list[str] = ["bom-ref", "type", "name", "version",
+    "hashes", "properties"]
+    let root_vals: list[JDoc] = [jd_str("hls:pkg:" + r.root_name),
+    jd_str("application"), jd_str(r.root_name),
+    jd_str(r.root_version), hashes_doc(hash_of.get_or(r.root_name, "")),
+    root_props]
+    let rp: str = purl(r.root_name, r.root_version)
+    if rp != "" {
+        root_keys.push("purl")
+        root_vals.push(jd_str(rp))
+    }
+    let root_comp: JDoc = jd_obj(root_keys, root_vals)
+
+    # the dependency edges: the root's direct deps, then each node's
+    # (first occurrence of a name claims the slot), rendered sorted.
+    let edge_names: list[str] = []
+    let edge_lists: list[list[str]] = []
+    let root_kids: list[str] = []
+    let mut rki: int = 0
+    while rki < root_node.deps.len() {
+        let dn: str = root_node.deps.get(rki).name
+        if !list_has(root_kids, dn) {
+            root_kids.push(dn)
+        }
+        rki = rki + 1
+    }
+    edge_names.push(r.root_name)
+    edge_lists.push(root_kids)
+    let mut eni: int = 1
+    while eni < nodes.len() {
+        let node: PkgNode = nodes.get(eni)
+        if list_has(edge_names, node.name) {
+            eni = eni + 1
+            continue
+        }
+        let kids: list[str] = []
+        let mut kj: int = 0
+        while kj < node.deps.len() {
+            let dn2: str = node.deps.get(kj).name
+            if !list_has(kids, dn2) {
+                kids.push(dn2)
+            }
+            kj = kj + 1
+        }
+        edge_names.push(node.name)
+        edge_lists.push(kids)
+        eni = eni + 1
+    }
+    let order: list[int] = []
+    let mut oi: int = 0
+    while oi < edge_names.len() {
+        order.push(oi)
+        oi = oi + 1
+    }
+    let mut a: int = 0
+    while a < order.len() {
+        let mut b: int = a + 1
+        while b < order.len() {
+            if edge_names.get(order.get(b)) < edge_names.get(order.get(a)) {
+                let t: int = order.get(a)
+                order.set(a, order.get(b))
+                order.set(b, t)
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    let dependencies: list[JDoc] = []
+    let mut di: int = 0
+    while di < order.len() {
+        let idx: int = order.get(di)
+        let kids2: list[JDoc] = []
+        let sorted_kids: list[str] = sort_strs(edge_lists.get(idx))
+        let mut si: int = 0
+        while si < sorted_kids.len() {
+            kids2.push(jd_str("hls:pkg:" + sorted_kids.get(si)))
+            si = si + 1
+        }
+        dependencies.push(jd_obj(["ref", "dependsOn"],
+        [jd_str("hls:pkg:" + edge_names.get(idx)), jd_arr(kids2)]))
+        di = di + 1
+    }
+
+    return Result.Ok(SbomSet {
+        digest: digest,
+        root_comp: root_comp,
+        components: comps,
+        dependencies: dependencies,
+        pkg_mode: true,
+        lockfile: r.lockfile,
+        root_name: r.root_name,
+        root_sha: hash_of.get_or(r.root_name, ""),
+        pkg_version: r.root_version
+    })
+}
+
+# ============================================================================
+# The two documents — CycloneDX 1.5 and SPDX 2.3 over one component
+# set, content-addressed end to end (the serial / the namespace are
+# derived from the digest, never the wall clock).
+# ============================================================================
+
+# jd_field(d, key) — the field JDoc or the null doc when absent.
+fn jd_field(d: JDoc, key: str) -> JDoc {
+    if d.kind != "obj" {
+        return jd_null()
+    }
+    let mut i: int = 0
+    while i < d.keys.len() {
+        if d.keys.get(i) == key {
+            return d.vals.get(i)
+        }
+        i = i + 1
+    }
+    return jd_null()
+}
+
+# jd_field_str(d, key) — a string field's text ("" when absent).
+fn jd_field_str(d: JDoc, key: str) -> str {
+    let v: JDoc = jd_field(d, key)
+    if v.kind == "str" {
+        return v.sval
+    }
+    return ""
+}
+
+# jd_arr_at(d, i) — element i of an array doc (null doc out of range).
+fn jd_arr_at(d: JDoc, i: int) -> JDoc {
+    if d.kind == "arr" && i >= 0 && i < d.arr.len() {
+        return d.arr.get(i)
+    }
+    return jd_null()
+}
+
+# jd_field_arr_str(d, key, i) — element i of a string-array field.
+fn jd_field_arr_str(d: JDoc, key: str, i: int) -> str {
+    return jd_field_str(jd_arr_at(jd_field(d, key), i), "")
+}
+
+# jd_hash_of(comp) — the component's first hash content.
+fn jd_hash_of(comp: JDoc) -> str {
+    return jd_field_str(jd_arr_at(jd_field(comp, "hashes"), 0), "content")
+}
+
+# jd_props_of(comp) — the properties array doc.
+fn jd_props_of(comp: JDoc) -> JDoc {
+    return jd_field(comp, "properties")
+}
+
+# build_cdx(sb, stamp) — the CycloneDX 1.5 document.
+fn build_cdx(sb: SbomSet, stamp: str) -> JDoc {
+    let tools: JDoc = jd_arr([jd_obj(["vendor", "name", "version"],
+    [jd_str("halis-lang"), jd_str(tool_name()),
+    jd_str(tool_version())])])
+    let metadata: JDoc = jd_obj(["timestamp", "tools", "component"],
+    [jd_str(stamp), tools, sb.root_comp])
+    return jd_obj(["bomFormat", "specVersion", "serialNumber", "version",
+    "metadata", "components", "dependencies"],
+    [jd_str("CycloneDX"), jd_str(cdx_spec()),
+    jd_str("urn:uuid:" + uuid_from_digest(sb.digest)), jd_int(1),
+    metadata, jd_arr(sb.components), jd_arr(sb.dependencies)])
+}
+
+# spdx_pkg_of(comp, purpose) — one SPDX package from a component doc.
+fn spdx_pkg_of(comp: JDoc, purpose: str) -> JDoc {
+    let props: JDoc = jd_props_of(comp)
+    let mut comment: str = ""
+    if props.kind == "arr" {
+        let mut i: int = 0
+        while i < props.arr.len() {
+            let pr: JDoc = props.arr.get(i)
+            if i > 0 {
+                comment = comment + "; "
+            }
+            comment = comment + jd_field_str(pr, "name") + " = "
+            + jd_field_str(pr, "value")
+            i = i + 1
+        }
+    }
+    let checksums: JDoc = jd_arr([jd_obj(["algorithm", "checksumValue"],
+    [jd_str("SHA256"), jd_str(jd_hash_of(comp))])])
+    let keys: list[str] = ["name", "SPDXID", "downloadLocation",
+    "filesAnalyzed", "licenseConcluded", "licenseDeclared",
+    "copyrightText", "primaryPackagePurpose", "checksums", "comment"]
+    let vals: list[JDoc] = [jd_str(jd_field_str(comp, "name")),
+    jd_str(spdx_id("Package", jd_field_str(comp, "name"))),
+    jd_str("NOASSERTION"), jd_bool(false), jd_str("NOASSERTION"),
+    jd_str("NOASSERTION"), jd_str("NOASSERTION"), jd_str(purpose),
+    checksums, jd_str(comment)]
+    if jd_field(comp, "version").kind != "null" {
+        keys.push("versionInfo")
+        vals.push(jd_str(jd_field_str(comp, "version")))
+    }
+    return jd_obj(keys, vals)
+}
+
+# build_spdx(sb, stamp) — the SPDX 2.3 document.
+fn build_spdx(sb: SbomSet, stamp: str) -> JDoc {
+    let root: JDoc = sb.root_comp
+    let root_id: str = spdx_id("Package", sb.root_name)
+    let pkgs: list[JDoc] = []
+    pkgs.push(spdx_pkg_of(root, "APPLICATION"))
+    let mut ci: int = 0
+    while ci < sb.components.len() {
+        pkgs.push(spdx_pkg_of(sb.components.get(ci), "LIBRARY"))
+        ci = ci + 1
+    }
+    let rels: list[JDoc] = []
+    rels.push(jd_obj(["spdxElementId", "relationshipType",
+    "relatedSpdxElement"],
+    [jd_str("SPDXRef-DOCUMENT"), jd_str("DESCRIBES"), jd_str(root_id)]))
+    let mut di: int = 0
+    while di < sb.dependencies.len() {
+        let dep: JDoc = sb.dependencies.get(di)
+        let ref: str = jd_field_str(dep, "ref")
+        let kids: JDoc = jd_field(dep, "dependsOn")
+        if kids.kind == "arr" {
+            let mut ki: int = 0
+            while ki < kids.arr.len() {
+                let kid: JDoc = kids.arr.get(ki)
+                let mut kid_name: str = ""
+                if kid.kind == "str" {
+                    kid_name = kid.sval
+                }
+                rels.push(jd_obj(["spdxElementId", "relationshipType",
+                "relatedSpdxElement"],
+                [jd_str(spdx_id("Package", ref_name(ref))),
+                jd_str("DEPENDS_ON"),
+                jd_str(spdx_id("Package", ref_name(kid_name)))]))
+                ki = ki + 1
+            }
+        }
+        di = di + 1
+    }
+    return jd_obj(["spdxVersion", "dataLicense", "SPDXID", "name",
+    "documentNamespace", "creationInfo", "packages", "relationships",
+    "documentDescribes"],
+    [jd_str(spdx_spec()), jd_str("CC0-1.0"), jd_str("SPDXRef-DOCUMENT"),
+    jd_str("SBOM-for-" + sb.root_name),
+    jd_str("https://halis-lang.dev/sbom/" + sb.root_name + "/"
+    + sb.digest.slice(0, 12)),
+    jd_obj(["created", "creators"], [jd_str(stamp),
+    jd_arr([jd_str("Tool: " + tool_name() + "-" + tool_version()),
+    jd_str("Organization: halis-lang")])]),
+    jd_arr(pkgs), jd_arr(rels), jd_arr([jd_str(root_id)])])
+}
+
+# ============================================================================
+# The --json report (schema hls-sbom/v1) — the component set, the
+# edges, and the documents' own SHA-256s, properties as an object.
+# ============================================================================
+
+# report_components(comps) — the report's component entries.
+fn report_components(comps: list[JDoc]) -> JDoc {
+    let out: list[JDoc] = []
+    let mut i: int = 0
+    while i < comps.len() {
+        let c: JDoc = comps.get(i)
+        let pkeys: list[str] = []
+        let pvals: list[JDoc] = []
+        let props: JDoc = jd_props_of(c)
+        if props.kind == "arr" {
+            let mut pi: int = 0
+            while pi < props.arr.len() {
+                let pr: JDoc = props.arr.get(pi)
+                pkeys.push(jd_field_str(pr, "name"))
+                pvals.push(jd_str(jd_field_str(pr, "value")))
+                pi = pi + 1
+            }
+        }
+        out.push(jd_obj(["name", "type", "version", "sha256",
+        "properties"],
+        [jd_str(jd_field_str(c, "name")), jd_str(jd_field_str(c, "type")),
+        jd_field(c, "version"), jd_str(jd_hash_of(c)),
+        jd_obj(pkeys, pvals)]))
+        i = i + 1
+    }
+    return jd_arr(out)
+}
+
+# build_report(sb, mode, release, cdx_sha, spdx_sha, serial, namespace,
+# written) — the internal report document.
+fn build_report(sb: SbomSet, release: bool, cdx_sha: str, spdx_sha: str,
+serial: str, namespace: str, written: list[str]) -> JDoc {
+    let mut mode: str = "source"
+    if sb.pkg_mode {
+        mode = "package"
+    }
+    let root: JDoc = jd_obj(["name", "type", "sha256"],
+    [jd_str(sb.root_name), jd_str(jd_field_str(sb.root_comp, "type")),
+    jd_str(sb.root_sha)])
+    let docs: JDoc = jd_obj(["cdx_sha256", "spdx_sha256", "serial_number",
+    "namespace"], [jd_str(cdx_sha), jd_str(spdx_sha), jd_str(serial),
+    jd_str(namespace)])
+    let written_docs: list[JDoc] = []
+    let mut wi: int = 0
+    while wi < written.len() {
+        written_docs.push(jd_str(written.get(wi)))
+        wi = wi + 1
+    }
+    let keys: list[str] = ["schema", "mode", "release", "digest", "root",
+    "components", "dependencies", "documents", "written"]
+    let vals: list[JDoc] = [jd_str(report_schema()), jd_str(mode),
+    jd_bool(release), jd_str(sb.digest), root,
+    report_components(sb.components), jd_arr(sb.dependencies), docs,
+    jd_arr(written_docs)]
+    if sb.pkg_mode {
+        keys.push("lockfile")
+        vals.push(jd_str(sb.lockfile))
+    }
+    return jd_obj(keys, vals)
+}
+
+# ============================================================================
+# The transparency log — hpkg_log.transparency_log_append: one record
+# appended to the JSON-lines ledger under the repo root (or the
+# HLS_PKG_TRANSPARENCY_LOG override), chained SHA-256 over the previous
+# head and the canonical record. The sidecar .lock file is created (the
+# .py holds an exclusive flock on it for the whole critical section —
+# this port creates it without the advisory lock; single-writer runs,
+# the byte law of the log itself, are unchanged).
+# ============================================================================
+
+struct TlogRec {
+    seq: int,
+    chain_hash: str
+}
+
+# tlog_count_lines(text) — Python's line-iteration count of a file.
+fn tlog_count_lines(text: str) -> int {
+    if text == "" {
+        return 0
+    }
+    let parts: list[str] = text.split("\n")
+    let mut n: int = parts.len()
+    if parts.get(parts.len() - 1) == "" {
+        n = n - 1
+    }
+    if n < 0 {
+        n = 0
+    }
+    return n
+}
+
+# tlog_head_hash(text) — the last non-blank line's chain_hash (genesis
+# "0"*64 when the log is empty / corrupt).
+fn tlog_head_hash(text: str) -> str {
+    let prev: str = str_repeat("0", 64)
+    if text == "" {
+        return prev
+    }
+    let lines: list[str] = text.split("\n")
+    let mut last: str = ""
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).trim() != "" {
+            last = lines.get(i)
+        }
+        i = i + 1
+    }
+    if last == "" {
+        return prev
+    }
+    let pr: Result[JsonValue, str] = json_parse_result(last)
+    if result_is_ok(pr) {
+        let rec: JsonValue = result_unwrap(pr)
+        let ch: JsonValue = json_object_get(rec, "chain_hash")
+        if json_is_str(ch) {
+            return json_str_value(ch)
+        }
+    }
+    return prev
+}
+
+# tlog_append(record) — build the chained record and append the line.
+fn tlog_append(record: JDoc) -> Result[TlogRec, Fail]
+uses Fs, Proc, Clock, Args {
+    let log_path: str = transparency_log_path()
+    let lock_path: str = log_path + ".lock"
+    if !file_exists(lock_path) {
+        write_file(lock_path, "")
+    }
+    let text: str = read_or(log_path, "")
+    let prev_hash: str = tlog_head_hash(text)
+    let seq: int = tlog_count_lines(text) + 1
+    let rec: JDoc = jd_obj(record.keys, record.vals)
+    obj_set(rec, "seq", jd_int(seq))
+    obj_set(rec, "timestamp",
+    jd_int(floor_div(system_time_now_ms(), 1000)))
+    obj_set(rec, "prev_hash", jd_str(prev_hash))
+    let canon: str = py_json_canon(rec)
+    let chain: str = sha256_hex(prev_hash + canon)
+    obj_set(rec, "chain_hash", jd_str(chain))
+    write_file(log_path, text + py_json_line(rec) + "\n")
+    return Result.Ok(TlogRec {
+        seq: seq, chain_hash: chain
+    })
+}
+
+# ============================================================================
+# Output — the .py's _write (plain text files) with the output-directory
+# law the CLI checks first.
+# ============================================================================
+
+fn write_doc(path: str, text: str) -> Result[str, Fail] uses Fs {
+    write_file(path, text)
+    return Result.Ok(path)
+}
+
+# ============================================================================
+# The CLI — argparse's grammar (positional entry, --pkg [DIR],
+# --format {cdx,spdx,both}, --out DIR, --stdout, --release, --json,
+# -h/--help), the same usage / error bytes, the same exit codes.
+# ============================================================================
+
+fn usage_text() -> str {
+    return "usage: hls-sbom [-h] [--pkg [DIR]] [--format {cdx,spdx,both}]"
+    + " [--out DIR]\n"
+    + "                [--stdout] [--release] [--json]\n"
+    + "                [entry]\n"
+}
+
+fn eprint_usage() -> void uses IO {
+    eprint(usage_text())
+}
+
+fn help_text() -> str {
+    return usage_text()
+    + "\n"
+    + "Stage 104 bill of materials (CycloneDX 1.5 + SPDX 2.3).\n"
+    + "\n"
+    + "positional arguments:\n"
+    + "  entry                 entry .hls file (source mode)\n"
+    + "\n"
+    + "options:\n"
+    + "  -h, --help            show this help message and exit\n"
+    + "  --pkg [DIR]           SBOM the package tree rooted at DIR "
+    + "(default: cwd)\n"
+    + "  --format {cdx,spdx,both}\n"
+    + "                        which document to emit (default: both)\n"
+    + "  --out DIR             write the documents into DIR (default: "
+    + "the entry's\n"
+    + "                        directory / the package directory)\n"
+    + "  --stdout              print a document to stdout instead of "
+    + "writing (one\n"
+    + "                        --format only)\n"
+    + "  --release             the shipping gate: lockfile required, "
+    + "drift and\n"
+    + "                        unauditable refused, versioned documents "
+    + "written, the\n"
+    + "                        SBOM's own hashes chained into the "
+    + "transparency log\n"
+    + "  --json                print the internal report (schema "
+    + "hls-sbom/v1)\n"
+}
+
+# usage_fail(msg) — argparse's error: usage to stderr, then the
+# prog-prefixed message; exit 2.
+fn usage_fail(msg: str) -> int uses IO, Exit {
+    eprint_usage()
+    eprintln(tool_name() + ": error: " + msg)
+    return 2
+}
+
+# fail_exit(f) — the AuditError / SystemExit division: AuditError
+# prints prefixed, exit 1; the interpreter's own SystemExit messages
+# print bare, exit 1.
+fn fail_exit(f: Fail) -> int uses IO {
+    if f.direct {
+        eprintln(f.msg)
+    } else {
+        eprintln(tool_name() + ": " + f.msg)
+    }
+    return 1
+}
+
+# looks_option(x) — would argparse treat the token as an option?
+fn looks_option(x: str) -> bool {
+    return x.len() > 1 && x.byte_at(0) == 45
+}
+
+struct Cli {
+    entry: str,
+    has_entry: bool,
+    pkg: str,
+    has_pkg: bool,
+    fmt: str,
+    out_dir: str,
+    has_out: bool,
+    want_stdout: bool,
+    release: bool,
+    want_json: bool
+}
+
+fn cli_new() -> Cli {
+    return Cli {
+        entry: "", has_entry: false, pkg: "", has_pkg: false,
+        fmt: "both", out_dir: "", has_out: false, want_stdout: false,
+        release: false, want_json: false
+    }
+}
+
+# parse_cli(argv) — Result[Ok(Cli), Err(usage message)] — argparse's
+# own errors (invalid choice, expected one argument, unrecognized
+# arguments); -h/--help exits 0 from inside.
+fn parse_cli(argv: list[str]) -> Result[Cli, str] uses IO, Exit {
+    let c: Cli = cli_new()
+    let extras: list[str] = []
+    let mut i: int = 1
+    let mut opts_done: bool = false
+    while i < argv.len() {
+        let a: str = argv.get(i)
+        if opts_done || a == "-" {
+            if !c.has_entry {
+                c.has_entry = true
+                c.entry = a
+            } else {
+                extras.push(a)
+            }
+            i = i + 1
+            continue
+        }
+        if a == "--" {
+            opts_done = true
+            i = i + 1
+            continue
+        }
+        if a == "-h" || a == "--help" {
+            print(help_text())
+            exit(0)
+        }
+        if a == "--pkg" {
+            c.has_pkg = true
+            if i + 1 < argv.len() && !looks_option(argv.get(i + 1)) {
+                c.pkg = argv.get(i + 1)
+                i = i + 2
+            } else {
+                c.pkg = "."
+                i = i + 1
+            }
+            continue
+        }
+        if a.starts_with("--pkg=") {
+            c.has_pkg = true
+            c.pkg = a.slice(6, a.len())
+            i = i + 1
+            continue
+        }
+        if a == "--format" {
+            if i + 1 >= argv.len() || looks_option(argv.get(i + 1)) {
+                return Result.Err(
+                "argument --format: expected one argument")
+            }
+            c.fmt = argv.get(i + 1)
+            if c.fmt != "cdx" && c.fmt != "spdx" && c.fmt != "both" {
+                return Result.Err("argument --format: invalid choice: '"
+                + c.fmt + "' (choose from cdx, spdx, both)")
+            }
+            i = i + 2
+            continue
+        }
+        if a.starts_with("--format=") {
+            c.fmt = a.slice(9, a.len())
+            if c.fmt != "cdx" && c.fmt != "spdx" && c.fmt != "both" {
+                return Result.Err("argument --format: invalid choice: '"
+                + c.fmt + "' (choose from cdx, spdx, both)")
+            }
+            i = i + 1
+            continue
+        }
+        if a == "--out" {
+            if i + 1 >= argv.len() || looks_option(argv.get(i + 1)) {
+                return Result.Err("argument --out: expected one argument")
+            }
+            c.has_out = true
+            c.out_dir = argv.get(i + 1)
+            i = i + 2
+            continue
+        }
+        if a.starts_with("--out=") {
+            c.has_out = true
+            c.out_dir = a.slice(6, a.len())
+            i = i + 1
+            continue
+        }
+        if a == "--stdout" {
+            c.want_stdout = true
+            i = i + 1
+            continue
+        }
+        if a == "--release" {
+            c.release = true
+            i = i + 1
+            continue
+        }
+        if a == "--json" {
+            c.want_json = true
+            i = i + 1
+            continue
+        }
+        if a.byte_at(0) == 45 {
+            extras.push(a)
+            i = i + 1
+            continue
+        }
+        if !c.has_entry {
+            c.has_entry = true
+            c.entry = a
+        } else {
+            extras.push(a)
+        }
+        i = i + 1
+    }
+    if extras.len() > 0 {
+        return Result.Err("unrecognized arguments: " + join(extras, " "))
+    }
+    return Result.Ok(c)
+}
+
+# ============================================================================
+# main — the .py's main(): the mode dispatch, the document build, the
+# three output paths (report-only / release / stdout / files), the
+# summary, the exit codes.
+# ============================================================================
+
+fn strip_prefix_str(s: str, prefix: str) -> str {
+    if s.starts_with(prefix) {
+        return s.slice(prefix.len(), s.len())
+    }
+    return s
+}
+
+# last_segment(s) — the text after the last "/" (rsplit("/", 1)[-1]).
+fn last_segment(s: str) -> str {
+    let mut i: int = s.len() - 1
+    while i >= 0 {
+        if s.byte_at(i) == 47 {
+            return s.slice(i + 1, s.len())
+        }
+        i = i - 1
+    }
+    return s
+}
+
+fn main() -> int uses IO, Fs, Proc, Exit, Clock, Args {
+    let argv: list[str] = args()
+    let pr: Result[Cli, str] = parse_cli(argv)
+    if result_is_err(pr) {
+        return usage_fail(result_err_or(pr, ""))
+    }
+    let c: Cli = result_unwrap(pr)
+
+    # the tool's own legs (usage errors, exit 2)
+    if !c.has_pkg && !c.has_entry {
+        eprint_usage()
+        eprintln("error: give an entry file (source mode) or --pkg "
+        + "[DIR] (package mode)")
+        return 2
+    }
+    if c.has_pkg && c.has_entry {
+        eprintln("error: <entry> and --pkg are mutually exclusive "
+        + "(one mode per run)")
+        return 2
+    }
+    if c.release && !c.has_pkg {
+        eprintln("error: --release ships a PACKAGE — pass --pkg")
+        return 2
+    }
+    if c.want_stdout && c.fmt == "both" {
+        eprintln("error: --stdout needs one --format (cdx or spdx), "
+        + "not both")
+        return 2
+    }
+    if c.want_stdout && c.has_out {
+        eprintln("error: --stdout and --out are mutually exclusive")
+        return 2
+    }
+    if c.release && c.want_stdout {
+        eprintln("error: --release writes the shipping documents; "
+        + "--stdout only inspects one")
+        return 2
+    }
+
+    let root: str = repo_root()
+    let stamp_r: Result[str, Fail] = utc_stamp()
+    if result_is_err(stamp_r) {
+        return fail_exit(result_err_or(stamp_r, fail("")))
+    }
+    let stamp: str = result_unwrap(stamp_r)
+
+    let mut sb_r: Result[SbomSet, Fail] = Result.Err(fail(""))
+    if c.has_pkg {
+        sb_r = sbom_package(c.pkg, root)
+    } else {
+        sb_r = sbom_source(c.entry, root)
+    }
+    if result_is_err(sb_r) {
+        return fail_exit(result_err_or(sb_r, fail("")))
+    }
+    let sb: SbomSet = result_unwrap(sb_r)
+
+    if c.release && sb.lockfile != "present" {
+        return fail_exit(fail("a release ships pinned content — no "
+        + "lockfile next to the manifest; run hls-pkg lock first"))
+    }
+
+    let mut default_out: str = ""
+    if c.has_pkg {
+        default_out = realpath_lex(c.pkg)
+    } else {
+        default_out = path_dirname(realpath_lex(c.entry))
+    }
+    let rel_name: str = sb.root_name + "-" + sb.pkg_version
+
+    let cdx: JDoc = build_cdx(sb, stamp)
+    let spdx: JDoc = build_spdx(sb, stamp)
+    let cdx_text: str = py_json_dump(cdx) + "\n"
+    let spdx_text: str = py_json_dump(spdx) + "\n"
+    let cdx_sha: str = sha256_hex(cdx_text)
+    let spdx_sha: str = sha256_hex(spdx_text)
+    let serial: str = jd_field_str(cdx, "serialNumber")
+    let namespace: str = jd_field_str(spdx, "documentNamespace")
+
+    if c.want_json && !c.release {
+        # Report-only: the machine-readable report NEVER writes
+        # artifacts (CI reads trees; it does not stamp them).
+        let report: JDoc = build_report(sb, false, cdx_sha, spdx_sha,
+        serial, namespace, [])
+        print(py_json_dump(report) + "\n")
+        return 0
+    }
+
+    let written: list[str] = []
+    let mut log_line: str = ""
+    let mut has_log_line: bool = false
+
+    if c.release {
+        let mut out_dir: str = default_out
+        if c.has_out {
+            out_dir = c.out_dir
+        }
+        if !is_dir_h(out_dir) {
+            return fail_exit(fail("output directory does not exist: "
+            + out_dir))
+        }
+        let w1: Result[str, Fail] = write_doc(path_join2(out_dir,
+        "hls-sbom-" + rel_name + ".cdx.json"), cdx_text)
+        if result_is_err(w1) {
+            return fail_exit(result_err_or(w1, fail("")))
+        }
+        written.push(result_unwrap(w1))
+        let w2: Result[str, Fail] = write_doc(path_join2(out_dir,
+        "hls-sbom-" + rel_name + ".spdx.json"), spdx_text)
+        if result_is_err(w2) {
+            return fail_exit(result_err_or(w2, fail("")))
+        }
+        written.push(result_unwrap(w2))
+        let rec: JDoc = jd_obj(["kind", "name", "version", "sha256",
+        "components", "cdx_sha256", "spdx_sha256"],
+        [jd_str("sbom"), jd_str(sb.root_name),
+        jd_str(sb.pkg_version), jd_str(sb.root_sha),
+        jd_int(1 + sb.components.len()), jd_str(cdx_sha),
+        jd_str(spdx_sha)])
+        let tr: Result[TlogRec, Fail] = tlog_append(rec)
+        if result_is_err(tr) {
+            return fail_exit(result_err_or(tr, fail("")))
+        }
+        let trec: TlogRec = result_unwrap(tr)
+        log_line = "transparency log seq: " + trec.seq.to_str()
+        + " (chain " + trec.chain_hash.slice(0, 16) + "...)"
+        has_log_line = true
+    } else if !c.want_stdout {
+        let mut out_dir2: str = default_out
+        if c.has_out {
+            out_dir2 = c.out_dir
+        }
+        if !is_dir_h(out_dir2) {
+            return fail_exit(fail("output directory does not exist: "
+            + out_dir2))
+        }
+        if c.fmt == "cdx" || c.fmt == "both" {
+            let w1: Result[str, Fail] = write_doc(path_join2(out_dir2,
+            cdx_name()), cdx_text)
+            if result_is_err(w1) {
+                return fail_exit(result_err_or(w1, fail("")))
+            }
+            written.push(result_unwrap(w1))
+        }
+        if c.fmt == "spdx" || c.fmt == "both" {
+            let w2: Result[str, Fail] = write_doc(path_join2(out_dir2,
+            spdx_name()), spdx_text)
+            if result_is_err(w2) {
+                return fail_exit(result_err_or(w2, fail("")))
+            }
+            written.push(result_unwrap(w2))
+        }
+    }
+
+    if c.want_json {
+        let report: JDoc = build_report(sb, c.release, cdx_sha, spdx_sha,
+        serial, namespace, written)
+        print(py_json_dump(report) + "\n")
+        return 0
+    }
+
+    if c.want_stdout {
+        # A pure document: the summary goes to stderr, the document is
+        # the ONLY thing on stdout.
+        eprintln(tool_name() + ": " + sb.root_name + " — digest "
+        + sb.digest.slice(0, 24))
+        let mut doc: str = ""
+        if c.fmt == "cdx" {
+            doc = cdx_text
+        } else {
+            doc = spdx_text
+        }
+        if doc.ends_with("\n") {
+            print(doc)
+        } else {
+            println(doc)
+        }
+        return 0
+    }
+
+    let mut subject: str = "bill of materials"
+    if c.release {
+        subject = "release"
+    }
+    println("== hls-sbom: " + subject + " ==")
+    if c.fmt == "cdx" || c.fmt == "both" {
+        println("  CycloneDX 1.5  serial "
+        + strip_prefix_str(serial, "urn:uuid:"))
+    }
+    if c.fmt == "spdx" || c.fmt == "both" {
+        println("  SPDX 2.3        ns    .../" + last_segment(namespace))
+    }
+    println("  root: " + sb.root_name + " ("
+    + sb.components.len().to_str() + " component(s) underneath)")
+    println("  digest: " + sb.digest.slice(0, 24))
+    let mut wi: int = 0
+    while wi < written.len() {
+        println("  wrote: " + written.get(wi))
+        wi = wi + 1
+    }
+    if has_log_line {
+        println("  " + log_line)
+    }
+    return 0
+}

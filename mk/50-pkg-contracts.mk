@@ -236,24 +236,24 @@ examples:
 # lists the manifest tree with the lockfile's own hashes. --release
 # is the shipping gate: lockfile required, drift refused, versioned
 # documents written, the SBOM chained into the transparency log.
-sbom:
-	@python3 tools/hls-sbom.py $(F)
+sbom: $(BIN)/hls-sbom
+	@$(BIN)/hls-sbom $(F)
 
 sbom-pkg:
 	@if [ -z "$(D)" ]; then echo "Usage: make sbom-pkg D=<pkg dir> [FORMAT=cdx|spdx|both]" && false; fi; \
 	if [ -n "$(FORMAT)" ]; then FMT="--format $(FORMAT)"; else FMT=""; fi; \
-	python3 tools/hls-sbom.py --pkg $(D) $$FMT
+	$(BIN)/hls-sbom --pkg $(D) $$FMT
 
 sbom-release:
 	@if [ -z "$(D)" ]; then echo "Usage: make sbom-release D=<pkg dir>" && false; fi; \
-	python3 tools/hls-sbom.py --pkg $(D) --release
+	$(BIN)/hls-sbom --pkg $(D) --release
 
 # Stage 104 acceptance gate: the eight-section battery (the CycloneDX
 # document, the SPDX twin, determinism, the package tree, the release
 # gate with the transparency-log chaining, the audit parity, the
 # demos, the tools). Tool-only - no solver, no compiler needed; the
 # native half of the demo parity runs when bin/hlc exists.
-sbom-acceptance: $(BIN)/acc-sbom
+sbom-acceptance: $(BIN)/acc-sbom $(BIN)/hls-sbom
 	@echo "[Stage 104 acceptance] running tests/acc/sbom_acceptance.hls..."
 	@$(BIN)/acc-sbom
 
@@ -299,7 +299,7 @@ repro-verify:
 # tampered + drifted), the release gate with the transparency
 # chaining, the demos, the tools. Tool-only — no solver needed; the
 # engine half runs native when bin/hlc exists, boot otherwise.
-repro-acceptance: $(BIN)/acc-repro
+repro-acceptance: $(BIN)/acc-repro $(BIN)/hls-sbom
 	@echo "[Stage 105 acceptance] running tests/acc/repro_acceptance.hls..."
 	@$(BIN)/acc-repro
 
