@@ -12,33 +12,78 @@ class InterpBuiltin_method(object):
         # on this thread first, so the slot exists; the property
         # wrapper is a Python call we do not need at ~9M calls/run.
         line = self._tls.line
-        if op == "str.len":
-            return len(t)
+        # Branch order follows the measured dynamic mix of a compiler-
+        # source run (byte_at / list.get / list.len / list.push carry
+        # ~70% of the traffic); every test is a unique interned string,
+        # so the chain costs one compare per miss.
         if op == "str.byte_at":
             if args[0] < 0 or args[0] >= len(t):
                 raise HLPanic("string access out of bounds", line)
             return t[args[0]]
+        if op == "list.get":
+            if args[0] < 0 or args[0] >= len(t):
+                raise HLPanic("array access out of bounds", line)
+            return t[args[0]]
+        if op == "list.len":
+            return len(t)
+        if op == "list.push":
+            t.append(args[0])
+            return None
         if op == "str.slice":
             a, b = args
             if a < 0 or b < a or b > len(t):
                 raise HLPanic("invalid string slice", line)
             return t[a:b]
-        if op == "str.find":
-            return t.find(args[0])
-        if op == "str.contains":
-            return t.find(args[0]) >= 0
+        if op == "str.len":
+            return len(t)
+        if op == "map.get_or":
+            v = t.get(args[0])
+            return args[1] if v is None else v
         if op == "str.starts_with":
             return t.startswith(args[0])
-        if op == "str.ends_with":
-            return t.endswith(args[0])
+        if op == "map.has":
+            return args[0] in t
+        if op == "int.to_str":
+            return str(t).encode("ascii")
+        if op == "map.set":
+            t[args[0]] = args[1]
+            return None
+        if op == "str.to_int":
+            return parse_int(t, line)
         if op == "str.split":
             if len(args[0]) == 0:
                 raise HLPanic("empty separator not allowed", line)
             return t.split(args[0])
+        if op == "map.keys":
+            return list(t.keys())
+        if op == "list.pop":
+            if len(t) == 0:
+                # BUG-SC-9 fix: "array access out of bounds" is misleading
+                # for pop() — the user called pop() on an empty list, not
+                # an index operation. Report the actual problem.
+                raise HLPanic("pop from empty list", line)
+            return t.pop()
+        if op == "str.find":
+            return t.find(args[0])
+        if op == "str.contains":
+            return t.find(args[0]) >= 0
+        if op == "str.ends_with":
+            return t.endswith(args[0])
         if op == "str.trim":
             return t.strip(B_LOW)
-        if op == "str.to_int":
-            return parse_int(t, line)
+        if op == "str.to_str":
+            return t
+        if op == "int.to_float":
+            return float(t)
+        if op == "int.abs":
+            return i64_neg(t, line) if t < 0 else t
+        if op == "list.set":
+            if args[0] < 0 or args[0] >= len(t):
+                raise HLPanic("array access out of bounds", line)
+            t[args[0]] = args[1]
+            return None
+        if op == "map.len":
+            return len(t)
         if op == "str.to_float":
             # strict: ^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ — matches the C version
             # BUG-007 fix: must require at least one digit; "." alone is invalid.
@@ -88,14 +133,6 @@ class InterpBuiltin_method(object):
             if saw_exp and exp_digits == 0:
                 raise HLPanic("cannot convert string to float", line)
             return float(t)
-        if op == "str.to_str":
-            return t
-        if op == "int.to_str":
-            return str(t).encode("ascii")
-        if op == "int.to_float":
-            return float(t)
-        if op == "int.abs":
-            return i64_neg(t, line) if t < 0 else t
         if op == "float.to_str":
             return fmt_float(t)
         if op == "float.to_int":
@@ -118,39 +155,6 @@ class InterpBuiltin_method(object):
             return abs(t)
         if op == "bool.to_str":
             return b"true" if t else b"false"
-        if op == "list.len":
-            return len(t)
-        if op == "list.push":
-            t.append(args[0])
-            return None
-        if op == "list.get":
-            if args[0] < 0 or args[0] >= len(t):
-                raise HLPanic("array access out of bounds", line)
-            return t[args[0]]
-        if op == "list.pop":
-            if len(t) == 0:
-                # BUG-SC-9 fix: "array access out of bounds" is misleading
-                # for pop() — the user called pop() on an empty list, not
-                # an index operation. Report the actual problem.
-                raise HLPanic("pop from empty list", line)
-            return t.pop()
-        if op == "list.set":
-            if args[0] < 0 or args[0] >= len(t):
-                raise HLPanic("array access out of bounds", line)
-            t[args[0]] = args[1]
-            return None
-        if op == "map.len":
-            return len(t)
-        if op == "map.set":
-            t[args[0]] = args[1]
-            return None
-        if op == "map.get_or":
-            v = t.get(args[0])
-            return args[1] if v is None else v
-        if op == "map.has":
-            return args[0] in t
-        if op == "map.keys":
-            return list(t.keys())
         # ----- Stage 16 (v0.27.0-alpha): Chan / Task methods -----
         if op == "chan.send" or op == "chan.try_send":
             # Boundary ownership rule: an owned message is deep-copied at
