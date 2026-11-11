@@ -15,10 +15,10 @@ lto:
 # emit-lto-ir: whole-program LTO'd LLVM IR (single .ll with every
 # transitive dependency; .bc too when llvm-as is available).
 # Usage: make emit-lto-ir F=examples/foo.hls [OUT=/tmp/foo]
-emit-lto-ir:
+emit-lto-ir: $(BIN)/hlboot
 	@test -n "$(F)" || (echo "Usage: make emit-lto-ir F=examples/foo.hls [OUT=/tmp/foo]" && false)
 	@if [ -z "$(OUT)" ]; then OUT=$(F:.hls=.lto.ll); fi; \
-	  $(PYTHON) tools/hlinterp/boot.py --emit lto $(F) > $$OUT; \
+	  $(BIN)/hlboot --emit lto $(F) > $$OUT; \
 	  echo "wrote $$OUT"; \
 	  if command -v llvm-as >/dev/null 2>&1; then \
 	    llvm-as $$OUT -o $$(dirname $$OUT)/$$(basename $$OUT .ll).bc; \

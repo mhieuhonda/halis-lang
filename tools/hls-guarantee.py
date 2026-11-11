@@ -71,7 +71,14 @@ _TOOLS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(_TOOLS)
 
 POLICY = "halis-guarantee-1"
-BOOT = os.path.join(ROOT, "tools", "hlinterp", "boot.py")
+# The probe driver: the self-hosted Stage-0 evaluator (bin/hlboot),
+# built from the committed snapshot when missing — the same oracle the
+# suites ride.
+BOOT = os.path.join(ROOT, "bin", "hlboot")
+if not os.path.isfile(BOOT):
+    subprocess.run(["make", "-s", "bin/hlboot"], cwd=ROOT,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   check=False)
 SECURITY_MD = "SECURITY.md"
 
 FAMILIES = ("types", "memory", "arithmetic", "effects", "taint",
@@ -446,16 +453,16 @@ LEDGER = [
         "refused outright, and the four file builtins are confined to "
         "the sandbox directory.",
         "mechanism":
-        "boot.py refuses extern \"C\" blocks and any function whose "
+        "hlboot refuses extern \"C\" blocks and any function whose "
         "computed effects reach Proc when --sandbox is active; the "
         "runtime confines read_file, read_file_tainted, write_file "
         "and file_exists to DIR, in both the interpreter and native "
         "paths.",
-        "enforced_by": "tools/hlinterp/boot.py (sandbox gate) + the runtime path "
+        "enforced_by": "tools/hlboot.hls (sandbox gate) + the runtime path "
                        "confinement",
         "anchors": [
-            ("tools/hlinterp/boot.py", "--sandbox is incompatible"),
-            ("tools/hlinterp/boot.py", "restrict filesystem builtins"),
+            ("tools/hlboot.hls", "--sandbox is incompatible"),
+            ("tools/hlboot.hls", "restrict filesystem builtins"),
         ],
         "probes": [
             {"path": "tests/guarantee_probes/sandbox_extern.hls",
@@ -740,7 +747,7 @@ def probe_run(tree, probe):
     path = os.path.join(tree, probe["path"])
     if not os.path.isfile(path):
         return "error", "probe file missing: %s" % probe["path"]
-    args = [sys.executable, BOOT]
+    args = [BOOT]
     args += probe.get("args", [])
     if probe["kind"] == "refuse":
         args += ["--check", path]

@@ -1,0 +1,3491 @@
+# ============================================================================
+# tools/hlemit.hls — the emission trio, on the compiler's own read:
+# --emit ir (the HLIR printer), --emit llvm (the LLVM IR backend),
+# --emit lto (the DCE'd whole-program emission).
+# ----------------------------------------------------------------------------
+# boot.py's lab printers, ported off the interpreter's private AST onto
+# hlfront's checked Ctx — the same ExprN/StmtN pools bin/hlc generates
+# from, so the emission can never disagree with the compiler about what
+# a program says. What survives verbatim from the Python years is the
+# WIRE: the HLIR text format (temps t1.., bindings v_<name>, blocks
+# then1/else2/endif3, the four-arg branch), the .ll module shape (the
+# runtime declare table, entry-block slot hoisting, boxed list/map
+# elements, checked i64 arithmetic through the with.overflow
+# intrinsics, hl_die on the overflow path), and the lto report line.
+#
+# The refusal law survives too: constructs the alpha LLVM backend does
+# not model (user-defined struct methods, generic instantiations, ...)
+# die through panic() — the probe-child discipline turns that into the
+# clean "compile error:" report, exactly the way --check already
+# behaves. Nothing silently miscompiles.
+#
+# The LTO leg reuses the compiler's own lto_reachable (the same
+# reachability hlc --lto applies, panic-handler rooting included), so
+# the dropped set is the DCE the native backend would agree with.
+#
+# Import law (src/hlc.hls's own): this module ships as a PIECE, not a
+# program — it does not import hlfront itself. The importing tool
+# imports tools/hlfront.hls FIRST, then this module; the merged program
+# is one flat namespace (the same order law src/hlc.hls applies to its
+# parts). Nothing here is standalone-compilable, exactly like the
+# compiler's own gen_*.hls pieces.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Shared type-string helpers (llvm_common's own, verbatim laws).
+# ----------------------------------------------------------------------------
+
+# ll_taint_inner(t) — the T inside tainted[T], or t itself.
+fn ll_taint_inner(t: str) -> str {
+    if t.starts_with("tainted[") {
+        return t.slice(8, t.len() - 1)
+    }
+    return t
+}
+
+# ll_is_list(t) — list[...].
+fn ll_is_list(t: str) -> bool {
+    return t.starts_with("list[")
+}
+
+# ll_list_elem(t) — the element type of list[T].
+fn ll_list_elem(t: str) -> str {
+    return t.slice(5, t.len() - 1)
+}
+
+# ll_is_map(t) — map[str, ...].
+fn ll_is_map(t: str) -> bool {
+    return t.starts_with("map[str, ")
+}
+
+# ll_map_val(t) — the value type of map[str, T].
+fn ll_map_val(t: str) -> str {
+    return t.slice(9, t.len() - 1)
+}
+
+# ll_type(t) — HLS -> LLVM type mapping (llvm_common's table).
+fn ll_type(t: str) -> str {
+    if t == "int" {
+        return "i64"
+    }
+    if t == "float" {
+        return "double"
+    }
+    if t == "bool" {
+        return "i1"
+    }
+    if t == "void" {
+        return "void"
+    }
+    if t == "str" {
+        return "ptr"
+    }
+    # Taint is compile-time only (same as the C backend): tainted[T]
+    # values have the representation of T at runtime.
+    if t.starts_with("tainted[") {
+        return ll_type(ll_taint_inner(t))
+    }
+    if t.starts_with("list[") || t.starts_with("map[") {
+        return "ptr"
+    }
+    # User-defined struct / enum -> opaque pointer.
+    return "ptr"
+}
+
+# ll_unsupported(what, line) — the clean refusal (llvm_common's
+# _unsupported; the probe child converts the panic into the compile
+# error the .py printed).
+fn ll_unsupported(what: str, line: int) -> str {
+    panic(what + " is not yet supported by --emit llvm (alpha subset; "
+    + "see SPEC.md section 21.4 'Limitations'). The C backend "
+    + "(-C / hlc.hls) supports it. (line " + line.to_str() + ")")
+    return ""
+}
+
+# ll_unsupported_v(what, line) — the same refusal for the TyVal-
+# returning lowering paths (the panic diverges; the pair is the
+# checker's demanded tail).
+fn ll_unsupported_v(what: str, line: int) -> TyVal {
+    panic(what + " is not yet supported by --emit llvm (alpha subset; "
+    + "see SPEC.md section 21.4 'Limitations'). The C backend "
+    + "(-C / hlc.hls) supports it. (line " + line.to_str() + ")")
+    return TyVal {
+        ty: "i64", v: "0"
+    }
+}
+
+# ir_unsupported(what, line) — the HLIR layer's own refusal.
+fn ir_unsupported(what: str, line: int) -> str {
+    panic(what + " is not yet supported by --emit ir "
+    + "(Stage 11 IR subset) (line " + line.to_str() + ")")
+    return ""
+}
+
+# he_py_repr_str(s) — Python's repr() for the literals the HLIR dump
+# embeds ('single quotes', backslash and quote escaped).
+fn he_py_repr_str(s: str) -> str {
+    let mut out: str = "'"
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c == 39 {
+            out = out + "\\" + "'"
+        } else if c == 92 {
+            out = out + "\\\\"
+        } else if c == 10 {
+            out = out + "\\n"
+        } else if c == 13 {
+            out = out + "\\" + "r"
+        } else if c == 9 {
+            out = out + "\\t"
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out + "'"
+}
+
+# ----------------------------------------------------------------------------
+# The HLIR printer — ir/__init__.py's builder + dump_module as one text
+# emission (the optimiser is hlc's own --opt-stats now; the dump is the
+# whole of --emit ir). Block structure, temp naming and the arg shapes
+# are the Python years' exactly: dest-less instructions carry two extra
+# spaces, terminators six, blocks two, and every fn ends with a blank.
+# ----------------------------------------------------------------------------
+
+struct IrEmit {
+    ctx: Ctx,
+    out: list[str], # the finished module lines
+    block_names: list[str], # per-fn, in creation order
+    block_lines: list[list[str]], # parallel to block_names
+    cur: int, # open block index (-1 = none yet; a fn always opens entry)
+    term: bool, # the current block is terminated
+    tmp: int, # t1, t2, ...
+    block_counter: int,
+    loop_cont: list[str], # continue targets (innermost last)
+    loop_brk: list[str] # break targets
+}
+
+# ir_new(ctx) — one module, one pass.
+fn ir_new(ctx: Ctx) -> IrEmit {
+    return IrEmit {
+        ctx: ctx,
+        out: [],
+        block_names: [],
+        block_lines: [],
+        cur: -1,
+        term: false,
+        tmp: 0,
+        block_counter: 0,
+        loop_cont: [],
+        loop_brk: []
+    }
+}
+
+# ir_fresh(ir) — the next tN.
+fn ir_fresh(ir: IrEmit) -> str {
+    ir.tmp = ir.tmp + 1
+    return "t" + ir.tmp.to_str()
+}
+
+# ir_create(ir, prefix) — create the next block WITHOUT opening it
+# (the .py's _new_block returned the block and only later assignments
+# of _current moved into it — terminators keep landing in the block
+# that was open when the construct began).
+fn ir_create(ir: IrEmit, prefix: str) -> str {
+    ir.block_counter = ir.block_counter + 1
+    let name: str = prefix + ir.block_counter.to_str()
+    ir.block_names.push(name)
+    let empty: list[str] = []
+    ir.block_lines.push(empty)
+    return name
+}
+
+# ir_open_block(ir) — open the LAST created block for emission.
+fn ir_open_block(ir: IrEmit) -> void {
+    ir.cur = ir.block_names.len() - 1
+    ir.term = false
+}
+
+# ir_emit(ir, dest, op, args) — one instruction into the current block.
+fn ir_emit(ir: IrEmit, dest: str, op: str, args: list[str]) -> str {
+    let mut d: str = ir_fresh(ir)
+    if dest != "" {
+        d = dest
+    }
+    let mut out: str = "    %" + d + " = " + op
+    let mut i: int = 0
+    while i < args.len() {
+        if i == 0 {
+            out = out + " "
+        } else {
+            out = out + ", "
+        }
+        out = out + args.get(i)
+        i = i + 1
+    }
+    ir.block_lines.get(ir.cur).push(out)
+    return d
+}
+
+# ir_term(ir, op, args) — terminate the current block (six spaces).
+fn ir_term(ir: IrEmit, op: str, args: list[str]) -> void {
+    let mut out: str = "      " + op
+    let mut i: int = 0
+    while i < args.len() {
+        if i == 0 {
+            out = out + " "
+        } else {
+            out = out + ", "
+        }
+        out = out + args.get(i)
+        i = i + 1
+    }
+    ir.block_lines.get(ir.cur).push(out)
+    ir.term = true
+}
+
+# ir_arg_* — the operand shapes _fmt_arg printed.
+fn ir_arg_var(name: str) -> str {
+    return "%" + name
+}
+
+fn ir_arg_label(name: str) -> str {
+    return "@" + name
+}
+
+fn ir_arg_lit_int(v: int) -> str {
+    return v.to_str()
+}
+
+fn ir_arg_lit_bool(v: bool) -> str {
+    if v {
+        return "True"
+    }
+    return "False"
+}
+
+# ir_effects_line(f) — ", ".join(sorted(effects)) or "pure".
+fn ir_effects_line(f: FnInfo) -> str {
+    let effs: list[str] = []
+    let mut i: int = 0
+    while i < f.effects.len() {
+        effs.push(f.effects.get(i))
+        i = i + 1
+    }
+    # insertion sort — the sorted() the dump printed
+    let mut a: int = 1
+    while a < effs.len() {
+        let key: str = effs.get(a)
+        let mut b: int = a - 1
+        while b >= 0 && effs.get(b) > key {
+            effs.set(b + 1, effs.get(b))
+            b = b - 1
+        }
+        effs.set(b + 1, key)
+        a = a + 1
+    }
+    if effs.len() == 0 {
+        return "pure"
+    }
+    let mut out: str = ""
+    let mut j: int = 0
+    while j < effs.len() {
+        if j > 0 {
+            out = out + ", "
+        }
+        out = out + effs.get(j)
+        j = j + 1
+    }
+    return out
+}
+
+# ir_flush_fn(ir, header) — the fn's blocks into out, creation order,
+# then "}" and the blank separator.
+fn ir_flush_fn(ir: IrEmit, header: str) -> void {
+    ir.out.push(header)
+    let mut b: int = 0
+    while b < ir.block_names.len() {
+        ir.out.push("  " + ir.block_names.get(b) + ":")
+        let lines: list[str] = ir.block_lines.get(b)
+        let mut i: int = 0
+        while i < lines.len() {
+            ir.out.push(lines.get(i))
+            i = i + 1
+        }
+        b = b + 1
+    }
+    ir.out.push("}")
+    ir.out.push("")
+}
+
+# ir_fn(ir, key, f) — one function: entry block, the body, the
+# implicit terminator law, the flush.
+fn ir_fn(ir: IrEmit, key: str, f: FnInfo) -> void {
+    # the param list, "name: type" in declaration order
+    let mut params: str = ""
+    let mut p: int = 0
+    while p < f.params.len() {
+        if p > 0 {
+            params = params + ", "
+        }
+        params = params + f.params.get(p) + ": " + f.ptypes.get(p)
+        p = p + 1
+    }
+    let header: str = "fn " + key + "(" + params + ") -> " + f.ret
+    + " uses " + ir_effects_line(f) + " {"
+    # per-fn state
+    ir.loop_cont = []
+    ir.loop_brk = []
+    ir.block_names = []
+    ir.block_lines = []
+    ir.block_counter = 0
+    ir.tmp = 0
+    ir_create(ir, "entry")
+    ir_open_block(ir)
+    let mut i: int = 0
+    while i < f.body.len() {
+        ir_stmt(ir, f.body.get(i))
+        i = i + 1
+    }
+    if !ir.term {
+        if f.ret == "void" {
+            ir_term(ir, "return", [])
+        } else {
+            ir_term(ir, "panic", [he_py_repr_str("missing return")])
+        }
+    }
+    ir_flush_fn(ir, header)
+}
+
+# ir_stmt(ir, si) — the statement lowering (the .py's _lower_stmt).
+fn ir_stmt(ir: IrEmit, si: int) -> void {
+    let ctx: Ctx = ir.ctx
+    let s: StmtN = ctx.stmts.get(si)
+    # statements after return/break/continue are unreachable — skip
+    if ir.term {
+        return
+    }
+    let k: str = s.kind
+    if k == "let" {
+        let val: str = ir_expr(ir, s.value)
+        ir_emit(ir, "v_" + s.name, "load", [ir_arg_var(val)])
+        return
+    }
+    if k == "assign" {
+        let tk: str = ctx.exprs[s.target].kind
+        let val: str = ir_expr(ir, s.value)
+        if tk == "ident" {
+            ir_emit(ir, "v_" + ctx.exprs[s.target].name, "store",
+            [ir_arg_var(val), ctx.exprs[s.target].name])
+        } else if tk == "field" {
+            let recv: str = ir_expr(ir, ctx.exprs[s.target].left)
+            ir_emit(ir, "", "struct_set",
+            [ir_arg_var(recv), ctx.exprs[s.target].name, ir_arg_var(val)])
+        } else if tk == "index" {
+            let lst: str = ir_expr(ir, ctx.exprs[s.target].left)
+            let idx: str = ir_expr(ir, ctx.exprs[s.target].right)
+            ir_emit(ir, "", "list_set",
+            [ir_arg_var(lst), ir_arg_var(idx), ir_arg_var(val)])
+        }
+        return
+    }
+    if k == "return" {
+        if s.value < 0 {
+            ir_term(ir, "return", [])
+        } else {
+            ir_term(ir, "return", [ir_arg_var(ir_expr(ir, s.value))])
+        }
+        return
+    }
+    if k == "if" {
+        let cond: str = ir_expr(ir, s.cond)
+        let then_b: str = ir_create(ir, "then")
+        let else_b: str = ir_create(ir, "else")
+        let end_b: str = ir_create(ir, "endif")
+        ir_term(ir, "branch",
+        [ir_arg_var(cond), ir_arg_label(then_b), ir_arg_label(else_b)])
+        ir_open(ir, then_b)
+        let mut i: int = 0
+        while i < s.body.len() {
+            ir_stmt(ir, s.body.get(i))
+            i = i + 1
+        }
+        if !ir.term {
+            ir_term(ir, "jump", [ir_arg_label(end_b)])
+        }
+        ir_open(ir, else_b)
+        let mut j: int = 0
+        while j < s.else_body.len() {
+            ir_stmt(ir, s.else_body.get(j))
+            j = j + 1
+        }
+        if !ir.term {
+            ir_term(ir, "jump", [ir_arg_label(end_b)])
+        }
+        ir_open(ir, end_b)
+        return
+    }
+    if k == "while" {
+        let cond_b: str = ir_create(ir, "while_cond")
+        let body_b: str = ir_create(ir, "while_body")
+        let end_b: str = ir_create(ir, "while_end")
+        ir_term(ir, "jump", [ir_arg_label(cond_b)])
+        ir_open(ir, cond_b)
+        let cond: str = ir_expr(ir, s.cond)
+        ir_term(ir, "branch",
+        [ir_arg_var(cond), ir_arg_label(body_b), ir_arg_label(end_b)])
+        ir_open(ir, body_b)
+        ir.loop_cont.push(cond_b)
+        ir.loop_brk.push(end_b)
+        let mut i: int = 0
+        while i < s.body.len() {
+            ir_stmt(ir, s.body.get(i))
+            i = i + 1
+        }
+        ir.loop_cont.pop()
+        ir.loop_brk.pop()
+        if !ir.term {
+            ir_term(ir, "jump", [ir_arg_label(cond_b)])
+        }
+        ir_open(ir, end_b)
+        return
+    }
+    if k == "for" {
+        # for v: T in iter { body } lowers to the re-checking loop:
+        #   v_iter = <iter>; v_i = 0
+        #   for_cond:  while v_i < list_len(v_iter)
+        #   for_body:  v = list_get(v_iter, v_i); body
+        #   for_inc:   v_i = v_i + 1  (the continue target)
+        #   for_end:
+        # The condition re-reads the CURRENT length every iteration and
+        # `continue` bumps the index before the re-check (deep-scan-5 /
+        # deep-scan-24's law, the same shape the LLVM backend rides).
+        let iter_name: str = ir_expr(ir, s.iter)
+        ir_emit(ir, "v_" + s.name + "__i", "const", [ir_arg_lit_int(0)])
+        let cond_b: str = ir_create(ir, "for_cond")
+        let body_b: str = ir_create(ir, "for_body")
+        let inc_b: str = ir_create(ir, "for_inc")
+        let end_b: str = ir_create(ir, "for_end")
+        ir_term(ir, "jump", [ir_arg_label(cond_b)])
+        ir_open(ir, cond_b)
+        let cur_len: str = ir_emit(ir, "", "list_len", [ir_arg_var(iter_name)])
+        let cond_tmp: str = ir_emit(ir, "", "binop",
+        ["<", ir_arg_var("v_" + s.name + "__i"), ir_arg_var(cur_len)])
+        ir_term(ir, "branch",
+        [ir_arg_var(cond_tmp), ir_arg_label(body_b), ir_arg_label(end_b)])
+        ir_open(ir, body_b)
+        ir_emit(ir, "v_" + s.name, "list_get",
+        [ir_arg_var(iter_name), ir_arg_var("v_" + s.name + "__i")])
+        ir.loop_cont.push(inc_b)
+        ir.loop_brk.push(end_b)
+        let mut i: int = 0
+        while i < s.body.len() {
+            ir_stmt(ir, s.body.get(i))
+            i = i + 1
+        }
+        ir.loop_cont.pop()
+        ir.loop_brk.pop()
+        if !ir.term {
+            ir_term(ir, "jump", [ir_arg_label(inc_b)])
+        }
+        ir_open(ir, inc_b)
+        let inc: str = ir_emit(ir, "", "binop",
+        ["+", ir_arg_var("v_" + s.name + "__i"), ir_arg_lit_int(1)])
+        ir_emit(ir, "v_" + s.name + "__i", "store",
+        [ir_arg_var(inc), s.name + "__i"])
+        ir_term(ir, "jump", [ir_arg_label(cond_b)])
+        ir_open(ir, end_b)
+        return
+    }
+    if k == "break" {
+        if ir.loop_brk.len() > 0 {
+            ir_term(ir, "jump",
+            [ir_arg_label(ir.loop_brk.get(ir.loop_brk.len() - 1))])
+        }
+        return
+    }
+    if k == "continue" {
+        if ir.loop_cont.len() > 0 {
+            ir_term(ir, "jump",
+            [ir_arg_label(ir.loop_cont.get(ir.loop_cont.len() - 1))])
+        }
+        return
+    }
+    if k == "expr" {
+        ir_expr(ir, s.e)
+        return
+    }
+    # Unknown statement kind — the comment marker the .py left for the
+    # optimiser to drop after DCE (asm statements land here today).
+    ir_emit(ir, "", "comment", [he_py_repr_str(k)])
+}
+
+# ir_open(ir, name) — reopen an already-created block by name (the
+# builder's `_current = <existing block>` move).
+fn ir_open(ir: IrEmit, name: str) -> void {
+    let mut i: int = 0
+    while i < ir.block_names.len() {
+        if ir.block_names.get(i) == name {
+            ir.cur = i
+            ir.term = false
+            return
+        }
+        i = i + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# The HLIR expression lowering (ir/__init__.py's _lower_expr): every
+# value lands in a temp; identifiers are the binding names themselves.
+# The refusal set is the Python layer's exactly — enum literals and
+# match expressions are construct refusals, not silent zeros.
+# ----------------------------------------------------------------------------
+
+# ir_expr(ir, e) — lower one expression, return its SSA name.
+fn ir_expr(ir: IrEmit, e: int) -> str {
+    let ctx: Ctx = ir.ctx
+    let k: str = ctx.exprs[e].kind
+    if k == "int" {
+        return ir_emit(ir, "", "const", [ir_arg_lit_int(ctx.exprs[e].ival)])
+    }
+    if k == "float" {
+        # the literal's own text — the shortest repr of the same double
+        let mut txt: str = ctx.exprs[e].ftext
+        if txt == "" {
+            txt = ctx.exprs[e].fval.to_str()
+        }
+        return ir_emit(ir, "", "const", [txt])
+    }
+    if k == "bool" {
+        return ir_emit(ir, "", "const", [ir_arg_lit_bool(ctx.exprs[e].bval)])
+    }
+    if k == "str" {
+        return ir_emit(ir, "", "const", [he_py_repr_str(ctx.exprs[e].sval)])
+    }
+    if k == "ident" {
+        return "v_" + ctx.exprs[e].name
+    }
+    if k == "bin" {
+        let a: str = ir_expr(ir, ctx.exprs[e].left)
+        let b: str = ir_expr(ir, ctx.exprs[e].right)
+        return ir_emit(ir, "", "binop",
+        [ctx.exprs[e].op, ir_arg_var(a), ir_arg_var(b)])
+    }
+    if k == "un" {
+        let a: str = ir_expr(ir, ctx.exprs[e].left)
+        return ir_emit(ir, "", "unop", [ctx.exprs[e].op, ir_arg_var(a)])
+    }
+    if k == "call" {
+        let cargs: list[str] = [ctx.exprs[e].name]
+        let mut i: int = 0
+        while i < ctx.exprs[e].args.len() {
+            cargs.push(ir_arg_var(ir_expr(ir, ctx.exprs[e].args.get(i))))
+            i = i + 1
+        }
+        return ir_emit(ir, "", "call", cargs)
+    }
+    if k == "method" || k == "fieldcall" {
+        let recv: str = ir_expr(ir, ctx.exprs[e].left)
+        let margs: list[str] = [ctx.exprs[e].name, ir_arg_var(recv)]
+        let mut i: int = 0
+        while i < ctx.exprs[e].args.len() {
+            margs.push(ir_arg_var(ir_expr(ir, ctx.exprs[e].args.get(i))))
+            i = i + 1
+        }
+        return ir_emit(ir, "", "method", margs)
+    }
+    if k == "field" {
+        let recv: str = ir_expr(ir, ctx.exprs[e].left)
+        return ir_emit(ir, "", "struct_get",
+        [ir_arg_var(recv), ctx.exprs[e].name])
+    }
+    if k == "index" {
+        let lst: str = ir_expr(ir, ctx.exprs[e].left)
+        let idx: str = ir_expr(ir, ctx.exprs[e].right)
+        return ir_emit(ir, "", "list_get", [ir_arg_var(lst), ir_arg_var(idx)])
+    }
+    if k == "qmark" {
+        let v: str = ir_expr(ir, ctx.exprs[e].left)
+        return ir_emit(ir, "", "qmark", [ir_arg_var(v)])
+    }
+    if k == "listlit" {
+        let largs: list[str] = []
+        let mut i: int = 0
+        while i < ctx.exprs[e].args.len() {
+            largs.push(ir_arg_var(ir_expr(ir, ctx.exprs[e].args.get(i))))
+            i = i + 1
+        }
+        return ir_emit(ir, "", "list_new", largs)
+    }
+    if k == "structlit" {
+        let sargs: list[str] = [ctx.exprs[e].name]
+        let mut i: int = 0
+        while i < ctx.exprs[e].ffields.len() {
+            sargs.push(ctx.exprs[e].ffields.get(i))
+            i = i + 1
+        }
+        let mut j: int = 0
+        while j < ctx.exprs[e].args.len() {
+            sargs.push(ir_arg_var(ir_expr(ir, ctx.exprs[e].args.get(j))))
+            j = j + 1
+        }
+        return ir_emit(ir, "", "struct_new", sargs)
+    }
+    if k == "match" {
+        # arm bodies would be dropped by the flat lowering — the layer
+        # refuses what it cannot represent faithfully (deep-scan-5).
+        panic("--emit ir / --opt-stats: `match` expressions "
+        + "are not supported by the HLIR builder yet "
+        + "(arm bodies would be dropped) (line "
+        + ctx.exprs[e].line.to_str() + ")")
+    }
+    if k == "enumlit" {
+        return ir_unsupported("enum literal (" + ctx.exprs[e].enum_name + "."
+        + ctx.exprs[e].variant + ")", ctx.exprs[e].line)
+    }
+    return ir_unsupported("expression kind '" + k + "'", ctx.exprs[e].line)
+}
+
+# ----------------------------------------------------------------------------
+# The concurrency gate — the HLIR does not model Chan/Task/spawn
+# (ir/__init__.py's _reject_concurrency, the same refusal).
+# ----------------------------------------------------------------------------
+
+# he_type_uses_concurrency(t) — Chan[..]/Task[..] anywhere in the type.
+fn he_type_uses_concurrency(t: str) -> bool {
+    if t.starts_with("Chan[") || t.starts_with("Task[") {
+        return true
+    }
+    if t.starts_with("list[") || t.starts_with("tainted[") {
+        return he_type_uses_concurrency(t.slice(t.find("[") + 1, t.len() - 1))
+    }
+    if t.starts_with("map[str, ") {
+        return he_type_uses_concurrency(t.slice(9, t.len() - 1))
+    }
+    return false
+}
+
+# he_expr_uses_concurrency(ctx, e) — a concurrency builtin in the tree?
+fn he_expr_uses_concurrency(ctx: Ctx, e: int) -> bool {
+    if e < 0 {
+        return false
+    }
+    let k: str = ctx.exprs[e].kind
+    if k == "call" {
+        let nm: str = ctx.exprs[e].name
+        if nm == "chan_new" || nm == "spawn" || nm == "select" {
+            return true
+        }
+    }
+    if k == "method" || k == "fieldcall" {
+        let rm: str = ctx.exprs[e].mop
+        if rm.starts_with("chan.") || rm == "task.join" {
+            return true
+        }
+    }
+    # the structural walk: operands and args (the statement walker
+    # covers the statement-owned positions)
+    if he_expr_uses_concurrency(ctx, ctx.exprs[e].left)
+    || he_expr_uses_concurrency(ctx, ctx.exprs[e].right) {
+        return true
+    }
+    let mut i: int = 0
+    while i < ctx.exprs[e].args.len() {
+        if he_expr_uses_concurrency(ctx, ctx.exprs[e].args.get(i)) {
+            return true
+        }
+        i = i + 1
+    }
+    if k == "match" {
+        let mut a: int = 0
+        while a < ctx.exprs[e].args.len() {
+            let arm: MatchArm = ctx.match_arms.get(ctx.exprs[e].args.get(a))
+            if he_expr_uses_concurrency(ctx, arm.body) {
+                return true
+            }
+            a = a + 1
+        }
+    }
+    return false
+}
+
+# he_stmt_uses_concurrency(ctx, si) — statements, nested bodies included.
+fn he_stmt_uses_concurrency(ctx: Ctx, si: int) -> bool {
+    let s: StmtN = ctx.stmts.get(si)
+    if he_expr_uses_concurrency(ctx, s.value) || he_expr_uses_concurrency(ctx, s.e)
+    || he_expr_uses_concurrency(ctx, s.cond)
+    || he_expr_uses_concurrency(ctx, s.iter)
+    || he_expr_uses_concurrency(ctx, s.target) {
+        return true
+    }
+    let mut i: int = 0
+    while i < s.body.len() {
+        if he_stmt_uses_concurrency(ctx, s.body.get(i)) {
+            return true
+        }
+        i = i + 1
+    }
+    let mut j: int = 0
+    while j < s.else_body.len() {
+        if he_stmt_uses_concurrency(ctx, s.else_body.get(j)) {
+            return true
+        }
+        j = j + 1
+    }
+    return false
+}
+
+# he_uses_concurrency(ctx) — the module-wide walk: struct fields + their
+# defaults, enum payloads, fn signatures, fn bodies.
+fn he_uses_concurrency(ctx: Ctx) -> bool {
+    let skeys: list[str] = ctx.structs.keys()
+    let mut si: int = 0
+    while si < skeys.len() {
+        let st: StructInfo = ctx.structs.get_or(skeys.get(si), dummy_struct())
+        let mut f: int = 0
+        while f < st.fields.len() {
+            if he_type_uses_concurrency(st.ftypes.get(f)) {
+                return true
+            }
+            if he_expr_uses_concurrency(ctx, st.fdefaults.get(f)) {
+                return true
+            }
+            f = f + 1
+        }
+        si = si + 1
+    }
+    let ekeys: list[str] = ctx.enums.keys()
+    let mut ei: int = 0
+    while ei < ekeys.len() {
+        let en: EnumInfo = ctx.enums.get_or(ekeys.get(ei), dummy_enum())
+        let mut v: int = 0
+        while v < en.variants.len() {
+            let payloads: list[str] = en.payloads.get(v)
+            let mut p: int = 0
+            while p < payloads.len() {
+                if he_type_uses_concurrency(payloads.get(p)) {
+                    return true
+                }
+                p = p + 1
+            }
+            v = v + 1
+        }
+        ei = ei + 1
+    }
+    let fkeys: list[str] = ctx.fns.keys()
+    let mut fi: int = 0
+    while fi < fkeys.len() {
+        let f: FnInfo = ctx.fns.get_or(fkeys.get(fi), dummy_fn())
+        let mut p: int = 0
+        while p < f.ptypes.len() {
+            if he_type_uses_concurrency(f.ptypes.get(p)) {
+                return true
+            }
+            p = p + 1
+        }
+        if he_type_uses_concurrency(f.ret) {
+            return true
+        }
+        let mut b: int = 0
+        while b < f.body.len() {
+            if he_stmt_uses_concurrency(ctx, f.body.get(b)) {
+                return true
+            }
+            b = b + 1
+        }
+        fi = fi + 1
+    }
+    return false
+}
+
+# ----------------------------------------------------------------------------
+# The LLVM emitter — llvm_parts' four files as one state machine over
+# the checked Ctx. Types ride TyVal pairs (Halis has no tuples).
+# ----------------------------------------------------------------------------
+
+struct TyVal {
+    ty: str,
+    v: str
+}
+
+struct LLEmit {
+    ctx: Ctx,
+    lines: list[str],
+    tmp: int,
+    label: int,
+    ov_counter: int,
+    str_counter: int,
+    sc_counter: int,
+    str_names: list[str], # parallel: the .str.N globals
+    str_lens: list[int], # byte lengths (data + NUL appended at print)
+    str_bytes: list[str], # the "i8 N, i8 M, ..." bodies
+    loop_brk: list[str],
+    loop_cont: list[str],
+    locals_slot: map[str, str], # binding name -> slot register
+    locals_ty: map[str, str], # binding name -> llvm type
+    cur_ret_t: str, # the current fn's HLS return type
+    cur_block: str, # the open basic block's label, "" after a terminator
+    entry_alloca_slot: list[str], # deferred entry-block allocas
+    entry_alloca_ty: list[str],
+    slot_pool: map[str, str], # name<US>ty -> slot register
+    slot_pool_ty: map[str, str],
+    target_triple: str,
+    target_feature: str
+}
+
+# ll_new(ctx, triple, feature) — fresh emitter state.
+fn ll_new(ctx: Ctx, triple: str, feature: str) -> LLEmit {
+    return LLEmit {
+        ctx: ctx,
+        lines: [],
+        tmp: 0,
+        label: 0,
+        ov_counter: 0,
+        str_counter: 0,
+        sc_counter: 0,
+        str_names: [],
+        str_lens: [],
+        str_bytes: [],
+        loop_brk: [],
+        loop_cont: [],
+        locals_slot: map_new(),
+        locals_ty: map_new(),
+        cur_ret_t: "void",
+        cur_block: "",
+        entry_alloca_slot: [],
+        entry_alloca_ty: [],
+        slot_pool: map_new(),
+        slot_pool_ty: map_new(),
+        target_triple: triple,
+        target_feature: feature
+    }
+}
+
+# ll_fresh(em, prefix) — the next %<prefix>N.
+fn ll_fresh(em: LLEmit, prefix: str) -> str {
+    em.tmp = em.tmp + 1
+    return "%" + prefix + em.tmp.to_str()
+}
+
+# ll_fresh_label(em, prefix) — the next <prefix>N (no %; sites add it).
+fn ll_fresh_label(em: LLEmit, prefix: str) -> str {
+    em.label = em.label + 1
+    return prefix + em.label.to_str()
+}
+
+# ll_emit(em, line) — one line out, with the current-block law: a line
+# ending in ':' opens a block, br/ret/unreachable/switch close one.
+fn ll_emit(em: LLEmit, line: str) -> void {
+    em.lines.push(line)
+    let s: str = line.trim()
+    if s.ends_with(":") && !s.starts_with(";") {
+        em.cur_block = s.slice(0, s.len() - 1)
+    } else {
+        if s.starts_with("br ") || s.starts_with("ret ")
+        || s == "unreachable" || s.starts_with("switch ") {
+            em.cur_block = ""
+        }
+    }
+}
+
+# ll_to_i1(em, val_ty, val) — coerce a value to the i1 a branch reads.
+fn ll_to_i1(em: LLEmit, val_ty: str, val: str) -> str {
+    if val_ty == "i1" {
+        return val
+    }
+    if val_ty == "i64" {
+        let tmp: str = ll_fresh(em, "b")
+        ll_emit(em, "  " + tmp + " = trunc i64 " + val + " to i1")
+        return tmp
+    }
+    if val_ty == "ptr" {
+        let tmp: str = ll_fresh(em, "b")
+        ll_emit(em, "  " + tmp + " = icmp ne ptr " + val + ", null")
+        return tmp
+    }
+    # any other type: truthy (non-zero), the .py's fallback
+    let tmp: str = ll_fresh(em, "b")
+    ll_emit(em, "  " + tmp + " = or i1 1, 0")
+    return tmp
+}
+
+# ll_coerce(em, val_ty, val, want_ty) — the defensive cast table,
+# SCAN-A's i1->double / ptr->double and deep-scan-7's double->i64 via
+# the range-checked runtime helper included.
+fn ll_coerce(em: LLEmit, val_ty: str, val: str, want_ty: str) -> str {
+    if val_ty == want_ty {
+        return val
+    }
+    if val_ty == "i1" && want_ty == "i64" {
+        let tmp: str = ll_fresh(em, "z")
+        ll_emit(em, "  " + tmp + " = zext i1 " + val + " to i64")
+        return tmp
+    }
+    if val_ty == "i64" && want_ty == "i1" {
+        let tmp: str = ll_fresh(em, "t")
+        ll_emit(em, "  " + tmp + " = trunc i64 " + val + " to i1")
+        return tmp
+    }
+    if val_ty == "i64" && want_ty == "ptr" {
+        let tmp: str = ll_fresh(em, "i2p")
+        ll_emit(em, "  " + tmp + " = inttoptr i64 " + val + " to ptr")
+        return tmp
+    }
+    if val_ty == "ptr" && want_ty == "i64" {
+        let tmp: str = ll_fresh(em, "p2i")
+        ll_emit(em, "  " + tmp + " = ptrtoint ptr " + val + " to i64")
+        return tmp
+    }
+    if val_ty == "i64" && want_ty == "double" {
+        let tmp: str = ll_fresh(em, "s2d")
+        ll_emit(em, "  " + tmp + " = sitofp i64 " + val + " to double")
+        return tmp
+    }
+    if val_ty == "i1" && want_ty == "double" {
+        let tmp_i64: str = ll_fresh(em, "z2d")
+        ll_emit(em, "  " + tmp_i64 + " = zext i1 " + val + " to i64")
+        let tmp: str = ll_fresh(em, "b2d")
+        ll_emit(em, "  " + tmp + " = sitofp i64 " + tmp_i64 + " to double")
+        return tmp
+    }
+    if val_ty == "ptr" && want_ty == "double" {
+        let tmp_i64: str = ll_fresh(em, "p2i_d")
+        ll_emit(em, "  " + tmp_i64 + " = ptrtoint ptr " + val + " to i64")
+        let tmp: str = ll_fresh(em, "p2d")
+        ll_emit(em, "  " + tmp + " = sitofp i64 " + tmp_i64 + " to double")
+        return tmp
+    }
+    # double -> i64 through the range-checked helper (NaN / out-of-range
+    # panic identically to the C backend — no silent fptosi wrap).
+    if val_ty == "double" && want_ty == "i64" {
+        let tmp: str = ll_fresh(em, "d2s")
+        ll_emit(em, "  " + tmp + " = call i64 @hl_float_to_int(double " + val + ")")
+        return tmp
+    }
+    return val
+}
+
+# ll_box(em, hls_ty, val_ty, val) — box a primitive for list/map
+# storage; heap types ride as raw pointers (the C backend's box_ptr).
+fn ll_box(em: LLEmit, hls_ty: str, val_ty: str, val: str) -> str {
+    let mut base: str = ll_taint_inner(hls_ty)
+    if base == "int" {
+        let v: str = ll_coerce(em, val_ty, val, "i64")
+        let tmp: str = ll_fresh(em, "box")
+        ll_emit(em, "  " + tmp + " = call ptr @hl_box_i64(i64 " + v + ")")
+        return tmp
+    }
+    if base == "float" {
+        let v: str = ll_coerce(em, val_ty, val, "double")
+        let tmp: str = ll_fresh(em, "box")
+        ll_emit(em, "  " + tmp + " = call ptr @hl_box_f64(double " + v + ")")
+        return tmp
+    }
+    if base == "bool" {
+        let v: str = ll_coerce(em, val_ty, val, "i1")
+        let tmp: str = ll_fresh(em, "box")
+        ll_emit(em, "  " + tmp + " = call ptr @hl_box_bool(i1 " + v + ")")
+        return tmp
+    }
+    return val
+}
+
+# ll_unbox(em, hls_ty, box) — load a primitive out of its box; heap
+# types pass through (the C backend's gen_unbox).
+fn ll_unbox(em: LLEmit, hls_ty: str, box: str) -> str {
+    let mut base: str = ll_taint_inner(hls_ty)
+    if base == "int" {
+        let tmp: str = ll_fresh(em, "ub")
+        ll_emit(em, "  " + tmp + " = load i64, ptr " + box)
+        return tmp
+    }
+    if base == "float" {
+        let tmp: str = ll_fresh(em, "ub")
+        ll_emit(em, "  " + tmp + " = load double, ptr " + box)
+        return tmp
+    }
+    if base == "bool" {
+        let tmp: str = ll_fresh(em, "ub")
+        ll_emit(em, "  " + tmp + " = load i1, ptr " + box)
+        return tmp
+    }
+    return box
+}
+
+# ll_emit_string_const(em, sval) — register a .str.N global; returns
+# its name. The byte body lands "i8 N, ..., i8 0".
+fn ll_emit_string_const(em: LLEmit, sval: str) -> str {
+    em.str_counter = em.str_counter + 1
+    let name: str = ".str." + em.str_counter.to_str()
+    let mut body: str = ""
+    if sval.len() == 0 {
+        body = "i8 0"
+    } else {
+        let mut i: int = 0
+        while i < sval.len() {
+            if i > 0 {
+                body = body + ", "
+            }
+            body = body + "i8 " + sval.byte_at(i).to_str()
+            i = i + 1
+        }
+        body = body + ", i8 0"
+    }
+    em.str_names.push(name)
+    em.str_lens.push(sval.len())
+    em.str_bytes.push(body)
+    return name
+}
+
+# ll_emit_overflow_op(em, intrinsic, a, b) — the checked i64 op: the
+# with.overflow call, the extractvalue pair, the hl_die path.
+fn ll_emit_overflow_op(em: LLEmit, intrinsic: str, a: str, b: str) -> str {
+    let n: int = em.ov_counter
+    em.ov_counter = em.ov_counter + 1
+    let res: str = ll_fresh(em, "ov_res")
+    ll_emit(em, "  " + res + " = call { i64, i1 } @" + intrinsic
+    + "(i64 " + a + ", i64 " + b + ")")
+    let out: str = ll_fresh(em, "r")
+    ll_emit(em, "  " + out + " = extractvalue { i64, i1 } " + res + ", 0")
+    let ovf: str = ll_fresh(em, "ov")
+    ll_emit(em, "  " + ovf + " = extractvalue { i64, i1 } " + res + ", 1")
+    let panic_lbl: str = "ov_panic_" + n.to_str()
+    let ok_lbl: str = "ov_ok_" + n.to_str()
+    ll_emit(em, "  br i1 " + ovf + ", label %" + panic_lbl
+    + ", label %" + ok_lbl)
+    ll_emit(em, panic_lbl + ":")
+    ll_emit(em, "  call void @hl_die(ptr @.panic_overflow_msg)")
+    ll_emit(em, "  unreachable")
+    ll_emit(em, ok_lbl + ":")
+    return out
+}
+
+# ll_slot_key(name, ty) — the pool key: a byte no identifier can hold.
+fn ll_slot_key(name: str, ty: str) -> str {
+    return name + "|" + ty
+}
+
+# ----------------------------------------------------------------------------
+# The LLVM statement lowering — llvm_emit_lower's _lower_stmt/_emit_
+# function. Slots are hoisted to the entry block (allocas inside loop
+# bodies grow the stack every iteration), and nothing is emitted after
+# a terminator (dead code after return/break/continue/panic is skipped).
+# ----------------------------------------------------------------------------
+
+# ll_collect_bindings(em, body, names, types) — every let / for binding
+# in the statement list, nested scopes included.
+fn ll_collect_bindings(em: LLEmit, body: list[int], names: list[str], types: list[str]) -> void {
+    let ctx: Ctx = em.ctx
+    let mut i: int = 0
+    while i < body.len() {
+        let s: StmtN = ctx.stmts.get(body.get(i))
+        if s.kind == "let" {
+            names.push(s.name)
+            types.push(s.vtype)
+        } else if s.kind == "if" {
+            ll_collect_bindings(em, s.body, names, types)
+            ll_collect_bindings(em, s.else_body, names, types)
+        } else if s.kind == "while" {
+            ll_collect_bindings(em, s.body, names, types)
+        } else if s.kind == "for" {
+            names.push(s.name)
+            types.push(s.vtype)
+            # the loop-index slot ("#idx" cannot collide with identifiers)
+            names.push(s.name + "#idx")
+            types.push("int")
+            ll_collect_bindings(em, s.body, names, types)
+        }
+        i = i + 1
+    }
+}
+
+# ll_get_slot(em, name, hls_ty) — the (slot, llvm type) pair for a
+# binding, allocated lazily INTO THE ENTRY BLOCK when the pre-pass
+# missed it (match-arm payload binds inside while bodies — deep-scan-
+# 20's law: an alloca in a loop body grows the stack per iteration).
+fn ll_get_slot(em: LLEmit, name: str, hls_ty: str) -> TyVal {
+    let key: str = ll_slot_key(name, hls_ty)
+    if em.slot_pool.has(key) {
+        return TyVal {
+            ty: em.slot_pool_ty.get_or(key, "i64"),
+            v: em.slot_pool.get_or(key, "")
+        }
+    }
+    let slot: str = ll_fresh(em, "l")
+    let ty: str = ll_type(hls_ty)
+    em.entry_alloca_slot.push(slot)
+    em.entry_alloca_ty.push(ty)
+    em.slot_pool.set(key, slot)
+    em.slot_pool_ty.set(key, ty)
+    return TyVal {
+        ty: ty, v: slot
+    }
+}
+
+# ll_stmt(em, si) — lower one statement.
+fn ll_stmt(em: LLEmit, si: int) -> void {
+    let ctx: Ctx = em.ctx
+    let s: StmtN = ctx.stmts.get(si)
+    # the current block is terminated: the rest is unreachable
+    if em.cur_block == "" {
+        return
+    }
+    let k: str = s.kind
+    if k == "let" {
+        let val: TyVal = ll_expr(em, s.value)
+        let slot: TyVal = ll_get_slot(em, s.name, s.vtype)
+        em.locals_slot.set(s.name, slot.v)
+        em.locals_ty.set(s.name, slot.ty)
+        if em.cur_block == "" {
+            # RHS was `never` (panic/exit) — nothing left to store
+            return
+        }
+        ll_emit(em, "  store " + slot.ty + " "
+        + ll_coerce(em, val.ty, val.v, slot.ty) + ", ptr " + slot.v)
+        return
+    }
+    if k == "assign" {
+        ll_assign(em, si)
+        return
+    }
+    if k == "return" {
+        if s.value < 0 {
+            ll_emit(em, "  ret void")
+        } else {
+            let val: TyVal = ll_expr(em, s.value)
+            if em.cur_block == "" {
+                # the value was `never` — the call already returned
+                return
+            }
+            let ret_ty: str = ll_type(em.cur_ret_t)
+            ll_emit(em, "  ret " + ret_ty + " "
+            + ll_coerce(em, val.ty, val.v, ret_ty))
+        }
+        return
+    }
+    if k == "if" {
+        let cond: TyVal = ll_expr(em, s.cond)
+        if em.cur_block == "" {
+            return
+        }
+        let c: str = ll_to_i1(em, cond.ty, cond.v)
+        let then_lbl: str = ll_fresh_label(em, "then")
+        let else_lbl: str = ll_fresh_label(em, "else")
+        let end_lbl: str = ll_fresh_label(em, "endif")
+        let has_else: bool = s.else_body.len() > 0
+        if has_else {
+            ll_emit(em, "  br i1 " + c + ", label %" + then_lbl
+            + ", label %" + else_lbl)
+        } else {
+            ll_emit(em, "  br i1 " + c + ", label %" + then_lbl
+            + ", label %" + end_lbl)
+        }
+        ll_emit(em, then_lbl + ":")
+        let mut i: int = 0
+        while i < s.body.len() {
+            ll_stmt(em, s.body.get(i))
+            i = i + 1
+        }
+        if em.cur_block != "" {
+            ll_emit(em, "  br label %" + end_lbl)
+        }
+        if has_else {
+            ll_emit(em, else_lbl + ":")
+            let mut j: int = 0
+            while j < s.else_body.len() {
+                ll_stmt(em, s.else_body.get(j))
+                j = j + 1
+            }
+            if em.cur_block != "" {
+                ll_emit(em, "  br label %" + end_lbl)
+            }
+        }
+        ll_emit(em, end_lbl + ":")
+        return
+    }
+    if k == "while" {
+        let cond_lbl: str = ll_fresh_label(em, "while_cond")
+        let body_lbl: str = ll_fresh_label(em, "while_body")
+        let end_lbl: str = ll_fresh_label(em, "while_end")
+        ll_emit(em, "  br label %" + cond_lbl)
+        ll_emit(em, cond_lbl + ":")
+        let cond: TyVal = ll_expr(em, s.cond)
+        if em.cur_block == "" {
+            return
+        }
+        let c: str = ll_to_i1(em, cond.ty, cond.v)
+        ll_emit(em, "  br i1 " + c + ", label %" + body_lbl
+        + ", label %" + end_lbl)
+        ll_emit(em, body_lbl + ":")
+        em.loop_cont.push(cond_lbl)
+        em.loop_brk.push(end_lbl)
+        let mut i: int = 0
+        while i < s.body.len() {
+            ll_stmt(em, s.body.get(i))
+            i = i + 1
+        }
+        em.loop_cont.pop()
+        em.loop_brk.pop()
+        if em.cur_block != "" {
+            ll_emit(em, "  br label %" + cond_lbl)
+        }
+        ll_emit(em, end_lbl + ":")
+        return
+    }
+    if k == "for" {
+        # The dynamic-list loop: length re-read every iteration (the
+        # body may grow/shrink the list), the loop variable slot and
+        # the index slot hoisted to the entry block, and the increment
+        # in its own block so `continue` jumps to the INCREMENT
+        # (BUG-DS4-5: the increment used to follow the continue branch,
+        # producing invalid IR).
+        let iter: TyVal = ll_expr(em, s.iter)
+        if em.cur_block == "" {
+            return
+        }
+        let len_val: str = ll_fresh(em, "len")
+        ll_emit(em, "  " + len_val + " = call i64 @hl_list_len(ptr " + iter.v + ")")
+        let i_slot: TyVal = ll_get_slot(em, s.name + "#idx", "int")
+        ll_emit(em, "  store i64 0, ptr " + i_slot.v)
+        # loop variable slot (hoisted; vtype is the element type)
+        let v_slot: TyVal = ll_get_slot(em, s.name, s.vtype)
+        em.locals_slot.set(s.name, v_slot.v)
+        em.locals_ty.set(s.name, v_slot.ty)
+        let cond_lbl: str = ll_fresh_label(em, "for_cond")
+        let body_lbl: str = ll_fresh_label(em, "for_body")
+        let inc_lbl: str = ll_fresh_label(em, "for_inc")
+        let end_lbl: str = ll_fresh_label(em, "for_end")
+        ll_emit(em, "  br label %" + cond_lbl)
+        ll_emit(em, cond_lbl + ":")
+        let i_val: str = ll_fresh(em, "i")
+        ll_emit(em, "  " + i_val + " = load i64, ptr " + i_slot.v)
+        let len2: str = ll_fresh(em, "len")
+        ll_emit(em, "  " + len2 + " = call i64 @hl_list_len(ptr " + iter.v + ")")
+        let cmp: str = ll_fresh(em, "c")
+        ll_emit(em, "  " + cmp + " = icmp slt i64 " + i_val + ", " + len2)
+        ll_emit(em, "  br i1 " + cmp + ", label %" + body_lbl
+        + ", label %" + end_lbl)
+        ll_emit(em, body_lbl + ":")
+        let elem: str = ll_fresh(em, "e")
+        ll_emit(em, "  " + elem + " = call ptr @hl_list_get(ptr " + iter.v
+        + ", i64 " + i_val + ")")
+        let unboxed: str = ll_unbox(em, s.vtype, elem)
+        ll_emit(em, "  store " + ll_type(s.vtype) + " " + unboxed
+        + ", ptr " + v_slot.v)
+        em.loop_cont.push(inc_lbl)
+        em.loop_brk.push(end_lbl)
+        let mut i: int = 0
+        while i < s.body.len() {
+            ll_stmt(em, s.body.get(i))
+            i = i + 1
+        }
+        em.loop_cont.pop()
+        em.loop_brk.pop()
+        if em.cur_block != "" {
+            ll_emit(em, "  br label %" + inc_lbl)
+        }
+        # increment block — also the `continue` target
+        ll_emit(em, inc_lbl + ":")
+        let i_val2: str = ll_fresh(em, "i")
+        ll_emit(em, "  " + i_val2 + " = load i64, ptr " + i_slot.v)
+        let inc: str = ll_fresh(em, "inc")
+        ll_emit(em, "  " + inc + " = add i64 " + i_val2 + ", 1")
+        ll_emit(em, "  store i64 " + inc + ", ptr " + i_slot.v)
+        ll_emit(em, "  br label %" + cond_lbl)
+        ll_emit(em, end_lbl + ":")
+        return
+    }
+    if k == "break" {
+        if em.loop_brk.len() > 0 {
+            ll_emit(em, "  br label %" + em.loop_brk.get(em.loop_brk.len() - 1))
+        }
+        return
+    }
+    if k == "continue" {
+        if em.loop_cont.len() > 0 {
+            ll_emit(em, "  br label %" + em.loop_cont.get(em.loop_cont.len() - 1))
+        }
+        return
+    }
+    if k == "expr" {
+        ll_expr(em, s.e)
+        return
+    }
+    # asm statements: the alpha LLVM backend does not model them
+    ll_unsupported("statement kind '" + k + "'", s.line)
+}
+
+# ll_assign(em, si) — assignment to ident / field / index.
+fn ll_assign(em: LLEmit, si: int) -> void {
+    let ctx: Ctx = em.ctx
+    let s: StmtN = ctx.stmts.get(si)
+    let target: int = s.target
+    let val: TyVal = ll_expr(em, s.value)
+    if em.cur_block == "" {
+        return
+    }
+    let tk: str = ctx.exprs[target].kind
+    if tk == "ident" {
+        let name: str = ctx.exprs[target].name
+        if !em.locals_slot.has(name) {
+            # the checker already rejects undefined vars; defensively skip
+            return
+        }
+        let slot: str = em.locals_slot.get_or(name, "")
+        let slot_ty: str = em.locals_ty.get_or(name, "i64")
+        ll_emit(em, "  store " + slot_ty + " "
+        + ll_coerce(em, val.ty, val.v, slot_ty) + ", ptr " + slot)
+        return
+    }
+    if tk == "field" {
+        ll_field_assign(em, target, val)
+        return
+    }
+    if tk == "index" {
+        # index assignment: box the value by the target list's element
+        # type (the runtime stores boxed elements — BUG-DS4-8)
+        let lst: TyVal = ll_expr(em, ctx.exprs[target].left)
+        let idx: TyVal = ll_expr(em, ctx.exprs[target].right)
+        let list_t: str = ctx.exprs[ctx.exprs[target].left].t
+        let mut elem_t: str = "int"
+        if ll_is_list(list_t) {
+            elem_t = ll_list_elem(list_t)
+        }
+        let boxed: str = ll_box(em, elem_t, val.ty, val.v)
+        ll_emit(em, "  call void @hl_list_set(ptr " + lst.v + ", i64 "
+        + idx.v + ", ptr " + boxed + ")")
+        return
+    }
+}
+
+# ----------------------------------------------------------------------------
+# The LLVM expression lowering — _lower_expr_typed: (llvm type, value).
+# ----------------------------------------------------------------------------
+
+# ll_expr(em, e) — lower one expression to a (type, value) pair.
+fn ll_expr(em: LLEmit, e: int) -> TyVal {
+    let ctx: Ctx = em.ctx
+    let k: str = ctx.exprs[e].kind
+    if k == "int" {
+        return TyVal {
+            ty: "i64", v: ctx.exprs[e].ival.to_str()
+        }
+    }
+    if k == "float" {
+        # the literal's own text (a valid double literal in .ll text;
+        # %.17e's round-trip and the source text name the same double)
+        let mut txt: str = ctx.exprs[e].ftext
+        if txt == "" {
+            txt = ctx.exprs[e].fval.to_str()
+        }
+        return TyVal {
+            ty: "double", v: txt
+        }
+    }
+    if k == "bool" {
+        if ctx.exprs[e].bval {
+            return TyVal {
+                ty: "i1", v: "1"
+            }
+        }
+        return TyVal {
+            ty: "i1", v: "0"
+        }
+    }
+    if k == "str" {
+        let const_name: str = ll_emit_string_const(em, ctx.exprs[e].sval)
+        let tmp: str = ll_fresh(em, "s")
+        ll_emit(em, "  " + tmp + " = call ptr @hl_str_from(ptr @" + const_name
+        + ", i64 " + ctx.exprs[e].sval.len().to_str() + ")")
+        return TyVal {
+            ty: "ptr", v: tmp
+        }
+    }
+    if k == "ident" {
+        let name: str = ctx.exprs[e].name
+        if !em.locals_slot.has(name) {
+            # should not happen post-check; defensively 0
+            return TyVal {
+                ty: "i64", v: "0"
+            }
+        }
+        let slot_ty: str = em.locals_ty.get_or(name, "i64")
+        let tmp: str = ll_fresh(em, "r")
+        ll_emit(em, "  " + tmp + " = load " + slot_ty + ", ptr "
+        + em.locals_slot.get_or(name, ""))
+        return TyVal {
+            ty: slot_ty, v: tmp
+        }
+    }
+    if k == "bin" {
+        return ll_binop(em, e)
+    }
+    if k == "un" {
+        return ll_unop(em, e)
+    }
+    if k == "call" {
+        return ll_call(em, e)
+    }
+    if k == "method" || k == "fieldcall" {
+        return ll_method(em, e)
+    }
+    if k == "field" {
+        return ll_field_access(em, e)
+    }
+    if k == "index" {
+        let lst: TyVal = ll_expr(em, ctx.exprs[e].left)
+        let idx: TyVal = ll_expr(em, ctx.exprs[e].right)
+        if em.cur_block == "" {
+            return TyVal {
+                ty: "i64", v: "0"
+            }
+        }
+        let tmp: str = ll_fresh(em, "e")
+        ll_emit(em, "  " + tmp + " = call ptr @hl_list_get(ptr " + lst.v
+        + ", i64 " + idx.v + ")")
+        # unbox by the checker-annotated element type
+        let et: str = ctx.exprs[e].t
+        let unboxed: str = ll_unbox(em, et, tmp)
+        return TyVal {
+            ty: ll_type(et), v: unboxed
+        }
+    }
+    if k == "listlit" {
+        let tmp: str = ll_fresh(em, "lst")
+        # arena-mode contract: elem_free = null (never release items)
+        ll_emit(em, "  " + tmp + " = call ptr @hl_list_new(ptr null)")
+        let list_t: str = ctx.exprs[e].t
+        let mut elem_t: str = "int"
+        if ll_is_list(list_t) {
+            elem_t = ll_list_elem(list_t)
+        }
+        let mut i: int = 0
+        while i < ctx.exprs[e].args.len() {
+            let iv: TyVal = ll_expr(em, ctx.exprs[e].args.get(i))
+            if em.cur_block == "" {
+                break
+            }
+            let boxed: str = ll_box(em, elem_t, iv.ty, iv.v)
+            ll_emit(em, "  call void @hl_list_push(ptr " + tmp + ", ptr " + boxed + ")")
+            i = i + 1
+        }
+        return TyVal {
+            ty: "ptr", v: tmp
+        }
+    }
+    if k == "structlit" {
+        return ll_structlit(em, e)
+    }
+    if k == "match" {
+        return ll_match(em, e)
+    }
+    if k == "qmark" {
+        return ll_qmark(em, e)
+    }
+    if k == "enumlit" {
+        return ll_enumlit(em, e)
+    }
+    if k == "mapnew" {
+        let tmp: str = ll_fresh(em, "map")
+        ll_emit(em, "  " + tmp + " = call ptr @hl_map_new()")
+        return TyVal {
+            ty: "ptr", v: tmp
+        }
+    }
+    # fallback: the clean refusal
+    return ll_unsupported_v("expression kind '" + k + "'", ctx.exprs[e].line)
+}
+
+# ll_structlit(em, e) — hl_struct_alloc + the typed setters, fields by
+# their declaration index.
+fn ll_structlit(em: LLEmit, e: int) -> TyVal {
+    let ctx: Ctx = em.ctx
+    let name: str = ctx.exprs[e].name
+    let st: StructInfo = ctx.structs.get_or(name, dummy_struct())
+    if st.name != name {
+        ll_unsupported("struct literal " + name
+        + " (checker did not resolve the struct)", ctx.exprs[e].line)
+    }
+    # 16 bytes per field (covers i64/double/ptr alignment)
+    let mut size_bytes: int = 16 * st.fields.len()
+    if size_bytes < 16 {
+        size_bytes = 16
+    }
+    let tmp: str = ll_fresh(em, "st")
+    ll_emit(em, "  " + tmp + " = call ptr @hl_struct_alloc(i64 "
+    + size_bytes.to_str() + ")")
+    let mut i: int = 0
+    while i < ctx.exprs[e].ffields.len() {
+        let fname: str = ctx.exprs[e].ffields.get(i)
+        let mut fidx: int = -1
+        let mut j: int = 0
+        while j < st.fields.len() {
+            if st.fields.get(j) == fname {
+                fidx = j
+            }
+            j = j + 1
+        }
+        if fidx < 0 {
+            ll_unsupported("struct literal " + name + ": unknown field '"
+            + fname + "'", ctx.exprs[e].line)
+        }
+        let ftype: str = st.ftypes.get(fidx)
+        let fval: TyVal = ll_expr(em, ctx.exprs[e].args.get(i))
+        if em.cur_block == "" {
+            return TyVal {
+                ty: "ptr", v: tmp
+            }
+        }
+        let mut base: str = ll_taint_inner(ftype)
+        if base == "int" {
+            let v: str = ll_coerce(em, fval.ty, fval.v, "i64")
+            ll_emit(em, "  call void @hl_struct_set_i64(ptr " + tmp
+            + ", i64 " + fidx.to_str() + ", i64 " + v + ")")
+        } else if base == "float" {
+            let v: str = ll_coerce(em, fval.ty, fval.v, "double")
+            ll_emit(em, "  call void @hl_struct_set_f64(ptr " + tmp
+            + ", i64 " + fidx.to_str() + ", double " + v + ")")
+        } else if base == "bool" {
+            let v: str = ll_coerce(em, fval.ty, fval.v, "i1")
+            ll_emit(em, "  call void @hl_struct_set_bool(ptr " + tmp
+            + ", i64 " + fidx.to_str() + ", i1 " + v + ")")
+        } else {
+            let v: str = ll_coerce(em, fval.ty, fval.v, "ptr")
+            ll_emit(em, "  call void @hl_struct_set_ptr(ptr " + tmp
+            + ", i64 " + fidx.to_str() + ", ptr " + v + ")")
+        }
+        i = i + 1
+    }
+    return TyVal {
+        ty: "ptr", v: tmp
+    }
+}
+
+# ll_enumlit(em, e) — hl_enum_new_variant(idx) (+ payload stores).
+fn ll_enumlit(em: LLEmit, e: int) -> TyVal {
+    let ctx: Ctx = em.ctx
+    let en: EnumInfo = ctx.enums.get_or(ctx.exprs[e].enum_name, dummy_enum())
+    if en.name != ctx.exprs[e].enum_name {
+        ll_unsupported("enum literal (checker did not resolve the enum)",
+        ctx.exprs[e].line)
+    }
+    let mut vidx: int = -1
+    let mut j: int = 0
+    while j < en.variants.len() {
+        if en.variants.get(j) == ctx.exprs[e].variant {
+            vidx = j
+        }
+        j = j + 1
+    }
+    if vidx < 0 {
+        ll_unsupported("enum literal " + ctx.exprs[e].enum_name + "."
+        + ctx.exprs[e].variant + " (unknown variant)", ctx.exprs[e].line)
+    }
+    let tmp: str = ll_fresh(em, "en")
+    ll_emit(em, "  " + tmp + " = call ptr @hl_enum_new_variant(i64 "
+    + vidx.to_str() + ")")
+    let payloads: list[str] = en.payloads.get(vidx)
+    let mut i: int = 0
+    while i < ctx.exprs[e].args.len() && i < payloads.len() {
+        let pt: str = payloads.get(i)
+        let payload_ptr: str = ll_fresh(em, "ep")
+        ll_emit(em, "  " + payload_ptr + " = call ptr @hl_enum_payload(ptr " + tmp + ")")
+        let pval: TyVal = ll_expr(em, ctx.exprs[e].args.get(i))
+        if em.cur_block == "" {
+            return TyVal {
+                ty: "ptr", v: tmp
+            }
+        }
+        let mut base: str = ll_taint_inner(pt)
+        if base == "int" {
+            let v: str = ll_coerce(em, pval.ty, pval.v, "i64")
+            ll_emit(em, "  call void @hl_struct_set_i64(ptr " + payload_ptr
+            + ", i64 " + i.to_str() + ", i64 " + v + ")")
+        } else if base == "float" {
+            let v: str = ll_coerce(em, pval.ty, pval.v, "double")
+            ll_emit(em, "  call void @hl_struct_set_f64(ptr " + payload_ptr
+            + ", i64 " + i.to_str() + ", double " + v + ")")
+        } else if base == "bool" {
+            let v: str = ll_coerce(em, pval.ty, pval.v, "i1")
+            ll_emit(em, "  call void @hl_struct_set_bool(ptr " + payload_ptr
+            + ", i64 " + i.to_str() + ", i1 " + v + ")")
+        } else {
+            let v: str = ll_coerce(em, pval.ty, pval.v, "ptr")
+            ll_emit(em, "  call void @hl_struct_set_ptr(ptr " + payload_ptr
+            + ", i64 " + i.to_str() + ", ptr " + v + ")")
+        }
+        i = i + 1
+    }
+    return TyVal {
+        ty: "ptr", v: tmp
+    }
+}
+
+# ----------------------------------------------------------------------------
+# match / qmark — the switch-on-tag lowering (deep-scan-7's result slot
+# in the entry block, deep-scan-20's multi-payload binds, deep-scan-15's
+# enclosing-return typing on the Err path).
+# ----------------------------------------------------------------------------
+
+# ll_variant_index(en, vname) — the variant's declaration index.
+fn ll_variant_index(en: EnumInfo, vname: str) -> int {
+    let mut i: int = 0
+    while i < en.variants.len() {
+        if en.variants.get(i) == vname {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# ll_match(em, e) — a switch over the enum tag; each arm a block; the
+# arm result stored to a per-match slot allocated in the ENTRY block
+# (deep-scan-12: a loop-body alloca grows the stack per iteration).
+fn ll_match(em: LLEmit, e: int) -> TyVal {
+    let ctx: Ctx = em.ctx
+    let scrut: TyVal = ll_expr(em, ctx.exprs[e].left)
+    if em.cur_block == "" {
+        return TyVal {
+            ty: "i64", v: "0"
+        }
+    }
+    let tag: str = ll_fresh(em, "tag")
+    ll_emit(em, "  " + tag + " = call i64 @hl_enum_tag(ptr " + scrut.v + ")")
+    let end_lbl: str = ll_fresh_label(em, "match_end")
+    # the match's result type + slot
+    let result_t: str = ctx.exprs[e].t
+    let llvm_ret_ty: str = ll_type(result_t)
+    let result_slot: str = ll_fresh(em, "match_result")
+    em.entry_alloca_slot.push(result_slot)
+    em.entry_alloca_ty.push(llvm_ret_ty)
+    # the enum the arms dispatch on
+    let en: EnumInfo = ctx.enums.get_or(
+    ctx.match_arms.get(ctx.exprs[e].args.get(0)).enum_name, dummy_enum())
+    # arm labels + variant indices (wildcard arms carry -1)
+    let arm_lbls: list[str] = []
+    let arm_idxs: list[int] = []
+    let mut i: int = 0
+    while i < ctx.exprs[e].args.len() {
+        let arm: MatchArm = ctx.match_arms.get(ctx.exprs[e].args.get(i))
+        arm_lbls.push(ll_fresh_label(em, "match_arm"))
+        if arm.pat_kind == "wildcard" {
+            arm_idxs.push(-1)
+        } else {
+            arm_idxs.push(ll_variant_index(en, arm.variant))
+        }
+        i = i + 1
+    }
+    # the default: the first wildcard arm, else a panic block
+    let mut default_lbl: str = ""
+    let mut has_wildcard: bool = false
+    let mut wi: int = 0
+    while wi < arm_idxs.len() {
+        if arm_idxs.get(wi) < 0 {
+            default_lbl = arm_lbls.get(wi)
+            has_wildcard = true
+            break
+        }
+        wi = wi + 1
+    }
+    if !has_wildcard {
+        default_lbl = ll_fresh_label(em, "match_panic")
+    }
+    # the switch
+    let mut switch_cases: str = ""
+    let mut ci: int = 0
+    while ci < arm_idxs.len() {
+        if arm_idxs.get(ci) >= 0 {
+            if switch_cases != "" {
+                switch_cases = switch_cases + ", "
+            }
+            switch_cases = switch_cases + "i64 " + arm_idxs.get(ci).to_str()
+            + " label %" + arm_lbls.get(ci)
+        }
+        ci = ci + 1
+    }
+    if switch_cases != "" {
+        ll_emit(em, "  switch i64 " + tag + ", label %" + default_lbl
+        + " [" + switch_cases + "]")
+    } else {
+        ll_emit(em, "  br label %" + default_lbl)
+    }
+    if !has_wildcard {
+        ll_emit(em, default_lbl + ":")
+        ll_emit(em, "  call void @hl_die(ptr @.panic_overflow_msg)")
+        ll_emit(em, "  unreachable")
+    }
+    # the arm bodies
+    let mut ai: int = 0
+    while ai < ctx.exprs[e].args.len() {
+        let arm: MatchArm = ctx.match_arms.get(ctx.exprs[e].args.get(ai))
+        ll_emit(em, arm_lbls.get(ai) + ":")
+        let vidx: int = arm_idxs.get(ai)
+        # bind the payloads (multi-payload variants included)
+        let nbinds: int = arm.bindings.len()
+        if vidx >= 0 && nbinds > 0 {
+            let payloads: list[str] = en.payloads.get(vidx)
+            let payload_ptr: str = ll_fresh(em, "ap")
+            ll_emit(em, "  " + payload_ptr + " = call ptr @hl_enum_payload(ptr "
+            + scrut.v + ")")
+            let mut bi: int = 0
+            while bi < nbinds && bi < payloads.len() {
+                let bname: str = arm.bindings.get(bi)
+                let ptype: str = payloads.get(bi)
+                let slot: TyVal = ll_get_slot(em, bname, ptype)
+                em.locals_slot.set(bname, slot.v)
+                em.locals_ty.set(bname, slot.ty)
+                let mut base: str = ll_taint_inner(ptype)
+                let ptmp: str = ll_fresh(em, "pv")
+                if base == "int" {
+                    ll_emit(em, "  " + ptmp + " = call i64 @hl_struct_get_i64(ptr "
+                    + payload_ptr + ", i64 " + bi.to_str() + ")")
+                    ll_emit(em, "  store i64 " + ptmp + ", ptr " + slot.v)
+                } else if base == "float" {
+                    ll_emit(em, "  " + ptmp + " = call double @hl_struct_get_f64(ptr "
+                    + payload_ptr + ", i64 " + bi.to_str() + ")")
+                    ll_emit(em, "  store double " + ptmp + ", ptr " + slot.v)
+                } else if base == "bool" {
+                    ll_emit(em, "  " + ptmp + " = call i1 @hl_struct_get_bool(ptr "
+                    + payload_ptr + ", i64 " + bi.to_str() + ")")
+                    ll_emit(em, "  store i1 " + ptmp + ", ptr " + slot.v)
+                } else {
+                    ll_emit(em, "  " + ptmp + " = call ptr @hl_struct_get_ptr(ptr "
+                    + payload_ptr + ", i64 " + bi.to_str() + ")")
+                    ll_emit(em, "  store ptr " + ptmp + ", ptr " + slot.v)
+                }
+                bi = bi + 1
+            }
+        }
+        # the arm body is a single expression
+        let arm_result: TyVal = ll_expr(em, arm.body)
+        let mut arm_val: str = arm_result.v
+        if arm_result.ty != llvm_ret_ty {
+            arm_val = ll_coerce(em, arm_result.ty, arm_result.v, llvm_ret_ty)
+        }
+        # an arm whose body diverges (panic -> unreachable) leaves no
+        # open block — no store, no branch (deep-scan-20)
+        if em.cur_block != "" {
+            ll_emit(em, "  store " + llvm_ret_ty + " " + arm_val
+            + ", ptr " + result_slot)
+            ll_emit(em, "  br label %" + end_lbl)
+        }
+        ai = ai + 1
+    }
+    # end block — load the result
+    ll_emit(em, end_lbl + ":")
+    let result_val: str = ll_fresh(em, "match_val")
+    ll_emit(em, "  " + result_val + " = load " + llvm_ret_ty + ", ptr "
+    + result_slot)
+    return TyVal {
+        ty: llvm_ret_ty, v: result_val
+    }
+}
+
+# ll_qmark(em, e) — `expr?`: tag test, Err returns from the enclosing
+# function, Ok unwraps the payload.
+fn ll_qmark(em: LLEmit, e: int) -> TyVal {
+    let ctx: Ctx = em.ctx
+    let scrut: TyVal = ll_expr(em, ctx.exprs[e].left)
+    if em.cur_block == "" {
+        return TyVal {
+            ty: "i64", v: "0"
+        }
+    }
+    let tag: str = ll_fresh(em, "qtag")
+    ll_emit(em, "  " + tag + " = call i64 @hl_enum_tag(ptr " + scrut.v + ")")
+    let en: EnumInfo = ctx.enums.get_or(
+    type_base(ctx.exprs[ctx.exprs[e].left].t), dummy_enum())
+    let mut ok_idx: int = ll_variant_index(en, ctx.exprs[e].ok_variant)
+    if ok_idx < 0 {
+        ok_idx = 0
+    }
+    let ok_lbl: str = ll_fresh_label(em, "qmark_ok")
+    let err_lbl: str = ll_fresh_label(em, "qmark_err")
+    let end_lbl: str = ll_fresh_label(em, "qmark_end")
+    let cond: str = ll_fresh(em, "qcond")
+    ll_emit(em, "  " + cond + " = icmp eq i64 " + tag + ", " + ok_idx.to_str())
+    ll_emit(em, "  br i1 " + cond + ", label %" + ok_lbl
+    + ", label %" + err_lbl)
+    # Err: return the scrutinee as the enclosing fn's declared type
+    # (deep-scan-12: the declared type, never a hardcoded ret ptr)
+    ll_emit(em, err_lbl + ":")
+    let mut fn_ret_llvm: str = ll_type(em.cur_ret_t)
+    if fn_ret_llvm == "void" {
+        ll_emit(em, "  ret void")
+    } else {
+        ll_emit(em, "  ret " + fn_ret_llvm + " " + scrut.v)
+    }
+    # Ok: unwrap the payload by its type
+    ll_emit(em, ok_lbl + ":")
+    let payload_ptr: str = ll_fresh(em, "qpayload")
+    ll_emit(em, "  " + payload_ptr + " = call ptr @hl_enum_payload(ptr "
+    + scrut.v + ")")
+    let mut ok_t: str = "int"
+    let payloads: list[str] = en.payloads.get(ok_idx)
+    if payloads.len() > 0 {
+        ok_t = payloads.get(0)
+    }
+    let mut base: str = ll_taint_inner(ok_t)
+    let tmp: str = ll_fresh(em, "qv")
+    if base == "int" {
+        ll_emit(em, "  " + tmp + " = call i64 @hl_struct_get_i64(ptr "
+        + payload_ptr + ", i64 0)")
+        ll_emit(em, "  br label %" + end_lbl)
+        ll_emit(em, end_lbl + ":")
+        return TyVal {
+            ty: "i64", v: tmp
+        }
+    }
+    if base == "float" {
+        ll_emit(em, "  " + tmp + " = call double @hl_struct_get_f64(ptr "
+        + payload_ptr + ", i64 0)")
+        ll_emit(em, "  br label %" + end_lbl)
+        ll_emit(em, end_lbl + ":")
+        return TyVal {
+            ty: "double", v: tmp
+        }
+    }
+    if base == "bool" {
+        ll_emit(em, "  " + tmp + " = call i1 @hl_struct_get_bool(ptr "
+        + payload_ptr + ", i64 0)")
+        ll_emit(em, "  br label %" + end_lbl)
+        ll_emit(em, end_lbl + ":")
+        return TyVal {
+            ty: "i1", v: tmp
+        }
+    }
+    ll_emit(em, "  " + tmp + " = call ptr @hl_struct_get_ptr(ptr "
+    + payload_ptr + ", i64 0)")
+    ll_emit(em, "  br label %" + end_lbl)
+    ll_emit(em, end_lbl + ":")
+    return TyVal {
+        ty: "ptr", v: tmp
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Operators — llvm_emit_ops' tables.
+# ----------------------------------------------------------------------------
+
+# ll_unop(em, e) — unary - / !.
+fn ll_unop(em: LLEmit, e: int) -> TyVal {
+    let ctx: Ctx = em.ctx
+    let a: TyVal = ll_expr(em, ctx.exprs[e].left)
+    if em.cur_block == "" {
+        return TyVal {
+            ty: "i64", v: "0"
+        }
+    }
+    if ctx.exprs[e].op == "-" {
+        if a.ty == "i64" {
+            # checked negation (the -INT64_MIN overflow panics identically)
+            let tmp: str = ll_fresh(em, "u")
+            ll_emit(em, "  " + tmp + " = call i64 @hl_neg_i64(i64 " + a.v + ")")
+            return TyVal {
+                ty: "i64", v: tmp
+            }
+        }
+        let tmp: str = ll_fresh(em, "u")
+        ll_emit(em, "  " + tmp + " = fneg double " + a.v)
+        return TyVal {
+            ty: "double", v: tmp
+        }
+    }
+    if ctx.exprs[e].op == "!" {
+        let tmp: str = ll_fresh(em, "u")
+        ll_emit(em, "  " + tmp + " = xor i1 " + a.v + ", 1")
+        return TyVal {
+            ty: "i1", v: tmp
+        }
+    }
+    return TyVal {
+        ty: "i64", v: "0"
+    }
+}
+
+# ll_str_binop(em, op, a, b) — concat / equality / ordering via
+# hl_str_cmp (BUG-DS4-10: never icmp on the pointers).
+fn ll_str_binop(em: LLEmit, op: str, a: str, b: str) -> TyVal {
+    if op == "+" {
+        let tmp: str = ll_fresh(em, "cat")
+        ll_emit(em, "  " + tmp + " = call ptr @hl_str_concat(ptr " + a
+        + ", ptr " + b + ")")
+        return TyVal {
+            ty: "ptr", v: tmp
+        }
+    }
+    if op == "==" {
+        let tmp: str = ll_fresh(em, "r")
+        ll_emit(em, "  " + tmp + " = call i1 @hl_str_eq(ptr " + a
+        + ", ptr " + b + ")")
+        return TyVal {
+            ty: "i1", v: tmp
+        }
+    }
+    if op == "!=" {
+        let eq: str = ll_fresh(em, "eq")
+        ll_emit(em, "  " + eq + " = call i1 @hl_str_eq(ptr " + a
+        + ", ptr " + b + ")")
+        let tmp: str = ll_fresh(em, "r")
+        ll_emit(em, "  " + tmp + " = xor i1 " + eq + ", 1")
+        return TyVal {
+            ty: "i1", v: tmp
+        }
+    }
+    if op == "<" || op == "<=" || op == ">" || op == ">=" {
+        let mut cmp_op: str = "slt"
+        if op == "<=" {
+            cmp_op = "sle"
+        } else if op == ">" {
+            cmp_op = "sgt"
+        } else if op == ">=" {
+            cmp_op = "sge"
+        }
+        let c: str = ll_fresh(em, "c")
+        ll_emit(em, "  " + c + " = call i64 @hl_str_cmp(ptr " + a
+        + ", ptr " + b + ")")
+        let tmp: str = ll_fresh(em, "r")
+        ll_emit(em, "  " + tmp + " = icmp " + cmp_op + " i64 " + c + ", 0")
+        return TyVal {
+            ty: "i1", v: tmp
+        }
+    }
+    return ll_unsupported_v("operator '" + op + "' on str", 0)
+}
+
+# ll_float_binop(em, op, a, b) — fadd..frem + the oeq/one/olt family.
+fn ll_float_binop(em: LLEmit, op: str, a: str, b: str) -> TyVal {
+    let tmp: str = ll_fresh(em, "r")
+    if op == "+" {
+        ll_emit(em, "  " + tmp + " = fadd double " + a + ", " + b)
+        return TyVal {
+            ty: "double", v: tmp
+        }
+    }
+    if op == "-" {
+        ll_emit(em, "  " + tmp + " = fsub double " + a + ", " + b)
+        return TyVal {
+            ty: "double", v: tmp
+        }
+    }
+    if op == "*" {
+        ll_emit(em, "  " + tmp + " = fmul double " + a + ", " + b)
+        return TyVal {
+            ty: "double", v: tmp
+        }
+    }
+    if op == "/" {
+        ll_emit(em, "  " + tmp + " = fdiv double " + a + ", " + b)
+        return TyVal {
+            ty: "double", v: tmp
+        }
+    }
+    if op == "%" {
+        ll_emit(em, "  " + tmp + " = frem double " + a + ", " + b)
+        return TyVal {
+            ty: "double", v: tmp
+        }
+    }
+    let mut fcmp_op: str = "oeq"
+    if op == "!=" {
+        fcmp_op = "one"
+    } else if op == "<" {
+        fcmp_op = "olt"
+    } else if op == "<=" {
+        fcmp_op = "ole"
+    } else if op == ">" {
+        fcmp_op = "ogt"
+    } else if op == ">=" {
+        fcmp_op = "oge"
+    }
+    ll_emit(em, "  " + tmp + " = fcmp " + fcmp_op + " double " + a + ", " + b)
+    return TyVal {
+        ty: "i1", v: tmp
+    }
+}
+
+# ll_shortcircuit(em, e) — a && b / a || b as control flow + phi: the
+# RHS is only evaluated when the LHS leaves the result undecided
+# (BUG-DS4-9; loops stay flat — no temp alloca).
+fn ll_shortcircuit(em: LLEmit, e: int) -> TyVal {
+    let ctx: Ctx = em.ctx
+    let op: str = ctx.exprs[e].op
+    let la: TyVal = ll_expr(em, ctx.exprs[e].left)
+    if em.cur_block == "" {
+        return TyVal {
+            ty: "i1", v: "0"
+        }
+    }
+    let la1: str = ll_to_i1(em, la.ty, la.v)
+    let lhs_block: str = em.cur_block
+    let n: int = em.sc_counter
+    em.sc_counter = em.sc_counter + 1
+    let rhs_lbl: str = "sc_rhs_" + n.to_str()
+    let end_lbl: str = "sc_end_" + n.to_str()
+    if op == "&&" {
+        # LHS false -> result false; skip the RHS entirely
+        ll_emit(em, "  br i1 " + la1 + ", label %" + rhs_lbl
+        + ", label %" + end_lbl)
+    } else {
+        # LHS true -> result true; skip the RHS entirely
+        ll_emit(em, "  br i1 " + la1 + ", label %" + end_lbl
+        + ", label %" + rhs_lbl)
+    }
+    ll_emit(em, rhs_lbl + ":")
+    let rb: TyVal = ll_expr(em, ctx.exprs[e].right)
+    let mut rhs_block: str = ""
+    let mut rb_i1: str = "0"
+    if em.cur_block == "" {
+        # RHS was `never`: the value along that edge is unreachable
+        rb_i1 = "0"
+    } else {
+        rhs_block = em.cur_block
+        rb_i1 = ll_to_i1(em, rb.ty, rb.v)
+        ll_emit(em, "  br label %" + end_lbl)
+    }
+    ll_emit(em, end_lbl + ":")
+    # the phi: short-circuit edge carries 0 for &&, 1 for ||
+    let mut short_val: str = "0"
+    if op != "&&" {
+        short_val = "1"
+    }
+    let tmp: str = ll_fresh(em, "sc")
+    if rhs_block != "" {
+        ll_emit(em, "  " + tmp + " = phi i1 [ " + short_val + ", %"
+        + lhs_block + " ], [ " + rb_i1 + ", %" + rhs_block + " ]")
+    } else {
+        # degenerate: the RHS diverges — one real edge
+        ll_emit(em, "  " + tmp + " = phi i1 [ " + short_val + ", %"
+        + lhs_block + " ]")
+    }
+    return TyVal {
+        ty: "i1", v: tmp
+    }
+}
+
+# ll_binop(em, e) — the typed operator table.
+fn ll_binop(em: LLEmit, e: int) -> TyVal {
+    let ctx: Ctx = em.ctx
+    let op: str = ctx.exprs[e].op
+    let lt: str = ctx.exprs[ctx.exprs[e].left].t
+    # && / || short-circuit (BUG-DS4-9)
+    if op == "&&" || op == "||" {
+        return ll_shortcircuit(em, e)
+    }
+    let a: TyVal = ll_expr(em, ctx.exprs[e].left)
+    if em.cur_block == "" {
+        return TyVal {
+            ty: "i1", v: "0"
+        }
+    }
+    let b: TyVal = ll_expr(em, ctx.exprs[e].right)
+    if em.cur_block == "" {
+        return TyVal {
+            ty: "i1", v: "0"
+        }
+    }
+    if lt == "str" {
+        return ll_str_binop(em, op, a.v, b.v)
+    }
+    if lt == "float" {
+        return ll_float_binop(em, op, a.v, b.v)
+    }
+    if lt == "bool" {
+        if op == "==" {
+            let tmp: str = ll_fresh(em, "r")
+            ll_emit(em, "  " + tmp + " = icmp eq i1 " + a.v + ", " + b.v)
+            return TyVal {
+                ty: "i1", v: tmp
+            }
+        }
+        if op == "!=" {
+            let tmp: str = ll_fresh(em, "r")
+            ll_emit(em, "  " + tmp + " = icmp ne i1 " + a.v + ", " + b.v)
+            return TyVal {
+                ty: "i1", v: tmp
+            }
+        }
+        return ll_unsupported_v("operator '" + op + "' on bool", ctx.exprs[e].line)
+    }
+    # integer arithmetic: + - * checked, / % through the runtime (the
+    # zero + INT64_MIN/-1 panics identical to the C backend)
+    if op == "+" {
+        return TyVal {
+            ty: "i64",
+            v: ll_emit_overflow_op(em, "llvm.sadd.with.overflow.i64", a.v, b.v)
+        }
+    }
+    if op == "-" {
+        return TyVal {
+            ty: "i64",
+            v: ll_emit_overflow_op(em, "llvm.ssub.with.overflow.i64", a.v, b.v)
+        }
+    }
+    if op == "*" {
+        return TyVal {
+            ty: "i64",
+            v: ll_emit_overflow_op(em, "llvm.smul.with.overflow.i64", a.v, b.v)
+        }
+    }
+    if op == "/" {
+        let tmp: str = ll_fresh(em, "r")
+        ll_emit(em, "  " + tmp + " = call i64 @hl_div_i64(i64 " + a.v
+        + ", i64 " + b.v + ")")
+        return TyVal {
+            ty: "i64", v: tmp
+        }
+    }
+    if op == "%" {
+        let tmp: str = ll_fresh(em, "r")
+        ll_emit(em, "  " + tmp + " = call i64 @hl_mod_i64(i64 " + a.v
+        + ", i64 " + b.v + ")")
+        return TyVal {
+            ty: "i64", v: tmp
+        }
+    }
+    # integer comparisons (i1 results — BUG-DS4-4: no zext to i64)
+    if op == "==" || op == "!=" || op == "<" || op == "<="
+    || op == ">" || op == ">=" {
+        let mut icmp_op: str = "eq"
+        if op == "!=" {
+            icmp_op = "ne"
+        } else if op == "<" {
+            icmp_op = "slt"
+        } else if op == "<=" {
+            icmp_op = "sle"
+        } else if op == ">" {
+            icmp_op = "sgt"
+        } else if op == ">=" {
+            icmp_op = "sge"
+        }
+        let tmp: str = ll_fresh(em, "r")
+        ll_emit(em, "  " + tmp + " = icmp " + icmp_op + " i64 " + a.v
+        + ", " + b.v)
+        return TyVal {
+            ty: "i1", v: tmp
+        }
+    }
+    return ll_unsupported_v("operator '" + op + "'", ctx.exprs[e].line)
+}
+
+# ----------------------------------------------------------------------------
+# Calls and methods — llvm_emit_calls' dispatch, the builtin table 1:1
+# with the C runtime's symbols.
+# ----------------------------------------------------------------------------
+
+# ll_call_recv(em, ret_ty, sym, want_tys, recv, atys, avals) — the
+# receiver-first call form (recv + args as one argument list).
+fn ll_call_recv(em: LLEmit, ret_ty: str, sym: str, want_tys: list[str], recv: TyVal, atys: list[str], avals: list[str]) -> TyVal {
+    let ftys: list[str] = [recv.ty]
+    let fvals: list[str] = [recv.v]
+    let mut i: int = 0
+    while i < atys.len() {
+        ftys.push(atys.get(i))
+        fvals.push(avals.get(i))
+        i = i + 1
+    }
+    return ll_call1(em, ret_ty, sym, want_tys, ftys, fvals)
+}
+
+# ll_call1(em, ret_ty, sym, want_tys, atys, avals) — one coerced call.
+fn ll_call1(em: LLEmit, ret_ty: str, sym: str, want_tys: list[str], atys: list[str], avals: list[str]) -> TyVal {
+    let mut arg_str: str = ""
+    let mut i: int = 0
+    while i < want_tys.len() && i < atys.len() {
+        if i > 0 {
+            arg_str = arg_str + ", "
+        }
+        arg_str = arg_str + want_tys.get(i) + " "
+        + ll_coerce(em, atys.get(i), avals.get(i), want_tys.get(i))
+        i = i + 1
+    }
+    if ret_ty == "void" {
+        ll_emit(em, "  call void " + sym + "(" + arg_str + ")")
+        return TyVal {
+            ty: "void", v: "0"
+        }
+    }
+    let tmp: str = ll_fresh(em, "call")
+    ll_emit(em, "  " + tmp + " = call " + ret_ty + " " + sym + "(" + arg_str + ")")
+    return TyVal {
+        ty: ret_ty, v: tmp
+    }
+}
+
+# ll_call(em, e) — a call: user fns through the mangled key, builtins
+# through the runtime table.
+fn ll_call(em: LLEmit, e: int) -> TyVal {
+    let ctx: Ctx = em.ctx
+    let name: str = ctx.exprs[e].name
+    # lower args left to right; a never-typed argument closes the block
+    # and stops the lowering (deep-scan-5)
+    let atys: list[str] = []
+    let avals: list[str] = []
+    let mut i: int = 0
+    while i < ctx.exprs[e].args.len() {
+        if em.cur_block == "" {
+            break
+        }
+        let av: TyVal = ll_expr(em, ctx.exprs[e].args.get(i))
+        atys.push(av.ty)
+        avals.push(av.v)
+        i = i + 1
+    }
+    if em.cur_block == "" {
+        return TyVal {
+            ty: "void", v: "0"
+        }
+    }
+    # ---- user-defined function call ----
+    if ctx.exprs[e].muser {
+        let key: str = ctx.exprs[e].mkey
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        if f.name != key || f.typeparams.len() > 0 {
+            # generic originals are never emitted (only their C-backend
+            # instantiations are); the alpha LLVM backend refuses the call
+            ll_unsupported("call to generic function '" + name + "'",
+            ctx.exprs[e].line)
+        }
+        let ret_ty: str = ll_type(f.ret)
+        let want_tys: list[str] = []
+        let mut p: int = 0
+        while p < f.ptypes.len() {
+            want_tys.push(ll_type(f.ptypes.get(p)))
+            p = p + 1
+        }
+        return ll_call1(em, ret_ty, "@" + key, want_tys, atys, avals)
+    }
+    return ll_builtin_call(em, name, e, atys, avals)
+}
+
+# ll_builtin_call(em, name, e, atys, avals) — the dispatch table
+# mirroring the C backend's gen_call.
+fn ll_builtin_call(em: LLEmit, name: str, e: int, atys: list[str], avals: list[str]) -> TyVal {
+    let ctx: Ctx = em.ctx
+    let line: int = ctx.exprs[e].line
+    # arg0's HLS type (for the typed dispatches below)
+    let mut arg0_t: str = "int"
+    if ctx.exprs[e].args.len() > 0 {
+        arg0_t = ctx.exprs[ctx.exprs[e].args.get(0)].t
+    }
+    if name == "print" {
+        return ll_call1(em, "void", "@hl_print", ["ptr"], atys, avals)
+    }
+    if name == "println" {
+        return ll_call1(em, "void", "@hl_println", ["ptr"], atys, avals)
+    }
+    if name == "eprint" {
+        return ll_call1(em, "void", "@hl_eprint", ["ptr"], atys, avals)
+    }
+    if name == "eprintln" {
+        return ll_call1(em, "void", "@hl_eprintln", ["ptr"], atys, avals)
+    }
+    if name == "isatty" {
+        return ll_call1(em, "i1", "@hl_isatty", ["i64"], atys, avals)
+    }
+    if name == "proc_pid" {
+        let tmp: str = ll_fresh(em, "pid")
+        ll_emit(em, "  " + tmp + " = call i64 @hl_proc_pid()")
+        return TyVal {
+            ty: "i64", v: tmp
+        }
+    }
+    if name == "sys_hostname" {
+        let tmp: str = ll_fresh(em, "hostname")
+        ll_emit(em, "  " + tmp + " = call ptr @hl_sys_hostname()")
+        return TyVal {
+            ty: "ptr", v: tmp
+        }
+    }
+    if name == "panic" {
+        # hl_panic never returns: call + unreachable close the block
+        ll_call1(em, "void", "@hl_panic", ["ptr"], atys, avals)
+        ll_emit(em, "  unreachable")
+        return TyVal {
+            ty: "void", v: "0"
+        }
+    }
+    if name == "exit" {
+        ll_call1(em, "void", "@hl_exit", ["i64"], atys, avals)
+        ll_emit(em, "  unreachable")
+        return TyVal {
+            ty: "void", v: "0"
+        }
+    }
+    if name == "str" {
+        if arg0_t == "int" {
+            return ll_call1(em, "ptr", "@hl_str_from_int64", ["i64"], atys, avals)
+        }
+        if arg0_t == "float" {
+            return ll_call1(em, "ptr", "@hl_str_from_double", ["double"], atys, avals)
+        }
+        if arg0_t == "bool" {
+            return ll_call1(em, "ptr", "@hl_str_from_bool", ["i1"], atys, avals)
+        }
+        if atys.len() > 0 {
+            return TyVal {
+                ty: atys.get(0), v: avals.get(0)
+            }
+        }
+        return TyVal {
+            ty: "ptr", v: "null"
+        }
+    }
+    if name == "int" {
+        return ll_call1(em, "i64", "@hl_str_to_int", ["ptr"], atys, avals)
+    }
+    if name == "len" {
+        if arg0_t == "str" {
+            return ll_call1(em, "i64", "@hl_str_len", ["ptr"], atys, avals)
+        }
+        if ll_is_list(arg0_t) {
+            return ll_call1(em, "i64", "@hl_list_len", ["ptr"], atys, avals)
+        }
+        return ll_call1(em, "i64", "@hl_map_len", ["ptr"], atys, avals)
+    }
+    if name == "range" {
+        return ll_call1(em, "ptr", "@hl_range", ["i64", "i64"], atys, avals)
+    }
+    if name == "join" {
+        return ll_call1(em, "ptr", "@hl_str_join", ["ptr", "ptr"], atys, avals)
+    }
+    if name == "has_feature" {
+        # const-folded from the --target-feature flag
+        let mut lit: str = ""
+        if ctx.exprs[e].args.len() > 0 {
+            lit = ctx.exprs[ctx.exprs[e].args.get(0)].sval
+        }
+        if lit == em.target_feature && lit != "" {
+            return TyVal {
+                ty: "i1", v: "1"
+            }
+        }
+        return TyVal {
+            ty: "i1", v: "0"
+        }
+    }
+    if name == "simd_cpu_supports" {
+        return ll_call1(em, "i1", "@hl_simd_cpu_supports", ["ptr"], atys, avals)
+    }
+    if name == "map_new" {
+        let tmp: str = ll_fresh(em, "map")
+        # arena-mode contract: val_free = null
+        ll_emit(em, "  " + tmp + " = call ptr @hl_map_new(ptr null)")
+        return TyVal {
+            ty: "ptr", v: tmp
+        }
+    }
+    if name == "read_file" || name == "read_file_tainted" {
+        # taint is compile-time only (same as the C backend)
+        return ll_call1(em, "ptr", "@hl_read_file", ["ptr"], atys, avals)
+    }
+    if name == "write_file" {
+        return ll_call1(em, "void", "@hl_write_file", ["ptr", "ptr"], atys, avals)
+    }
+    if name == "args" || name == "tainted_args" {
+        let tmp: str = ll_fresh(em, "call")
+        ll_emit(em, "  " + tmp + " = call ptr @hl_args()")
+        return TyVal {
+            ty: "ptr", v: tmp
+        }
+    }
+    if name == "args_os" {
+        let tmp: str = ll_fresh(em, "args_os")
+        ll_emit(em, "  " + tmp + " = call ptr @hl_args()")
+        return TyVal {
+            ty: "ptr", v: tmp
+        }
+    }
+    if name == "taint_mark" || name == "taint_unwrap" || name == "take" {
+        # identity at runtime
+        if atys.len() > 0 {
+            return TyVal {
+                ty: atys.get(0), v: avals.get(0)
+            }
+        }
+        return TyVal {
+            ty: "i64", v: "0"
+        }
+    }
+    if name == "drop" {
+        # compile-time annotation only; runtime no-op
+        return TyVal {
+            ty: "void", v: "0"
+        }
+    }
+    if name == "chr" {
+        return ll_call1(em, "ptr", "@hl_chr", ["i64"], atys, avals)
+    }
+    if name == "clock_ms" {
+        let tmp: str = ll_fresh(em, "call")
+        ll_emit(em, "  " + tmp + " = call i64 @hl_clock_ms()")
+        return TyVal {
+            ty: "i64", v: tmp
+        }
+    }
+    if name == "thread_sleep_ms" {
+        return ll_call1(em, "void", "@hl_thread_sleep_ms", ["i64"], atys, avals)
+    }
+    if name == "thread_yield" {
+        return ll_call1(em, "void", "@hl_thread_yield", [], atys, avals)
+    }
+    if name == "thread_current_id" {
+        let tmp: str = ll_fresh(em, "tid")
+        ll_emit(em, "  " + tmp + " = call i64 @hl_thread_current_id()")
+        return TyVal {
+            ty: "i64", v: tmp
+        }
+    }
+    if name == "file_exists" {
+        return ll_call1(em, "i1", "@hl_file_exists", ["ptr"], atys, avals)
+    }
+    if name == "fs_read_dir" {
+        return ll_call1(em, "ptr", "@hl_fs_read_dir", ["ptr"], atys, avals)
+    }
+    if name == "fs_size" {
+        return ll_call1(em, "i64", "@hl_fs_size", ["ptr"], atys, avals)
+    }
+    if name == "fs_is_dir" {
+        return ll_call1(em, "i1", "@hl_fs_is_dir", ["ptr"], atys, avals)
+    }
+    if name == "fs_set_perms" {
+        return ll_call1(em, "void", "@hl_fs_set_perms", ["ptr", "i64"], atys, avals)
+    }
+    if name == "net_tcp_connect" {
+        return ll_call1(em, "i64", "@hl_net_tcp_connect", ["ptr", "i64"], atys, avals)
+    }
+    if name == "net_tcp_listen" {
+        return ll_call1(em, "i64", "@hl_net_tcp_listen", ["ptr", "i64", "i64"], atys, avals)
+    }
+    if name == "net_tcp_accept" {
+        return ll_call1(em, "i64", "@hl_net_tcp_accept", ["i64"], atys, avals)
+    }
+    if name == "net_read" {
+        return ll_call1(em, "ptr", "@hl_net_read", ["i64", "i64"], atys, avals)
+    }
+    if name == "net_write" {
+        return ll_call1(em, "i64", "@hl_net_write", ["i64", "ptr"], atys, avals)
+    }
+    if name == "net_close" {
+        return ll_call1(em, "void", "@hl_net_close", ["i64"], atys, avals)
+    }
+    if name == "net_udp_open" {
+        let tmp: str = ll_fresh(em, "udp_open")
+        ll_emit(em, "  " + tmp + " = call i64 @hl_net_udp_open()")
+        return TyVal {
+            ty: "i64", v: tmp
+        }
+    }
+    if name == "net_udp_send_to" {
+        return ll_call1(em, "i64", "@hl_net_udp_send_to",
+        ["i64", "ptr", "i64", "ptr"], atys, avals)
+    }
+    if name == "net_udp_recv_from" {
+        return ll_call1(em, "ptr", "@hl_net_udp_recv_from", ["i64", "i64"], atys, avals)
+    }
+    if name == "net_tls_get" {
+        return ll_call1(em, "ptr", "@hl_net_tls_get", ["ptr", "i64", "ptr"], atys, avals)
+    }
+    if name == "clone" {
+        if arg0_t == "str" {
+            return ll_call1(em, "ptr", "@hl_clone_str", ["ptr"], atys, avals)
+        }
+        if ll_is_list(arg0_t) {
+            let elem: str = ll_list_elem(arg0_t)
+            if elem == "int" || elem == "float" || elem == "bool" || elem == "str" {
+                return ll_call1(em, "ptr", "@hl_clone_list_" + elem,
+                ["ptr"], atys, avals)
+            }
+            ll_unsupported("clone() on list[" + elem + ")", line)
+        }
+        if ll_is_map(arg0_t) {
+            let vt: str = ll_map_val(arg0_t)
+            if vt == "int" || vt == "float" || vt == "bool" || vt == "str" {
+                return ll_call1(em, "ptr", "@hl_clone_map_" + vt,
+                ["ptr"], atys, avals)
+            }
+            ll_unsupported("clone() on map[str, " + vt + ")", line)
+        }
+        return ll_unsupported_v("clone() on type " + arg0_t, line)
+    }
+    if name == "proc_exec" {
+        return ll_call1(em, "i64", "@hl_proc_exec", ["ptr"], atys, avals)
+    }
+    if name == "proc_spawn" {
+        return ll_call1(em, "i64", "@hl_proc_spawn",
+        ["ptr", "ptr", "i64", "i64", "i64"], atys, avals)
+    }
+    if name == "proc_wait" {
+        return ll_call1(em, "i64", "@hl_proc_wait", ["i64"], atys, avals)
+    }
+    if name == "proc_kill" {
+        return ll_call1(em, "i64", "@hl_proc_kill", ["i64"], atys, avals)
+    }
+    if name == "proc_child_write" {
+        return ll_call1(em, "i64", "@hl_proc_child_write", ["i64", "ptr"], atys, avals)
+    }
+    if name == "proc_child_read" {
+        return ll_call1(em, "ptr", "@hl_proc_child_read",
+        ["i64", "i64", "i64"], atys, avals)
+    }
+    if name == "proc_child_close" {
+        return ll_call1(em, "i64", "@hl_proc_child_close", ["i64", "i64"], atys, avals)
+    }
+    if name == "env_get" {
+        return ll_call1(em, "ptr", "@hl_env_get", ["ptr"], atys, avals)
+    }
+    if name == "env_has" {
+        return ll_call1(em, "i1", "@hl_env_has", ["ptr"], atys, avals)
+    }
+    if name == "env_set" {
+        return ll_call1(em, "void", "@hl_env_set", ["ptr", "ptr"], atys, avals)
+    }
+    if name == "env_unset" {
+        return ll_call1(em, "void", "@hl_env_unset", ["ptr"], atys, avals)
+    }
+    if name == "cwd_get" {
+        let tmp: str = ll_fresh(em, "cwd")
+        ll_emit(em, "  " + tmp + " = call ptr @hl_cwd_get()")
+        return TyVal {
+            ty: "ptr", v: tmp
+        }
+    }
+    if name == "cwd_set" {
+        return ll_call1(em, "i64", "@hl_cwd_set", ["ptr"], atys, avals)
+    }
+    if name == "instant_now_ns" {
+        let tmp: str = ll_fresh(em, "instant")
+        ll_emit(em, "  " + tmp + " = call i64 @hl_instant_now_ns()")
+        return TyVal {
+            ty: "i64", v: tmp
+        }
+    }
+    if name == "system_time_now_ms" {
+        let tmp: str = ll_fresh(em, "systime")
+        ll_emit(em, "  " + tmp + " = call i64 @hl_system_time_now_ms()")
+        return TyVal {
+            ty: "i64", v: tmp
+        }
+    }
+    # libm: 1-arg double->double
+    if name == "math_sin" || name == "math_cos" || name == "math_tan"
+    || name == "math_asin" || name == "math_acos" || name == "math_atan"
+    || name == "math_sinh" || name == "math_cosh" || name == "math_tanh"
+    || name == "math_exp" || name == "math_log" || name == "math_log10"
+    || name == "math_log2" || name == "math_sqrt" || name == "math_cbrt"
+    || name == "math_erf" || name == "math_erfc" || name == "math_tgamma"
+    || name == "math_lgamma" {
+        return ll_call1(em, "double", "@hl_" + name, ["double"], atys, avals)
+    }
+    # libm: 2-arg double->double
+    if name == "math_atan2" || name == "math_pow" || name == "math_hypot"
+    || name == "math_fmod" || name == "math_copysign" {
+        return ll_call1(em, "double", "@hl_" + name,
+        ["double", "double"], atys, avals)
+    }
+    # IEEE-754 predicates: double -> bool
+    if name == "math_isnan" || name == "math_isinf"
+    || name == "math_isfinite" || name == "math_signbit" {
+        return ll_call1(em, "i1", "@hl_" + name, ["double"], atys, avals)
+    }
+    return ll_unsupported_v("builtin function '" + name + "'", line)
+}
+
+# ----------------------------------------------------------------------------
+# Methods — llvm_emit_calls' _lower_method_typed: builtin method ops
+# 1:1 with the runtime; user-defined struct methods refuse cleanly.
+# ----------------------------------------------------------------------------
+
+# ll_method(em, e) — a method call through the checker's mop annotation.
+fn ll_method(em: LLEmit, e: int) -> TyVal {
+    let ctx: Ctx = em.ctx
+    let line: int = ctx.exprs[e].line
+    if ctx.exprs[e].muser {
+        return ll_unsupported_v("call to user-defined method '" + ctx.exprs[e].name + "'", line)
+    }
+    let op: str = ctx.exprs[e].mop
+    let recv: TyVal = ll_expr(em, ctx.exprs[e].left)
+    if em.cur_block == "" {
+        return TyVal {
+            ty: "i64", v: "0"
+        }
+    }
+    let recv_t: str = ctx.exprs[ctx.exprs[e].left].t
+    # lower args (stopping on a never-typed one — deep-scan-5)
+    let atys: list[str] = []
+    let avals: list[str] = []
+    let mut i: int = 0
+    while i < ctx.exprs[e].args.len() {
+        if em.cur_block == "" {
+            break
+        }
+        let av: TyVal = ll_expr(em, ctx.exprs[e].args.get(i))
+        atys.push(av.ty)
+        avals.push(av.v)
+        i = i + 1
+    }
+    if em.cur_block == "" {
+        return TyVal {
+            ty: "i64", v: "0"
+        }
+    }
+    # ---- str.* ----
+    if op == "str.len" {
+        return ll_call1(em, "i64", "@hl_str_len", ["ptr"], [recv.ty], [recv.v])
+    }
+    if op == "str.byte_at" {
+        return ll_call_recv(em, "i64", "@hl_str_byte_at", ["ptr", "i64"], recv, atys, avals)
+    }
+    if op == "str.slice" {
+        return ll_call_recv(em, "ptr", "@hl_str_slice", ["ptr", "i64", "i64"], recv, atys, avals)
+    }
+    if op == "str.find" {
+        return ll_call_recv(em, "i64", "@hl_str_find", ["ptr", "ptr"], recv, atys, avals)
+    }
+    if op == "str.contains" {
+        return ll_call_recv(em, "i1", "@hl_str_contains", ["ptr", "ptr"], recv, atys, avals)
+    }
+    if op == "str.starts_with" {
+        return ll_call_recv(em, "i1", "@hl_str_starts_with", ["ptr", "ptr"], recv, atys, avals)
+    }
+    if op == "str.ends_with" {
+        return ll_call_recv(em, "i1", "@hl_str_ends_with", ["ptr", "ptr"], recv, atys, avals)
+    }
+    if op == "str.split" {
+        return ll_call_recv(em, "ptr", "@hl_str_split", ["ptr", "ptr"], recv, atys, avals)
+    }
+    if op == "str.trim" {
+        return ll_call1(em, "ptr", "@hl_str_trim", ["ptr"], [recv.ty], [recv.v])
+    }
+    if op == "str.to_int" {
+        return ll_call1(em, "i64", "@hl_str_to_int", ["ptr"], [recv.ty], [recv.v])
+    }
+    if op == "str.to_float" {
+        return ll_call1(em, "double", "@hl_str_to_double", ["ptr"], [recv.ty], [recv.v])
+    }
+    if op == "str.to_str" {
+        return TyVal {
+            ty: recv.ty, v: recv.v
+        }
+    }
+    # ---- int.* ----
+    if op == "int.to_str" {
+        return ll_call_recv(em, "ptr", "@hl_str_from_int64", ["i64"], recv, atys, avals)
+    }
+    if op == "int.to_float" {
+        let tmp: str = ll_fresh(em, "s2d")
+        ll_emit(em, "  " + tmp + " = sitofp i64 " + recv.v + " to double")
+        return TyVal {
+            ty: "double", v: tmp
+        }
+    }
+    if op == "int.abs" {
+        return ll_call_recv(em, "i64", "@hl_abs_i64", ["i64"], recv, atys, avals)
+    }
+    # ---- float.* ----
+    if op == "float.to_str" {
+        return ll_call_recv(em, "ptr", "@hl_str_from_double", ["double"], recv, atys, avals)
+    }
+    if op == "float.to_int" {
+        return ll_call_recv(em, "i64", "@hl_float_to_int", ["double"], recv, atys, avals)
+    }
+    if op == "float.abs" {
+        let tmp: str = ll_fresh(em, "fa")
+        ll_emit(em, "  " + tmp + " = call double @llvm.fabs.f64(double " + recv.v + ")")
+        return TyVal {
+            ty: "double", v: tmp
+        }
+    }
+    # ---- bool.* ----
+    if op == "bool.to_str" {
+        return ll_call_recv(em, "ptr", "@hl_str_from_bool", ["i1"], recv, atys, avals)
+    }
+    # ---- list.* (boxed element ABI) ----
+    if op.starts_with("list.") {
+        let mut elem_t: str = "int"
+        if ll_is_list(recv_t) {
+            elem_t = ll_list_elem(recv_t)
+        }
+        if op == "list.len" {
+            return ll_call1(em, "i64", "@hl_list_len", ["ptr"], [recv.ty], [recv.v])
+        }
+        if op == "list.push" {
+            # box the pushed value by the element type
+            let boxed: str = ll_box(em, elem_t, atys.get(0), avals.get(0))
+            ll_emit(em, "  call void @hl_list_push(ptr " + recv.v
+            + ", ptr " + boxed + ")")
+            return TyVal {
+                ty: "void", v: "0"
+            }
+        }
+        if op == "list.get" {
+            let idx: str = ll_coerce(em, atys.get(0), avals.get(0), "i64")
+            let tmp: str = ll_fresh(em, "e")
+            ll_emit(em, "  " + tmp + " = call ptr @hl_list_get(ptr " + recv.v
+            + ", i64 " + idx + ")")
+            let ret_t: str = ctx.exprs[e].t
+            let unboxed: str = ll_unbox(em, ret_t, tmp)
+            return TyVal {
+                ty: ll_type(ret_t), v: unboxed
+            }
+        }
+        if op == "list.set" {
+            let idx: str = ll_coerce(em, atys.get(0), avals.get(0), "i64")
+            let boxed: str = ll_box(em, elem_t, atys.get(1), avals.get(1))
+            ll_emit(em, "  call void @hl_list_set(ptr " + recv.v
+            + ", i64 " + idx + ", ptr " + boxed + ")")
+            return TyVal {
+                ty: "void", v: "0"
+            }
+        }
+        if op == "list.pop" {
+            # strip taint before dispatching (SCAN-A)
+            let base_elem: str = ll_taint_inner(elem_t)
+            if base_elem == "int" {
+                let tmp: str = ll_fresh(em, "pop")
+                ll_emit(em, "  " + tmp + " = call i64 @hl_list_pop_i64(ptr " + recv.v + ")")
+                return TyVal {
+                    ty: "i64", v: tmp
+                }
+            }
+            if base_elem == "float" {
+                let tmp: str = ll_fresh(em, "pop")
+                ll_emit(em, "  " + tmp + " = call double @hl_list_pop_f64(ptr " + recv.v + ")")
+                return TyVal {
+                    ty: "double", v: tmp
+                }
+            }
+            if base_elem == "bool" {
+                let tmp: str = ll_fresh(em, "pop")
+                ll_emit(em, "  " + tmp + " = call i1 @hl_list_pop_bool(ptr " + recv.v + ")")
+                return TyVal {
+                    ty: "i1", v: tmp
+                }
+            }
+            let tmp: str = ll_fresh(em, "e")
+            ll_emit(em, "  " + tmp + " = call ptr @hl_list_pop(ptr " + recv.v + ")")
+            let ret_t: str = ctx.exprs[e].t
+            return TyVal {
+                ty: ll_type(ret_t), v: tmp
+            }
+        }
+        return ll_unsupported_v("method '" + op + "'", line)
+    }
+    # ---- map.* (boxed value ABI) ----
+    if op.starts_with("map.") {
+        let mut val_t: str = "int"
+        if ll_is_map(recv_t) {
+            val_t = ll_map_val(recv_t)
+        }
+        if op == "map.len" {
+            return ll_call1(em, "i64", "@hl_map_len", ["ptr"], [recv.ty], [recv.v])
+        }
+        if op == "map.set" {
+            let k: str = ll_coerce(em, atys.get(0), avals.get(0), "ptr")
+            let boxed: str = ll_box(em, val_t, atys.get(1), avals.get(1))
+            ll_emit(em, "  call void @hl_map_set(ptr " + recv.v
+            + ", ptr " + k + ", ptr " + boxed + ")")
+            return TyVal {
+                ty: "void", v: "0"
+            }
+        }
+        if op == "map.get_or" {
+            # the typed getters, defaults by value (deep-scan-5: the old
+            # hl_map_get symbol no longer exists in the runtime)
+            let k: str = ll_coerce(em, atys.get(0), avals.get(0), "ptr")
+            let mut base: str = ll_taint_inner(val_t)
+            if base == "int" {
+                let dv: str = ll_coerce(em, atys.get(1), avals.get(1), "i64")
+                let tmp: str = ll_fresh(em, "gv")
+                ll_emit(em, "  " + tmp + " = call i64 @hl_map_get_i64(ptr "
+                + recv.v + ", ptr " + k + ", i64 " + dv + ")")
+                return TyVal {
+                    ty: "i64", v: tmp
+                }
+            }
+            if base == "float" {
+                let dv: str = ll_coerce(em, atys.get(1), avals.get(1), "double")
+                let tmp: str = ll_fresh(em, "gv")
+                ll_emit(em, "  " + tmp + " = call double @hl_map_get_f64(ptr "
+                + recv.v + ", ptr " + k + ", double " + dv + ")")
+                return TyVal {
+                    ty: "double", v: tmp
+                }
+            }
+            if base == "bool" {
+                let dv: str = ll_coerce(em, atys.get(1), avals.get(1), "i1")
+                let tmp: str = ll_fresh(em, "gv")
+                ll_emit(em, "  " + tmp + " = call i1 @hl_map_get_bool(ptr "
+                + recv.v + ", ptr " + k + ", i1 " + dv + ")")
+                return TyVal {
+                    ty: "i1", v: tmp
+                }
+            }
+            # pointer-valued: the borrow lookup + select on null
+            let tmp: str = ll_fresh(em, "gv")
+            ll_emit(em, "  " + tmp + " = call ptr @hl_map_borrow(ptr "
+            + recv.v + ", ptr " + k + ")")
+            let cmp_tmp: str = ll_fresh(em, "gvnull")
+            ll_emit(em, "  " + cmp_tmp + " = icmp ne ptr " + tmp + ", null")
+            let d2: str = ll_coerce(em, atys.get(1), avals.get(1), "ptr")
+            let sel: str = ll_fresh(em, "gvsel")
+            ll_emit(em, "  " + sel + " = select i1 " + cmp_tmp + ", ptr "
+            + tmp + ", ptr " + d2)
+            let ret_t: str = ctx.exprs[e].t
+            return TyVal {
+                ty: ll_type(ret_t), v: sel
+            }
+        }
+        if op == "map.has" {
+            let k: str = ll_coerce(em, atys.get(0), avals.get(0), "ptr")
+            let tmp: str = ll_fresh(em, "has")
+            ll_emit(em, "  " + tmp + " = call i1 @hl_map_has(ptr " + recv.v
+            + ", ptr " + k + ")")
+            return TyVal {
+                ty: "i1", v: tmp
+            }
+        }
+        if op == "map.keys" {
+            return ll_call1(em, "ptr", "@hl_map_keys", ["ptr"], [recv.ty], [recv.v])
+        }
+        return ll_unsupported_v("method '" + op + "'", line)
+    }
+    return ll_unsupported_v("method '" + op + "'", line)
+}
+
+# ----------------------------------------------------------------------------
+# Struct field access / assignment — the typed hl_struct_get/set_*
+# helpers, field index from the declaration order.
+# ----------------------------------------------------------------------------
+
+# ll_field_index(st, fname) — the field's declaration index.
+fn ll_field_index(st: StructInfo, fname: str) -> int {
+    let mut i: int = 0
+    while i < st.fields.len() {
+        if st.fields.get(i) == fname {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# ll_field_access(em, e) — expr.field via the typed getters.
+fn ll_field_access(em: LLEmit, e: int) -> TyVal {
+    let ctx: Ctx = em.ctx
+    let target: TyVal = ll_expr(em, ctx.exprs[e].left)
+    if em.cur_block == "" {
+        return TyVal {
+            ty: "i64", v: "0"
+        }
+    }
+    let st: StructInfo = ctx.structs.get_or(
+    type_base(ctx.exprs[ctx.exprs[e].left].t), dummy_struct())
+    if st.name != type_base(ctx.exprs[ctx.exprs[e].left].t) {
+        ll_unsupported("struct field access (unresolved struct "
+        + type_base(ctx.exprs[ctx.exprs[e].left].t) + ")", ctx.exprs[e].line)
+    }
+    let fidx: int = ll_field_index(st, ctx.exprs[e].name)
+    if fidx < 0 {
+        ll_unsupported("struct field access (unknown field '"
+        + ctx.exprs[e].name + "')", ctx.exprs[e].line)
+    }
+    let ftype: str = ctx.exprs[e].t
+    let mut base: str = ll_taint_inner(ftype)
+    let tmp: str = ll_fresh(em, "fld")
+    if base == "int" {
+        ll_emit(em, "  " + tmp + " = call i64 @hl_struct_get_i64(ptr "
+        + target.v + ", i64 " + fidx.to_str() + ")")
+        return TyVal {
+            ty: "i64", v: tmp
+        }
+    }
+    if base == "float" {
+        ll_emit(em, "  " + tmp + " = call double @hl_struct_get_f64(ptr "
+        + target.v + ", i64 " + fidx.to_str() + ")")
+        return TyVal {
+            ty: "double", v: tmp
+        }
+    }
+    if base == "bool" {
+        ll_emit(em, "  " + tmp + " = call i1 @hl_struct_get_bool(ptr "
+        + target.v + ", i64 " + fidx.to_str() + ")")
+        return TyVal {
+            ty: "i1", v: tmp
+        }
+    }
+    ll_emit(em, "  " + tmp + " = call ptr @hl_struct_get_ptr(ptr "
+    + target.v + ", i64 " + fidx.to_str() + ")")
+    return TyVal {
+        ty: "ptr", v: tmp
+    }
+}
+
+# ll_field_assign(em, target, val) — expr.field = value via the typed
+# setters.
+fn ll_field_assign(em: LLEmit, target: int, val: TyVal) -> void {
+    let ctx: Ctx = em.ctx
+    let target_val: TyVal = ll_expr(em, ctx.exprs[target].left)
+    if em.cur_block == "" {
+        return
+    }
+    let st: StructInfo = ctx.structs.get_or(
+    type_base(ctx.exprs[ctx.exprs[target].left].t), dummy_struct())
+    if st.name != type_base(ctx.exprs[ctx.exprs[target].left].t) {
+        ll_unsupported("struct field assignment (unresolved struct)",
+        ctx.exprs[target].line)
+    }
+    let fidx: int = ll_field_index(st, ctx.exprs[target].name)
+    if fidx < 0 {
+        ll_unsupported("struct field assignment (unknown field '"
+        + ctx.exprs[target].name + "')", ctx.exprs[target].line)
+    }
+    let ftype: str = ctx.exprs[target].t
+    let mut base: str = ll_taint_inner(ftype)
+    if base == "int" {
+        let v: str = ll_coerce(em, val.ty, val.v, "i64")
+        ll_emit(em, "  call void @hl_struct_set_i64(ptr " + target_val.v
+        + ", i64 " + fidx.to_str() + ", i64 " + v + ")")
+    } else if base == "float" {
+        let v: str = ll_coerce(em, val.ty, val.v, "double")
+        ll_emit(em, "  call void @hl_struct_set_f64(ptr " + target_val.v
+        + ", i64 " + fidx.to_str() + ", double " + v + ")")
+    } else if base == "bool" {
+        let v: str = ll_coerce(em, val.ty, val.v, "i1")
+        ll_emit(em, "  call void @hl_struct_set_bool(ptr " + target_val.v
+        + ", i64 " + fidx.to_str() + ", i1 " + v + ")")
+    } else {
+        let v: str = ll_coerce(em, val.ty, val.v, "ptr")
+        ll_emit(em, "  call void @hl_struct_set_ptr(ptr " + target_val.v
+        + ", i64 " + fidx.to_str() + ", ptr " + v + ")")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Function emission — llvm_emit_core's _emit_function: params get
+# entry-block slots (let mut reassignment), every let/for binding is
+# pre-allocated in the entry block (BUG-DS4-7: allocas inside loop
+# bodies grow the stack per iteration), and deferred allocas splice in
+# at the placeholder before the body's instructions.
+# ----------------------------------------------------------------------------
+
+# ll_function(em, key, f) — one define.
+fn ll_function(em: LLEmit, key: str, f: FnInfo) -> void {
+    em.cur_ret_t = f.ret
+    em.locals_slot = map_new()
+    em.locals_ty = map_new()
+    em.cur_block = ""
+    em.entry_alloca_slot = []
+    em.entry_alloca_ty = []
+    em.slot_pool = map_new()
+    em.slot_pool_ty = map_new()
+    let ret_llvm: str = ll_type(f.ret)
+    # the signature
+    let mut param_str: str = ""
+    let mut p: int = 0
+    while p < f.params.len() {
+        if p > 0 {
+            param_str = param_str + ", "
+        }
+        param_str = param_str + ll_type(f.ptypes.get(p)) + " %v_"
+        + f.params.get(p)
+        p = p + 1
+    }
+    ll_emit(em, "define " + ret_llvm + " @" + key + "(" + param_str + ") {")
+    ll_emit(em, "entry:")
+    # stack slots for the parameters (reassignment support)
+    p = 0
+    while p < f.params.len() {
+        let slot: str = ll_fresh(em, "p")
+        let pty: str = ll_type(f.ptypes.get(p))
+        ll_emit(em, "  " + slot + " = alloca " + pty)
+        ll_emit(em, "  store " + pty + " %v_" + f.params.get(p)
+        + ", ptr " + slot)
+        em.locals_slot.set(f.params.get(p), slot)
+        em.locals_ty.set(f.params.get(p), pty)
+        p = p + 1
+    }
+    # pre-allocate every let / for binding in the entry block (same
+    # name + type reuses one slot safely: HLS forbids shadowing)
+    let bnames: list[str] = []
+    let btypes: list[str] = []
+    ll_collect_bindings(em, f.body, bnames, btypes)
+    let mut bi: int = 0
+    while bi < bnames.len() {
+        let key2: str = ll_slot_key(bnames.get(bi), btypes.get(bi))
+        if em.slot_pool.has(key2) {
+            bi = bi + 1
+            continue
+        }
+        let slot: str = ll_fresh(em, "l")
+        let bty: str = ll_type(btypes.get(bi))
+        ll_emit(em, "  " + slot + " = alloca " + bty)
+        em.slot_pool.set(key2, slot)
+        em.slot_pool_ty.set(key2, bty)
+        bi = bi + 1
+    }
+    # the deferred-alloca placeholder (spliced at function close)
+    let marker_idx: int = em.lines.len()
+    ll_emit(em, "  ; __deferred_allocas_placeholder__")
+    # the body
+    let mut i: int = 0
+    while i < f.body.len() {
+        ll_stmt(em, f.body.get(i))
+        i = i + 1
+    }
+    # implicit return void / defensive unreachable
+    if em.cur_block != "" {
+        if f.ret == "void" {
+            ll_emit(em, "  ret void")
+        } else {
+            ll_emit(em, "  unreachable")
+        }
+    }
+    # splice the deferred allocas over the placeholder
+    if em.entry_alloca_slot.len() > 0 {
+        let new_lines: list[str] = []
+        let mut j: int = 0
+        while j < marker_idx {
+            new_lines.push(em.lines.get(j))
+            j = j + 1
+        }
+        let mut k: int = 0
+        while k < em.entry_alloca_slot.len() {
+            new_lines.push("  " + em.entry_alloca_slot.get(k) + " = alloca "
+            + em.entry_alloca_ty.get(k))
+            k = k + 1
+        }
+        let mut m: int = marker_idx + 1
+        while m < em.lines.len() {
+            new_lines.push(em.lines.get(m))
+            m = m + 1
+        }
+        em.lines = new_lines
+    } else {
+        # nothing deferred — drop the placeholder comment line
+        let new_lines: list[str] = []
+        let mut j: int = 0
+        while j < em.lines.len() {
+            if j != marker_idx {
+                new_lines.push(em.lines.get(j))
+            }
+            j = j + 1
+        }
+        em.lines = new_lines
+    }
+    ll_emit(em, "}")
+    ll_emit(em, "")
+}
+
+# ----------------------------------------------------------------------------
+# The module prelude — the runtime declare table, verbatim from
+# llvm_common (BUG-DS4-3's law: the table mirrors the C runtime 1:1).
+# ----------------------------------------------------------------------------
+
+# ll_runtime_block() — the declare text, one entry per line.
+fn ll_runtime_block() -> str {
+    return "; ===== Halis runtime declarations (opaque externals) =====\n"
+    + "; Layout mirrors the C runtime generated by src/hlc.hls.\n"
+    + "%hl_str  = type { i64, ptr }              ; { len, data }\n"
+    + "%hl_list = type { i64, i64, ptr }         ; { len, cap, items }\n"
+    + "%hl_map  = type { i64, i64, ptr, ptr, ptr }\n"
+    + "\n"
+    + "declare void     @hl_die(ptr) #0                 ; const char* -> noreturn\n"
+    + "declare void     @hl_panic(ptr) #0                 ; hl_str* -> noreturn (panic: msg, exit 101)\n"
+    + "declare void     @hl_exit(i64) #0                  ; noreturn\n"
+    + "declare i64      @hl_clock_ms()\n"
+    + "declare ptr      @hl_args()                         ; -> hl_list* (list[str])\n"
+    + "declare void     @hl_thread_sleep_ms(i64)           ; (ms) -> void\n"
+    + "declare void     @hl_thread_yield()                 ; () -> void\n"
+    + "declare i64      @hl_thread_current_id()            ; () -> int\n"
+    + "declare i1       @hl_file_exists(ptr)\n"
+    + "declare ptr      @hl_read_file(ptr)\n"
+    + "declare void     @hl_write_file(ptr, ptr)\n"
+    + "declare ptr      @hl_fs_read_dir(ptr)               ; -> hl_list* (list[str])\n"
+    + "declare i64      @hl_fs_size(ptr)\n"
+    + "declare i1       @hl_fs_is_dir(ptr)\n"
+    + "declare void     @hl_fs_set_perms(ptr, i64)\n"
+    + "declare void     @hl_print(ptr)                     ; hl_str*\n"
+    + "declare void     @hl_println(ptr)                   ; hl_str*\n"
+    + "declare void     @hl_eprint(ptr)                    ; hl_str* -> stderr\n"
+    + "declare void     @hl_eprintln(ptr)                  ; hl_str* -> stderr + newline\n"
+    + "declare i1       @hl_isatty(i64)                    ; (fd) -> bool\n"
+    + "declare i64      @hl_proc_pid()                     ; -> OS process id\n"
+    + "declare ptr      @hl_sys_hostname()                 ; -> fresh str host name\n"
+    + "\n"
+    + "; strings\n"
+    + "declare ptr      @hl_str_alloc(i64)\n"
+    + "declare ptr      @hl_str_from(ptr, i64)             ; (const char* data, i64 len) -> hl_str*\n"
+    + "declare ptr      @hl_str_concat(ptr, ptr)\n"
+    + "declare i1       @hl_str_eq(ptr, ptr)\n"
+    + "declare i64      @hl_str_cmp(ptr, ptr)\n"
+    + "declare i64      @hl_str_len(ptr)\n"
+    + "declare i64      @hl_str_byte_at(ptr, i64)\n"
+    + "declare ptr      @hl_str_slice(ptr, i64, i64)\n"
+    + "declare i64      @hl_str_find(ptr, ptr)\n"
+    + "declare i1       @hl_str_contains(ptr, ptr)\n"
+    + "declare i1       @hl_str_starts_with(ptr, ptr)\n"
+    + "declare i1       @hl_str_ends_with(ptr, ptr)\n"
+    + "declare ptr      @hl_str_split(ptr, ptr)\n"
+    + "declare ptr      @hl_str_trim(ptr)\n"
+    + "declare ptr      @hl_str_from_int64(i64)\n"
+    + "declare ptr      @hl_str_from_double(double)\n"
+    + "declare ptr      @hl_str_from_bool(i1)\n"
+    + "declare i64      @hl_str_to_int(ptr)\n"
+    + "declare double   @hl_str_to_double(ptr)\n"
+    + "declare ptr      @hl_chr(i64)                       ; -> hl_str*\n"
+    + "declare ptr      @hl_clone_str(ptr)\n"
+    + "\n"
+    + "; checked int64 arithmetic (identical panics to the interpreter)\n"
+    + "declare i64      @hl_neg_i64(i64)\n"
+    + "declare i64      @hl_abs_i64(i64)\n"
+    + "declare i64      @hl_div_i64(i64, i64)\n"
+    + "declare i64      @hl_mod_i64(i64, i64)\n"
+    + "declare i64      @hl_float_to_int(double)           ; range-checked\n"
+    + "\n"
+    + "; dynamic list (boxed elements)\n"
+    + "declare ptr      @hl_list_new(ptr)               ; (elem_free) - arena mode passes null\n"
+    + "declare void     @hl_list_push(ptr, ptr)\n"
+    + "declare ptr      @hl_list_get(ptr, i64)\n"
+    + "declare void     @hl_list_set(ptr, i64, ptr)\n"
+    + "declare ptr      @hl_list_pop(ptr)\n"
+    + "declare i64     @hl_list_pop_i64(ptr)              ; pop + unbox + free the box\n"
+    + "declare double  @hl_list_pop_f64(ptr)\n"
+    + "declare i1      @hl_list_pop_bool(ptr)\n"
+    + "declare i64     @hl_list_len(ptr)\n"
+    + "declare ptr      @hl_range(i64, i64)\n"
+    + "declare ptr      @hl_str_join(ptr, ptr)         ; (list[str], sep) -> str - O(n) join (Stage 19)\n"
+    + "declare i1       @hl_simd_cpu_supports(ptr)      ; (feature name) -> bool (Stage 21 runtime probe)\n"
+    + "\n"
+    + "; boxed element constructors (get uses a plain load from the box pointer)\n"
+    + "declare ptr      @hl_box_i64(i64)\n"
+    + "declare ptr      @hl_box_f64(double)\n"
+    + "declare ptr      @hl_box_bool(i1)\n"
+    + "declare ptr      @hl_box_ptr(ptr)\n"
+    + "\n"
+    + "; map[str, T]\n"
+    + "declare ptr      @hl_map_new(ptr)                ; (val_free) - arena mode passes null\n"
+    + "declare i64     @hl_map_get_i64(ptr, ptr, i64)    ; (m, k, default) -> value or default\n"
+    + "declare double  @hl_map_get_f64(ptr, ptr, double)\n"
+    + "declare i1      @hl_map_get_bool(ptr, ptr, i1)\n"
+    + "declare ptr     @hl_map_borrow(ptr, ptr)           ; (m, k) -> stored value or null\n"
+    + "declare void     @hl_map_set(ptr, ptr, ptr)\n"
+    + "declare i1       @hl_map_has(ptr, ptr)\n"
+    + "declare i64     @hl_map_len(ptr)\n"
+    + "declare ptr     @hl_map_keys(ptr)\n"
+    + "\n"
+    + "; per-instantiation clone helpers (Stage 8-alpha subset)\n"
+    + "declare ptr      @hl_clone_list_int(ptr)\n"
+    + "declare ptr      @hl_clone_list_float(ptr)\n"
+    + "declare ptr      @hl_clone_list_bool(ptr)\n"
+    + "declare ptr      @hl_clone_list_str(ptr)\n"
+    + "declare ptr      @hl_clone_map_int(ptr)\n"
+    + "declare ptr      @hl_clone_map_float(ptr)\n"
+    + "declare ptr      @hl_clone_map_bool(ptr)\n"
+    + "declare ptr      @hl_clone_map_str(ptr)\n"
+    + "\n"
+    + "; Stage 12 release: struct/enum runtime constructors + field accessors.\n"
+    + "declare ptr      @hl_struct_alloc(i64)              ; (size in bytes) -> opaque ptr\n"
+    + "declare void     @hl_struct_set_i64(ptr, i64, i64)  ; (struct, field_idx, value)\n"
+    + "declare void     @hl_struct_set_f64(ptr, i64, double)\n"
+    + "declare void     @hl_struct_set_bool(ptr, i64, i1)\n"
+    + "declare void     @hl_struct_set_ptr(ptr, i64, ptr)\n"
+    + "declare i64      @hl_struct_get_i64(ptr, i64)\n"
+    + "declare double   @hl_struct_get_f64(ptr, i64)\n"
+    + "declare i1       @hl_struct_get_bool(ptr, i64)\n"
+    + "declare ptr      @hl_struct_get_ptr(ptr, i64)\n"
+    + "\n"
+    + "; Enum tag access (the runtime emits enums as a tagged-union struct).\n"
+    + "declare i64      @hl_enum_tag(ptr)                  ; -> variant index\n"
+    + "declare ptr      @hl_enum_new_variant(i64)          ; (variant_idx) -> new enum value\n"
+    + "declare ptr      @hl_enum_payload(ptr)               ; -> payload ptr (variant data)\n"
+    + "\n"
+    + "declare ptr      @hl_read_line()                   ; -> hl_str* (one line, CRLF stripped)\n"
+    + "\n"
+    + "declare i1       @hl_net_lookup(ptr, ptr)           ; (host, out_ip) -> success\n"
+    + "declare i64      @hl_net_tcp_connect(ptr, i64)       ; (host, port) -> fd\n"
+    + "declare i64      @hl_net_tcp_listen(ptr, i64, i64)   ; (host, port, backlog) -> fd\n"
+    + "declare i64      @hl_net_tcp_accept(i64)             ; (fd) -> client_fd\n"
+    + "declare ptr      @hl_net_read(i64, i64)              ; (fd, n) -> fresh str\n"
+    + "declare i64      @hl_net_write(i64, ptr)             ; (fd, data) -> bytes_written\n"
+    + "declare void     @hl_net_close(i64)                  ; (fd)\n"
+    + "declare i64      @hl_net_udp_open()                  ; -> fd\n"
+    + "declare i64      @hl_net_udp_send_to(i64, ptr, i64, ptr) ; (fd, host, port, data)\n"
+    + "declare ptr      @hl_net_udp_recv_from(i64, i64)     ; (fd, n) -> fresh str\n"
+    + "declare ptr      @hl_net_tls_get(ptr, i64, ptr)      ; (host, port, path) -> fresh str\n"
+    + "declare i64      @hl_rand_int(i64)                  ; (max_exclusive) -> [0, max)\n"
+    + "declare double   @hl_rand_float()\n"
+    + "declare void     @hl_rand_seed(i64)\n"
+    + "declare i64      @hl_proc_exec(ptr)                 ; (cmd) -> exit code\n"
+    + "declare i64      @hl_proc_spawn(ptr, ptr, i64, i64, i64)  ; (program, args, stdin_kind, stdout_kind, stderr_kind) -> pid\n"
+    + "declare i64      @hl_proc_wait(i64)                     ; (pid) -> exit_status\n"
+    + "declare i64      @hl_proc_kill(i64)                     ; (pid) -> 0 / -1\n"
+    + "declare i64      @hl_proc_child_write(i64, ptr)         ; (pid, data) -> bytes_written\n"
+    + "declare ptr      @hl_proc_child_read(i64, i64, i64)     ; (pid, fd_kind, n) -> fresh str\n"
+    + "declare i64      @hl_proc_child_close(i64, i64)         ; (pid, fd_kind) -> 0 / -1\n"
+    + "declare ptr      @hl_env_get(ptr)                     ; (key) -> fresh str\n"
+    + "declare i1       @hl_env_has(ptr)                      ; (key) -> bool\n"
+    + "declare void     @hl_env_set(ptr, ptr)                ; (key, value)\n"
+    + "declare void     @hl_env_unset(ptr)                   ; (key)\n"
+    + "declare ptr      @hl_cwd_get()                        ; -> fresh str\n"
+    + "declare i64      @hl_cwd_set(ptr)                     ; (path) -> 0 / -1\n"
+    + "declare i64      @hl_instant_now_ns()                  ; -> monotonic ns\n"
+    + "declare i64      @hl_system_time_now_ms()              ; -> wall-clock ms\n"
+    + "declare double   @hl_math_sin(double)                  ; sin\n"
+    + "declare double   @hl_math_cos(double)                  ; cos\n"
+    + "declare double   @hl_math_tan(double)                  ; tan\n"
+    + "declare double   @hl_math_asin(double)                 ; asin\n"
+    + "declare double   @hl_math_acos(double)                 ; acos\n"
+    + "declare double   @hl_math_atan(double)                 ; atan\n"
+    + "declare double   @hl_math_atan2(double, double)        ; atan2(y, x)\n"
+    + "declare double   @hl_math_sinh(double)                 ; sinh\n"
+    + "declare double   @hl_math_cosh(double)                 ; cosh\n"
+    + "declare double   @hl_math_tanh(double)                 ; tanh\n"
+    + "declare double   @hl_math_exp(double)                  ; exp\n"
+    + "declare double   @hl_math_log(double)                  ; natural log\n"
+    + "declare double   @hl_math_log10(double)                ; log10\n"
+    + "declare double   @hl_math_log2(double)                 ; log2\n"
+    + "declare double   @hl_math_pow(double, double)          ; pow(base, exp)\n"
+    + "declare double   @hl_math_sqrt(double)                 ; sqrt\n"
+    + "declare double   @hl_math_cbrt(double)                 ; cube root\n"
+    + "declare double   @hl_math_hypot(double, double)        ; sqrt(x*x+y*y)\n"
+    + "declare double   @hl_math_fmod(double, double)         ; C fmod\n"
+    + "declare double   @hl_math_erf(double)                  ; error function\n"
+    + "declare double   @hl_math_erfc(double)                 ; complementary erf\n"
+    + "declare double   @hl_math_tgamma(double)               ; gamma function\n"
+    + "declare double   @hl_math_lgamma(double)               ; log|gamma(x)|\n"
+    + "declare i1       @hl_math_isnan(double)                ; IEEE-754 isnan\n"
+    + "declare i1       @hl_math_isinf(double)                ; IEEE-754 isinf\n"
+    + "declare i1       @hl_math_isfinite(double)             ; IEEE-754 isfinite\n"
+    + "declare i1       @hl_math_signbit(double)              ; IEEE-754 signbit\n"
+    + "declare double   @hl_math_copysign(double, double)     ; copysign(x, y)"
+}
+
+# ll_intrinsics_block() — the intrinsic declares.
+fn ll_intrinsics_block() -> str {
+    return "declare { i64, i1 } @llvm.sadd.with.overflow.i64(i64, i64)\n"
+    + "declare { i64, i1 } @llvm.ssub.with.overflow.i64(i64, i64)\n"
+    + "declare { i64, i1 } @llvm.smul.with.overflow.i64(i64, i64)\n"
+    + "declare double     @llvm.fabs.f64(double)"
+}
+
+# ----------------------------------------------------------------------------
+# Module assembly + the public entry points.
+# ----------------------------------------------------------------------------
+
+# ll_push_block(em, text) — push a prelude block's lines (the tracker
+# is inert on declares and comments).
+fn ll_push_block(em: LLEmit, text: str) -> void {
+    let lines: list[str] = text.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        ll_emit(em, lines.get(i))
+        i = i + 1
+    }
+}
+
+# ll_module(ctx, triple, feature, keep, lto) — the complete .ll text.
+# keep is the LTO reachability set (unused when lto is false); generic
+# originals are never emitted (their concrete instantiations belong to
+# the C backend's mangling, the alpha LLVM subset refuses them).
+fn ll_module(ctx: Ctx, triple: str, feature: str, keep: list[str], lto: bool) -> str {
+    let em: LLEmit = ll_new(ctx, triple, feature)
+    if triple != "" {
+        ll_emit(em, "target triple = \"" + triple + "\"")
+        ll_emit(em, "")
+    }
+    ll_push_block(em, ll_runtime_block())
+    ll_emit(em, "")
+    ll_push_block(em, ll_intrinsics_block())
+    ll_emit(em, "")
+    # the panic message constant ("integer overflow" + NUL = 17 bytes)
+    ll_emit(em, "@.panic_overflow_msg = private unnamed_addr constant [17 x i8] c\"integer overflow\\00\"")
+    ll_emit(em, "")
+    # extern "C" declarations become declare lines (BUG-DS4-6: never
+    # broken defines that shadow the real libc symbols); externs are
+    # kept unconditionally in both modes (lto.py's law)
+    let extern_lines: list[str] = []
+    let mut i: int = 0
+    while i < ctx.fn_order.len() {
+        let key: str = ctx.fn_order.get(i)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        if f.name == key && f.is_extern {
+            let mut param_tys: str = ""
+            let mut p: int = 0
+            while p < f.ptypes.len() {
+                if p > 0 {
+                    param_tys = param_tys + ", "
+                }
+                param_tys = param_tys + ll_type(f.ptypes.get(p))
+                p = p + 1
+            }
+            extern_lines.push("declare " + ll_type(f.ret) + " @" + key
+            + "(" + param_tys + ")")
+        }
+        i = i + 1
+    }
+    let mut e: int = 0
+    while e < extern_lines.len() {
+        ll_emit(em, extern_lines.get(e))
+        e = e + 1
+    }
+    if extern_lines.len() > 0 {
+        ll_emit(em, "")
+    }
+    # the defines
+    i = 0
+    while i < ctx.fn_order.len() {
+        let key: str = ctx.fn_order.get(i)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        if f.name != key || f.is_extern || f.typeparams.len() > 0 {
+            i = i + 1
+            continue
+        }
+        if lto && key != "main" && !list_has(keep, key) {
+            i = i + 1
+            continue
+        }
+        ll_function(em, key, f)
+        i = i + 1
+    }
+    # the string constants, spliced after the 4th blank line (right
+    # after the prelude's last separator)
+    if em.str_names.len() > 0 {
+        let mut insert_at: int = -1
+        let mut blank_count: int = 0
+        let mut li: int = 0
+        while li < em.lines.len() {
+            if em.lines.get(li) == "" {
+                blank_count = blank_count + 1
+                if blank_count == 4 {
+                    insert_at = li + 1
+                    break
+                }
+            }
+            li = li + 1
+        }
+        if insert_at < 0 {
+            insert_at = em.lines.len()
+        }
+        let new_lines: list[str] = []
+        let mut j: int = 0
+        while j < insert_at {
+            new_lines.push(em.lines.get(j))
+            j = j + 1
+        }
+        let mut s: int = 0
+        while s < em.str_names.len() {
+            new_lines.push("@" + em.str_names.get(s)
+            + " = private unnamed_addr constant ["
+            + (em.str_lens.get(s) + 1).to_str() + " x i8] ["
+            + em.str_bytes.get(s) + "]")
+            s = s + 1
+        }
+        new_lines.push("")
+        let mut k: int = insert_at
+        while k < em.lines.len() {
+            new_lines.push(em.lines.get(k))
+            k = k + 1
+        }
+        em.lines = new_lines
+    }
+    # the attributes block (LLVM requires it after the declarations
+    # that reference it)
+    ll_emit(em, "attributes #0 = { noreturn }")
+    ll_emit(em, "")
+    let mut out: str = ""
+    let mut n: int = 0
+    while n < em.lines.len() {
+        if n > 0 {
+            out = out + "\n"
+        }
+        out = out + em.lines.get(n)
+        n = n + 1
+    }
+    return out + "\n"
+}
+
+# ----------------------------------------------------------------------------
+# The entry points — what hlboot's --emit flags call.
+# ----------------------------------------------------------------------------
+
+# TyVal2 — the (text, report) pair hlemit_lto returns.
+struct TyVal2 {
+    text: str,
+    report: str
+}
+
+# hlemit_ir(ctx) — the HLIR text of every non-extern function.
+fn hlemit_ir(ctx: Ctx) -> str {
+    if he_uses_concurrency(ctx) {
+        panic("concurrency (Chan[T] / Task[R] / spawn / chan_new / select) is "
+        + "not yet supported by the --emit ir path - Stage 16 ships in the C "
+        + "backend and the interpreter only")
+    }
+    let ir: IrEmit = ir_new(ctx)
+    let mut i: int = 0
+    while i < ctx.fn_order.len() {
+        let key: str = ctx.fn_order.get(i)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        # extern fns are declarations, not definitions (BUG-DS4-11);
+        # generic originals are the C backend's instantiations
+        if f.name == key && !f.is_extern && f.typeparams.len() == 0 {
+            ir_fn(ir, key, f)
+        }
+        i = i + 1
+    }
+    let mut out: str = ""
+    let mut n: int = 0
+    while n < ir.out.len() {
+        if n > 0 {
+            out = out + "\n"
+        }
+        out = out + ir.out.get(n)
+        n = n + 1
+    }
+    return out
+}
+
+# hlemit_llvm(ctx, triple, feature) — the plain .ll text.
+fn hlemit_llvm(ctx: Ctx, triple: str, feature: str) -> str {
+    return ll_module(ctx, triple, feature, [], false)
+}
+
+# hlemit_lto(ctx, triple, feature) — the DCE'd whole-program .ll text
+# (reachability through the compiler's own lto_reachable) plus the
+# report line for stderr.
+fn hlemit_lto(ctx: Ctx, triple: str, feature: str) -> TyVal2 {
+    let reach: list[str] = lto_reachable(ctx)
+    let text: str = ll_module(ctx, triple, feature, reach, true)
+    # the stats over the declaration order: kept / dropped / reachable
+    let mut kept: int = 0
+    let mut dropped: int = 0
+    let mut i: int = 0
+    while i < ctx.fn_order.len() {
+        let key: str = ctx.fn_order.get(i)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        if f.name != key || f.is_extern || f.typeparams.len() > 0 {
+            i = i + 1
+            continue
+        }
+        if key == "main" || list_has(reach, key) {
+            kept = kept + 1
+        } else {
+            dropped = dropped + 1
+        }
+        i = i + 1
+    }
+    let report: str = "== lto: " + kept.to_str() + " functions kept, "
+    + dropped.to_str() + " dropped (unreachable), " + reach.len().to_str()
+    + " reachable keys =="
+    return TyVal2 {
+        text: text, report: report
+    }
+}
+
+# ----------------------------------------------------------------------------
+# End of tools/hlemit.hls
+# ============================================================================

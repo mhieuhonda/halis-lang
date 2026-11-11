@@ -1049,7 +1049,7 @@ now a keyword and cannot be a struct literal field name).
 
 ### 18.2. The `--audit` flag
 
-`hlc --audit <file.hls>` and `boot.py --audit <file.hls>` print the
+`hlc --audit <file.hls>` and `bin/hlboot --audit <file.hls>` print the
 full capability / effect tree of every function in the program:
 
 - Declared effects (or `pure`) per function.
@@ -1222,10 +1222,10 @@ it is the Stage 11 release target.
 
 ### 20.5. CLI flags
 
-- `boot.py --emit ir FILE.hls` — print the HLIR of every function.
-- `boot.py --opt-stats FILE.hls` — run the optimiser, print per-pass
-  statistics (instructions before / after / removed, per function and
-  total).
+- `bin/hlboot --emit ir FILE.hls` — print the HLIR of every function
+  (tools/hlemit.hls, the printer on the compiler's own front-end).
+- `hlc --opt-stats FILE.hls` — run the optimiser, print per-pass
+  statistics (self-hosted: the compiler's own pipeline).
 
 ## 21. LLVM IR text backend
 
@@ -1254,7 +1254,9 @@ before `sdiv`/`srem`. Float arithmetic uses `fadd`/`fsub`/`fmul`/`fdiv`/
 
 ### 21.3. CLI flags
 
-- `boot.py --emit llvm FILE.hls` — print the LLVM IR of the program.
+- `bin/hlboot --emit llvm FILE.hls` — print the LLVM IR of the program.
+- `bin/hlboot --emit lto FILE.hls` — print the whole-program LTO'd
+  (DCE'd) LLVM IR; the keep/drop report line rides stderr.
 - `--target TRIPLE` — set the LLVM target triple (e.g. `aarch64-linux`).
 
 ### 21.4. Limitations
@@ -2755,8 +2757,8 @@ the emitted assembly uses <= 256 bytes of stack.
 
 The acceptance gate (`make stack-acceptance`) verifies:
 
-1. The HLS file parses with all three attributes (via `tools/hlinterp/boot.py`
-   and via the native `bin/hlc`).
+1. The HLS file parses with all three attributes (via the Stage-0
+   evaluator `bin/hlboot` and via the native `bin/hlc`).
 2. The C source contains `__attribute__((interrupt))` on the
    `handle_irq` and `handle_irq_minimal` functions.
 3. The C source compiles cleanly under the freestanding build

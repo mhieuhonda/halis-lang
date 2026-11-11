@@ -118,7 +118,7 @@ $(BIN)/hllint: tools/hllint.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc
 # same batch wire, same verdicts — the differential oracle every suite
 # leg spawns, built by the bootstrap's own compiler on the shared
 # front-end tools/hlfront.hls links).
-$(BIN)/hlboot: tools/hlboot.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+$(BIN)/hlboot: tools/hlboot.hls tools/hlfront.hls tools/hlemit.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
 	@mkdir -p $(BIN)
 	@echo "[hlboot] hlc compiles the Stage-0 evaluator (self-hosted, no python)..."
 	@$(BIN)/hlc tools/hlboot.hls $@.c
@@ -424,9 +424,8 @@ snapshot-prove: $(BIN)/hls-snap
 # The acceptance gates, self-hosted: every tests/acc/*_acceptance.hls
 # battery is compiled NATIVE by bin/hlc + cc and run as a binary —
 # the gate itself is Halis, the way the kit is. A gate may still
-# spawn python3 tools/hlinterp/boot.py where a leg exercises the
-# interpreter BY DESIGN (the differential oracle) or a Python tool
-# that has not moved yet; the harness is tests/acc/harness.hls and
+# spawn a Python tool that has not moved yet (the fleet is mid-
+# migration); the harness is tests/acc/harness.hls and
 # the scratch world lives under tests/.acc-scratch/ (gitignored,
 # wiped per run). The mk/*.mk targets depend on $(BIN)/acc-<gate>.
 $(BIN)/acc-%: tests/acc/%_acceptance.hls tests/acc/harness.hls $(wildcard std/*.hls) $(BIN)/hlfmt $(BIN)/hllint $(BIN)/hlboot | $(BIN)/hlc
@@ -566,14 +565,16 @@ audit:
 	@$(BIN)/hlc --audit $(F)
 
 # Stage 11 (v0.9.0-alpha): print the HLIR of a program. Lab
-# tooling: the interpreter's printer, off every build path.
-emit-ir:
-	@$(PYTHON) tools/hlinterp/boot.py --emit ir $(F)
+# tooling: hlboot's printer over the compiler's own front-end
+# (tools/hlemit.hls), off every build path.
+emit-ir: $(BIN)/hlboot
+	@$(BIN)/hlboot --emit ir $(F)
 
 # Stage 12 (v0.10.0-alpha): print the LLVM IR of a program. Lab
-# tooling: the interpreter's printer, off every build path.
-emit-llvm:
-	@$(PYTHON) tools/hlinterp/boot.py --emit llvm $(F)
+# tooling: hlboot's printer over the compiler's own front-end
+# (tools/hlemit.hls), off every build path.
+emit-llvm: $(BIN)/hlboot
+	@$(BIN)/hlboot --emit llvm $(F)
 
 # Stage 11: run the optimiser and print per-pass statistics
 # (self-hosted: hlc --opt-stats)

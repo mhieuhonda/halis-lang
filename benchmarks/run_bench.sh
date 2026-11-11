@@ -12,18 +12,21 @@
 # ============================================================================
 set -u
 cd "$(dirname "$0")/.."
+# The Stage-0 legs ride the self-hosted evaluator (bin/hlboot) -
+# built on demand, the way the make targets demand it.
+test -x bin/hlboot || make -s bin/hlboot
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT INT TERM HUP
 
 run_interp() {
     local f="$1"
-    echo "  [interp]    $(python3 tools/hlinterp/boot.py "$f" 2>/dev/null)"
+    echo "  [interp]    $(./bin/hlboot "$f" 2>/dev/null)"
 }
 
 run_native_stage0() {
     local f="$1"
     local name=$(basename "$f" .hls)
-    if python3 tools/hlinterp/boot.py src/hlc.hls "$f" "$TMP/$name.c" >/dev/null 2>&1; then
+    if ./bin/hlboot src/hlc.hls "$f" "$TMP/$name.c" >/dev/null 2>&1; then
         if gcc -O2 -o "$TMP/$name.bin" "$TMP/$name.c" -lm -pthread 2>/dev/null; then
             echo "  [native s0] $("$TMP/$name.bin" 2>/dev/null)"
         else
@@ -39,7 +42,7 @@ run_native_self() {
     local name=$(basename "$f" .hls)
     # Use the bootstrap chain to get a native hlc.
     if [ ! -x "$TMP/hlc_native" ]; then
-        python3 tools/hlinterp/boot.py src/hlc.hls src/hlc.hls "$TMP/hlc_s1.c" >/dev/null 2>&1
+        ./bin/hlboot src/hlc.hls src/hlc.hls "$TMP/hlc_s1.c" >/dev/null 2>&1
         gcc -O2 -o "$TMP/hlc_native" "$TMP/hlc_s1.c" -lm -pthread 2>/dev/null
     fi
     if "$TMP/hlc_native" "$f" "$TMP/$name.self.c" >/dev/null 2>&1; then
