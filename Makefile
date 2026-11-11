@@ -179,6 +179,18 @@ $(BIN)/hls-sbom: tools/hls-sbom.hls $(wildcard std/*.hls) $(wildcard core/*.hls)
 	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
 	@rm -f $@.c
 
+# hls-xdiff — the Stage 133 cross-implementation differential suite,
+# in Halis (the native twin of the Python hls-xdiff that retired; the
+# llvm leg rides the native bin/ll_validate — the .py still spawned
+# the retired Python validator — and the module-driver leg of the gate
+# imports a stripped copy of this file, fn main cut).
+$(BIN)/hls-xdiff: tools/hls-xdiff.hls $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hls-xdiff] hlc compiles the cross-impl differential suite (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hls-xdiff.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
 # hls-rt — the soft-real-time verifier, in Halis (the native twin of
 # the Python hls-rt that retired; the module-driver legs of the gate
 # import a stripped copy of this file, fn main cut).
@@ -907,10 +919,10 @@ lts-policy-acceptance: $(BIN)/acc-lts_policy $(BIN)/hls-lts
 # the fast core (every verdict class in ~a minute); `make
 # xdiff-acceptance` is the gate: eight sections over the real CLI,
 # the real backends and the negative space of the ledger law.
-xdiff:
-	@$(PYTHON) tools/hls-xdiff.py --core
+xdiff: $(BIN)/hls-xdiff
+	@$(BIN)/hls-xdiff --core
 
-xdiff-acceptance: $(BIN)/acc-xdiff bin/hlc
+xdiff-acceptance: $(BIN)/acc-xdiff $(BIN)/hls-xdiff $(BIN)/ll_validate bin/hlc
 	@echo "[Stage 133 acceptance] running tests/acc/xdiff_acceptance.hls..."
 	@$(BIN)/acc-xdiff
 	@echo "ACCEPTANCE OK: Stage 133 -- cross-impl differential suite (3+ backends)"

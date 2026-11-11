@@ -626,12 +626,12 @@ LEDGER = [
         "implementations and diffs; hls-xdiff sits the corpus in "
         "front of three executing backends and compares bytes and "
         "halt classes against the ledger.",
-        "enforced_by": "tests/suites/suite_02_differential.sh + "
-                       "tools/hls-xdiff.py",
+        "enforced_by": "tests/acc/suite_02_differential_acceptance.hls + "
+                       "tools/hls-xdiff.hls (bin/hls-xdiff)",
         "anchors": [
-            ("tests/suites/suite_02_differential.sh",
+            ("tests/acc/suite_02_differential_acceptance.hls",
              "native vs interpreter"),
-            ("tools/hls-xdiff.py", "ledger"),
+            ("tools/hls-xdiff.hls", "ledger"),
         ],
         "probes": [],
         "violation":

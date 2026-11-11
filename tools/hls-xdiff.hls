@@ -1,0 +1,3676 @@
+# ============================================================================
+# tools/hls-xdiff.hls — the Stage 133 cross-implementation differential
+# suite, in Halis (the native twin of the Python hls-xdiff that retired;
+# same CLI, same verdict lattice, same ledger law — driven through
+# bin/hls-xdiff, built by the bootstrap's own compiler).
+# ----------------------------------------------------------------------------
+# Usage:
+#   bin/hls-xdiff                     # the default sweep over the purity-gated corpus
+#   bin/hls-xdiff --core              # the curated core corpus (fast; every verdict class)
+#   bin/hls-xdiff --file <prog.hls>   # one program, every available backend
+#   bin/hls-xdiff --backends interp,native,wasm
+#   bin/hls-xdiff --discover          # the purity census, no legs run
+#   bin/hls-xdiff --list              # print the corpus, no legs run
+#   bin/hls-xdiff --json report.json  # machine-readable report
+#   bin/hls-xdiff --update-ledger     # draft waiver entries for the diverging set
+#   bin/hls-xdiff selftest            # normalizer + verdict vectors, no backends
+#
+# The backends (four registered, three executing):
+#
+#   interp  python3 tools/hlinterp/boot.py <file>   the reference implementation
+#                                                   (lab tooling, spawned as a child)
+#   native  bin/hlc <file> <c> + gcc -O2 + run     the shipped compiler
+#   wasm    python3 tools/hlwasm.py + node          the wasm32 backend
+#   llvm    boot.py --emit llvm + bin/ll_validate   STATIC — structural validation
+#                                                   (+ llvm-as when installed); the llvm
+#                                                   leg never executes here, it
+#                                                   participates in the report as a
+#                                                   validated static leg and the report
+#                                                   says so, in those words.
+#
+# The oracle. Two channels are compared across every pair of executing
+# legs: the program's stdout BYTES and its exit code. stdout: exact byte
+# equality is the goal; where backends differ only in REPRESENTATION
+# (printf's "0.750000" vs the JS glue's "0.75") the channel
+# canonicalizer maps both sides onto one numeric form — round to the
+# printf channel's 6 decimal places, Python's shortest-round-trip
+# repr, exponent forms normalized, +/-nan folded to nan, the sign of
+# zero dropped — and the verdict records `normalized` instead of
+# `exact`. Short decimal forms ("1.5"), version strings ("1.10") and
+# integers ("9007199254740993") are NEVER rewritten: a divergence
+# between those is real, and the canonicalizer refuses to launder it.
+# Exit codes: equal codes compare exactly; where a backend HALTS, the
+# halt classes are compared as classes (the wasm alpha halts every
+# panic/abort/exit(N) through one `unreachable` trap — exit codes are
+# not propagated — so hosted-101 + wasm-trap is panic-equal, a uniform
+# hosted N + wasm-trap is a named halt-gap, one side clean and another
+# halted is the loudest divergence the suite owns).
+#
+# The verdict lattice (per program): exact | normalized | panic-equal |
+# halt-gap | unpaired | skipped | divergence | error. The run is GREEN
+# when there is no unexplained divergence and no unledgered error, and
+# the ledger is consistent; `--strict` demotes `normalized` and
+# `halt-gap` to failures for auditing the byte-exact frontier.
+#
+# The ledger (tests/xdiff/ledger.json) is two-way: a divergence the
+# ledger names is SANCTIONED (the run stays green, the diagnosis is
+# quoted back); a ledgered program that now compares clean is STALE
+# (trim the ledger); a ledgered program whose observed per-backend
+# states no longer match the entry is a REGRESSION (re-diagnose); and
+# an unledgered divergence is the alarm this stage exists to wire.
+# `--update-ledger` drafts entries; the tool never writes the file.
+#
+# The purity gate. A program is differential-eligible only when its
+# output is a function of its source: crate modes (#![freestanding]
+# and friends) have no hosted main; imports of time/env/net/fs/...
+# (read the gate's deny table) make output environment- or
+# wall-clock-dependent. Eligibility is decided by scanning the SOURCE
+# (imports + impure builtins), the reason for every exclusion is NAMED
+# in the report, and `--all` lifts the gate for auditing.
+#
+# Corpus: tests/ok (the acceptance corpus every release ships) plus
+# tests/xdiff (fixtures written FOR the cross-impl table). `--core`
+# runs the curated subset that exercises every verdict class on every
+# executing backend; the default sweep is the whole gated corpus.
+#
+# Native notes, in place of the .py's fine print:
+#   - legs run sequentially (--jobs is accepted and recorded, the run
+#     is one lane; the .py's ThreadPoolExecutor retired with the GIL);
+#   - no per-leg alarm exists in the runtime yet (--timeout is
+#     accepted and recorded; the CI job's own timeout is the backstop,
+#     the same discipline tests/acc/harness.hls documents);
+#   - signalled children arrive as 128+signum from proc_wait and are
+#     classified as crashes, the .py's negative-code class;
+#   - the canonicalizer works on BYTES (the .py decoded utf-8 with
+#     replacement first; corpus output is clean UTF-8 either way).
+#
+# Exit codes: 0 = green (every executing pair agreed, or its divergence
+# is ledgered; the ledger is consistent; at least two executing backends
+# participated); 1 = not green; 2 = usage error. Run from the repo
+# root — the legs resolve bin/hlc, bin/ll_validate and tools/ against
+# it, loudly.
+# ============================================================================
+
+import "std.str"
+import "std.json"
+import "std.result"
+import "std.sha256"
+import "std.env"
+
+# ============================================================================
+# Constants.
+# ============================================================================
+
+fn tool_version() -> str {
+    return "0.151.0-alpha"
+}
+
+fn boot_py() -> str {
+    return "tools/hlinterp/boot.py"
+}
+
+fn hlwasm_py() -> str {
+    return "tools/hlwasm.py"
+}
+
+fn ll_validate_bin() -> str {
+    return "bin/ll_validate"
+}
+
+fn hlc_bin() -> str {
+    return "bin/hlc"
+}
+
+fn ledger_default() -> str {
+    return "tests/xdiff/ledger.json"
+}
+
+fn ok_dir() -> str {
+    return "tests/ok"
+}
+
+fn xdiff_dir() -> str {
+    return "tests/xdiff"
+}
+
+fn default_backends() -> str {
+    return "interp,native,wasm,llvm"
+}
+
+fn is_executing_backend(b: str) -> bool {
+    return b == "interp" || b == "native" || b == "wasm"
+}
+
+fn is_known_backend(b: str) -> bool {
+    return b == "interp" || b == "native" || b == "wasm" || b == "llvm"
+}
+
+# ============================================================================
+# Small text helpers (the Python bytes idioms the .py leaned on).
+# ============================================================================
+
+# is_py_ws(c) — the bytes str.strip() set: space, \t, \n, \r, \v, \f.
+fn is_py_ws(c: int) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12
+}
+
+# strip_py(s) — Python's bytes.strip() on both ends.
+fn strip_py(s: str) -> str {
+    let mut a: int = 0
+    let n: int = s.len()
+    while a < n && is_py_ws(s.byte_at(a)) {
+        a = a + 1
+    }
+    let mut b: int = n
+    while b > a && is_py_ws(s.byte_at(b - 1)) {
+        b = b - 1
+    }
+    return s.slice(a, b)
+}
+
+# split_lines_py(s) — bytes.splitlines(): boundaries at \n, \r and
+# \r\n (the pair is ONE boundary), no trailing empty piece.
+fn split_lines_py(s: str) -> list[str] {
+    let out: list[str] = []
+    let n: int = s.len()
+    let mut i: int = 0
+    let mut start: int = 0
+    while i < n {
+        let c: int = s.byte_at(i)
+        if c == 10 {
+            out.push(s.slice(start, i))
+            i = i + 1
+            start = i
+        } else if c == 13 {
+            out.push(s.slice(start, i))
+            i = i + 1
+            if i < n && s.byte_at(i) == 10 {
+                i = i + 1
+            }
+            start = i
+        } else {
+            i = i + 1
+        }
+    }
+    if start < n {
+        out.push(s.slice(start, n))
+    }
+    return out
+}
+
+# clip_str(s, n) — Python's s[:n] (negative-safe is not needed here;
+# callers pass 80/110/160/200/400).
+fn clip_str(s: str, n: int) -> str {
+    if n <= 0 {
+        return ""
+    }
+    if s.len() <= n {
+        return s
+    }
+    return s.slice(0, n)
+}
+
+# pad_right(s, w) — the %-Ns law.
+fn pad_right(s: str, w: int) -> str {
+    let mut out: str = s
+    while out.len() < w {
+        out = out + " "
+    }
+    return out
+}
+
+# first_line(text) — the first non-empty line, trimmed, clipped to 160.
+fn first_line(text: str) -> str {
+    let lines: list[str] = split_lines_py(text)
+    let mut i: int = 0
+    while i < lines.len() {
+        let t: str = strip_py(lines.get(i))
+        if t != "" {
+            return clip_str(t, 160)
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# tail_line(text) — the last non-empty line, trimmed, clipped to 200.
+fn tail_line(text: str) -> str {
+    let lines: list[str] = split_lines_py(text)
+    let mut i: int = lines.len() - 1
+    while i >= 0 {
+        let t: str = strip_py(lines.get(i))
+        if t != "" {
+            return clip_str(t, 200)
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+# py_repr_str(s) — Python's repr() for the strings this tool embeds in
+# detail lines: single quotes, backslash and quote escaped, the common
+# control bytes named, the rest passed through as bytes.
+fn py_repr_str(s: str) -> str {
+    let mut out: str = "'"
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c == 39 {
+            out = out + "\\'"
+        } else if c == 92 {
+            out = out + "\\\\"
+        } else if c == 10 {
+            out = out + "\\n"
+        } else if c == 9 {
+            out = out + "\\t"
+        } else if c == 13 {
+            out = out + "\\r"
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out + "'"
+}
+
+# ============================================================================
+# The channel canonicalizer — pass one: nan / inf words.
+# ============================================================================
+# _NAN_RE / _INF_RE, case-insensitive, word-bounded (a lookbehind and a
+# lookahead of not-[A-Za-z0-9_.]) so identifiers and version strings
+# never fold: "nan"/"NaN"/"-nan" -> "nan" (the sign is noise);
+# "inf"/"Infinity"/"-inf" -> "inf"/"-inf" (the minus sign is kept, a
+# plus sign is dropped).
+
+fn is_word_byte(c: int) -> bool {
+    return(c >= 97 && c <= 122) || (c >= 65 && c <= 90)
+    || (c >= 48 && c <= 57) || c == 95
+}
+
+# ci3(s, i, a, b, c) — the 3 bytes at i match a/b/c case-insensitively.
+fn ci3(s: str, i: int, a: int, b: int, c: int) -> bool {
+    if i + 2 >= s.len() {
+        return false
+    }
+    let x0: int = lower_ascii(s.byte_at(i))
+    let x1: int = lower_ascii(s.byte_at(i + 1))
+    let x2: int = lower_ascii(s.byte_at(i + 2))
+    return x0 == a && x1 == b && x2 == c
+}
+
+fn lower_ascii(c: int) -> int {
+    if c >= 65 && c <= 90 {
+        return c + 32
+    }
+    return c
+}
+
+# boundary_ok(s, i) — the regex lookbehind/lookahead law: the byte at
+# i (either side of a token) must not be [A-Za-z0-9_.]; positions off
+# the string ends are boundaries.
+fn boundary_ok(s: str, i: int) -> bool {
+    if i < 0 || i >= s.len() {
+        return true
+    }
+    let c: int = s.byte_at(i)
+    return !is_word_byte(c) && c != 46
+}
+
+# canon_nan_inf(s) — the word pass over the whole text.
+fn canon_nan_inf(s: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    let n: int = s.len()
+    while i < n {
+        let c: int = s.byte_at(i)
+        let mut sign: int = 0
+        let mut j: int = i
+        if c == 43 || c == 45 {
+            sign = c
+            j = i + 1
+        }
+        if j < n && boundary_ok(s, i - 1) {
+            # "nan" — the sign folds away.
+            if ci3(s, j, 110, 97, 110) && boundary_ok(s, j + 3) {
+                out = out + "nan"
+                i = j + 3
+                continue
+            }
+            # "infinity" (greedy) then "inf" — the minus is kept, the
+            # plus folds.
+            if ci3(s, j, 105, 110, 102) {
+                let mut end: int = j + 3
+                if j + 8 <= n - 0 {
+                    # "inity" following? match ci on all five bytes.
+                    if lower_ascii(s.byte_at(j + 3)) == 105
+                    && lower_ascii(s.byte_at(j + 4)) == 110
+                    && lower_ascii(s.byte_at(j + 5)) == 105
+                    && lower_ascii(s.byte_at(j + 6)) == 116
+                    && lower_ascii(s.byte_at(j + 7)) == 121 {
+                        end = j + 8
+                    }
+                }
+                if boundary_ok(s, end) {
+                    if sign == 45 {
+                        out = out + "-inf"
+                    } else {
+                        out = out + "inf"
+                    }
+                    i = end
+                    continue
+                }
+            }
+        }
+        out = out + s.slice(i, i + 1)
+        i = i + 1
+    }
+    return out
+}
+
+# ============================================================================
+# The channel canonicalizer — pass two: float tokens.
+# ============================================================================
+# _FLOAT_RE: (?<![\w.])([-+]?(?:\d+\.\d*(?:[eE][-+]?\d+)?|\.\d+(?:[
+# eE][-+]?\d+)?|\d+[eE][-+]?\d+))(?![\w.]) — a float literal needs a
+# decimal point or an exponent; bare integers are never touched. The
+# scanner below walks each start position and tries the alternation's
+# candidates in the engine's own order (digits '.' digits* [exp], then
+# the same without the exponent, then .digits [exp], then digits exp);
+# every shrink of the digit runs only ever exposes another word byte,
+# so the maximal candidates are the only ones that can pass the
+# lookahead — the scan is the regex, not an approximation of it.
+
+fn is_digit_byte(c: int) -> bool {
+    return c >= 48 && c <= 57
+}
+
+# digit_run(s, i) — the index of the first non-digit at or after i.
+fn digit_run(s: str, i: int) -> int {
+    let mut j: int = i
+    while j < s.len() && is_digit_byte(s.byte_at(j)) {
+        j = j + 1
+    }
+    return j
+}
+
+# match_exp(s, i) — [eE][-+]?\d+ at i, or -1 when absent.
+fn match_exp(s: str, i: int) -> int {
+    let n: int = s.len()
+    if i >= n {
+        return -1
+    }
+    let c: int = s.byte_at(i)
+    if c != 101 && c != 69 {
+        return -1
+    }
+    let mut j: int = i + 1
+    if j < n {
+        let sc: int = s.byte_at(j)
+        if sc == 43 || sc == 45 {
+            j = j + 1
+        }
+    }
+    if j >= n || !is_digit_byte(s.byte_at(j)) {
+        return -1
+    }
+    return digit_run(s, j)
+}
+
+# try_float_at(s, i) — the end index of a _FLOAT_RE match starting at
+# i, or -1. The sign (when present and the lookbehind holds) is part
+# of the match; the alternation order is the engine's.
+fn try_float_at(s: str, i: int) -> int {
+    let n: int = s.len()
+    if i >= n {
+        return -1
+    }
+    if !boundary_ok(s, i - 1) {
+        return -1
+    }
+    let mut j: int = i
+    let c: int = s.byte_at(i)
+    if c == 43 || c == 45 {
+        j = i + 1
+    }
+    if j >= n {
+        return -1
+    }
+    let b0: int = s.byte_at(j)
+    if is_digit_byte(b0) {
+        # branch 1: digits '.' digits* [exp]
+        let d1e: int = digit_run(s, j)
+        if d1e < n && s.byte_at(d1e) == 46 {
+            let d2e: int = digit_run(s, d1e + 1)
+            let ee: int = match_exp(s, d2e)
+            if ee >= 0 && boundary_ok(s, ee) {
+                return ee
+            }
+            if boundary_ok(s, d2e) {
+                return d2e
+            }
+            return -1
+        }
+        # branch 3: digits exp (the exponent is required)
+        let ee2: int = match_exp(s, d1e)
+        if ee2 >= 0 && boundary_ok(s, ee2) {
+            return ee2
+        }
+        return -1
+    }
+    if b0 == 46 {
+        # branch 2: '.' digits [exp]
+        let de: int = digit_run(s, j + 1)
+        if de == j + 1 {
+            return -1
+        }
+        let ee3: int = match_exp(s, de)
+        if ee3 >= 0 && boundary_ok(s, ee3) {
+            return ee3
+        }
+        if boundary_ok(s, de) {
+            return de
+        }
+        return -1
+    }
+    return -1
+}
+
+# is_channel_float(tok) — would printf or JS render this token
+# differently from its value? printf("%f") always emits six decimals
+# (any token with three or more decimal digits is channel noise); JS
+# emits an exponent below 1e-7 / above 1e21 (any exponent token is
+# channel noise); anything with seven or more integer digits renders
+# in full on the printf channel and abbreviated in JS. One-decimal and
+# two-decimal short forms ("1.5", "3.14") are identical on both
+# channels and stay raw — and version strings ("1.10") keep their
+# digits.
+fn is_channel_float(tok: str) -> bool {
+    let mut body: str = tok
+    while body.len() > 0 {
+        let c: int = body.byte_at(0)
+        if c == 43 || c == 45 {
+            body = body.slice(1, body.len())
+        } else {
+            break
+        }
+    }
+    let mut i: int = 0
+    while i < body.len() {
+        let c: int = body.byte_at(i)
+        if c == 101 || c == 69 {
+            return true
+        }
+        i = i + 1
+    }
+    let ip: str = body
+    let fp: str = ""
+    let dot: int = body.find(".")
+    if dot >= 0 {
+        let parts: list[str] = [body.slice(0, dot), body.slice(dot + 1, body.len())]
+        return is_channel_float_parts(parts.get(0), parts.get(1))
+    }
+    return is_channel_float_parts(ip, fp)
+}
+
+fn is_channel_float_parts(ip: str, fp: str) -> bool {
+    if fp.len() >= 3 {
+        return true
+    }
+    let mut ipnz: str = ip
+    while ipnz.len() > 0 && ipnz.byte_at(0) == 48 {
+        ipnz = ipnz.slice(1, ipnz.len())
+    }
+    if ipnz.len() >= 7 {
+        return true
+    }
+    return false
+}
+
+# ============================================================================
+# Exact float numerics — the .py's float() / round(v, 6) / repr(),
+# reproduced with integer arithmetic so not one digit can drift from
+# the CPython the ledger's verdicts were cut against.
+# ============================================================================
+
+# decompose(v) — v = mant * 2^e exactly, mant in [2^52, 2^53) (the
+# normalized IEEE mantissa scaled to an integer). Returns [mant, e];
+# every step (halving/doubling, the Sterbenz subtraction, the 52
+# fraction extractions) is exact in doubles.
+fn decompose(v: float) -> list[int] {
+    let mut x: float = v
+    let mut e: int = 0
+    while x >= 2.0 {
+        x = x / 2.0
+        e = e + 1
+    }
+    while x < 1.0 {
+        x = x * 2.0
+        e = e - 1
+    }
+    let mut m: int = 0
+    let mut f: float = x - 1.0
+    let mut i: int = 0
+    while i < 52 {
+        m = m * 2
+        f = f * 2.0
+        if f >= 1.0 {
+            m = m + 1
+            f = f - 1.0
+        }
+        i = i + 1
+    }
+    return[4503599627370496 + m, e - 52]
+}
+
+# ---- little-endian 32-bit-limb bignums (list[int], no sign) ----
+
+# big_norm(a) — drop the high zero limbs.
+fn big_norm(a: list[int]) -> list[int] {
+    let mut n: int = a.len()
+    while n > 0 && a.get(n - 1) == 0 {
+        n = n - 1
+    }
+    let out: list[int] = []
+    let mut i: int = 0
+    while i < n {
+        out.push(a.get(i))
+        i = i + 1
+    }
+    return out
+}
+
+# big_from_int(v) — v >= 0.
+fn big_from_int(v: int) -> list[int] {
+    if v == 0 {
+        let z: list[int] = []
+        return z
+    }
+    let out: list[int] = []
+    let mut x: int = v
+    while x > 0 {
+        out.push(x % 4294967296)
+        x = x / 4294967296
+    }
+    return out
+}
+
+# big_is_zero(a)
+fn big_is_zero(a: list[int]) -> bool {
+    return a.len() == 0
+}
+
+# big_copy(a)
+fn big_copy(a: list[int]) -> list[int] {
+    let out: list[int] = []
+    let mut i: int = 0
+    while i < a.len() {
+        out.push(a.get(i))
+        i = i + 1
+    }
+    return out
+}
+
+# big_cmp(a, b) — -1 / 0 / 1.
+fn big_cmp(a: list[int], b: list[int]) -> int {
+    if a.len() > b.len() {
+        return 1
+    }
+    if a.len() < b.len() {
+        return -1
+    }
+    let mut i: int = a.len() - 1
+    while i >= 0 {
+        if a.get(i) > b.get(i) {
+            return 1
+        }
+        if a.get(i) < b.get(i) {
+            return -1
+        }
+        i = i - 1
+    }
+    return 0
+}
+
+# big_add(a, b)
+fn big_add(a: list[int], b: list[int]) -> list[int] {
+    let out: list[int] = []
+    let n: int = a.len()
+    let m: int = b.len()
+    let mut carry: int = 0
+    let mut i: int = 0
+    while i < n || i < m || carry > 0 {
+        let mut t: int = carry
+        if i < n {
+            t = t + a.get(i)
+        }
+        if i < m {
+            t = t + b.get(i)
+        }
+        out.push(t % 4294967296)
+        carry = t / 4294967296
+        i = i + 1
+    }
+    return big_norm(out)
+}
+
+# big_sub(a, b) — a >= b.
+fn big_sub(a: list[int], b: list[int]) -> list[int] {
+    let out: list[int] = []
+    let mut borrow: int = 0
+    let mut i: int = 0
+    while i < a.len() {
+        let mut t: int = a.get(i) - borrow
+        if i < b.len() {
+            t = t - b.get(i)
+        }
+        if t < 0 {
+            t = t + 4294967296
+            borrow = 1
+        } else {
+            borrow = 0
+        }
+        out.push(t)
+        i = i + 1
+    }
+    return big_norm(out)
+}
+
+# big_mul_small(a, m) — m < 2^31.
+fn big_mul_small(a: list[int], m: int) -> list[int] {
+    if m == 0 || a.len() == 0 {
+        let z: list[int] = []
+        return z
+    }
+    let out: list[int] = []
+    let mut carry: int = 0
+    let mut i: int = 0
+    while i < a.len() {
+        let t: int = a.get(i) * m + carry
+        out.push(t % 4294967296)
+        carry = t / 4294967296
+        i = i + 1
+    }
+    while carry > 0 {
+        out.push(carry % 4294967296)
+        carry = carry / 4294967296
+    }
+    return big_norm(out)
+}
+
+# big_shl_bits(a, bits) — bits >= 0.
+fn big_shl_bits(a: list[int], bits: int) -> list[int] {
+    if a.len() == 0 || bits == 0 {
+        return big_copy(a)
+    }
+    let limbs: int = bits / 32
+    let sh: int = bits % 32
+    let out: list[int] = []
+    let mut i: int = 0
+    while i < limbs {
+        out.push(0)
+        i = i + 1
+    }
+    if sh == 0 {
+        let mut k: int = 0
+        while k < a.len() {
+            out.push(a.get(k))
+            k = k + 1
+        }
+        return big_norm(out)
+    }
+    let mut carry: int = 0
+    let mut k: int = 0
+    while k < a.len() {
+        let limb: int = a.get(k)
+        let hi: int = limb / (4294967296 / pow2(sh))
+        let lo: int = (limb % (4294967296 / pow2(sh))) * pow2(sh)
+        out.push(lo + carry)
+        carry = hi
+        k = k + 1
+    }
+    if carry > 0 {
+        out.push(carry)
+    }
+    return big_norm(out)
+}
+
+# pow2(k) — 2^k for 0 <= k <= 31.
+fn pow2(k: int) -> int {
+    let mut out: int = 1
+    let mut i: int = 0
+    while i < k {
+        out = out * 2
+        i = i + 1
+    }
+    return out
+}
+
+# big_shr_bits(a, bits) — bits >= 0.
+fn big_shr_bits(a: list[int], bits: int) -> list[int] {
+    if a.len() == 0 {
+        let z: list[int] = []
+        return z
+    }
+    let limbs: int = bits / 32
+    let sh: int = bits % 32
+    if limbs >= a.len() {
+        let z: list[int] = []
+        return z
+    }
+    let out: list[int] = []
+    let mut k: int = limbs
+    while k < a.len() {
+        let mut v: int = a.get(k) / pow2(sh)
+        if k + 1 < a.len() {
+            v = v + (a.get(k + 1) % pow2(sh)) * pow2(32 - sh)
+        }
+        out.push(v)
+        k = k + 1
+    }
+    return big_norm(out)
+}
+
+# big_divmod_small(a, d) — [quotient, remainder]; d > 0, fits int.
+fn big_divmod_small(a: list[int], d: int) -> list[list[int]] {
+    let q: list[int] = []
+    let mut i: int = 0
+    while i < a.len() {
+        q.push(0)
+        i = i + 1
+    }
+    let mut rem: int = 0
+    let mut k: int = a.len() - 1
+    while k >= 0 {
+        let cur: int = rem * 4294967296 + a.get(k)
+        q.set(k, cur / d)
+        rem = cur % d
+        k = k - 1
+    }
+    return[big_norm(q), big_from_int(rem)]
+}
+
+# big_to_decimal(a) — the exact decimal digits of a ("" for zero).
+fn big_to_decimal(a: list[int]) -> str {
+    if big_is_zero(a) {
+        return ""
+    }
+    let chunks: list[str] = []
+    let mut cur: list[int] = big_copy(a)
+    while !big_is_zero(cur) {
+        let dr: list[list[int]] = big_divmod_small(cur, 1000000000)
+        cur = dr.get(0)
+        let r: int = big_to_int(dr.get(1))
+        let mut piece: str = r.to_str()
+        while piece.len() < 9 {
+            piece = "0" + piece
+        }
+        chunks.push(piece)
+    }
+    let mut out: str = ""
+    let mut i: int = chunks.len() - 1
+    while i >= 0 {
+        if i == chunks.len() - 1 {
+            # the top chunk keeps no leading zeros
+            let mut t: str = chunks.get(i)
+            while t.len() > 1 && t.byte_at(0) == 48 {
+                t = t.slice(1, t.len())
+            }
+            out = out + t
+        } else {
+            out = out + chunks.get(i)
+        }
+        i = i - 1
+    }
+    return out
+}
+
+# big_to_int(a) — when the value is known to fit.
+fn big_to_int(a: list[int]) -> int {
+    let mut out: int = 0
+    let mut i: int = a.len() - 1
+    while i >= 0 {
+        out = out * 4294967296 + a.get(i)
+        i = i - 1
+    }
+    return out
+}
+
+# ---- round6: the exact round(v, 6) ----
+
+# round6_me(m, e) — v = m*2^e (m in [2^52,2^53), e <= -7 on this
+# path) returns [M, E, zero]: the double v rounded to six decimal
+# places (half-even), as M*2^E with M in [2^52, 2^53]; zero flags the
+# ±0.0 results. Ties are decided half-even; a tie needs a factor
+# 5^-6 in v, which a dyadic double cannot carry except through the
+# 2^-7 alignment, so the tie test below is exact where it can happen
+# and the no-tie fast compare everywhere else.
+fn round6_me(m: int, e: int) -> list[int] {
+    let num: list[int] = big_mul_small(big_from_int(m), 15625)
+    let t: int = 0 - (e + 6)
+    if t >= 68 {
+        return[0, 0, 1]
+    }
+    let q0: list[int] = big_shr_bits(num, t)
+    let back: list[int] = big_shl_bits(q0, t)
+    let rem: list[int] = big_sub(num, back)
+    let half: list[int] = big_shl_bits(big_from_int(1), t - 1)
+    let cmp: int = big_cmp(rem, half)
+    if cmp > 0 {
+        return round6_finish(big_add(q0, big_from_int(1)))
+    }
+    if cmp < 0 {
+        return round6_finish(q0)
+    }
+    # the exact tie: to even
+    if q0.len() > 0 && q0.get(0) % 2 == 1 {
+        return round6_finish(big_add(q0, big_from_int(1)))
+    }
+    return round6_finish(q0)
+}
+
+# round6_finish(q) — q >= 0 integer (the value*10^6, rounded): the
+# double nearest to q*10^-6, as [M, E, zero].
+fn round6_finish(q: list[int]) -> list[int] {
+    if big_is_zero(q) {
+        return[0, 0, 1]
+    }
+    # E: the power of two with 2^E <= q/10^6 < 2^(E+1), i.e.
+    # 10^6*2^E <= q < 10^6*2^(E+1). D >= 1e-6 > 2^-21 puts E >= -20.
+    let mut e_found: int = 53
+    while e_found >= -21 {
+        if e_found >= 0 {
+            let bound: list[int] = big_shl_bits(big_from_int(1000000), e_found)
+            if big_cmp(q, bound) >= 0 {
+                break
+            }
+        } else {
+            let qs: list[int] = big_shl_bits(q, 0 - e_found)
+            if big_cmp(qs, big_from_int(1000000)) >= 0 {
+                break
+            }
+        }
+        e_found = e_found - 1
+    }
+    # M = round(D * 2^(52-E)) = round(q * 2^(46-E) / 15625) — one
+    # exact division; for E >= 47 the power of two moves into the
+    # divisor instead (still one division, still exact arithmetic).
+    if e_found <= 46 {
+        let nbig: list[int] = big_shl_bits(q, 46 - e_found)
+        let dr: list[list[int]] = big_divmod_small(nbig, 15625)
+        let mut mm: int = big_to_int(dr.get(0))
+        let rem: int = big_to_int(dr.get(1))
+        if rem * 2 > 15625 {
+            mm = mm + 1
+        }
+        return round6_renorm(mm, e_found)
+    }
+    let divisor: int = 15625 * pow2(e_found - 46)
+    let dr2: list[list[int]] = big_divmod_small(q, divisor)
+    let mut mm2: int = big_to_int(dr2.get(0))
+    let rem2: int = big_to_int(dr2.get(1))
+    if rem2 * 2 > divisor {
+        mm2 = mm2 + 1
+    } else {
+        if rem2 * 2 == divisor && mm2 % 2 == 1 {
+            mm2 = mm2 + 1
+        }
+    }
+    return round6_renorm(mm2, e_found)
+}
+
+# round6_renorm(mm, E) — M in [2^52, 2^53]; the 2^53 carry folds.
+# Returns the [M, E, zero] triple round6_me speaks.
+fn round6_renorm(mm: int, e_found: int) -> list[int] {
+    if mm == 9007199254740992 {
+        return[4503599627370496, e_found + 1 - 52, 0]
+    }
+    return[mm, e_found - 52, 0]
+}
+
+# ---- repr: the shortest string that round-trips, Python's layout ----
+
+# scale2(x, k) — x * 2^k, exact (|k| small, no over/underflow on this
+# tool's domain).
+fn scale2(x: float, k: int) -> float {
+    let mut v: float = x
+    let mut i: int = 0
+    while i < k {
+        v = v * 2.0
+        i = i + 1
+    }
+    while i > k {
+        v = v / 2.0
+        i = i - 1
+    }
+    return v
+}
+
+# exact_digits(m, e) — [digits, exp10]: the FULL exact decimal digit
+# string of |m*2^e| (leading zeros stripped, trailing zeros kept) and
+# the power of ten of its first digit; m in [2^52, 2^53).
+fn exact_digits(m: int, e: int) -> list[str] {
+    if e >= 0 {
+        let ibig: list[int] = big_shl_bits(big_from_int(m), e)
+        let digits: str = big_to_decimal(ibig)
+        let exp10: int = digits.len() - 1
+        return[digits, exp10.to_str()]
+    }
+    # e < 0 (|e| <= 72 on every path here): m*2^e = (m*5^|e|)*10^-|e|
+    let ae: int = 0 - e
+    let mut b: list[int] = big_from_int(m)
+    let mut i: int = 0
+    while i < ae {
+        b = big_mul_small(b, 5)
+        i = i + 1
+    }
+    let bd: str = big_to_decimal(b)
+    let point: int = bd.len() - ae
+    if point >= 1 {
+        return exact_digits_finish(bd, point)
+    }
+    # value < 1: "0" then |e|-len zeros then the digits
+    let mut pad: str = "0"
+    let mut k: int = 0
+    while k < ae - bd.len() {
+        pad = pad + "0"
+        k = k + 1
+    }
+    return exact_digits_finish(pad + bd, 1)
+}
+
+# exact_digits_finish(total, point_pos) — strip the leading zeros,
+# place exp10.
+fn exact_digits_finish(total: str, point_pos: int) -> list[str] {
+    let mut nz: int = 0
+    while nz < total.len() && total.byte_at(nz) == 48 {
+        nz = nz + 1
+    }
+    if nz >= total.len() {
+        return["0", "0"]
+    }
+    let digits: str = total.slice(nz, total.len())
+    let exp10: int = point_pos - nz - 1
+    return[digits, exp10.to_str()]
+}
+
+# round_digits(digits, n) — the first n significant digits, rounded
+# half-even on the exact remainder; returns [digits, exp10_shift].
+fn round_digits(digits: str, n: int) -> list[str] {
+    if n >= digits.len() {
+        return[digits, "0"]
+    }
+    let kept: str = digits.slice(0, n)
+    let rest: str = digits.slice(n, digits.len())
+    let r0: int = rest.byte_at(0) - 48
+    let mut up: bool = false
+    if r0 > 5 {
+        up = true
+    } else {
+        if r0 == 5 {
+            let mut more: bool = false
+            let mut i: int = 1
+            while i < rest.len() {
+                if rest.byte_at(i) != 48 {
+                    more = true
+                }
+                i = i + 1
+            }
+            if more {
+                up = true
+            } else {
+                # the exact tie: to even
+                if(kept.byte_at(n - 1) - 48) % 2 == 1 {
+                    up = true
+                }
+            }
+        }
+    }
+    if !up {
+        return[kept, "0"]
+    }
+    # increment the kept digits, with the carry
+    let mut ds: list[int] = []
+    let mut i2: int = 0
+    while i2 < n {
+        ds.push(kept.byte_at(i2) - 48)
+        i2 = i2 + 1
+    }
+    let mut c: int = 1
+    let mut k: int = n - 1
+    while k >= 0 && c > 0 {
+        let t: int = ds.get(k) + c
+        ds.set(k, t % 10)
+        c = t / 10
+        k = k - 1
+    }
+    if c > 0 {
+        # 999... -> 1000...: one digit, one higher power
+        return["1", "1"]
+    }
+    let mut out: str = ""
+    let mut k2: int = 0
+    while k2 < n {
+        out = out + (ds.get(k2) + 48).to_str()
+        k2 = k2 + 1
+    }
+    return[out, "0"]
+}
+
+# format_decimal(digits, exp10) — Python's float repr layout: fixed
+# for -4 <= exp10 <= 15 (".0" when there is no fraction), else
+# d[.ddd]e{+,-}NN with a two-digit minimum exponent.
+fn format_decimal(digits: str, exp10: int) -> str {
+    let n: int = digits.len()
+    if exp10 >= -4 && exp10 <= 15 {
+        if exp10 >= 0 {
+            let k: int = exp10 + 1
+            if n > k {
+                return digits.slice(0, k) + "." + digits.slice(k, n)
+            }
+            let mut out: str = digits
+            let mut i: int = n
+            while i < k {
+                out = out + "0"
+                i = i + 1
+            }
+            return out + ".0"
+        }
+        let mut out: str = "0."
+        let mut i: int = 0
+        while i < 0 - exp10 - 1 {
+            out = out + "0"
+            i = i + 1
+        }
+        return out + digits
+    }
+    let mant: str = digits.slice(0, 1)
+    let mut m: str = mant
+    if n > 1 {
+        m = mant + "." + digits.slice(1, n)
+    }
+    let mut sign: str = "+"
+    if exp10 < 0 {
+        sign = "-"
+    }
+    let ae: int = exp10.abs()
+    let es: str = ae.to_str()
+    if ae < 10 {
+        return m + "e" + sign + "0" + es
+    }
+    return m + "e" + sign + es
+}
+
+# repr_decomposed(m, e) — Python's repr() of the double m*2^e (m in
+# [2^52, 2^53), e any): the shortest decimal digit string that
+# strtod-round-trips back to the value, in Python's layout. The
+# candidate for each length is the correctly rounded one (the closest
+# n-digit decimal; if it does not round-trip, no n-digit decimal
+# does), and 17 digits always suffice.
+fn repr_decomposed(m: int, e: int) -> str {
+    let dv: list[str] = exact_digits(m, e)
+    let digits: str = dv.get(0)
+    let exp10: int = dv.get(1).to_int()
+    let value: float = scale2(m.to_float(), e)
+    let mut n: int = 1
+    while n <= 17 {
+        if n > digits.len() {
+            break
+        }
+        let rd: list[str] = round_digits(digits, n)
+        let cand_digits: str = rd.get(0)
+        let shift: int = rd.get(1).to_int()
+        let cand_exp: int = exp10 + shift
+        let cand: str = format_decimal(cand_digits, cand_exp)
+        if cand.to_float() == value {
+            return cand
+        }
+        n = n + 1
+    }
+    # the 17-digit correctly rounded form always round-trips
+    let rd17: list[str] = round_digits(digits, 17)
+    return format_decimal(rd17.get(0), exp10 + rd17.get(1).to_int())
+}
+
+# canonical_float(tok) — one canonical string per float VALUE at the
+# printf channel: parse (strtod), round to 6 decimals (exact,
+# half-even), render the shortest round-trip repr. Zero folds to
+# "0.0" (the sign of zero is noise); overflow renders inf/-inf.
+fn canonical_float(tok: str) -> str {
+    let v: float = tok.to_float()
+    if v != v {
+        return "nan"
+    }
+    let z: float = v * 0.0
+    if z != 0.0 {
+        if v < 0.0 {
+            return "-inf"
+        }
+        return "inf"
+    }
+    if v == 0.0 {
+        return "0.0"
+    }
+    let neg: bool = v < 0.0
+    let mut a: float = v
+    if neg {
+        a = 0.0 - v
+    }
+    let mv: list[int] = decompose(a)
+    let m: int = mv.get(0)
+    let e: int = mv.get(1)
+    # e >= -6: v*10^6 is an integer (or v is huge), rounding is the
+    # identity; e >= 52 means the same for every integer double.
+    if e >= -6 {
+        let r: str = repr_decomposed(m, e)
+        if neg {
+            return "-" + r
+        }
+        return r
+    }
+    let rr: list[int] = round6_me(m, e)
+    if rr.get(2) == 1 {
+        return "0.0"
+    }
+    let r2: str = repr_decomposed(rr.get(0), rr.get(1))
+    if neg {
+        return "-" + r2
+    }
+    return r2
+}
+
+# ============================================================================
+# The channel, assembled.
+# ============================================================================
+
+struct Channel {
+    text: str, # the canonical text
+    changed: bool # at least one token was rewritten
+}
+
+# canonical_channel(text) — canonicalize one leg's stdout onto the
+# shared observation channel. changed=true when at least one token was
+# rewritten, i.e. the raw bytes carried backend-specific representation
+# and only the canonical form is comparable.
+fn canonical_channel(text: str) -> Channel {
+    let s: str = canon_nan_inf(text)
+    let mut out: str = ""
+    let mut changed: bool = false
+    let mut i: int = 0
+    while i < s.len() {
+        let end: int = try_float_at(s, i)
+        if end > i {
+            let tok: str = s.slice(i, end)
+            if is_channel_float(tok) {
+                let canon: str = canonical_float(tok)
+                if canon != tok {
+                    changed = true
+                }
+                out = out + canon
+            } else {
+                out = out + tok
+            }
+            i = end
+        } else {
+            out = out + s.slice(i, i + 1)
+            i = i + 1
+        }
+    }
+    let c: Channel = Channel {
+        text: out,
+        changed: changed
+    }
+    return c
+}
+
+# ============================================================================
+# The purity gate.
+# ============================================================================
+
+# std modules whose output depends on the wall clock, the environment,
+# the filesystem, the network, or the scheduler. A program importing
+# any of these cannot be differentially compared byte-for-byte: its
+# output is a function of the world, not of the implementation.
+fn is_deny_import(mod: str) -> bool {
+    let deny: list[str] = ["time", "env", "process", "net", "fs",
+    "thread", "sync", "http", "http2", "websocket", "sse", "session",
+    "cookie", "csrf", "archive", "config", "cli", "complete", "man",
+    "hlscli", "hlsdoc", "tui", "color", "progress", "log", "template",
+    "graphql", "openapi", "jsffi", "dom", "taint", "sanitize", "uuid",
+    "simd", "repl", "bench"]
+    let mut i: int = 0
+    while i < deny.len() {
+        if deny.get(i) == mod {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# is_deny_builtin(name) — the impure builtin table: wall clock,
+# randomness, environment, filesystem, network, processes, scheduler
+# channels and locks. Same law as the imports.
+fn is_deny_builtin(name: str) -> bool {
+    let deny: list[str] = ["rand_seed", "rand_int", "clock_ms",
+    "clock_ns", "monotonic_ns", "sleep", "proc_exec", "proc_spawn",
+    "proc_kill", "proc_wait", "spawn", "read_file", "write_file",
+    "append_file", "read_dir", "remove_file", "net_lookup",
+    "net_tcp_connect", "net_udp_send", "hostname", "env_get",
+    "env_set", "args_get", "read_line", "chan_new", "chan_send",
+    "chan_recv", "mutex_lock", "taint_unwrap"]
+    let mut i: int = 0
+    while i < deny.len() {
+        if deny.get(i) == name {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# struct Purity { eligible: bool, reason: str } is expressed as a
+# list[str] pair to keep the module-leg import surface small.
+# purity_verdict(source) — [eligible "1"/"0", reason].
+fn purity_verdict(source: str) -> list[str] {
+    let lines: list[str] = source.split("\n")
+    # crate modes: a line-leading #![attr] declares not-a-hosted-program
+    let mut i: int = 0
+    while i < lines.len() {
+        let l: str = lines.get(i)
+        let mut j: int = 0
+        while j < l.len() && (l.byte_at(j) == 32 || l.byte_at(j) == 9) {
+            j = j + 1
+        }
+        if l.slice(j, l.len()).starts_with("#![") {
+            let mut k: int = j + 3
+            while k < l.len() && (l.byte_at(k) == 32 || l.byte_at(k) == 9) {
+                k = k + 1
+            }
+            let mut word: str = ""
+            while k < l.len() {
+                let c: int = l.byte_at(k)
+                if(c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95 {
+                    word = word + l.slice(k, k + 1)
+                    k = k + 1
+                } else {
+                    break
+                }
+            }
+            if word != "" {
+                return["0", "crate mode #![" + word + "] — not a hosted program"]
+            }
+        }
+        i = i + 1
+    }
+    # imports: a line-leading import "std.X / core.X"
+    let mut i2: int = 0
+    while i2 < lines.len() {
+        let l2: str = lines.get(i2)
+        let mut j2: int = 0
+        while j2 < l2.len() && (l2.byte_at(j2) == 32 || l2.byte_at(j2) == 9) {
+            j2 = j2 + 1
+        }
+        let rest: str = l2.slice(j2, l2.len())
+        if rest.starts_with("import") {
+            let mut k2: int = j2 + 6
+            let ws_start: int = k2
+            while k2 < l2.len() && (l2.byte_at(k2) == 32 || l2.byte_at(k2) == 9) {
+                k2 = k2 + 1
+            }
+            # \s+ needs at least one whitespace before the quote
+            if k2 > ws_start && k2 < l2.len() && l2.byte_at(k2) == 34 {
+                let after_q: str = l2.slice(k2 + 1, l2.len())
+                let mut off: int = 0
+                if after_q.starts_with("std.") {
+                    off = 4
+                } else {
+                    if after_q.starts_with("core.") {
+                        off = 5
+                    }
+                }
+                if off > 0 {
+                    let mut w: str = ""
+                    let mut p: int = off
+                    while p < after_q.len() {
+                        let c2: int = after_q.byte_at(p)
+                        if is_word_byte(c2) {
+                            w = w + after_q.slice(p, p + 1)
+                            p = p + 1
+                        } else {
+                            break
+                        }
+                    }
+                    if w != "" && is_deny_import(w) {
+                        return["0", "imports std." + w
+                        + " — output depends on the world, not the implementation"]
+                    }
+                }
+            }
+        }
+        i2 = i2 + 1
+    }
+    # impure builtins: every maximal [A-Za-z0-9_] run (the \b...\b of
+    # the .py, exactly)
+    let mut i3: int = 0
+    while i3 < source.len() {
+        if is_word_byte(source.byte_at(i3)) {
+            let mut j3: int = i3
+            while j3 < source.len() && is_word_byte(source.byte_at(j3)) {
+                j3 = j3 + 1
+            }
+            let word3: str = source.slice(i3, j3)
+            if is_deny_builtin(word3) {
+                return["0", "builtin '" + word3
+                + "' — nondeterministic or environment-bound"]
+            }
+            i3 = j3
+        } else {
+            i3 = i3 + 1
+        }
+    }
+    return["1", ""]
+}
+
+# ============================================================================
+# The verdict lattice.
+# ============================================================================
+
+struct Leg {
+    status: str, # ok | halted | error | skip | validated
+    kind: str, # error class (timeout/crash/compile/tool/...)
+    why: str,
+    notes: str, # the validated leg's notes
+    code: int, # exit code (ok/halted)
+    out: str, # captured stdout (ok/halted)
+    err: str, # captured stderr tail (halted)
+    trap: bool, # the wasm trap convention
+    has_out: bool # whether `out` participates in the JSON report
+}
+
+fn leg_new() -> Leg {
+    let l: Leg = Leg {
+        status: "",
+        kind: "",
+        why: "",
+        notes: "",
+        code: -1,
+        out: "",
+        err: "",
+        trap: false,
+        has_out: false
+    }
+    return l
+}
+
+# leg_state(l) — one canonical state token per leg, for the ledger
+# signature.
+fn leg_state(l: Leg) -> str {
+    if l.status == "ok" {
+        return "ok"
+    }
+    if l.status == "halted" {
+        if l.trap {
+            return "halt(trap)"
+        }
+        return "halt(" + l.code.to_str() + ")"
+    }
+    if l.status == "error" {
+        if l.kind == "" {
+            return "error(unknown)"
+        }
+        return "error(" + l.kind + ")"
+    }
+    if l.status == "validated" {
+        return "validated"
+    }
+    return "skip"
+}
+
+# list_has(xs, x)
+fn list_has(xs: list[str], x: str) -> bool {
+    let mut i: int = 0
+    while i < xs.len() {
+        if xs.get(i) == x {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# sort_strs(xs) — a stable insertion sort (Python's sorted()).
+fn sort_strs(xs: list[str]) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < xs.len() {
+        out.push(xs.get(i))
+        i = i + 1
+    }
+    let mut j: int = 1
+    while j < out.len() {
+        let v: str = out.get(j)
+        let mut k: int = j - 1
+        while k >= 0 && out.get(k) > v {
+            out.set(k + 1, out.get(k))
+            k = k - 1
+        }
+        out.set(k + 1, v)
+        j = j + 1
+    }
+    return out
+}
+
+# int_list_has(xs, x)
+fn int_list_has(xs: list[int], x: int) -> bool {
+    let mut i: int = 0
+    while i < xs.len() {
+        if xs.get(i) == x {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# sorted_unique_ints(xs) — sorted(set(xs)) as Python renders it.
+fn sorted_unique_ints(xs: list[int]) -> list[int] {
+    let out: list[int] = []
+    let mut i: int = 0
+    while i < xs.len() {
+        if !int_list_has(out, xs.get(i)) {
+            out.push(xs.get(i))
+        }
+        i = i + 1
+    }
+    let mut j: int = 1
+    while j < out.len() {
+        let v: int = out.get(j)
+        let mut k: int = j - 1
+        while k >= 0 && out.get(k) > v {
+            out.set(k + 1, out.get(k))
+            k = k - 1
+        }
+        out.set(k + 1, v)
+        j = j + 1
+    }
+    return out
+}
+
+# py_list_ints(xs) — Python's list repr: [1, 3]
+fn py_list_ints(xs: list[int]) -> str {
+    let mut out: str = "["
+    let mut i: int = 0
+    while i < xs.len() {
+        if i > 0 {
+            out = out + ", "
+        }
+        out = out + xs.get(i).to_str()
+        i = i + 1
+    }
+    return out + "]"
+}
+
+# py_dict_repr(pairs) — Python's dict repr, insertion order:
+# {'interp': 1, 'wasm': 3}
+fn py_dict_repr(pairs: list[list[str]]) -> str {
+    let mut out: str = "{"
+    let mut i: int = 0
+    while i < pairs.len() {
+        if i > 0 {
+            out = out + ", "
+        }
+        out = out + "'" + pairs.get(i).get(0) + "': " + pairs.get(i).get(1)
+        i = i + 1
+    }
+    return out + "}"
+}
+
+struct VD {
+    verdict: str,
+    detail: str
+}
+
+# struct FD — the first divergence between two canonical outputs.
+struct FD {
+    found: bool,
+    line: int,
+    a: str,
+    b: str
+}
+
+# first_divergence(a, b) — the first differing line of two (already
+# canonicalized) outputs.
+fn first_divergence(a: str, b: str) -> FD {
+    let la: list[str] = split_lines_py(a)
+    let lb: list[str] = split_lines_py(b)
+    let mut n: int = la.len()
+    if lb.len() > n {
+        n = lb.len()
+    }
+    let mut i: int = 0
+    while i < n {
+        let mut va: str = "<end of output>"
+        let mut vb: str = "<end of output>"
+        if i < la.len() {
+            va = la.get(i)
+        }
+        if i < lb.len() {
+            vb = lb.get(i)
+        }
+        if va != vb {
+            let fd: FD = FD {
+                found: true,
+                line: i + 1,
+                a: clip_str(va, 80),
+                b: clip_str(vb, 80)
+            }
+            return fd
+        }
+        i = i + 1
+    }
+    let none: FD = FD {
+        found: false,
+        line: 0,
+        a: "",
+        b: ""
+    }
+    return none
+}
+
+# compare_exec(backends, legs, strict) — the oracle over the legs that
+# DID execute (status ok/halted). legs[i] belongs to backends[i].
+fn compare_exec(backends: list[str], legs: list[Leg], strict: bool) -> VD {
+    let halts: list[str] = []
+    let oks: list[str] = []
+    let mut i: int = 0
+    while i < backends.len() {
+        if legs.get(i).status == "halted" {
+            halts.push(backends.get(i))
+        }
+        if legs.get(i).status == "ok" {
+            oks.push(backends.get(i))
+        }
+        i = i + 1
+    }
+    if oks.len() > 0 && halts.len() > 0 {
+        # a clean run on one backend and a halt on another is the
+        # loudest alarm the suite owns: the implementations disagree
+        # about whether the program halts at all.
+        let bad: str = str_join_nice(sort_strs(halts))
+        let good: str = str_join_nice(sort_strs(oks))
+        let d: VD = VD {
+            verdict: "divergence",
+            detail: "halted on " + bad + ", ran clean on " + good
+        }
+        return d
+    }
+    if halts.len() > 0 {
+        # the hosted pair (interp/native)
+        let hosted: list[str] = []
+        let mut hi: int = 0
+        while hi < backends.len() {
+            if legs.get(hi).status == "halted" && backends.get(hi) != "wasm" {
+                hosted.push(backends.get(hi))
+            }
+            hi = hi + 1
+        }
+        let mut wasm_leg: Leg = leg_new()
+        let mut has_wasm: bool = false
+        let mut wi: int = 0
+        while wi < backends.len() {
+            if backends.get(wi) == "wasm" && legs.get(wi).status == "halted" {
+                wasm_leg = legs.get(wi)
+                has_wasm = true
+            }
+            wi = wi + 1
+        }
+        if has_wasm && wasm_leg.trap {
+            let codes: list[int] = []
+            let mut ci: int = 0
+            while ci < backends.len() {
+                if legs.get(ci).status == "halted" && backends.get(ci) != "wasm" {
+                    codes.push(legs.get(ci).code)
+                }
+                ci = ci + 1
+            }
+            let sc: list[int] = sorted_unique_ints(codes)
+            if hosted.len() > 0 && sc.len() == 1 && sc.get(0) == 101 {
+                let d1: VD = VD {
+                    verdict: "panic-equal",
+                    detail: "every backend halts in the panic class"
+                }
+                return d1
+            }
+            if hosted.len() > 0 && sc.len() == 1 {
+                let d2: VD = VD {
+                    verdict: "halt-gap",
+                    detail: "every backend halts; wasm does not propagate exit "
+                    + sc.get(0).to_str() + " (the alpha trap convention)"
+                }
+                return d2
+            }
+            if hosted.len() > 0 {
+                let d3: VD = VD {
+                    verdict: "divergence",
+                    detail: "hosted halt codes disagree: " + py_list_ints(sc)
+                }
+                return d3
+            }
+            let d4: VD = VD {
+                verdict: "panic-equal",
+                detail: "wasm halts, no hosted leg available"
+            }
+            return d4
+        }
+        # no trap: deliberate exit(N) on every halted leg — codes must agree
+        let mut first_code: int = -1
+        let mut all_same: bool = true
+        let mut got: bool = false
+        let mut gi: int = 0
+        while gi < backends.len() {
+            if legs.get(gi).status == "halted" {
+                if !got {
+                    first_code = legs.get(gi).code
+                    got = true
+                } else {
+                    if legs.get(gi).code != first_code {
+                        all_same = false
+                    }
+                }
+            }
+            gi = gi + 1
+        }
+        if all_same && got {
+            if first_code == 101 {
+                let d5: VD = VD {
+                    verdict: "panic-equal",
+                    detail: "every executing backend panics (no wasm trap leg)"
+                }
+                return d5
+            }
+            let d6: VD = VD {
+                verdict: "exact",
+                detail: "all backends exit " + first_code.to_str()
+            }
+            return d6
+        }
+        let pairs: list[list[str]] = []
+        let mut pi: int = 0
+        while pi < backends.len() {
+            if legs.get(pi).status == "halted" {
+                let pair: list[str] = [backends.get(pi),
+                legs.get(pi).code.to_str()]
+                pairs.push(pair)
+            }
+            pi = pi + 1
+        }
+        let d7: VD = VD {
+            verdict: "divergence",
+            detail: "halt codes disagree: " + py_dict_repr(pairs)
+        }
+        return d7
+    }
+    # every executing leg ran clean: compare stdout
+    let raws: list[str] = []
+    let names: list[str] = []
+    let mut ri: int = 0
+    while ri < backends.len() {
+        if legs.get(ri).status == "ok" {
+            raws.push(legs.get(ri).out)
+            names.push(backends.get(ri))
+        }
+        ri = ri + 1
+    }
+    let mut all_equal: bool = true
+    let mut k: int = 1
+    while k < raws.len() {
+        if raws.get(k) != raws.get(0) {
+            all_equal = false
+        }
+        k = k + 1
+    }
+    if all_equal {
+        if strict {
+            let ds: VD = VD {
+                verdict: "exact",
+                detail: "byte-identical (strict)"
+            }
+            return ds
+        }
+        let ds2: VD = VD {
+            verdict: "exact",
+            detail: "byte-identical"
+        }
+        return ds2
+    }
+    let canons: list[str] = []
+    let mut changed: bool = false
+    let mut ci2: int = 0
+    while ci2 < raws.len() {
+        let c: Channel = canonical_channel(raws.get(ci2))
+        canons.push(c.text)
+        if c.changed {
+            changed = true
+        }
+        ci2 = ci2 + 1
+    }
+    let mut canon_equal: bool = true
+    let mut k2: int = 1
+    while k2 < canons.len() {
+        if canons.get(k2) != canons.get(0) {
+            canon_equal = false
+        }
+        k2 = k2 + 1
+    }
+    if canon_equal {
+        let mut d: str = "agreed after canonicalization"
+        if changed {
+            d = "agreed on the shared channel; raw bytes differ only in "
+            + "float/nan representation"
+        }
+        if strict {
+            let d8: VD = VD {
+                verdict: "divergence",
+                detail: d + " (strict: raw bytes differ)"
+            }
+            return d8
+        }
+        let d9: VD = VD {
+            verdict: "normalized",
+            detail: d
+        }
+        return d9
+    }
+    let sorted_names: list[str] = sort_strs(names)
+    let ref: str = sorted_names.get(0)
+    let mut ref_out: str = ""
+    let mut oi: int = 0
+    while oi < names.len() {
+        if names.get(oi) == ref {
+            ref_out = canons.get(oi)
+        }
+        oi = oi + 1
+    }
+    let mut si: int = 0
+    while si < sorted_names.len() {
+        let other: str = sorted_names.get(si)
+        if other == ref {
+            si = si + 1
+            continue
+        }
+        let mut other_out: str = ""
+        let mut oj: int = 0
+        while oj < names.len() {
+            if names.get(oj) == other {
+                other_out = canons.get(oj)
+            }
+            oj = oj + 1
+        }
+        let fd: FD = first_divergence(ref_out, other_out)
+        if fd.found {
+            let d10: VD = VD {
+                verdict: "divergence",
+                detail: "line " + fd.line.to_str() + ": " + ref + "="
+                + py_repr_str(fd.a) + " vs " + other + "="
+                + py_repr_str(fd.b)
+            }
+            return d10
+        }
+        si = si + 1
+    }
+    let d11: VD = VD {
+        verdict: "divergence",
+        detail: "outputs differ"
+    }
+    return d11
+}
+
+# str_join_nice(xs) — ",".join(xs)
+fn str_join_nice(xs: list[str]) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < xs.len() {
+        if i > 0 {
+            out = out + ","
+        }
+        out = out + xs.get(i)
+        i = i + 1
+    }
+    return out
+}
+
+# compare_program(backends, legs, strict) — the oracle. legs[i]
+# belongs to backends[i]. SKIP legs are absent by design and never
+# poison a verdict; ERROR legs cap the verdict (a backend that TRIED
+# and failed has not agreed to anything).
+fn compare_program(backends: list[str], legs: list[Leg], strict: bool) -> VD {
+    let exec_b: list[str] = []
+    let err_b: list[str] = []
+    let mut i: int = 0
+    while i < backends.len() {
+        let st: str = legs.get(i).status
+        if st == "ok" || st == "halted" {
+            exec_b.push(backends.get(i))
+        }
+        if st == "error" {
+            err_b.push(backends.get(i))
+        }
+        i = i + 1
+    }
+    if exec_b.len() == 0 && err_b.len() == 0 {
+        let d: VD = VD {
+            verdict: "skipped",
+            detail: "no executing leg"
+        }
+        return d
+    }
+    if exec_b.len() + err_b.len() < 2 {
+        let mut only: str = "?"
+        if exec_b.len() > 0 {
+            only = exec_b.get(0)
+        } else {
+            if err_b.len() > 0 {
+                only = err_b.get(0)
+            }
+        }
+        let d2: VD = VD {
+            verdict: "unpaired",
+            detail: "only " + only + " ran — nothing to compare"
+        }
+        return d2
+    }
+    # the divergence among the legs that DID run is the loudest signal
+    let mut verdict: str = ""
+    let mut detail: str = ""
+    if exec_b.len() >= 2 {
+        let sub_b: list[str] = []
+        let sub_l: list[Leg] = []
+        let mut j: int = 0
+        while j < backends.len() {
+            let st2: str = legs.get(j).status
+            if st2 == "ok" || st2 == "halted" {
+                sub_b.push(backends.get(j))
+                sub_l.push(legs.get(j))
+            }
+            j = j + 1
+        }
+        let vd: VD = compare_exec(sub_b, sub_l, strict)
+        verdict = vd.verdict
+        detail = vd.detail
+        if verdict == "divergence" {
+            return vd
+        }
+    }
+    if err_b.len() > 0 {
+        let mut why: str = ""
+        let mut j2: int = 0
+        while j2 < backends.len() {
+            if legs.get(j2).status == "error" && why == "" {
+                why = legs.get(j2).why
+            }
+            j2 = j2 + 1
+        }
+        let d3: VD = VD {
+            verdict: "error",
+            detail: str_join_nice(sort_strs(err_b)) + " leg failed: " + why
+        }
+        return d3
+    }
+    if verdict == "" {
+        let d4: VD = VD {
+            verdict: "unpaired",
+            detail: "nothing to compare"
+        }
+        return d4
+    }
+    let d5: VD = VD {
+        verdict: verdict,
+        detail: detail
+    }
+    return d5
+}
+
+# ============================================================================
+# The ledger.
+# ============================================================================
+
+# jstr_or(v, k, fallback) — a missing or mistyped key reads as the
+# fallback, never a panic.
+fn jstr_or(v: JsonValue, k: str, fallback: str) -> str {
+    let f: JsonValue = json_object_get(v, k)
+    if json_is_str(f) {
+        return json_str_value(f)
+    }
+    return fallback
+}
+
+# struct Ledgered { ok: bool, err: str, waivers: JsonValue }
+struct Ledgered {
+    ok: bool,
+    err: str,
+    waivers: JsonValue
+}
+
+# load_ledger(path) — the empty ledger when the file is absent; a
+# named error when it is corrupt or has no waivers table.
+fn load_ledger(path: str) -> Ledgered uses Fs {
+    if !file_exists(path) {
+        let empty: JsonValue = json_object(["schema", "description", "waivers"],
+        [json_int(1), json_str(""), json_array([])])
+        let l: Ledgered = Ledgered {
+            ok: true,
+            err: "",
+            waivers: json_object_get(empty, "waivers")
+        }
+        return l
+    }
+    let parsed: Result[JsonValue, str] = json_parse_result(read_file(path))
+    if result_is_ok(parsed) {
+        let data: JsonValue = result_unwrap(parsed)
+        if json_is_object(data) && json_object_has(data, "waivers") {
+            let wv: JsonValue = json_object_get(data, "waivers")
+            if json_is_array(wv) {
+                let l5: Ledgered = Ledgered {
+                    ok: true,
+                    err: "",
+                    waivers: wv
+                }
+                return l5
+            }
+        }
+        let l3: Ledgered = Ledgered {
+            ok: false,
+            err: "ledger " + path + " has no waivers table",
+            waivers: json_null()
+        }
+        return l3
+    }
+    let l2: Ledgered = Ledgered {
+        ok: false,
+        err: "corrupt ledger " + path + ": " + result_err_or(parsed, ""),
+        waivers: json_null()
+    }
+    return l2
+}
+
+# struct Judge { status: str, entry: JsonValue } — status in
+# sanctioned / stale / mismatch / "" (none).
+struct Judge {
+    status: str,
+    entry: JsonValue
+}
+
+# ledger_judge(name, verdict, backends, legs, ledger) — the two-way
+# law: an unledgered divergence is the alarm; a ledgered program that
+# compares clean is stale; an entry whose states moved is a mismatch.
+fn ledger_judge(name: str, verdict: str, backends: list[str],
+legs: list[Leg], ledger: Ledgered) -> Judge {
+    let none: Judge = Judge {
+        status: "",
+        entry: json_null()
+    }
+    if verdict != "divergence" && verdict != "error" {
+        let mut w: int = 0
+        while w < ledger.waivers.arr.len() {
+            if jstr_or(ledger.waivers.arr.get(w), "file", "") == name {
+                let st: Judge = Judge {
+                    status: "stale",
+                    entry: ledger.waivers.arr.get(w)
+                }
+                return st
+            }
+            w = w + 1
+        }
+        return none
+    }
+    # the observed signature: ok/halted/error legs only
+    let sig_b: list[str] = []
+    let sig_s: list[str] = []
+    let mut i: int = 0
+    while i < backends.len() {
+        let st2: str = legs.get(i).status
+        if st2 == "ok" || st2 == "halted" || st2 == "error" {
+            sig_b.push(backends.get(i))
+            sig_s.push(leg_state(legs.get(i)))
+        }
+        i = i + 1
+    }
+    let mut w2: int = 0
+    while w2 < ledger.waivers.arr.len() {
+        let entry: JsonValue = ledger.waivers.arr.get(w2)
+        if jstr_or(entry, "file", "") != name {
+            w2 = w2 + 1
+            continue
+        }
+        let want: JsonValue = json_object_get(entry, "states")
+        let culprit: str = jstr_or(entry, "culprit", "")
+        if culprit != "" {
+            let mut culprit_in_sig: bool = false
+            let mut culprit_state: str = ""
+            let mut ci: int = 0
+            while ci < sig_b.len() {
+                if sig_b.get(ci) == culprit {
+                    culprit_in_sig = true
+                    culprit_state = sig_s.get(ci)
+                }
+                ci = ci + 1
+            }
+            if !culprit_in_sig {
+                # the named culprit leg did not even run
+                w2 = w2 + 1
+                continue
+            }
+            if culprit_state != jstr_or(want, culprit, "") {
+                let mm: Judge = Judge {
+                    status: "mismatch",
+                    entry: entry
+                }
+                return mm
+            }
+        }
+        let mut ok: bool = true
+        let mut wi: int = 0
+        while wi < want.obj_keys.len() {
+            let b: str = want.obj_keys.get(wi)
+            let mut st3: str = ""
+            if json_is_str(want.obj_vals.get(wi)) {
+                st3 = json_str_value(want.obj_vals.get(wi))
+            }
+            if b != culprit {
+                let mut bi: int = 0
+                while bi < sig_b.len() {
+                    if sig_b.get(bi) == b && sig_s.get(bi) != st3 {
+                        ok = false
+                    }
+                    bi = bi + 1
+                }
+            }
+            wi = wi + 1
+        }
+        if ok {
+            let sc: Judge = Judge {
+                status: "sanctioned",
+                entry: entry
+            }
+            return sc
+        }
+        let mm2: Judge = Judge {
+            status: "mismatch",
+            entry: entry
+        }
+        return mm2
+    }
+    return none
+}
+
+# ============================================================================
+# The backends.
+# ============================================================================
+
+struct RunCap {
+    spawned: bool,
+    code: int,
+    out: str,
+    err: str
+}
+
+# run_cap(program, args) — spawn with stdout+stderr piped, stdin null;
+# drain both pipes, wait, close. Children inherit this tool's cwd (the
+# repo root) and environment (LC_ALL=C, TZ=UTC — set once in main,
+# the .py's per-child env dict).
+fn run_cap(program: str, args: list[str]) -> RunCap uses Proc {
+    let r: RunCap = RunCap {
+        spawned: false,
+        code: -1,
+        out: "",
+        err: ""
+    }
+    let pid: int = proc_spawn(program, args, 2, 1, 1)
+    if pid < 1 {
+        return r
+    }
+    r.spawned = true
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    r.code = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    r.out = out
+    r.err = err
+    return r
+}
+
+# which(name) — true when the command resolves on PATH.
+fn which(name: str) -> bool uses Proc {
+    return proc_exec("command -v '" + shell_quote(name) + "' >/dev/null 2>&1") == 0
+}
+
+# shell_quote(s) — neutralise single quotes for the one-liners above.
+fn shell_quote(s: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < s.len() {
+        if s.byte_at(i) == 39 {
+            out = out + "'\\''"
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# leg_interp(path, scratch) — the reference implementation, the
+# Stage-0 interpreter (lab tooling, spawned as a child process).
+fn leg_interp(path: str, scratch: str) -> Leg uses Fs, Proc {
+    let argv: list[str] = ["python3", boot_py(), path]
+    let r: RunCap = run_cap(argv.get(0), [argv.get(1), argv.get(2)])
+    let l: Leg = leg_new()
+    if !r.spawned {
+        l.status = "error"
+        l.kind = "tool"
+        l.why = "interp leg raised: python3 missing"
+        return l
+    }
+    if r.code >= 128 {
+        l.status = "error"
+        l.kind = "crash"
+        l.why = "interpreter died with signal " + (r.code - 128).to_str()
+        return l
+    }
+    if r.code == 1 {
+        l.status = "error"
+        l.kind = "compile"
+        l.why = first_line(r.err)
+        return l
+    }
+    if r.code == 0 {
+        l.status = "ok"
+        l.code = 0
+        l.out = r.out
+        l.has_out = true
+        return l
+    }
+    l.status = "halted"
+    l.code = r.code
+    l.out = r.out
+    l.err = tail_line(r.err)
+    l.trap = false
+    l.has_out = true
+    return l
+}
+
+# leg_native(path, scratch) — the shipped compiler: hlc -> C -> gcc
+# -O2 -> run.
+fn leg_native(path: str, scratch: str) -> Leg uses Fs, Proc {
+    let l: Leg = leg_new()
+    if !file_exists(hlc_bin()) {
+        l.status = "skip"
+        l.why = "bin/hlc missing (run make bootstrap)"
+        return l
+    }
+    if !which("gcc") {
+        l.status = "skip"
+        l.why = "gcc not found"
+        return l
+    }
+    let cfile: str = scratch + "/prog.c"
+    let binfile: str = scratch + "/prog.bin"
+    let r: RunCap = run_cap(hlc_bin(), [path, cfile])
+    if !r.spawned {
+        l.status = "error"
+        l.kind = "tool"
+        l.why = "hlc failed to spawn"
+        return l
+    }
+    if r.code != 0 {
+        l.status = "skip"
+        l.why = "hlc refused: " + first_line(r.err)
+        return l
+    }
+    let gr: RunCap = run_cap("gcc", ["-O2", "-o", binfile, cfile,
+    "-lm", "-pthread"])
+    if !file_exists(binfile) {
+        l.status = "error"
+        l.kind = "tool"
+        l.why = "gcc produced no binary"
+        return l
+    }
+    if !gr.spawned {
+        l.status = "error"
+        l.kind = "tool"
+        l.why = "gcc failed to spawn"
+        return l
+    }
+    let rr: RunCap = run_cap(binfile, [])
+    if !rr.spawned {
+        l.status = "error"
+        l.kind = "tool"
+        l.why = "native binary failed to spawn"
+        return l
+    }
+    if rr.code >= 128 {
+        l.status = "error"
+        l.kind = "crash"
+        l.why = "native binary died with signal " + (rr.code - 128).to_str()
+        return l
+    }
+    if rr.code == 0 {
+        l.status = "ok"
+        l.code = 0
+        l.out = rr.out
+        l.has_out = true
+        return l
+    }
+    l.status = "halted"
+    l.code = rr.code
+    l.out = rr.out
+    l.err = tail_line(rr.err)
+    l.trap = false
+    l.has_out = true
+    return l
+}
+
+# node_runner_src() — the wasm leg's JS runner (the .py's
+# _NODE_RUNNER, unchanged: read the module, eval the glue, run, map
+# the result through the 0x7fffffff the glue's exit convention uses).
+fn node_runner_src() -> str {
+    return "const fs = require(\"fs\");\n"
+    + "const wasmBytes = fs.readFileSync(process.argv[2]);\n"
+    + "eval(fs.readFileSync(process.argv[2].replace(/\\.wasm$/, \".js\"), \"utf-8\"));\n"
+    + "Halis.run(new Uint8Array(wasmBytes)).then(function (code) {\n"
+    + "  process.exit(Number(code) & 0x7fffffff);\n"
+    + "}).catch(function (e) {\n"
+    + "  console.error(\"Halis run failed: \" + e.message);\n"
+    + "  process.exit(1);\n"
+    + "});\n"
+}
+
+# leg_wasm(path, scratch) — the wasm32 alpha: hlwasm -> node. The
+# alpha names its subset refusals and every one is a SKIP (the backend
+# cannot take the program), never an error; the glue's catch receives
+# BOTH runtime traps and module-compile rejections and they are
+# different failure classes.
+fn leg_wasm(path: str, scratch: str) -> Leg uses Fs, Proc {
+    let l: Leg = leg_new()
+    if !which("node") {
+        l.status = "skip"
+        l.why = "node not found"
+        return l
+    }
+    let base: str = scratch + "/prog"
+    let r: RunCap = run_cap("python3", [hlwasm_py(), path, base,
+    "--no-html", "--wasm-opt", "off"])
+    if !r.spawned {
+        l.status = "error"
+        l.kind = "tool"
+        l.why = "hlwasm failed to spawn"
+        return l
+    }
+    if r.code != 0 {
+        let mut why: str = first_line(r.err)
+        if why == "" {
+            why = first_line(r.out)
+        }
+        # "not yet supported by --emit wasm (Stage 23-alpha subset)",
+        # "range() can only be used as the iter expression of a `for`
+        # loop in Stage 23-alpha", ... — every one is a SKIP.
+        if why.contains("not yet supported") || why.contains("Stage 23-alpha") {
+            l.status = "skip"
+            l.why = "wasm alpha subset: " + why
+            return l
+        }
+        l.status = "error"
+        l.kind = "tool"
+        l.why = "hlwasm refused: " + why
+        return l
+    }
+    let wasmfile: str = base + ".wasm"
+    if !file_exists(wasmfile) {
+        l.status = "error"
+        l.kind = "tool"
+        l.why = "hlwasm wrote no .wasm"
+        return l
+    }
+    let runner: str = scratch + "/runner.js"
+    write_file(runner, node_runner_src())
+    let rr: RunCap = run_cap("node", [runner, wasmfile])
+    if !rr.spawned {
+        l.status = "error"
+        l.kind = "tool"
+        l.why = "node failed to spawn"
+        return l
+    }
+    # a compile rejection is an emitter bug (invalid module);
+    # "unreachable" and friends are halts.
+    if rr.err.contains("WebAssembly.compile")
+    || rr.err.contains("Compiling function") {
+        l.status = "error"
+        l.kind = "invalid-module"
+        l.why = first_line(rr.err)
+        return l
+    }
+    if rr.err.contains("Halis run failed") {
+        l.status = "halted"
+        l.code = rr.code
+        l.out = rr.out
+        l.err = tail_line(rr.err)
+        l.trap = true
+        l.has_out = true
+        return l
+    }
+    if rr.code != 0 || rr.err.contains("Error") {
+        l.status = "error"
+        if rr.err.contains("WebAssembly.compile") {
+            l.kind = "invalid-module"
+        } else {
+            l.kind = "node"
+        }
+        l.why = first_line(rr.err)
+        return l
+    }
+    if rr.code == 0 {
+        l.status = "ok"
+        l.code = 0
+        l.out = rr.out
+        l.has_out = true
+        return l
+    }
+    l.status = "halted"
+    l.code = rr.code
+    l.out = rr.out
+    l.err = tail_line(rr.err)
+    l.trap = false
+    l.has_out = true
+    return l
+}
+
+# leg_llvm(path, scratch) — the STATIC leg: emit LLVM IR and
+# structurally validate it through the native ll_validate (the .py
+# spawned the retired Python validator; the twin rides the tool the
+# Stage-137 fleet shipped). When llvm-as is installed the IR is also
+# assembled, which upgrades the structural check to a real parser
+# check. The llvm leg never executes here — the report says so, in
+# those words.
+fn leg_llvm(path: str, scratch: str) -> Leg uses Fs, Proc {
+    let l: Leg = leg_new()
+    let llfile: str = scratch + "/prog.ll"
+    let r: RunCap = run_cap("python3", [boot_py(), "--emit", "llvm", path])
+    if !r.spawned {
+        l.status = "error"
+        l.kind = "tool"
+        l.why = "llvm emit failed to spawn"
+        return l
+    }
+    if r.code != 0 {
+        let why: str = first_line(r.err)
+        if why.contains("not supported") || why.contains("subset") {
+            l.status = "skip"
+            l.why = "llvm emitter subset: " + why
+            return l
+        }
+        l.status = "error"
+        l.kind = "compile"
+        l.why = "llvm emit: " + why
+        return l
+    }
+    write_file(llfile, r.out)
+    if !file_exists(ll_validate_bin()) {
+        l.status = "skip"
+        l.why = "bin/ll_validate missing (run make bin/ll_validate)"
+        return l
+    }
+    let notes: list[str] = []
+    let vr: RunCap = run_cap(ll_validate_bin(), [llfile])
+    if !vr.spawned {
+        l.status = "error"
+        l.kind = "tool"
+        l.why = "ll_validate failed to spawn"
+        return l
+    }
+    if vr.code != 0 {
+        l.status = "error"
+        l.kind = "invalid-ir"
+        l.why = "ll_validate: " + first_line(vr.err)
+        return l
+    }
+    notes.push("IR valid")
+    if which("llvm-as") {
+        let ar: RunCap = run_cap("llvm-as", [llfile, "-o", scratch + "/prog.bc"])
+        if ar.code == 0 {
+            notes.push("assembled")
+        } else {
+            notes.push("llvm-as rejected: " + first_line(ar.err))
+        }
+    }
+    l.status = "validated"
+    l.notes = str_join_nice2(notes)
+    return l
+}
+
+# str_join_nice2(xs) — ", ".join(xs)
+fn str_join_nice2(xs: list[str]) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < xs.len() {
+        if i > 0 {
+            out = out + ", "
+        }
+        out = out + xs.get(i)
+        i = i + 1
+    }
+    return out
+}
+
+# ============================================================================
+# The corpus.
+# ============================================================================
+
+# core_corpus() — the curated core: every verdict class on every
+# executing backend, in minutes. Sixteen programs the first sweep
+# proved byte-identical on all three executing legs; ten the sweep
+# proved panic-equal; two the sweep proved channel-normalized; five
+# the sweep found divergent and the ledger names.
+fn core_corpus() -> list[str] {
+    return["feat_contract_basic", "feat_contract_ensures",
+    "feat_contract_loop", "feat_deep_scan11_cr_comment",
+    "feat_deep_scan12_lint_deadcode", "feat_deep_scan12_lint_unused",
+    "feat_deep_scan12_optimiser", "feat_inline_licm", "feat_optimize",
+    "feat_proof_elide", "feat_stage101_sidechannel",
+    "feat_stage102_consttime", "feat_stage124_bench",
+    "feat_stage130_deprecated", "feat_stage97_invariants",
+    "feat_stage98_refine_fast", "feat_deep_scan25_checked_casts",
+    "feat_proof_sound_divcorner", "feat_proof_sound_nz",
+    "feat_proof_sound_ovf", "feat_stage98_refine_sound",
+    "panic_badint", "panic_divzero", "panic_float_inf_toint",
+    "panic_message", "panic_overflow", "feat_arith",
+    "feat_deep_scan6_lexer", "feat_deep_scan7_to_float",
+    "feat_deep_scan27_nested_generic", "feat_stage31_tail",
+    "feat_stage98_refine_panic", "panic_str_bounds"]
+}
+
+# discover_corpus(gated) — [entries, skips]: eligible programs (each
+# [name, path]) + named exclusions (each [name, reason]). tests/xdiff
+# wins name collisions over tests/ok (the fixture set is the table's
+# own); the walk is one directory level, filenames sorted, exactly
+# the .py's two os.listdir passes.
+fn discover_corpus(gated: bool) -> list[list[list[str]]] uses Fs {
+    let entries: list[list[str]] = []
+    let skips: list[list[str]] = []
+    let seen: list[str] = []
+    let dirs: list[str] = [xdiff_dir(), ok_dir()]
+    let mut d: int = 0
+    while d < dirs.len() {
+        let dir: str = dirs.get(d)
+        if !fs_is_dir(dir) {
+            d = d + 1
+            continue
+        }
+        let names: list[str] = fs_read_dir(dir)
+        let mut i: int = 0
+        while i < names.len() {
+            let fname: str = names.get(i)
+            if !fname.ends_with(".hls") || list_has(seen, fname) {
+                i = i + 1
+                continue
+            }
+            seen.push(fname)
+            let path: str = dir + "/" + fname
+            if gated {
+                if !file_exists(path) {
+                    let sk: list[str] = [fname, "unreadable: " + path]
+                    skips.push(sk)
+                    i = i + 1
+                    continue
+                }
+                let pv: list[str] = purity_verdict(read_file(path))
+                if pv.get(0) == "0" {
+                    let sk2: list[str] = [fname, pv.get(1)]
+                    skips.push(sk2)
+                    i = i + 1
+                    continue
+                }
+            }
+            let e: list[str] = [fname.slice(0, fname.len() - 4), path]
+            entries.push(e)
+            i = i + 1
+        }
+        d = d + 1
+    }
+    let out: list[list[list[str]]] = [entries, skips]
+    return out
+}
+
+# resolve_core() — the curated names that exist, then every
+# tests/xdiff fixture (sorted), exactly the .py's resolution.
+fn resolve_core() -> list[list[str]] uses Fs {
+    let out: list[list[str]] = []
+    let core: list[str] = core_corpus()
+    let mut i: int = 0
+    while i < core.len() {
+        let p: str = ok_dir() + "/" + core.get(i) + ".hls"
+        if file_exists(p) {
+            let e: list[str] = [core.get(i), p]
+            out.push(e)
+        }
+        i = i + 1
+    }
+    if fs_is_dir(xdiff_dir()) {
+        let names: list[str] = fs_read_dir(xdiff_dir())
+        let mut j: int = 0
+        while j < names.len() {
+            if names.get(j).ends_with(".hls") {
+                let e2: list[str] = [names.get(j).slice(0, names.get(j).len() - 4),
+                xdiff_dir() + "/" + names.get(j)]
+                out.push(e2)
+            }
+            j = j + 1
+        }
+    }
+    return out
+}
+
+# ============================================================================
+# The worker.
+# ============================================================================
+
+struct Rec {
+    name: str,
+    path: str,
+    verdict: str,
+    detail: str,
+    signature: str,
+    backends: list[str],
+    legs: list[Leg],
+    has_ledger: bool,
+    ledger_status: str,
+    ledger_class: str,
+    ledger_culprit: str,
+    ledger_diagnosis: str
+}
+
+# digest16(s) — sha256, first 16 hex digits.
+fn digest16(s: str) -> str {
+    return sha256_hex(s).slice(0, 16)
+}
+
+# run_leg(b, path, scratch) — dispatch one backend.
+fn run_leg(b: str, path: str, scratch: str) -> Leg uses Fs, Proc {
+    if b == "interp" {
+        return leg_interp(path, scratch)
+    }
+    if b == "native" {
+        return leg_native(path, scratch)
+    }
+    if b == "wasm" {
+        return leg_wasm(path, scratch)
+    }
+    return leg_llvm(path, scratch)
+}
+
+# run_program(name, path, backends, scratch, ledger, strict) — every
+# leg over one program, the oracle, the ledger verdict, the record.
+# The scratch dir is this program's own (the .py's mkdtemp), so a leg
+# that refuses early can never read a previous program's outputs.
+fn run_program(name: str, path: str, backends: list[str], scratch: str,
+ledger: Ledgered, strict: bool) -> Rec uses Fs, Proc {
+    let legs: list[Leg] = []
+    let mut i: int = 0
+    while i < backends.len() {
+        legs.push(run_leg(backends.get(i), path, scratch))
+        i = i + 1
+    }
+    let vd: VD = compare_program(backends, legs, strict)
+    let judge: Judge = ledger_judge(name, vd.verdict, backends, legs, ledger)
+    # the signature: ok/halted/error/validated legs, backends sorted
+    let sig_b: list[str] = []
+    let sig_s: list[str] = []
+    let mut j: int = 0
+    while j < backends.len() {
+        let st: str = legs.get(j).status
+        if st == "ok" || st == "halted" || st == "error" || st == "validated" {
+            sig_b.push(backends.get(j))
+            sig_s.push(leg_state(legs.get(j)))
+        }
+        j = j + 1
+    }
+    let sorted_b: list[str] = sort_strs(sig_b)
+    let mut sig: str = ""
+    let mut k: int = 0
+    while k < sorted_b.len() {
+        let mut state: str = "skip"
+        let mut ki: int = 0
+        while ki < sig_b.len() {
+            if sig_b.get(ki) == sorted_b.get(k) {
+                state = sig_s.get(ki)
+            }
+            ki = ki + 1
+        }
+        if k > 0 {
+            sig = sig + " "
+        }
+        sig = sig + sorted_b.get(k) + "=" + state
+        k = k + 1
+    }
+    let rec: Rec = Rec {
+        name: name,
+        path: path,
+        verdict: vd.verdict,
+        detail: vd.detail,
+        signature: sig,
+        backends: backends,
+        legs: legs,
+        has_ledger: judge.status != "",
+        ledger_status: judge.status,
+        ledger_class: jstr_or(judge.entry, "class", ""),
+        ledger_culprit: jstr_or(judge.entry, "culprit", ""),
+        ledger_diagnosis: jstr_or(judge.entry, "diagnosis", "")
+    }
+    return rec
+}
+
+# ============================================================================
+# The report.
+# ============================================================================
+
+fn verdict_mark(v: str) -> str {
+    if v == "exact" {
+        return "."
+    }
+    if v == "normalized" {
+        return "~"
+    }
+    if v == "panic-equal" {
+        return "p"
+    }
+    if v == "halt-gap" {
+        return "h"
+    }
+    if v == "divergence" {
+        return "X"
+    }
+    if v == "error" {
+        return "E"
+    }
+    if v == "unpaired" {
+        return "u"
+    }
+    if v == "skipped" {
+        return "-"
+    }
+    return "?"
+}
+
+fn verdict_is_green(v: str) -> bool {
+    return v == "exact" || v == "normalized" || v == "panic-equal"
+    || v == "halt-gap"
+}
+
+# fmt_tenths(ms) — "%0.1f" of the elapsed seconds, rounded.
+fn fmt_tenths(ms: int) -> str {
+    let t10: int = (ms + 50) / 100
+    let whole: int = t10 / 10
+    let frac: int = t10 % 10
+    return whole.to_str() + "." + frac.to_str()
+}
+
+# print_report(records, skips, backends, elapsed_ms) — the table.
+fn print_report(records: list[Rec], skips: list[list[str]],
+backends: list[str], elapsed_ms: int) -> void uses IO {
+    println("=====================================================================")
+    println("  hls-xdiff — the cross-impl differential table (Stage 133)")
+    let mut bline: str = "  backends: " + str_join_space(backends)
+    if list_has(backends, "llvm") {
+        bline = bline + "  (llvm: static — validated, not executed)"
+    }
+    println(bline)
+    println("=====================================================================")
+    let mut i: int = 0
+    while i < records.len() {
+        let r: Rec = records.get(i)
+        let mut note: str = ""
+        if r.has_ledger {
+            note = " [" + r.ledger_status + ": " + r.ledger_class + "]"
+        }
+        println("  " + verdict_mark(r.verdict) + " "
+        + pad_right(clip_str(r.name, 42), 42) + " "
+        + pad_right(r.verdict, 11) + " "
+        + clip_str(r.detail, 110) + note)
+        i = i + 1
+    }
+    let mut s: int = 0
+    while s < skips.len() {
+        println("  - " + pad_right(clip_str(skips.get(s).get(0), 42), 42)
+        + " " + pad_right("excluded", 11) + " " + skips.get(s).get(1))
+        s = s + 1
+    }
+    println("---------------------------------------------------------------------")
+    let order: list[str] = ["exact", "normalized", "panic-equal",
+    "halt-gap", "divergence", "error", "unpaired", "skipped"]
+    let counts: list[str] = []
+    let mut cvals: list[int] = []
+    let mut t: int = 0
+    while t < order.len() {
+        let mut n: int = 0
+        let mut ri: int = 0
+        while ri < records.len() {
+            if records.get(ri).verdict == order.get(t) {
+                n = n + 1
+            }
+            ri = ri + 1
+        }
+        if n > 0 {
+            counts.push(order.get(t))
+            cvals.push(n)
+        }
+        t = t + 1
+    }
+    let line: str = "  " + records.len().to_str() + " programs in "
+    + fmt_tenths(elapsed_ms) + "s — "
+    let mut pieces: str = ""
+    let mut p: int = 0
+    while p < counts.len() {
+        if p > 0 {
+            pieces = pieces + "  "
+        }
+        pieces = pieces + counts.get(p) + " " + cvals.get(p).to_str()
+        p = p + 1
+    }
+    println(line + pieces)
+}
+
+# str_join_space(xs) — " ".join(xs)
+fn str_join_space(xs: list[str]) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < xs.len() {
+        if i > 0 {
+            out = out + " "
+        }
+        out = out + xs.get(i)
+        i = i + 1
+    }
+    return out
+}
+
+# leg_to_json(l) — the report's leg entry.
+fn leg_to_json(l: Leg) -> JsonValue {
+    let keys: list[str] = ["status"]
+    let vals: list[JsonValue] = [json_str(l.status)]
+    if l.status == "ok" || l.status == "halted" {
+        keys.push("exit")
+        vals.push(json_int(l.code))
+    }
+    if l.has_out {
+        keys.push("out_sha256_16")
+        vals.push(json_str(digest16(l.out)))
+        keys.push("out_bytes")
+        vals.push(json_int(l.out.len()))
+        keys.push("out_canonical_sha256_16")
+        vals.push(json_str(digest16(canonical_channel(l.out).text)))
+    }
+    if l.status == "halted" {
+        keys.push("trap")
+        vals.push(json_bool(l.trap))
+    }
+    if l.why != "" {
+        keys.push("why")
+        vals.push(json_str(l.why))
+    }
+    if l.kind != "" {
+        keys.push("kind")
+        vals.push(json_str(l.kind))
+    }
+    if l.notes != "" {
+        keys.push("notes")
+        vals.push(json_str(l.notes))
+    }
+    return json_object(keys, vals)
+}
+
+# rec_to_json(r) — the report's program entry.
+fn rec_to_json(r: Rec) -> JsonValue {
+    let leg_keys: list[str] = []
+    let leg_vals: list[JsonValue] = []
+    let mut i: int = 0
+    while i < r.backends.len() {
+        leg_keys.push(r.backends.get(i))
+        leg_vals.push(leg_to_json(r.legs.get(i)))
+        i = i + 1
+    }
+    let mut led: JsonValue = json_null()
+    if r.has_ledger {
+        led = json_object(["class", "culprit", "status", "diagnosis"],
+        [json_str(r.ledger_class), json_str(r.ledger_culprit),
+        json_str(r.ledger_status), json_str(r.ledger_diagnosis)])
+    }
+    return json_object(["name", "path", "verdict", "detail",
+    "signature", "legs", "ledger"],
+    [json_str(r.name), json_str(r.path), json_str(r.verdict),
+    json_str(r.detail), json_str(r.signature),
+    json_object(leg_keys, leg_vals), led])
+}
+
+# records_to_json(records, skips, backends, elapsed_ms, ledger_path)
+fn records_to_json(records: list[Rec], skips: list[list[str]],
+backends: list[str], elapsed_ms: int,
+ledger_path: str) -> JsonValue {
+    let order: list[str] = ["exact", "normalized", "panic-equal",
+    "halt-gap", "divergence", "error", "unpaired", "skipped"]
+    let sum_keys: list[str] = []
+    let sum_vals: list[JsonValue] = []
+    let mut t: int = 0
+    while t < order.len() {
+        let mut n: int = 0
+        let mut ri: int = 0
+        while ri < records.len() {
+            if records.get(ri).verdict == order.get(t) {
+                n = n + 1
+            }
+            ri = ri + 1
+        }
+        if n > 0 {
+            sum_keys.push(order.get(t))
+            sum_vals.push(json_int(n))
+        }
+        t = t + 1
+    }
+    let ex_keys: list[str] = []
+    let ex_vals: list[JsonValue] = []
+    let mut s: int = 0
+    while s < skips.len() {
+        ex_keys.push(skips.get(s).get(0))
+        ex_vals.push(json_str(skips.get(s).get(1)))
+        s = s + 1
+    }
+    let progs: list[JsonValue] = []
+    let mut p: int = 0
+    while p < records.len() {
+        progs.push(rec_to_json(records.get(p)))
+        p = p + 1
+    }
+    let tenth: int = (elapsed_ms + 50) / 100
+    let elapsed_f: float = tenth.to_float() / 10.0
+    return json_object(["schema", "tool", "backends", "llvm_is_static",
+    "elapsed_s", "ledger", "summary", "excluded", "programs"],
+    [json_int(1),
+    json_str("hls-xdiff (Stage 133, v" + tool_version() + ")"),
+    json_array(backends_to_json(backends)),
+    json_bool(list_has(backends, "llvm")),
+    json_float(elapsed_f),
+    json_str(ledger_path),
+    json_object(sum_keys, sum_vals),
+    json_object(ex_keys, ex_vals),
+    json_array(progs)])
+}
+
+# backends_to_json(backends) — the JsonValue list of names.
+fn backends_to_json(backends: list[str]) -> list[JsonValue] {
+    let out: list[JsonValue] = []
+    let mut i: int = 0
+    while i < backends.len() {
+        out.push(json_str(backends.get(i)))
+        i = i + 1
+    }
+    return out
+}
+
+# ---- the --update-ledger draft renderer (json.dumps indent=2) ----
+
+# json_escape_py(s) — the JSON string body Python's json.dumps emits.
+fn json_escape_py(s: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c == 34 {
+            out = out + "\\\""
+        } else if c == 92 {
+            out = out + "\\\\"
+        } else if c == 10 {
+            out = out + "\\n"
+        } else if c == 9 {
+            out = out + "\\t"
+        } else if c == 13 {
+            out = out + "\\r"
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# dump_indent2(v) — json.dumps(v, indent=2) for the shapes the drafts
+# carry (arrays, objects, strings, ints).
+fn dump_indent2(v: JsonValue) -> str {
+    return dump_indent2_at(v, 0)
+}
+
+fn dump_indent2_at(v: JsonValue, depth: int) -> str {
+    let mut pad: str = ""
+    let mut p: int = 0
+    while p < depth * 2 {
+        pad = pad + " "
+        p = p + 1
+    }
+    let mut pad_in: str = ""
+    let mut p2: int = 0
+    while p2 < (depth + 1) * 2 {
+        pad_in = pad_in + " "
+        p2 = p2 + 1
+    }
+    if json_is_array(v) {
+        if v.arr.len() == 0 {
+            return "[]"
+        }
+        let mut out: str = "[\n"
+        let mut i: int = 0
+        while i < v.arr.len() {
+            out = out + pad_in + dump_indent2_at(v.arr.get(i), depth + 1)
+            if i + 1 < v.arr.len() {
+                out = out + ","
+            }
+            out = out + "\n"
+            i = i + 1
+        }
+        return out + pad + "]"
+    }
+    if json_is_object(v) {
+        if v.obj_keys.len() == 0 {
+            return "{}"
+        }
+        let mut out2: str = "{\n"
+        let mut k: int = 0
+        while k < v.obj_keys.len() {
+            out2 = out2 + pad_in + "\"" + json_escape_py(v.obj_keys.get(k))
+            + "\": " + dump_indent2_at(v.obj_vals.get(k), depth + 1)
+            if k + 1 < v.obj_keys.len() {
+                out2 = out2 + ","
+            }
+            out2 = out2 + "\n"
+            k = k + 1
+        }
+        return out2 + pad + "}"
+    }
+    if json_is_str(v) {
+        return "\"" + json_escape_py(json_str_value(v)) + "\""
+    }
+    if json_is_bool(v) {
+        if json_bool_value(v) {
+            return "true"
+        }
+        return "false"
+    }
+    if json_is_null(v) {
+        return "null"
+    }
+    if json_is_float(v) {
+        return json_float_value(v).to_str()
+    }
+    return json_int_value(v).to_str()
+}
+
+# ============================================================================
+# selftest — the pure logic, no backends.
+# ============================================================================
+
+# mk_ok(out) / mk_halt(code) / mk_trap() / mk_skip(why) — the
+# selftest's synthetic legs.
+fn mk_ok(out: str) -> Leg {
+    let l: Leg = leg_new()
+    l.status = "ok"
+    l.code = 0
+    l.out = out
+    l.has_out = true
+    return l
+}
+
+fn mk_halt(code: int) -> Leg {
+    let l: Leg = leg_new()
+    l.status = "halted"
+    l.code = code
+    l.trap = false
+    return l
+}
+
+fn mk_trap() -> Leg {
+    let l: Leg = leg_new()
+    l.status = "halted"
+    l.code = 1
+    l.trap = true
+    return l
+}
+
+fn mk_err(kind: str) -> Leg {
+    let l: Leg = leg_new()
+    l.status = "error"
+    l.kind = kind
+    return l
+}
+
+# selftest() — the 17 normalizer vectors, the 9 verdict vectors and
+# the 5 ledger-law vectors, exactly the .py's.
+fn selftest() -> int uses IO {
+    let va: list[str] = ["0.750000", "1.500000", "3.140000", "100.000000",
+    "0.123457", "123456789012345680.000000", "0.000000", "0.000010",
+    "1000000000000000000000.000000", "-0.000000", "nan", "-nan", "inf",
+    "-inf", "1.10", "9007199254740993", "0.750001", "abc", "v1.2.3"]
+    let vb: list[str] = ["0.75", "1.5", "3.14", "100.0", "0.12345678901",
+    "123456789012345680.0", "1e-7", "1e-5", "1e+21", "0.0", "NaN",
+    "nan", "Infinity", "-Infinity", "1.1", "9007199254740994", "0.75",
+    "abd", "v1.2.4"]
+    let ve: list[bool] = [true, true, true, true, true, true, true, true,
+    true, true, true, true, true, true, false, false, false, false,
+    false]
+    let mut fails: int = 0
+    let mut i: int = 0
+    while i < va.len() {
+        let ca: Channel = canonical_channel(va.get(i))
+        let cb: Channel = canonical_channel(vb.get(i))
+        let got: bool = ca.text == cb.text
+        if got != ve.get(i) {
+            fails = fails + 1
+            println("  [FAIL] channel(" + py_repr_str(va.get(i)) + ")="
+            + py_repr_str(ca.text) + " vs channel("
+            + py_repr_str(vb.get(i)) + ")=" + py_repr_str(cb.text)
+            + " — expected "
+            + bool_word(ve.get(i)))
+        }
+        i = i + 1
+    }
+    # the verdict vectors
+    fails = fails + selftest_verdicts()
+    # the ledger law: sanctioned / stale / mismatch
+    let w1: JsonValue = json_object(["file", "class", "culprit", "states",
+    "diagnosis"],
+    [json_str("prog_a"), json_str("wasm-invalid-module"),
+    json_str("wasm"),
+    json_object(["interp", "native", "wasm"],
+    [json_str("ok"), json_str("ok"),
+    json_str("error(invalid-module)")]),
+    json_str("")])
+    let w2: JsonValue = json_object(["file", "class", "culprit", "states",
+    "diagnosis"],
+    [json_str("prog_b"), json_str("wasm-missing-check"),
+    json_str("wasm"),
+    json_object(["interp", "native", "wasm"],
+    [json_str("halt(101)"), json_str("halt(101)"),
+    json_str("ok")]),
+    json_str("")])
+    let ledger: Ledgered = Ledgered {
+        ok: true,
+        err: "",
+        waivers: json_array([w1, w2])
+    }
+    let b_a: list[str] = ["interp", "native", "wasm"]
+    let legs_div: list[Leg] = [mk_ok("a"), mk_ok("a"), mk_err("invalid-module")]
+    let st: Judge = ledger_judge("prog_a", "divergence", b_a, legs_div, ledger)
+    if st.status != "sanctioned" {
+        fails = fails + 1
+        println("  [FAIL] ledger: named divergence should be sanctioned, got "
+        + st.status)
+    }
+    let legs_clean: list[Leg] = [mk_ok("a"), mk_ok("a"), mk_ok("a")]
+    let st2: Judge = ledger_judge("prog_a", "exact", b_a, legs_clean, ledger)
+    if st2.status != "stale" {
+        fails = fails + 1
+        println("  [FAIL] ledger: clean program should make its entry stale, got "
+        + st2.status)
+    }
+    let legs_moved: list[Leg] = [mk_ok("a"), mk_halt(3),
+    mk_err("invalid-module")]
+    let st3: Judge = ledger_judge("prog_a", "divergence", b_a, legs_moved, ledger)
+    if st3.status != "mismatch" {
+        fails = fails + 1
+        println("  [FAIL] ledger: a moved divergence should mismatch, got "
+        + st3.status)
+    }
+    let legs_haltnow: list[Leg] = [mk_halt(101), mk_halt(101), mk_ok("")]
+    let st4: Judge = ledger_judge("prog_b", "divergence", b_a, legs_haltnow, ledger)
+    if st4.status != "sanctioned" {
+        fails = fails + 1
+        println("  [FAIL] ledger: missing-check entry should sanction, got "
+        + st4.status)
+    }
+    let st5: Judge = ledger_judge("prog_b", "exact", b_a, legs_clean, ledger)
+    if st5.status != "stale" {
+        fails = fails + 1
+        println("  [FAIL] ledger: healed program should be stale, got "
+        + st5.status)
+    }
+    if fails == 0 {
+        println("selftest: " + va.len().to_str() + " normalizer + 9 verdict + 5 ledger vectors green")
+        return 0
+    }
+    println("selftest: " + fails.to_str() + " FAILURES")
+    return 1
+}
+
+fn bool_word(b: bool) -> str {
+    if b {
+        return "equal"
+    }
+    return "unequal"
+}
+
+# selftest_verdicts() — the 9 verdict vectors; returns the fail count.
+fn selftest_verdicts() -> int uses IO {
+    let mut fails: int = 0
+    # all three clean, equal bytes -> exact
+    let b1: list[str] = ["interp", "native", "wasm"]
+    let l1: list[Leg] = [mk_ok("a\n"), mk_ok("a\n"), mk_ok("a\n")]
+    fails = fails + verdict_check(b1, l1, "exact", "interp,native,wasm ok a")
+    # the float channel -> normalized
+    let b2: list[str] = ["interp", "wasm"]
+    let l2: list[Leg] = [mk_ok("x=0.750000\n"), mk_ok("x=0.75\n")]
+    fails = fails + verdict_check(b2, l2, "normalized", "interp,wasm floats")
+    # hosted panic + wasm trap -> panic-equal
+    let b3: list[str] = ["interp", "native", "wasm"]
+    let l3: list[Leg] = [mk_halt(101), mk_halt(101), mk_trap()]
+    fails = fails + verdict_check(b3, l3, "panic-equal", "panic-equal")
+    # hosted exit 7 + wasm trap -> halt-gap
+    let b4: list[str] = ["interp", "native", "wasm"]
+    let l4: list[Leg] = [mk_halt(7), mk_halt(7), mk_trap()]
+    fails = fails + verdict_check(b4, l4, "halt-gap", "halt-gap")
+    # one clean, one trap -> divergence
+    let b5: list[str] = ["interp", "wasm"]
+    let l5: list[Leg] = [mk_ok("a\n"), mk_trap()]
+    fails = fails + verdict_check(b5, l5, "divergence", "clean vs trap")
+    # hosted panic, wasm prints -> divergence
+    let b6: list[str] = ["interp", "native", "wasm"]
+    let l6: list[Leg] = [mk_halt(101), mk_halt(101), mk_ok("unreachable\n")]
+    fails = fails + verdict_check(b6, l6, "divergence", "panic vs output")
+    # two clean, different bytes -> divergence
+    let b7: list[str] = ["interp", "native"]
+    let l7: list[Leg] = [mk_ok("a\n"), mk_ok("b\n")]
+    fails = fails + verdict_check(b7, l7, "divergence", "a vs b")
+    # halt codes disagree -> divergence
+    let b8: list[str] = ["interp", "native", "wasm"]
+    let l8: list[Leg] = [mk_halt(101), mk_halt(101), mk_halt(3)]
+    fails = fails + verdict_check(b8, l8, "divergence", "halt codes")
+    # one executing leg -> unpaired
+    let b9: list[str] = ["interp"]
+    let l9: list[Leg] = [mk_ok("a\n")]
+    fails = fails + verdict_check(b9, l9, "unpaired", "only interp")
+    return fails
+}
+
+# verdict_check(backends, legs, expect, label) — one vector.
+fn verdict_check(backends: list[str], legs: list[Leg], expect: str,
+label: str) -> int uses IO {
+    let vd: VD = compare_program(backends, legs, false)
+    if vd.verdict == expect {
+        return 0
+    }
+    # the .py's %s of {backend: leg["status"], ...} — the dict repr
+    let pairs: list[list[str]] = []
+    let mut i: int = 0
+    while i < backends.len() {
+        let pair: list[str] = [backends.get(i), "'" + legs.get(i).status + "'"]
+        pairs.push(pair)
+        i = i + 1
+    }
+    println("  [FAIL] verdict(" + py_dict_repr(pairs) + ") = " + vd.verdict
+    + ", expected " + expect)
+    return 1
+}
+
+# ============================================================================
+# The CLI.
+# ============================================================================
+
+fn usage_text() -> str {
+    return "usage: hls-xdiff [-h] [--file PROG] [--core] [--all] "
+    + "[--backends interp,native,wasm,llvm]\n"
+    + "                 [--timeout S] [--jobs N] [--json PATH] "
+    + "[--ledger PATH] [--discover]\n"
+    + "                 [--list] [--strict] [--update-ledger] "
+    + "[selftest]\n"
+    + "\n"
+    + "the Stage 133 cross-implementation differential suite "
+    + "(the native twin of the\n"
+    + "Python hls-xdiff; same corpus, same oracle, same ledger law)"
+}
+
+# struct Cfg — the parsed command line.
+struct Cfg {
+    file: str,
+    core: bool,
+    all: bool,
+    backends: str,
+    timeout: int,
+    jobs: int,
+    json_path: str,
+    ledger_path: str,
+    discover: bool,
+    list: bool,
+    strict: bool,
+    update_ledger: bool
+}
+
+# cfg_new() — the defaults, argparse's own.
+fn cfg_new() -> Cfg {
+    let cfg: Cfg = Cfg {
+        file: "",
+        core: false,
+        all: false,
+        backends: default_backends(),
+        timeout: 60,
+        jobs: 2,
+        json_path: "",
+        ledger_path: ledger_default(),
+        discover: false,
+        list: false,
+        strict: false,
+        update_ledger: false
+    }
+    return cfg
+}
+
+# parse_args(argv, cfg) — [mode, arg]: the argparse surface (--flag
+# value and --flag=value both parse; unknown flags are usage errors,
+# exit 2). Modes: cfg (the config was filled in), selftest, help,
+# unknown <flag>, noval <flag>, selfish <word>.
+fn parse_args(argv: list[str], cfg: Cfg) -> list[str] {
+    let value_flags: list[str] = ["--file", "--backends", "--timeout",
+    "--jobs", "--json", "--ledger"]
+    let bool_flags: list[str] = ["--core", "--all", "--discover", "--list",
+    "--strict", "--update-ledger", "-h", "--help"]
+    let mut i: int = 1
+    while i < argv.len() {
+        let a: str = argv.get(i)
+        if a.starts_with("--") || a == "-h" {
+            let mut head: str = a
+            let mut val: str = ""
+            let mut has_val: bool = false
+            let eq: int = a.find("=")
+            if eq >= 0 {
+                head = a.slice(0, eq)
+                val = a.slice(eq + 1, a.len())
+                has_val = true
+            }
+            if list_has(value_flags, head) {
+                if !has_val {
+                    if i + 1 >= argv.len() {
+                        return["noval", head]
+                    }
+                    i = i + 1
+                    val = argv.get(i)
+                }
+                if head == "--file" {
+                    cfg.file = val
+                }
+                if head == "--backends" {
+                    cfg.backends = val
+                }
+                if head == "--timeout" {
+                    cfg.timeout = val.to_int()
+                }
+                if head == "--jobs" {
+                    cfg.jobs = val.to_int()
+                }
+                if head == "--json" {
+                    cfg.json_path = val
+                }
+                if head == "--ledger" {
+                    cfg.ledger_path = val
+                }
+            } else {
+                if !list_has(bool_flags, head) {
+                    return["unknown", a]
+                }
+                if head == "--core" {
+                    cfg.core = true
+                }
+                if head == "--all" {
+                    cfg.all = true
+                }
+                if head == "--discover" {
+                    cfg.discover = true
+                }
+                if head == "--list" {
+                    cfg.list = true
+                }
+                if head == "--strict" {
+                    cfg.strict = true
+                }
+                if head == "--update-ledger" {
+                    cfg.update_ledger = true
+                }
+                if head == "-h" || head == "--help" {
+                    return["help", ""]
+                }
+            }
+            i = i + 1
+            continue
+        }
+        # a positional: "selftest" runs the vectors; anything else is
+        # the .py's silent positional (argparse filled it, main
+        # ignored it) — "self*" gets the did-you-mean refusal.
+        if a == "selftest" {
+            return["selftest", ""]
+        }
+        if a.starts_with("self") {
+            return["selfish", a]
+        }
+        i = i + 1
+    }
+    return["cfg", ""]
+}
+
+# main — the suite CLI.
+fn main() -> int uses IO, Fs, Proc, Args, Exit, Clock {
+    let argv: list[str] = args()
+    let cfg: Cfg = cfg_new()
+    let pa: list[str] = parse_args(argv, cfg)
+    let mode: str = pa.get(0)
+    if mode == "selftest" {
+        return selftest()
+    }
+    if mode == "help" {
+        println(usage_text())
+        return 0
+    }
+    if mode == "unknown" {
+        eprintln("hls-xdiff: error: unrecognized arguments: " + pa.get(1))
+        return 2
+    }
+    if mode == "noval" {
+        eprintln("hls-xdiff: error: argument " + pa.get(1)
+        + ": expected one argument")
+        return 2
+    }
+    if mode == "selfish" {
+        eprintln("hls-xdiff: error: did you mean: hls-xdiff selftest")
+        return 2
+    }
+    # the tool runs from the repo root: every leg resolves bin/hlc,
+    # bin/ll_validate and tools/ against it.
+    if !file_exists(boot_py()) {
+        eprintln("hls-xdiff: REFUSED — run from the repo root "
+        + "(the legs resolve bin/hlc, bin/ll_validate and tools/ against it)")
+        return 2
+    }
+
+    # the backends
+    let raw: list[str] = cfg.backends.split(",")
+    let backends: list[str] = []
+    let mut ri: int = 0
+    while ri < raw.len() {
+        let b: str = raw.get(ri).trim()
+        if b != "" {
+            backends.push(b)
+        }
+        ri = ri + 1
+    }
+    let mut bi: int = 0
+    while bi < backends.len() {
+        if !is_known_backend(backends.get(bi)) {
+            eprintln("hls-xdiff: unknown backend '" + backends.get(bi)
+            + "' (choose from interp,native,wasm,llvm)")
+            return 2
+        }
+        bi = bi + 1
+    }
+    if list_has(backends, "native") && !list_has(backends, "interp") {
+        eprintln("hls-xdiff: the interp leg is the reference — it cannot be dropped while native runs")
+        return 2
+    }
+    # the corpus
+    let entries: list[list[str]] = []
+    let skips: list[list[str]] = []
+    if cfg.file != "" {
+        let path: str = cfg.file
+        if !file_exists(path) {
+            eprintln("hls-xdiff: no such program: " + cfg.file)
+            return 2
+        }
+        let name: str = path_base_stem(path)
+        let e: list[str] = [name, path]
+        entries.push(e)
+    } else {
+        if cfg.core {
+            let core: list[list[str]] = resolve_core()
+            let mut ci: int = 0
+            while ci < core.len() {
+                entries.push(core.get(ci))
+                ci = ci + 1
+            }
+        } else {
+            let dc: list[list[list[str]]] = discover_corpus(!cfg.all)
+            let de: list[list[str]] = dc.get(0)
+            let ds: list[list[str]] = dc.get(1)
+            let mut di: int = 0
+            while di < de.len() {
+                entries.push(de.get(di))
+                di = di + 1
+            }
+            let mut dj: int = 0
+            while dj < ds.len() {
+                skips.push(ds.get(dj))
+                dj = dj + 1
+            }
+        }
+    }
+    if cfg.discover {
+        println("purity census: " + entries.len().to_str() + " eligible, "
+        + skips.len().to_str() + " excluded")
+        let mut si: int = 0
+        while si < skips.len() {
+            println("  excluded " + pad_right(skips.get(si).get(0), 44) + " "
+            + skips.get(si).get(1))
+            si = si + 1
+        }
+        return 0
+    }
+    if cfg.list {
+        let mut li: int = 0
+        while li < entries.len() {
+            println(entries.get(li).get(0))
+            li = li + 1
+        }
+        return 0
+    }
+    if entries.len() == 0 {
+        eprintln("hls-xdiff: empty corpus")
+        return 2
+    }
+    # the ledger
+    let ledger: Ledgered = load_ledger(cfg.ledger_path)
+    if !ledger.ok {
+        eprintln("hls-xdiff: " + ledger.err)
+        return 2
+    }
+    # the .py ran children with LC_ALL=C, TZ=UTC; the twin sets the
+    # environment once and every child inherits it.
+    env_set_var("LC_ALL", "C")
+    env_set_var("TZ", "UTC")
+    # one scratch per program (the mkdtemp law: a leg that refuses
+    # early can never read a previous program's outputs), all under
+    # one per-run root seeded by the clock.
+    let run_root: str = "/tmp/hls-xdiff-" + system_time_now_ms().to_str()
+    let t0: int = system_time_now_ms()
+    let records: list[Rec] = []
+    let mut pi: int = 0
+    while pi < entries.len() {
+        let entry: list[str] = entries.get(pi)
+        let scratch: str = run_root + "/p" + pi.to_str()
+        proc_exec("mkdir -p '" + shell_quote(scratch) + "'")
+        records.push(run_program(entry.get(0), entry.get(1), backends,
+        scratch, ledger, cfg.strict))
+        pi = pi + 1
+    }
+    let elapsed_ms: int = system_time_now_ms() - t0
+    # stable sort by name, the .py's records.sort(key=name)
+    let mut sj: int = 1
+    while sj < records.len() {
+        let rv: Rec = records.get(sj)
+        let mut sk: int = sj - 1
+        while sk >= 0 && records.get(sk).name > rv.name {
+            records.set(sk + 1, records.get(sk))
+            sk = sk - 1
+        }
+        records.set(sk + 1, rv)
+        sj = sj + 1
+    }
+    print_report(records, skips, backends, elapsed_ms)
+    # --update-ledger: draft entries for the diverging set, printed,
+    # never written (the tool never writes the ledger).
+    if cfg.update_ledger {
+        let drafts: list[JsonValue] = []
+        let mut di2: int = 0
+        while di2 < records.len() {
+            let r: Rec = records.get(di2)
+            if(r.verdict == "divergence" || r.verdict == "error")
+            && !r.has_ledger {
+                let st_keys: list[str] = []
+                let st_vals: list[JsonValue] = []
+                let mut li2: int = 0
+                while li2 < r.backends.len() {
+                    let st: str = r.legs.get(li2).status
+                    if st == "ok" || st == "halted" || st == "error" {
+                        st_keys.push(r.backends.get(li2))
+                        st_vals.push(json_str(leg_state(r.legs.get(li2))))
+                    }
+                    li2 = li2 + 1
+                }
+                drafts.push(json_object(["file", "class", "culprit",
+                "states", "diagnosis"],
+                [json_str(r.name), json_str("TODO"), json_str("TODO"),
+                json_object(st_keys, st_vals),
+                json_str(r.detail)]))
+            }
+            di2 = di2 + 1
+        }
+        println("")
+        println("--update-ledger: " + drafts.len().to_str()
+        + " draft entries (review, classify, splice into "
+        + cfg.ledger_path + " by hand — the tool never writes the ledger):")
+        println(dump_indent2(json_array(drafts)))
+    }
+    if cfg.json_path != "" {
+        write_file(cfg.json_path,
+        json_stringify(records_to_json(records, skips, backends,
+        elapsed_ms, cfg.ledger_path)))
+    }
+    # the verdict law: ledger discipline first (a stale entry is a
+    # failure even when the program itself compares clean), then the
+    # verdict classes
+    let fail_names: list[str] = []
+    let fail_kinds: list[str] = []
+    let fail_details: list[str] = []
+    let mut fi: int = 0
+    while fi < records.len() {
+        let r: Rec = records.get(fi)
+        let v: str = r.verdict
+        if r.has_ledger && (r.ledger_status == "stale"
+        || r.ledger_status == "mismatch") {
+            fail_names.push(r.name)
+            fail_kinds.push("ledger-" + r.ledger_status)
+            fail_details.push(r.detail + " (ledger class " + r.ledger_class + ")")
+            fi = fi + 1
+            continue
+        }
+        if verdict_is_green(v) && !cfg.strict {
+            fi = fi + 1
+            continue
+        }
+        if v == "exact" {
+            fi = fi + 1
+            continue
+        }
+        if(v == "normalized" || v == "halt-gap") && cfg.strict {
+            fail_names.push(r.name)
+            fail_kinds.push(v)
+            fail_details.push(r.detail)
+            fi = fi + 1
+            continue
+        }
+        if r.has_ledger && r.ledger_status == "sanctioned" {
+            fi = fi + 1
+            continue
+        }
+        if v == "divergence" || v == "error" {
+            fail_names.push(r.name)
+            fail_kinds.push(v)
+            fail_details.push(r.detail)
+        }
+        fi = fi + 1
+    }
+    # at least two executing backends must have participated
+    let mut exec_count: int = 0
+    let mut xi: int = 0
+    while xi < backends.len() {
+        if is_executing_backend(backends.get(xi)) {
+            let mut ran: bool = false
+            let mut ri2: int = 0
+            while ri2 < records.len() {
+                let mut bi2: int = 0
+                while bi2 < records.get(ri2).backends.len() {
+                    if records.get(ri2).backends.get(bi2) == backends.get(xi) {
+                        let st: str = records.get(ri2).legs.get(bi2).status
+                        if st == "ok" || st == "halted" {
+                            ran = true
+                        }
+                    }
+                    bi2 = bi2 + 1
+                }
+                ri2 = ri2 + 1
+            }
+            if ran {
+                exec_count = exec_count + 1
+            }
+        }
+        xi = xi + 1
+    }
+    if exec_count < 2 {
+        fail_names.push("(suite)")
+        fail_kinds.push("no-differential-pair")
+        fail_details.push("only " + exec_count.to_str()
+        + " executing backend(s) ran; the suite needs 2+ to compare anything")
+    }
+    # the scratch root goes away with the run
+    proc_exec("rm -rf '" + shell_quote(run_root) + "'")
+    if fail_names.len() > 0 {
+        println("NOT GREEN: " + fail_names.len().to_str() + " failure(s):")
+        let mut fj: int = 0
+        while fj < fail_names.len() {
+            println("  " + fail_kinds.get(fj) + " " + fail_names.get(fj)
+            + ": " + fail_details.get(fj))
+            fj = fj + 1
+        }
+        return 1
+    }
+    println("GREEN: every executing pair agreed (or its divergence is "
+    + "ledgered); the ledger is consistent.")
+    return 0
+}
+
+# path_base_stem(p) — the basename without the trailing ".hls" (the
+# .py's basename(path)[:-4]).
+fn path_base_stem(p: str) -> str {
+    let mut b: str = p
+    let mut i: int = p.len() - 1
+    while i >= 0 {
+        if p.byte_at(i) == 47 {
+            b = p.slice(i + 1, p.len())
+            break
+        }
+        i = i - 1
+    }
+    if b.ends_with(".hls") {
+        return b.slice(0, b.len() - 4)
+    }
+    return b
+}

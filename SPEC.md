@@ -8948,7 +8948,8 @@ interpreter, native differential, fmt-canonical, lint-clean).
 The language ships four implementations of itself — the Stage-0
 interpreter, the self-hosted C backend, the WebAssembly backend and
 the LLVM IR emitter — and their agreement is now a measured fact
-instead of an assumption. `tools/hls-xdiff.py` runs the SAME program
+instead of an assumption. `tools/hls-xdiff.hls` (the native twin,
+`bin/hls-xdiff`) runs the SAME program
 through every backend and compares the observable behaviour: stdout
 bytes and exit codes. Three backends execute (interp, native, wasm);
 the llvm leg is a static participant — it emits IR and structurally

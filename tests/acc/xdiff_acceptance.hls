@@ -7,11 +7,12 @@
 # Run with `make xdiff-acceptance` (which compiles this file and runs
 # it from the repo root).
 #
-# The battery drove the REAL suite CLI (python3 tools/hls-xdiff.py) for
-# everything but section 2, where it loaded the tool with importlib and
-# called canonical_channel() in process; the gate asks that one question
-# through a small python3 driver it writes into its scratch world (the
-# module stays the subject; the vectors and the comparisons live here).
+# The battery drove the REAL suite CLI (bin/hls-xdiff, the native
+# twin of the Python hls-xdiff that retired) for everything but
+# section 2, where it loads the tool's own module through a stripped
+# copy of tools/hls-xdiff.hls (fn main cut) and calls
+# canonical_channel in process — the .hls twin of the battery's
+# importlib front door; the vectors and the comparisons live here.
 # The ledger surgery of section 5 (filter / append / rewrite a states
 # entry) runs here too, over std.json — the tool never writes its
 # ledger, and neither does anything else.
@@ -36,7 +37,7 @@
 #
 # The battery's timeout=900 wrappers have no Halis equivalent (no
 # per-child alarm); every child here is the xdiff tool, boot.py, hlc,
-# gcc or the gate's own python3 driver. The --core sweep legitimately
+# gcc or the gate's own native module driver. The --core sweep legitimately
 # runs for minutes.
 # ============================================================================
 
@@ -80,13 +81,7 @@ fn chk(acc: Acc, label: str, cond: bool, detail: str) -> bool uses IO {
 # ----------------------------------------------------------------------------
 
 fn run_xdiff(args: list[str]) -> RunResult uses Proc {
-    let argv: list[str] = ["tools/hls-xdiff.py"]
-    let mut i: int = 0
-    while i < args.len() {
-        argv.push(args.get(i))
-        i = i + 1
-    }
-    return run_capture("python3", argv)
+    return run_capture("./bin/hls-xdiff", args)
 }
 
 fn file_run(path: str, extra: list[str]) -> RunResult uses Proc {
@@ -135,24 +130,65 @@ fn first_token(s: str) -> str {
 }
 
 # ----------------------------------------------------------------------------
-# The python3 driver: section 2's front door to the tool's own
-# canonical_channel (loaded by path exactly the way the battery loads
-# it). `canon A B` prints the canonical form and the changed-token flag
-# of both sides; the vectors and the verdicts stay in the gate.
+# The module driver: section 2's front door to the tool's own
+# canonical_channel — a native binary this gate builds from a stripped
+# copy of tools/hls-xdiff.hls (fn main cut, the .hls twin of the
+# battery's importlib front door). `canon A B` prints the canonical
+# form and the changed-token flag of both sides; the vectors and the
+# verdicts stay in the gate.
 # ----------------------------------------------------------------------------
 
-fn driver_src() -> str {
-    return "import importlib.util, sys\n" +
-        "spec = importlib.util.spec_from_file_location('hls_xdiff', 'tools/hls-xdiff.py')\n" +
-        "xd = importlib.util.module_from_spec(spec)\n" +
-        "spec.loader.exec_module(xd)\n" +
-        "a, b = sys.argv[2], sys.argv[3]\n" +
-        "ca, cha = xd.canonical_channel(a)\n" +
-        "cb, chb = xd.canonical_channel(b)\n" +
-        "print('ca=%s' % ca)\n" +
-        "print('cb=%s' % cb)\n" +
-        "print('cha=%d' % int(cha))\n" +
-        "print('chb=%d' % int(chb))\n"
+fn mod_driver_src() -> str {
+    return "import \"hls_xdiff_mod.hls\"\n" +
+        "import \"std.str\"\n" +
+        "fn main() -> int uses IO, Args {\n" +
+        "    let argv: list[str] = args()\n" +
+        "    if argv.len() < 4 {\n" +
+        "        return 2\n" +
+        "    }\n" +
+        "    let ca: Channel = canonical_channel(argv.get(2))\n" +
+        "    let cb: Channel = canonical_channel(argv.get(3))\n" +
+        "    println(\"ca=\" + ca.text)\n" +
+        "    println(\"cb=\" + cb.text)\n" +
+        "    println(\"cha=\" + flag01(ca.changed))\n" +
+        "    println(\"chb=\" + flag01(cb.changed))\n" +
+        "    return 0\n" +
+        "}\n" +
+        "fn flag01(b: bool) -> str {\n" +
+        "    if b {\n" +
+        "        return \"1\"\n" +
+        "    }\n" +
+        "    return \"0\"\n" +
+        "}\n"
+}
+
+# build_mod_driver(acc) — write the stripped module copy + the driver,
+# compile both with bin/hlc + gcc, return the driver binary path (""
+# on failure, which fails every section-2 check loudly).
+fn build_mod_driver(acc: Acc) -> str uses IO, Fs, Proc {
+    let binp: str = scratch(acc, "xdiff_mod_driver.bin")
+    if file_exists(binp) {
+        return binp
+    }
+    let src: str = read_file(path_join3(acc.root, "tools/hls-xdiff.hls"))
+    let at: int = src.find("\nfn main(")
+    if at < 0 {
+        return ""
+    }
+    write_file(scratch(acc, "hls_xdiff_mod.hls"), src.slice(0, at + 1))
+    write_file(scratch(acc, "xdiff_mod_driver.hls"), mod_driver_src())
+    let cpath: str = scratch(acc, "xdiff_mod_driver.c")
+    let c: RunResult = run_capture(path_join3(acc.root, "bin/hlc"),
+        [scratch(acc, "xdiff_mod_driver.hls"), cpath])
+    if c.code != 0 {
+        return ""
+    }
+    let g: RunResult = run_capture("gcc",
+        ["-O2", "-o", binp, cpath, "-lm", "-pthread"])
+    if g.code != 0 {
+        return ""
+    }
+    return binp
 }
 
 # value_after(out, prefix) — the remainder of the first line that
@@ -255,8 +291,8 @@ fn sec2(acc: Acc, driver: str) -> void uses IO, Proc {
     let mut n_bad: int = 0
     let mut i: int = 0
     while i < va.len() {
-        let r: RunResult = run_capture("python3",
-            [driver, "canon", va.get(i), vb.get(i)])
+        let r: RunResult = run_capture(driver,
+            ["canon", va.get(i), vb.get(i)])
         let ca: str = value_after(r.out, "ca=")
         let cb: str = value_after(r.out, "cb=")
         if (ca == cb) != vexpect.get(i) {
@@ -270,8 +306,8 @@ fn sec2(acc: Acc, driver: str) -> void uses IO, Proc {
     }
     chk(acc, "17 channel vectors green", n_bad == 0, clip(norm_bad, 120))
 
-    let rc: RunResult = run_capture("python3",
-        [driver, "canon", "x=0.750000", "x=0.75"])
+    let rc: RunResult = run_capture(driver,
+        ["canon", "x=0.750000", "x=0.75"])
     chk(acc, "the channel reports WHEN it changed a token (normalized vs exact)",
         flag(rc.out, "cha=") == 1, "")
     chk(acc, "a short form passes through unrewritten",
@@ -672,7 +708,7 @@ fn sec8(acc: Acc, scratch: str) -> void uses IO, Fs, Proc, Clock, Conc {
 fn main() -> int uses IO, Fs, Proc, Args, Exit, Clock, Conc {
     let acc: Acc = acc_new("xdiff")
     let scratch: str = acc.scratch_base
-    let driver: str = write_src(acc, "driver.py", driver_src())
+    let driver: str = build_mod_driver(acc)
     sec1(acc)
     sec2(acc, driver)
     sec3(acc)
