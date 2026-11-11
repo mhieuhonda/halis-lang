@@ -1,0 +1,422 @@
+# ============================================================================
+# tools/hlcov.hls — the Stage 18 HLIR-level coverage tracker, in Halis
+# (the native twin of the Python hlcov that retired; same CLI, same
+# report shapes, same lcov records).
+# ----------------------------------------------------------------------------
+# Static half: every function's basic-block count, walked off the
+# compiler's own AST (hlfront's StmtN pool — the same read bin/hlc
+# generates from). The counting law is the .py's: a statement list is
+# one block; `if` adds its arms' blocks plus one, `while`/`for` add
+# their body plus one, every match arm is a block (the expr-statement
+# wrapper included — deep-scan-20's fix, kept).
+#
+# Dynamic half: the program runs under bin/hlboot --cov-run, which
+# counts every function ENTRY in the evaluator itself (the .py years
+# monkey-patched call_fn; the port arms a counter in Boot — one map,
+# shared across tasks by reference, the same one-process count). The
+# hits TSV survives panics: a program that died still covered what it
+# covered.
+#
+# Usage:
+#   bin/hlcov <file.hls> [program args...]
+#   bin/hlcov --lcov out.lcov <file.hls>
+#   bin/hlcov --html out/ <file.hls>    (accepted, still future)
+# ============================================================================
+
+import "./hlfront.hls"
+import "std.str"
+
+# ----------------------------------------------------------------------------
+# The static block count.
+# ----------------------------------------------------------------------------
+
+# cov_blocks_stmts(ctx, body) — blocks in a statement list (+1 for the
+# list itself).
+fn cov_blocks_stmts(ctx: Ctx, body: list[int]) -> int {
+    let mut n: int = 1
+    let mut i: int = 0
+    while i < body.len() {
+        n = n + cov_blocks_stmt(ctx, body.get(i))
+        i = i + 1
+    }
+    return n
+}
+
+# cov_blocks_stmt(ctx, si) — the additional blocks one statement
+# contributes.
+fn cov_blocks_stmt(ctx: Ctx, si: int) -> int {
+    let s: StmtN = ctx.stmts.get(si)
+    let k: str = s.kind
+    if k == "if" {
+        return 1 + cov_blocks_stmts(ctx, s.body)
+        + cov_blocks_stmts(ctx, s.else_body)
+    }
+    if k == "while" {
+        return 1 + cov_blocks_stmts(ctx, s.body)
+    }
+    if k == "for" {
+        return 1 + cov_blocks_stmts(ctx, s.body)
+    }
+    if k == "expr" {
+        # the parser wraps a match-as-STATEMENT inside an expr node —
+        # count the arms (deep-scan-20: the wrapper hid them)
+        let e: int = s.e
+        if ctx.exprs[e].kind == "match" {
+            let mut n: int = 1
+            let mut i: int = 0
+            while i < ctx.exprs[e].args.len() {
+                n = n + 1
+                i = i + 1
+            }
+            return n
+        }
+        return 0
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# Small helpers (the report's formatting laws).
+# ----------------------------------------------------------------------------
+
+# cov_pad(s, n) — left-aligned width-n field.
+fn cov_pad(s: str, n: int) -> str {
+    let mut out: str = s
+    let mut i: int = s.len()
+    while i < n {
+        out = out + " "
+        i = i + 1
+    }
+    return out
+}
+
+# cov_pct1(hit, total) — "%.1f" of 100*hit/total, 0.0 when total == 0.
+fn cov_pct1(hit: int, total: int) -> str {
+    if total == 0 {
+        return "0.0"
+    }
+    let tenths: int = hit * 1000 / total
+    let whole: int = tenths / 10
+    let frac: int = tenths % 10
+    return whole.to_str() + "." + frac.to_str()
+}
+
+# cov_repeat(c, n) — the "=" * 60 rule.
+fn cov_repeat(c: str, n: int) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < n {
+        out = out + c
+        i = i + 1
+    }
+    return out
+}
+
+# cov_read(path) — read_file with "" on failure (the run child's TSV
+# may be missing when the program never got to run at all).
+fn cov_read(path: str) -> str uses IO {
+    if !file_exists(path) {
+        return ""
+    }
+    return read_file(path)
+}
+
+# ----------------------------------------------------------------------------
+# The runner child — the tool re-execs itself to survive bad programs
+# (the .py caught HLError; the port panics in the child, the parent
+# reports the clean compile error).
+# ----------------------------------------------------------------------------
+
+struct CovRun {
+    code: int,
+    out: str,
+    err: str,
+    spawned: bool
+}
+
+# cov_spawn(prog, args) — piped child capture.
+fn cov_spawn(prog: str, cargs: list[str]) -> CovRun uses Proc {
+    let r: CovRun = CovRun {
+        code: -1,
+        out: "",
+        err: "",
+        spawned: false
+    }
+    let pid: int = proc_spawn(prog, cargs, 2, 1, 1)
+    if pid < 1 {
+        return r
+    }
+    r.spawned = true
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    r.code = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    r.out = out
+    r.err = err
+    return r
+}
+
+# cov_first_line(s) — the report relay's line.
+fn cov_first_line(s: str) -> str {
+    let pos: int = s.find("\n")
+    if pos < 0 {
+        return s
+    }
+    return s.slice(0, pos)
+}
+
+# cov_static_probe(path) — the private leg: load + check + print the
+# per-fn block counts as TSV (fn key <TAB> blocks), declaration order.
+fn cov_static_probe(path: str) -> int uses IO, Fs, Proc {
+    let ctx: Ctx = hl_load_crate(path)
+    hl_check(ctx)
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < ctx.fn_order.len() {
+        let key: str = ctx.fn_order.get(i)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        if !f.is_extern {
+            out = out + key + "\t" + cov_blocks_stmts(ctx, f.body).to_str() + "\n"
+        }
+        i = i + 1
+    }
+    print(out)
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# main — the CLI law (flags before the file, program args after).
+# ----------------------------------------------------------------------------
+
+fn cov_usage() -> str {
+    return "usage: hlcov [--lcov PATH] [--html DIR] <file.hls> [program args...]\n"
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let argv: list[str] = args()
+    let n: int = argv.len()
+    let mut i: int = 1
+    let mut lcov_path: str = ""
+    let mut html_dir: str = ""
+    # the private static leg (the parent re-invokes the tool)
+    if n > 1 && argv.get(1) == "--probe-static" {
+        if n < 3 {
+            eprint("error: --probe-static needs a file\n")
+            return 2
+        }
+        return cov_static_probe(argv.get(2))
+    }
+    while i < n {
+        let a: str = argv.get(i)
+        if a == "--lcov" {
+            if i + 1 >= n {
+                eprint("error: --lcov expects a path\n")
+                return 2
+            }
+            lcov_path = argv.get(i + 1)
+            i = i + 2
+            continue
+        }
+        if a == "--html" {
+            if i + 1 >= n {
+                eprint("error: --html expects a directory\n")
+                return 2
+            }
+            html_dir = argv.get(i + 1)
+            i = i + 2
+            continue
+        }
+        break
+    }
+    if i >= n {
+        eprint(cov_usage())
+        return 2
+    }
+    let path: str = argv.get(i)
+    if !file_exists(path) {
+        eprint("hlcov: error: no such file: " + path + "\n")
+        return 2
+    }
+    let prog_args: list[str] = []
+    let mut k: int = i + 1
+    while k < n {
+        prog_args.push(argv.get(k))
+        k = k + 1
+    }
+    # ---- the static half (probe child; panics become compile errors) ----
+    let self_path: str = argv.get(0)
+    let stat: CovRun = cov_spawn(self_path, ["--probe-static", path])
+    if !stat.spawned || stat.code != 0 {
+        let mut msg: str = cov_first_line(stat.err)
+        if msg.starts_with("panic: ") {
+            msg = msg.slice(7, msg.len())
+        }
+        eprint("compile error: " + msg + "\n")
+        return 1
+    }
+    # static TSV -> parallel arrays (declaration order preserved)
+    let stat_keys: list[str] = []
+    let stat_blocks: list[int] = []
+    let stat_rows: list[str] = stat.out.split("\n")
+    let mut ri: int = 0
+    while ri < stat_rows.len() {
+        let row: str = stat_rows.get(ri)
+        if row != "" {
+            let parts: list[str] = row.split("\t")
+            if parts.len() == 2 {
+                stat_keys.push(parts.get(0))
+                stat_blocks.push(parts.get(1).to_int())
+            }
+        }
+        ri = ri + 1
+    }
+    # ---- the dynamic half (bin/hlboot --cov-run; the TSV survives
+    # panics — a program that died still covered what it covered) ----
+    let hlboot: str = "./bin/hlboot"
+    if !file_exists(hlboot) {
+        eprint("hlcov: no bin/hlboot - run make bootstrap\n")
+        return 2
+    }
+    let tsv_path: str = "/tmp/hlcov-" + system_time_now_ms().to_str() + ".tsv"
+    let run_argv: list[str] = ["--cov-run", tsv_path, path]
+    let mut ai: int = 0
+    while ai < prog_args.len() {
+        run_argv.push(prog_args.get(ai))
+        ai = ai + 1
+    }
+    let run: CovRun = cov_spawn(hlboot, run_argv)
+    # hits TSV -> parallel arrays
+    let hit_keys: list[str] = []
+    let hit_counts: list[int] = []
+    let hits_txt: str = cov_read(tsv_path)
+    if hits_txt != "" {
+        let hrows: list[str] = hits_txt.split("\n")
+        let mut hi: int = 0
+        while hi < hrows.len() {
+            let row: str = hrows.get(hi)
+            if row != "" {
+                let parts: list[str] = row.split("\t")
+                if parts.len() == 2 {
+                    hit_keys.push(parts.get(0))
+                    hit_counts.push(parts.get(1).to_int())
+                }
+            }
+            hi = hi + 1
+        }
+    }
+    if tsv_path != "" {
+        proc_exec("rm -f '" + tsv_path + "'")
+    }
+    # ---- the text report (the .py's own shapes) ----
+    let mut total_static: int = 0
+    let mut total_hit: int = 0
+    # rows sorted by (-blocks, key): insertion sort over the joined view
+    let mut order: list[int] = []
+    let mut si: int = 0
+    while si < stat_keys.len() {
+        order.push(si)
+        si = si + 1
+    }
+    let mut a: int = 1
+    while a < order.len() {
+        let key_i: int = order.get(a)
+        let mut b: int = a - 1
+        while b >= 0 && (stat_blocks.get(order.get(b)) < stat_blocks.get(key_i)
+        || (stat_blocks.get(order.get(b)) == stat_blocks.get(key_i)
+        && stat_keys.get(order.get(b)) > stat_keys.get(key_i))) {
+            order.set(b + 1, order.get(b))
+            b = b - 1
+        }
+        order.set(b + 1, key_i)
+        a = a + 1
+    }
+    let bar: str = cov_repeat("=", 60)
+    println(bar)
+    println("  " + cov_pad("function", 40) + "  " + cov_pad("blocks", 8)
+    + "  " + cov_pad("calls", 6) + "  hit")
+    println(bar)
+    let mut oi: int = 0
+    while oi < order.len() {
+        let idx: int = order.get(oi)
+        let key: str = stat_keys.get(idx)
+        let bb: int = stat_blocks.get(idx)
+        # the call count (0 when never entered)
+        let mut calls: int = 0
+        let mut hj: int = 0
+        while hj < hit_keys.len() {
+            if hit_keys.get(hj) == key {
+                calls = hit_counts.get(hj)
+            }
+            hj = hj + 1
+        }
+        let mut flag: str = "no"
+        if calls > 0 {
+            flag = "YES"
+            # if the fn was entered, all its blocks count as hit (the
+            # Stage 18 criterion is function coverage)
+            total_hit = total_hit + bb
+        }
+        total_static = total_static + bb
+        println("  " + cov_pad(key, 40) + "  " + cov_pad(bb.to_str(), 8)
+        + "  " + cov_pad(calls.to_str(), 6) + "  " + flag)
+        oi = oi + 1
+    }
+    println(bar)
+    println("  total: " + total_hit.to_str() + "/" + total_static.to_str()
+    + " blocks hit (" + cov_pct1(total_hit, total_static) + "%)")
+    # ---- the lcov record ----
+    if lcov_path != "" {
+        let mut lcov: str = ""
+        let mut li: int = 0
+        while li < stat_keys.len() {
+            let key: str = stat_keys.get(li)
+            let bb2: int = stat_blocks.get(li)
+            let mut calls2: int = 0
+            let mut hj2: int = 0
+            while hj2 < hit_keys.len() {
+                if hit_keys.get(hj2) == key {
+                    calls2 = hit_counts.get(hj2)
+                }
+                hj2 = hj2 + 1
+            }
+            let mut fnh: int = 0
+            let mut brh: int = 0
+            if calls2 > 0 {
+                fnh = 1
+                brh = bb2
+            }
+            lcov = lcov + "TN:halis\n"
+            lcov = lcov + "SF:" + key + "\n"
+            lcov = lcov + "FN:1," + key + "\n"
+            lcov = lcov + "FNDA:" + calls2.to_str() + "," + key + "\n"
+            lcov = lcov + "FNF:1\n"
+            lcov = lcov + "FNH:" + fnh.to_str() + "\n"
+            lcov = lcov + "BRF:" + bb2.to_str() + "\n"
+            lcov = lcov + "BRH:" + brh.to_str() + "\n"
+            lcov = lcov + "end_of_record\n"
+            li = li + 1
+        }
+        write_file(lcov_path, lcov)
+        println("== lcov written to " + lcov_path + " ==")
+    }
+    if html_dir != "" {
+        # still future — the .py accepted and ignored it too
+        println("== html report is a future stage (dir noted: " + html_dir + ") ==")
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# End of tools/hlcov.hls
+# ============================================================================

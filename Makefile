@@ -123,6 +123,15 @@ $(BIN)/hlboot: tools/hlboot.hls tools/hlfront.hls tools/hlemit.hls src/hlc.hls $
 	@echo "[hlboot] hlc compiles the Stage-0 evaluator (self-hosted, no python)..."
 	@$(BIN)/hlc tools/hlboot.hls $@.c
 	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+
+# Stage 18: the coverage tracker. Halis now (tools/hlcov.hls, the full
+# port of the Python years): the static block count rides hlfront, the
+# dynamic count rides the evaluator's own --cov-run hook.
+$(BIN)/hlcov: tools/hlcov.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hlcov] hlc compiles the coverage tracker (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hlcov.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
 	@rm -f $@.c
 
 # The lab fleet keeps the same discipline: one rule per tool, the

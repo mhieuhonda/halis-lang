@@ -352,7 +352,12 @@ struct Boot {
     trace: bool,
     contracts: bool,
     target_feature: str,
-    sandbox: str
+    sandbox: str,
+    # cov_on / cov_hits: the Stage 18 coverage hook — the .py years
+    # monkey-patched call_fn; the port counts in the evaluator itself.
+    # (fn key -> call count; armed by --cov-run.)
+    cov_on: bool,
+    cov_hits: map[str, int]
 }
 
 # BootCore — the crossing payload: everything a spawned task needs to
@@ -367,7 +372,11 @@ struct BootCore {
     trace: bool,
     contracts: bool,
     target_feature: str,
-    sandbox: str
+    sandbox: str,
+    # the coverage hook crosses with the task (the map is shared by
+    # reference — one process, one counter, the .py's own law)
+    cov_on: bool,
+    cov_hits: map[str, int]
 }
 
 # boot_core_of(boot) — the crossing view of a boot.
@@ -380,7 +389,9 @@ fn boot_core_of(boot: Boot) -> BootCore {
         trace: boot.trace,
         contracts: boot.contracts,
         target_feature: boot.target_feature,
-        sandbox: boot.sandbox
+        sandbox: boot.sandbox,
+        cov_on: boot.cov_on,
+        cov_hits: boot.cov_hits
     }
 }
 
@@ -395,7 +406,9 @@ fn boot_of_core(core: BootCore) -> Boot {
         trace: core.trace,
         contracts: core.contracts,
         target_feature: core.target_feature,
-        sandbox: core.sandbox
+        sandbox: core.sandbox,
+        cov_on: core.cov_on,
+        cov_hits: core.cov_hits
     }
 }
 
@@ -1674,6 +1687,9 @@ fn check_refine(boot: Boot, pred_text: str, val: V, what: str, line: int) -> R u
 # return-side ret_pred + ensures, and the #[tail_call] trampoline.
 # ----------------------------------------------------------------------------
 fn call_fn(boot: Boot, key: str, args: list[V]) -> R uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    if boot.cov_on {
+        boot.cov_hits.set(key, boot.cov_hits.get_or(key, 0) + 1)
+    }
     let f: FnInfo = boot.ctx.fns.get_or(key, dummy_fn())
     if f.is_extern {
         return call_extern(boot, f, args)
@@ -3561,7 +3577,9 @@ fn hb_load_checked(path: str, prog_args: list[str], contracts: bool, target_feat
         trace: env_get("HL_DET_TRACE") != "",
         contracts: contracts,
         target_feature: target_feature,
-        sandbox: sandbox
+        sandbox: sandbox,
+        cov_on: env_get("HLBOOT_COV") != "",
+        cov_hits: map_new()
     }
     return boot
 }
@@ -3855,6 +3873,7 @@ fn hb_main_inner(argv: list[str]) -> int uses IO, Fs, Proc, Conc, Clock, Args, E
     let mut target_feature: str = ""
     let mut target_triple: str = ""
     let mut emit_mode: str = ""
+    let mut cov_out: str = ""
     let mut batch_list: str = ""
     let mut batch_log: str = ""
     let mut batch: bool = false
@@ -3871,6 +3890,19 @@ fn hb_main_inner(argv: list[str]) -> int uses IO, Fs, Proc, Conc, Clock, Args, E
             batch_list = argv.get(i + 1)
             batch_log = argv.get(i + 2)
             i = i + 3
+            continue
+        }
+        if a == "--cov-run" {
+            # private-ish flag (the coverage tool drives it): arm the
+            # fn-call counter, run the program, write the hits TSV on
+            # the way out — panic or not, the counts survive.
+            if i + 1 >= n {
+                eprint("error: --cov-run expects a tsv path\n")
+                return 2
+            }
+            cov_out = argv.get(i + 1)
+            env_set("HLBOOT_COV", "1")
+            i = i + 2
             continue
         }
         if a == "--emit" {
@@ -4196,7 +4228,30 @@ fn hb_main_inner(argv: list[str]) -> int uses IO, Fs, Proc, Conc, Clock, Args, E
             return rgate
         }
     }
-    return hb_run_program(boot)
+    let run_code: int = hb_run_program(boot)
+    if cov_out != "" {
+        # the coverage harvest: every hit fn in declaration order, one
+        # "key<TAB>count" record per line (the tool joins it against the
+        # static block counts)
+        let mut lines: list[str] = []
+        let mut fi: int = 0
+        let order: list[str] = boot.ctx.fn_order
+        while fi < order.len() {
+            let key: str = order.get(fi)
+            if boot.cov_hits.has(key) {
+                lines.push(key + "\t" + boot.cov_hits.get_or(key, 0).to_str())
+            }
+            fi = fi + 1
+        }
+        let mut out: str = ""
+        let mut li: int = 0
+        while li < lines.len() {
+            out = out + lines.get(li) + "\n"
+            li = li + 1
+        }
+        write_file(cov_out, out)
+    }
+    return run_code
 }
 
 fn main() -> int uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {

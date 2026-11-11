@@ -36,10 +36,10 @@ fuzz-acceptance:
 
 # hlcov: HLIR-level coverage report for a single file.
 # Usage: make cov F=examples/hello.hls [LCOV=out.lcov]
-cov:
+cov: $(BIN)/hlcov
 	@test -n "$(F)" || (echo "Usage: make cov F=examples/hello.hls [LCOV=out.lcov]" && false)
 	@if [ -n "$(LCOV)" ]; then L="--lcov $(LCOV)"; fi; \
-	  $(PYTHON) tools/hlcov.py $$L $(F)
+	  $(BIN)/hlcov $$L $(F)
 
 # ============================================================================
 # Stage 19 (v0.35.0-alpha): profile-guided optimisation targets
