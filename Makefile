@@ -535,7 +535,7 @@ test:
 suite-01-boot-acceptance: $(BIN)/acc-suite_01_boot
 	@$(BIN)/acc-suite_01_boot
 
-suite-02-differential-acceptance: $(BIN)/acc-suite_02_differential $(BIN)/hls-sbom
+suite-02-differential-acceptance: $(BIN)/acc-suite_02_differential $(BIN)/hls-sbom $(BIN)/hls-repro
 	@$(BIN)/acc-suite_02_differential
 
 suite-03-selfhost-acceptance: $(BIN)/acc-suite_03_selfhost

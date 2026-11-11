@@ -3692,6 +3692,208 @@ fn hb_sandbox_gate(ctx: Ctx, dir: str) -> int uses IO, Fs {
     return 0
 }
 
+# ----------------------------------------------------------------------------
+# The Stage 17 model checker — hlmodel's whole flow, riding the
+# evaluator that executes it (the .py drove a monkey-instance of the
+# Python interpreter; the port IS the interpreter). The wire is the
+# .py's: same header, same table, same BFS report, same exits.
+# ----------------------------------------------------------------------------
+
+# hb_param_base(t) — the type before any "[" (the enum name a param
+# must be).
+fn hb_param_base(t: str) -> str {
+    let cut: int = t.find("[")
+    if cut < 0 {
+        return t
+    }
+    return t.slice(0, cut)
+}
+
+# hb_model(path, fn_name, inv_name, init_variant) -> int — exhaustive
+# finite-state model check: every (state, event) pair EXECUTED with
+# contracts armed (deep-scan-10: an always-false requires used to pass
+# silently), then the BFS reachability + invariant walk (deep-scan-12:
+# a FIFO frontier, and contract-violation panics reported separately
+# from dead transitions).
+fn hb_model(path: str, fn_name: str, inv_name: str, init_variant: str) -> int uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let boot: Boot = hb_load_checked(path, ["hlmodel"], true, "", "", "")
+    eprint("__HLBOOT_COMPILED__\n")
+    let ctx: Ctx = boot.ctx
+    if !ctx.fns.has(fn_name) {
+        eprint("hlmodel: function not found: " + fn_name + "\n")
+        return 1
+    }
+    let f: FnInfo = ctx.fns.get_or(fn_name, dummy_fn())
+    if f.params.len() != 2 {
+        eprint("hlmodel: transition fn must take exactly two enum parameters (state, event)\n")
+        return 1
+    }
+    # the two enum domains (payload-less only)
+    let s_enum: str = hb_param_base(f.ptypes.get(0))
+    let e_enum: str = hb_param_base(f.ptypes.get(1))
+    if !ctx.enums.has(s_enum) {
+        eprint("hlmodel: parameter '" + f.params.get(0) + "' of the transition must be a payload-less enum, got " + f.ptypes.get(0) + "\n")
+        return 1
+    }
+    if !ctx.enums.has(e_enum) {
+        eprint("hlmodel: parameter '" + f.params.get(1) + "' of the transition must be a payload-less enum, got " + f.ptypes.get(1) + "\n")
+        return 1
+    }
+    let sen: EnumInfo = ctx.enums.get_or(s_enum, dummy_enum())
+    let een: EnumInfo = ctx.enums.get_or(e_enum, dummy_enum())
+    let s_variants: list[str] = []
+    let mut si: int = 0
+    while si < sen.variants.len() {
+        if sen.payloads.get(si).len() > 0 {
+            eprint("hlmodel: enum " + s_enum + " has payload variant " + sen.variants.get(si) + " — model checking is defined for payload-less state enums only\n")
+            return 1
+        }
+        s_variants.push(sen.variants.get(si))
+        si = si + 1
+    }
+    let e_variants: list[str] = []
+    let mut ei: int = 0
+    while ei < een.variants.len() {
+        if een.payloads.get(ei).len() > 0 {
+            eprint("hlmodel: enum " + e_enum + " has payload variant " + een.variants.get(ei) + " — model checking is defined for payload-less state enums only\n")
+            return 1
+        }
+        e_variants.push(een.variants.get(ei))
+        ei = ei + 1
+    }
+    println("hlmodel — exhaustive model check of '" + fn_name + "'")
+    println("  states:  " + s_enum + " = {" + join(s_variants, ", ") + "}")
+    println("  events:  " + e_enum + " = {" + join(e_variants, ", ") + "}")
+    println("  domain:  " + s_variants.len().to_str() + " x " + e_variants.len().to_str() + " = " + (s_variants.len() * e_variants.len()).to_str() + " transitions")
+    println("")
+    # ---- the exhaustive table ----
+    let mut violations: int = 0
+    let mut a: int = 0
+    while a < s_variants.len() {
+        let sv: str = s_variants.get(a)
+        let mut b: int = 0
+        while b < e_variants.len() {
+            let ev: str = e_variants.get(b)
+            let r: R = call_fn(boot, fn_name,
+            [v_enum(s_enum, sv, []), v_enum(e_enum, ev, [])])
+            let mut status: str = ""
+            if r.flow == FL_PANIC() {
+                violations = violations + 1
+                status = "PANIC: " + r.msg
+            } else {
+                status = "-> " + r.v.var
+            }
+            println("    " + s_enum + "." + sv + " + " + e_enum + "." + ev + "  " + status)
+            b = b + 1
+        }
+        a = a + 1
+    }
+    println("")
+    if violations > 0 {
+        println("  VIOLATIONS: " + violations.to_str() + " transitions panicked (see above)")
+    } else {
+        println("  All " + (s_variants.len() * e_variants.len()).to_str() + " transitions terminate without panic.")
+    }
+    # ---- reachability + invariant (BFS) ----
+    if inv_name != "" {
+        if !ctx.fns.has(inv_name) {
+            eprint("hlmodel: invariant fn not found: " + inv_name + "\n")
+            return 1
+        }
+        let mut init_v: str = init_variant
+        if init_v == "" {
+            init_v = s_variants.get(0)
+        }
+        if !list_has(s_variants, init_v) {
+            eprint("hlmodel: --init must be a variant of " + s_enum + "\n")
+            return 1
+        }
+        println("")
+        println("  Reachability (BFS from " + s_enum + "." + init_v + ") + invariant '" + inv_name + "':")
+        # the invariant on the initial state
+        let bad_states: list[str] = []
+        let r0: R = call_fn(boot, inv_name, [v_enum(s_enum, init_v, [])])
+        if r0.flow == FL_PANIC() {
+            bad_states.push(init_v + " (panic: " + r0.msg + ")")
+        } else {
+            if r0.v.k != VK_BOOL() || r0.v.i == 0 {
+                bad_states.push(init_v)
+            }
+        }
+        let seen: list[str] = [init_v]
+        # FIFO frontier (deep-scan-12: pop(0), not pop())
+        let frontier: list[V] = [v_enum(s_enum, init_v, [])]
+        let mut head: int = 0
+        let contract_violations: list[str] = []
+        let mut edges: int = 0
+        while head < frontier.len() {
+            let cur: V = frontier.get(head)
+            head = head + 1
+            let mut b2: int = 0
+            while b2 < e_variants.len() {
+                let ev2: str = e_variants.get(b2)
+                let r: R = call_fn(boot, fn_name,
+                [cur, v_enum(e_enum, ev2, [])])
+                if r.flow == FL_PANIC() {
+                    # contract-violation panics are REPORTED; other
+                    # panics are dead transitions (deep-scan-12)
+                    if r.msg.contains("contract violation") {
+                        contract_violations.push(cur.var + " + " + ev2 + ": " + r.msg)
+                    }
+                    b2 = b2 + 1
+                    continue
+                }
+                let nvar: str = r.v.var
+                edges = edges + 1
+                if !list_has(seen, nvar) {
+                    seen.push(nvar)
+                    let ri: R = call_fn(boot, inv_name, [r.v])
+                    if ri.flow == FL_PANIC() {
+                        bad_states.push(nvar + " (panic: " + ri.msg + ")")
+                    } else {
+                        if ri.v.k != VK_BOOL() || ri.v.i == 0 {
+                            bad_states.push(nvar)
+                        }
+                    }
+                    frontier.push(r.v)
+                }
+                b2 = b2 + 1
+            }
+        }
+        let dead: list[str] = []
+        let mut d: int = 0
+        while d < s_variants.len() {
+            if !list_has(seen, s_variants.get(d)) {
+                dead.push(s_variants.get(d))
+            }
+            d = d + 1
+        }
+        println("    reachable states: " + seen.len().to_str() + " / " + s_variants.len().to_str() + " (" + edges.to_str() + " edges explored)")
+        if contract_violations.len() > 0 {
+            println("    CONTRACT VIOLATIONS (" + contract_violations.len().to_str() + "):")
+            let mut c: int = 0
+            while c < contract_violations.len() {
+                println("      " + contract_violations.get(c))
+                c = c + 1
+            }
+        }
+        if dead.len() > 0 {
+            println("    DEAD states (unreachable from " + s_enum + "." + init_v + "): " + join(dead, ", "))
+        } else {
+            println("    no dead states — the machine is fully reachable")
+        }
+        if bad_states.len() > 0 {
+            println("    INVARIANT VIOLATED in: " + join(bad_states, ", "))
+            return 1
+        }
+        println("    invariant '" + inv_name + "' holds on every reachable state ✓")
+    }
+    if violations > 0 {
+        return 1
+    }
+    return 0
+}
+
 # hb_read_all_stdout(ch) / hb_read_all_stderr(ch) — drain a child's
 # pipe to EOF.
 fn hb_drain(ch: Child, fd: int) -> str uses Proc {
@@ -3874,6 +4076,7 @@ fn hb_main_inner(argv: list[str]) -> int uses IO, Fs, Proc, Conc, Clock, Args, E
     let mut target_triple: str = ""
     let mut emit_mode: str = ""
     let mut cov_out: str = ""
+    let mut model_mode: bool = false
     let mut batch_list: str = ""
     let mut batch_log: str = ""
     let mut batch: bool = false
@@ -3890,6 +4093,14 @@ fn hb_main_inner(argv: list[str]) -> int uses IO, Fs, Proc, Conc, Clock, Args, E
             batch_list = argv.get(i + 1)
             batch_log = argv.get(i + 2)
             i = i + 3
+            continue
+        }
+        if a == "--model" {
+            # the Stage 17 model checker rides the evaluator (the file
+            # and its --fn/--invariant/--init flags follow, the .py's
+            # own order)
+            model_mode = true
+            i = i + 1
             continue
         }
         if a == "--cov-run" {
@@ -3944,6 +4155,35 @@ fn hb_main_inner(argv: list[str]) -> int uses IO, Fs, Proc, Conc, Clock, Args, E
             eprint(lto.report + "\n")
             print(lto.text)
             return 0
+        }
+        if a == "--probe-model" {
+            # private flag (the model parent re-invokes the tool): the
+            # file, then the .py's own flag order
+            if i + 1 >= n {
+                eprint("error: --probe-model needs a file\n")
+                return 2
+            }
+            let mpath: str = argv.get(i + 1)
+            let mut mfn: str = ""
+            let mut minv: str = ""
+            let mut minit: str = ""
+            let mut j: int = i + 2
+            while j < n {
+                let fa: str = argv.get(j)
+                if fa == "--fn" && j + 1 < n {
+                    mfn = argv.get(j + 1)
+                    j = j + 2
+                } else if fa == "--invariant" && j + 1 < n {
+                    minv = argv.get(j + 1)
+                    j = j + 2
+                } else if fa == "--init" && j + 1 < n {
+                    minit = argv.get(j + 1)
+                    j = j + 2
+                } else {
+                    j = j + 1
+                }
+            }
+            return hb_model(mpath, mfn, minv, minit)
         }
         if a == "--probe-audit" {
             if i + 1 >= n {
@@ -4146,6 +4386,58 @@ fn hb_main_inner(argv: list[str]) -> int uses IO, Fs, Proc, Conc, Clock, Args, E
     while k < n {
         prog_args.push(argv.get(k))
         k = k + 1
+    }
+    if model_mode {
+        # the .py's wire: the file first, then --fn / --invariant /
+        # --init in any order
+        let mut mfn: str = ""
+        let mut minv: str = ""
+        let mut minit: str = ""
+        let mut j: int = i + 1
+        while j < n {
+            let fa: str = argv.get(j)
+            if fa == "--fn" && j + 1 < n {
+                mfn = argv.get(j + 1)
+                j = j + 2
+            } else if fa == "--invariant" && j + 1 < n {
+                minv = argv.get(j + 1)
+                j = j + 2
+            } else if fa == "--init" && j + 1 < n {
+                minit = argv.get(j + 1)
+                j = j + 2
+            } else {
+                j = j + 1
+            }
+        }
+        if mfn == "" {
+            eprint("hlmodel: --fn <transition> is required\n")
+            return 2
+        }
+        let cargs5: list[str] = ["--probe-model", path, "--fn", mfn]
+        if minv != "" {
+            cargs5.push("--invariant")
+            cargs5.push(minv)
+        }
+        if minit != "" {
+            cargs5.push("--init")
+            cargs5.push(minit)
+        }
+        let res5: CapRes = hb_spawn_child(argv.get(0), cargs5)
+        if res5.code < 0 {
+            eprint("hlmodel: the evaluator failed to spawn\n")
+            return 1
+        }
+        if res5.code != 0 && !res5.err.contains("__HLBOOT_COMPILED__") {
+            # the load itself died: the clean compile error
+            let mut msg5: str = hb_first_real_line(res5.err)
+            if msg5.starts_with("panic: ") {
+                msg5 = msg5.slice(7, msg5.len())
+            }
+            eprint("compile error: " + msg5 + "\n")
+            return 1
+        }
+        print(res5.out)
+        return res5.code
     }
     if audit_only {
         # The probe-child discipline (the same law as --check); the

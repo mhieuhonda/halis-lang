@@ -116,7 +116,8 @@ model:
 	@if [ -z "$(F)" ] || [ -z "$(FN)" ]; then echo "Usage: make model F=file.hls FN=transition_fn [INV=invariant_fn] [INIT=Enum.Variant]" && false; fi; \
 	if [ -n "$(INV)" ]; then I="--invariant $(INV)"; else I=""; fi; \
 	if [ -n "$(INIT)" ]; then S="--init $(INIT)"; else S=""; fi; \
-	python3 tools/hlmodel.py $(F) --fn $(FN) $$I $$S
+	test -x $(BIN)/hlboot || $(MAKE) bin/hlboot; \
+	$(BIN)/hlboot --model $(F) --fn $(FN) $$I $$S
 
 # The Stage 17 acceptance example (HMAC envelope, fully proven hot path)
 prove-acceptance:

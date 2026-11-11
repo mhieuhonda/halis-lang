@@ -2486,13 +2486,13 @@ python3 tools/hlprove.py file.hls [--smt] [--z3] [--cvc5]
 ### 26.6. `hlmodel` — exhaustive finite-state model checking
 
 ```
-python3 tools/hlmodel.py file.hls --fn step --invariant is_valid --init State.Start
+bin/hlboot --model file.hls --fn step --invariant is_valid --init State.Start
 ```
 
 For a transition function `fn step(s: State, e: Event) -> State` over
-payload-less enums, `hlmodel` enumerates EVERY (state, event) pair and
-EXECUTES the function via the interpreter — the full finite domain, no
-abstraction:
+payload-less enums, the model checker (a mode of the Stage-0
+evaluator) enumerates EVERY (state, event) pair and EXECUTES the
+function — the full finite domain, no abstraction:
 
 - every transition must terminate without panic;
 - `requires`/`ensures` (if declared) are evaluated per pair;
