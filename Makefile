@@ -113,6 +113,18 @@ $(BIN)/hllint: tools/hllint.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc
 	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
 	@rm -f $@.c
 
+# hlboot — the Stage-0 evaluator, in Halis (the native twin of the
+# Python interpreter under tools/hlinterp/ that is retiring; same CLI,
+# same batch wire, same verdicts — the differential oracle every suite
+# leg spawns, built by the bootstrap's own compiler on the shared
+# front-end tools/hlfront.hls links).
+$(BIN)/hlboot: tools/hlboot.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hlboot] hlc compiles the Stage-0 evaluator (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hlboot.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
 # The lab fleet keeps the same discipline: one rule per tool, the
 # tool's sources + std + core as prerequisites, never $(SNAP).
 $(BIN)/hlpgo: tools/hlpgo.hls $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
@@ -417,7 +429,7 @@ snapshot-prove: $(BIN)/hls-snap
 # that has not moved yet; the harness is tests/acc/harness.hls and
 # the scratch world lives under tests/.acc-scratch/ (gitignored,
 # wiped per run). The mk/*.mk targets depend on $(BIN)/acc-<gate>.
-$(BIN)/acc-%: tests/acc/%_acceptance.hls tests/acc/harness.hls $(wildcard std/*.hls) $(BIN)/hlfmt $(BIN)/hllint | $(BIN)/hlc
+$(BIN)/acc-%: tests/acc/%_acceptance.hls tests/acc/harness.hls $(wildcard std/*.hls) $(BIN)/hlfmt $(BIN)/hllint $(BIN)/hlboot | $(BIN)/hlc
 	@mkdir -p $(BIN)
 	@echo "[acc] hlc compiles the $* gate (self-hosted, no python)..."
 	@$(BIN)/hlc tests/acc/$*_acceptance.hls $@.c
@@ -445,10 +457,10 @@ $(BIN)/acc-hlc1: $(SNAP) | $(BIN)
 # twice, and the fixed-point law (snapshot == Stage-0 emission) is what
 # makes the two interchangeable. The recipe lands the bytes with mv so
 # a failed compile never leaves a partial file for make to trust.
-$(BIN)/hlc1_src.c: src/hlc.hls $(wildcard src/hlc/*.hls) | $(BIN)
+$(BIN)/hlc1_src.c: src/hlc.hls $(wildcard src/hlc/*.hls) tools/hlboot.hls tools/hlfront.hls $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
 	@mkdir -p $(BIN)
-	@echo "[seed] boot.py: the shared Stage-0 emission (one per suite run)"
-	@$(PYTHON) tools/hlinterp/boot.py src/hlc.hls src/hlc.hls $@.tmp \
+	@echo "[seed] hlboot: the shared Stage-0 emission (one per suite run)"
+	@$(BIN)/hlboot src/hlc.hls src/hlc.hls $@.tmp \
 		&& mv -f $@.tmp $@ \
 		|| { rm -f $@.tmp; exit 1; }
 

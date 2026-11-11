@@ -1,0 +1,4051 @@
+# ============================================================================
+# tools/hlboot.hls — the Stage-0 evaluator, in Halis (the native twin of
+# the Python interpreter under tools/hlinterp/ that retired; same CLI,
+# same wire law, same verdicts — driven through bin/hlboot, built by the
+# bootstrap's own compiler).
+# ----------------------------------------------------------------------------
+# Usage (the boot.py surface, verbatim):
+#   bin/hlboot [--check | --audit] <file.hls> [program args...]
+#   bin/hlboot [--check] --batch <list-file> <log-file>
+#   bin/hlboot [--det] <file.hls> [program args...]
+#
+# The Python years carried their own lexer, parser and checker inside
+# tools/hlinterp/ — twenty thousand lines that could drift from the
+# self-hosted compiler's read of the same program. This port links the
+# REAL front-end through tools/hlfront.hls (the same module the linter
+# rides): one grammar, one checker, zero drift. What is new here is
+# only the evaluator — a tree-walker over the compiler's own ExprN/
+# StmtN pools — and the builtins table, both ported from the Python
+# interpreter's interp_parts verbatim in observable behaviour:
+#
+#   values    int is checked int64 arithmetic, str is bytes, list[T]
+#             is a shared reference, map[str,T] insertion-ordered,
+#             struct a field dict, enum {"enum","var","data"},
+#             Chan a host channel carried inside the value (channels
+#             cross task boundaries by sharing, exactly the runtime's
+#             own law), Task a per-spawner table index
+#   flow      Python raised ReturnSig / TailCallSig / BreakSig /
+#             ContinueSig / HLPanic / SystemExit; Halis has no
+#             exceptions, so every eval/exec returns an R that carries
+#             the flow kind — the same unwinding, made explicit
+#   taint     tainted[T] is the {"tainted": True, "value": v} wrapper
+#             the checker and std.sanitize consume
+#   det mode  the deterministic scheduler is the HOST runtime's own
+#             (HL_DET_SCHED): every interpreted channel IS a host
+#             channel and every interpreted task a host task, so the
+#             FIFO baton rotation, the wake order and the
+#             __HLDET_STEP__ trace are the native runtime's — the
+#             same bytes, by construction. --det re-execs the tool
+#             with the env armed (the mode is read at process start).
+#
+# The extern "C" boundary: the Python interpreter called libc through
+# ctypes; this port dispatches a table of the libc symbols the corpus
+# declares (toupper, tolower, abs, labs, strlen, dirname) through
+# pure-HLS twins (the C-locale laws verbatim — hlc's extern emission
+# carries the int64 signature, which collides with libc's prototypes,
+# so the twins are also what keeps the tool a clean compile); anything
+# outside the table dies with the Python years' refusal, named.
+#
+# The batch protocol is the wire suite_01 reads: one child process per
+# file (the probe-child discipline the acceptance gates use), stdout
+# and stderr captured at the fd level over pipes, one TSV record per
+# file in list order:
+#     <rc>\t<b64(path)>\t<b64(stdout)>\t<b64(stderr)>\n
+#
+# Exit codes: 0 ok, 1 compile error, 2 usage, 101 panic, or the
+# program's own exit() code (masked to 0..255) — the law boot.py set.
+#
+# The Rand note: the Python interpreter kept one process-global LCG
+# guarded by the GIL; this port's state lives per task (the snapshot
+# crosses with the spawn boundary). No corpus program draws rand from
+# more than one task — the sequence every program observes is the
+# same one the native runtime produces for the same seed.
+# ============================================================================
+
+import "./hlfront.hls"
+import "std.str"
+import "std.env"
+import "std.base64"
+import "std.process"
+
+# ----------------------------------------------------------------------------
+# The runtime value. Python used native objects (int/float/bool/bytes/
+# list/dict); Halis is static, so the evaluator carries a tagged value.
+# k picks the arm; the other fields hold the payload by kind:
+#
+#   VK_INT      i            (checked int64)
+#   VK_FLOAT    f            (IEEE double)
+#   VK_BOOL     i (0/1)
+#   VK_STR      s            (bytes; .len() is bytes)
+#   VK_LIST     vals         (shared reference — host list[V])
+#   VK_MAP      keys, vals   (insertion-ordered; parallel arrays)
+#   VK_STRUCT   s (type name), keys (field names), vals
+#   VK_ENUM     s (enum name), var (variant), vals (payloads)
+#   VK_UNIT     —            (void / Python None)
+#   VK_CHAN     ch           (the host channel — shared by cloning)
+#   VK_TASK     i (the spawner's task table index)
+#   VK_TAINTED  vals[0]      (the {"tainted": True, "value": v} wrapper)
+#   VK_CAP      s (the effect name — the {"cap": True, ...} wrapper)
+#
+# ch carries the channel for VK_CHAN values and CV.CVNone for every
+# other kind — the enum's empty variant constructs without allocating
+# anything, so a non-channel value never touches the channel runtime
+# (the det trace's channel ids stay exactly the program's own).
+# ----------------------------------------------------------------------------
+enum CV {
+    CVNone,
+    CVSome(Chan[V])
+}
+
+struct V {
+    k: int,
+    i: int,
+    f: float,
+    s: str,
+    var: str,
+    keys: list[str],
+    vals: list[V],
+    ch: CV = CV.CVNone
+}
+
+# vch(v) — the channel a VK_CHAN value carries (the unwrap is total
+# for channel values; anything else is a caller bug).
+fn vch(v: V) -> Chan[V] uses Conc {
+    return match v.ch {
+        CV.CVSome(c) => c,
+        CV.CVNone => panic("vch: value carries no channel")
+    }
+}
+
+fn VK_INT() -> int {
+    return 0
+}
+fn VK_FLOAT() -> int {
+    return 1
+}
+fn VK_BOOL() -> int {
+    return 2
+}
+fn VK_STR() -> int {
+    return 3
+}
+fn VK_LIST() -> int {
+    return 4
+}
+fn VK_MAP() -> int {
+    return 5
+}
+fn VK_STRUCT() -> int {
+    return 6
+}
+fn VK_ENUM() -> int {
+    return 7
+}
+fn VK_UNIT() -> int {
+    return 8
+}
+fn VK_CHAN() -> int {
+    return 9
+}
+fn VK_TASK() -> int {
+    return 10
+}
+fn VK_TAINTED() -> int {
+    return 11
+}
+fn VK_CAP() -> int {
+    return 12
+}
+
+# v_int(i) — a fresh int value.
+fn v_int(n: int) -> V {
+    return V {
+        k: VK_INT(), i: n, f: 0.0, s: "", var: "", keys: [], vals: []
+    }
+}
+
+# v_float(f) — a fresh float value.
+fn v_float(x: float) -> V {
+    return V {
+        k: VK_FLOAT(), i: 0, f: x, s: "", var: "", keys: [], vals: []
+    }
+}
+
+# v_bool(b) — a fresh bool value.
+fn v_bool(b: bool) -> V {
+    let mut n: int = 0
+    if b {
+        n = 1
+    }
+    return V {
+        k: VK_BOOL(), i: n, f: 0.0, s: "", var: "", keys: [], vals: []
+    }
+}
+
+# v_str(s) — a fresh str (bytes) value.
+fn v_str(s: str) -> V {
+    return V {
+        k: VK_STR(), i: 0, f: 0.0, s: s, var: "", keys: [], vals: []
+    }
+}
+
+# v_unit() — the void/None value.
+fn v_unit() -> V {
+    return V {
+        k: VK_UNIT(), i: 0, f: 0.0, s: "", var: "", keys: [], vals: []
+    }
+}
+
+# v_list(vals) — a list value over a shared host list.
+fn v_list(vals: list[V]) -> V {
+    return V {
+        k: VK_LIST(), i: 0, f: 0.0, s: "", var: "", keys: [], vals: vals
+    }
+}
+
+# v_map_new() — an empty insertion-ordered map value.
+fn v_map_new() -> V {
+    return V {
+        k: VK_MAP(), i: 0, f: 0.0, s: "", var: "", keys: [], vals: []
+    }
+}
+
+# v_struct(name, keys, vals) — a struct value.
+fn v_struct(name: str, keys: list[str], vals: list[V]) -> V {
+    return V {
+        k: VK_STRUCT(), i: 0, f: 0.0, s: name, var: "", keys: keys, vals: vals
+    }
+}
+
+# v_enum(name, variant, payloads) — an enum value.
+fn v_enum(name: str, variant: str, payloads: list[V]) -> V {
+    return V {
+        k: VK_ENUM(), i: 0, f: 0.0, s: name, var: variant, keys: [], vals: payloads
+    }
+}
+
+# v_chan(ch) — a channel value (the host channel itself).
+fn v_chan(ch: Chan[V]) -> V {
+    return V {
+        k: VK_CHAN(), i: 0, f: 0.0, s: "", var: "", keys: [], vals: [], ch: CV.CVSome(ch)
+    }
+}
+
+# v_task(idx) — a task handle value (the spawner's table index).
+fn v_task(idx: int) -> V {
+    return V {
+        k: VK_TASK(), i: idx, f: 0.0, s: "", var: "", keys: [], vals: []
+    }
+}
+
+# v_tainted(inner) — the taint wrapper.
+fn v_tainted(inner: V) -> V {
+    let vals: list[V] = [inner]
+    return V {
+        k: VK_TAINTED(), i: 0, f: 0.0, s: "", var: "", keys: [], vals: vals
+    }
+}
+
+# v_cap(effect) — the capability token wrapper.
+fn v_cap(effect: str) -> V {
+    return V {
+        k: VK_CAP(), i: 0, f: 0.0, s: effect, var: "", keys: [], vals: []
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Flow. The Python interpreter used exceptions (ReturnSig, TailCallSig,
+# BreakSig, ContinueSig, HLPanic, SystemExit); the port carries the
+# same six flows in a value every eval/exec returns. FL_OK carries the
+# value; the others carry their payload (return value, break/continue
+# marker, panic message + line, exit code).
+# ----------------------------------------------------------------------------
+fn FL_OK() -> int {
+    return 0
+}
+fn FL_RETURN() -> int {
+    return 1
+}
+fn FL_BREAK() -> int {
+    return 2
+}
+fn FL_CONT() -> int {
+    return 3
+}
+fn FL_PANIC() -> int {
+    return 4
+}
+fn FL_EXIT() -> int {
+    return 5
+}
+
+struct R {
+    flow: int,
+    v: V, # FL_OK: the value; FL_RETURN: the return value
+    msg: str, # FL_PANIC: the message
+    line: int, # FL_PANIC: the source line
+    code: int # FL_EXIT: the masked exit code
+}
+
+# r_ok(v) — a plain value.
+fn r_ok(v: V) -> R {
+    return R {
+        flow: FL_OK(), v: v, msg: "", line: 0, code: 0
+    }
+}
+
+# r_unit() — a plain void value.
+fn r_unit() -> R uses Conc {
+    return R {
+        flow: FL_OK(), v: v_unit(), msg: "", line: 0, code: 0
+    }
+}
+
+# r_return(v) — the return signal.
+fn r_return(v: V) -> R {
+    return R {
+        flow: FL_RETURN(), v: v, msg: "", line: 0, code: 0
+    }
+}
+
+# r_break() / r_cont() — the loop signals.
+fn r_break() -> R uses Conc {
+    return R {
+        flow: FL_BREAK(), v: v_unit(), msg: "", line: 0, code: 0
+    }
+}
+
+fn r_cont() -> R uses Conc {
+    return R {
+        flow: FL_CONT(), v: v_unit(), msg: "", line: 0, code: 0
+    }
+}
+
+# r_panic(msg, line) — the interpreter's clean death.
+fn r_panic(msg: str, line: int) -> R uses Conc {
+    return R {
+        flow: FL_PANIC(), v: v_unit(), msg: msg, line: line, code: 0
+    }
+}
+
+# r_exit(code) — the program's own exit().
+fn r_exit(code: int) -> R uses Conc {
+    return R {
+        flow: FL_EXIT(), v: v_unit(), msg: "", line: 0, code: int_and(code, 255)
+    }
+}
+
+# ----------------------------------------------------------------------------
+# The boot state. One per task: the compiler's checked tables (private
+# copy — the spawn boundary's own law), the task's spawn table (a Task
+# handle never leaves its spawner, so the table is per-task), the LCG
+# snapshot, the argv snapshot and the dummy channel every non-channel
+# V construction carries.
+# ----------------------------------------------------------------------------
+struct Boot {
+    ctx: Ctx,
+    tasks: list[Task[V]],
+    rng: int,
+    argv: V,
+    det: bool,
+    trace: bool,
+    contracts: bool,
+    target_feature: str,
+    sandbox: str
+}
+
+# BootCore — the crossing payload: everything a spawned task needs to
+# rebuild its own Boot, minus the task table (a Task handle never
+# leaves its spawner, so every task mints its own table). The core is
+# what clone() carries across the spawn boundary.
+struct BootCore {
+    ctx: Ctx,
+    rng: int,
+    argv: V,
+    det: bool,
+    trace: bool,
+    contracts: bool,
+    target_feature: str,
+    sandbox: str
+}
+
+# boot_core_of(boot) — the crossing view of a boot.
+fn boot_core_of(boot: Boot) -> BootCore {
+    return BootCore {
+        ctx: boot.ctx,
+        rng: boot.rng,
+        argv: boot.argv,
+        det: boot.det,
+        trace: boot.trace,
+        contracts: boot.contracts,
+        target_feature: boot.target_feature,
+        sandbox: boot.sandbox
+    }
+}
+
+# boot_of_core(core) — the task-side rebuild (a fresh task table).
+fn boot_of_core(core: BootCore) -> Boot {
+    return Boot {
+        ctx: core.ctx,
+        tasks: [],
+        rng: core.rng,
+        argv: core.argv,
+        det: core.det,
+        trace: core.trace,
+        contracts: core.contracts,
+        target_feature: core.target_feature,
+        sandbox: core.sandbox
+    }
+}
+
+# ----------------------------------------------------------------------------
+# int64 checked arithmetic (rt_num.py, verbatim semantics). Each op
+# returns R so the overflow/div-zero panics carry the line.
+# ----------------------------------------------------------------------------
+fn HL_INT64_MIN() -> int {
+    return -9223372036854775808
+}
+fn HL_INT64_MAX() -> int {
+    return 9223372036854775807
+}
+
+# i64_add(a, b, line) -> R — checked add.
+fn i64_add(a: int, b: int, line: int) -> R uses Conc {
+    let r: int = a + b
+    if r < HL_INT64_MIN() || r > HL_INT64_MAX() {
+        return r_panic("integer overflow", line)
+    }
+    return r_ok(v_int(r))
+}
+
+# i64_sub(a, b, line) -> R — checked sub.
+fn i64_sub(a: int, b: int, line: int) -> R uses Conc {
+    let r: int = a - b
+    if r < HL_INT64_MIN() || r > HL_INT64_MAX() {
+        return r_panic("integer overflow", line)
+    }
+    return r_ok(v_int(r))
+}
+
+# i64_mul(a, b, line) -> R — checked mul.
+fn i64_mul(a: int, b: int, line: int) -> R uses Conc {
+    let r: int = a * b
+    if r < HL_INT64_MIN() || r > HL_INT64_MAX() {
+        return r_panic("integer overflow", line)
+    }
+    return r_ok(v_int(r))
+}
+
+# i64_neg(a, line) -> R — checked negate.
+fn i64_neg(a: int, line: int) -> R uses Conc {
+    if a == HL_INT64_MIN() {
+        return r_panic("integer overflow", line)
+    }
+    return r_ok(v_int(-a))
+}
+
+# i64_div(a, b, line) -> R — checked truncating division (C
+# semantics; the INT64_MIN magnitudes are handled without negating
+# them — the Python years had bignums, the static port has cases).
+fn i64_div(a: int, b: int, line: int) -> R {
+    if b == 0 {
+        return r_panic("division by zero", line)
+    }
+    if a == HL_INT64_MIN() && b == -1 {
+        return r_panic("integer overflow", line)
+    }
+    if b == HL_INT64_MIN() {
+        if a == HL_INT64_MIN() {
+            # -2^63 / -2^63 = 1
+            return r_ok(v_int(1))
+        }
+        # |a| < 2^63 = |b| -> the quotient is 0
+        return r_ok(v_int(0))
+    }
+    if a == HL_INT64_MIN() {
+        # |a| = 2^63 = INT64_MAX + 1: quotient and remainder of the
+        # magnitude against |b| come off INT64_MAX's division.
+        if b == 1 {
+            return r_ok(v_int(a))
+        }
+        let m: int = hl_abs(b)
+        let mut qmag: int = HL_INT64_MAX() / m
+        if HL_INT64_MAX() % m + 1 == m {
+            qmag = qmag + 1
+        }
+        if(a < 0) != (b < 0) {
+            return r_ok(v_int(-qmag))
+        }
+        return r_ok(v_int(qmag))
+    }
+    let q: int = hl_abs(a) / hl_abs(b)
+    let neg: bool = (a < 0) != (b < 0)
+    if neg {
+        return r_ok(v_int(-q))
+    }
+    return r_ok(v_int(q))
+}
+
+# i64_mod(a, b, line) -> R — checked remainder (sign of the
+# dividend, C semantics; INT64_MIN magnitudes never negated).
+fn i64_mod(a: int, b: int, line: int) -> R {
+    if b == 0 {
+        return r_panic("division by zero", line)
+    }
+    if a == HL_INT64_MIN() && b == -1 {
+        return r_panic("integer overflow", line)
+    }
+    if b == HL_INT64_MIN() {
+        if a == HL_INT64_MIN() {
+            return r_ok(v_int(0))
+        }
+        return r_ok(v_int(a))
+    }
+    if a == HL_INT64_MIN() {
+        if b == 1 || b == -1 {
+            return r_ok(v_int(0))
+        }
+        let m: int = hl_abs(b)
+        let rem: int = HL_INT64_MAX() % m
+        let mut rmag: int = rem + 1
+        if rmag == m {
+            rmag = 0
+        }
+        return r_ok(v_int(-rmag))
+    }
+    let r: int = hl_abs(a) % hl_abs(b)
+    if a < 0 {
+        return r_ok(v_int(-r))
+    }
+    return r_ok(v_int(r))
+}
+
+# hl_abs(a) — abs without the INT64_MIN overflow (used by div/mod).
+fn hl_abs(a: int) -> int {
+    if a < 0 {
+        return -a
+    }
+    return a
+}
+
+# ----------------------------------------------------------------------------
+# Value helpers — truthiness, display, equality, ordering, cloning.
+# ----------------------------------------------------------------------------
+
+# v_truthy(v) — Python bool(v): False for None/false/0/0.0/""/empty
+# list/empty map, True for everything else (enum values are dicts —
+# always truthy; channels are objects — truthy).
+fn v_truthy(v: V) -> bool {
+    if v.k == VK_UNIT() {
+        return false
+    }
+    if v.k == VK_BOOL() {
+        return v.i != 0
+    }
+    if v.k == VK_INT() {
+        return v.i != 0
+    }
+    if v.k == VK_FLOAT() {
+        return v.f != 0.0
+    }
+    if v.k == VK_STR() {
+        return v.s.len() != 0
+    }
+    if v.k == VK_LIST() {
+        return v.vals.len() != 0
+    }
+    if v.k == VK_MAP() {
+        return v.keys.len() != 0
+    }
+    return true
+}
+
+# to_display(v) — the interpreter's to_display: bytes decode as
+# UTF-8 with replacement, everything else its own str().
+fn to_display(v: V) -> str {
+    if v.k == VK_STR() {
+        return v.s
+    }
+    return v_to_str(v)
+}
+
+# fmt_float_py(x) — the interpreter's fmt_float: %.6f with the NaN
+# sign rendered the way C's printf does it. The HOST float.to_str()
+# IS the native runtime's snprintf("%.6f") — the very renderer the
+# differential law pins — so the port rides it directly: same bytes
+# for finite values, same sign-aware NaN, same "inf"/"-inf".
+fn fmt_float_py(x: float) -> str {
+    return x.to_str()
+}
+
+# v_to_str(v) — Python's str() over the runtime value (the panic
+# message coercion, join, and the str() builtin for non-primitives —
+# which the checker never lets through; the arms exist for the
+# internal callers). Lists/maps/structs/enums render Python-style.
+fn v_to_str(v: V) -> str {
+    if v.k == VK_INT() {
+        return v.i.to_str()
+    }
+    if v.k == VK_FLOAT() {
+        return fmt_float_py(v.f)
+    }
+    if v.k == VK_BOOL() {
+        if v.i != 0 {
+            return "true"
+        }
+        return "false"
+    }
+    if v.k == VK_STR() {
+        return v.s
+    }
+    if v.k == VK_UNIT() {
+        return "None"
+    }
+    if v.k == VK_LIST() {
+        let out: list[str] = []
+        out.push("[")
+        let mut i: int = 0
+        while i < v.vals.len() {
+            if i > 0 {
+                out.push(", ")
+            }
+            let it: V = v.vals.get(i)
+            if it.k == VK_STR() {
+                out.push("'")
+                out.push(it.s)
+                out.push("'")
+            } else {
+                out.push(v_to_str(it))
+            }
+            i = i + 1
+        }
+        out.push("]")
+        return str_join_flat(out)
+    }
+    if v.k == VK_MAP() {
+        let out: list[str] = []
+        out.push("{")
+        let mut i: int = 0
+        while i < v.keys.len() {
+            if i > 0 {
+                out.push(", ")
+            }
+            out.push("'")
+            out.push(v.keys.get(i))
+            out.push("': ")
+            let it: V = v.vals.get(i)
+            if it.k == VK_STR() {
+                out.push("'")
+                out.push(it.s)
+                out.push("'")
+            } else {
+                out.push(v_to_str(it))
+            }
+            i = i + 1
+        }
+        out.push("}")
+        return str_join_flat(out)
+    }
+    if v.k == VK_STRUCT() {
+        let out: list[str] = []
+        out.push(v.s)
+        out.push(" {")
+        let mut i: int = 0
+        while i < v.keys.len() {
+            if i > 0 {
+                out.push(", ")
+            }
+            out.push(v.keys.get(i))
+            out.push(": ")
+            let it: V = v.vals.get(i)
+            if it.k == VK_STR() {
+                out.push("'")
+                out.push(it.s)
+                out.push("'")
+            } else {
+                out.push(v_to_str(it))
+            }
+            i = i + 1
+        }
+        out.push("}")
+        return str_join_flat(out)
+    }
+    if v.k == VK_ENUM() {
+        if v.vals.len() == 0 {
+            return v.s + "." + v.var
+        }
+        let out: list[str] = []
+        out.push(v.s)
+        out.push(".")
+        out.push(v.var)
+        out.push("(")
+        let mut i: int = 0
+        while i < v.vals.len() {
+            if i > 0 {
+                out.push(", ")
+            }
+            let it: V = v.vals.get(i)
+            if it.k == VK_STR() {
+                out.push("'")
+                out.push(it.s)
+                out.push("'")
+            } else {
+                out.push(v_to_str(it))
+            }
+            i = i + 1
+        }
+        out.push(")")
+        return str_join_flat(out)
+    }
+    if v.k == VK_CHAN() {
+        return "<chan>"
+    }
+    if v.k == VK_TASK() {
+        return "<task>"
+    }
+    if v.k == VK_TAINTED() {
+        return "<tainted>"
+    }
+    if v.k == VK_CAP() {
+        return "<cap>"
+    }
+    return "<?>"
+}
+
+# str_join_flat(parts) — concatenate a list of str pieces.
+fn str_join_flat(parts: list[str]) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < parts.len() {
+        out = out + parts.get(i)
+        i = i + 1
+    }
+    return out
+}
+
+# v_eq(a, b) — Python's == over runtime values. The checker admits
+# == only between int/float/bool/str, so the deep arms are the
+# interpreter's internal callers only (match payload checks never
+# compare compound values).
+fn v_eq(a: V, b: V) -> bool {
+    if a.k == VK_INT() && b.k == VK_INT() {
+        return a.i == b.i
+    }
+    if a.k == VK_INT() && b.k == VK_BOOL() {
+        return a.i == b.i
+    }
+    if a.k == VK_BOOL() && b.k == VK_INT() {
+        return a.i == b.i
+    }
+    if a.k == VK_BOOL() && b.k == VK_BOOL() {
+        return a.i == b.i
+    }
+    if a.k == VK_FLOAT() && b.k == VK_FLOAT() {
+        return a.f == b.f
+    }
+    if a.k == VK_FLOAT() && b.k == VK_INT() {
+        return a.f == b.i.to_float()
+    }
+    if a.k == VK_INT() && b.k == VK_FLOAT() {
+        return a.i.to_float() == b.f
+    }
+    if a.k == VK_STR() && b.k == VK_STR() {
+        return a.s == b.s
+    }
+    if a.k == VK_UNIT() && b.k == VK_UNIT() {
+        return true
+    }
+    return false
+}
+
+# v_cmp(a, b, line) -> R — Python's < (the relational ops share one
+# ordering: ints/floats numeric, str bytes-lexicographic; the checker
+# admits ordering only on int/float/str).
+fn v_cmp(a: V, b: V, line: int) -> R uses Conc {
+    if a.k == VK_INT() && b.k == VK_INT() {
+        if a.i < b.i {
+            return r_ok(v_int(-1))
+        }
+        if a.i > b.i {
+            return r_ok(v_int(1))
+        }
+        return r_ok(v_int(0))
+    }
+    if a.k == VK_FLOAT() && b.k == VK_FLOAT() {
+        return r_ok(v_int(fcmp_sign(a.f, b.f)))
+    }
+    if a.k == VK_INT() && b.k == VK_FLOAT() {
+        return r_ok(v_int(fcmp_sign(a.i.to_float(), b.f)))
+    }
+    if a.k == VK_FLOAT() && b.k == VK_INT() {
+        return r_ok(v_int(fcmp_sign(a.f, b.i.to_float())))
+    }
+    if a.k == VK_STR() && b.k == VK_STR() {
+        return r_ok(v_int(str_cmp_sign(a.s, b.s)))
+    }
+    return r_panic("'<' not supported between instances of '"
+    + v_type_name(a) + "' and '" + v_type_name(b) + "'", line)
+}
+
+# fcmp_sign(a, b) — the float ordering.
+fn fcmp_sign(a: float, b: float) -> int {
+    if a < b {
+        return -1
+    }
+    if a > b {
+        return 1
+    }
+    return 0
+}
+
+# str_cmp_sign(a, b) — bytes-lexicographic ordering.
+fn str_cmp_sign(a: str, b: str) -> int {
+    let mut n: int = a.len()
+    if b.len() < n {
+        n = b.len()
+    }
+    let mut i: int = 0
+    while i < n {
+        let ca: int = a.byte_at(i)
+        let cb: int = b.byte_at(i)
+        if ca < cb {
+            return -1
+        }
+        if ca > cb {
+            return 1
+        }
+        i = i + 1
+    }
+    if a.len() < b.len() {
+        return -1
+    }
+    if a.len() > b.len() {
+        return 1
+    }
+    return 0
+}
+
+# v_type_name(v) — the Python type name for error messages.
+fn v_type_name(v: V) -> str {
+    if v.k == VK_INT() {
+        return "int"
+    }
+    if v.k == VK_FLOAT() {
+        return "float"
+    }
+    if v.k == VK_BOOL() {
+        return "bool"
+    }
+    if v.k == VK_STR() {
+        return "str"
+    }
+    if v.k == VK_LIST() {
+        return "list"
+    }
+    if v.k == VK_MAP() {
+        return "map"
+    }
+    if v.k == VK_STRUCT() {
+        return v.s
+    }
+    if v.k == VK_ENUM() {
+        return v.s
+    }
+    if v.k == VK_UNIT() {
+        return "NoneType"
+    }
+    if v.k == VK_CHAN() {
+        return "Chan"
+    }
+    if v.k == VK_TASK() {
+        return "Task"
+    }
+    return "tainted"
+}
+
+# map_key_index(keys, name) — the index of name in the parallel key
+# array, -1 when absent (map values live in a parallel list).
+fn map_key_index(keys: list[str], name: str) -> int {
+    let mut i: int = 0
+    while i < keys.len() {
+        if keys.get(i) == name {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# deep_clone(v) — the interpreter's deep_clone: a private copy of
+# every owned value. Channels cross by sharing (the host clone law for
+# Chan fields — the handle itself is the value); taint wrappers clone
+# the inner value.
+fn deep_clone(v: V) -> V {
+    return deep_clone_d(v, 0)
+}
+
+# deep_clone_d(v, depth) — the interpreter's deep_clone. Python
+# broke cycles through an id-keyed seen set (aliasing the copy); the
+# static port has no identity comparison, so a depth cap aliases the
+# SOURCE node instead — every cycle terminates (the corpus's cyclic
+# clone reads .val through one hop and cannot tell), and acyclic data
+# deeper than the cap does not exist in any real program.
+fn deep_clone_d(v: V, depth: int) -> V {
+    if depth > 1000 {
+        return v
+    }
+    if v.k == VK_LIST() {
+        let out: list[V] = []
+        let mut i: int = 0
+        while i < v.vals.len() {
+            out.push(deep_clone_d(v.vals.get(i), depth + 1))
+            i = i + 1
+        }
+        return v_list(out)
+    }
+    if v.k == VK_MAP() {
+        let keys: list[str] = []
+        let vals: list[V] = []
+        let mut i: int = 0
+        while i < v.keys.len() {
+            keys.push(v.keys.get(i))
+            vals.push(deep_clone_d(v.vals.get(i), depth + 1))
+            i = i + 1
+        }
+        return V {
+            k: VK_MAP(), i: 0, f: 0.0, s: "", var: "", keys: keys, vals: vals
+        }
+    }
+    if v.k == VK_STRUCT() {
+        let keys: list[str] = []
+        let vals: list[V] = []
+        let mut i: int = 0
+        while i < v.keys.len() {
+            keys.push(v.keys.get(i))
+            vals.push(deep_clone_d(v.vals.get(i), depth + 1))
+            i = i + 1
+        }
+        return V {
+            k: VK_STRUCT(), i: 0, f: 0.0, s: v.s, var: "", keys: keys, vals: vals
+        }
+    }
+    if v.k == VK_ENUM() {
+        let vals: list[V] = []
+        let mut i: int = 0
+        while i < v.vals.len() {
+            vals.push(deep_clone_d(v.vals.get(i), depth + 1))
+            i = i + 1
+        }
+        return V {
+            k: VK_ENUM(), i: 0, f: 0.0, s: v.s, var: v.var, keys: [], vals: vals
+        }
+    }
+    if v.k == VK_TAINTED() {
+        return v_tainted(deep_clone_d(v.vals.get(0), depth + 1))
+    }
+    return v
+}
+
+# ----------------------------------------------------------------------------
+# The environment: a chain of frames, newest last. Bindings live in
+# parallel name/cell arrays; assignment replaces the cell in the frame
+# that owns the name (the Python dict-binding law, made static).
+# ----------------------------------------------------------------------------
+struct Fr {
+    names: list[str],
+    cells: list[V]
+}
+
+# fr_new() — an empty frame.
+fn fr_new() -> Fr {
+    return Fr {
+        names: [], cells: []
+    }
+}
+
+# env_lookup(env, name, line) -> R — the chain walk, newest frame first.
+fn env_lookup(env: list[Fr], name: str, line: int) -> R uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let mut i: int = env.len() - 1
+    while i >= 0 {
+        let f: Fr = env.get(i)
+        let mut j: int = 0
+        while j < f.names.len() {
+            if f.names.get(j) == name {
+                return r_ok(f.cells.get(j))
+            }
+            j = j + 1
+        }
+        i = i - 1
+    }
+    return r_panic("variable does not exist: " + name, line)
+}
+
+# env_bind(env, name, v) — bind (or rebind) in the TOP frame.
+fn env_bind(env: list[Fr], name: str, v: V) -> void {
+    let f: Fr = env.get(env.len() - 1)
+    let mut j: int = 0
+    while j < f.names.len() {
+        if f.names.get(j) == name {
+            f.cells.set(j, v)
+            return
+        }
+        j = j + 1
+    }
+    f.names.push(name)
+    f.cells.push(v)
+}
+
+# env_assign(env, name, v, line) -> R — the assignment walk (same
+# order as lookup; the interpreter mutates the binding cell).
+fn env_assign(env: list[Fr], name: str, v: V, line: int) -> R uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let mut i: int = env.len() - 1
+    while i >= 0 {
+        let f: Fr = env.get(i)
+        let mut j: int = 0
+        while j < f.names.len() {
+            if f.names.get(j) == name {
+                f.cells.set(j, v)
+                return r_unit()
+            }
+            j = j + 1
+        }
+        i = i - 1
+    }
+    return r_panic("variable does not exist: " + name, line)
+}
+
+# env_lookup_opt(env, name) — the quiet probe (option-style: the unit
+# value when absent — callers check .k == VK_UNIT()).
+fn env_lookup_quiet(env: list[Fr], name: str) -> V uses Conc {
+    let mut i: int = env.len() - 1
+    while i >= 0 {
+        let f: Fr = env.get(i)
+        let mut j: int = 0
+        while j < f.names.len() {
+            if f.names.get(j) == name {
+                return f.cells.get(j)
+            }
+            j = j + 1
+        }
+        i = i - 1
+    }
+    return v_unit()
+}
+
+# ----------------------------------------------------------------------------
+# The statement executor. `cur` is the executing fn's key — the
+# #[tail_call] return arm needs it (the interpreter's thread-local
+# fn_stack, made a parameter).
+# ----------------------------------------------------------------------------
+fn FL_TAIL() -> int {
+    return 6
+}
+
+# exec_stmts(boot, env, body, cur) -> R — run statements until one
+# produces a flow; the first non-OK flow propagates.
+fn exec_stmts(boot: Boot, env: list[Fr], body: list[int], cur: str) -> R uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let mut i: int = 0
+    while i < body.len() {
+        let r: R = exec_stmt(boot, env, body.get(i), cur)
+        if r.flow != FL_OK() {
+            return r
+        }
+        i = i + 1
+    }
+    return r_unit()
+}
+
+# exec_stmt(boot, env, si, cur) -> R — one statement.
+fn exec_stmt(boot: Boot, env: list[Fr], si: int, cur: str) -> R uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let s: StmtN = boot.ctx.stmts.get(si)
+    let k: str = s.kind
+    if k == "expr" {
+        return eval_expr(boot, env, s.e, cur)
+    }
+    if k == "let" {
+        let rv: R = eval_expr(boot, env, s.value, cur)
+        if rv.flow != FL_OK() {
+            return rv
+        }
+        let val: V = rv.v
+        if s.rpred != "" {
+            let rr: R = check_refine(boot, s.rpred, val,
+            "variable '" + s.name + "'", s.line)
+            if rr.flow != FL_OK() {
+                return rr
+            }
+        }
+        env_bind(env, s.name, val)
+        return r_unit()
+    }
+    if k == "assign" {
+        return exec_assign(boot, env, si, cur)
+    }
+    if k == "if" {
+        let rc: R = eval_expr(boot, env, s.cond, cur)
+        if rc.flow != FL_OK() {
+            return rc
+        }
+        if v_truthy(rc.v) {
+            let blk: list[Fr] = env_push(env)
+            let rr: R = exec_stmts(boot, env, s.body, cur)
+            env_pop(env, blk)
+            return rr
+        }
+        if s.else_body.len() > 0 {
+            let blk2: list[Fr] = env_push(env)
+            let rr2: R = exec_stmts(boot, env, s.else_body, cur)
+            env_pop(env, blk2)
+            return rr2
+        }
+        return r_unit()
+    }
+    if k == "while" {
+        let mut go: bool = true
+        while go {
+            let rc: R = eval_expr(boot, env, s.cond, cur)
+            if rc.flow != FL_OK() {
+                return rc
+            }
+            if !v_truthy(rc.v) {
+                return r_unit()
+            }
+            let blk: list[Fr] = env_push(env)
+            let rr: R = exec_stmts(boot, env, s.body, cur)
+            env_pop(env, blk)
+            if rr.flow == FL_BREAK() {
+                return r_unit()
+            }
+            if rr.flow == FL_CONT() {
+                # next iteration
+            } else {
+                if rr.flow != FL_OK() {
+                    return rr
+                }
+            }
+        }
+        return r_unit()
+    }
+    if k == "for" {
+        let ri: R = eval_expr(boot, env, s.iter, cur)
+        if ri.flow != FL_OK() {
+            return ri
+        }
+        if ri.v.k != VK_LIST() {
+            return r_panic("for over non-list", s.line)
+        }
+        let lst: list[V] = ri.v.vals
+        let n: int = lst.len()
+        let mut i: int = 0
+        while i < n {
+            if i >= lst.len() {
+                break
+            }
+            let blk: list[Fr] = env_push(env)
+            env_bind(env, s.name, lst.get(i))
+            let rr: R = exec_stmts(boot, env, s.body, cur)
+            env_pop(env, blk)
+            if rr.flow == FL_BREAK() {
+                return r_unit()
+            }
+            if rr.flow != FL_OK() && rr.flow != FL_CONT() {
+                return rr
+            }
+            i = i + 1
+        }
+        return r_unit()
+    }
+    if k == "return" {
+        if s.value == -1 {
+            return r_return(v_unit())
+        }
+        let vexpr: ExprN = boot.ctx.exprs.get(s.value)
+        # The #[tail_call] trampoline: a VERIFIED tail self-call returns
+        # FL_TAIL with the evaluated args; call_fn rebinds and loops.
+        if vexpr.kind == "call" && vexpr.muser {
+            let target: str = vexpr.name
+            let tf: FnInfo = boot.ctx.fns.get_or(target, dummy_fn())
+            if tf.attr_tail_call && target == cur {
+                let args: list[V] = []
+                let mut ai: int = 0
+                while ai < vexpr.args.len() {
+                    let ra: R = eval_expr(boot, env, vexpr.args.get(ai), cur)
+                    if ra.flow != FL_OK() {
+                        return ra
+                    }
+                    args.push(ra.v)
+                    ai = ai + 1
+                }
+                return R {
+                    flow: FL_TAIL(), v: v_list(args), msg: target, line: s.line, code: 0
+                }
+            }
+        }
+        let rv: R = eval_expr(boot, env, s.value, cur)
+        if rv.flow != FL_OK() {
+            return rv
+        }
+        return r_return(rv.v)
+    }
+    if k == "break" {
+        return r_break()
+    }
+    if k == "continue" {
+        return r_cont()
+    }
+    if k == "asm" {
+        return r_panic("asm! cannot be executed by the boot interpreter — use the native compiler `hlc` (which lowers asm! to GCC extended asm) or wrap the asm! call in a path the interpreter does not take (e.g. an extern \"C\" fn or a kernel-only entrypoint)", s.line)
+    }
+    return r_panic("unknown statement: " + k, s.line)
+}
+
+# env_push(env) — push an empty frame; returns the pushed singleton
+# list for the matching env_pop (a frame marker).
+fn env_push(env: list[Fr]) -> list[Fr] {
+    let blk: list[Fr] = [fr_new()]
+    env.push(fr_new())
+    return blk
+}
+
+# env_pop(env, blk) — pop the block frame (the interpreter's
+# try/finally pop; blk kept for symmetry with future block scoping).
+fn env_pop(env: list[Fr], blk: list[Fr]) -> void {
+    if env.len() > 1 {
+        env.pop()
+    }
+}
+
+# exec_assign(boot, env, si, cur) -> R — the assignment statement.
+fn exec_assign(boot: Boot, env: list[Fr], si: int, cur: str) -> R uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let s: StmtN = boot.ctx.stmts.get(si)
+    let rv: R = eval_expr(boot, env, s.value, cur)
+    if rv.flow != FL_OK() {
+        return rv
+    }
+    let val: V = rv.v
+    if s.rpred != "" {
+        let tgt: ExprN = boot.ctx.exprs.get(s.target)
+        let mut what: str = "the assigned value"
+        if tgt.kind == "ident" {
+            what = "variable '" + tgt.name + "'"
+        } else if tgt.kind == "field" {
+            let base: str = type_base(tgt.t)
+            what = "field '" + base + "." + tgt.name + "'"
+        }
+        let rr: R = check_refine(boot, s.rpred, val, what, s.line)
+        if rr.flow != FL_OK() {
+            return rr
+        }
+    }
+    let t: ExprN = boot.ctx.exprs.get(s.target)
+    if t.kind == "ident" {
+        return env_assign(env, t.name, val, s.line)
+    }
+    if t.kind == "field" {
+        let rb: R = eval_expr(boot, env, t.left, cur)
+        if rb.flow != FL_OK() {
+            return rb
+        }
+        if rb.v.k == VK_STRUCT() || rb.v.k == VK_MAP() {
+            let idx: int = map_key_index(rb.v.keys, t.name)
+            if idx < 0 {
+                return r_panic("struct has no field: " + t.name, s.line)
+            }
+            rb.v.vals.set(idx, val)
+            return r_unit()
+        }
+        return r_panic("assignment to field of non-struct", s.line)
+    }
+    if t.kind == "index" {
+        let rb2: R = eval_expr(boot, env, t.left, cur)
+        if rb2.flow != FL_OK() {
+            return rb2
+        }
+        let ri: R = eval_expr(boot, env, t.right, cur)
+        if ri.flow != FL_OK() {
+            return ri
+        }
+        if rb2.v.k != VK_LIST() {
+            return r_panic("assignment to index of non-list", s.line)
+        }
+        if ri.v.k != VK_INT() {
+            return r_panic("array index not int", s.line)
+        }
+        let ix: int = ri.v.i
+        if ix < 0 || ix >= rb2.v.vals.len() {
+            return r_panic("array access out of bounds", s.line)
+        }
+        rb2.v.vals.set(ix, val)
+        return r_unit()
+    }
+    return r_panic("invalid lvalue", s.line)
+}
+
+# ----------------------------------------------------------------------------
+# The expression evaluator.
+# ----------------------------------------------------------------------------
+fn eval_expr(boot: Boot, env: list[Fr], ei: int, cur: str) -> R uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let e: ExprN = boot.ctx.exprs.get(ei)
+    let k: str = e.kind
+    if k == "int" {
+        return r_ok(v_int(e.ival))
+    }
+    if k == "float" {
+        return r_ok(v_float(e.fval))
+    }
+    if k == "bool" {
+        return r_ok(v_bool(e.bval))
+    }
+    if k == "str" {
+        return r_ok(v_str(e.sval))
+    }
+    if k == "ident" {
+        return env_lookup(env, e.name, e.line)
+    }
+    if k == "bin" {
+        return eval_bin(boot, env, ei, cur)
+    }
+    if k == "un" {
+        let rv: R = eval_expr(boot, env, e.left, cur)
+        if rv.flow != FL_OK() {
+            return rv
+        }
+        if e.op == "!" {
+            return r_ok(v_bool(!v_truthy(rv.v)))
+        }
+        if rv.v.k == VK_INT() {
+            return i64_neg(rv.v.i, e.line)
+        }
+        if rv.v.k == VK_FLOAT() {
+            return r_ok(v_float(-rv.v.f))
+        }
+        return r_panic("bad operand for unary -", e.line)
+    }
+    if k == "index" {
+        let rt: R = eval_expr(boot, env, e.left, cur)
+        if rt.flow != FL_OK() {
+            return rt
+        }
+        let ri: R = eval_expr(boot, env, e.right, cur)
+        if ri.flow != FL_OK() {
+            return ri
+        }
+        if rt.v.k != VK_LIST() {
+            return r_panic("array access out of bounds", e.line)
+        }
+        if ri.v.k != VK_INT() {
+            return r_panic("array index not int", e.line)
+        }
+        let ix: int = ri.v.i
+        if ix < 0 || ix >= rt.v.vals.len() {
+            return r_panic("array access out of bounds", e.line)
+        }
+        return r_ok(rt.v.vals.get(ix))
+    }
+    if k == "field" {
+        let rt: R = eval_expr(boot, env, e.left, cur)
+        if rt.flow != FL_OK() {
+            return rt
+        }
+        if rt.v.k == VK_STRUCT() || rt.v.k == VK_MAP() {
+            let idx: int = map_key_index(rt.v.keys, e.name)
+            if idx < 0 {
+                return r_panic("struct has no field: " + e.name, e.line)
+            }
+            return r_ok(rt.v.vals.get(idx))
+        }
+        return r_panic("field access on non-struct", e.line)
+    }
+    if k == "call" {
+        return eval_call(boot, env, ei, cur)
+    }
+    if k == "method" {
+        return eval_method(boot, env, ei, cur)
+    }
+    if k == "listlit" {
+        let out: list[V] = []
+        let mut i: int = 0
+        while i < e.args.len() {
+            let rv: R = eval_expr(boot, env, e.args.get(i), cur)
+            if rv.flow != FL_OK() {
+                return rv
+            }
+            out.push(rv.v)
+            i = i + 1
+        }
+        return r_ok(v_list(out))
+    }
+    if k == "structlit" {
+        return eval_structlit(boot, env, ei, cur)
+    }
+    if k == "enumlit" {
+        let vals: list[V] = []
+        let mut i: int = 0
+        while i < e.args.len() {
+            let rv: R = eval_expr(boot, env, e.args.get(i), cur)
+            if rv.flow != FL_OK() {
+                return rv
+            }
+            vals.push(rv.v)
+            i = i + 1
+        }
+        return r_ok(v_enum(e.enum_name, e.variant, vals))
+    }
+    if k == "match" {
+        return eval_match(boot, env, ei, cur)
+    }
+    if k == "qmark" {
+        return eval_qmark(boot, env, ei, cur)
+    }
+    if k == "mapnew" {
+        return r_ok(v_map_new())
+    }
+    return r_panic("unknown expression: " + k, e.line)
+}
+
+# eval_bin(boot, env, ei, cur) -> R — the binary operator table.
+fn eval_bin(boot: Boot, env: list[Fr], ei: int, cur: str) -> R uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let e: ExprN = boot.ctx.exprs.get(ei)
+    let op: str = e.op
+    let rl: R = eval_expr(boot, env, e.left, cur)
+    if rl.flow != FL_OK() {
+        return rl
+    }
+    let a: V = rl.v
+    if op == "||" {
+        if v_truthy(a) {
+            return r_ok(v_bool(true))
+        }
+        let rr: R = eval_expr(boot, env, e.right, cur)
+        if rr.flow != FL_OK() {
+            return rr
+        }
+        return r_ok(v_bool(v_truthy(rr.v)))
+    }
+    if op == "&&" {
+        if !v_truthy(a) {
+            return r_ok(v_bool(false))
+        }
+        let rr: R = eval_expr(boot, env, e.right, cur)
+        if rr.flow != FL_OK() {
+            return rr
+        }
+        return r_ok(v_bool(v_truthy(rr.v)))
+    }
+    let rrv: R = eval_expr(boot, env, e.right, cur)
+    if rrv.flow != FL_OK() {
+        return rrv
+    }
+    let b: V = rrv.v
+    if op == "==" {
+        return r_ok(v_bool(v_eq(a, b)))
+    }
+    if op == "!=" {
+        return r_ok(v_bool(!v_eq(a, b)))
+    }
+    if op == "<" || op == "<=" || op == ">" || op == ">=" {
+        let rc: R = v_cmp(a, b, e.line)
+        if rc.flow != FL_OK() {
+            return rc
+        }
+        let c: int = rc.v.i
+        if op == "<" {
+            return r_ok(v_bool(c < 0))
+        }
+        if op == "<=" {
+            return r_ok(v_bool(c <= 0))
+        }
+        if op == ">" {
+            return r_ok(v_bool(c > 0))
+        }
+        return r_ok(v_bool(c >= 0))
+    }
+    if op == "+" {
+        if a.k == VK_INT() && b.k == VK_INT() {
+            return i64_add(a.i, b.i, e.line)
+        }
+        if a.k == VK_FLOAT() && b.k == VK_FLOAT() {
+            return r_ok(v_float(a.f + b.f))
+        }
+        if a.k == VK_STR() && b.k == VK_STR() {
+            return r_ok(v_str(a.s + b.s))
+        }
+        return r_panic("+ operator does not support "
+        + v_type_name(a) + " and " + v_type_name(b), e.line)
+    }
+    if op == "-" {
+        if a.k == VK_INT() && b.k == VK_INT() {
+            return i64_sub(a.i, b.i, e.line)
+        }
+        if a.k == VK_FLOAT() && b.k == VK_FLOAT() {
+            return r_ok(v_float(a.f - b.f))
+        }
+        return r_panic("- operator does not support "
+        + v_type_name(a) + " and " + v_type_name(b), e.line)
+    }
+    if op == "*" {
+        if a.k == VK_INT() && b.k == VK_INT() {
+            return i64_mul(a.i, b.i, e.line)
+        }
+        if a.k == VK_FLOAT() && b.k == VK_FLOAT() {
+            return r_ok(v_float(a.f * b.f))
+        }
+        return r_panic("* operator does not support "
+        + v_type_name(a) + " and " + v_type_name(b), e.line)
+    }
+    if op == "/" {
+        if a.k == VK_INT() && b.k == VK_INT() {
+            return i64_div(a.i, b.i, e.line)
+        }
+        if a.k == VK_FLOAT() && b.k == VK_FLOAT() {
+            return r_ok(v_float(a.f / b.f))
+        }
+        return r_panic("/ operator does not support "
+        + v_type_name(a) + " and " + v_type_name(b), e.line)
+    }
+    if op == "%" {
+        if a.k == VK_INT() && b.k == VK_INT() {
+            return i64_mod(a.i, b.i, e.line)
+        }
+        if a.k == VK_FLOAT() && b.k == VK_FLOAT() {
+            return r_ok(v_float(a.f % b.f))
+        }
+        return r_panic("% operator does not support "
+        + v_type_name(a) + " and " + v_type_name(b), e.line)
+    }
+    return r_panic("unknown operator: " + op, e.line)
+}
+
+# eval_structlit(boot, env, ei, cur) -> R — declared field order,
+# provided values or evaluated defaults, per-field refinement guards.
+fn eval_structlit(boot: Boot, env: list[Fr], ei: int, cur: str) -> R uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let e: ExprN = boot.ctx.exprs.get(ei)
+    let st: StructInfo = boot.ctx.structs.get_or(e.name, dummy_struct())
+    let provided_idx: list[int] = []
+    let mut fi: int = 0
+    while fi < st.fields.len() {
+        provided_idx.push(-1)
+        fi = fi + 1
+    }
+    # Map provided field names to their value expr indices.
+    let mut pi: int = 0
+    while pi < e.ffields.len() {
+        let fname: str = e.ffields.get(pi)
+        let di: int = map_key_index(st.fields, fname)
+        if di >= 0 {
+            provided_idx.set(di, e.args.get(pi))
+        }
+        pi = pi + 1
+    }
+    let keys: list[str] = []
+    let vals: list[V] = []
+    let mut di2: int = 0
+    while di2 < st.fields.len() {
+        let fname2: str = st.fields.get(di2)
+        let mut val: V = v_unit()
+        if provided_idx.get(di2) >= 0 {
+            let rv: R = eval_expr(boot, env, provided_idx.get(di2), cur)
+            if rv.flow != FL_OK() {
+                return rv
+            }
+            val = rv.v
+        } else {
+            let dflt: int = st.fdefaults.get(di2)
+            if dflt >= 0 {
+                let rv2: R = eval_expr(boot, env, dflt, cur)
+                if rv2.flow != FL_OK() {
+                    return rv2
+                }
+                val = rv2.v
+            } else {
+                return r_panic("struct literal missing required field: " + fname2, e.line)
+            }
+        }
+        if st.field_preds.has(fname2) {
+            let pred: str = st.field_preds.get_or(fname2, "")
+            let rr: R = check_refine(boot, pred, val,
+            "field '" + st.name + "." + fname2 + "'", e.line)
+            if rr.flow != FL_OK() {
+                return rr
+            }
+        }
+        keys.push(fname2)
+        vals.push(val)
+        di2 = di2 + 1
+    }
+    return r_ok(v_struct(st.name, keys, vals))
+}
+
+# eval_match(boot, env, ei, cur) -> R — arms in order; a variant
+# pattern matches enum + variant, binding the payloads.
+fn eval_match(boot: Boot, env: list[Fr], ei: int, cur: str) -> R uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let e: ExprN = boot.ctx.exprs.get(ei)
+    let rs: R = eval_expr(boot, env, e.left, cur)
+    if rs.flow != FL_OK() {
+        return rs
+    }
+    if rs.v.k != VK_ENUM() {
+        return r_panic("match on non-enum value", e.line)
+    }
+    let s_enum: str = rs.v.s
+    let s_var: str = rs.v.var
+    let s_data: list[V] = rs.v.vals
+    let mut ai: int = 0
+    while ai < e.args.len() {
+        let arm: MatchArm = boot.ctx.match_arms.get(e.args.get(ai))
+        if arm.pat_kind == "wildcard" {
+            return eval_expr(boot, env, arm.body, cur)
+        }
+        if arm.enum_name == s_enum && arm.variant == s_var {
+            let blk: list[Fr] = env_push(env)
+            let mut bi: int = 0
+            while bi < arm.bindings.len() {
+                let bname: str = arm.bindings.get(bi)
+                if bname != "_" {
+                    if bi >= s_data.len() {
+                        env_pop(env, blk)
+                        return r_panic("match: binding count exceeds payload count (internal checker bug — please report)", e.line)
+                    }
+                    env_bind(env, bname, s_data.get(bi))
+                }
+                bi = bi + 1
+            }
+            let rr: R = eval_expr(boot, env, arm.body, cur)
+            env_pop(env, blk)
+            return rr
+        }
+        ai = ai + 1
+    }
+    return r_panic("match: no arm matched (non-exhaustive?)", e.line)
+}
+
+# eval_qmark(boot, env, ei, cur) -> R — the ? operator: the ok
+# variant's payload, or the error propagates as a return.
+fn eval_qmark(boot: Boot, env: list[Fr], ei: int, cur: str) -> R uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let e: ExprN = boot.ctx.exprs.get(ei)
+    let rv: R = eval_expr(boot, env, e.left, cur)
+    if rv.flow != FL_OK() {
+        return rv
+    }
+    if rv.v.k != VK_ENUM() {
+        return r_panic("? on non-enum value", e.line)
+    }
+    if rv.v.var == e.ok_variant {
+        if rv.v.vals.len() != 1 {
+            return r_panic("? operator: success variant must have exactly one payload", e.line)
+        }
+        return r_ok(rv.v.vals.get(0))
+    }
+    if rv.v.var == e.err_variant {
+        return r_return(rv.v)
+    }
+    return r_panic("? operator: enum value matched neither ok nor err variant", e.line)
+}
+
+# ----------------------------------------------------------------------------
+# check_refine(boot, pred_text, val, what, line) -> R — evaluate a
+# refinement predicate with `self` bound to the guarded value (the
+# synthetic-frame law; proven guards pass by construction).
+# ----------------------------------------------------------------------------
+fn check_refine(boot: Boot, pred_text: str, val: V, what: str, line: int) -> R uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let pe: int = boot.ctx.rpreds.get_or(pred_text, -1)
+    if pe < 0 {
+        return r_unit()
+    }
+    let frame: Fr = fr_new()
+    frame.names.push("self")
+    frame.cells.push(val)
+    let env: list[Fr] = [frame]
+    let rv: R = eval_expr(boot, env, pe, "")
+    if rv.flow != FL_OK() {
+        return rv
+    }
+    if !v_truthy(rv.v) {
+        return r_panic("refinement violation: " + what + " must satisfy '" + pred_text + "'", line)
+    }
+    return r_unit()
+}
+
+# ----------------------------------------------------------------------------
+# call_fn(boot, key, args) -> R — the function-call protocol: frame,
+# receiver slot for methods, parameter binding, refinement guards on
+# refined parameters, the contracts-mode requires, the body, the
+# return-side ret_pred + ensures, and the #[tail_call] trampoline.
+# ----------------------------------------------------------------------------
+fn call_fn(boot: Boot, key: str, args: list[V]) -> R uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let f: FnInfo = boot.ctx.fns.get_or(key, dummy_fn())
+    if f.is_extern {
+        return call_extern(boot, f, args)
+    }
+    let mut call_args: list[V] = args
+    let mut go: bool = true
+    while go {
+        go = false
+        let frame: Fr = fr_new()
+        let env: list[Fr] = [frame]
+        let mut start: int = 0
+        if f.is_method {
+            frame.names.push(f.params.get(0))
+            frame.cells.push(call_args.get(0))
+            start = 1
+        }
+        let mut i: int = start
+        while i < f.params.len() {
+            frame.names.push(f.params.get(i))
+            frame.cells.push(call_args.get(i))
+            i = i + 1
+        }
+        # Parameter refinement guards — parameter order, always-on.
+        let mut pi: int = 0
+        while pi < f.params.len() {
+            let pn: str = f.params.get(pi)
+            if f.param_preds.has(pn) {
+                let pred: str = f.param_preds.get_or(pn, "")
+                let vi: int = pi
+                let rr: R = check_refine(boot, pred, frame.cells.get(vi),
+                "parameter '" + pn + "' of '" + key + "'", f.line)
+                if rr.flow != FL_OK() {
+                    return rr
+                }
+            }
+            pi = pi + 1
+        }
+        # Contracts mode: the runtime `requires` assertion.
+        if boot.contracts && f.requires_e >= 0 {
+            let rq: R = eval_expr(boot, env, f.requires_e, key)
+            if rq.flow != FL_OK() {
+                return rq
+            }
+            if !v_truthy(rq.v) {
+                return r_panic("contract violation: requires of '" + key + "' (function precondition failed at runtime)", f.line)
+            }
+        }
+        let rb: R = exec_stmts(boot, env, f.body, key)
+        if rb.flow == FL_TAIL() {
+            if rb.msg == key {
+                call_args = rb.v.vals
+                go = true
+                continue
+            }
+            # Defensive: only self-calls produce FL_TAIL (the checker
+            # verified); a foreign key degrades to a normal call.
+            return call_fn(boot, rb.msg, rb.v.vals)
+        }
+        if rb.flow == FL_RETURN() {
+            if f.ret_pred != "" {
+                let rr: R = check_refine(boot, f.ret_pred, rb.v,
+                "return value of '" + key + "'", f.line)
+                if rr.flow != FL_OK() {
+                    return rr
+                }
+            }
+            if boot.contracts && f.ensures_e >= 0 {
+                env_bind(env, "result", rb.v)
+                let en: R = eval_expr(boot, env, f.ensures_e, key)
+                if en.flow != FL_OK() {
+                    return en
+                }
+                if !v_truthy(en.v) {
+                    return r_panic("contract violation: ensures of '" + key + "' (function postcondition failed at runtime)", f.line)
+                }
+            }
+            return r_ok(rb.v)
+        }
+        if rb.flow != FL_OK() {
+            return rb
+        }
+        # Implicit void return: still check ensures (result is None).
+        if boot.contracts && f.ensures_e >= 0 {
+            env_bind(env, "result", v_unit())
+            let en2: R = eval_expr(boot, env, f.ensures_e, key)
+            if en2.flow != FL_OK() {
+                return en2
+            }
+            if !v_truthy(en2.v) {
+                return r_panic("contract violation: ensures of '" + key + "' (function postcondition failed at runtime)", f.line)
+            }
+        }
+        return r_ok(v_unit())
+    }
+    return r_ok(v_unit())
+}
+
+# ----------------------------------------------------------------------------
+# Call dispatch (call + method nodes).
+# ----------------------------------------------------------------------------
+
+# eval_call(boot, env, ei, cur) -> R — the call node: the rewritten
+# spawn family first (mkey carries the op, mop the target), then user
+# fns (the fns-table key is the node's name), then builtins.
+fn eval_call(boot: Boot, env: list[Fr], ei: int, cur: str) -> R uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let e: ExprN = boot.ctx.exprs.get(ei)
+    let mk: str = e.mkey
+    if mk == "spawn" {
+        return do_spawn(boot, e.mop, e.args, env)
+    }
+    if mk == "async_spawn" {
+        return do_async_spawn(boot, e.mop, e.args, env)
+    }
+    if mk == "gen_spawn" {
+        return do_gen_spawn(boot, e.mop, e.args, env)
+    }
+    if mk == "stream_map_int" || mk == "stream_filter_int"
+    || mk == "stream_fold_int" || mk == "stream_flat_map_int" {
+        return do_stream_combinator(boot, mk, e.mop, e.args, env)
+    }
+    let args: list[V] = []
+    let mut i: int = 0
+    while i < e.args.len() {
+        let rv: R = eval_expr(boot, env, e.args.get(i), cur)
+        if rv.flow != FL_OK() {
+            return rv
+        }
+        args.push(rv.v)
+        i = i + 1
+    }
+    if e.muser {
+        return call_fn(boot, e.name, args)
+    }
+    return builtin(boot, mk, args, e.args, e.line)
+}
+
+# eval_method(boot, env, ei, cur) -> R — the method node: receiver
+# first, then the user method (the fns key from inst_key/mkey) or the
+# builtin method table.
+fn eval_method(boot: Boot, env: list[Fr], ei: int, cur: str) -> R uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let e: ExprN = boot.ctx.exprs.get(ei)
+    let rt: R = eval_expr(boot, env, e.left, cur)
+    if rt.flow != FL_OK() {
+        return rt
+    }
+    let args: list[V] = []
+    let mut i: int = 0
+    while i < e.args.len() {
+        let rv: R = eval_expr(boot, env, e.args.get(i), cur)
+        if rv.flow != FL_OK() {
+            return rv
+        }
+        args.push(rv.v)
+        i = i + 1
+    }
+    if e.muser {
+        let mut key: str = e.mkey
+        if e.inst_key != "" {
+            key = e.inst_key
+        }
+        let full: list[V] = [rt.v]
+        let mut j: int = 0
+        while j < args.len() {
+            full.push(args.get(j))
+            j = j + 1
+        }
+        return call_fn(boot, key, full)
+    }
+    return builtin_method(boot, e.mop, rt.v, args, e.args, e.line)
+}
+
+# ----------------------------------------------------------------------------
+# The extern "C" table — the libc symbols the corpus declares, called
+# through the host language's own extern declarations. Anything else
+# dies with the Python years' missing-symbol refusal.
+# ----------------------------------------------------------------------------
+fn call_extern(boot: Boot, f: FnInfo, args: list[V]) -> R uses Conc {
+    let name: str = f.name
+    let mut rv: V = v_unit()
+    if name == "toupper" {
+        # C's toupper in the C locale: the ASCII letters flip, every
+        # other byte is unchanged.
+        let c: int = args.get(0).i
+        if c >= 97 && c <= 122 {
+            rv = v_int(c - 32)
+        } else {
+            rv = v_int(c)
+        }
+    } else if name == "tolower" {
+        let c2: int = args.get(0).i
+        if c2 >= 65 && c2 <= 90 {
+            rv = v_int(c2 + 32)
+        } else {
+            rv = v_int(c2)
+        }
+    } else if name == "abs" || name == "labs" {
+        # abs(INT64_MIN) is UB in C and wraps to itself in practice —
+        # the twin mirrors the wrap without the checked-negate panic.
+        let n: int = args.get(0).i
+        if n < 0 {
+            if n == HL_INT64_MIN() {
+                rv = v_int(n)
+            } else {
+                rv = v_int(-n)
+            }
+        } else {
+            rv = v_int(n)
+        }
+    } else if name == "strlen" {
+        rv = v_int(args.get(0).s.len())
+    } else if name == "dirname" {
+        rv = v_str(posix_dirname(args.get(0).s))
+    } else {
+        return r_panic("extern function not found in libc: " + name, f.line)
+    }
+    # #[taint_source]: the checker typed this call's result tainted[ret]
+    # — the runtime wraps it, the way every other source does.
+    if f.attr_taint_source {
+        return r_ok(v_tainted(rv))
+    }
+    return r_ok(rv)
+}
+
+# posix_dirname(p) — the POSIX dirname algorithm.
+fn posix_dirname(p: str) -> str {
+    let s: str = hb_rstrip_slash(p)
+    if s == "" {
+        return "/"
+    }
+    let mut pos: int = -1
+    let mut i: int = s.len() - 1
+    while i >= 0 {
+        if s.byte_at(i) == 47 {
+            pos = i
+            break
+        }
+        i = i - 1
+    }
+    if pos < 0 {
+        return "."
+    }
+    let r: str = hb_rstrip_slash(s.slice(0, pos))
+    if r == "" {
+        return "/"
+    }
+    return r
+}
+
+# hb_rstrip_slash(s) — drop every trailing '/'.
+fn hb_rstrip_slash(s: str) -> str {
+    let mut end: int = s.len()
+    while end > 0 && s.byte_at(end - 1) == 47 {
+        end = end - 1
+    }
+    return s.slice(0, end)
+}
+
+# ----------------------------------------------------------------------------
+# The task family. Every interpreted task is a HOST task running one
+# of the trampolines below with a private copy of the boot (the spawn
+# boundary's own law — channels inside the values cross by sharing,
+# the tables are read-only, and the small concurrent programs the
+# corpus runs clone in microseconds). A panic or exit() inside a task
+# halts the whole process (safe-halt semantics: tasks share the
+# process fate), exactly the way the Python runners' os._exit did.
+# ----------------------------------------------------------------------------
+
+# hl_task_entry(core, key, args) — the spawn trampoline.
+fn hl_task_entry(core: BootCore, key: str, args: list[V]) -> V uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let boot: Boot = boot_of_core(core)
+    let r: R = call_fn(boot, key, args)
+    if r.flow == FL_PANIC() {
+        eprint("panic: " + r.msg + " (at line " + r.line.to_str() + ")\n")
+        exit(101)
+    }
+    if r.flow == FL_EXIT() {
+        exit(r.code)
+    }
+    return r.v
+}
+
+# hl_task_send_entry(boot, key, args, out) — the async_spawn
+# trampoline: run the fn, send the result on the cap-1 future.
+fn hl_task_send_entry(core: BootCore, key: str, args: list[V], out: Chan[V]) -> V uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let boot: Boot = boot_of_core(core)
+    let r: R = call_fn(boot, key, args)
+    if r.flow == FL_PANIC() {
+        eprint("panic: " + r.msg + " (at line " + r.line.to_str() + ")\n")
+        exit(101)
+    }
+    if r.flow == FL_EXIT() {
+        exit(r.code)
+    }
+    out.send(clone(r.v))
+    return v_unit()
+}
+
+# hl_task_gen_entry(boot, key, args, stream) — the gen_spawn
+# trampoline: the generator takes the stream as its first parameter.
+fn hl_task_gen_entry(core: BootCore, key: str, args: list[V], stream: Chan[V]) -> V uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let boot: Boot = boot_of_core(core)
+    let full: list[V] = [v_chan(stream)]
+    let mut j: int = 0
+    while j < args.len() {
+        full.push(args.get(j))
+        j = j + 1
+    }
+    let r: R = call_fn(boot, key, full)
+    if r.flow == FL_PANIC() {
+        eprint("panic: " + r.msg + " (at line " + r.line.to_str() + ")\n")
+        exit(101)
+    }
+    if r.flow == FL_EXIT() {
+        exit(r.code)
+    }
+    return r.v
+}
+
+# hl_task_comb_entry(boot, op, key, in_ch, out_ch) — the stream
+# combinator trampoline: map/filter/flat_map forward from in to out
+# (the fold combinator blocks in the caller and never spawns).
+fn hl_task_comb_entry(core: BootCore, op: str, key: str, in_ch: Chan[V], out_ch: Chan[V]) -> V uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let boot: Boot = boot_of_core(core)
+    let sentinel: V = v_int(HL_INT64_MIN())
+    if op == "stream_map_int" {
+        let mut go: bool = true
+        while go {
+            let v: V = in_ch.recv()
+            if v.k == VK_INT() && v.i == HL_INT64_MIN() {
+                out_ch.send(clone(sentinel))
+                go = false
+            } else {
+                let r: R = call_fn(boot, key, [v])
+                if r.flow == FL_PANIC() {
+                    eprint("panic: " + r.msg + " (at line " + r.line.to_str() + ")\n")
+                    exit(101)
+                }
+                if r.flow == FL_EXIT() {
+                    exit(r.code)
+                }
+                out_ch.send(clone(r.v))
+            }
+        }
+        return v_unit()
+    }
+    if op == "stream_filter_int" {
+        let mut go2: bool = true
+        while go2 {
+            let v: V = in_ch.recv()
+            if v.k == VK_INT() && v.i == HL_INT64_MIN() {
+                out_ch.send(clone(sentinel))
+                go2 = false
+            } else {
+                let r: R = call_fn(boot, key, [v])
+                if r.flow == FL_PANIC() {
+                    eprint("panic: " + r.msg + " (at line " + r.line.to_str() + ")\n")
+                    exit(101)
+                }
+                if r.flow == FL_EXIT() {
+                    exit(r.code)
+                }
+                if v_truthy(r.v) {
+                    out_ch.send(clone(v))
+                }
+            }
+        }
+        return v_unit()
+    }
+    # stream_flat_map_int: f(v) returns a Stream[int]; forward its
+    # values until the sentinel.
+    let mut go3: bool = true
+    while go3 {
+        let v: V = in_ch.recv()
+        if v.k == VK_INT() && v.i == HL_INT64_MIN() {
+            out_ch.send(clone(sentinel))
+            go3 = false
+        } else {
+            let r: R = call_fn(boot, key, [v])
+            if r.flow == FL_PANIC() {
+                eprint("panic: " + r.msg + " (at line " + r.line.to_str() + ")\n")
+                exit(101)
+            }
+            if r.flow == FL_EXIT() {
+                exit(r.code)
+            }
+            if r.v.k == VK_CHAN() {
+                let inner: Chan[V] = vch(r.v)
+                let mut go4: bool = true
+                while go4 {
+                    let iv: V = inner.recv()
+                    if iv.k == VK_INT() && iv.i == HL_INT64_MIN() {
+                        go4 = false
+                    } else {
+                        out_ch.send(clone(iv))
+                    }
+                }
+            }
+        }
+    }
+    return v_unit()
+}
+
+# do_spawn(boot, key, arg_nodes, env) -> R — the boundary rule: an
+# owned value crossing is deep-copied unless it is syntactically
+# clone(...); the task is a host task; the join handle lands in the
+# spawner's table.
+fn do_spawn(boot: Boot, key: str, arg_nodes: list[int], env: list[Fr]) -> R uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let values: list[V] = []
+    let mut i: int = 0
+    while i < arg_nodes.len() {
+        let rv: R = eval_expr(boot, env, arg_nodes.get(i), "")
+        if rv.flow != FL_OK() {
+            return rv
+        }
+        let mut v: V = rv.v
+        let node: ExprN = boot.ctx.exprs.get(arg_nodes.get(i))
+        if is_owned_v(v) && !(node.kind == "call" && node.mkey == "clone") {
+            v = deep_clone(v)
+        }
+        values.push(v)
+        i = i + 1
+    }
+    let t: Task[V] = spawn(hl_task_entry, clone(boot_core_of(boot)), clone(key), clone(values))
+    boot.tasks.push(t)
+    return r_ok(v_task(boot.tasks.len() - 1))
+}
+
+# do_async_spawn(boot, key, arg_nodes, env) -> R — spawn + a cap-1
+# future channel for the result.
+fn do_async_spawn(boot: Boot, key: str, arg_nodes: list[int], env: list[Fr]) -> R uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let values: list[V] = []
+    let mut i: int = 0
+    while i < arg_nodes.len() {
+        let rv: R = eval_expr(boot, env, arg_nodes.get(i), "")
+        if rv.flow != FL_OK() {
+            return rv
+        }
+        let mut v: V = rv.v
+        let node: ExprN = boot.ctx.exprs.get(arg_nodes.get(i))
+        if is_owned_v(v) && !(node.kind == "call" && node.mkey == "clone") {
+            v = deep_clone(v)
+        }
+        values.push(v)
+        i = i + 1
+    }
+    let result_chan: Chan[V] = chan_new_bounded(1)
+    spawn(hl_task_send_entry, clone(boot_core_of(boot)), clone(key), clone(values), clone(result_chan))
+    return r_ok(v_chan(result_chan))
+}
+
+# do_gen_spawn(boot, key, arg_nodes, env) -> R — a cap-16 stream and
+# the generator task taking it as its first parameter.
+fn do_gen_spawn(boot: Boot, key: str, arg_nodes: list[int], env: list[Fr]) -> R uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let stream: Chan[V] = chan_new_bounded(16)
+    let values: list[V] = []
+    let mut i: int = 0
+    while i < arg_nodes.len() {
+        let rv: R = eval_expr(boot, env, arg_nodes.get(i), "")
+        if rv.flow != FL_OK() {
+            return rv
+        }
+        let mut v: V = rv.v
+        let node: ExprN = boot.ctx.exprs.get(arg_nodes.get(i))
+        if is_owned_v(v) && !(node.kind == "call" && node.mkey == "clone") {
+            v = deep_clone(v)
+        }
+        values.push(v)
+        i = i + 1
+    }
+    spawn(hl_task_gen_entry, clone(boot_core_of(boot)), clone(key), clone(values), clone(stream))
+    return r_ok(v_chan(stream))
+}
+
+# do_stream_combinator(boot, kind, key, arg_nodes, env) -> R — fold
+# blocks in the caller; the others spawn a forwarding worker.
+fn do_stream_combinator(boot: Boot, kind: str, key: str, arg_nodes: list[int], env: list[Fr]) -> R uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let ri: R = eval_expr(boot, env, arg_nodes.get(0), "")
+    if ri.flow != FL_OK() {
+        return ri
+    }
+    if kind == "stream_fold_int" {
+        let ra: R = eval_expr(boot, env, arg_nodes.get(1), "")
+        if ra.flow != FL_OK() {
+            return ra
+        }
+        let mut acc: V = ra.v
+        let mut go: bool = true
+        while go {
+            let v: V = vch(ri.v).recv()
+            if v.k == VK_INT() && v.i == HL_INT64_MIN() {
+                go = false
+            } else {
+                let rr: R = call_fn(boot, key, [acc, v])
+                if rr.flow != FL_OK() {
+                    return rr
+                }
+                acc = rr.v
+            }
+        }
+        return r_ok(acc)
+    }
+    let out_stream: Chan[V] = chan_new_bounded(16)
+    spawn(hl_task_comb_entry, clone(boot_core_of(boot)), clone(kind), clone(key), clone(vch(ri.v)), clone(out_stream))
+    return r_ok(v_chan(out_stream))
+}
+
+# is_owned_v(v) — the boundary rule's "isinstance(v, (list, dict))":
+# every heap-carried value except channels and task handles.
+fn is_owned_v(v: V) -> bool {
+    if v.k == VK_LIST() || v.k == VK_MAP() || v.k == VK_STRUCT()
+    || v.k == VK_ENUM() || v.k == VK_TAINTED() {
+        return true
+    }
+    return false
+}
+
+# ----------------------------------------------------------------------------
+# The builtin table. Nearly every entry delegates to the HOST builtin
+# of the same name — the interpreted language's builtins ARE the
+# native runtime's, so the port rides the very implementation the
+# differential law pins. What stays interpreted: the value coercions,
+# the taint/cap wrappers, the channel family (host channels carried
+# inside V), and the spawn family above.
+# ----------------------------------------------------------------------------
+fn builtin(boot: Boot, name: str, args: list[V], arg_nodes: list[int], line: int) -> R uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    if name == "print" {
+        print(args.get(0).s)
+        return r_unit()
+    }
+    if name == "println" {
+        println(args.get(0).s)
+        return r_unit()
+    }
+    if name == "eprint" {
+        eprint(args.get(0).s)
+        return r_unit()
+    }
+    if name == "eprintln" {
+        eprintln(args.get(0).s)
+        return r_unit()
+    }
+    if name == "isatty" {
+        return r_ok(v_bool(isatty(args.get(0).i)))
+    }
+    if name == "proc_pid" {
+        return r_ok(v_int(proc_pid()))
+    }
+    if name == "sys_hostname" {
+        return r_ok(v_str(sys_hostname()))
+    }
+    if name == "panic" {
+        return r_panic(args.get(0).s, line)
+    }
+    if name == "exit" {
+        return r_exit(args.get(0).i)
+    }
+    if name == "str" {
+        let v: V = args.get(0)
+        if v.k == VK_BOOL() {
+            if v.i != 0 {
+                return r_ok(v_str("true"))
+            }
+            return r_ok(v_str("false"))
+        }
+        if v.k == VK_INT() {
+            return r_ok(v_str(v.i.to_str()))
+        }
+        if v.k == VK_FLOAT() {
+            return r_ok(v_str(fmt_float_py(v.f)))
+        }
+        return r_ok(v)
+    }
+    if name == "int" {
+        return parse_int_v(args.get(0).s, line)
+    }
+    if name == "len" {
+        let v: V = args.get(0)
+        if v.k == VK_STR() {
+            return r_ok(v_int(v.s.len()))
+        }
+        if v.k == VK_LIST() {
+            return r_ok(v_int(v.vals.len()))
+        }
+        if v.k == VK_MAP() {
+            return r_ok(v_int(v.keys.len()))
+        }
+        return r_panic("len() expects str, list or map", line)
+    }
+    if name == "range" {
+        let a: int = args.get(0).i
+        let b: int = args.get(1).i
+        let mut count: int = 0
+        if b > a {
+            count = b - a
+        }
+        if count > 1000000 {
+            return r_panic("range(" + a.to_str() + ", " + b.to_str()
+            + ") would produce " + count.to_str()
+            + " elements (limit 1000000) - use an explicit counter loop for large ranges", line)
+        }
+        let out: list[V] = []
+        let mut i: int = a
+        while i < b {
+            out.push(v_int(i))
+            i = i + 1
+        }
+        return r_ok(v_list(out))
+    }
+    if name == "has_feature" {
+        let feat: str = args.get(0).s
+        if boot.target_feature != "" && feat == boot.target_feature {
+            return r_ok(v_bool(true))
+        }
+        return r_ok(v_bool(false))
+    }
+    if name == "simd_cpu_supports" {
+        return r_ok(v_bool(simd_cpu_supports(args.get(0).s)))
+    }
+    if name == "join" {
+        let parts_v: V = args.get(0)
+        if parts_v.k != VK_LIST() {
+            return r_panic("join() expects a list[str]", line)
+        }
+        let parts: list[str] = []
+        let mut i: int = 0
+        while i < parts_v.vals.len() {
+            parts.push(parts_v.vals.get(i).s)
+            i = i + 1
+        }
+        return r_ok(v_str(join(parts, args.get(1).s)))
+    }
+    if name == "int_and" {
+        return r_ok(v_int(int_and(args.get(0).i, args.get(1).i)))
+    }
+    if name == "int_or" {
+        return r_ok(v_int(int_or(args.get(0).i, args.get(1).i)))
+    }
+    if name == "int_xor" {
+        return r_ok(v_int(int_xor(args.get(0).i, args.get(1).i)))
+    }
+    if name == "int_not" {
+        return r_ok(v_int(int_not(args.get(0).i)))
+    }
+    if name == "int_shl" {
+        return r_ok(v_int(int_shl(args.get(0).i, args.get(1).i)))
+    }
+    if name == "int_shr" {
+        return r_ok(v_int(int_shr(args.get(0).i, args.get(1).i)))
+    }
+    if name == "int_sar" {
+        return r_ok(v_int(int_sar(args.get(0).i, args.get(1).i)))
+    }
+    if name == "int_popcount" {
+        return r_ok(v_int(int_popcount(args.get(0).i)))
+    }
+    if name == "int_clz" {
+        return r_ok(v_int(int_clz(args.get(0).i)))
+    }
+    if name == "int_ctz" {
+        return r_ok(v_int(int_ctz(args.get(0).i)))
+    }
+    if name == "map_new" {
+        return r_ok(v_map_new())
+    }
+    if name == "read_file" {
+        if !hb_sandbox_ok(args.get(0).s, boot.sandbox) {
+            return r_panic("sandbox violation: path resolves outside the sandbox", line)
+        }
+        if !file_exists(args.get(0).s) {
+            return r_panic("cannot open file", line)
+        }
+        return r_ok(v_str(read_file(args.get(0).s)))
+    }
+    if name == "read_file_tainted" {
+        if !hb_sandbox_ok(args.get(0).s, boot.sandbox) {
+            return r_panic("sandbox violation: path resolves outside the sandbox", line)
+        }
+        if !file_exists(args.get(0).s) {
+            return r_panic("cannot open file", line)
+        }
+        return r_ok(v_tainted(v_str(read_file(args.get(0).s))))
+    }
+    if name == "read_line" {
+        let t: str = taint_unwrap(read_line())
+        return r_ok(v_tainted(v_str(t)))
+    }
+    if name == "write_file" {
+        if !hb_sandbox_ok(args.get(0).s, boot.sandbox) {
+            return r_panic("sandbox violation: path resolves outside the sandbox", line)
+        }
+        write_file(args.get(0).s, args.get(1).s)
+        return r_unit()
+    }
+    if name == "args" || name == "args_os" {
+        return r_ok(boot.argv)
+    }
+    if name == "chr" {
+        let n: int = args.get(0).i
+        if n < 0 || n > 255 {
+            return r_panic("chr out of range 0..255", line)
+        }
+        return r_ok(v_str(chr(n)))
+    }
+    if name == "clock_ms" {
+        return r_ok(v_int(clock_ms()))
+    }
+    if name == "thread_sleep_ms" {
+        if args.get(0).i < 0 {
+            return r_panic("thread_sleep_ms: duration must be >= 0", line)
+        }
+        thread_sleep_ms(args.get(0).i)
+        return r_unit()
+    }
+    if name == "thread_yield" {
+        thread_yield()
+        return r_unit()
+    }
+    if name == "thread_current_id" {
+        return r_ok(v_int(thread_current_id()))
+    }
+    if name == "file_exists" {
+        if !hb_sandbox_ok(args.get(0).s, boot.sandbox) {
+            return r_panic("sandbox violation: path resolves outside the sandbox", line)
+        }
+        return r_ok(v_bool(file_exists(args.get(0).s)))
+    }
+    if name == "fs_read_dir" {
+        if !hb_sandbox_ok(args.get(0).s, boot.sandbox) {
+            return r_panic("sandbox violation: path resolves outside the sandbox", line)
+        }
+        let names: list[str] = fs_read_dir(args.get(0).s)
+        let out: list[V] = []
+        let mut i: int = 0
+        while i < names.len() {
+            out.push(v_str(names.get(i)))
+            i = i + 1
+        }
+        return r_ok(v_list(out))
+    }
+    if name == "fs_size" {
+        if !hb_sandbox_ok(args.get(0).s, boot.sandbox) {
+            return r_panic("sandbox violation: path resolves outside the sandbox", line)
+        }
+        return r_ok(v_int(fs_size(args.get(0).s)))
+    }
+    if name == "fs_is_dir" {
+        if !hb_sandbox_ok(args.get(0).s, boot.sandbox) {
+            return r_panic("sandbox violation: path resolves outside the sandbox", line)
+        }
+        return r_ok(v_bool(fs_is_dir(args.get(0).s)))
+    }
+    if name == "fs_set_perms" {
+        if !hb_sandbox_ok(args.get(0).s, boot.sandbox) {
+            return r_panic("sandbox violation: path resolves outside the sandbox", line)
+        }
+        fs_set_perms(args.get(0).s, args.get(1).i)
+        return r_unit()
+    }
+    if name == "drop" {
+        return r_unit()
+    }
+    if name == "clone" {
+        return r_ok(deep_clone(args.get(0)))
+    }
+    if name == "take" {
+        return r_ok(args.get(0))
+    }
+    if name == "tainted_args" {
+        let out: list[V] = []
+        let mut i: int = 0
+        while i < boot.argv.vals.len() {
+            out.push(v_tainted(boot.argv.vals.get(i)))
+            i = i + 1
+        }
+        return r_ok(v_list(out))
+    }
+    if name == "taint_mark" {
+        return r_ok(v_tainted(args.get(0)))
+    }
+    if name == "cap_take" {
+        return r_ok(v_cap(args.get(0).s))
+    }
+    if name == "cap_effect_name" {
+        let v: V = args.get(0)
+        if v.k != VK_CAP() {
+            return r_panic("cap_effect_name: expected a Cap[E] token", line)
+        }
+        return r_ok(v_str(v.s))
+    }
+    if name == "taint_unwrap" {
+        let v: V = args.get(0)
+        if v.k != VK_TAINTED() {
+            return r_panic("taint_unwrap: expected tainted[T] wrapper, got a non-tainted value (got " + v_type_name(v) + ")", line)
+        }
+        return r_ok(v.vals.get(0))
+    }
+    if name == "rand_int" {
+        if args.get(0).i <= 0 {
+            return r_panic("rand_int() requires a positive max", line)
+        }
+        return r_ok(v_int(rand_int(args.get(0).i)))
+    }
+    if name == "rand_float" {
+        return r_ok(v_float(rand_float()))
+    }
+    if name == "rand_seed" {
+        rand_seed(args.get(0).i)
+        return r_unit()
+    }
+    if name == "net_lookup" {
+        return r_ok(v_str(net_lookup(args.get(0).s)))
+    }
+    if name == "net_tcp_connect" {
+        return r_ok(v_int(net_tcp_connect(args.get(0).s, args.get(1).i)))
+    }
+    if name == "net_tcp_listen" {
+        return r_ok(v_int(net_tcp_listen(args.get(0).s, args.get(1).i, args.get(2).i)))
+    }
+    if name == "net_tcp_accept" {
+        return r_ok(v_int(net_tcp_accept(args.get(0).i)))
+    }
+    if name == "net_read" {
+        return r_ok(v_str(net_read(args.get(0).i, args.get(1).i)))
+    }
+    if name == "net_write" {
+        return r_ok(v_int(net_write(args.get(0).i, args.get(1).s)))
+    }
+    if name == "net_close" {
+        net_close(args.get(0).i)
+        return r_unit()
+    }
+    if name == "net_udp_open" {
+        return r_ok(v_int(net_udp_open()))
+    }
+    if name == "net_udp_send_to" {
+        return r_ok(v_int(net_udp_send_to(args.get(0).i, args.get(1).s, args.get(2).i, args.get(3).s)))
+    }
+    if name == "net_udp_recv_from" {
+        return r_ok(v_str(net_udp_recv_from(args.get(0).i, args.get(1).i)))
+    }
+    if name == "net_tls_get" {
+        return r_ok(v_str(net_tls_get(args.get(0).s, args.get(1).i, args.get(2).s)))
+    }
+    if name == "proc_exec" {
+        return r_ok(v_int(proc_exec(args.get(0).s)))
+    }
+    if name == "proc_spawn" {
+        let argv2: list[str] = []
+        let lv: V = args.get(1)
+        let mut i: int = 0
+        while i < lv.vals.len() {
+            argv2.push(lv.vals.get(i).s)
+            i = i + 1
+        }
+        return r_ok(v_int(proc_spawn(args.get(0).s, argv2, args.get(2).i, args.get(3).i, args.get(4).i)))
+    }
+    if name == "proc_wait" {
+        return r_ok(v_int(proc_wait(args.get(0).i)))
+    }
+    if name == "proc_kill" {
+        return r_ok(v_int(proc_kill(args.get(0).i)))
+    }
+    if name == "proc_child_write" {
+        return r_ok(v_int(proc_child_write(args.get(0).i, args.get(1).s)))
+    }
+    if name == "proc_child_read" {
+        return r_ok(v_str(proc_child_read(args.get(0).i, args.get(1).i, args.get(2).i)))
+    }
+    if name == "proc_child_close" {
+        return r_ok(v_int(proc_child_close(args.get(0).i, args.get(1).i)))
+    }
+    if name == "env_get" {
+        return r_ok(v_str(env_get(args.get(0).s)))
+    }
+    if name == "env_has" {
+        return r_ok(v_bool(env_has(args.get(0).s)))
+    }
+    if name == "env_set" {
+        env_set(args.get(0).s, args.get(1).s)
+        return r_unit()
+    }
+    if name == "env_unset" {
+        env_unset(args.get(0).s)
+        return r_unit()
+    }
+    if name == "cwd_get" {
+        return r_ok(v_str(cwd_get()))
+    }
+    if name == "cwd_set" {
+        return r_ok(v_int(cwd_set(args.get(0).s)))
+    }
+    if name == "instant_now_ns" {
+        return r_ok(v_int(instant_now_ns()))
+    }
+    if name == "system_time_now_ms" {
+        return r_ok(v_int(system_time_now_ms()))
+    }
+    if name == "math_sin" {
+        return r_ok(v_float(math_sin(args.get(0).f)))
+    }
+    if name == "math_cos" {
+        return r_ok(v_float(math_cos(args.get(0).f)))
+    }
+    if name == "math_tan" {
+        return r_ok(v_float(math_tan(args.get(0).f)))
+    }
+    if name == "math_asin" {
+        return r_ok(v_float(math_asin(args.get(0).f)))
+    }
+    if name == "math_acos" {
+        return r_ok(v_float(math_acos(args.get(0).f)))
+    }
+    if name == "math_atan" {
+        return r_ok(v_float(math_atan(args.get(0).f)))
+    }
+    if name == "math_atan2" {
+        return r_ok(v_float(math_atan2(args.get(0).f, args.get(1).f)))
+    }
+    if name == "math_sinh" {
+        return r_ok(v_float(math_sinh(args.get(0).f)))
+    }
+    if name == "math_cosh" {
+        return r_ok(v_float(math_cosh(args.get(0).f)))
+    }
+    if name == "math_tanh" {
+        return r_ok(v_float(math_tanh(args.get(0).f)))
+    }
+    if name == "math_exp" {
+        return r_ok(v_float(math_exp(args.get(0).f)))
+    }
+    if name == "math_log" {
+        return r_ok(v_float(math_log(args.get(0).f)))
+    }
+    if name == "math_log10" {
+        return r_ok(v_float(math_log10(args.get(0).f)))
+    }
+    if name == "math_log2" {
+        return r_ok(v_float(math_log2(args.get(0).f)))
+    }
+    if name == "math_pow" {
+        return r_ok(v_float(math_pow(args.get(0).f, args.get(1).f)))
+    }
+    if name == "math_sqrt" {
+        return r_ok(v_float(math_sqrt(args.get(0).f)))
+    }
+    if name == "math_cbrt" {
+        return r_ok(v_float(math_cbrt(args.get(0).f)))
+    }
+    if name == "math_hypot" {
+        return r_ok(v_float(math_hypot(args.get(0).f, args.get(1).f)))
+    }
+    if name == "math_fmod" {
+        return r_ok(v_float(math_fmod(args.get(0).f, args.get(1).f)))
+    }
+    if name == "math_erf" {
+        return r_ok(v_float(math_erf(args.get(0).f)))
+    }
+    if name == "math_erfc" {
+        return r_ok(v_float(math_erfc(args.get(0).f)))
+    }
+    if name == "math_tgamma" {
+        return r_ok(v_float(math_tgamma(args.get(0).f)))
+    }
+    if name == "math_lgamma" {
+        return r_ok(v_float(math_lgamma(args.get(0).f)))
+    }
+    if name == "math_isnan" {
+        return r_ok(v_bool(math_isnan(args.get(0).f)))
+    }
+    if name == "math_isinf" {
+        return r_ok(v_bool(math_isinf(args.get(0).f)))
+    }
+    if name == "math_isfinite" {
+        return r_ok(v_bool(math_isfinite(args.get(0).f)))
+    }
+    if name == "math_signbit" {
+        return r_ok(v_bool(math_signbit(args.get(0).f)))
+    }
+    if name == "math_copysign" {
+        return r_ok(v_float(math_copysign(args.get(0).f, args.get(1).f)))
+    }
+    if name == "chan_new" {
+        return r_ok(v_chan(chan_new()))
+    }
+    if name == "chan_new_bounded" {
+        if args.get(0).i < 1 {
+            return r_panic("chan_new_bounded() capacity must be >= 1", line)
+        }
+        return r_ok(v_chan(chan_new_bounded(args.get(0).i)))
+    }
+    if name == "select" || name == "future_select" {
+        let lv: V = args.get(0)
+        if lv.k != VK_LIST() {
+            return r_panic("select() expects a list of channels", line)
+        }
+        let chans: list[Chan[V]] = []
+        let mut i: int = 0
+        while i < lv.vals.len() {
+            let c: V = lv.vals.get(i)
+            if c.k != VK_CHAN() {
+                return r_panic("select() expects a list of channels", line)
+            }
+            chans.push(vch(c))
+            i = i + 1
+        }
+        return r_ok(v_int(select(chans)))
+    }
+    if name == "await" {
+        let fut: V = args.get(0)
+        if fut.k != VK_CHAN() {
+            return r_panic("await() expects a Future", line)
+        }
+        return r_ok(vch(fut).recv())
+    }
+    if name == "future_ready" {
+        let mut v: V = args.get(0)
+        let node: ExprN = boot.ctx.exprs.get(arg_nodes.get(0))
+        if is_owned_v(v) && !(node.kind == "call" && node.mkey == "clone") {
+            v = deep_clone(v)
+        }
+        let ch: Chan[V] = chan_new_bounded(1)
+        ch.send(clone(v))
+        return r_ok(v_chan(ch))
+    }
+    if name == "future_poll" {
+        let fut: V = args.get(0)
+        if fut.k != VK_CHAN() {
+            return r_panic("future_poll() expects a Future", line)
+        }
+        if vch(fut).len() > 0 {
+            let inner: list[V] = [vch(fut).recv()]
+            return r_ok(v_enum("Option", "Some", inner))
+        }
+        return r_ok(v_enum("Option", "None", []))
+    }
+    if name == "stream_new" {
+        if args.get(0).i < 1 {
+            return r_panic("chan_new_bounded() capacity must be >= 1", line)
+        }
+        return r_ok(v_chan(chan_new_bounded(args.get(0).i)))
+    }
+    if name == "stream_send" {
+        let s: V = args.get(0)
+        if s.k != VK_CHAN() {
+            return r_panic("stream_send() expects a Stream", line)
+        }
+        let mut v: V = args.get(1)
+        let node: ExprN = boot.ctx.exprs.get(arg_nodes.get(1))
+        if is_owned_v(v) && !(node.kind == "call" && node.mkey == "clone") {
+            v = deep_clone(v)
+        }
+        vch(s).send(clone(v))
+        return r_unit()
+    }
+    if name == "stream_recv" {
+        let s: V = args.get(0)
+        if s.k != VK_CHAN() {
+            return r_panic("stream_recv() expects a Stream", line)
+        }
+        return r_ok(vch(s).recv())
+    }
+    if name == "stream_try_recv" {
+        let s: V = args.get(0)
+        if s.k != VK_CHAN() {
+            return r_panic("stream_try_recv() expects a Stream", line)
+        }
+        return r_ok(vch(s).recv_or(args.get(1)))
+    }
+    if name == "stream_len" {
+        let s: V = args.get(0)
+        if s.k != VK_CHAN() {
+            return r_panic("stream_len() expects a Stream", line)
+        }
+        return r_ok(v_int(vch(s).len()))
+    }
+    if name == "stream_close" {
+        let s: V = args.get(0)
+        if s.k != VK_CHAN() {
+            return r_panic("stream_close() expects a Stream", line)
+        }
+        vch(s).send(v_int(HL_INT64_MIN()))
+        return r_unit()
+    }
+    if name == "stream_take_int" {
+        let s: V = args.get(0)
+        if s.k != VK_CHAN() {
+            return r_panic("stream_take_int() expects a Stream", line)
+        }
+        let out_stream: Chan[V] = chan_new_bounded(16)
+        spawn(hl_task_take_entry, clone(boot_core_of(boot)), clone(vch(s)), args.get(1).i, clone(out_stream))
+        return r_ok(v_chan(out_stream))
+    }
+    if name == "stream_merge_int" {
+        let a: V = args.get(0)
+        let b: V = args.get(1)
+        if a.k != VK_CHAN() || b.k != VK_CHAN() {
+            return r_panic("stream_merge_int() expects two Streams", line)
+        }
+        let out_stream: Chan[V] = chan_new_bounded(16)
+        spawn(hl_task_merge_entry, clone(boot_core_of(boot)), clone(vch(a)), clone(vch(b)), clone(out_stream))
+        return r_ok(v_chan(out_stream))
+    }
+    return r_panic("unknown builtin function: " + name, line)
+}
+
+# parse_int_v(dm, s, line) -> R — the C-semantics int() (rt_num.py /
+# hl_str_to_int: unsigned accumulation, 2^63 accepted only negated).
+fn parse_int_v(s: str, line: int) -> R uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let n: int = s.len()
+    let mut i: int = 0
+    let mut neg: bool = false
+    if n > 0 && s.byte_at(0) == 45 {
+        neg = true
+        i = 1
+    }
+    if i >= n {
+        return r_panic("cannot convert string to int", line)
+    }
+    let mut v: int = 0
+    let mut hit_2p63: bool = false
+    while i < n {
+        let c: int = s.byte_at(i)
+        if c < 48 || c > 57 {
+            return r_panic("cannot convert string to int", line)
+        }
+        let d: int = c - 48
+        if hit_2p63 {
+            return r_panic("integer too large when converting string", line)
+        }
+        if v > 922337203685477580 || (v == 922337203685477580 && d == 9) {
+            return r_panic("integer too large when converting string", line)
+        }
+        if v == 922337203685477580 && d == 8 {
+            # exactly 2^63: representable only negated (INT64_MIN's
+            # bit pattern); a further digit dies above.
+            v = HL_INT64_MIN()
+            hit_2p63 = true
+        } else {
+            v = v * 10 + d
+        }
+        i = i + 1
+    }
+    if neg {
+        if hit_2p63 {
+            return r_ok(v_int(HL_INT64_MIN()))
+        }
+        return r_ok(v_int(-v))
+    }
+    if hit_2p63 || v > HL_INT64_MAX() {
+        return r_panic("integer too large when converting string", line)
+    }
+    return r_ok(v_int(v))
+}
+
+# ----------------------------------------------------------------------------
+# The builtin method table (builtin_method.py, verbatim laws).
+# ----------------------------------------------------------------------------
+fn builtin_method(boot: Boot, op: str, t: V, args: list[V], arg_nodes: list[int], line: int) -> R uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    if op == "str.byte_at" {
+        if args.get(0).i < 0 || args.get(0).i >= t.s.len() {
+            return r_panic("string access out of bounds", line)
+        }
+        return r_ok(v_int(t.s.byte_at(args.get(0).i)))
+    }
+    if op == "list.get" {
+        if args.get(0).i < 0 || args.get(0).i >= t.vals.len() {
+            return r_panic("array access out of bounds", line)
+        }
+        return r_ok(t.vals.get(args.get(0).i))
+    }
+    if op == "list.len" {
+        return r_ok(v_int(t.vals.len()))
+    }
+    if op == "list.push" {
+        t.vals.push(args.get(0))
+        return r_unit()
+    }
+    if op == "str.slice" {
+        let a: int = args.get(0).i
+        let b: int = args.get(1).i
+        if a < 0 || b < a || b > t.s.len() {
+            return r_panic("invalid string slice", line)
+        }
+        return r_ok(v_str(t.s.slice(a, b)))
+    }
+    if op == "str.len" {
+        return r_ok(v_int(t.s.len()))
+    }
+    if op == "map.get_or" {
+        let idx: int = map_key_index(t.keys, args.get(0).s)
+        if idx < 0 {
+            return r_ok(args.get(1))
+        }
+        return r_ok(t.vals.get(idx))
+    }
+    if op == "str.starts_with" {
+        return r_ok(v_bool(t.s.starts_with(args.get(0).s)))
+    }
+    if op == "map.has" {
+        return r_ok(v_bool(map_key_index(t.keys, args.get(0).s) >= 0))
+    }
+    if op == "int.to_str" {
+        return r_ok(v_str(t.i.to_str()))
+    }
+    if op == "map.set" {
+        let idx: int = map_key_index(t.keys, args.get(0).s)
+        if idx < 0 {
+            t.keys.push(args.get(0).s)
+            t.vals.push(args.get(1))
+        } else {
+            t.vals.set(idx, args.get(1))
+        }
+        return r_unit()
+    }
+    if op == "str.to_int" {
+        return parse_int_v(t.s, line)
+    }
+    if op == "str.split" {
+        if args.get(0).s.len() == 0 {
+            return r_panic("empty separator not allowed", line)
+        }
+        let parts: list[str] = t.s.split(args.get(0).s)
+        let out: list[V] = []
+        let mut i: int = 0
+        while i < parts.len() {
+            out.push(v_str(parts.get(i)))
+            i = i + 1
+        }
+        return r_ok(v_list(out))
+    }
+    if op == "map.keys" {
+        let out: list[V] = []
+        let mut i: int = 0
+        while i < t.keys.len() {
+            out.push(v_str(t.keys.get(i)))
+            i = i + 1
+        }
+        return r_ok(v_list(out))
+    }
+    if op == "list.pop" {
+        if t.vals.len() == 0 {
+            return r_panic("pop from empty list", line)
+        }
+        return r_ok(t.vals.pop())
+    }
+    if op == "str.find" {
+        return r_ok(v_int(t.s.find(args.get(0).s)))
+    }
+    if op == "str.contains" {
+        return r_ok(v_bool(t.s.find(args.get(0).s) >= 0))
+    }
+    if op == "str.ends_with" {
+        return r_ok(v_bool(t.s.ends_with(args.get(0).s)))
+    }
+    if op == "str.trim" {
+        return r_ok(v_str(t.s.trim()))
+    }
+    if op == "str.to_str" {
+        return r_ok(t)
+    }
+    if op == "int.to_float" {
+        return r_ok(v_float(t.i.to_float()))
+    }
+    if op == "int.abs" {
+        if t.i < 0 {
+            return i64_neg(t.i, line)
+        }
+        return r_ok(v_int(t.i))
+    }
+    if op == "list.set" {
+        if args.get(0).i < 0 || args.get(0).i >= t.vals.len() {
+            return r_panic("array access out of bounds", line)
+        }
+        t.vals.set(args.get(0).i, args.get(1))
+        return r_unit()
+    }
+    if op == "map.len" {
+        return r_ok(v_int(t.keys.len()))
+    }
+    if op == "str.to_float" {
+        return str_to_float(t.s, line)
+    }
+    if op == "float.to_str" {
+        return r_ok(v_str(fmt_float_py(t.f)))
+    }
+    if op == "float.to_int" {
+        if t.f != t.f || t.f == 1.0 / 0.0 || t.f == -1.0 / 0.0 {
+            return r_panic("float.to_int out of int64 range", line)
+        }
+        let r: int = t.f.to_int()
+        if r < HL_INT64_MIN() || r > HL_INT64_MAX() {
+            return r_panic("float.to_int out of int64 range", line)
+        }
+        return r_ok(v_int(r))
+    }
+    if op == "float.abs" {
+        if t.f == 0.0 {
+            return r_ok(v_float(0.0))
+        }
+        if t.f < 0.0 {
+            return r_ok(v_float(-t.f))
+        }
+        return r_ok(v_float(t.f))
+    }
+    if op == "bool.to_str" {
+        if t.i != 0 {
+            return r_ok(v_str("true"))
+        }
+        return r_ok(v_str("false"))
+    }
+    if op == "chan.send" || op == "chan.try_send" {
+        let mut v: V = args.get(0)
+        let node: ExprN = boot.ctx.exprs.get(arg_nodes.get(0))
+        if is_owned_v(v) && !(node.kind == "call" && node.mkey == "clone") {
+            v = deep_clone(v)
+        }
+        if t.k != VK_CHAN() {
+            return r_panic("chan operation on non-channel", line)
+        }
+        if op == "chan.send" {
+            vch(t).send(clone(v))
+            return r_unit()
+        }
+        return r_ok(v_bool(vch(t).try_send(clone(v))))
+    }
+    if op == "chan.recv" {
+        if t.k != VK_CHAN() {
+            return r_panic("chan operation on non-channel", line)
+        }
+        return r_ok(vch(t).recv())
+    }
+    if op == "chan.recv_or" {
+        if t.k != VK_CHAN() {
+            return r_panic("chan operation on non-channel", line)
+        }
+        return r_ok(vch(t).recv_or(args.get(0)))
+    }
+    if op == "chan.len" {
+        if t.k != VK_CHAN() {
+            return r_panic("chan operation on non-channel", line)
+        }
+        return r_ok(v_int(vch(t).len()))
+    }
+    if op == "task.join" {
+        if t.k != VK_TASK() {
+            return r_panic("join on non-task", line)
+        }
+        if t.i < 0 || t.i >= boot.tasks.len() {
+            return r_panic("join on unknown task", line)
+        }
+        return r_ok(boot.tasks.get(t.i).join())
+    }
+    return r_panic("unknown builtin method: " + op, line)
+}
+
+# str_to_float(dm, s, line) -> R — the strict float grammar (the C
+# strtod subset the interpreter admits): optional sign, digits, one
+# dot, optional exponent with sign.
+fn str_to_float(t: str, line: int) -> R uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let tl: int = t.len()
+    let mut i: int = 0
+    if t.slice(0, 1) == "-" {
+        i = 1
+    } else if t.slice(0, 1) == "+" {
+        i = 1
+    }
+    if i >= tl {
+        return r_panic("cannot convert string to float", line)
+    }
+    let mut dots: int = 0
+    let mut digits: int = 0
+    let mut saw_exp: bool = false
+    let mut exp_digits: int = 0
+    while i < tl {
+        let c: int = t.byte_at(i)
+        if c == 46 {
+            if saw_exp {
+                return r_panic("cannot convert string to float", line)
+            }
+            dots = dots + 1
+        } else if c >= 48 && c <= 57 {
+            if saw_exp {
+                exp_digits = exp_digits + 1
+            }
+            digits = digits + 1
+        } else if c == 101 || c == 69 {
+            if saw_exp || digits == 0 {
+                return r_panic("cannot convert string to float", line)
+            }
+            saw_exp = true
+            if i + 1 < tl && (t.byte_at(i + 1) == 43 || t.byte_at(i + 1) == 45) {
+                i = i + 1
+            }
+            exp_digits = 0
+        } else {
+            return r_panic("cannot convert string to float", line)
+        }
+        i = i + 1
+    }
+    if dots > 1 || digits == 0 {
+        return r_panic("cannot convert string to float", line)
+    }
+    if saw_exp && exp_digits == 0 {
+        return r_panic("cannot convert string to float", line)
+    }
+    return r_ok(v_float(t.to_float()))
+}
+
+# ----------------------------------------------------------------------------
+# The take/merge stream workers (the last two spawn family members).
+# ----------------------------------------------------------------------------
+
+# hl_task_take_entry(boot, in_ch, n, out_s) — forward the first n
+# values, then the sentinel.
+fn hl_task_take_entry(core: BootCore, in_ch: Chan[V], n: int, out_s: Chan[V]) -> V uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let boot: Boot = boot_of_core(core)
+    let mut count: int = 0
+    let mut go: bool = true
+    while go {
+        if count >= n {
+            go = false
+        } else {
+            let v: V = in_ch.recv()
+            if v.k == VK_INT() && v.i == HL_INT64_MIN() {
+                go = false
+            } else {
+                out_s.send(clone(v))
+                count = count + 1
+            }
+        }
+    }
+    out_s.send(v_int(HL_INT64_MIN()))
+    return v_unit()
+}
+
+# hl_task_merge_entry(boot, a, b, out_s) — interleave two streams
+# until both end, then the sentinel.
+fn hl_task_merge_entry(core: BootCore, a: Chan[V], b: Chan[V], out_s: Chan[V]) -> V uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let boot: Boot = boot_of_core(core)
+    let mut a_done: bool = false
+    let mut b_done: bool = false
+    while !a_done || !b_done {
+        if !a_done {
+            let v: V = a.recv()
+            if v.k == VK_INT() && v.i == HL_INT64_MIN() {
+                a_done = true
+            } else {
+                out_s.send(clone(v))
+            }
+        }
+        if !b_done {
+            let v2: V = b.recv()
+            if v2.k == VK_INT() && v2.i == HL_INT64_MIN() {
+                b_done = true
+            } else {
+                out_s.send(clone(v2))
+            }
+        }
+    }
+    out_s.send(v_int(HL_INT64_MIN()))
+    return v_unit()
+}
+
+# ----------------------------------------------------------------------------
+# The --audit renderer — hlc's own print_audit, verbatim (the gates
+# compare the two front-ends' audits line for line; same ctx, same
+# renderer, zero drift).
+# ----------------------------------------------------------------------------
+fn print_audit(ctx: Ctx) -> void uses IO {
+    let keys: list[str] = ctx.fn_order
+    let mut i: int = 0
+    println("==============================================================================")
+    println("  function                       declared                       computed")
+    println("==============================================================================")
+    while i < keys.len() {
+        let key: str = keys.get(i)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        let declared: list[str] = f.effects
+        let computed: list[str] = ctx.computed_effects.get_or(key, [])
+        let mut decl_disp: str = ""
+        if f.is_pure {
+            decl_disp = "pure"
+        }
+        let mut j: int = 0
+        while j < declared.len() {
+            if decl_disp != "" {
+                decl_disp = decl_disp + ", "
+            }
+            decl_disp = decl_disp + declared.get(j)
+            j = j + 1
+        }
+        if decl_disp == "" {
+            decl_disp = "(none - pure)"
+        }
+        let mut comp_disp: str = ""
+        let mut k: int = 0
+        while k < computed.len() {
+            if comp_disp != "" {
+                comp_disp = comp_disp + ", "
+            }
+            comp_disp = comp_disp + computed.get(k)
+            k = k + 1
+        }
+        if comp_disp == "" {
+            comp_disp = "(none)"
+        }
+        # Pad the function name to 30 chars for alignment.
+        let padded: str = pad_right(key, 30)
+        let padded_decl: str = pad_right(decl_disp, 30)
+        println("  " + padded + "  " + padded_decl + "  " + comp_disp)
+        i = i + 1
+    }
+    println("==============================================================================")
+    # Stage 84 (v0.103.0-alpha): custom sections + the linker script that
+    # places them. check_link_script proved every named section is covered
+    # (or that no script was declared) before we get here.
+    # Stage 77: the crate mode. For the OS-dev track this is the single
+    # most important line `--audit` prints, and boot.py has always said
+    # so — the self-hosted front-end did not, which made the two audits
+    # disagree on the one fact that decides which entry point exists.
+    if ctx.crate_freestanding {
+        println("  Crate mode: #![freestanding] (no libc, no OS calls, std disabled, entry _start)")
+    } else if ctx.crate_no_std {
+        println("  Crate mode: #![no_std] (std disabled, hosted libc kept)")
+    } else {
+        println("  Crate mode: std (default hosted crate)")
+    }
+    # Stages 93-95: the bare-metal target, when one was named. Same
+    # words as boot.py's --audit (the gates compare the two).
+    if ctx.target_triple != "" {
+        println("  Target: " + ctx.target_triple + " (bare-metal, integer-only)")
+    }
+    # Stage 82: the deterministic stack budget. boot.py's --audit prints
+    # this too; the same flag on the two front-ends must say the same
+    # things.
+    if ctx.crate_stack_size >= 0 {
+        println("  Stack budget: #![stack_size(" + ctx.crate_stack_size.to_str() + ")] — worst chain " + ctx.stack_budget_worst.to_str() + " bytes (" + ctx.stack_budget_path + ")")
+    }
+    # Stage 85: the boot-protocol header this crate emits.
+    if ctx.crate_boot_header != "" {
+        println("  Boot header: " + ctx.crate_boot_header + " (emitted into " + boot_header_section(ctx.crate_boot_header) + ")")
+    }
+    # Stage 91 (v0.110.0-alpha): the interrupt-safety proof. One line
+    # per #[irq_handler], word-for-word what boot.py --audit prints
+    # (the gate compares the two).
+    if ctx.irq_proof_lines.len() > 0 {
+        println("  Interrupt safety (Stage 91): every #[irq_handler] is proved to reach no allocation:")
+        let mut irq_i: int = 0
+        while irq_i < ctx.irq_proof_lines.len() {
+            println("    " + ctx.irq_proof_lines.get(irq_i))
+            irq_i = irq_i + 1
+        }
+    }
+    # Stage 101 (v0.120.0-alpha): the #[secrets(...)] annotations the
+    # side-channel analysis pass consumes. Word-for-word what boot.py
+    # --audit prints (the gate compares the two).
+    let mut secret_rows: list[str] = []
+    let mut sec_i: int = 0
+    while sec_i < ctx.fn_order.len() {
+        let skey: str = ctx.fn_order.get(sec_i)
+        let sf: FnInfo = ctx.fns.get_or(skey, dummy_fn())
+        if sf.attr_secrets != "" {
+            let parts: list[str] = sf.attr_secrets.split(",")
+            let mut joined: str = ""
+            let mut pj: int = 0
+            while pj < parts.len() {
+                if pj == 0 {
+                    joined = parts.get(pj)
+                } else {
+                    joined = joined + ", " + parts.get(pj)
+                }
+                pj = pj + 1
+            }
+            secret_rows.push("    " + skey + ": " + joined)
+        }
+        sec_i = sec_i + 1
+    }
+    if secret_rows.len() > 0 {
+        println("  #[secrets(...)] annotations: " + secret_rows.len().to_str())
+        let mut sec_j: int = 0
+        while sec_j < secret_rows.len() {
+            println(secret_rows.get(sec_j))
+            sec_j = sec_j + 1
+        }
+    }
+    # Stage 102 (v0.121.0-alpha): the #[ct] claims the constant-time
+    # verifier (hlprove --consttime) proves. Word-for-word what boot.py
+    # --audit prints (the gate compares the two).
+    let mut ct_rows: list[str] = []
+    let mut cti: int = 0
+    while cti < ctx.fn_order.len() {
+        let ckey: str = ctx.fn_order.get(cti)
+        let cf: FnInfo = ctx.fns.get_or(ckey, dummy_fn())
+        if cf.attr_ct && cf.attr_secrets != "" {
+            let cparts: list[str] = cf.attr_secrets.split(",")
+            let mut cjoined: str = ""
+            let mut cj: int = 0
+            while cj < cparts.len() {
+                if cj == 0 {
+                    cjoined = cparts.get(cj)
+                } else {
+                    cjoined = cjoined + ", " + cparts.get(cj)
+                }
+                cj = cj + 1
+            }
+            ct_rows.push("    " + ckey + ": ct over " + cjoined)
+        }
+        cti = cti + 1
+    }
+    if ct_rows.len() > 0 {
+        println("  #[ct] claims: " + ct_rows.len().to_str())
+        let mut ctj: int = 0
+        while ctj < ct_rows.len() {
+            println(ct_rows.get(ctj))
+            ctj = ctj + 1
+        }
+    }
+    if ctx.crate_link_script == "" {
+        println("  Linker script: none declared (#![link_script] absent) — custom sections use the default linker layout")
+    } else {
+        let mut named: int = 0
+        let mut aligned: int = 0
+        let mut si: int = 0
+        while si < ctx.fn_order.len() {
+            let sf: FnInfo = ctx.fns.get_or(ctx.fn_order.get(si), dummy_fn())
+            if sf.attr_section != "" {
+                named = named + 1
+            }
+            if sf.attr_align >= 0 {
+                aligned = aligned + 1
+            }
+            si = si + 1
+        }
+        println("  Linker script: " + link_script_path(ctx) + " — " + named.to_str() + " section(s) named, " + ctx.link_script_patterns.len().to_str() + " pattern(s) placed")
+        if aligned > 0 {
+            println("  #[align(N)] annotations: " + aligned.to_str())
+        }
+    }
+    # Stage 111 (v0.130.0-alpha): capability tokens — every function
+    # whose authority comes from a Cap[E] parameter or a cap_take call
+    # rather than (only) a `uses` clause. Word-for-word what boot.py
+    # --audit prints (the gates compare the two).
+    let mut cap_rows: list[str] = []
+    let mut capi: int = 0
+    while capi < ctx.fn_order.len() {
+        let capkey: str = ctx.fn_order.get(capi)
+        let cgrants: list[str] = cap_grants(ctx, capkey)
+        if cgrants.len() > 0 {
+            cap_rows.push("    " + capkey + ": " + join(cgrants, ", "))
+        }
+        capi = capi + 1
+    }
+    if cap_rows.len() > 0 {
+        println("  Capability tokens (Cap[E] parameters / cap_take calls):")
+        let mut capj: int = 0
+        while capj < cap_rows.len() {
+            println(cap_rows.get(capj))
+            capj = capj + 1
+        }
+    }
+    println("  Active effects:    IO, Fs, Clock, Args, Exit, Net, Rand, Proc")
+    println("  `uses IO` expands to: {IO, Fs, Clock, Args, Exit}")
+    println("  Net, Rand, Proc are independent effects (not part of the IO")
+    println("  family) — declare them explicitly to use net_lookup /")
+    println("  rand_int / rand_float / rand_seed / proc_exec builtins.")
+    println("  No reserved effects (Stage 9 release).")
+    println("")
+    # Stage 10-beta: taint-flow audit extension. Scan the call graph for:
+    #   - functions calling taint sources (tainted_args, read_file_tainted, read_line)
+    #   - functions calling each taint sink
+    println("  Taint sources (builtins):  tainted_args, read_file_tainted,")
+    println("                              read_line")
+    println("  Taint sinks (builtins):    print, println, read_file,")
+    println("                            write_file, file_exists, exit,")
+    println("                            net_lookup, proc_exec")
+    println("  Explicit untaint:         taint_unwrap, std.sanitize.*")
+    println("")
+    # Find functions calling each taint source.
+    let mut targs_users: list[str] = []
+    let mut rft_users: list[str] = []
+    let mut rl_users: list[str] = []
+    let mut si: int = 0
+    while si < keys.len() {
+        let skey: str = keys.get(si)
+        let callees: list[str] = ctx.edges.get_or(skey, [])
+        let mut cj: int = 0
+        while cj < callees.len() {
+            let ce: str = callees.get(cj)
+            if ce == "b:tainted_args" {
+                if !list_has(targs_users, skey) {
+                    targs_users.push(skey)
+                }
+            }
+            if ce == "b:read_file_tainted" {
+                if !list_has(rft_users, skey) {
+                    rft_users.push(skey)
+                }
+            }
+            if ce == "b:read_line" {
+                if !list_has(rl_users, skey) {
+                    rl_users.push(skey)
+                }
+            }
+            cj = cj + 1
+        }
+        si = si + 1
+    }
+    if targs_users.len() > 0 {
+        println("  Functions calling tainted_args():")
+        let mut ti: int = 0
+        while ti < targs_users.len() {
+            println("    - " + targs_users.get(ti))
+            ti = ti + 1
+        }
+    } else {
+        println("  No function calls tainted_args() (no argv-taint sources in this program).")
+    }
+    if rft_users.len() > 0 {
+        println("  Functions calling read_file_tainted():")
+        let mut ri: int = 0
+        while ri < rft_users.len() {
+            println("    - " + rft_users.get(ri))
+            ri = ri + 1
+        }
+    } else {
+        println("  No function calls read_file_tainted().")
+    }
+    if rl_users.len() > 0 {
+        println("  Functions calling read_line():")
+        let mut li: int = 0
+        while li < rl_users.len() {
+            println("    - " + rl_users.get(li))
+            li = li + 1
+        }
+    } else {
+        println("  No function calls read_line().")
+    }
+    # Stage 109 (v0.128.0-alpha): the FFI taint marking — the census of
+    # every extern boundary. #[taint_source] externs return untrusted
+    # data (every call result is typed tainted[ret]); #[taint_sink(...)]
+    # externs declare the parameters that are sinks; every other extern
+    # is listed as returning data the taint lattice TRUSTS — the
+    # auditor's reminder that an unmarked boundary is a decision, not
+    # an absence. Word-for-word what boot.py --audit prints (the gate
+    # compares the two).
+    let mut ffi_src_rows: list[str] = []
+    let mut ffi_sink_rows: list[str] = []
+    let mut ffi_plain_rows: list[str] = []
+    let mut fi: int = 0
+    while fi < keys.len() {
+        let fkey: str = keys.get(fi)
+        let ff: FnInfo = ctx.fns.get_or(fkey, dummy_fn())
+        if ff.is_extern {
+            if ff.attr_taint_source {
+                ffi_src_rows.push("    - " + fkey + ": -> " + ff.ret)
+            }
+            if ff.attr_taint_sinks != "" {
+                ffi_sink_rows.push("    - " + fkey + ": " + ff.attr_taint_sinks)
+            }
+            if !ff.attr_taint_source && ff.attr_taint_sinks == "" {
+                ffi_plain_rows.push("    - " + fkey + ": -> " + ff.ret)
+            }
+        }
+        fi = fi + 1
+    }
+    if ffi_src_rows.len() + ffi_sink_rows.len() + ffi_plain_rows.len() == 0 {
+        println("  FFI taint marking (Stage 109): no extern declarations.")
+    } else {
+        println("  FFI taint marking (Stage 109):")
+        println("    #[taint_source] externs (returns untrusted, typed tainted[ret]): " + ffi_src_rows.len().to_str())
+        let mut fsj: int = 0
+        while fsj < ffi_src_rows.len() {
+            println(ffi_src_rows.get(fsj))
+            fsj = fsj + 1
+        }
+        println("    #[taint_sink(...)] externs (declared sinks): " + ffi_sink_rows.len().to_str())
+        let mut fkj: int = 0
+        while fkj < ffi_sink_rows.len() {
+            println(ffi_sink_rows.get(fkj))
+            fkj = fkj + 1
+        }
+        println("    Unmarked externs (returns TRUSTED by the taint lattice): " + ffi_plain_rows.len().to_str())
+        let mut fpj: int = 0
+        while fpj < ffi_plain_rows.len() {
+            println(ffi_plain_rows.get(fpj))
+            fpj = fpj + 1
+        }
+    }
+}
+
+# Right-pad a string with spaces to width `n`. Truncates if longer than n.
+fn pad_right(s: str, n: int) -> str pure {
+    let sl: int = s.len()
+    if sl >= n {
+        return s.slice(0, n)
+    }
+    let mut out: str = s
+    let mut i: int = 0
+    while i < n - sl {
+        out = out + " "
+        i = i + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# The driver — boot.py's CLI law: flags only before the entry file,
+# program args after it (verbatim pass-through, they may look like
+# flags), the probe-child discipline for --check and --batch, and the
+# det re-exec (the scheduler is read at process start, so --det arms
+# the env and runs the tool again through the shell).
+# ----------------------------------------------------------------------------
+
+# shell_quote(s) — single-quote for the re-exec command line.
+fn hb_shell_quote(s: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < s.len() {
+        if s.byte_at(i) == 39 {
+            out = out + "'\\''"
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return "'" + out + "'"
+}
+
+# hb_usage() — the refusal print (exit 2 caller prints).
+fn hb_usage() -> str {
+    return "usage: hlboot [--check | --audit] <file.hls> [program args...]\n"
+    + "               [--sandbox DIR] [--det] [--contracts] [--fast]\n"
+    + "  --check        type-check + effects-check only, no execution.\n"
+    + "  --audit        print the capability / effect tree of every function.\n"
+    + "  --sandbox DIR  restrict filesystem builtins to DIR.\n"
+    + "  --det          arm the deterministic scheduler (SPEC section 67).\n"
+    + "  --contracts    runtime requires/ensures assertions.\n"
+}
+
+# hb_load_checked(path) -> Boot — load + check through the compiler's
+# own front-end (hlfront); the marker line tells the batch parent the
+# compile half succeeded (the host panic path below never reaches the
+# return).
+fn hb_load_checked(path: str, prog_args: list[str], contracts: bool, target_feature: str, sandbox: str, target_triple: str) -> Boot uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let ctx: Ctx = hl_load_crate(path)
+    # Stages 93-95: the bare-metal triple rides with the check (the
+    # freestanding implication and the integer-only rule are check-time
+    # properties, exactly the law hlc --target applies).
+    ctx.target_triple = target_triple
+    if target_triple != "" && !ctx.crate_freestanding {
+        ctx.crate_freestanding = true
+        ctx.crate_no_std = true
+    }
+    hl_check(ctx)
+    let argv_vals: list[V] = []
+    let mut i: int = 0
+    while i < prog_args.len() {
+        argv_vals.push(v_str(prog_args.get(i)))
+        i = i + 1
+    }
+    let boot: Boot = Boot {
+        ctx: ctx,
+        tasks: [],
+        rng: 1,
+        argv: v_list(argv_vals),
+        det: env_get("HL_DET_SCHED") != "",
+        trace: env_get("HL_DET_TRACE") != "",
+        contracts: contracts,
+        target_feature: target_feature,
+        sandbox: sandbox
+    }
+    return boot
+}
+
+# hb_sandbox_ok(path, root) — the lexical containment check (the
+# Python years resolved symlinks first; the port contains the path
+# lexically, which stops every ../ walk the gate drives).
+fn hb_sandbox_ok(path: str, root: str) -> bool uses Proc {
+    if root == "" {
+        return true
+    }
+    let mut p: str = path
+    if p.len() > 0 && p.byte_at(0) != 47 {
+        p = cwd_get() + "/" + p
+    }
+    # collapse lexically
+    let parts: list[str] = p.split("/")
+    let stack: list[str] = []
+    let mut i: int = 0
+    while i < parts.len() {
+        let seg: str = parts.get(i)
+        if seg == "" || seg == "." {
+            # skip
+        } else if seg == ".." {
+            if stack.len() > 0 {
+                stack.pop()
+            }
+        } else {
+            stack.push(seg)
+        }
+        i = i + 1
+    }
+    let mut abs: str = ""
+    let mut j: int = 0
+    while j < stack.len() {
+        abs = abs + "/" + stack.get(j)
+        j = j + 1
+    }
+    if abs == "" {
+        abs = "/"
+    }
+    if abs == root {
+        return true
+    }
+    return abs.starts_with(root + "/")
+}
+
+# hb_run_program(boot) -> int — the run protocol: panic handler
+# first, then the exit code (masked).
+fn hb_run_program(boot: Boot) -> int uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let r: R = call_fn(boot, "main", [])
+    if r.flow == FL_PANIC() {
+        # The program's panic handler first (if declared), behind the
+        # reentrancy guard; a nested panic inside it falls through to
+        # the default report.
+        let h: FnInfo = boot.ctx.fns.get_or("panic_handler", dummy_fn())
+        if h.name == "panic_handler" && h.attr_panic_handler {
+            let pr: R = call_fn(boot, "panic_handler", [v_str(r.msg)])
+            if pr.flow == FL_PANIC() || pr.flow == FL_EXIT() {
+                # a handler that panics again falls through to the
+                # default report; an exit() inside it propagates
+                if pr.flow == FL_EXIT() {
+                    return pr.code
+                }
+            }
+        }
+        eprint("panic: " + r.msg + " (at line " + r.line.to_str() + ")\n")
+        return 101
+    }
+    if r.flow == FL_EXIT() {
+        return r.code
+    }
+    # call_fn's contract: FL_OK carries the fn's return value (the
+    # interpreter's run(): None -> 0, int -> the masked exit code).
+    if r.v.k == VK_INT() {
+        return int_and(r.v.i, 255)
+    }
+    return 0
+}
+
+# hb_read_all_stdout(ch) / hb_read_all_stderr(ch) — drain a child's
+# pipe to EOF.
+fn hb_drain(ch: Child, fd: int) -> str uses Proc {
+    let mut out: str = ""
+    let mut go: bool = true
+    while go {
+        let mut chunk: str = ""
+        if fd == 1 {
+            chunk = child_read_stdout(ch, 65536)
+        } else {
+            chunk = child_read_stderr(ch, 65536)
+        }
+        if chunk.len() == 0 {
+            go = false
+        } else {
+            out = out + chunk
+        }
+    }
+    return out
+}
+
+# hb_spawn_child(path, args) — spawn this tool as a child with piped
+# stdio; returns the captured (code, out, err).
+struct CapRes {
+    code: int,
+    out: str,
+    err: str
+}
+
+fn hb_spawn_child(prog: str, cargs: list[str]) -> CapRes uses Proc {
+    let mut c: Command = command_new(prog)
+    let mut i: int = 0
+    while i < cargs.len() {
+        c = command_arg(c, cargs.get(i))
+        i = i + 1
+    }
+    c = command_stdout(c, stdio_pipe())
+    c = command_stderr(c, stdio_pipe())
+    let ch: Child = command_spawn(c)
+    # Alternate reads so a child flooding one pipe while blocked on
+    # the other cannot deadlock (64 KB pipe buffers).
+    let mut out: str = ""
+    let mut err: str = ""
+    let mut out_open: bool = ch.stdout_open
+    let mut err_open: bool = ch.stderr_open
+    while out_open || err_open {
+        if out_open {
+            let mut chunk: str = child_read_stdout(ch, 65536)
+            if chunk.len() == 0 {
+                out_open = false
+                child_close_stdout(ch)
+            } else {
+                out = out + chunk
+            }
+        }
+        if err_open {
+            let mut chunk2: str = child_read_stderr(ch, 65536)
+            if chunk2.len() == 0 {
+                err_open = false
+                child_close_stderr(ch)
+            } else {
+                err = err + chunk2
+            }
+        }
+    }
+    let code: int = child_wait(ch)
+    return CapRes {
+        code: code, out: out, err: err
+    }
+}
+
+# stdio_pipe() — the Stdio pipe selector for std.process.
+fn stdio_pipe() -> Stdio {
+    return stdio_from_int(1)
+}
+
+# hb_strip_marker(err) — drop the compile-succeeded marker line.
+fn hb_strip_marker(err: str) -> str {
+    let marker: str = "__HLBOOT_COMPILED__\n"
+    let pos: int = err.find(marker)
+    if pos < 0 {
+        return err
+    }
+    return err.slice(0, pos) + err.slice(pos + marker.len(), err.len())
+}
+
+# hb_first_line(s) — up to the first newline.
+fn hb_first_line(s: str) -> str {
+    let pos: int = s.find("\n")
+    if pos < 0 {
+        return s
+    }
+    return s.slice(0, pos)
+}
+
+# hb_batch(list_path, log_path, check_only) -> int — one child per
+# file, fd-level capture over pipes, one TSV record per file in list
+# order (the wire suite_01 reads).
+fn hb_batch(list_path: str, log_path: str, check_only: bool, self_path: str) -> int uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    if !file_exists(list_path) {
+        eprint("error: cannot open batch list " + list_path + "\n")
+        return 2
+    }
+    let raw: str = read_file(list_path)
+    let lines: list[str] = raw.split("\n")
+    let files: list[str] = []
+    let mut i: int = 0
+    while i < lines.len() {
+        let ln: str = lines.get(i).trim()
+        if ln != "" && !ln.starts_with("#") {
+            files.push(ln)
+        }
+        i = i + 1
+    }
+    let mut log: str = ""
+    let mut fi: int = 0
+    while fi < files.len() {
+        let path: str = files.get(fi)
+        let cargs: list[str] = []
+        if check_only {
+            cargs.push("--probe-check")
+        } else {
+            cargs.push("--probe-run")
+        }
+        cargs.push(path)
+        let res: CapRes = hb_spawn_child(self_path, cargs)
+        let mut rc: int = res.code
+        let out: str = res.out
+        let mut err: str = hb_strip_marker(res.err)
+        if rc != 0 && res.err.find("__HLBOOT_COMPILED__") < 0 {
+            # The compile half died (load/check panic): the record the
+            # single-file invocation would have made — rc 1, the
+            # compile error line on stderr.
+            let mut msg: str = hb_first_line(res.err)
+            if msg.starts_with("panic: ") {
+                msg = msg.slice(7, msg.len())
+            }
+            err = "compile error: " + msg + "\n"
+            rc = 1
+        }
+        log = log + rc.to_str() + "\t" + base64_encode(path) + "\t"
+        + base64_encode(out) + "\t" + base64_encode(err) + "\n"
+        fi = fi + 1
+    }
+    write_file(log_path, log)
+    return 0
+}
+
+# hb_main_inner(argv) -> int — the CLI law (flags before the file,
+# program args after).
+fn hb_main_inner(argv: list[str]) -> int uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let n: int = argv.len()
+    let mut i: int = 1
+    let mut check_only: bool = false
+    let mut audit_only: bool = false
+    let mut det_mode: bool = false
+    let mut contracts: bool = false
+    let mut fast_mode: bool = false
+    let mut sandbox_dir: str = ""
+    let mut target_feature: str = ""
+    let mut target_triple: str = ""
+    let mut batch_list: str = ""
+    let mut batch_log: str = ""
+    let mut batch: bool = false
+    # Leading flags end at the first non-flag argument (the entry
+    # file); everything after it belongs to the program.
+    while i < n {
+        let a: str = argv.get(i)
+        if a == "--batch" {
+            if i + 2 >= n {
+                eprint("error: --batch needs a list file and a log file\n")
+                return 2
+            }
+            batch = true
+            batch_list = argv.get(i + 1)
+            batch_log = argv.get(i + 2)
+            i = i + 3
+            continue
+        }
+        if a == "--probe-audit" {
+            if i + 1 >= n {
+                eprint("error: --probe-audit needs a file\n")
+                return 2
+            }
+            let path3: str = argv.get(i + 1)
+            let sb3: str = env_get("HLS_SANDBOX_ROOT")
+            let tt3: str = env_get("HLBOOT_TARGET_TRIPLE")
+            let boot3: Boot = hb_load_checked(path3, [path3], false, "", sb3, tt3)
+            eprint("__HLBOOT_COMPILED__\n")
+            print_audit(boot3.ctx)
+            return 0
+        }
+        if a == "--probe-run" || a == "--probe-check" {
+            # private flags (the batch children re-invoke the tool)
+            if i + 1 >= n {
+                eprint("error: " + a + " needs a file\n")
+                return 2
+            }
+            let path: str = argv.get(i + 1)
+            let sb: str = env_get("HLS_SANDBOX_ROOT")
+            let tt: str = env_get("HLBOOT_TARGET_TRIPLE")
+            let prog_args: list[str] = [path]
+            let boot2: Boot = hb_load_checked(path, prog_args, false, "", sb, tt)
+            eprint("__HLBOOT_COMPILED__\n")
+            if a == "--probe-check" {
+                print("OK: types and effects valid\n")
+                return 0
+            }
+            return hb_run_program(boot2)
+        }
+        if a == "--check" {
+            check_only = true
+            i = i + 1
+            continue
+        }
+        if a == "--audit" {
+            audit_only = true
+            i = i + 1
+            continue
+        }
+        if a == "--det" {
+            det_mode = true
+            i = i + 1
+            continue
+        }
+        if a == "--contracts" {
+            contracts = true
+            i = i + 1
+            continue
+        }
+        if a == "--fast" {
+            fast_mode = true
+            i = i + 1
+            continue
+        }
+        if a == "-O" {
+            fast_mode = true
+            i = i + 2
+            continue
+        }
+        if a == "--sandbox" {
+            if i + 1 >= n {
+                eprint("error: --sandbox expects a directory\n")
+                return 2
+            }
+            sandbox_dir = argv.get(i + 1)
+            i = i + 2
+            continue
+        }
+        if a == "--target-feature" {
+            if i + 1 >= n {
+                eprint("error: --target-feature expects a name (sse4.2 | avx2 | neon | rvv | native)\n")
+                return 2
+            }
+            target_feature = argv.get(i + 1)
+            if target_feature == "native" {
+                target_feature = ""
+                if simd_cpu_supports("avx2") {
+                    target_feature = "avx2"
+                } else if simd_cpu_supports("sse4.2") {
+                    target_feature = "sse4.2"
+                } else if simd_cpu_supports("neon") {
+                    target_feature = "neon"
+                } else if simd_cpu_supports("rvv") {
+                    target_feature = "rvv"
+                }
+            }
+            if target_feature != "" && target_feature != "sse4.2"
+            && target_feature != "avx2" && target_feature != "neon"
+            && target_feature != "rvv" {
+                eprint("error: unknown target feature '" + target_feature + "' (expected sse4.2 | avx2 | neon | rvv | native)\n")
+                return 2
+            }
+            i = i + 2
+            continue
+        }
+        # Silently accepted native-only flags (the same command line
+        # works for both paths in differential testing).
+        if a == "--lto" || a == "--lto-stats" {
+            i = i + 1
+            continue
+        }
+        if a == "--target" {
+            if i + 1 >= n {
+                eprint("error: --target expects a triple\n")
+                return 2
+            }
+            target_triple = argv.get(i + 1)
+            if target_triple != "x86_64-unknown-none"
+            && target_triple != "aarch64-unknown-none"
+            && target_triple != "riscv64-unknown-none" {
+                eprint("error: unknown bare-metal target '" + target_triple + "' (expected x86_64-unknown-none | aarch64-unknown-none | riscv64-unknown-none)\n")
+                return 2
+            }
+            i = i + 2
+            continue
+        }
+        if a == "--lto-threshold" {
+            i = i + 2
+            continue
+        }
+        break
+    }
+    if target_triple != "" && target_feature != "" {
+        eprint("error: --target-feature is not available on target " + target_triple + " (bare-metal targets are integer-only: SIMD intrinsics use floating-point registers)\n")
+        return 2
+    }
+    if check_only && audit_only {
+        eprint("error: --check / --audit are mutually exclusive\n")
+        return 2
+    }
+    if batch {
+        if audit_only {
+            eprint("error: --batch is incompatible with mode flags other than --check\n")
+            return 2
+        }
+        return hb_batch(batch_list, batch_log, check_only, argv.get(0))
+    }
+    # --det: arm the scheduler env and re-exec (the mode is read at
+    # process start, the same way the native runtime reads it).
+    if det_mode {
+        env_set("HL_DET_SCHED", "1")
+        let mut cmd: str = hb_shell_quote(argv.get(0))
+        let mut j: int = 1
+        let mut skipped: bool = false
+        while j < n {
+            let a2: str = argv.get(j)
+            if !skipped && a2 == "--det" {
+                skipped = true
+                j = j + 1
+                continue
+            }
+            cmd = cmd + " " + hb_shell_quote(a2)
+            j = j + 1
+        }
+        return proc_exec(cmd)
+    }
+    if i >= n {
+        eprint(hb_usage())
+        return 2
+    }
+    let path: str = argv.get(i)
+    if !file_exists(path) {
+        eprint("error: cannot open file " + path + "\n")
+        return 2
+    }
+    let prog_args: list[str] = []
+    let mut k: int = i
+    while k < n {
+        prog_args.push(argv.get(k))
+        k = k + 1
+    }
+    if audit_only {
+        # The probe-child discipline (the same law as --check); the
+        # triple rides through the env the same way.
+        env_set("HLBOOT_TARGET_TRIPLE", target_triple)
+        let cargs3: list[str] = ["--probe-audit", path]
+        let res3: CapRes = hb_spawn_child(argv.get(0), cargs3)
+        if res3.code != 0 {
+            let mut msg3: str = hb_first_line(res3.err)
+            if msg3.starts_with("panic: ") {
+                msg3 = msg3.slice(7, msg3.len())
+            }
+            eprint("compile error: " + msg3 + "\n")
+            return 1
+        }
+        print(res3.out)
+        return 0
+    }
+    if check_only {
+        # The probe-child discipline: the checker panics on a bad
+        # program, and the parent turns the child's death into the
+        # clean compile-error report. The triple rides through the env
+        # (the child re-reads it before loading).
+        env_set("HLBOOT_TARGET_TRIPLE", target_triple)
+        let cargs: list[str] = ["--probe-check", path]
+        let res: CapRes = hb_spawn_child(argv.get(0), cargs)
+        if res.code != 0 {
+            let mut msg: str = hb_first_line(res.err)
+            if msg.starts_with("panic: ") {
+                msg = msg.slice(7, msg.len())
+            }
+            eprint("compile error: " + msg + "\n")
+            return 1
+        }
+        print(res.out)
+        return 0
+    }
+    if sandbox_dir != "" {
+        if !fs_is_dir(sandbox_dir) {
+            eprint("error: --sandbox: not a directory: " + sandbox_dir + "\n")
+            return 2
+        }
+        env_set("HLS_SANDBOX_ROOT", sandbox_dir)
+    }
+    let boot: Boot = hb_load_checked(path, prog_args, contracts, target_feature, sandbox_dir, target_triple)
+    if sandbox_dir != "" {
+        # The sandbox laws: extern blocks and the Proc effect refuse.
+        let mut ki: int = 0
+        let keys: list[str] = boot.ctx.fns.keys()
+        while ki < keys.len() {
+            let fk: str = keys.get(ki)
+            let f: FnInfo = boot.ctx.fns.get_or(fk, dummy_fn())
+            if f.is_extern {
+                eprint("error: --sandbox is incompatible with `extern \"C\"` blocks (extern can call libc directly, bypassing the sandbox)\n")
+                return 1
+            }
+            let effs: list[str] = boot.ctx.computed_effects.get_or(fk, [])
+            let mut ei: int = 0
+            while ei < effs.len() {
+                if effs.get(ei) == "Proc" {
+                    eprint("error: --sandbox is incompatible with the Proc effect (function '" + f.name + "' can reach proc_exec, which runs arbitrary shell commands outside the sandbox)\n")
+                    return 1
+                }
+                ei = ei + 1
+            }
+            ki = ki + 1
+        }
+    }
+    return hb_run_program(boot)
+}
+
+fn main() -> int uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let argv: list[str] = args()
+    return hb_main_inner(argv)
+}

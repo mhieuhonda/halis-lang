@@ -195,7 +195,7 @@ refine-acceptance: $(BIN)/hlc
 	@$(BIN)/acc-refine
 
 # Run the example programs to verify they still work after a change
-examples:
+examples: $(BIN)/hlboot
 	@# Most examples exit 0; secure_demo.hls deliberately panics on
 	@# integer overflow to demonstrate safe-panic semantics (exit 101).
 	@# NOTE: taint_beta_demo.hls and wordcount.hls need a data-file
@@ -217,17 +217,17 @@ examples:
 		   examples/heap_demo.hls examples/conn_machine.hls \
 		   examples/bits_demo.hls \
 		   examples/set_demo.hls; do \
-		 echo "--- $$f"; $(PYTHON) tools/hlinterp/boot.py $$f || exit 1; \
+		 echo "--- $$f"; $(BIN)/hlboot $$f || exit 1; \
 	done
 	@echo "--- examples/secure_demo.hls (deliberately panics on overflow)"
-	@rc=0; $(PYTHON) tools/hlinterp/boot.py examples/secure_demo.hls || rc=$$?; \
+	@rc=0; $(BIN)/hlboot examples/secure_demo.hls || rc=$$?; \
 	if [ "$$rc" != "0" ] && [ "$$rc" != "101" ]; then \
 	    echo "secure_demo.hls failed with unexpected exit code $$rc"; exit 1; \
 	fi
 	@# wordcount needs a data-file argument
-	@echo "--- examples/wordcount.hls"; $(PYTHON) tools/hlinterp/boot.py examples/wordcount.hls examples/data.txt
+	@echo "--- examples/wordcount.hls"; $(BIN)/hlboot examples/wordcount.hls examples/data.txt
 	@# taint_beta_demo.hls needs a data-file argument
-	@echo "--- examples/taint_beta_demo.hls"; $(PYTHON) tools/hlinterp/boot.py examples/taint_beta_demo.hls examples/data.txt
+	@echo "--- examples/taint_beta_demo.hls"; $(BIN)/hlboot examples/taint_beta_demo.hls examples/data.txt
 
 
 # Stage 104 (v0.123.0-alpha): hls-sbom, the CycloneDX + SPDX bill of

@@ -881,7 +881,7 @@ def smoke_run(path, timeout_s):
     """'ok' | 'panic:<first line>' | 'timeout' | 'error:<first line>'."""
     try:
         p = subprocess.run(
-            [sys.executable, os.path.join(REPO_ROOT, "tools/hlinterp/boot.py"), path],
+            [os.path.join(REPO_ROOT, "bin/hlboot"), path],
             capture_output=True, timeout=timeout_s, input=b"",
             cwd=REPO_ROOT)
     except subprocess.TimeoutExpired:
