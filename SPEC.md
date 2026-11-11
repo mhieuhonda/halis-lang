@@ -8361,7 +8361,8 @@ backends.
 
 ### 67.5. `hls-det` — the verifier
 
-`tools/hls-det.py` certifies instead of believing:
+`tools/hls-det.hls` (the native twin, `bin/hls-det`) certifies
+instead of believing:
 
 1. the NATIVE leg — the house recipe (bin/hlc + gcc -O2 -lm -pthread),
    `--runs` times (default 5) under the mode with the trace on;

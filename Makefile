@@ -191,6 +191,16 @@ $(BIN)/hls-xdiff: tools/hls-xdiff.hls $(wildcard std/*.hls) $(wildcard core/*.hl
 	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
 	@rm -f $@.c
 
+# hls-det — the Stage 127 determinism verifier, in Halis (the native
+# twin of the Python hls-det that retired; the validator driver of the
+# gate imports a stripped copy of this file, fn main cut).
+$(BIN)/hls-det: tools/hls-det.hls $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hls-det] hlc compiles the determinism verifier (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hls-det.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
 # hls-rt — the soft-real-time verifier, in Halis (the native twin of
 # the Python hls-rt that retired; the module-driver legs of the gate
 # import a stripped copy of this file, fn main cut).
@@ -750,7 +760,7 @@ rt-acceptance: $(BIN)/acc-rt $(BIN)/hls-rt bin/hlc
 # (stdout/trace/exit identical across backends for the whole fixture
 # set, hlfmt/hllint/checker green, no litter). The gate compiles on
 # bin/hlc and gcc, so the native build is a prerequisite.
-det-acceptance: $(BIN)/acc-det bin/hlc
+det-acceptance: $(BIN)/acc-det $(BIN)/hls-det bin/hlc
 	@echo "[Stage 127 acceptance] running tests/acc/det_acceptance.hls..."
 	@$(BIN)/acc-det
 	@echo "ACCEPTANCE OK: Stage 127 -- deterministic-scheduler option (testing concurrency)"

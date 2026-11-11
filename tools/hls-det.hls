@@ -1,0 +1,1140 @@
+# ============================================================================
+# tools/hls-det.hls — the Stage 127 determinism verifier, in Halis (the
+# native twin of the Python hls-det that retired; same CLI, same trace
+# law, same verdicts — driven through bin/hls-det, built by the
+# bootstrap's own compiler).
+# ----------------------------------------------------------------------------
+# Usage:
+#   bin/hls-det workload.hls
+#   bin/hls-det --runs 10 workload.hls
+#   bin/hls-det --trace workload.hls
+#   bin/hls-det --json r.json workload.hls
+#   bin/hls-det --no-parity workload.hls
+#   bin/hls-det --observe-preemptive workload.hls
+#   bin/hls-det workload.hls arg1 arg2      # argv reaches the program
+#
+# Stage 16 made the task model data-race-free; Stage 127 makes its
+# INTERLEAVING testable. HL_DET_SCHED (the mode this tool arms) replaces
+# the preemptive OS scheduling with the FIFO baton rotation SPEC section
+# 67 specifies — every spawn/send/try_send/recv/recv_or/select/join/
+# finish is a scheduling point, the woken task runs ahead of its waker,
+# a spawned task's first turn comes before its parent's next — so a
+# concurrent program's output and interleaving are identical on every
+# run. This tool CERTIFIES that claim instead of believing it:
+#
+#  1. the NATIVE leg — the workload is compiled with the house recipe
+#     (bin/hlc + gcc -O2 -lm -pthread) and run --runs times with the
+#     mode armed (and the trace on): every run's stdout, interleaving
+#     trace and exit status must be byte-identical. The first differing
+#     run is reported with its digest. A program may die — a
+#     deterministic panic is a deterministic interleaving — the verdict
+#     says so and carries the exit code.
+#
+#  2. the PARITY leg — the Stage-0 interpreter runs the same workload
+#     under `boot.py --det` with the trace on: its stdout, trace and
+#     exit must match the native leg exactly. --no-parity skips it
+#     (and says so — a skipped leg is never a pass).
+#
+# The trace (HL_DET_TRACE, armed by the tool, parsed with the reserved-
+# prefix discipline of Stage 119/124/125/126): one line per scheduling
+# point on stderr,
+#
+#     __HLDET_STEP__ <seq> t<task> <op>[ <detail>]
+#
+# with seq dense from 0, task ids by spawn order (main = t0), channel
+# ids by creation order (ch0..), op in {spawn, send, try_send, recv,
+# recv_or, select, join, finish} and the detail exactly `t<n>` for
+# spawn/join, `ch<n>[,ch<m>...]` for select, `ch<n>` for the channel
+# ops, absent for finish. A line STARTING with the stem must parse
+# exactly and continue the sequence; a line merely CONTAINING `__HLDET_`
+# — on either stream — is a protocol error: a program that forges
+# protocol look-alikes corrupts the witness and fails loudly, never
+# silently. Program chatter on stderr is fine; it is kept out of the
+# comparison (the interpreter's task-panic lines carry a source-location
+# suffix the native runtime does not — a pre-existing, documented
+# divergence — so the non-trace stderr is compared across the NATIVE
+# runs only).
+#
+# --observe-preemptive runs the same binary --runs times WITHOUT the
+# mode and reports what it saw: stable or varying, honestly labelled an
+# OBSERVATION, never a certificate — preemptive stability on N runs is
+# evidence, not proof (that asymmetry is the whole reason this stage
+# exists).
+#
+# Verdicts: DETERMINISTIC when every native det run is byte-identical
+# and the parity leg agrees (or was skipped, said so, and --no-parity
+# was explicit); NOT DETERMINISTIC when the native runs differ; PARITY
+# FAILURE when the interpreter disagrees. Exit 0 certifies, 1 is not
+# certified (nondeterminism, parity, timeout, protocol error, compile
+# or run failure — the reason is named), 2 is usage (missing file,
+# non-.hls, --runs < 2 — a determinism claim needs at least two runs —
+# bad option values, no bin/hlc, no gcc).
+#
+# Native notes: no per-run alarm exists in the runtime yet (--timeout
+# is accepted and recorded; the CI job's own timeout is the backstop,
+# the same discipline tests/acc/harness.hls documents); the report's
+# JSON is written with Python's indent=2 sort_keys layout, keys
+# alphabetical at every level. Run from the repo root — the compile leg
+# resolves bin/hlc and the parity leg tools/hlinterp/boot.py against it.
+# ============================================================================
+
+import "std.str"
+import "std.json"
+import "std.result"
+import "std.sha256"
+import "std.env"
+
+fn tool_version() -> str {
+    return "0.145.0-alpha"
+}
+
+# The reserved protocol prefixes (the Stage 119/124/125/126 discipline).
+fn proto_step() -> str {
+    return "__HLDET_STEP__ "
+}
+
+fn proto_stem() -> str {
+    return "__HLDET_"
+}
+
+# ============================================================================
+# The trace validator (the .py's parse_trace / check_stdout_protocol,
+# the reserved-prefix law, exactly).
+# ============================================================================
+
+struct Trace {
+    ok: bool, # false: a protocol error (err names it)
+    err: str,
+    steps: list[str], # the step lines, dense and in order
+    chatter: list[str] # the non-trace stderr lines
+}
+
+# is_op(op) — the eight scheduling-point ops.
+fn is_op(op: str) -> bool {
+    let ops: list[str] = ["spawn", "send", "try_send", "recv", "recv_or",
+    "select", "join", "finish"]
+    let mut i: int = 0
+    while i < ops.len() {
+        if ops.get(i) == op {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# split_lines_py(s) — str.splitlines(): boundaries at \n, \r and \r\n
+# (the pair is ONE boundary), no trailing empty piece (the .py's
+# splitlines; a trailing "" from a plain split would count as chatter).
+fn split_lines_py(s: str) -> list[str] {
+    let out: list[str] = []
+    let n: int = s.len()
+    let mut i: int = 0
+    let mut start: int = 0
+    while i < n {
+        let c: int = s.byte_at(i)
+        if c == 10 {
+            out.push(s.slice(start, i))
+            i = i + 1
+            start = i
+        } else if c == 13 {
+            out.push(s.slice(start, i))
+            i = i + 1
+            if i < n && s.byte_at(i) == 10 {
+                i = i + 1
+            }
+            start = i
+        } else {
+            i = i + 1
+        }
+    }
+    if start < n {
+        out.push(s.slice(start, n))
+    }
+    return out
+}
+
+# all_digits(s) — [0-9]+ and non-empty.
+fn all_digits(s: str) -> bool {
+    if s.len() == 0 {
+        return false
+    }
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c < 48 || c > 57 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# is_lower_word(s) — [a-z_]+ and non-empty.
+fn is_lower_word(s: str) -> bool {
+    if s.len() == 0 {
+        return false
+    }
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if !((c >= 97 && c <= 122) || c == 95) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# is_task_tok(s) — t<digits>.
+fn is_task_tok(s: str) -> bool {
+    if s.len() < 2 {
+        return false
+    }
+    if s.byte_at(0) != 116 {
+        return false
+    }
+    return all_digits(s.slice(1, s.len()))
+}
+
+# is_chan_list(s) — ch<n>[,ch<m>...].
+fn is_chan_list(s: str) -> bool {
+    let parts: list[str] = s.split(",")
+    let mut i: int = 0
+    while i < parts.len() {
+        let p: str = parts.get(i)
+        if p.len() < 3 {
+            return false
+        }
+        if !p.starts_with("ch") {
+            return false
+        }
+        if !all_digits(p.slice(2, p.len())) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# is_detail_tok(s) — the detail shape: t<n> or a ch list.
+fn is_detail_tok(s: str) -> bool {
+    if is_task_tok(s) {
+        return true
+    }
+    return is_chan_list(s)
+}
+
+# py_repr_str(s) — Python's repr() for the lines the errors embed.
+fn py_repr_str(s: str) -> str {
+    let mut out: str = "'"
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c == 39 {
+            out = out + "\\'"
+        } else if c == 92 {
+            out = out + "\\\\"
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out + "'"
+}
+
+# parse_trace(stderr) — split a run's stderr into steps and chatter.
+# Every line starting with the stem must parse EXACTLY and continue the
+# dense sequence; a line merely containing the stem is a forgery and
+# fails loudly.
+fn parse_trace(stderr: str) -> Trace {
+    let t: Trace = Trace {
+        ok: true,
+        err: "",
+        steps: [],
+        chatter: []
+    }
+    let lines: list[str] = split_lines_py(stderr)
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i)
+        if line.starts_with(proto_step()) {
+            # the _STEP_RE law: <seq> t<task> <op> [detail]
+            let toks: list[str] = line.slice(proto_step().len(),
+            line.len()).split(" ")
+            let mut shape_ok: bool = toks.len() == 3 || toks.len() == 4
+            if shape_ok {
+                if !all_digits(toks.get(0)) || !is_task_tok(toks.get(1))
+                || !is_lower_word(toks.get(2)) {
+                    shape_ok = false
+                }
+            }
+            if shape_ok && toks.len() == 4 {
+                if !is_detail_tok(toks.get(3)) {
+                    shape_ok = false
+                }
+            }
+            if !shape_ok {
+                t.ok = false
+                t.err = "malformed step record: " + py_repr_str(line)
+                return t
+            }
+            # the dense sequence: seq == len(steps). A seq longer than
+            # 18 digits can never equal it (the .py compared bignums;
+            # the refusal is the same).
+            let mut seq_mismatch: bool = false
+            let got: str = toks.get(0)
+            if got.len() > 18 {
+                seq_mismatch = true
+            } else {
+                if got.to_int() != t.steps.len() {
+                    seq_mismatch = true
+                }
+            }
+            if seq_mismatch {
+                t.ok = false
+                t.err = "non-advancing step record: expected seq "
+                + t.steps.len().to_str() + ", got " + got
+                return t
+            }
+            if !is_op(toks.get(2)) {
+                t.ok = false
+                t.err = "unknown op in step record: " + py_repr_str(line)
+                return t
+            }
+            t.steps.push(line)
+        } else {
+            if line.contains(proto_stem()) {
+                t.ok = false
+                t.err = "protocol look-alike on stderr: "
+                + py_repr_str(line)
+                return t
+            }
+            t.chatter.push(line)
+        }
+        i = i + 1
+    }
+    return t
+}
+
+# check_stdout_protocol(stdout) — the reserved stem may not appear on
+# the program's stdout; the error string, or "".
+fn check_stdout_protocol(stdout: str) -> str {
+    let lines: list[str] = split_lines_py(stdout)
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).contains(proto_stem()) {
+            return "protocol look-alike on stdout: "
+            + py_repr_str(lines.get(i))
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# ============================================================================
+# The legs.
+# ============================================================================
+
+struct RunCap {
+    spawned: bool,
+    code: int,
+    out: str,
+    err: str
+}
+
+# run_cap(program, args) — spawn with stdout+stderr piped, stdin null.
+fn run_cap(program: str, args: list[str]) -> RunCap uses Proc {
+    let r: RunCap = RunCap {
+        spawned: false,
+        code: -1,
+        out: "",
+        err: ""
+    }
+    let pid: int = proc_spawn(program, args, 2, 1, 1)
+    if pid < 1 {
+        return r
+    }
+    r.spawned = true
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    r.code = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    r.out = out
+    r.err = err
+    return r
+}
+
+# which(name) — the PATH probe.
+fn which(name: str) -> bool uses Proc {
+    return proc_exec("command -v '" + shell_quote(name) + "' >/dev/null 2>&1") == 0
+}
+
+fn shell_quote(s: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < s.len() {
+        if s.byte_at(i) == 39 {
+            out = out + "'\\''"
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# argv_with(argv, prog_args) — prog + the program's own argv.
+fn argv_with(argv: list[str], prog_args: list[str]) -> list[str] {
+    let full: list[str] = []
+    let mut i: int = 0
+    while i < argv.len() {
+        full.push(argv.get(i))
+        i = i + 1
+    }
+    let mut j: int = 0
+    while j < prog_args.len() {
+        full.push(prog_args.get(j))
+        j = j + 1
+    }
+    return full
+}
+
+# DetRun — one armed run's outcome.
+struct DetRun {
+    ok: bool, # false: refused (protocol or spawn); err names it
+    err: str,
+    code: int,
+    out: str,
+    steps: list[str]
+}
+
+# run_det(binary, prog_args) — one armed run: HL_DET_SCHED=1 and
+# HL_DET_TRACE=1 (set once before the leg; the parity leg keeps them,
+# the preemptive leg unsets them), the stdout law, the trace parse.
+fn run_det(binary: str, prog_args: list[str]) -> DetRun uses Proc {
+    let r: RunCap = run_cap(binary, prog_args)
+    let d: DetRun = DetRun {
+        ok: true,
+        err: "",
+        code: r.code,
+        out: r.out,
+        steps: []
+    }
+    if !r.spawned {
+        d.ok = false
+        d.err = "native binary failed to spawn"
+        return d
+    }
+    let forge: str = check_stdout_protocol(r.out)
+    if forge != "" {
+        d.ok = false
+        d.err = forge
+        return d
+    }
+    let t: Trace = parse_trace(r.err)
+    if !t.ok {
+        d.ok = false
+        d.err = t.err
+        return d
+    }
+    d.steps = t.steps
+    return d
+}
+
+# run_interp(file, prog_args) — the parity leg: boot.py --det with the
+# trace armed (the .py set the env per run; the twin arms once and
+# every child inherits it).
+fn run_interp(file: str, prog_args: list[str]) -> DetRun uses Proc {
+    let boot_argv: list[str] = ["tools/hlinterp/boot.py", "--det", file]
+    let r: RunCap = run_cap("python3", argv_with(boot_argv, prog_args))
+    let d: DetRun = DetRun {
+        ok: true,
+        err: "",
+        code: r.code,
+        out: r.out,
+        steps: []
+    }
+    if !r.spawned {
+        d.ok = false
+        d.err = "interpreter failed to spawn"
+        return d
+    }
+    let forge: str = check_stdout_protocol(r.out)
+    if forge != "" {
+        d.ok = false
+        d.err = forge
+        return d
+    }
+    let t: Trace = parse_trace(r.err)
+    if !t.ok {
+        d.ok = false
+        d.err = t.err
+        return d
+    }
+    d.steps = t.steps
+    return d
+}
+
+# ============================================================================
+# Small helpers.
+# ============================================================================
+
+# sha16(s) — sha256, first 16 hex digits.
+fn sha16(s: str) -> str {
+    return sha256_hex(s).slice(0, 16)
+}
+
+# join_nl(xs) — "\n".join(xs).
+fn join_nl(xs: list[str]) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < xs.len() {
+        if i > 0 {
+            out = out + "\n"
+        }
+        out = out + xs.get(i)
+        i = i + 1
+    }
+    return out
+}
+
+# list_has(xs, x)
+fn list_has(xs: list[str], x: str) -> bool {
+    let mut i: int = 0
+    while i < xs.len() {
+        if xs.get(i) == x {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# tok(s, i) — s.split(" ")[i], "" past the end.
+fn tok(s: str, i: int) -> str {
+    let parts: list[str] = s.split(" ")
+    if i >= 0 && i < parts.len() {
+        return parts.get(i)
+    }
+    return ""
+}
+
+# ============================================================================
+# The JSON report (Python's json.dump(indent=2, sort_keys=True) layout).
+# ============================================================================
+
+# jobj_sorted(keys, vals) — the keys sorted, the values along for the
+# ride (the .py wrote with sort_keys=True at every level).
+fn jobj_sorted(keys: list[str], vals: list[JsonValue]) -> JsonValue {
+    let ks: list[str] = []
+    let vs: list[JsonValue] = []
+    let mut i: int = 0
+    while i < keys.len() {
+        ks.push(keys.get(i))
+        vs.push(vals.get(i))
+        let mut j: int = ks.len() - 1
+        while j > 0 && ks.get(j) < ks.get(j - 1) {
+            let tk: str = ks.get(j)
+            ks.set(j, ks.get(j - 1))
+            ks.set(j - 1, tk)
+            let tv: JsonValue = vs.get(j)
+            vs.set(j, vs.get(j - 1))
+            vs.set(j - 1, tv)
+            j = j - 1
+        }
+        i = i + 1
+    }
+    return json_object(ks, vs)
+}
+
+# json_escape_py(s) — the JSON string body Python's json.dumps emits.
+fn json_escape_py(s: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c == 34 {
+            out = out + "\\\""
+        } else if c == 92 {
+            out = out + "\\\\"
+        } else if c == 10 {
+            out = out + "\\n"
+        } else if c == 9 {
+            out = out + "\\t"
+        } else if c == 13 {
+            out = out + "\\r"
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# dump_indent2(v) — json.dumps(v, indent=2, sort_keys=True) for the
+# shapes this report carries. Object keys arrive pre-sorted from
+# jobj_sorted.
+fn dump_indent2(v: JsonValue) -> str {
+    return dump_indent2_at(v, 0)
+}
+
+fn dump_indent2_at(v: JsonValue, depth: int) -> str {
+    let mut pad: str = ""
+    let mut p: int = 0
+    while p < depth * 2 {
+        pad = pad + " "
+        p = p + 1
+    }
+    let mut pad_in: str = ""
+    let mut p2: int = 0
+    while p2 < (depth + 1) * 2 {
+        pad_in = pad_in + " "
+        p2 = p2 + 1
+    }
+    if json_is_array(v) {
+        if v.arr.len() == 0 {
+            return "[]"
+        }
+        let mut out: str = "[\n"
+        let mut i: int = 0
+        while i < v.arr.len() {
+            out = out + pad_in + dump_indent2_at(v.arr.get(i), depth + 1)
+            if i + 1 < v.arr.len() {
+                out = out + ","
+            }
+            out = out + "\n"
+            i = i + 1
+        }
+        return out + pad + "]"
+    }
+    if json_is_object(v) {
+        if v.obj_keys.len() == 0 {
+            return "{}"
+        }
+        let mut out2: str = "{\n"
+        let mut k: int = 0
+        while k < v.obj_keys.len() {
+            out2 = out2 + pad_in + "\"" + json_escape_py(v.obj_keys.get(k))
+            + "\": " + dump_indent2_at(v.obj_vals.get(k), depth + 1)
+            if k + 1 < v.obj_keys.len() {
+                out2 = out2 + ","
+            }
+            out2 = out2 + "\n"
+            k = k + 1
+        }
+        return out2 + pad + "}"
+    }
+    if json_is_str(v) {
+        return "\"" + json_escape_py(json_str_value(v)) + "\""
+    }
+    if json_is_bool(v) {
+        if json_bool_value(v) {
+            return "true"
+        }
+        return "false"
+    }
+    if json_is_null(v) {
+        return "null"
+    }
+    if json_is_float(v) {
+        return json_float_value(v).to_str()
+    }
+    return json_int_value(v).to_str()
+}
+
+# ============================================================================
+# The CLI.
+# ============================================================================
+
+# struct Cfg — the parsed command line.
+struct Cfg {
+    file: str,
+    prog_args: list[str],
+    runs: int,
+    timeout_s: int,
+    json_path: str,
+    trace: bool,
+    no_parity: bool,
+    observe_preemptive: bool
+}
+
+fn cfg_new() -> Cfg {
+    let c: Cfg = Cfg {
+        file: "",
+        prog_args: [],
+        runs: 5,
+        timeout_s: 120,
+        json_path: "",
+        trace: false,
+        no_parity: false,
+        observe_preemptive: false
+    }
+    return c
+}
+
+# parse_args(argv, cfg) — "cfg" or the refusal mode + its subject.
+# argparse's surface: the flags may sit anywhere; the first positional
+# is the workload, the rest are the program's own argv.
+fn parse_args(argv: list[str], cfg: Cfg) -> list[str] {
+    let value_flags: list[str] = ["--runs", "--timeout", "--json"]
+    let bool_flags: list[str] = ["--trace", "--no-parity",
+    "--observe-preemptive", "-h", "--help"]
+    let mut i: int = 1
+    while i < argv.len() {
+        let a: str = argv.get(i)
+        if a.starts_with("--") || a == "-h" {
+            let mut head: str = a
+            let mut val: str = ""
+            let mut has_val: bool = false
+            let eq: int = a.find("=")
+            if eq >= 0 {
+                head = a.slice(0, eq)
+                val = a.slice(eq + 1, a.len())
+                has_val = true
+            }
+            if list_has(value_flags, head) {
+                if !has_val {
+                    if i + 1 >= argv.len() {
+                        return["noval", head]
+                    }
+                    i = i + 1
+                    val = argv.get(i)
+                }
+                if head == "--runs" {
+                    cfg.runs = val.to_int()
+                }
+                if head == "--timeout" {
+                    cfg.timeout_s = val.to_int()
+                }
+                if head == "--json" {
+                    cfg.json_path = val
+                }
+            } else {
+                if !list_has(bool_flags, head) {
+                    return["unknown", a]
+                }
+                if head == "--trace" {
+                    cfg.trace = true
+                }
+                if head == "--no-parity" {
+                    cfg.no_parity = true
+                }
+                if head == "--observe-preemptive" {
+                    cfg.observe_preemptive = true
+                }
+                if head == "-h" || head == "--help" {
+                    return["help", ""]
+                }
+            }
+            i = i + 1
+            continue
+        }
+        # a positional: the first is the workload, the rest the argv
+        if cfg.file == "" {
+            cfg.file = a
+        } else {
+            cfg.prog_args.push(a)
+        }
+        i = i + 1
+    }
+    if cfg.file == "" {
+        return["nofile", ""]
+    }
+    return["cfg", ""]
+}
+
+fn usage_text() -> str {
+    return "usage: hls-det [-h] [--runs N] [--timeout SEC] [--json FILE]\n"
+    + "               [--trace] [--no-parity] [--observe-preemptive]\n"
+    + "               file [argv ...]\n"
+    + "\n"
+    + "the Stage 127 determinism verifier (the native twin of the\n"
+    + "Python hls-det; same legs, same trace law, same verdicts)"
+}
+
+# ============================================================================
+# The report record — built as JsonValue pieces as the legs complete,
+# rendered once at finish.
+# ============================================================================
+
+# Report — the mutable report fields (the .py's dict, letter by letter).
+struct Report {
+    verdict: JsonValue, # json_str or json_null
+    reason: JsonValue, # json_str or json_null
+    parity: JsonValue,
+    preemptive: JsonValue,
+    first_diff: JsonValue,
+    runs: JsonValue, # the runs array (built at the end)
+    stats: JsonValue
+}
+
+fn report_new() -> Report {
+    let r: Report = Report {
+        verdict: json_null(),
+        reason: json_null(),
+        parity: json_null(),
+        preemptive: json_null(),
+        first_diff: json_null(),
+        runs: json_null(),
+        stats: json_null()
+    }
+    return r
+}
+
+# jbool(b)
+fn jbool(b: bool) -> JsonValue {
+    return json_bool(b)
+}
+
+# finish(cfg, rep, verdict, reason, code, workdir) — set the verdict,
+# write the report, clean the scratch, return the exit code.
+fn finish(cfg: Cfg, rep: Report, verdict: str, reason: str, code: int,
+workdir: str) -> int uses IO, Fs, Proc {
+    rep.verdict = json_str(verdict)
+    if reason == "" {
+        rep.reason = json_null()
+    } else {
+        rep.reason = json_str(reason)
+    }
+    if cfg.json_path != "" {
+        let keys: list[str] = ["argv", "config", "file", "parity",
+        "preemptive", "reason", "runs", "stats", "tool", "verdict",
+        "version"]
+        let prog_argv: list[JsonValue] = []
+        let mut pi: int = 0
+        while pi < cfg.prog_args.len() {
+            prog_argv.push(json_str(cfg.prog_args.get(pi)))
+            pi = pi + 1
+        }
+        let config: JsonValue = jobj_sorted(
+        ["observe_preemptive", "parity", "runs", "timeout_s"],
+        [jbool(cfg.observe_preemptive), jbool(!cfg.no_parity),
+        json_int(cfg.runs), json_int(cfg.timeout_s)])
+        let top: list[JsonValue] = [json_array(prog_argv), config,
+        json_str(cfg.file), rep.parity, rep.preemptive, rep.reason,
+        rep.runs, rep.stats, json_str("hls-det"),
+        rep.verdict, json_str(tool_version())]
+        # first_diff sits in the report only when the runs differed
+        let mut doc: JsonValue = jobj_sorted(keys, top)
+        if !json_is_null(rep.first_diff) {
+            doc = jobj_sorted(["argv", "config", "file", "first_diff",
+            "parity", "preemptive", "reason", "runs", "stats", "tool",
+            "verdict", "version"],
+            [json_array(prog_argv), config, json_str(cfg.file),
+            rep.first_diff, rep.parity, rep.preemptive, rep.reason,
+            rep.runs, rep.stats, json_str("hls-det"), rep.verdict,
+            json_str(tool_version())])
+        }
+        write_file(cfg.json_path, dump_indent2(doc) + "\n")
+    }
+    if workdir != "" {
+        proc_exec("rm -rf '" + shell_quote(workdir) + "'")
+    }
+    return code
+}
+
+# ============================================================================
+# main — the verifier.
+# ============================================================================
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit, Clock {
+    let argv: list[str] = args()
+    let cfg: Cfg = cfg_new()
+    let pa: list[str] = parse_args(argv, cfg)
+    let mode: str = pa.get(0)
+    if mode == "help" {
+        println(usage_text())
+        return 0
+    }
+    if mode == "unknown" {
+        eprintln("hls-det: error: unrecognized arguments: " + pa.get(1))
+        return 2
+    }
+    if mode == "noval" {
+        eprintln("hls-det: error: argument " + pa.get(1)
+        + ": expected one argument")
+        return 2
+    }
+    if mode == "nofile" {
+        eprintln("hls-det: error: the following arguments are required: file")
+        return 2
+    }
+    # ---- usage gates (exit 2) ----
+    if !file_exists(cfg.file) {
+        eprintln("hls-det: no such file: " + cfg.file)
+        return 2
+    }
+    if !cfg.file.ends_with(".hls") {
+        eprintln("hls-det: not a .hls workload: " + cfg.file)
+        return 2
+    }
+    if cfg.runs < 2 {
+        eprintln("hls-det: --runs must be >= 2 "
+        + "(a determinism claim needs at least two runs)")
+        return 2
+    }
+    if cfg.timeout_s < 1 {
+        eprintln("hls-det: --timeout must be >= 1 second")
+        return 2
+    }
+    if !file_exists("bin/hlc") {
+        eprintln("hls-det: no bin/hlc — run make bootstrap")
+        return 2
+    }
+    if !which("gcc") {
+        eprintln("hls-det: gcc not found on PATH")
+        return 2
+    }
+    let rep: Report = report_new()
+    # ---- the scratch (per-run seeded; every exit path cleans it) ----
+    let workdir: str = "/tmp/hls-det-" + system_time_now_ms().to_str()
+    proc_exec("mkdir -p '" + shell_quote(workdir) + "'")
+    # ---- compile (program failures are exit 1, named) ----
+    let c_path: str = workdir + "/workload.c"
+    let bin_path: str = workdir + "/workload"
+    let comp: RunCap = run_cap("bin/hlc", [cfg.file, c_path])
+    if !comp.spawned || comp.code != 0 {
+        eprintln(comp.err)
+        return finish(cfg, rep, "NOT CERTIFIED",
+        "hlc compile failed (exit " + comp.code.to_str() + ")", 1,
+        workdir)
+    }
+    let gcc: RunCap = run_cap("gcc", ["-O2", "-o", bin_path, c_path,
+    "-lm", "-pthread"])
+    if !gcc.spawned || gcc.code != 0 {
+        eprintln(gcc.err)
+        return finish(cfg, rep, "NOT CERTIFIED",
+        "gcc failed (exit " + gcc.code.to_str() + ")", 1, workdir)
+    }
+    # ---- the native det leg (the mode armed, the trace on) ----
+    env_set_var("HL_DET_SCHED", "1")
+    env_set_var("HL_DET_TRACE", "1")
+    let exits: list[int] = []
+    let stdout_shas: list[str] = []
+    let steps_counts: list[int] = []
+    let steps_shas: list[str] = []
+    let first_steps: list[str] = []
+    let mut refused: str = ""
+    let mut i: int = 0
+    while i < cfg.runs {
+        let d: DetRun = run_det(bin_path, cfg.prog_args)
+        if !d.ok {
+            refused = "run " + (i + 1).to_str() + " refused: " + d.err
+            break
+        }
+        exits.push(d.code)
+        stdout_shas.push(sha16(d.out))
+        steps_counts.push(d.steps.len())
+        steps_shas.push(sha16(join_nl(d.steps)))
+        if i == 0 {
+            let mut s: int = 0
+            while s < d.steps.len() {
+                first_steps.push(d.steps.get(s))
+                s = s + 1
+            }
+        }
+        i = i + 1
+    }
+    if refused != "" {
+        println("hls-det: " + refused)
+        return finish(cfg, rep, "NOT CERTIFIED", "det run: " + refused, 1,
+        workdir)
+    }
+    # det stability: every run against the first
+    let mut det_stable: bool = true
+    let mut diff_run: int = 1
+    let mut r: int = 1
+    while r < exits.len() {
+        if exits.get(r) != exits.get(0)
+        || stdout_shas.get(r) != stdout_shas.get(0)
+        || steps_shas.get(r) != steps_shas.get(0) {
+            det_stable = false
+            diff_run = r
+        }
+        r = r + 1
+    }
+    if !det_stable {
+        rep.first_diff = jobj_sorted(["exit", "run", "steps_sha",
+        "stdout_sha"],
+        [json_array([json_int(exits.get(0)),
+        json_int(exits.get(diff_run))]),
+        json_int(diff_run),
+        json_array([json_str(steps_shas.get(0)),
+        json_str(steps_shas.get(diff_run))]),
+        json_array([json_str(stdout_shas.get(0)),
+        json_str(stdout_shas.get(diff_run))])])
+    }
+    # ---- the parity leg ----
+    let mut parity_ok: bool = true
+    let mut parity_checked: bool = true
+    if cfg.no_parity {
+        parity_checked = false
+        rep.parity = jobj_sorted(["checked", "reason"],
+        [jbool(false), json_str("--no-parity (explicit)")])
+    } else {
+        let ir: DetRun = run_interp(cfg.file, cfg.prog_args)
+        if !ir.ok {
+            println("hls-det: interpreter leg refused: " + ir.err)
+            return finish(cfg, rep, "NOT CERTIFIED",
+            "interpreter: " + ir.err, 1, workdir)
+        }
+        let exit_match: bool = ir.code == exits.get(0)
+        let stdout_match: bool = sha16(ir.out) == stdout_shas.get(0)
+        let steps_match: bool = sha16(join_nl(ir.steps)) == steps_shas.get(0)
+        parity_ok = exit_match && stdout_match && steps_match
+        let pk: list[str] = ["checked", "exit", "exit_match",
+        "stdout_match", "steps", "steps_match"]
+        let pv: list[JsonValue] = [jbool(true), json_int(ir.code),
+        jbool(exit_match), jbool(stdout_match),
+        json_int(ir.steps.len()), jbool(steps_match)]
+        if !parity_ok {
+            pk.push("native_steps")
+            pv.push(json_int(steps_counts.get(0)))
+        }
+        rep.parity = jobj_sorted(pk, pv)
+    }
+    # ---- the preemptive observation leg ----
+    if cfg.observe_preemptive {
+        env_unset_var("HL_DET_SCHED")
+        env_unset_var("HL_DET_TRACE")
+        let mut stable: bool = true
+        let mut o: int = 0
+        let mut o_exit: int = 0
+        let mut o_out: str = ""
+        while o < cfg.runs {
+            let oc: RunCap = run_cap(bin_path, cfg.prog_args)
+            if o == 0 {
+                o_exit = oc.code
+                o_out = oc.out
+            } else {
+                if oc.code != o_exit || oc.out != o_out {
+                    stable = false
+                }
+            }
+            o = o + 1
+        }
+        let mut observed: str = "varying"
+        if stable {
+            observed = "stable"
+        }
+        rep.preemptive = jobj_sorted(["note", "observed"],
+        [json_str("an observation over " + cfg.runs.to_str()
+        + " runs, never a certificate"),
+        json_str(observed)])
+    }
+    # ---- the stats + the runs array ----
+    let ops: list[str] = []
+    let op_counts: list[int] = []
+    let mut s: int = 0
+    while s < first_steps.len() {
+        let op: str = tok(first_steps.get(s), 3)
+        let mut found: bool = false
+        let mut oi: int = 0
+        while oi < ops.len() {
+            if ops.get(oi) == op {
+                op_counts.set(oi, op_counts.get(oi) + 1)
+                found = true
+            }
+            oi = oi + 1
+        }
+        if !found {
+            ops.push(op)
+            op_counts.push(1)
+        }
+        s = s + 1
+    }
+    let mut max_task: int = 0
+    let mut s2: int = 0
+    while s2 < first_steps.len() {
+        let ttok: str = tok(first_steps.get(s2), 2)
+        if ttok.len() > 1 {
+            let tid: int = ttok.slice(1, ttok.len()).to_int()
+            if tid > max_task {
+                max_task = tid
+            }
+        }
+        s2 = s2 + 1
+    }
+    rep.stats = jobj_sorted(["op_histogram", "steps", "tasks"],
+    [jobj_sorted(ops, op_counts_i(op_counts)),
+    json_int(steps_counts.get(0)),
+    json_int(1 + max_task)])
+    let runs_arr: list[JsonValue] = []
+    let mut ri: int = 0
+    while ri < exits.len() {
+        runs_arr.push(jobj_sorted(["exit", "i", "stdout_sha", "steps",
+        "steps_sha"],
+        [json_int(exits.get(ri)), json_int(ri),
+        json_str(stdout_shas.get(ri)), json_int(steps_counts.get(ri)),
+        json_str(steps_shas.get(ri))]))
+        ri = ri + 1
+    }
+    rep.runs = json_array(runs_arr)
+    # ---- the verdict ----
+    if !det_stable {
+        println("hls-det: NOT DETERMINISTIC — native det runs differ "
+        + "(first difference at run " + diff_run.to_str() + ")")
+        return finish(cfg, rep, "NOT DETERMINISTIC",
+        "native det runs differ", 1, workdir)
+    }
+    if parity_checked && !parity_ok {
+        println("hls-det: PARITY FAILURE — the interpreter's det run "
+        + "disagrees with the native one")
+        return finish(cfg, rep, "PARITY FAILURE",
+        "interpreter det run differs", 1, workdir)
+    }
+    # ---- the report ----
+    println("hls-det: DETERMINISTIC over " + cfg.runs.to_str()
+    + " native det runs (exit " + exits.get(0).to_str() + ", "
+    + steps_counts.get(0).to_str() + " steps)")
+    if exits.get(0) != 0 {
+        println("           the program itself exits " + exits.get(0).to_str()
+        + " — the interleaving is certified, not the health")
+    }
+    if cfg.no_parity {
+        println("           parity leg SKIPPED (--no-parity, explicit)")
+    } else {
+        println("           parity: interpreter agrees (stdout, trace, exit)")
+    }
+    if cfg.observe_preemptive {
+        let mut obs: str = "varying"
+        if json_is_str(json_object_get(rep.preemptive, "observed")) {
+            obs = json_str_value(json_object_get(rep.preemptive,
+            "observed"))
+        }
+        println("           preemptive observation: " + obs)
+    }
+    if cfg.trace {
+        println("---- interleaving trace (run 0) ----")
+        let mut t: int = 0
+        while t < first_steps.len() {
+            println(first_steps.get(t))
+            t = t + 1
+        }
+        println("---- end trace ----")
+    }
+    return finish(cfg, rep, "DETERMINISTIC", "", 0, workdir)
+}
+
+# op_counts_i(counts) — int list to JsonValue list.
+fn op_counts_i(counts: list[int]) -> list[JsonValue] {
+    let out: list[JsonValue] = []
+    let mut i: int = 0
+    while i < counts.len() {
+        out.push(json_int(counts.get(i)))
+        i = i + 1
+    }
+    return out
+}

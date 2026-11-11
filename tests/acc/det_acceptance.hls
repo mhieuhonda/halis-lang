@@ -7,18 +7,21 @@
 # Run with `make det-acceptance` (which compiles this file and runs it
 # from the repo root).
 #
-# Everything runs through the REAL verifier CLI (python3
-# tools/hls-det.py), the REAL compiler recipe (bin/hlc + gcc -O2 -lm
-# -pthread) and the REAL interpreter (boot.py --det). The armed/unarmed
+# Everything runs through the REAL verifier CLI (bin/hls-det, the
+# native twin of the Python hls-det that retired), the REAL compiler
+# recipe (bin/hlc + gcc -O2 -lm -pthread) and the REAL interpreter
+# (boot.py --det). The armed/unarmed
 # env discipline mirrors the battery: HL_DET_SCHED=1 and HL_DET_TRACE=1
 # are set around an armed child and unset around an unarmed one
 # (std.env; children inherit). The trace is the stderr lines starting
 # with the reserved stem, compared line by line against the
 # hand-computed section-67 policy.
 #
-# The battery imported tools/hls-det.py for the validator's unit checks
-# (parse_trace / check_stdout_protocol — no CLI surface); the gate runs
-# the same module through a tiny python driver in its scratch and
+# The battery imported tools/hls-det.py (retired; tools/hls-det.hls is
+# the native twin) for the validator's unit checks
+# (parse_trace / check_stdout_protocol — no CLI surface); the gate
+# builds the same module natively — a stripped copy of
+# tools/hls-det.hls, fn main cut, behind a tiny driver binary — and
 # asserts the printed CHECK lines under the battery's own names (the
 # repro-gate pattern: the front door a native binary has).
 #
@@ -298,13 +301,7 @@ fn tok(s: str, i: int) -> str {
 }
 
 fn run_det_tool(acc: Acc, args: list[str]) -> RunResult uses Proc {
-    let argv: list[str] = [path_join3(acc.root, "tools/hls-det.py")]
-    let mut i: int = 0
-    while i < args.len() {
-        argv.push(args.get(i))
-        i = i + 1
-    }
-    return run_capture("python3", argv)
+    return run_capture("./bin/hls-det", args)
 }
 
 # dir_names(path) — os.listdir via `ls -A` (dotfiles included), one
@@ -329,42 +326,59 @@ fn dir_names(path: str) -> list[str] uses Proc {
 
 # ----------------------------------------------------------------------------
 # The validator driver (section 7's unit checks — the battery imports
-# tools/hls-det.py; the gate drives the same module and asserts the
+# tools/hls-det.hls; the gate drives the same module and asserts the
 # printed CHECK lines).
 # ----------------------------------------------------------------------------
 
-fn det_val_driver(acc: Acc) -> str uses Fs, Proc {
-    return write_src(acc, "det_val.py",
-        "import importlib.util as ilu, sys\n"
-        + "spec = ilu.spec_from_file_location(\"hls_det\", sys.argv[1])\n"
-        + "m = ilu.module_from_spec(spec)\n"
-        + "sys.modules[\"hls_det\"] = m\n"
-        + "spec.loader.exec_module(m)\n"
-        + "def b(x):\n"
-        + "    return \"1\" if x else \"0\"\n"
-        + "def pe(s):\n"
-        + "    try:\n"
-        + "        m.parse_trace(s.encode())\n"
-        + "    except m.ProtocolError:\n"
-        + "        return True\n"
-        + "    return False\n"
-        + "print(\"CHECK gap \" + b(pe(\"__HLDET_STEP__ 0 t0 recv ch0\\n"
-        + "__HLDET_STEP__ 2 t0 recv ch0\\n\")))\n"
-        + "print(\"CHECK malformed \" + b(pe(\"__HLDET_STEP__ x t0 recv ch0\\n\")))\n"
-        + "print(\"CHECK unknown_op \" + b(pe(\"__HLDET_STEP__ 0 t0 teleport ch0\\n\")))\n"
-        + "print(\"CHECK lookalike \" + b(pe(\"some __HLDET_ chatter\\n\")))\n"
-        + "print(\"CHECK wellformed \" + b(not pe(\"__HLDET_STEP__ 0 t0 spawn t1\\n"
-        + "__HLDET_STEP__ 1 t1 finish\\n\")))\n"
-        + "try:\n"
-        + "    m.check_stdout_protocol(b\"__HLDET_STEP__ 9 t9 recv ch9\\n\")\n"
-        + "    forgery = False\n"
-        + "except m.ProtocolError:\n"
-        + "    forgery = True\n"
-        + "print(\"CHECK stdout_forgery \" + b(forgery))\n"
-        + "steps, chatter = m.parse_trace(b\"__HLDET_STEP__ 0 t0 recv ch0\\n"
+fn det_val_driver(acc: Acc) -> str uses IO, Fs, Proc {
+    let binp: str = scratch(acc, "det_val_driver.bin")
+    if file_exists(binp) {
+        return binp
+    }
+    let src: str = read_file(path_join3(acc.root, "tools/hls-det.hls"))
+    let at: int = src.find("\nfn main(")
+    if at < 0 {
+        return ""
+    }
+    write_file(scratch(acc, "hls_det_mod.hls"), src.slice(0, at + 1))
+    let driver: str = "import \"hls_det_mod.hls\"\n"
+        + "import \"std.str\"\n"
+        + "fn main() -> int uses IO {\n"
+        + "    println(\"CHECK gap \" + b01(parse_trace(\"__HLDET_STEP__ 0 t0 recv ch0\\n"
+        + "__HLDET_STEP__ 2 t0 recv ch0\\n\").err != \"\"))\n"
+        + "    println(\"CHECK malformed \" + b01(parse_trace(\"__HLDET_STEP__ x t0 recv ch0\\n\").err != \"\"))\n"
+        + "    println(\"CHECK unknown_op \" + b01(parse_trace(\"__HLDET_STEP__ 0 t0 teleport ch0\\n\").err != \"\"))\n"
+        + "    println(\"CHECK lookalike \" + b01(parse_trace(\"some __HLDET_ chatter\\n\").err != \"\"))\n"
+        + "    println(\"CHECK wellformed \" + b01(parse_trace(\"__HLDET_STEP__ 0 t0 spawn t1\\n"
+        + "__HLDET_STEP__ 1 t1 finish\\n\").err == \"\"))\n"
+        + "    println(\"CHECK stdout_forgery \" + b01(check_stdout_protocol(\"__HLDET_STEP__ 9 t9 recv ch9\\n\") != \"\"))\n"
+        + "    let t: Trace = parse_trace(\"__HLDET_STEP__ 0 t0 recv ch0\\n"
         + "program chatter\\n\")\n"
-        + "print(\"CHECK chatter \" + b(steps == [\"__HLDET_STEP__ 0 t0 recv ch0\"] "
-        + "and chatter == [\"program chatter\"]))\n")
+        + "    println(\"CHECK chatter \" + b01(t.steps.len() == 1\n"
+        + "        && t.steps.get(0) == \"__HLDET_STEP__ 0 t0 recv ch0\"\n"
+        + "        && t.chatter.len() == 1\n"
+        + "        && t.chatter.get(0) == \"program chatter\"))\n"
+        + "    return 0\n"
+        + "}\n"
+        + "fn b01(x: bool) -> str {\n"
+        + "    if x {\n"
+        + "        return \"1\"\n"
+        + "    }\n"
+        + "    return \"0\"\n"
+        + "}\n"
+    write_file(scratch(acc, "det_val_driver.hls"), driver)
+    let cpath: str = scratch(acc, "det_val_driver.c")
+    let c: RunResult = run_capture(path_join3(acc.root, "bin/hlc"),
+        [scratch(acc, "det_val_driver.hls"), cpath])
+    if c.code != 0 {
+        return ""
+    }
+    let g: RunResult = run_capture("gcc",
+        ["-O2", "-o", binp, cpath, "-lm", "-pthread"])
+    if g.code != 0 {
+        return ""
+    }
+    return binp
 }
 
 fn driver_check(acc: Acc, r: RunResult, key: str, name: str) -> void uses IO {
@@ -724,8 +738,7 @@ fn sec7(acc: Acc) -> void uses IO, Fs, Proc {
 
     # The validator, unit-checked through the same module the battery
     # imports (a python driver — no CLI surface for these internals).
-    let dv: RunResult = run_capture("python3",
-        [det_val_driver(acc), path_join3(acc.root, "tools/hls-det.py")])
+    let dv: RunResult = run_capture(det_val_driver(acc), [])
     driver_check(acc, dv, "gap", "validator: a seq gap is refused")
     driver_check(acc, dv, "malformed", "validator: a malformed record is refused")
     driver_check(acc, dv, "unknown_op", "validator: an unknown op is refused")
