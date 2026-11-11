@@ -1,156 +1,1433 @@
 # ============================================================================
-# hlbindgen.hls — Stage 15 release: a minimal self-hosted C-header -> HLS
-# extern-block generator.
+# tools/hlbindgen.hls — the Stage 15 release C-header -> HLS extern
+# generator, the FULL port of the Python years (the 156-line subset that
+# demoed self-hosting is retired by this file).
 # ----------------------------------------------------------------------------
-# This file demonstrates that the Halis toolchain can self-host its own
-# bindgen. It implements a SUBSET of hlbindgen.py's behaviour:
-#   - reads a .h file from argv[1]
-#   - emits HLS `extern "C" { ... }` declarations for every
-#     `RETTYPE name(params);` declaration in the header
-#   - maps C types (int/long/char/char*/void/double/float) to HLS types
-#   - writes the output to stdout (or argv[2] if given)
-#
-# Limitations vs the Python hlbindgen.py:
-#   - No struct/enum generation.
-#   - No #include resolution.
-#   - No const/volatile qualifier tracking.
-#   - No ABI-compatibility header generation.
+# Everything the .py did, on hand-rolled scanners instead of regexes:
+#   - #include "file.h" resolution through --include search paths
+#     (system <...> includes become comments), circular includes noted
+#   - comment stripping (block + line), preprocessor-line stripping
+#   - struct definitions, multi-declarator lines expanded (int x, *y,
+#     z[4]), nested struct/enum field types, array fields as list[T]
+#   - enum definitions with = value literals (hex/octal/decimal)
+#   - function declarations: array params decay to pointers, char* ->
+#     str, qualifiers stripped (the deep-scan-20 list: extern, __inline,
+#     __restrict and friends), function-pointer params warned + opaque
+#   - reserved-word field sanitisation (c_ prefix)
+#   - the ABI-compatibility header: shadow structs with HLS-ABI types,
+#     _Static_assert on sizes + offsetof, and used function-pointer
+#     definitions that force the LINKER to resolve every extern
 #
 # Usage:
-#   bin/hlc tools/hlbindgen.hls bin/hlbindgen.c
-#   gcc -O2 -o bin/hlbindgen bin/hlbindgen.c -lm
-#   bin/hlbindgen input.h [output.hls]
+#   bin/hlbindgen HEADER.h [-o out.hls] [--abi-header out.h]
+#                        [--include DIR]... [--pure FN]...
 # ============================================================================
 
 import "std.str"
 
-# Convert a C type string to an HLS type string.
-# Returns "int" for any unknown type (opaque pointer fallback).
-fn c_to_hls(c_type: str) -> str {
-    # Strip leading "const " / "volatile ".
-    let mut t: str = c_type
-    if t.starts_with("const ") {
-        t = t.slice(6, t.len())
-    }
-    if t.starts_with("volatile ") {
-        t = t.slice(10, t.len())
-    }
-    # Pointer?
-    if t.contains("*") {
-        # Strip the `*` (replace with space, then trim).
-        let mut base: str = str_replace(t, "*", " ").trim()
-        if base.starts_with("const ") {
-            base = base.slice(6, base.len())
-        }
-        # char* -> str; everything else -> opaque int.
-        if base == "char" {
-            return "str"
-        }
+# ----------------------------------------------------------------------------
+# The type tables.
+# ----------------------------------------------------------------------------
+
+# bg_c_to_hls(t) — the primitive mapping (C_TO_HLS).
+fn bg_c_to_hls(t: str) -> str {
+    if t == "int" || t == "long" || t == "long int" || t == "long long"
+    || t == "long long int" || t == "short" || t == "short int"
+    || t == "unsigned" || t == "unsigned int" || t == "unsigned long"
+    || t == "unsigned long long" || t == "size_t" || t == "ssize_t"
+    || t == "int8_t" || t == "int16_t" || t == "int32_t" || t == "int64_t"
+    || t == "uint8_t" || t == "uint16_t" || t == "uint32_t" || t == "uint64_t"
+    || t == "char" || t == "unsigned char" || t == "signed char" {
         return "int"
-    }
-    # Non-pointer types.
-    if t == "int" || t == "long" || t == "char" || t == "short" {
-        return "int"
-    }
-    if t == "void" {
-        return "void"
     }
     if t == "double" || t == "float" {
         return "float"
     }
+    if t == "void" {
+        return "void"
+    }
     if t == "_Bool" || t == "bool" {
         return "bool"
+    }
+    return ""
+}
+
+# bg_ptr_to_hls(base) — the pointer mapping (PTR_TO_HLS).
+fn bg_ptr_to_hls(base: str) -> str {
+    # char* -> str (HLS bytes are byte-strings); everything else opaque
+    if base == "char" || base == "const char" {
+        return "str"
+    }
+    if base == "void" || base == "int" || base == "long" || base == "short"
+    || base == "float" || base == "double" || base == "unsigned"
+    || base == "unsigned int" || base == "unsigned long"
+    || base == "size_t" || base == "ssize_t" || base == "int8_t"
+    || base == "int16_t" || base == "int32_t" || base == "int64_t"
+    || base == "uint8_t" || base == "uint16_t" || base == "uint32_t"
+    || base == "uint64_t" || base == "_Bool" || base == "bool" {
+        return "int"
+    }
+    return ""
+}
+
+# bg_hls_to_c(t) — the ABI shadow type (HLS int is i64, float is f64,
+# bool is _Bool, str is char*; structs/enums are void*).
+fn bg_hls_to_c(t: str) -> str {
+    if t == "int" {
+        return "int64_t"
+    }
+    if t == "float" {
+        return "double"
+    }
+    if t == "bool" {
+        return "_Bool"
+    }
+    if t == "str" {
+        return "char*"
+    }
+    return "void*"
+}
+
+# ----------------------------------------------------------------------------
+# Small scanners.
+# ----------------------------------------------------------------------------
+
+# bg_is_word(c) — [A-Za-z0-9_].
+fn bg_is_word(c: int) -> bool {
+    return(c >= 97 && c <= 122) || (c >= 65 && c <= 90)
+    || (c >= 48 && c <= 57) || c == 95
+}
+
+# bg_is_ws(c) — whitespace.
+fn bg_is_ws(c: int) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12
+}
+
+# bg_word_at(s, i) — the identifier starting at i ("" when none).
+fn bg_word_at(s: str, i: int) -> str {
+    let mut j: int = i
+    while j < s.len() && bg_is_word(s.byte_at(j)) {
+        j = j + 1
+    }
+    if j == i {
+        return ""
+    }
+    return s.slice(i, j)
+}
+
+# bg_word_before(s, i) — the identifier ending right before i.
+fn bg_word_before(s: str, i: int) -> str {
+    let mut j: int = i
+    while j > 0 && bg_is_word(s.byte_at(j - 1)) {
+        j = j - 1
+    }
+    if j == i {
+        return ""
+    }
+    return s.slice(j, i)
+}
+
+# bg_skip_ws(s, i) — first non-ws position at or after i.
+fn bg_skip_ws(s: str, i: int) -> int {
+    let mut j: int = i
+    while j < s.len() && bg_is_ws(s.byte_at(j)) {
+        j = j + 1
+    }
+    return j
+}
+
+# bg_trim(s) — both ends.
+fn bg_trim(s: str) -> str {
+    let a: int = bg_skip_ws(s, 0)
+    let mut b: int = s.len()
+    while b > a && bg_is_ws(s.byte_at(b - 1)) {
+        b = b - 1
+    }
+    return s.slice(a, b)
+}
+
+# bg_find_from(s, sub, from) — the first index >= from where sub
+# occurs (-1 when never) — the scanner's regex-from-position.
+fn bg_find_from(s: str, sub: str, from: int) -> int {
+    let n: int = s.len()
+    let m: int = sub.len()
+    if m == 0 {
+        return from
+    }
+    let mut i: int = from
+    while i + m <= n {
+        let mut j: int = 0
+        let mut same: bool = true
+        while j < m {
+            if s.byte_at(i + j) != sub.byte_at(j) {
+                same = false
+            }
+            j = j + 1
+        }
+        if same {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# bg_list_has(xs, x) — membership.
+fn bg_list_has(xs: list[str], x: str) -> bool {
+    let mut i: int = 0
+    while i < xs.len() {
+        if xs.get(i) == x {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# bg_is_reserved(name) — the HLS reserved set (field names get a c_
+# prefix when they clash).
+fn bg_is_reserved(name: str) -> bool {
+    let reserved: list[str] = ["fn", "let", "mut", "return", "if", "else",
+    "while", "for", "in", "break", "continue", "struct", "impl", "enum",
+    "import", "uses", "true", "false", "match", "pure", "extern", "int",
+    "float", "bool", "str", "void", "list", "map", "tainted", "self",
+    "IO", "Fs", "Clock", "Args", "Exit", "Net", "Rand", "Proc"]
+    let mut i: int = 0
+    while i < reserved.len() {
+        if reserved.get(i) == name {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# bg_sanitize_field(name) — c_ prefix for reserved words / leading
+# digits.
+fn bg_sanitize_field(name: str) -> str {
+    if bg_is_reserved(name) {
+        return "c_" + name
+    }
+    if name.len() > 0 && name.byte_at(0) >= 48 && name.byte_at(0) <= 57 {
+        return "c_" + name
+    }
+    return name
+}
+
+# bg_strip_qualifiers(t) — const/volatile/restrict/static/register/
+# inline/_Noreturn/extern + the GCC __extension__/__inline/__restrict/
+# __const/__volatile__ spellings (deep-scan-20's list: `extern char
+# *getenv(...)` used to map to opaque int instead of str).
+fn bg_strip_qualifiers(t: str) -> str {
+    let quals: list[str] = ["const", "volatile", "restrict", "static",
+    "register", "inline", "_Noreturn", "extern", "__extension__",
+    "__inline", "__inline__", "__restrict", "__restrict__", "__const",
+    "__volatile__"]
+    let toks: list[str] = t.split(" ")
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < toks.len() {
+        let w: str = toks.get(i)
+        let mut keep: bool = true
+        let mut q: int = 0
+        while q < quals.len() {
+            if w == quals.get(q) {
+                keep = false
+            }
+            q = q + 1
+        }
+        if keep {
+            out.push(w)
+        }
+        i = i + 1
+    }
+    let mut joined: str = ""
+    let mut j: int = 0
+    while j < out.len() {
+        if j > 0 {
+            joined = joined + " "
+        }
+        joined = joined + out.get(j)
+        j = j + 1
+    }
+    return bg_trim(joined)
+}
+
+# bg_parse_int0(s) — C int literal with 0x/0X hex and 0-octal
+# prefixes (Python's int(s, 0)); MIN_INT sentinel on failure.
+fn bg_parse_int0(s: str) -> int {
+    let t: str = bg_trim(s)
+    if t == "" {
+        return -9223372036854775808
+    }
+    let mut body: str = t
+    let mut neg: bool = false
+    if body.len() > 1 && body.byte_at(0) == 45 {
+        neg = true
+        body = body.slice(1, body.len())
+    }
+    # strip the u/l suffixes int() tolerates
+    let mut end: int = body.len()
+    while end > 0 {
+        let c: int = body.byte_at(end - 1)
+        if c == 117 || c == 85 || c == 108 || c == 76 {
+            end = end - 1
+        } else {
+            end = body.len()
+            break
+        }
+    }
+    body = body.slice(0, end)
+    let mut acc: int = 0
+    if body.len() > 2 && body.byte_at(0) == 48
+    && (body.byte_at(1) == 120 || body.byte_at(1) == 88) {
+        let mut i: int = 2
+        while i < body.len() {
+            let c: int = body.byte_at(i)
+            let mut d: int = -1
+            if c >= 48 && c <= 57 {
+                d = c - 48
+            } else if c >= 97 && c <= 102 {
+                d = c - 87
+            } else if c >= 65 && c <= 70 {
+                d = c - 55
+            }
+            if d < 0 {
+                return -9223372036854775808
+            }
+            acc = acc * 16 + d
+            i = i + 1
+        }
+    } else if body.len() > 1 && body.byte_at(0) == 48 {
+        let mut i: int = 1
+        while i < body.len() {
+            let c: int = body.byte_at(i)
+            if c < 48 || c > 55 {
+                return -9223372036854775808
+            }
+            acc = acc * 8 + (c - 48)
+            i = i + 1
+        }
+    } else {
+        let mut i: int = 0
+        while i < body.len() {
+            let c: int = body.byte_at(i)
+            if c < 48 || c > 57 {
+                return -9223372036854775808
+            }
+            acc = acc * 10 + (c - 48)
+            i = i + 1
+        }
+    }
+    if neg {
+        return 0 - acc
+    }
+    return acc
+}
+
+# ----------------------------------------------------------------------------
+# Source preparation: include resolution, comment + directive stripping.
+# ----------------------------------------------------------------------------
+
+# bg_strip_comments(src) — /* ... */ (multiline) and // ... lines.
+fn bg_strip_comments(src: str) -> str {
+    let mut out: str = ""
+    let n: int = src.len()
+    let mut i: int = 0
+    while i < n {
+        let c: int = src.byte_at(i)
+        if c == 47 && i + 1 < n && src.byte_at(i + 1) == 42 {
+            # block comment — find the closing */
+            let mut j: int = i + 2
+            let mut closed: bool = false
+            while j + 1 < n {
+                if src.byte_at(j) == 42 && src.byte_at(j + 1) == 47 {
+                    closed = true
+                    break
+                }
+                j = j + 1
+            }
+            if closed {
+                # keep the newlines the comment spanned (line structure
+                # matters to the line scanners)
+                let mut k: int = i
+                while k < j {
+                    if src.byte_at(k) == 10 {
+                        out = out + "\n"
+                    }
+                    k = k + 1
+                }
+                i = j + 2
+            } else {
+                i = n
+            }
+        } else if c == 47 && i + 1 < n && src.byte_at(i + 1) == 47 {
+            # line comment — to end of line
+            let mut j: int = i + 2
+            while j < n && src.byte_at(j) != 10 {
+                j = j + 1
+            }
+            i = j
+        } else {
+            out = out + src.slice(i, i + 1)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+# bg_strip_directives(src) — lines whose first non-ws char is '#'.
+fn bg_strip_directives(src: str) -> str {
+    let lines: list[str] = src.split("\n")
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < lines.len() {
+        let l: str = lines.get(i)
+        let t: str = bg_trim(l)
+        if t.len() > 0 && t.byte_at(0) == 35 {
+            out.push("")
+        } else {
+            out.push(l)
+        }
+        i = i + 1
+    }
+    let mut joined: str = ""
+    let mut j: int = 0
+    while j < out.len() {
+        if j > 0 {
+            joined = joined + "\n"
+        }
+        joined = joined + out.get(j)
+        j = j + 1
+    }
+    return joined
+}
+
+# bg_path_join(d, f) — one slash.
+fn bg_path_join(d: str, f: str) -> str {
+    if d == "" {
+        return f
+    }
+    if d.byte_at(d.len() - 1) == 47 {
+        return d + f
+    }
+    return d + "/" + f
+}
+
+# bg_resolve_includes(src, include_paths, seen) — "..." includes expand
+# through the search paths (circular ones become notes); <...> system
+# includes become comments.
+fn bg_resolve_includes(src: str, include_paths: list[str], seen: list[str]) -> str uses IO {
+    let lines: list[str] = src.split("\n")
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i)
+        let t: str = bg_trim(line)
+        # #include "file.h"
+        if t.starts_with("#") && t.contains("include") {
+            let rest: str = bg_trim(t.slice(t.find("include") + 7, t.len()))
+            if rest.len() > 2 && rest.byte_at(0) == 34 {
+                # quoted include
+                let close: int = bg_find_from(rest, "\"", 1)
+                if close > 0 {
+                    let path: str = rest.slice(1, close)
+                    let mut resolved: str = ""
+                    let mut d: int = 0
+                    while d < include_paths.len() {
+                        let cand: str = bg_path_join(include_paths.get(d), path)
+                        if file_exists(cand) {
+                            resolved = cand
+                            d = include_paths.len()
+                        }
+                        d = d + 1
+                    }
+                    if resolved != "" {
+                        if bg_list_has(seen, resolved) {
+                            out.push("/* circular include: " + path + " */")
+                        } else {
+                            seen.push(resolved)
+                            out.push("/* begin include: " + resolved + " */")
+                            out.push(bg_resolve_includes(read_file(resolved), include_paths, seen))
+                            out.push("/* end include: " + resolved + " */")
+                        }
+                    } else {
+                        out.push("/* unresolved include: " + path + " */")
+                    }
+                    i = i + 1
+                    continue
+                }
+            }
+            if rest.len() > 2 && rest.byte_at(0) == 60 {
+                # system include <...>
+                let close2: int = rest.find(">")
+                if close2 > 0 {
+                    out.push("/* system include: " + rest.slice(1, close2) + " */")
+                    i = i + 1
+                    continue
+                }
+            }
+        }
+        out.push(line)
+        i = i + 1
+    }
+    let mut joined: str = ""
+    let mut j: int = 0
+    while j < out.len() {
+        if j > 0 {
+            joined = joined + "\n"
+        }
+        joined = joined + out.get(j)
+        j = j + 1
+    }
+    return joined
+}
+
+# ----------------------------------------------------------------------------
+# The declaration model.
+# ----------------------------------------------------------------------------
+
+struct BgField {
+    name: str,
+    ty: str
+}
+
+struct BgStruct {
+    name: str,
+    fields: list[BgField]
+}
+
+struct BgVariant {
+    name: str,
+    val: int
+}
+
+struct BgEnum {
+    name: str,
+    variants: list[BgVariant]
+}
+
+struct BgParam {
+    name: str,
+    ty: str
+}
+
+struct BgFn {
+    name: str,
+    ret: str,
+    params: list[BgParam],
+    span: int
+}
+
+struct BgDecls {
+    functions: list[BgFn],
+    structs: list[BgStruct],
+    enums: list[BgEnum]
+}
+
+# ----------------------------------------------------------------------------
+# The type parser.
+# ----------------------------------------------------------------------------
+
+# bg_parse_c_type(type_str, full) — C type string -> HLS type; "int"
+# (opaque ptr) when unmappable.
+fn bg_parse_c_type(type_str: str, full: str) -> str {
+    let mut t: str = bg_trim(type_str)
+    t = bg_strip_qualifiers(t)
+    # pointer? (the full declaration counts too)
+    let has_star: bool = t.contains("*") || (full != "" && full.contains("*"))
+    if has_star {
+        # strip the stars
+        let mut base: str = ""
+        let mut i: int = 0
+        while i < t.len() {
+            if t.byte_at(i) != 42 {
+                base = base + t.slice(i, i + 1)
+            }
+            i = i + 1
+        }
+        base = bg_strip_qualifiers(bg_trim(base))
+        let mapped: str = bg_ptr_to_hls(base)
+        if mapped != "" {
+            return mapped
+        }
+        return "int"
+    }
+    let prim: str = bg_c_to_hls(t)
+    if prim != "" {
+        return prim
     }
     return "int"
 }
 
-fn main() -> int uses IO {
-    let argv: list[str] = args()
-    if argv.len() < 2 {
-        println("usage: hlbindgen <input.h> [output.hls]")
-        return 1
-    }
-    let in_path: str = argv.get(1)
-    let src: str = read_file(in_path)
+# ----------------------------------------------------------------------------
+# Struct / enum / function scanning.
+# ----------------------------------------------------------------------------
 
-    let mut out_path: str = ""
-    if argv.len() >= 3 {
-        out_path = argv.get(2)
-    }
-
-    let mut output: str = "extern \"C\" {\n"
-    let lines: list[str] = src.split("\n")
+# bg_split_declarators(decl) — top-level commas only (bracket-aware;
+# deep-scan-20: `int x, y;` used to drop x).
+fn bg_split_declarators(decl: str) -> list[str] {
+    let parts: list[str] = []
+    let mut cur: str = ""
+    let mut depth: int = 0
     let mut i: int = 0
-    while i < lines.len() {
-        let line: str = lines.get(i).trim()
-        # Skip empty lines, comments, and preprocessor directives.
-        if line.len() == 0 {
-            i = i + 1
-            continue
+    while i < decl.len() {
+        let c: int = decl.byte_at(i)
+        if c == 40 || c == 91 || c == 123 {
+            depth = depth + 1
+        } else if c == 41 || c == 93 || c == 125 {
+            depth = depth - 1
         }
-        if line.starts_with("#") || line.starts_with("//") {
-            i = i + 1
-            continue
+        if c == 44 && depth == 0 {
+            parts.push(bg_trim(cur))
+            cur = ""
+        } else {
+            cur = cur + decl.slice(i, i + 1)
         }
-        # Match `RETTYPE name(params);` — naive but works for simple headers.
-        # Find the `(` to locate the function name.
-        let paren: int = line.find("(")
-        if paren < 0 {
-            i = i + 1
-            continue
-        }
-        # Find the matching `)` — naive: assume single-line declarations.
-        let close: int = line.find(")")
-        if close < 0 || close < paren {
-            i = i + 1
-            continue
-        }
-        # The function name is the last identifier before `(`.
-        let prefix: str = line.slice(0, paren).trim()
-        # Find the LAST space in the prefix — everything before is the
-        # return type, everything after is the function name.
-        # Deep-scan-12 fix (DSS-T-04): the previous code used
-        # `str_index_of` which returns the FIRST occurrence — correct
-        # for `int foo` but wrong for any multi-word return type like
-        # `unsigned long foo`, `static int foo`, `const char *foo` —
-        # those used to be mis-split (the first space left the function
-        # name with the rest of the type glued onto it). Find the LAST
-        # space manually (HLS has no str.rfind builtin).
-        let mut last_space: int = -1
-        let mut k_idx: int = prefix.len() - 1
-        while k_idx >= 0 {
-            if prefix.byte_at(k_idx) == 32 {
-                last_space = k_idx
-                k_idx = -1
-            } else {
-                k_idx = k_idx - 1
-            }
-        }
-        if last_space < 0 {
-            # `foo(...)` with no return type — assume int.
-            let name: str = prefix
-            let ret: str = "int"
-            output = output + "    fn " + name + "() -> " + ret + " uses IO\n"
-            i = i + 1
-            continue
-        }
-        let ret_type_str: str = prefix.slice(0, last_space).trim()
-        let name: str = prefix.slice(last_space + 1, prefix.len()).trim()
-        let ret: str = c_to_hls(ret_type_str)
-        # Extract params (between paren+1 and close).
-        let params_str: str = line.slice(paren + 1, close).trim()
-        # Emit a simple extern declaration with no typed params (the
-        # caller is expected to annotate them). This is a minimal demo.
-        output = output + "    fn " + name + "() -> " + ret + " uses IO\n"
         i = i + 1
     }
-    output = output + "}\n"
+    let tail: str = bg_trim(cur)
+    if tail != "" {
+        parts.push(tail)
+    }
+    return parts
+}
 
-    if out_path.len() == 0 || out_path == "-" {
-        print(output)
+# bg_word_boundary_ok(s, at, len) — the word at `at` is not part of a
+# longer identifier (a word char must not precede or follow it).
+fn bg_word_boundary_ok(s: str, at: int, wlen: int) -> bool {
+    if at > 0 && bg_is_word(s.byte_at(at - 1)) {
+        return false
+    }
+    if at + wlen < s.len() && bg_is_word(s.byte_at(at + wlen)) {
+        return false
+    }
+    return true
+}
+
+# bg_parse_structs(src, decls) — `struct Name { ... };` (the body runs
+# to the FIRST }, exactly the .py's [^}]*).
+fn bg_parse_structs(src: str, decls: BgDecls) -> void {
+    let n: int = src.len()
+    let mut i: int = 0
+    while i < n {
+        let at: int = bg_find_from(src, "struct", i)
+        if at < 0 {
+            return
+        }
+        i = at + 6
+        if !bg_word_boundary_ok(src, at, 6) {
+            continue
+        }
+        # \s+ name \s* {
+        let p: int = bg_skip_ws(src, at + 6)
+        if p == at + 6 {
+            continue
+        }
+        let sname: str = bg_word_at(src, p)
+        if sname == "" {
+            continue
+        }
+        let q: int = bg_skip_ws(src, p + sname.len())
+        if q >= n || src.byte_at(q) != 123 {
+            continue
+        }
+        # body to the first }
+        let close: int = bg_find_from(src, "}", q + 1)
+        if close < 0 {
+            return
+        }
+        let after: int = bg_skip_ws(src, close + 1)
+        if after >= n || src.byte_at(after) != 59 {
+            # `struct Name { ... } var;` is a usage, not a definition
+            i = close + 1
+            continue
+        }
+        let body: str = src.slice(q + 1, close)
+        # ---- the fields (multi-declarator lines expanded) ----
+        let fields: list[BgField] = []
+        let raw_decls: list[str] = []
+        let stmts: list[str] = body.split(";")
+        let mut si: int = 0
+        while si < stmts.len() {
+            let fd: str = bg_trim(stmts.get(si))
+            if fd == "" {
+                si = si + 1
+                continue
+            }
+            let parts: list[str] = bg_split_declarators(fd)
+            if parts.len() > 1 && parts.get(0).split(" ").len() >= 2 {
+                # the first declarator's type prefix rides the rest
+                let ptoks: list[str] = parts.get(0).split(" ")
+                let mut prefix: str = ""
+                let mut pi: int = 0
+                while pi < ptoks.len() - 1 {
+                    if prefix != "" {
+                        prefix = prefix + " "
+                    }
+                    prefix = prefix + ptoks.get(pi)
+                    pi = pi + 1
+                }
+                raw_decls.push(parts.get(0))
+                let mut xi: int = 1
+                while xi < parts.len() {
+                    raw_decls.push(bg_trim(prefix + " " + parts.get(xi)))
+                    xi = xi + 1
+                }
+            } else {
+                raw_decls.push(fd)
+            }
+            si = si + 1
+        }
+        let mut ri: int = 0
+        while ri < raw_decls.len() {
+            let fdecl: str = raw_decls.get(ri)
+            let toks: list[str] = fdecl.split(" ")
+            if toks.len() < 2 {
+                ri = ri + 1
+                continue
+            }
+            # the LAST token is the name (strip array brackets / stars)
+            let last: str = toks.get(toks.len() - 1)
+            # array field: name[...][...]
+            let mut arr_name: str = ""
+            let mut arr: bool = false
+            if last.contains("[") {
+                let br: int = last.find("[")
+                let nm: str = last.slice(0, br)
+                if nm.len() > 0 && bg_is_word(nm.byte_at(0)) && bg_word_is_ident(nm) {
+                    # all brackets must close on the last token
+                    let mut ok: bool = true
+                    let mut k: int = br
+                    while k < last.len() {
+                        if last.byte_at(k) == 91 {
+                            let closeb: int = bg_find_from(last, "]", k)
+                            if closeb < 0 {
+                                ok = false
+                            }
+                            k = closeb
+                        }
+                        k = k + 1
+                    }
+                    if ok {
+                        arr = true
+                        arr_name = nm
+                    }
+                }
+            }
+            if arr {
+                let mut tjoin: str = ""
+                let mut ti: int = 0
+                while ti < toks.len() - 1 {
+                    if tjoin != "" {
+                        tjoin = tjoin + " "
+                    }
+                    tjoin = tjoin + toks.get(ti)
+                    ti = ti + 1
+                }
+                let base_type: str = bg_parse_c_type(tjoin + " *", "")
+                fields.push(BgField {
+                    name: bg_sanitize_field(arr_name),
+                    ty: "list[" + base_type + "]"
+                })
+                ri = ri + 1
+                continue
+            }
+            # pointer field?
+            let mut zi: int = 0
+            let mut pjoin: str = ""
+            while zi < toks.len() - 1 {
+                if pjoin != "" {
+                    pjoin = pjoin + " "
+                }
+                pjoin = pjoin + toks.get(zi)
+                zi = zi + 1
+            }
+            if pjoin.contains("*") || last.contains("*") {
+                let fname: str = bg_lstrip_stars(last)
+                let base_type2: str = bg_parse_c_type(pjoin + " *", "")
+                fields.push(BgField {
+                    name: bg_sanitize_field(fname),
+                    ty: base_type2
+                })
+                ri = ri + 1
+                continue
+            }
+            # struct/enum keyword anywhere in the type tokens
+            let mut soi: int = -1
+            let mut wi: int = 0
+            while wi < toks.len() - 1 {
+                if toks.get(wi) == "struct" || toks.get(wi) == "enum" {
+                    soi = wi
+                    break
+                }
+                wi = wi + 1
+            }
+            if soi >= 0 && toks.len() >= soi + 3 {
+                fields.push(BgField {
+                    name: bg_sanitize_field(last),
+                    ty: toks.get(soi + 1)
+                })
+                ri = ri + 1
+                continue
+            }
+            # plain type (with the struct/enum Name two-token form)
+            let mut ftype: str = ""
+            if toks.len() >= 3 && (toks.get(0) == "struct" || toks.get(0) == "enum") {
+                ftype = toks.get(1)
+            } else {
+                ftype = bg_parse_c_type(pjoin, "")
+            }
+            fields.push(BgField {
+                name: bg_sanitize_field(last),
+                ty: ftype
+            })
+            ri = ri + 1
+        }
+        # empty structs are skipped (the HLS parser refuses them)
+        if fields.len() > 0 {
+            decls.structs.push(BgStruct {
+                name: sname, fields: fields
+            })
+        }
+        i = after + 1
+    }
+}
+
+# bg_word_is_ident(s) — every char is a word char, first is not a digit.
+fn bg_word_is_ident(s: str) -> bool {
+    if s.len() == 0 {
+        return false
+    }
+    if s.byte_at(0) >= 48 && s.byte_at(0) <= 57 {
+        return false
+    }
+    let mut i: int = 0
+    while i < s.len() {
+        if !bg_is_word(s.byte_at(i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# bg_lstrip_stars(s) — the name with leading *s dropped.
+fn bg_lstrip_stars(s: str) -> str {
+    let mut i: int = 0
+    while i < s.len() && (s.byte_at(i) == 42 || s.byte_at(i) == 32) {
+        i = i + 1
+    }
+    return s.slice(i, s.len())
+}
+
+# bg_parse_enums(src, decls) — `enum Name { A, B = 10, C };`.
+fn bg_parse_enums(src: str, decls: BgDecls) -> void {
+    let n: int = src.len()
+    let mut i: int = 0
+    while i < n {
+        let at: int = bg_find_from(src, "enum", i)
+        if at < 0 {
+            return
+        }
+        i = at + 4
+        if !bg_word_boundary_ok(src, at, 4) {
+            continue
+        }
+        let p: int = bg_skip_ws(src, at + 4)
+        if p == at + 4 {
+            continue
+        }
+        let ename: str = bg_word_at(src, p)
+        if ename == "" {
+            continue
+        }
+        let q: int = bg_skip_ws(src, p + ename.len())
+        if q >= n || src.byte_at(q) != 123 {
+            continue
+        }
+        let close: int = bg_find_from(src, "}", q + 1)
+        if close < 0 {
+            return
+        }
+        let after: int = bg_skip_ws(src, close + 1)
+        if after >= n || src.byte_at(after) != 59 {
+            i = close + 1
+            continue
+        }
+        let body: str = src.slice(q + 1, close)
+        let variants: list[BgVariant] = []
+        let mut next_val: int = 0
+        let pieces: list[str] = body.split(",")
+        let mut vi: int = 0
+        while vi < pieces.len() {
+            let v: str = bg_trim(pieces.get(vi))
+            if v == "" || v.starts_with("/*") || v.starts_with("//") {
+                vi = vi + 1
+                continue
+            }
+            # `NAME` or `NAME = value`
+            let eq: int = v.find("=")
+            let mut vname: str = ""
+            let mut valstr: str = ""
+            if eq < 0 {
+                vname = bg_trim(v)
+            } else {
+                vname = bg_trim(v.slice(0, eq))
+                valstr = bg_trim(v.slice(eq + 1, v.len()))
+            }
+            if !bg_word_is_ident(vname) {
+                vi = vi + 1
+                continue
+            }
+            let mut val: int = next_val
+            if valstr != "" {
+                let parsed: int = bg_parse_int0(valstr)
+                if parsed != -9223372036854775808 {
+                    val = parsed
+                    next_val = parsed
+                }
+            }
+            variants.push(BgVariant {
+                name: vname, val: val
+            })
+            next_val = val + 1
+            vi = vi + 1
+        }
+        if variants.len() > 0 {
+            decls.enums.push(BgEnum {
+                name: ename, variants: variants
+            })
+        }
+        i = after + 1
+    }
+}
+
+# bg_parse_functions(src, decls) — the .py's ^-anchored regex as a
+# region scan over the whole source: a candidate starts at every line
+# start, collects word/space/star chars (newlines INCLUDED — `int\n
+# name(...)` is one declaration to the .py's [\w\s*] class), and must
+# end at '('. The params run to the FIRST ')' followed by ;.
+fn bg_parse_functions(src: str, decls: BgDecls) -> void uses IO {
+    let n: int = src.len()
+    let matched: list[str] = []
+    let mut pos: int = 0
+    while pos <= n {
+        if pos == n {
+            break
+        }
+        # the region: word/ws/star chars from the line start
+        let mut r: int = pos
+        while r < n {
+            let c: int = src.byte_at(r)
+            if bg_is_word(c) || bg_is_ws(c) || c == 42 {
+                r = r + 1
+            } else {
+                break
+            }
+        }
+        let mut advanced: bool = false
+        if r > pos && r < n && src.byte_at(r) == 40 {
+            let head: str = src.slice(pos, r)
+            let hit: BgFn = bg_scan_fn_region(head, src, r)
+            if hit.name != "" && !bg_list_has(matched, hit.name) {
+                matched.push(hit.name)
+                decls.functions.push(hit)
+                pos = bg_next_line_start(src, pos, pos + hit.span)
+                advanced = true
+            } else {
+                # a decl-shaped region the strict scan refused (function
+                # pointers / complex params) — the .py's skip warning
+                let nm: str = bg_region_name(head)
+                if nm != "" && !bg_list_has(matched, nm) {
+                    let semi: int = bg_find_from(src, ";", r)
+                    if semi > 0 {
+                        let mut before: int = semi - 1
+                        while before > r && bg_is_ws(src.byte_at(before)) {
+                            before = before - 1
+                        }
+                        if src.byte_at(before) == 41 {
+                            eprint("warning: skipped unsupported C declaration (function "
+                            + "pointers / complex params are not supported): "
+                            + clip_str(bg_trim(src.slice(pos, semi + 1)), 100) + "\n")
+                        }
+                    }
+                }
+            }
+        }
+        if !advanced {
+            pos = bg_next_line_start(src, pos, pos + 1)
+        }
+    }
+}
+
+# bg_next_line_start(src, from, min) — the first line start at or after
+# min (finditer resumes after the match end; candidates are line
+# starts).
+fn bg_next_line_start(src: str, from: int, min: int) -> int {
+    let n: int = src.len()
+    if min >= n {
+        return n
+    }
+    let nl: int = bg_find_from(src, "\n", min)
+    if nl < 0 {
+        return n
+    }
+    return nl + 1
+}
+
+# bg_has_ws_str(s) — any whitespace byte.
+fn bg_has_ws_str(s: str) -> bool {
+    let mut i: int = 0
+    while i < s.len() {
+        if bg_is_ws(s.byte_at(i)) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# bg_region_name(head) — the last identifier before the region's '('.
+fn bg_region_name(head: str) -> str {
+    let mut e: int = head.len()
+    while e > 0 && (head.byte_at(e - 1) == 42 || bg_is_ws(head.byte_at(e - 1))) {
+        e = e - 1
+    }
+    return bg_word_before(head, e)
+}
+
+# bg_scan_fn_region(head, src, open) — the strict shape over the region
+# head (ending at '(') with the params taken from src after open. The
+# span field carries the match length for the scan advance.
+
+fn bg_scan_fn_region(head: str, src: str, open: int) -> BgFn uses IO {
+    let empty: BgFn = BgFn {
+        name: "", ret: "int", params: [], span: 0
+    }
+    # the name: the identifier ending right before "(", preceded by
+    # stars which are preceded by whitespace (the regex's \s+\**\s*)
+    let nend: int = head.len()
+    let mut nstart: int = nend
+    while nstart > 0 && bg_is_word(head.byte_at(nstart - 1)) {
+        nstart = nstart - 1
+    }
+    if nstart == nend {
+        return empty
+    }
+    let name: str = head.slice(nstart, nend)
+    if !bg_word_is_ident(name) {
+        return empty
+    }
+    let mid: str = head.slice(0, nstart)
+    let mut k: int = mid.len()
+    while k > 0 && (mid.byte_at(k - 1) == 42 || bg_is_ws(mid.byte_at(k - 1))) {
+        k = k - 1
+    }
+    let type_part: str = bg_trim(mid.slice(0, k))
+    if k < mid.len() {
+        let between: str = mid.slice(k, mid.len())
+        if !bg_has_ws_str(between) && type_part != "" {
+            # "char*getenv(" — no separator at all: the regex refused it
+            return empty
+        }
     } else {
-        write_file(out_path, output)
-        println("Wrote " + out_path)
+        if type_part != "" {
+            return empty
+        }
+    }
+    if type_part == "" {
+        return empty
+    }
+    # params: to the FIRST ) after open, then ws* ;
+    let close: int = bg_find_from(src, ")", open + 1)
+    if close < 0 {
+        return empty
+    }
+    let mut after: int = close + 1
+    while after < src.len() && bg_is_ws(src.byte_at(after)) {
+        after = after + 1
+    }
+    if after >= src.len() || src.byte_at(after) != 59 {
+        return empty
+    }
+    let params_str: str = bg_trim(src.slice(open + 1, close))
+    let ret: str = bg_parse_c_type(bg_trim(mid), "")
+    let params: list[BgParam] = []
+    if params_str != "" && params_str != "void" {
+        let pieces: list[str] = params_str.split(",")
+        let mut pi: int = 0
+        while pi < pieces.len() {
+            let p: str = bg_trim(pieces.get(pi))
+            if p == "" || p == "..." {
+                pi = pi + 1
+                continue
+            }
+            let ptoks: list[str] = p.split(" ")
+            if ptoks.len() < 2 {
+                params.push(BgParam {
+                    name: "_arg" + params.len().to_str(),
+                    ty: bg_parse_c_type(p, "")
+                })
+            } else {
+                let last: str = ptoks.get(ptoks.len() - 1)
+                # array param: name[...] decays to a pointer
+                let mut handled: bool = false
+                if last.contains("[") {
+                    let br: int = last.find("[")
+                    let nm: str = last.slice(0, br)
+                    if bg_word_is_ident(nm) {
+                        let mut tjoin: str = ""
+                        let mut ti: int = 0
+                        while ti < ptoks.len() - 1 {
+                            if tjoin != "" {
+                                tjoin = tjoin + " "
+                            }
+                            tjoin = tjoin + ptoks.get(ti)
+                            ti = ti + 1
+                        }
+                        params.push(BgParam {
+                            name: nm,
+                            ty: bg_parse_c_type(tjoin + " *", "")
+                        })
+                        handled = true
+                    }
+                }
+                if !handled {
+                    if last.contains("(") || last.contains(")") {
+                        # function-pointer parameter: opaque ptr + warning
+                        let pname: str = "_arg" + params.len().to_str()
+                        eprint("warning: function-pointer parameter '" + last
+                        + "' in " + p + " is not supported; synthesizing an "
+                        + "opaque ptr parameter named " + pname + "\n")
+                        params.push(BgParam {
+                            name: pname, ty: "int"
+                        })
+                    } else {
+                        let mut tjoin2: str = ""
+                        let mut tj: int = 0
+                        while tj < ptoks.len() - 1 {
+                            if tjoin2 != "" {
+                                tjoin2 = tjoin2 + " "
+                            }
+                            tjoin2 = tjoin2 + ptoks.get(tj)
+                            tj = tj + 1
+                        }
+                        params.push(BgParam {
+                            name: bg_lstrip_stars(last),
+                            ty: bg_parse_c_type(tjoin2, p)
+                        })
+                    }
+                }
+            }
+            pi = pi + 1
+        }
+    }
+    return BgFn {
+        name: name, ret: ret, params: params, span: after + 1 - (open - head.len())
+    }
+}
+
+# clip_str(s, n) — the warning truncation.
+fn clip_str(s: str, n: int) -> str {
+    if s.len() <= n {
+        return s
+    }
+    return s.slice(0, n)
+}
+
+# ----------------------------------------------------------------------------
+# Emission — the extern block and the ABI-compatibility header.
+# ----------------------------------------------------------------------------
+
+# bg_emit_extern_block(decls, abi, pure_fns) — structs + enums first,
+# then the extern block (pure fns marked pure, the rest uses IO).
+fn bg_emit_extern_block(decls: BgDecls, abi: str, pure_fns: list[str]) -> str {
+    let lines: list[str] = []
+    # structs
+    let mut si: int = 0
+    while si < decls.structs.len() {
+        let st: BgStruct = decls.structs.get(si)
+        lines.push("struct " + st.name + " {")
+        let mut fi: int = 0
+        while fi < st.fields.len() {
+            let f: BgField = st.fields.get(fi)
+            lines.push("    " + f.name + ": " + f.ty)
+            fi = fi + 1
+        }
+        lines.push("}")
+        lines.push("")
+        si = si + 1
+    }
+    # enums
+    let mut ei: int = 0
+    while ei < decls.enums.len() {
+        let en: BgEnum = decls.enums.get(ei)
+        lines.push("enum " + en.name + " {")
+        let mut vi: int = 0
+        while vi < en.variants.len() {
+            let mut suffix: str = ""
+            if vi < en.variants.len() - 1 {
+                suffix = ","
+            }
+            lines.push("    " + en.variants.get(vi).name + suffix)
+            vi = vi + 1
+        }
+        lines.push("}")
+        lines.push("")
+        ei = ei + 1
+    }
+    # the extern block
+    lines.push("extern \"" + abi + "\" {")
+    let mut di: int = 0
+    while di < decls.functions.len() {
+        let d: BgFn = decls.functions.get(di)
+        let mut params_str: str = ""
+        let mut pi: int = 0
+        while pi < d.params.len() {
+            if pi > 0 {
+                params_str = params_str + ", "
+            }
+            params_str = params_str + d.params.get(pi).name + ": " + d.params.get(pi).ty
+            pi = pi + 1
+        }
+        if bg_list_has(pure_fns, d.name) {
+            lines.push("    fn " + d.name + "(" + params_str + ") -> " + d.ret + " pure")
+        } else {
+            lines.push("    fn " + d.name + "(" + params_str + ") -> " + d.ret + " uses IO")
+        }
+        di = di + 1
+    }
+    lines.push("}")
+    let mut out: str = ""
+    let mut li: int = 0
+    while li < lines.len() {
+        if li > 0 {
+            out = out + "\n"
+        }
+        out = out + lines.get(li)
+        li = li + 1
+    }
+    return out + "\n"
+}
+
+# bg_emit_abi_header(decls, src_header) — the C header whose compile
+# proves the extern signatures: size/offset _Static_asserts against
+# shadow structs with HLS-ABI types, and used function-pointer
+# definitions that force the LINKER to resolve every extern.
+fn bg_emit_abi_header(decls: BgDecls, src_header: str) -> str {
+    let lines: list[str] = []
+    lines.push("/* HLS ABI-compatibility header (generated by hlbindgen). */")
+    lines.push("/* Compile with: gcc -c -Wall this_header.h */")
+    lines.push("")
+    if src_header != "" {
+        lines.push("#include \"" + src_header + "\"")
+        lines.push("")
+    }
+    lines.push("/* Type-size assertions: HLS int is i64 (8 bytes),")
+    lines.push("   HLS float is f64 (8 bytes), HLS bool is 1 byte.")
+    lines.push("   C externs must use int64_t/double/_Bool to match. */")
+    lines.push("#include <stdint.h>")
+    lines.push("#include <stdbool.h>")
+    lines.push("_Static_assert(sizeof(int64_t) == 8, \"HLS int is i64 (8 bytes)\");")
+    lines.push("_Static_assert(sizeof(double) == 8, \"HLS float is f64 (8 bytes)\");")
+    lines.push("_Static_assert(sizeof(_Bool) == 1, \"HLS bool is 1 byte\");")
+    # per-struct size + field-offset assertions (deep-scan-12)
+    lines.push("#include <stddef.h>")
+    let mut si: int = 0
+    while si < decls.structs.len() {
+        let st: BgStruct = decls.structs.get(si)
+        let shadow_name: str = "_hl_shadow_" + st.name
+        let field_lines: list[str] = []
+        let mut has_array_field: bool = false
+        let mut fi: int = 0
+        while fi < st.fields.len() {
+            let f: BgField = st.fields.get(fi)
+            if f.ty.starts_with("list[") {
+                # array fields bind as pointers: the shadow layout
+                # differs BY DESIGN — no assertion can hold
+                has_array_field = true
+            }
+            field_lines.push("    " + bg_hls_to_c(f.ty) + " " + f.name + ";")
+            fi = fi + 1
+        }
+        if field_lines.len() == 0 {
+            si = si + 1
+            continue
+        }
+        lines.push("/* Struct ABI check for " + st.name + " */")
+        lines.push("struct " + shadow_name + " {")
+        let mut fl: int = 0
+        while fl < field_lines.len() {
+            lines.push(field_lines.get(fl))
+            fl = fl + 1
+        }
+        lines.push("};")
+        if has_array_field {
+            lines.push("/* (size/offset asserts skipped: array fields are "
+            + "bound as pointers, so the shadow layout differs "
+            + "by design) */")
+            si = si + 1
+            continue
+        }
+        lines.push("_Static_assert(sizeof(struct " + shadow_name
+        + ") == sizeof(struct " + st.name + "), \"HLS struct " + st.name
+        + " size mismatch\");")
+        let mut fj: int = 0
+        while fj < st.fields.len() {
+            let f2: BgField = st.fields.get(fj)
+            lines.push("_Static_assert(offsetof(struct " + shadow_name + ", "
+            + f2.name + ") == offsetof(struct " + st.name + ", " + f2.name
+            + "), \"HLS struct " + st.name + " field " + f2.name
+            + " offset mismatch\");")
+            fj = fj + 1
+        }
+        si = si + 1
+    }
+    # function-existence assertions (the LINKER resolves them)
+    lines.push("")
+    lines.push("/* Function-existence assertions: each HLS extern must")
+    lines.push("   resolve to a real C function with a compatible signature. */")
+    let mut di: int = 0
+    while di < decls.functions.len() {
+        let d: BgFn = decls.functions.get(di)
+        lines.push("__attribute__((used)) static void (*const " + d.name
+        + "_ptr)(void) = (void (*)(void))&" + d.name + ";")
+        di = di + 1
+    }
+    lines.push("")
+    let mut out: str = ""
+    let mut li: int = 0
+    while li < lines.len() {
+        if li > 0 {
+            out = out + "\n"
+        }
+        out = out + lines.get(li)
+        li = li + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# main — the CLI law (the .py's flags).
+# ----------------------------------------------------------------------------
+
+fn bg_usage() -> str {
+    return "usage: hlbindgen HEADER.h [-o out.hls] [--abi-header out.h]\n"
+    + "                    [--include DIR]... [--pure FN]...\n"
+}
+
+fn main() -> int uses IO, Args, Exit {
+    let argv: list[str] = args()
+    let n: int = argv.len()
+    let mut i: int = 1
+    let mut header: str = ""
+    let mut output: str = ""
+    let mut abi_header: str = ""
+    let mut have_abi: bool = false
+    let mut includes: list[str] = []
+    let mut pures: list[str] = []
+    while i < n {
+        let a: str = argv.get(i)
+        if a == "-o" || a == "--output" {
+            if i + 1 >= n {
+                eprint("error: " + a + " expects a path\n")
+                return 2
+            }
+            output = argv.get(i + 1)
+            i = i + 2
+            continue
+        }
+        if a == "--abi-header" {
+            if i + 1 >= n {
+                eprint("error: --abi-header expects a path (- for stdout)\n")
+                return 2
+            }
+            have_abi = true
+            abi_header = argv.get(i + 1)
+            i = i + 2
+            continue
+        }
+        if a == "--include" {
+            if i + 1 >= n {
+                eprint("error: --include expects a directory\n")
+                return 2
+            }
+            includes.push(argv.get(i + 1))
+            i = i + 2
+            continue
+        }
+        if a == "--pure" {
+            if i + 1 >= n {
+                eprint("error: --pure expects a function name\n")
+                return 2
+            }
+            pures.push(argv.get(i + 1))
+            i = i + 2
+            continue
+        }
+        if a == "-h" || a == "--help" {
+            println(bg_usage())
+            return 0
+        }
+        if a.starts_with("-") && a != "-" {
+            eprint("error: unknown option: " + a + "\n")
+            return 2
+        }
+        if header == "" {
+            header = a
+            i = i + 1
+            continue
+        }
+        eprint("error: unexpected argument: " + a + "\n")
+        return 2
+    }
+    if header == "" {
+        eprint(bg_usage())
+        return 2
+    }
+    if !file_exists(header) {
+        eprint("error: file not found: " + header + "\n")
+        return 1
+    }
+    let src: str = read_file(header)
+    # the pipeline: includes -> comments -> directives -> decls
+    let resolved: str = bg_resolve_includes(src, includes, [])
+    let stripped: str = bg_strip_directives(bg_strip_comments(resolved))
+    let decls: BgDecls = BgDecls {
+        functions: [],
+        structs: [],
+        enums: []
+    }
+    bg_parse_structs(stripped, decls)
+    bg_parse_enums(stripped, decls)
+    bg_parse_functions(stripped, decls)
+    let out: str = bg_emit_extern_block(decls, "C", pures)
+    if decls.functions.len() == 0 {
+        eprint("warning: no function declarations found in " + header + "\n")
+    }
+    eprint("hlbindgen: " + decls.functions.len().to_str() + " functions, "
+    + decls.structs.len().to_str() + " structs, " + decls.enums.len().to_str()
+    + " enums\n")
+    if output != "" {
+        write_file(output, out)
+        println("Wrote " + output)
+    } else {
+        print(out)
+    }
+    if have_abi {
+        let abi_src: str = bg_emit_abi_header(decls, header)
+        if abi_header == "-" {
+            print("\n/* === ABI HEADER === */\n")
+            print(abi_src)
+        } else {
+            write_file(abi_header, abi_src)
+            println("Wrote ABI header " + abi_header)
+        }
     }
     return 0
 }
+
+# ----------------------------------------------------------------------------
+# End of tools/hlbindgen.hls
+# ============================================================================

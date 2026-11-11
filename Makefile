@@ -124,6 +124,15 @@ $(BIN)/hlboot: tools/hlboot.hls tools/hlfront.hls tools/hlemit.hls src/hlc.hls $
 	@$(BIN)/hlc tools/hlboot.hls $@.c
 	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
 
+# Stage 15: the C-header binder. The FULL port now (structs, enums,
+# include resolution, qualifiers, the ABI header) — the 156-line demo
+# subset is retired.
+$(BIN)/hlbindgen: tools/hlbindgen.hls $(wildcard std/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hlbindgen] hlc compiles the header binder (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hlbindgen.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+
 # Stage 18: the coverage tracker. Halis now (tools/hlcov.hls, the full
 # port of the Python years): the static block count rides hlfront, the
 # dynamic count rides the evaluator's own --cov-run hook.

@@ -2210,20 +2210,29 @@ extern "C" {
 
 ### 24.3. `hlbindgen` — C header → HLS extern generator
 
-Parses simple C function declarations (`int foo(char* s, long n);`),
-maps C types to HLS types, emits an `extern "C" { ... }` block with
-`uses IO` on every function (safe default).
+`bin/hlbindgen` (the full Halis port of the Python years): parses C
+function declarations, struct definitions (multi-declarator lines,
+nested struct/enum field types, array fields as `list[T]`) and enum
+definitions, resolves `#include "..."` through `--include` search
+paths, strips the qualifier list (`const`/`volatile`/`restrict`/
+`static`/`register`/`inline`/`_Noreturn`/`extern` + the GCC
+`__extension__`/`__inline`/`__restrict` spellings), maps C types to
+HLS types, and emits the struct/enum definitions plus an
+`extern "C" { ... }` block with `uses IO` on every function (`--pure`
+FN marks exceptions). `--abi-header PATH` emits the C
+ABI-compatibility header: shadow structs with HLS-ABI types,
+`_Static_assert` on sizes and `offsetof`, and `__attribute__((used))`
+function-pointer definitions that force the linker to resolve every
+extern.
 
 ### 24.4. Limitations
 
-- `extern` is not yet supported in the self-hosted `hlc.hls` (only
-  `boot/` supports it).
-- C codegen for extern fns (forward declarations) is not implemented.
 - Ownership rules across the FFI boundary are not enforced.
-- `bindgen` improvements: struct/enum generation, macro expansion,
-  `#include` resolution, `const`/`volatile` qualifiers.
-- ABI-compatibility checking header.
-- Re-implement `hlbindgen` in HLS itself.
+- Macro expansion is not performed.
+- Variadic declarations are skipped (the `...` token is dropped;
+  HLS callers cannot pass varargs).
+- Function-pointer parameters synthesize an opaque `int` parameter
+  (with a warning).
 
 
 
