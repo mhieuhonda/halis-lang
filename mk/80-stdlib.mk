@@ -236,7 +236,7 @@ sync-acceptance: bin/hlc $(BIN)/hlboot
 		|| (echo "FAIL: feat_stage45_sync differential mismatch" && false)
 	@# Stage 45 acceptance: hlmodel verifies the 2-thread / 2-lock
 	@# acquisition protocol is deadlock-free (Deadlock state unreachable).
-	@python3 tools/hlmodel.py tests/ok/feat_stage45_sync_model.hls --fn step --invariant no_deadlock --init Init > /tmp/s45_hlmodel.txt 2>&1
+	@$(BIN)/hlboot --model tests/ok/feat_stage45_sync_model.hls --fn step --invariant no_deadlock --init Init > /tmp/s45_hlmodel.txt 2>&1
 	@grep -q "invariant 'no_deadlock' holds on every reachable state" /tmp/s45_hlmodel.txt \
 		|| (echo "FAIL: hlmodel deadlock check failed" && cat /tmp/s45_hlmodel.txt && false)
 	@rm -f /tmp/sync_demo /tmp/sync_demo.c /tmp/sync_interp.txt /tmp/sync_nat.txt \
