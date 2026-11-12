@@ -300,7 +300,7 @@ repro-verify:
 # tampered + drifted), the release gate with the transparency
 # chaining, the demos, the tools. Tool-only — no solver needed; the
 # engine half runs native when bin/hlc exists, boot otherwise.
-repro-acceptance: $(BIN)/acc-repro $(BIN)/hls-sbom
+repro-acceptance: $(BIN)/acc-repro $(BIN)/hls-sbom $(BIN)/hls-pkg
 	@echo "[Stage 105 acceptance] running tests/acc/repro_acceptance.hls..."
 	@$(BIN)/acc-repro
 
@@ -352,7 +352,7 @@ sign-selftest:
 # transparency chaining, the ledger, the demos, the tools). Tool-only
 # — no solver, no compiler needed; the native half of the demo parity
 # runs when bin/hlc exists.
-sign-acceptance: $(BIN)/acc-signed
+sign-acceptance: $(BIN)/acc-signed $(BIN)/hls-sign $(BIN)/hls-pkg
 	@echo "[Stage 106 acceptance] running tests/acc/signed_acceptance.hls..."
 	@$(BIN)/acc-signed
 
@@ -422,7 +422,7 @@ tlog-selftest:
 # grown, rewritten), the repo ledger end to end, the demos, the
 # tools). Tool-only — no solver needed; the native half of the demo
 # parity runs when bin/hlc exists.
-tlog-acceptance: $(BIN)/acc-tlog $(BIN)/hlfmt
+tlog-acceptance: $(BIN)/acc-tlog $(BIN)/hlfmt $(BIN)/hls-pkg $(BIN)/hls-tlog $(BIN)/hls-sign
 	@echo "[Stage 107 acceptance] running tests/acc/tlog_acceptance.hls..."
 	@$(BIN)/acc-tlog
 
@@ -607,6 +607,6 @@ auditlog-selftest:
 # refusals, the launcher, the checkpoint verdicts, the ledgers, the
 # demos, the tools). Tool-only — no solver, no kernel half needed;
 # the native half of the demo parity runs when bin/hlc exists.
-auditlog-acceptance: $(BIN)/acc-auditlog
+auditlog-acceptance: $(BIN)/acc-auditlog $(BIN)/hls-pkg $(BIN)/hls-sign
 	@echo "[Stage 112 acceptance] running tests/acc/auditlog_acceptance.hls..."
 	@$(BIN)/acc-auditlog

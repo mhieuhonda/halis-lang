@@ -9350,7 +9350,7 @@ error. `make guarantee` is the fast re-demonstration pass;
 ## 75. The per-commit performance ledger
 
 Stage 124 built the instrument (`hls-bench`); Stage 136 adds the
-memory. `tools/hls-perf.py` is a LEDGER over commits: every `record`
+memory. `hls-perf` is a LEDGER over commits: every `record`
 is one measurement of the tracked suite
 (`benchmarks/regression_watch.hls` — five deterministic,
 allocation-shaped benches over the interpreter's hot shapes: the
@@ -9423,7 +9423,7 @@ Exit codes: 0 verified, 1 a named violation, 2 usage error.
 ## 76. The RSS-over-time ledger
 
 Stage 125 built the instrument (`hls-rss`); Stage 137 adds the
-history. `tools/hls-mem.py` is a LEDGER over commits: every `record`
+history. `hls-mem` is a LEDGER over commits: every `record`
 is one measurement of the tracked canary suite
 (`benchmarks/rss_watch/` — four deterministic, allocation-shaped
 workloads over the memory shapes a release can quietly regress: the
@@ -9544,7 +9544,7 @@ Stage 124 built the runtime instrument; Stage 136 gave runtime its
 ledger; Stage 137 gave memory its own; Stage 138 gives the
 COMPILER's own wall time its ledger — the axis a language release
 can regress that no program benchmark sees: the tool gets slower to
-feed. `tools/hls-ctime.py` is a LEDGER over commits: every `record`
+feed. `hls-ctime` is a LEDGER over commits: every `record`
 is one measurement of the tracked compile suite
 (`benchmarks/ctime_watch/` — five deterministic, compile-shaped
 workloads over the front-end phases a release can quietly slow
@@ -9669,7 +9669,7 @@ Stage 136 gave runtime its ledger; Stage 137 gave memory its own;
 Stage 138 gave the compiler's wall time its own; Stage 139 gives
 the BYTES their ledger — the axis a language release regresses
 that no timing sees: the tool gets fatter to ship, and every
-program it ships gets fatter with it. `tools/hls-size.py` is a
+program it ships gets fatter with it. `hls-size` is a
 LEDGER over commits: every `record` is one size measurement of
 the tracked suite (`benchmarks/size_watch/` — five deterministic,
 size-shaped workloads: the runtime floor `startup_floor`, the

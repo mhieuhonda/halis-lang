@@ -826,7 +826,7 @@ suite-03-selfhost-acceptance: $(BIN)/acc-suite_03_selfhost
 suite-04-optimizers-acceptance: $(BIN)/acc-suite_04_optimizers
 	@$(BIN)/acc-suite_04_optimizers
 
-suite-05-backends-acceptance: $(BIN)/acc-suite_05_backends
+suite-05-backends-acceptance: $(BIN)/acc-suite_05_backends $(BIN)/hls-pkg
 	@$(BIN)/acc-suite_05_backends
 
 suite-06-advanced-acceptance: $(BIN)/acc-suite_06_advanced
@@ -1125,7 +1125,8 @@ migrate-acceptance: $(BIN)/acc-migrate bin/hlc
 
 # Stage 131 (v0.149.0-alpha): the semver-enforcement gate. Eight
 # sections over the REAL hls-pkg CLI and the REAL enforcement module
-# (tools/hpkg_parts/hpkg_semver.py): the convention (check/cmp/bump/sat
+# (bin/hls-pkg semver — the .py's hpkg_parts/hpkg_semver folded in): the
+# convention (check/cmp/bump/sat
 # exits 0/1/2 with the grammar named in every refusal), the grammar and
 # the spec §11 precedence law (the canonical chain, build metadata
 # ignored, numeric < alphanumeric, leading zeros refused, tag_version
@@ -1147,7 +1148,7 @@ migrate-acceptance: $(BIN)/acc-migrate bin/hlc
 # fmt-canonical, lint-clean). The gate runs its own isolated ledger,
 # cache and audit log via the Stage 131 env overrides, so it never
 # touches the developer's real state.
-semver-acceptance: $(BIN)/acc-semver
+semver-acceptance: $(BIN)/acc-semver $(BIN)/hls-pkg
 	@echo "[Stage 131 acceptance] running tests/acc/semver_acceptance.hls..."
 	@$(BIN)/acc-semver
 	@echo "ACCEPTANCE OK: Stage 131 -- semantic-versioning enforcement in hls-pkg"
