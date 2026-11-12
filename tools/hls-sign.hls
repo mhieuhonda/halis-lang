@@ -1,0 +1,5249 @@
+# ============================================================================
+# tools/hls-sign.hls — Stage 106 signed packages (minisign, Ed25519),
+# in Halis — the native twin of tools/hls-sign.py + tools/hlsign_parts/
+# (hlsign_aead.py, hlsign_ed25519.py, hlsign_format.py,
+# hlsign_release.py, all four folded in here, sectioned like the .py).
+# ----------------------------------------------------------------------------
+# Usage (the .py's own grammar, byte for byte on the wire):
+#   hls-sign keygen [-f SECRET] [-p PUBLIC] [-c COMMENT]
+#                   [--password-env VAR] [--iterations N] [--force]
+#   hls-sign sign [-s SECRET] FILE [--sig-out PATH]
+#                 [--trusted-comment STR] [--password-env VAR] [--json]
+#   hls-sign verify [-p PUB | -P HEX] FILE [SIG] [--json]
+#   hls-sign release DIR [--key SECRET] [--out DIR]
+#               [--trusted-comment STR] [--password-env VAR] [--json]
+#   hls-sign verify-release DIR [-p PUB | -P HEX] [--json]
+#   hls-sign selftest
+#
+# The crypto is RFC-pinned, not folklore: Ed25519 (RFC 8032) proven
+# against section 7.1's exact signature bytes, the secret-key box
+# against RFC 8439's ChaCha20-Poly1305 (the sunscreen ciphertext,
+# byte for byte), the KDF against PBKDF2-HMAC-SHA256's standard
+# vectors. Python's bignums become 16x16-bit-limb arithmetic here
+# (the field p = 2^255-19 folds 2^256 -> 38 and 2^255 -> 19; the
+# group order L reduces by shift-subtract) — the algorithms are the
+# .py's own, the limbs are how int64 carries them.
+#
+# The release gate audits the package tree through the REAL front-end
+# (tools/hlfront.hls, linked): one package entry at a time, in a probe
+# child that re-execs this binary with --probe-audit so a program that
+# does not check is UNAUDITABLE, never a crash. The ledger is the same
+# .hls-pkg-transparency.log every stage appends to (one "sign" record,
+# chained); the audit log is Stage 112's .hls-audit.log (sign.keygen /
+# sign.sign / sign.release, refusals recorded exactly like successes).
+#
+# Exit contract: 0 verified/released; 1 on any refusal; 2 usage.
+# ============================================================================
+
+import "./hlfront.hls"
+import "std.str"
+import "std.result"
+import "std.sha256"
+import "std.base64"
+import "std.hex"
+import "std.json"
+import "std.hash"
+
+# ----------------------------------------------------------------------------
+# Constants (the .py's).
+# ----------------------------------------------------------------------------
+
+fn tool_name() -> str {
+    return "hls-sign"
+}
+
+fn tool_version() -> str {
+    return "0.125.0-alpha"
+}
+
+# hlaudit_parts/hal_common.VERSION — the toolchain release the AUDIT
+# log's entries stamp (hal_ops.record's default tool_version).
+fn audit_tool_version() -> str {
+    return "0.131.0-alpha"
+}
+
+fn sig_algo() -> str {
+    return "Ed"
+}
+
+fn secret_marker() -> str {
+    return "hs"
+}
+
+fn kdf_id() -> str {
+    return "PD"
+}
+
+fn kdf_aad() -> str {
+    return "hls-sign-key"
+}
+
+fn default_iterations() -> int {
+    return 200000
+}
+
+fn default_pub_name() -> str {
+    return "hls-sign.pub"
+}
+
+fn default_secret_name() -> str {
+    return "hls-sign.key"
+}
+
+fn pub_comment() -> str {
+    return "minisign public key"
+}
+
+fn statement_schema() -> str {
+    return "hls-release-statement/v1"
+}
+
+fn statement_suffix() -> str {
+    return ".release.json"
+}
+
+fn sig_suffix() -> str {
+    return ".minisig"
+}
+
+# ============================================================================
+# Small utilities — Fail, byte classes, find_from, paths, sorting.
+# ============================================================================
+
+struct Fail {
+    msg: str
+}
+
+fn fail(msg: str) -> Fail {
+    return Fail {
+        msg: msg
+    }
+}
+
+fn is_digit_b(c: int) -> bool {
+    return c >= 48 && c <= 57
+}
+
+fn is_alpha_b(c: int) -> bool {
+    return(c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+}
+
+fn hex_val_b(c: int) -> int {
+    if c >= 48 && c <= 57 {
+        return c - 48
+    }
+    if c >= 97 && c <= 102 {
+        return c - 87
+    }
+    if c >= 65 && c <= 70 {
+        return c - 55
+    }
+    return -1
+}
+
+fn hex_digit_lc(n: int) -> str {
+    let digits: str = "0123456789abcdef"
+    return digits.slice(n, n + 1)
+}
+
+# hex4(n) — four lowercase hex digits (the \uXXXX escapes).
+fn hex4(n: int) -> str {
+    return hex_digit_lc(int_and(int_shr(n, 12), 15))
+    + hex_digit_lc(int_and(int_shr(n, 8), 15))
+    + hex_digit_lc(int_and(int_shr(n, 4), 15))
+    + hex_digit_lc(int_and(n, 15))
+}
+
+# find_from(s, needle, from) — str.find anchored at a start offset.
+fn find_from(s: str, needle: str, from: int) -> int {
+    let n: int = s.len()
+    let m: int = needle.len()
+    if m == 0 {
+        if from <= n {
+            return from
+        }
+        return -1
+    }
+    let mut i: int = from
+    if i < 0 {
+        i = 0
+    }
+    while i + m <= n {
+        let mut k: int = 0
+        let mut same: bool = true
+        while k < m {
+            if s.byte_at(i + k) != needle.byte_at(k) {
+                same = false
+                k = m
+            }
+            k = k + 1
+        }
+        if same {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn join_strs(parts: list[str], sep: str) -> str {
+    return str_join(parts, sep)
+}
+
+# ----------------------------------------------------------------------------
+# Path plumbing — the os.path slice the .py uses (lexical; the repo's
+# own no-symlink convention, hlfmt's and hls-sbom's before it).
+# ----------------------------------------------------------------------------
+
+fn path_is_abs(p: str) -> bool {
+    return p.len() > 0 && p.byte_at(0) == 47
+}
+
+fn path_join2(base: str, rel: str) -> str {
+    if rel.len() == 0 {
+        if base.len() == 0 {
+            return ""
+        }
+        return base
+    }
+    if path_is_abs(rel) {
+        return rel
+    }
+    if base.len() == 0 {
+        return rel
+    }
+    if base.byte_at(base.len() - 1) == 47 {
+        return base + rel
+    }
+    return base + "/" + rel
+}
+
+fn path_dirname(p: str) -> str {
+    let n: int = p.len()
+    if n == 0 {
+        return "."
+    }
+    let mut k: int = n - 1
+    while k > 0 && p.byte_at(k) == 47 {
+        k = k - 1
+    }
+    while k >= 0 {
+        if p.byte_at(k) == 47 {
+            if k == 0 {
+                return "/"
+            }
+            return p.slice(0, k)
+        }
+        k = k - 1
+    }
+    return "."
+}
+
+fn path_basename(p: str) -> str {
+    let n: int = p.len()
+    if n == 0 {
+        return ""
+    }
+    let mut k: int = n - 1
+    while k > 0 && p.byte_at(k) == 47 {
+        k = k - 1
+    }
+    let mut j: int = k
+    while j >= 0 {
+        if p.byte_at(j) == 47 {
+            return p.slice(j + 1, k + 1)
+        }
+        j = j - 1
+    }
+    return p.slice(0, k + 1)
+}
+
+fn split_components(p: str) -> list[str] {
+    let out: list[str] = []
+    let n: int = p.len()
+    let mut i: int = 0
+    while i < n {
+        let mut j: int = i
+        while j < n && p.byte_at(j) != 47 {
+            j = j + 1
+        }
+        out.push(p.slice(i, j))
+        i = j + 1
+    }
+    return out
+}
+
+fn norm_path(p: str) -> str {
+    if p == "" {
+        return "."
+    }
+    let abs: bool = path_is_abs(p)
+    let comps: list[str] = split_components(p)
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < comps.len() {
+        let c: str = comps.get(i)
+        if c == "" || c == "." {
+            i = i + 1
+            continue
+        }
+        if c == ".." {
+            if out.len() > 0 && out.get(out.len() - 1) != ".." {
+                out.pop()
+            } else if !abs {
+                out.push("..")
+            }
+            i = i + 1
+            continue
+        }
+        out.push(c)
+        i = i + 1
+    }
+    if out.len() == 0 {
+        if abs {
+            return "/"
+        }
+        return "."
+    }
+    let mut r: str = ""
+    if abs {
+        r = "/"
+    }
+    let mut j: int = 0
+    while j < out.len() {
+        r = r + out.get(j)
+        if j + 1 < out.len() {
+            r = r + "/"
+        }
+        j = j + 1
+    }
+    return r
+}
+
+fn realpath_lex(p: str) -> str uses Proc {
+    let mut raw: str = p
+    if !path_is_abs(raw) {
+        raw = cwd_get() + "/" + raw
+    }
+    return norm_path(raw)
+}
+
+fn is_file_h(p: str) -> bool uses Fs {
+    return file_exists(p) && !fs_is_dir(p)
+}
+
+fn is_dir_h(p: str) -> bool uses Fs {
+    return fs_is_dir(p)
+}
+
+fn read_or(p: str, default_value: str) -> str uses Fs {
+    if file_exists(p) {
+        return read_file(p)
+    }
+    return default_value
+}
+
+fn sha256_file_h(p: str) -> str uses Fs {
+    return sha256_hex(read_or(p, ""))
+}
+
+# ----------------------------------------------------------------------------
+# Sorting — Python's sorted() over str lists (byte-lexicographic).
+# ----------------------------------------------------------------------------
+
+fn merge_strs(a: list[str], b: list[str]) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    let mut j: int = 0
+    while i < a.len() && j < b.len() {
+        if !(b.get(j) < a.get(i)) {
+            out.push(a.get(i))
+            i = i + 1
+        } else {
+            out.push(b.get(j))
+            j = j + 1
+        }
+    }
+    while i < a.len() {
+        out.push(a.get(i))
+        i = i + 1
+    }
+    while j < b.len() {
+        out.push(b.get(j))
+        j = j + 1
+    }
+    return out
+}
+
+fn sort_strs(xs: list[str]) -> list[str] {
+    if xs.len() <= 1 {
+        let one: list[str] = []
+        let mut i0: int = 0
+        while i0 < xs.len() {
+            one.push(xs.get(i0))
+            i0 = i0 + 1
+        }
+        return one
+    }
+    let mid: int = xs.len() / 2
+    let left_in: list[str] = []
+    let right_in: list[str] = []
+    let mut i: int = 0
+    while i < mid {
+        left_in.push(xs.get(i))
+        i = i + 1
+    }
+    while i < xs.len() {
+        right_in.push(xs.get(i))
+        i = i + 1
+    }
+    return merge_strs(sort_strs(left_in), sort_strs(right_in))
+}
+
+fn sorted_unique(xs: list[str]) -> list[str] {
+    let s: list[str] = sort_strs(xs)
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < s.len() {
+        if out.len() == 0 || s.get(i) != out.get(out.len() - 1) {
+            out.push(s.get(i))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn sg_has(xs: list[str], x: str) -> bool {
+    let mut i: int = 0
+    while i < xs.len() {
+        if xs.get(i) == x {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# ============================================================================
+# Python-compatible JSON — JDoc (the model) and the three serialisations
+# the .py uses: json.dumps(indent=2, sort_keys=True) for documents and
+# reports, json.dumps(sort_keys=True, separators=(",", ":")) for the
+# chain hashes, and json.dumps(sort_keys=True) (default ", " / ": "
+# separators) for the transparency-log line. Escaping is ensure_ascii.
+# (The same emitter family hls-sbom.hls carries — one law, two tools.)
+# ============================================================================
+
+struct JDoc {
+    kind: str, # "null" | "bool" | "int" | "str" | "arr" | "obj"
+    sval: str,
+    ival: int,
+    bval: bool,
+    arr: list[JDoc],
+    keys: list[str],
+    vals: list[JDoc]
+}
+
+fn jd_null() -> JDoc {
+    return JDoc {
+        kind: "null", sval: "", ival: 0, bval: false, arr: [],
+        keys: [], vals: []
+    }
+}
+
+fn jd_bool(v: bool) -> JDoc {
+    return JDoc {
+        kind: "bool", sval: "", ival: 0, bval: v, arr: [],
+        keys: [], vals: []
+    }
+}
+
+fn jd_int(v: int) -> JDoc {
+    return JDoc {
+        kind: "int", sval: "", ival: v, bval: false, arr: [],
+        keys: [], vals: []
+    }
+}
+
+fn jd_str(v: str) -> JDoc {
+    return JDoc {
+        kind: "str", sval: v, ival: 0, bval: false, arr: [],
+        keys: [], vals: []
+    }
+}
+
+fn jd_arr(items: list[JDoc]) -> JDoc {
+    return JDoc {
+        kind: "arr", sval: "", ival: 0, bval: false, arr: items,
+        keys: [], vals: []
+    }
+}
+
+fn jd_obj(keys: list[str], vals: list[JDoc]) -> JDoc {
+    return JDoc {
+        kind: "obj", sval: "", ival: 0, bval: false, arr: [],
+        keys: keys, vals: vals
+    }
+}
+
+# obj_set(doc, key, val) — set/replace one key in an object doc.
+fn obj_set(doc: JDoc, key: str, val: JDoc) -> void {
+    let mut i: int = 0
+    while i < doc.keys.len() {
+        if doc.keys.get(i) == key {
+            doc.vals.set(i, val)
+            return
+        }
+        i = i + 1
+    }
+    doc.keys.push(key)
+    doc.vals.push(val)
+}
+
+fn obj_get(doc: JDoc, key: str) -> JDoc {
+    let mut i: int = 0
+    while i < doc.keys.len() {
+        if doc.keys.get(i) == key {
+            return doc.vals.get(i)
+        }
+        i = i + 1
+    }
+    return jd_null()
+}
+
+fn obj_get_str(doc: JDoc, key: str) -> str {
+    let v: JDoc = obj_get(doc, key)
+    if v.kind == "str" {
+        return v.sval
+    }
+    return ""
+}
+
+fn obj_get_int(doc: JDoc, key: str) -> int {
+    let v: JDoc = obj_get(doc, key)
+    if v.kind == "int" {
+        return v.ival
+    }
+    return 0
+}
+
+# utf8_at(s, i) — the codepoint at i (len 1..4); [-1, -1] on invalid.
+fn utf8_at(s: str, i: int) -> list[int] {
+    let n: int = s.len()
+    let b0: int = s.byte_at(i)
+    if b0 < 128 {
+        return[b0, 1]
+    }
+    if b0 >= 192 && b0 < 224 && i + 1 < n {
+        let b1: int = s.byte_at(i + 1)
+        if b1 >= 128 && b1 < 192 {
+            return[(b0 - 192) * 64 + (b1 - 128), 2]
+        }
+        return[-1, -1]
+    }
+    if b0 >= 224 && b0 < 240 && i + 2 < n {
+        let b1: int = s.byte_at(i + 1)
+        let b2: int = s.byte_at(i + 2)
+        if b1 >= 128 && b1 < 192 && b2 >= 128 && b2 < 192 {
+            return[(b0 - 224) * 4096 + (b1 - 128) * 64 + (b2 - 128), 3]
+        }
+        return[-1, -1]
+    }
+    if b0 >= 240 && b0 < 248 && i + 3 < n {
+        let b1: int = s.byte_at(i + 1)
+        let b2: int = s.byte_at(i + 2)
+        let b3: int = s.byte_at(i + 3)
+        if b1 >= 128 && b1 < 192 && b2 >= 128 && b2 < 192
+        && b3 >= 128 && b3 < 192 {
+            return[(b0 - 240) * 262144 + (b1 - 128) * 4096
+            + (b2 - 128) * 64 + (b3 - 128), 4]
+        }
+        return[-1, -1]
+    }
+    return[-1, -1]
+}
+
+# py_json_escape(s) — Python's ensure_ascii string body.
+fn py_json_escape(s: str) -> str {
+    let mut out: str = ""
+    let n: int = s.len()
+    let mut i: int = 0
+    while i < n {
+        let c: int = s.byte_at(i)
+        if c == 34 {
+            out = out + "\\\""
+            i = i + 1
+            continue
+        }
+        if c == 92 {
+            out = out + "\\\\"
+            i = i + 1
+            continue
+        }
+        if c == 8 {
+            out = out + "\\b"
+            i = i + 1
+            continue
+        }
+        if c == 9 {
+            out = out + "\\t"
+            i = i + 1
+            continue
+        }
+        if c == 10 {
+            out = out + "\\n"
+            i = i + 1
+            continue
+        }
+        if c == 12 {
+            out = out + "\\f"
+            i = i + 1
+            continue
+        }
+        if c == 13 {
+            out = out + "\\r"
+            i = i + 1
+            continue
+        }
+        if c < 32 {
+            out = out + "\\u" + hex4(c)
+            i = i + 1
+            continue
+        }
+        if c < 127 {
+            out = out + s.slice(i, i + 1)
+            i = i + 1
+            continue
+        }
+        let cp: list[int] = utf8_at(s, i)
+        if cp.get(0) < 0 {
+            out = out + s.slice(i, i + 1)
+            i = i + 1
+            continue
+        }
+        if cp.get(0) < 65536 {
+            out = out + "\\u" + hex4(cp.get(0))
+        } else {
+            let v: int = cp.get(0) - 65536
+            let hi: int = 55296 + v / 1024
+            let lo: int = 56320 + v % 1024
+            out = out + "\\u" + hex4(hi) + "\\u" + hex4(lo)
+        }
+        i = i + cp.get(1)
+    }
+    return out
+}
+
+fn jd_scalar_text(d: JDoc) -> str {
+    if d.kind == "null" {
+        return "null"
+    }
+    if d.kind == "bool" {
+        if d.bval {
+            return "true"
+        }
+        return "false"
+    }
+    if d.kind == "int" {
+        return d.ival.to_str()
+    }
+    return "\"" + py_json_escape(d.sval) + "\""
+}
+
+# jd_sorted_order(d) — the key indices in sorted-key order.
+fn jd_sorted_order(d: JDoc) -> list[int] {
+    let order: list[int] = []
+    let mut i: int = 0
+    while i < d.keys.len() {
+        order.push(i)
+        i = i + 1
+    }
+    let mut a: int = 0
+    while a < order.len() {
+        let mut b: int = a + 1
+        while b < order.len() {
+            if d.keys.get(order.get(b)) < d.keys.get(order.get(a)) {
+                let t: int = order.get(a)
+                order.set(a, order.get(b))
+                order.set(b, t)
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    return order
+}
+
+# py_json_dump_at(d, indent, pretty) — the recursive serializer.
+# pretty: indent=2 with sort_keys. compact: separators (",", ":").
+fn py_json_dump_at(d: JDoc, indent: int, pretty: bool) -> str {
+    if d.kind == "arr" {
+        if d.arr.len() == 0 {
+            return "[]"
+        }
+        let mut pad: str = ""
+        let mut k: int = 0
+        while k < indent {
+            pad = pad + "  "
+            k = k + 1
+        }
+        let in_pad: str = pad + "  "
+        if pretty {
+            let mut out: str = "[\n"
+            let mut i: int = 0
+            while i < d.arr.len() {
+                out = out + in_pad
+                + py_json_dump_at(d.arr.get(i), indent + 1, true)
+                if i + 1 < d.arr.len() {
+                    out = out + ","
+                }
+                out = out + "\n"
+                i = i + 1
+            }
+            return out + pad + "]"
+        }
+        let mut out2: str = "["
+        let mut j: int = 0
+        while j < d.arr.len() {
+            out2 = out2 + py_json_dump_at(d.arr.get(j), indent, false)
+            if j + 1 < d.arr.len() {
+                out2 = out2 + ","
+            }
+            j = j + 1
+        }
+        return out2 + "]"
+    }
+    if d.kind == "obj" {
+        if d.keys.len() == 0 {
+            return "{}"
+        }
+        let order: list[int] = jd_sorted_order(d)
+        if pretty {
+            let mut pad: str = ""
+            let mut k: int = 0
+            while k < indent {
+                pad = pad + "  "
+                k = k + 1
+            }
+            let in_pad: str = pad + "  "
+            let mut out: str = "{\n"
+            let mut j: int = 0
+            while j < order.len() {
+                let idx: int = order.get(j)
+                out = out + in_pad + "\""
+                + py_json_escape(d.keys.get(idx)) + "\": "
+                + py_json_dump_at(d.vals.get(idx), indent + 1, true)
+                if j + 1 < order.len() {
+                    out = out + ","
+                }
+                out = out + "\n"
+                j = j + 1
+            }
+            return out + pad + "}"
+        }
+        let mut out2: str = "{"
+        let mut j2: int = 0
+        while j2 < order.len() {
+            let idx2: int = order.get(j2)
+            out2 = out2 + "\"" + py_json_escape(d.keys.get(idx2))
+            + "\":" + py_json_dump_at(d.vals.get(idx2), indent, false)
+            if j2 + 1 < order.len() {
+                out2 = out2 + ","
+            }
+            j2 = j2 + 1
+        }
+        return out2 + "}"
+    }
+    return jd_scalar_text(d)
+}
+
+# py_json_dump(d) — json.dumps(d, indent=2, sort_keys=True).
+fn py_json_dump(d: JDoc) -> str {
+    return py_json_dump_at(d, 0, true)
+}
+
+# py_json_canon(d) — json.dumps(d, sort_keys=True, separators=(",", ":")).
+fn py_json_canon(d: JDoc) -> str {
+    return py_json_dump_at(d, 0, false)
+}
+
+# py_json_line(d) — json.dumps(d, sort_keys=True) with the default
+# ", " / ": " separators — the appended transparency-log line.
+fn py_json_line(d: JDoc) -> str {
+    if d.kind == "arr" {
+        let mut out: str = "["
+        let mut i: int = 0
+        while i < d.arr.len() {
+            out = out + py_json_line(d.arr.get(i))
+            if i + 1 < d.arr.len() {
+                out = out + ", "
+            }
+            i = i + 1
+        }
+        return out + "]"
+    }
+    if d.kind == "obj" {
+        if d.keys.len() == 0 {
+            return "{}"
+        }
+        let order: list[int] = jd_sorted_order(d)
+        let mut out: str = "{"
+        let mut j: int = 0
+        while j < order.len() {
+            let idx: int = order.get(j)
+            out = out + "\"" + py_json_escape(d.keys.get(idx))
+            + "\": " + py_json_line(d.vals.get(idx))
+            if j + 1 < order.len() {
+                out = out + ", "
+            }
+            j = j + 1
+        }
+        return out + "}"
+    }
+    return jd_scalar_text(d)
+}
+
+# jv_to_jdoc(v) — a parsed std.json value to the emitter's model
+# (the statement's flat scalars; floats never appear in this tool's
+# documents, an integral float maps to int, anything else to 0).
+fn jv_to_jdoc(v: JsonValue) -> JDoc {
+    if v.kind == "null" {
+        return jd_null()
+    }
+    if v.kind == "bool" {
+        return jd_bool(v.bval)
+    }
+    if v.kind == "int" {
+        return jd_int(v.ival)
+    }
+    if v.kind == "str" {
+        return jd_str(v.sval)
+    }
+    if v.kind == "array" {
+        let items: list[JDoc] = []
+        let mut i: int = 0
+        while i < v.arr.len() {
+            items.push(jv_to_jdoc(v.arr.get(i)))
+            i = i + 1
+        }
+        return jd_arr(items)
+    }
+    if v.kind == "object" {
+        let keys: list[str] = []
+        let vals: list[JDoc] = []
+        let mut j: int = 0
+        while j < v.obj_keys.len() {
+            keys.push(v.obj_keys.get(j))
+            vals.push(jv_to_jdoc(v.obj_vals.get(j)))
+            j = j + 1
+        }
+        return jd_obj(keys, vals)
+    }
+    return jd_int(0)
+}
+
+# ============================================================================
+# SHA-512 (RFC 6234) — the 64-bit words on int64 (two's-complement for
+# the >= 2^63 constants; hash_u64_add / hash_u64_rotr from std.hash
+# carry the bit patterns, int_xor / int_shr are the native builtins).
+# Ed25519's one hash (RFC 8032 uses SHA-512, not SHA-256).
+# ============================================================================
+
+fn sha512_iv() -> list[int] {
+    return[
+    7640891576956012808, -4942790177534073029,
+    4354685564936845355, -6534734903238641935,
+    5840696475078001361, -7276294671716946913,
+    2270897969802886507, 6620516959819538809
+    ]
+}
+
+fn sha512_k() -> list[int] {
+    return[
+    4794697086780616226, 8158064640168781261,
+     -5349999486874862801, -1606136188198331460,
+    4131703408338449720, 6480981068601479193,
+     -7908458776815382629, -6116909921290321640,
+     -2880145864133508542, 1334009975649890238,
+    2608012711638119052, 6128411473006802146,
+    8268148722764581231, -9160688886553864527,
+     -7215885187991268811, -4495734319001033068,
+     -1973867731355612462, -1171420211273849373,
+    1135362057144423861, 2597628984639134821,
+    3308224258029322869, 5365058923640841347,
+    6679025012923562964, 8573033837759648693,
+     -7476448914759557205, -6327057829258317296,
+     -5763719355590565569, -4658551843659510044,
+     -4116276920077217854, -3051310485924567259,
+    489312712824947311, 1452737877330783856,
+    2861767655752347644, 3322285676063803686,
+    5560940570517711597, 5996557281743188959,
+    7280758554555802590, 8532644243296465576,
+     -9096487096722542874, -7894198246740708037,
+     -6719396339535248540, -6333637450476146687,
+     -4446306890439682159, -4076793802049405392,
+     -3345356375505022440, -2983346525034927856,
+     -860691631967231958, 1182934255886127544,
+    1847814050463011016, 2177327727835720531,
+    2830643537854262169, 3796741975233480872,
+    4115178125766777443, 5681478168544905931,
+    6601373596472566643, 7507060721942968483,
+    8399075790359081724, 8693463985226723168,
+     -8878714635349349518, -8302665154208450068,
+     -8016688836872298968, -6606660893046293015,
+     -4685533653050689259, -4147400797238176981,
+     -3880063495543823972, -3348786107499101689,
+     -1523767162380948706, -757361751448694408,
+    500013540394364858, 748580250866718886,
+    1242879168328830382, 1977374033974150939,
+    2944078676154940804, 3659926193048069267,
+    4368137639120453308, 4836135668995329356,
+    5532061633213252278, 6448918945643986474,
+    6902733635092675308, 7801388544844847127
+    ]
+}
+
+# u64_of_be(b, off) — 8 big-endian bytes as a 64-bit pattern.
+fn u64_of_be(b: str, off: int) -> int {
+    let mut w: int = int_shl(b.byte_at(off), 56)
+    w = int_or(w, int_shl(b.byte_at(off + 1), 48))
+    w = int_or(w, int_shl(b.byte_at(off + 2), 40))
+    w = int_or(w, int_shl(b.byte_at(off + 3), 32))
+    w = int_or(w, int_shl(b.byte_at(off + 4), 24))
+    w = int_or(w, int_shl(b.byte_at(off + 5), 16))
+    w = int_or(w, int_shl(b.byte_at(off + 6), 8))
+    w = int_or(w, b.byte_at(off + 7))
+    return w
+}
+
+# u64_bytes_be(w) — the 64-bit pattern as 8 big-endian bytes.
+fn u64_bytes_be(w: int) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < 8 {
+        out = out + chr(int_and(int_shr(w, 56 - 8 * i), 255))
+        i = i + 1
+    }
+    return out
+}
+
+# sha512_hash(data) — the 64-byte digest.
+fn sha512_hash(data: str) -> str {
+    let orig_len: int = data.len()
+    let bits: int = orig_len * 8
+    # pad: 0x80, zeros to 112 mod 128, 16-byte big-endian bit length
+    # (the high 8 bytes are zero for any str the runtime can carry).
+    let after80: int = orig_len + 1
+    let mod_after: int = after80 - (after80 / 128) * 128
+    let zeros: int = (112 - mod_after + 128) - ((112 - mod_after + 128) / 128) * 128
+    let mut padded: str = data + chr(128)
+    let mut zi: int = 0
+    while zi < zeros {
+        padded = padded + chr(0)
+        zi = zi + 1
+    }
+    padded = padded + str_repeat(chr(0), 8)
+    let mut lb: str = ""
+    let mut bi: int = 0
+    while bi < 8 {
+        lb = lb + chr(int_and(int_shr(bits, 56 - 8 * bi), 255))
+        bi = bi + 1
+    }
+    padded = padded + lb
+    let k: list[int] = sha512_k()
+    let mut state: list[int] = sha512_iv()
+    let n_blocks: int = padded.len() / 128
+    let mut blk: int = 0
+    while blk < n_blocks {
+        let block: str = padded.slice(blk * 128, (blk + 1) * 128)
+        let w: list[int] = []
+        let mut wi: int = 0
+        while wi < 16 {
+            w.push(u64_of_be(block, wi * 8))
+            wi = wi + 1
+        }
+        wi = 16
+        while wi < 80 {
+            let x15: int = w.get(wi - 15)
+            let x2: int = w.get(wi - 2)
+            let s0: int = int_xor(int_xor(hash_u64_rotr(x15, 1),
+            hash_u64_rotr(x15, 8)), int_shr(x15, 7))
+            let s1: int = int_xor(int_xor(hash_u64_rotr(x2, 19),
+            hash_u64_rotr(x2, 61)), int_shr(x2, 6))
+            let acc: int = hash_u64_add(w.get(wi - 16), s0)
+            let acc2: int = hash_u64_add(acc, w.get(wi - 7))
+            w.push(hash_u64_add(acc2, s1))
+            wi = wi + 1
+        }
+        let a0: int = state.get(0)
+        let b0: int = state.get(1)
+        let c0: int = state.get(2)
+        let d0: int = state.get(3)
+        let e0: int = state.get(4)
+        let f0: int = state.get(5)
+        let g0: int = state.get(6)
+        let h0: int = state.get(7)
+        let mut a: int = a0
+        let mut b: int = b0
+        let mut c: int = c0
+        let mut d: int = d0
+        let mut e: int = e0
+        let mut f: int = f0
+        let mut g: int = g0
+        let mut h: int = h0
+        let mut i: int = 0
+        while i < 80 {
+            let s1: int = int_xor(int_xor(hash_u64_rotr(e, 14),
+            hash_u64_rotr(e, 18)), hash_u64_rotr(e, 41))
+            let ch: int = int_xor(int_and(e, f),
+            int_and(int_not(e), g))
+            let t1a: int = hash_u64_add(h, s1)
+            let t1b: int = hash_u64_add(t1a, ch)
+            let t1c: int = hash_u64_add(t1b, k.get(i))
+            let t1: int = hash_u64_add(t1c, w.get(i))
+            let s0: int = int_xor(int_xor(hash_u64_rotr(a, 28),
+            hash_u64_rotr(a, 34)), hash_u64_rotr(a, 39))
+            let maj: int = int_xor(int_xor(int_and(a, b),
+            int_and(a, c)), int_and(b, c))
+            let t2: int = hash_u64_add(s0, maj)
+            h = g
+            g = f
+            f = e
+            e = hash_u64_add(d, t1)
+            d = c
+            c = b
+            b = a
+            a = hash_u64_add(t1, t2)
+            i = i + 1
+        }
+        state.set(0, hash_u64_add(state.get(0), a))
+        state.set(1, hash_u64_add(state.get(1), b))
+        state.set(2, hash_u64_add(state.get(2), c))
+        state.set(3, hash_u64_add(state.get(3), d))
+        state.set(4, hash_u64_add(state.get(4), e))
+        state.set(5, hash_u64_add(state.get(5), f))
+        state.set(6, hash_u64_add(state.get(6), g))
+        state.set(7, hash_u64_add(state.get(7), h))
+        blk = blk + 1
+    }
+    let mut out: str = ""
+    let mut si: int = 0
+    while si < 8 {
+        out = out + u64_bytes_be(state.get(si))
+        si = si + 1
+    }
+    return out
+}
+
+# ============================================================================
+# PBKDF2-HMAC-SHA256 (RFC 8032's box KDF) — the ipad/opad states cached
+# across the iterations (std.sha256's compress over 64-byte blocks),
+# two compressions per round trip.
+# ============================================================================
+
+fn sha256_iv_list() -> list[int] {
+    return[
+    sha256_h0(), sha256_h1(), sha256_h2(), sha256_h3(),
+    sha256_h4(), sha256_h5(), sha256_h6(), sha256_h7()
+    ]
+}
+
+# s256_be64(v) — 8 bytes big-endian (the length word).
+fn s256_be64(v: int) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < 8 {
+        out = out + chr(int_and(int_shr(v, 56 - 8 * i), 255))
+        i = i + 1
+    }
+    return out
+}
+
+# s256_finish_from(state, tail, prefix_len) — the digest of a message
+# whose first prefix_len bytes are already compressed into state and
+# whose remainder (tail, < 64 bytes here) is unprocessed.
+fn s256_finish_from(state: list[int], tail: str, prefix_len: int) -> str {
+    let k: list[int] = sha256_k()
+    let total: int = prefix_len + tail.len()
+    let mut work: list[int] = []
+    let mut i: int = 0
+    while i < 8 {
+        work.push(state.get(i))
+        i = i + 1
+    }
+    let mut block: str = tail + chr(128)
+    let need: int = 64 - ((total + 9) - ((total + 9) / 64) * 64)
+    let mut pad: int = 0
+    if total + 9 - ((total + 9) / 64) * 64 > 64 {
+        pad = need
+    } else {
+        pad = (total + 9 - ((total + 9) / 64) * 64) * 0 + (64 - ((total + 9) - ((total + 9) / 64) * 64)) % 64
+    }
+    let mut zi: int = 0
+    while zi < pad {
+        block = block + chr(0)
+        zi = zi + 1
+    }
+    block = block + s256_be64(total * 8)
+    work = sha256_compress_block(work, block.slice(0, 64), k)
+    let rest: str = block.slice(64, block.len())
+    if rest.len() > 0 {
+        work = sha256_compress_block(work, rest, k)
+    }
+    let mut out: str = ""
+    i = 0
+    while i < 8 {
+        out = out + sha256_word_to_bytes(work.get(i))
+        i = i + 1
+    }
+    return out
+}
+
+# hmac_pad(key, byte) — the 64-byte ipad/opad block of a key <= 64
+# bytes (longer keys are hashed first, HMAC's law).
+fn hmac_pad(key: str, pad_byte: int) -> str {
+    let mut k: str = key
+    if k.len() > 64 {
+        k = sha256_hash(k)
+    }
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < 64 {
+        let mut kb: int = 0
+        if i < k.len() {
+            kb = k.byte_at(i)
+        }
+        out = out + chr(int_xor(kb, pad_byte))
+        i = i + 1
+    }
+    return out
+}
+
+fn xor_bytes(a: str, b: str) -> str {
+    let mut out: str = ""
+    let n: int = a.len()
+    if b.len() < n {
+        return a
+    }
+    let mut i: int = 0
+    while i < n {
+        out = out + chr(int_xor(a.byte_at(i), b.byte_at(i)))
+        i = i + 1
+    }
+    return out
+}
+
+# pbkdf2_key(password, salt16, iterations) — PBKDF2-HMAC-SHA256 to 32
+# bytes (dklen 32: one block, T = U_1 XOR ... XOR_U_c).
+fn pbkdf2_key(password: str, salt16: str, iterations: int) -> str {
+    if iterations < 1 {
+        panic("the KDF needs at least one iteration")
+    }
+    let k: list[int] = sha256_k()
+    let inner0: list[int] = sha256_compress_block(sha256_iv_list(),
+    hmac_pad(password, 54), k)
+    let outer0: list[int] = sha256_compress_block(sha256_iv_list(),
+    hmac_pad(password, 92), k)
+    # U_1 = HMAC(P, salt || INT(1)) — INT(1) big-endian 4 bytes.
+    let msg1: str = salt16 + chr(0) + chr(0) + chr(0) + chr(1)
+    let mut u: str = s256_finish_from(outer0,
+    s256_finish_from(inner0, msg1, 64), 64)
+    let mut t: str = u
+    let mut it: int = 1
+    while it < iterations {
+        u = s256_finish_from(outer0, s256_finish_from(inner0, u, 64), 64)
+        t = xor_bytes(t, u)
+        it = it + 1
+    }
+    return t
+}
+
+# ============================================================================
+# ChaCha20 (RFC 8439 section 2.3) — 32-bit words on int64 (masked).
+# ============================================================================
+
+fn u32_mask() -> int {
+    return 4294967295
+}
+
+fn rotl32(v: int, n: int) -> int {
+    return int_and(int_or(int_shl(v, n), int_shr(v, 32 - n)), u32_mask())
+}
+
+# chacha_qr(s, a, b, c, d) — the quarter round (s a fresh list).
+fn chacha_qr(s: list[int], a: int, b: int, c: int, d: int) -> void {
+    s.set(a, int_and(s.get(a) + s.get(b), u32_mask()))
+    s.set(d, rotl32(int_xor(s.get(d), s.get(a)), 16))
+    s.set(c, int_and(s.get(c) + s.get(d), u32_mask()))
+    s.set(b, rotl32(int_xor(s.get(b), s.get(c)), 12))
+    s.set(a, int_and(s.get(a) + s.get(b), u32_mask()))
+    s.set(d, rotl32(int_xor(s.get(d), s.get(a)), 8))
+    s.set(c, int_and(s.get(c) + s.get(d), u32_mask()))
+    s.set(b, rotl32(int_xor(s.get(b), s.get(c)), 7))
+}
+
+fn u32_of_le(b: str, off: int) -> int {
+    return int_or(int_or(b.byte_at(off), int_shl(b.byte_at(off + 1), 8)),
+    int_or(int_shl(b.byte_at(off + 2), 16), int_shl(b.byte_at(off + 3), 24)))
+}
+
+fn u32_to_le(w: int) -> str {
+    return chr(int_and(w, 255)) + chr(int_and(int_shr(w, 8), 255))
+    + chr(int_and(int_shr(w, 16), 255)) + chr(int_and(int_shr(w, 24), 255))
+}
+
+# chacha20_block(key32, counter, nonce12) — one 64-byte keystream block.
+fn chacha20_block(key32: str, counter: int, nonce12: str) -> str {
+    if key32.len() != 32 {
+        panic("the ChaCha20 key is 32 bytes")
+    }
+    if nonce12.len() != 12 {
+        panic("the ChaCha20 nonce is 12 bytes")
+    }
+    let s: list[int] = []
+    s.push(1634760805)
+    s.push(857760878)
+    s.push(2036477234)
+    s.push(1797285236)
+    let mut i: int = 0
+    while i < 8 {
+        s.push(u32_of_le(key32, i * 4))
+        i = i + 1
+    }
+    s.push(int_and(counter, u32_mask()))
+    s.push(u32_of_le(nonce12, 0))
+    s.push(u32_of_le(nonce12, 4))
+    s.push(u32_of_le(nonce12, 8))
+    let work: list[int] = []
+    let mut j: int = 0
+    while j < 16 {
+        work.push(s.get(j))
+        j = j + 1
+    }
+    let mut round: int = 0
+    while round < 10 {
+        chacha_qr(work, 0, 4, 8, 12)
+        chacha_qr(work, 1, 5, 9, 13)
+        chacha_qr(work, 2, 6, 10, 14)
+        chacha_qr(work, 3, 7, 11, 15)
+        chacha_qr(work, 0, 5, 10, 15)
+        chacha_qr(work, 1, 6, 11, 12)
+        chacha_qr(work, 2, 7, 8, 13)
+        chacha_qr(work, 3, 4, 9, 14)
+        round = round + 1
+    }
+    let mut out: str = ""
+    let mut m: int = 0
+    while m < 16 {
+        out = out + u32_to_le(int_and(work.get(m) + s.get(m), u32_mask()))
+        m = m + 1
+    }
+    return out
+}
+
+# chacha20_xor(key32, counter, nonce12, data) — the stream cipher.
+fn chacha20_xor(key32: str, counter: int, nonce12: str, data: str) -> str {
+    let mut out: str = ""
+    let n: int = data.len()
+    let mut block_index: int = 0
+    while block_index * 64 < n {
+        let ks: str = chacha20_block(key32, counter + block_index, nonce12)
+        let start: int = block_index * 64
+        let mut end: int = start + 64
+        if end > n {
+            end = n
+        }
+        let mut i: int = start
+        while i < end {
+            out = out + chr(int_xor(data.byte_at(i), ks.byte_at(i - start)))
+            i = i + 1
+        }
+        block_index = block_index + 1
+    }
+    return out
+}
+
+# ============================================================================
+# Poly1305 (RFC 8439 section 2.5) — the 5x26-bit-limb evaluation
+# (poly1305-donna's 32-bit shape; every partial product fits int64).
+# ============================================================================
+
+fn u8to32(b: str, off: int) -> int {
+    return int_or(int_or(b.byte_at(off), int_shl(b.byte_at(off + 1), 8)),
+    int_or(int_shl(b.byte_at(off + 2), 16), int_shl(b.byte_at(off + 3), 24)))
+}
+
+# unpack26(w0, w1, w2, w3) — four LE 32-bit words into five 26-bit limbs.
+fn unpack26(w0: int, w1: int, w2: int, w3: int) -> list[int] {
+    let r: list[int] = []
+    r.push(int_and(w0, 67108863))
+    r.push(int_and(int_or(int_shr(w0, 26), int_shl(w1, 6)), 67108863))
+    r.push(int_and(int_or(int_shr(w1, 20), int_shl(w2, 12)), 67108863))
+    r.push(int_and(int_or(int_shr(w2, 14), int_shl(w3, 18)), 67108863))
+    r.push(int_and(int_shr(w3, 8), 67108863))
+    return r
+}
+
+# poly1305(key32, msg) — the one-time authenticator (16 bytes).
+fn poly1305(key32: str, msg: str) -> str {
+    if key32.len() != 32 {
+        panic("the Poly1305 key is 32 bytes")
+    }
+    # r = key[:16] clamped (0x0ffffffc0ffffffc0ffffffc0fffffff on the
+    # four LE words), s = key[16:32] (the pad).
+    let w0: int = int_and(u8to32(key32, 0), 268435455)
+    let w1: int = int_and(u8to32(key32, 4), 268435452)
+    let w2: int = int_and(u8to32(key32, 8), 268435452)
+    let w3: int = int_and(u8to32(key32, 12), 268435452)
+    let r: list[int] = unpack26(w0, w1, w2, w3)
+    let s1: int = r.get(1) * 5
+    let s2: int = r.get(2) * 5
+    let s3: int = r.get(3) * 5
+    let s4: int = r.get(4) * 5
+    let pad0: int = u8to32(key32, 16)
+    let pad1: int = u8to32(key32, 20)
+    let pad2: int = u8to32(key32, 24)
+    let pad3: int = u8to32(key32, 28)
+    let h: list[int] = [0, 0, 0, 0, 0]
+    let n: int = msg.len()
+    let mut i: int = 0
+    while i < n {
+        # clamp the end (str.slice panics past len; the .py's
+        # msg[i:i+16] clamps for free)
+        let mut end: int = i + 16
+        if end > n {
+            end = n
+        }
+        let blk: str = msg.slice(i, end)
+        let mut buf: str = blk
+        let mut hibit: int = 16777216
+        if blk.len() < 16 {
+            buf = blk + chr(1)
+            buf = buf + str_repeat(chr(0), 16 - buf.len())
+            hibit = 0
+        }
+        let hh: list[int] = unpack26(u8to32(buf, 0), u8to32(buf, 4),
+        u8to32(buf, 8), u8to32(buf, 12))
+        let mut k: int = 0
+        while k < 5 {
+            h.set(k, h.get(k) + hh.get(k))
+            k = k + 1
+        }
+        h.set(4, h.get(4) + hibit)
+        # h *= r (the 2^130 = 5 folds in the s-terms)
+        let d0: int = h.get(0) * r.get(0) + h.get(1) * s4
+        + h.get(2) * s3 + h.get(3) * s2 + h.get(4) * s1
+        let d1: int = h.get(0) * r.get(1) + h.get(1) * r.get(0)
+        + h.get(2) * s4 + h.get(3) * s3 + h.get(4) * s2
+        let d2: int = h.get(0) * r.get(2) + h.get(1) * r.get(1)
+        + h.get(2) * r.get(0) + h.get(3) * s4 + h.get(4) * s3
+        let d3: int = h.get(0) * r.get(3) + h.get(1) * r.get(2)
+        + h.get(2) * r.get(1) + h.get(3) * r.get(0) + h.get(4) * s4
+        let d4: int = h.get(0) * r.get(4) + h.get(1) * r.get(3)
+        + h.get(2) * r.get(2) + h.get(3) * r.get(1) + h.get(4) * r.get(0)
+        # (partial) h %= p
+        let mut c: int = int_shr(d0, 26)
+        h.set(0, int_and(d0, 67108863))
+        let mut d1v: int = d1 + c
+        c = int_shr(d1v, 26)
+        h.set(1, int_and(d1v, 67108863))
+        let mut d2v: int = d2 + c
+        c = int_shr(d2v, 26)
+        h.set(2, int_and(d2v, 67108863))
+        let mut d3v: int = d3 + c
+        c = int_shr(d3v, 26)
+        h.set(3, int_and(d3v, 67108863))
+        let mut d4v: int = d4 + c
+        c = int_shr(d4v, 26)
+        h.set(4, int_and(d4v, 67108863))
+        h.set(0, h.get(0) + c * 5)
+        c = int_shr(h.get(0), 26)
+        h.set(0, int_and(h.get(0), 67108863))
+        h.set(1, h.get(1) + c)
+        i = i + 16
+    }
+    # fully carry h
+    let mut c: int = int_shr(h.get(1), 26)
+    h.set(1, int_and(h.get(1), 67108863))
+    h.set(2, h.get(2) + c)
+    c = int_shr(h.get(2), 26)
+    h.set(2, int_and(h.get(2), 67108863))
+    h.set(3, h.get(3) + c)
+    c = int_shr(h.get(3), 26)
+    h.set(3, int_and(h.get(3), 67108863))
+    h.set(4, h.get(4) + c)
+    c = int_shr(h.get(4), 26)
+    h.set(4, int_and(h.get(4), 67108863))
+    h.set(0, h.get(0) + c * 5)
+    c = int_shr(h.get(0), 26)
+    h.set(0, int_and(h.get(0), 67108863))
+    h.set(1, h.get(1) + c)
+    # compute h + -p; select h if h < p, else h + -p
+    let t0: int = h.get(0) + 5
+    let g0: int = int_and(t0, 67108863)
+    let mut gc: int = int_shr(t0, 26)
+    let t1: int = h.get(1) + gc
+    let g1: int = int_and(t1, 67108863)
+    gc = int_shr(t1, 26)
+    let t2: int = h.get(2) + gc
+    let g2: int = int_and(t2, 67108863)
+    gc = int_shr(t2, 26)
+    let t3: int = h.get(3) + gc
+    let g3: int = int_and(t3, 67108863)
+    gc = int_shr(t3, 26)
+    let g4: int = h.get(4) + gc - 67108864
+    if g4 >= 0 {
+        h.set(0, g0)
+        h.set(1, g1)
+        h.set(2, g2)
+        h.set(3, g3)
+        h.set(4, g4)
+    }
+    # h %= 2^128, then mac = (h + pad) % 2^128
+    let ow0: int = int_and(int_or(h.get(0), int_shl(h.get(1), 26)), u32_mask())
+    let ow1: int = int_and(int_or(int_shr(h.get(1), 6), int_shl(h.get(2), 20)), u32_mask())
+    let ow2: int = int_and(int_or(int_shr(h.get(2), 12), int_shl(h.get(3), 14)), u32_mask())
+    let ow3: int = int_and(int_or(int_shr(h.get(3), 18), int_shl(h.get(4), 8)), u32_mask())
+    let mut f: int = ow0 + pad0
+    let fw0: int = int_and(f, u32_mask())
+    f = ow1 + pad1 + int_shr(f, 32)
+    let fw1: int = int_and(f, u32_mask())
+    f = ow2 + pad2 + int_shr(f, 32)
+    let fw2: int = int_and(f, u32_mask())
+    f = ow3 + pad3 + int_shr(f, 32)
+    let fw3: int = int_and(f, u32_mask())
+    return u32_to_le(fw0) + u32_to_le(fw1) + u32_to_le(fw2) + u32_to_le(fw3)
+}
+
+# poly1305_key_gen(key32, nonce12) — block 0's first 32 bytes.
+fn poly1305_key_gen(key32: str, nonce12: str) -> str {
+    return chacha20_block(key32, 0, nonce12).slice(0, 32)
+}
+
+# pad16(data) — the zero pad to a 16-byte boundary.
+fn pad16(data: str) -> str {
+    let rem: int = data.len() - (data.len() / 16) * 16
+    if rem == 0 {
+        return ""
+    }
+    return str_repeat(chr(0), 16 - rem)
+}
+
+# le64_bytes(v) — 8 bytes little-endian. RFC 8439 2.8.1's le_int():
+# the MAC data ends with the AAD and ciphertext lengths, LITTLE-endian
+# (the .py's len(x).to_bytes(8, "little")).
+fn le64_bytes(v: int) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < 8 {
+        out = out + chr(int_and(int_shr(v, 8 * i), 255))
+        i = i + 1
+    }
+    return out
+}
+
+struct EncOut {
+    ct: str,
+    tag: str
+}
+
+# aead_mac_data(aad, ct) — AAD || pad || ct || pad || len(aad) || len(ct).
+# The lengths are le_int()'s little-endian words, as the RFC composes
+# them (and the .py's to_bytes(8, "little")).
+fn aead_mac_data(aad: str, ct: str) -> str {
+    return aad + pad16(aad) + ct + pad16(ct) + le64_bytes(aad.len())
+    + le64_bytes(ct.len())
+}
+
+# aead_encrypt(key32, nonce12, aad, plaintext) — (ciphertext, tag).
+fn aead_encrypt(key32: str, nonce12: str, aad: str, plaintext: str) -> EncOut {
+    let otk: str = poly1305_key_gen(key32, nonce12)
+    let ct: str = chacha20_xor(key32, 1, nonce12, plaintext)
+    let tag: str = poly1305(otk, aead_mac_data(aad, ct))
+    return EncOut {
+        ct: ct, tag: tag
+    }
+}
+
+# aead_decrypt(key32, nonce12, aad, ct, tag) — MAC checked FIRST.
+fn aead_decrypt(key32: str, nonce12: str, aad: str, ct: str, tag: str)
+-> Result[str, str] {
+    let otk: str = poly1305_key_gen(key32, nonce12)
+    let want: str = poly1305(otk, aead_mac_data(aad, ct))
+    if want != tag {
+        return Result.Err("the AEAD tag does not verify — the box was "
+        + "tampered with or the passphrase is wrong")
+    }
+    return Result.Ok(chacha20_xor(key32, 1, nonce12, ct))
+}
+
+# ============================================================================
+# Ed25519 (RFC 8032) — the .py's own algorithm, the curve in extended
+# homogeneous coordinates. Python's bignums become 16x16-bit limbs:
+# the field p = 2^255-19 (fe_*), the group order L (sc_*). All the
+# bounds fit checked int64 (the largest intermediate, a folded product
+# limb, is < 2^42).
+# ============================================================================
+
+struct Fe {
+    l: list[int] # 16 limbs, little-endian, canonical (< p)
+}
+
+struct EdPt {
+    x: Fe,
+    y: Fe,
+    z: Fe,
+    t: Fe
+}
+
+# fe_p_limbs() — p = 2^255-19.
+fn fe_p_limbs() -> list[int] {
+    return[65517, 65535, 65535, 65535, 65535, 65535, 65535, 65535,
+    65535, 65535, 65535, 65535, 65535, 65535, 65535, 32767]
+}
+
+# sc_l_limbs() — L = 2^252 + 27742317777372353535851937790883648493.
+fn sc_l_limbs() -> list[int] {
+    return[54253, 23797, 25370, 22546, 40150, 41719, 63966, 5342,
+    0, 0, 0, 0, 0, 0, 0, 4096]
+}
+
+# fe_d2() — 2*d, d = -121665/121666 mod p.
+fn fe_d2() -> Fe {
+    return Fe {
+        l: [61785, 9906, 39828, 60374, 45398, 33411, 5274, 224,
+        53552, 61171, 33010, 6542, 64743, 22239, 55772, 9222]
+    }
+}
+
+# fe_d() — d = -121665 * inv(121666) mod p.
+fn fe_d() -> Fe {
+    return Fe {
+        l: [30883, 4953, 19914, 30187, 55467, 16705, 2637, 112,
+        59544, 30585, 16505, 36039, 65139, 11119, 27886, 20995]
+    }
+}
+
+# fe_sqrt_m1() — sqrt(-1) = 2^((p-1)/4) mod p.
+fn fe_sqrt_m1() -> Fe {
+    return Fe {
+        l: [41136, 18958, 6951, 50414, 58488, 44335, 6150, 12099,
+        55207, 15867, 153, 11085, 57099, 20417, 9344, 11139]
+    }
+}
+
+fn fe_bx() -> Fe {
+    return Fe {
+        l: [54554, 36645, 11616, 51542, 42930, 38181, 51040, 26924,
+        56412, 64982, 57905, 49316, 21502, 52590, 14035, 8553]
+    }
+}
+
+fn fe_by() -> Fe {
+    return Fe {
+        l: [26200, 26214, 26214, 26214, 26214, 26214, 26214, 26214,
+        26214, 26214, 26214, 26214, 26214, 26214, 26214, 26214]
+    }
+}
+
+fn fe_bt() -> Fe {
+    return Fe {
+        l: [56739, 42423, 35507, 28126, 21237, 30545, 40832, 8432,
+        58237, 25771, 20110, 26346, 30309, 55179, 24335, 26503]
+    }
+}
+
+# exp_pm2() — the exponent p-2 (Fermat inversion).
+fn exp_pm2() -> list[int] {
+    return[65515, 65535, 65535, 65535, 65535, 65535, 65535, 65535,
+    65535, 65535, 65535, 65535, 65535, 65535, 65535, 32767]
+}
+
+# exp_p38() — the exponent (p+3)/8 (the x recovery).
+fn exp_p38() -> list[int] {
+    return[65534, 65535, 65535, 65535, 65535, 65535, 65535, 65535,
+    65535, 65535, 65535, 65535, 65535, 65535, 65535, 4095]
+}
+
+fn fe_zero() -> Fe {
+    return Fe {
+        l: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    }
+}
+
+fn fe_one() -> Fe {
+    return Fe {
+        l: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    }
+}
+
+# fe_carry_mut(t) — normalize a 17-limb list (t[16] the 2^256 word):
+# carry-propagate 0..15, fold 2^256 -> 38 until the 17th word empties.
+# The caller owns the list (every fe op builds it fresh).
+fn fe_carry_mut(t: list[int]) -> void {
+    let mut guard: int = 0
+    while guard < 8 {
+        if t.get(16) != 0 {
+            t.set(0, t.get(0) + 38 * t.get(16))
+            t.set(16, 0)
+        }
+        let mut i: int = 0
+        while i < 16 {
+            let c: int = int_shr(t.get(i), 16)
+            t.set(i, int_and(t.get(i), 65535))
+            t.set(i + 1, t.get(i + 1) + c)
+            i = i + 1
+        }
+        if t.get(16) == 0 {
+            return
+        }
+        guard = guard + 1
+    }
+    panic("fe_carry: the 2^256 fold did not settle")
+}
+
+# fe_cmp_p(t) — a canonical-limb value vs p (1, 0, -1).
+fn fe_cmp_p(t: list[int]) -> int {
+    let p: list[int] = fe_p_limbs()
+    let mut i: int = 15
+    while i >= 0 {
+        if t.get(i) != p.get(i) {
+            if t.get(i) > p.get(i) {
+                return 1
+            }
+            return -1
+        }
+        i = i - 1
+    }
+    return 0
+}
+
+# fe_sub_p_mut(t) — t -= p (t >= p, limbs canonical).
+fn fe_sub_p_mut(t: list[int]) -> void {
+    let p: list[int] = fe_p_limbs()
+    let mut borrow: int = 0
+    let mut i: int = 0
+    while i < 16 {
+        let d: int = t.get(i) - p.get(i) - borrow
+        if d < 0 {
+            t.set(i, d + 65536)
+            borrow = 1
+        } else {
+            t.set(i, d)
+            borrow = 0
+        }
+        i = i + 1
+    }
+}
+
+# fe_norm(t17) — a 17-limb list to a canonical Fe: carry+fold, the
+# 2^255 -> 19 fold, then conditional subtraction of p.
+fn fe_norm(t: list[int]) -> Fe {
+    fe_carry_mut(t)
+    if t.get(15) >= 32768 {
+        t.set(15, t.get(15) - 32768)
+        t.set(0, t.get(0) + 19)
+        fe_carry_mut(t)
+    }
+    let mut sub: int = 0
+    while sub < 2 {
+        if fe_cmp_p(t) >= 0 {
+            fe_sub_p_mut(t)
+        }
+        sub = sub + 1
+    }
+    return Fe {
+        l: t
+    }
+}
+
+fn fe_add(a: Fe, b: Fe) -> Fe {
+    let t: list[int] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    let mut i: int = 0
+    while i < 16 {
+        t.set(i, a.l.get(i) + b.l.get(i))
+        i = i + 1
+    }
+    return fe_norm(t)
+}
+
+# fe_neg(b) — p - b (b canonical; the result is canonical too).
+fn fe_neg(b: Fe) -> Fe {
+    let p: list[int] = fe_p_limbs()
+    let t: list[int] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    let mut borrow: int = 0
+    let mut i: int = 0
+    while i < 16 {
+        let d: int = p.get(i) - b.l.get(i) - borrow
+        if d < 0 {
+            t.set(i, d + 65536)
+            borrow = 1
+        } else {
+            t.set(i, d)
+            borrow = 0
+        }
+        i = i + 1
+    }
+    return Fe {
+        l: t
+    }
+}
+
+fn fe_sub(a: Fe, b: Fe) -> Fe {
+    return fe_add(a, fe_neg(b))
+}
+
+# fe_small(k, a) — k * a for a small k (2 and 1 are all the .py needs).
+fn fe_small(k: int, a: Fe) -> Fe {
+    let t: list[int] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    let mut i: int = 0
+    while i < 16 {
+        t.set(i, k * a.l.get(i))
+        i = i + 1
+    }
+    return fe_norm(t)
+}
+
+# fe_mul(a, b) — schoolbook 16x16 into 32 limbs, carry, the 2^256 -> 38
+# fold of the high half, then the canonical normalization.
+fn fe_mul(a: Fe, b: Fe) -> Fe {
+    let t: list[int] = []
+    let mut i: int = 0
+    while i < 32 {
+        t.push(0)
+        i = i + 1
+    }
+    i = 0
+    while i < 16 {
+        let ai: int = a.l.get(i)
+        if ai != 0 {
+            let mut j: int = 0
+            while j < 16 {
+                t.set(i + j, t.get(i + j) + ai * b.l.get(j))
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    let mut k: int = 0
+    while k < 31 {
+        let c: int = int_shr(t.get(k), 16)
+        t.set(k, int_and(t.get(k), 65535))
+        t.set(k + 1, t.get(k + 1) + c)
+        k = k + 1
+    }
+    let u: list[int] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    let mut m: int = 0
+    while m < 16 {
+        u.set(m, t.get(m) + 38 * t.get(m + 16))
+        m = m + 1
+    }
+    return fe_norm(u)
+}
+
+fn fe_sq(a: Fe) -> Fe {
+    return fe_mul(a, a)
+}
+
+# fe_pow(a, e) — a^e mod p over a 16-limb exponent (< 2^255),
+# square-and-multiply from bit 254 down (the .py's pow()).
+fn fe_pow(a: Fe, e: list[int]) -> Fe {
+    let mut result: Fe = fe_one()
+    let mut i: int = 254
+    while i >= 0 {
+        result = fe_sq(result)
+        let limb: int = e.get(i / 16)
+        if int_and(int_shr(limb, i - (i / 16) * 16), 1) == 1 {
+            result = fe_mul(result, a)
+        }
+        i = i - 1
+    }
+    return result
+}
+
+fn fe_eq(a: Fe, b: Fe) -> bool {
+    let mut i: int = 0
+    while i < 16 {
+        if a.l.get(i) != b.l.get(i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# fe_to_bytes(fe) — 32 bytes little-endian (canonical < p).
+fn fe_to_bytes(fe: Fe) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < 16 {
+        let v: int = fe.l.get(i)
+        out = out + chr(int_and(v, 255)) + chr(int_shr(v, 8))
+        i = i + 1
+    }
+    return out
+}
+
+# fe_from_le_bytes(b) — 32 bytes little-endian, bit 255 masked (the
+# y coordinate; NOT reduced — the caller checks < p first).
+fn fe_from_le_bytes(b: str) -> Fe {
+    let l: list[int] = []
+    let mut i: int = 0
+    while i < 16 {
+        let mut v: int = int_or(b.byte_at(i * 2), int_shl(b.byte_at(i * 2 + 1), 8))
+        if i == 15 {
+            v = int_and(v, 32767)
+        }
+        l.push(v)
+        i = i + 1
+    }
+    return Fe {
+        l: l
+    }
+}
+
+# fe_ge_p(a) — a (masked, canonical limbs) >= p.
+fn fe_ge_p(a: Fe) -> bool {
+    return fe_cmp_p(a.l) >= 0
+}
+
+# ---------------------------------------------------------------------------
+# Scalar arithmetic mod L (16 limbs; shift-subtract reduction).
+# ---------------------------------------------------------------------------
+
+# sc_cmp_l(t) — a 16-limb value vs L (1, 0, -1).
+fn sc_cmp_l(t: list[int]) -> int {
+    let l: list[int] = sc_l_limbs()
+    let mut i: int = 15
+    while i >= 0 {
+        if t.get(i) != l.get(i) {
+            if t.get(i) > l.get(i) {
+                return 1
+            }
+            return -1
+        }
+        i = i - 1
+    }
+    return 0
+}
+
+# sc_sub_l_mut(t) — t -= L (t >= L).
+fn sc_sub_l_mut(t: list[int]) -> void {
+    let l: list[int] = sc_l_limbs()
+    let mut borrow: int = 0
+    let mut i: int = 0
+    while i < 16 {
+        let d: int = t.get(i) - l.get(i) - borrow
+        if d < 0 {
+            t.set(i, d + 65536)
+            borrow = 1
+        } else {
+            t.set(i, d)
+            borrow = 0
+        }
+        i = i + 1
+    }
+}
+
+# sc_mod(div32) — a 512-bit dividend (32 limbs) mod L, by binary long
+# division (512 shift-subtract steps; the dividends are SHA-512
+# digests and 256-bit products).
+fn sc_mod(div32: list[int]) -> list[int] {
+    let rem: list[int] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    let mut bit: int = 511
+    while bit >= 0 {
+        let mut c: int = int_and(int_shr(div32.get(bit / 16),
+        bit - (bit / 16) * 16), 1)
+        let mut i: int = 0
+        while i < 16 {
+            let nc: int = int_shr(rem.get(i), 15)
+            rem.set(i, int_and(int_or(int_shl(rem.get(i), 1), c), 65535))
+            c = nc
+            i = i + 1
+        }
+        if sc_cmp_l(rem) >= 0 {
+            sc_sub_l_mut(rem)
+        }
+        bit = bit - 1
+    }
+    return rem
+}
+
+# sc_add(a, b) — (a + b) mod L (both < L; the sum < 2L).
+fn sc_add(a: list[int], b: list[int]) -> list[int] {
+    let t: list[int] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    let mut i: int = 0
+    while i < 16 {
+        t.set(i, a.get(i) + b.get(i))
+        i = i + 1
+    }
+    fe_carry_mut(t)
+    let mut sub: int = 0
+    while sub < 2 {
+        if sc_cmp_l(t) >= 0 {
+            sc_sub_l_mut(t)
+        }
+        sub = sub + 1
+    }
+    if t.get(16) != 0 {
+        panic("sc_add: the sum escaped 256 bits")
+    }
+    let out: list[int] = []
+    i = 0
+    while i < 16 {
+        out.push(t.get(i))
+        i = i + 1
+    }
+    return out
+}
+
+# sc_mul(a, b) — (a * b) mod L (schoolbook into 32 limbs, then mod).
+fn sc_mul(a: list[int], b: list[int]) -> list[int] {
+    let t: list[int] = []
+    let mut i: int = 0
+    while i < 32 {
+        t.push(0)
+        i = i + 1
+    }
+    i = 0
+    while i < 16 {
+        let ai: int = a.get(i)
+        if ai != 0 {
+            let mut j: int = 0
+            while j < 16 {
+                t.set(i + j, t.get(i + j) + ai * b.get(j))
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    let mut k: int = 0
+    while k < 31 {
+        let c: int = int_shr(t.get(k), 16)
+        t.set(k, int_and(t.get(k), 65535))
+        t.set(k + 1, t.get(k + 1) + c)
+        k = k + 1
+    }
+    return sc_mod(t)
+}
+
+# sc_from_bytes(b) — a byte string as a 32-limb dividend (LE).
+fn sc_from_bytes(b: str) -> list[int] {
+    let out: list[int] = []
+    let limbs: int = b.len() / 2
+    let mut i: int = 0
+    while i < 32 {
+        if i < limbs {
+            out.push(int_or(b.byte_at(i * 2), int_shl(b.byte_at(i * 2 + 1), 8)))
+        } else {
+            out.push(0)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# sc_to_bytes32(s) — 16 limbs as 32 LE bytes (canonical < L).
+fn sc_to_bytes32(s: list[int]) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < 16 {
+        let v: int = s.get(i)
+        out = out + chr(int_and(v, 255)) + chr(int_shr(v, 8))
+        i = i + 1
+    }
+    return out
+}
+
+# ---------------------------------------------------------------------------
+# Point arithmetic — RFC 8032 section 5.1.4's formulas, verbatim.
+# ---------------------------------------------------------------------------
+
+fn pt_ident() -> EdPt {
+    return EdPt {
+        x: fe_zero(), y: fe_one(), z: fe_one(), t: fe_zero()
+    }
+}
+
+fn pt_base() -> EdPt {
+    return EdPt {
+        x: fe_bx(), y: fe_by(), z: fe_one(), t: fe_bt()
+    }
+}
+
+fn pt_add(p1: EdPt, p2: EdPt) -> EdPt {
+    let a: Fe = fe_mul(fe_sub(p1.y, p1.x), fe_sub(p2.y, p2.x))
+    let b: Fe = fe_mul(fe_add(p1.y, p1.x), fe_add(p2.y, p2.x))
+    let c: Fe = fe_mul(fe_mul(p1.t, p2.t), fe_d2())
+    let dd: Fe = fe_small(2, fe_mul(p1.z, p2.z))
+    let e: Fe = fe_sub(b, a)
+    let f: Fe = fe_sub(dd, c)
+    let g: Fe = fe_add(dd, c)
+    let h: Fe = fe_add(b, a)
+    return EdPt {
+        x: fe_mul(e, f), y: fe_mul(g, h), z: fe_mul(f, g), t: fe_mul(e, h)
+    }
+}
+
+fn pt_double(p: EdPt) -> EdPt {
+    let a: Fe = fe_sq(p.x)
+    let b: Fe = fe_sq(p.y)
+    let c: Fe = fe_small(2, fe_sq(p.z))
+    let h: Fe = fe_add(a, b)
+    let xy: Fe = fe_add(p.x, p.y)
+    let e: Fe = fe_sub(h, fe_sq(xy))
+    let g: Fe = fe_sub(a, b)
+    let f: Fe = fe_add(c, g)
+    return EdPt {
+        x: fe_mul(e, f), y: fe_mul(g, h), z: fe_mul(f, g), t: fe_mul(e, h)
+    }
+}
+
+# sc_bit(e, i) — bit i of a limb-array scalar.
+fn sc_bit(e: list[int], i: int) -> int {
+    return int_and(int_shr(e.get(i / 16), i - (i / 16) * 16), 1)
+}
+
+# pt_scalarmult(p, e) — [e]p by double-and-add from bit 255 (the .py's
+# own loop; plain double-and-add, not constant-time — the .py's own
+# honesty about where this module's trust boundary sits).
+fn pt_scalarmult(p: EdPt, e: list[int]) -> EdPt {
+    let mut q: EdPt = pt_ident()
+    let mut i: int = 255
+    while i >= 0 {
+        q = pt_double(q)
+        if sc_bit(e, i) == 1 {
+            q = pt_add(q, p)
+        }
+        i = i - 1
+    }
+    return q
+}
+
+# pt_compress(p) — (y | (x&1)<<255) little-endian.
+fn pt_compress(p: EdPt) -> str {
+    let zinv: Fe = fe_pow(p.z, exp_pm2())
+    let x: Fe = fe_mul(p.x, zinv)
+    let y: Fe = fe_mul(p.y, zinv)
+    let mut out: str = fe_to_bytes(y)
+    if int_and(x.l.get(0), 1) == 1 {
+        out = out.slice(0, 31)
+        + chr(int_or(out.byte_at(31), 128))
+    }
+    return out
+}
+
+# ed_x_of(y) — x^2 = (y^2-1)/(d*y^2+1) recovered; Err when the point
+# is not on the curve.
+fn ed_x_of(y: Fe) -> Result[Fe, str] {
+    let num: Fe = fe_sub(fe_sq(y), fe_one())
+    let den: Fe = fe_add(fe_mul(fe_mul(fe_d(), y), y), fe_one())
+    let deninv: Fe = fe_pow(den, exp_pm2())
+    let x2: Fe = fe_mul(num, deninv)
+    let mut x: Fe = fe_pow(x2, exp_p38())
+    if !fe_eq(fe_sq(x), x2) {
+        x = fe_mul(x, fe_sqrt_m1())
+    }
+    if !fe_eq(fe_sq(x), x2) {
+        return Result.Err("not a square")
+    }
+    return Result.Ok(x)
+}
+
+# pt_decompress(b32) — Err on every malformed encoding (the .py's
+# refusals: bad length, y >= p, no x, x=0 with the sign bit).
+fn pt_decompress(b32: str) -> Result[EdPt, str] {
+    if b32.len() != 32 {
+        return Result.Err("bad length")
+    }
+    let sign: int = int_and(int_shr(b32.byte_at(31), 7), 1)
+    let y: Fe = fe_from_le_bytes(b32)
+    if fe_ge_p(y) {
+        return Result.Err("y >= p")
+    }
+    let xr: Result[Fe, str] = ed_x_of(y)
+    if result_is_err(xr) {
+        return Result.Err("not on the curve")
+    }
+    let mut x: Fe = result_unwrap(xr)
+    if x.l.get(0) == 0 && sign == 1 {
+        return Result.Err("x = 0 with the sign bit")
+    }
+    if int_and(x.l.get(0), 1) != sign {
+        x = fe_neg(x)
+    }
+    return Result.Ok(EdPt {
+        x: x, y: y, z: fe_one(), t: fe_mul(x, y)
+    })
+}
+
+# ---------------------------------------------------------------------------
+# Keys, signing, verifying (RFC 8032 5.1.5 / 5.1.6 / 5.1.7).
+# ---------------------------------------------------------------------------
+
+# ed_clamp(prefix32) — the seed's clamped scalar as limbs.
+fn ed_clamp(prefix32: str) -> list[int] {
+    let a: str = chr(int_and(prefix32.byte_at(0), 248))
+    + prefix32.slice(1, 31)
+    + chr(int_or(int_and(prefix32.byte_at(31), 127), 64))
+    let out: list[int] = []
+    let mut i: int = 0
+    while i < 16 {
+        out.push(int_or(a.byte_at(i * 2), int_shl(a.byte_at(i * 2 + 1), 8)))
+        i = i + 1
+    }
+    return out
+}
+
+# ed_secret_expand(seed) — (clamped scalar, prefix).
+struct EdSecret {
+    a: list[int],
+    prefix: str
+}
+
+fn ed_secret_expand(seed: str) -> EdSecret {
+    if seed.len() != 32 {
+        panic("the seed is 32 bytes")
+    }
+    let h: str = sha512_hash(seed)
+    return EdSecret {
+        a: ed_clamp(h.slice(0, 32)), prefix: h.slice(32, 64)
+    }
+}
+
+fn ed_public_from_seed(seed: str) -> str {
+    let s: EdSecret = ed_secret_expand(seed)
+    return pt_compress(pt_scalarmult(pt_base(), s.a))
+}
+
+# ed_sign(seed, msg) — deterministic (r from SHA-512(prefix||msg)).
+fn ed_sign(seed: str, msg: str) -> str {
+    let s: EdSecret = ed_secret_expand(seed)
+    let pk: str = pt_compress(pt_scalarmult(pt_base(), s.a))
+    let r: list[int] = sc_mod(sc_from_bytes(sha512_hash(s.prefix + msg)))
+    let r_enc: str = pt_compress(pt_scalarmult(pt_base(), r))
+    let k: list[int] = sc_mod(sc_from_bytes(sha512_hash(r_enc + pk + msg)))
+    let ka: list[int] = sc_mul(k, s.a)
+    let sv: list[int] = sc_add(r, ka)
+    return r_enc + sc_to_bytes32(sv)
+}
+
+# ed_verify(pk, msg, sig) — the cofactored equation, False on any
+# malformed input (never an exception, the .py's contract).
+fn ed_verify(pk: str, msg: str, sig: str) -> bool {
+    if sig.len() != 64 {
+        return false
+    }
+    let a_pt_r: Result[EdPt, str] = pt_decompress(pk)
+    if result_is_err(a_pt_r) {
+        return false
+    }
+    let a_pt: EdPt = result_unwrap(a_pt_r)
+    let r_pt_r: Result[EdPt, str] = pt_decompress(sig.slice(0, 32))
+    if result_is_err(r_pt_r) {
+        return false
+    }
+    let r_pt: EdPt = result_unwrap(r_pt_r)
+    let s_limbs: list[int] = sc_from_bytes(sig.slice(32, 64))
+    # s as a 16-limb value; refuse s >= L.
+    let s16: list[int] = []
+    let mut si: int = 0
+    while si < 16 {
+        s16.push(s_limbs.get(si))
+        si = si + 1
+    }
+    if sc_cmp_l(s16) >= 0 {
+        return false
+    }
+    let k: list[int] = sc_mod(sc_from_bytes(sha512_hash(sig.slice(0, 32)
+    + pk + msg)))
+    let eight: list[int] = [8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    let left: EdPt = pt_scalarmult(pt_scalarmult(pt_base(), s16), eight)
+    let right: EdPt = pt_scalarmult(pt_add(r_pt, pt_scalarmult(a_pt, k)),
+    eight)
+    return pt_compress(left) == pt_compress(right)
+}
+
+# ============================================================================
+# Random bytes — os.urandom's stand-in: head -c over /dev/urandom in a
+# captured child (the runtime has no entropy builtin), LCG fallback.
+# ============================================================================
+
+struct RunCap {
+    code: int,
+    out: str,
+    err: str
+}
+
+fn spawn_cap(program: str, argv: list[str]) -> RunCap uses Proc {
+    let r: RunCap = RunCap {
+        code: -1, out: "", err: ""
+    }
+    let pid: int = proc_spawn(program, argv, 2, 1, 1)
+    if pid < 1 {
+        return r
+    }
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    r.code = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    r.out = out
+    r.err = err
+    return r
+}
+
+fn urandom_bytes(n: int) -> str uses Proc, Clock, Rand {
+    let r: RunCap = spawn_cap("head", ["-c", n.to_str(), "/dev/urandom"])
+    if r.code == 0 && r.out.len() == n {
+        return r.out
+    }
+    # fallback: the runtime LCG, seeded by the clock and the pid.
+    rand_seed(system_time_now_ms() + 104729 * proc_pid())
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < n {
+        out = out + chr(rand_int(256))
+        i = i + 1
+    }
+    return out
+}
+
+# ============================================================================
+# The minisign format layer — hlsign_format.py.
+# ============================================================================
+
+# fmt_b64(data) — base64 of the blob.
+fn fmt_b64(data: str) -> str {
+    return base64_encode(data)
+}
+
+# fmt_unb64(text, what) — strict base64 (validate=True).
+fn fmt_unb64(text: str, what: str) -> Result[str, str] {
+    let t: str = text.trim()
+    if t.len() == 0 || t.len() - (t.len() / 4) * 4 != 0 {
+        return Result.Err(what + " is not valid base64 (Incorrect padding)")
+    }
+    let mut i: int = 0
+    let mut eqs: int = 0
+    while i < t.len() {
+        let c: int = t.byte_at(i)
+        if c == 61 {
+            eqs = eqs + 1
+            if i < t.len() - 2 {
+                return Result.Err(what
+                + " is not valid base64 (Invalid base64-encoded string)")
+            }
+        } else {
+            if eqs > 0 {
+                return Result.Err(what
+                + " is not valid base64 (Invalid base64-encoded string)")
+            }
+            let ok: bool = (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+            || (c >= 48 && c <= 57) || c == 43 || c == 47
+            if !ok {
+                return Result.Err(what
+                + " is not valid base64 (Invalid base64-encoded string)")
+            }
+        }
+        i = i + 1
+    }
+    return Result.Ok(base64_decode(t))
+}
+
+# fmt_key_id(public) — SHA-256(public)[:8].
+fn fmt_key_id(public: str) -> str {
+    return sha256_hash(public).slice(0, 8)
+}
+
+fn fmt_key_id_hex(public: str) -> str {
+    return hex_encode(fmt_key_id(public))
+}
+
+# file_lines(path) — the .py's readlines() (no trailing empty).
+fn file_lines(path: str) -> list[str] uses Fs {
+    let lines: list[str] = read_or(path, "").split("\n")
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < lines.len() {
+        if !(i == lines.len() - 1 && lines.get(i) == "") {
+            out.push(lines.get(i))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn replace_newlines(s: str) -> str {
+    return str_replace(s, "\n", " ")
+}
+
+# ---------------------------------------------------------------------------
+# The public key file (minisign's two-line layout).
+# ---------------------------------------------------------------------------
+
+fn fmt_public_blob(public: str) -> str {
+    return sig_algo() + fmt_key_id(public) + public
+}
+
+fn fmt_write_public(path: str, public: str, comment: str) -> void uses Fs {
+    let mut header: str = "untrusted comment: " + pub_comment()
+    + " " + fmt_key_id_hex(public)
+    if comment != "" {
+        header = header + " " + replace_newlines(comment)
+    }
+    write_file(path, header + "\n" + fmt_b64(fmt_public_blob(public)) + "\n")
+}
+
+struct PubInfo {
+    public: str,
+    comment: str
+}
+
+fn fmt_read_public(path: str) -> Result[PubInfo, str] uses Fs {
+    if !is_file_h(path) {
+        return Result.Err("cannot read the public key " + path)
+    }
+    let lines: list[str] = file_lines(path)
+    if lines.len() < 2 || !lines.get(0).starts_with("untrusted comment:") {
+        return Result.Err(path + " is not a public key file")
+    }
+    let br: Result[str, str] = fmt_unb64(lines.get(1), "the public key blob")
+    if result_is_err(br) {
+        return Result.Err(result_err_or(br, ""))
+    }
+    let blob: str = result_unwrap(br)
+    if blob.len() != 42 || blob.slice(0, 2) != sig_algo() {
+        return Result.Err("the public key blob is not Ed(2) + id(8) + pk(32)")
+    }
+    let public: str = blob.slice(10, 42)
+    if blob.slice(2, 10) != fmt_key_id(public) {
+        return Result.Err("the public key file's id does not name its key")
+    }
+    return Result.Ok(PubInfo {
+        public: public,
+        comment: lines.get(0).slice(18, lines.get(0).len()).trim()
+    })
+}
+
+# ---------------------------------------------------------------------------
+# The secret key file — the encrypted box (the documented divergence).
+# ---------------------------------------------------------------------------
+
+# fmt_secret_plaintext(public, seed) — Ed + id + seed + pk + checksum.
+fn fmt_secret_plaintext(public: str, seed: str) -> str {
+    return sig_algo() + fmt_key_id(public) + seed + public
+    + sha256_hash(seed + public).slice(0, 8)
+}
+
+fn fmt_write_secret(path: str, seed: str, public: str, password: str,
+iterations: int, comment: str) -> void uses Fs, Proc, Clock, Rand {
+    let plaintext: str = fmt_secret_plaintext(public, seed)
+    let salt: str = urandom_bytes(16)
+    let nonce: str = urandom_bytes(12)
+    let box_key: str = pbkdf2_key(password, salt, iterations)
+    let enc: EncOut = aead_encrypt(box_key, nonce, kdf_aad(), plaintext)
+    let blob: str = secret_marker() + kdf_id()
+    + chr(int_and(int_shr(iterations, 24), 255))
+    + chr(int_and(int_shr(iterations, 16), 255))
+    + chr(int_and(int_shr(iterations, 8), 255))
+    + chr(int_and(iterations, 255))
+    + salt + nonce + enc.ct + enc.tag
+    let mut header: str = "untrusted comment: hls-sign secret key "
+    + fmt_key_id_hex(public)
+    if comment != "" {
+        header = header + " " + replace_newlines(comment)
+    }
+    write_file(path, header + "\n" + fmt_b64(blob) + "\n")
+    # 0600, always (the .py opens with the mode AND chmods).
+    fs_set_perms(path, 384)
+}
+
+struct SecretInfo {
+    seed: str,
+    public: str,
+    comment: str
+}
+
+fn fmt_read_secret(path: str, password: str) -> Result[SecretInfo, str]
+uses Fs {
+    if !is_file_h(path) {
+        return Result.Err("cannot read the secret key " + path)
+    }
+    let lines: list[str] = file_lines(path)
+    if lines.len() < 2 || !lines.get(0).starts_with("untrusted comment:") {
+        return Result.Err(path + " is not a secret key file")
+    }
+    let br: Result[str, str] = fmt_unb64(lines.get(1), "the secret key box")
+    if result_is_err(br) {
+        return Result.Err(result_err_or(br, ""))
+    }
+    let blob: str = result_unwrap(br)
+    if blob.len() < 4 {
+        return Result.Err("the secret key box is not a Halis key")
+    }
+    if blob.slice(0, 2) != secret_marker() {
+        return Result.Err("the secret key box is not a Halis key (marker "
+        + blob.slice(0, 2) + ")")
+    }
+    if blob.slice(2, 4) != kdf_id() {
+        return Result.Err("the secret key's KDF (" + blob.slice(2, 4)
+        + ") is not supported")
+    }
+    let mut iterations: int = int_shl(blob.byte_at(4), 24)
+    iterations = int_or(iterations, int_shl(blob.byte_at(5), 16))
+    iterations = int_or(iterations, int_shl(blob.byte_at(6), 8))
+    iterations = int_or(iterations, blob.byte_at(7))
+    let salt: str = blob.slice(8, 24)
+    let nonce: str = blob.slice(24, 36)
+    let body: str = blob.slice(36, blob.len() - 16)
+    let tag: str = blob.slice(blob.len() - 16, blob.len())
+    let box_key: str = pbkdf2_key(password, salt, iterations)
+    let dr: Result[str, str] = aead_decrypt(box_key, nonce, kdf_aad(), body,
+    tag)
+    if result_is_err(dr) {
+        return Result.Err("the secret key cannot be opened ("
+        + result_err_or(dr, "") + ")")
+    }
+    let plaintext: str = result_unwrap(dr)
+    if plaintext.len() != 82 || plaintext.slice(0, 2) != sig_algo() {
+        return Result.Err("the decrypted secret key is not the expected box")
+    }
+    let seed: str = plaintext.slice(10, 42)
+    let public: str = plaintext.slice(42, 74)
+    let keyid_bytes: str = plaintext.slice(2, 10)
+    let checksum: str = plaintext.slice(74, 82)
+    if sha256_hash(seed + public).slice(0, 8) != checksum {
+        return Result.Err("the secret key's checksum does not match")
+    }
+    if ed_public_from_seed(seed) != public {
+        return Result.Err("the secret key's seed does not derive its public "
+        + "key")
+    }
+    if keyid_bytes != fmt_key_id(public) {
+        return Result.Err("the secret key's id does not name its key")
+    }
+    return Result.Ok(SecretInfo {
+        seed: seed, public: public,
+        comment: lines.get(0).slice(18, lines.get(0).len()).trim()
+    })
+}
+
+# ---------------------------------------------------------------------------
+# Minisign signature files (the four-line contract).
+# ---------------------------------------------------------------------------
+
+fn fmt_default_trusted_comment(path: str) -> str uses Clock {
+    let secs: int = system_time_now_ms() / 1000
+    return "timestamp:" + secs.to_str() + "\tfile:"
+    + replace_newlines(path_basename(path))
+}
+
+fn fmt_write_signature(path: str, public: str, raw_sig: str, global_sig: str,
+trusted_comment: str) -> void uses Fs {
+    write_file(path, "untrusted comment: signature from hls-sign key "
+    + fmt_key_id_hex(public) + "\n" + fmt_b64(sig_algo() + raw_sig)
+    + "\n" + "trusted comment: " + replace_newlines(trusted_comment)
+    + "\n" + fmt_b64(sig_algo() + global_sig) + "\n")
+}
+
+struct SigInfo {
+    raw_sig: str,
+    global_sig: str,
+    trusted: str
+}
+
+fn fmt_read_signature(path: str) -> Result[SigInfo, str] uses Fs {
+    if !is_file_h(path) {
+        return Result.Err("cannot read the signature " + path)
+    }
+    let lines: list[str] = file_lines(path)
+    if lines.len() < 4 || !lines.get(0).starts_with("untrusted comment:") {
+        return Result.Err(path + " is not a signature file")
+    }
+    let rb: Result[str, str] = fmt_unb64(lines.get(1), "the signature line")
+    if result_is_err(rb) {
+        return Result.Err(result_err_or(rb, ""))
+    }
+    let raw_blob: str = result_unwrap(rb)
+    if raw_blob.len() != 66 || raw_blob.slice(0, 2) != sig_algo() {
+        return Result.Err("the signature line is not Ed(2) + sig(64)")
+    }
+    if !lines.get(2).starts_with("trusted comment: ") {
+        return Result.Err("the third line of a signature file is the trusted "
+        + "comment")
+    }
+    let trusted: str = lines.get(2).slice(17, lines.get(2).len())
+    let gb: Result[str, str] = fmt_unb64(lines.get(3),
+    "the trusted-comment signature line")
+    if result_is_err(gb) {
+        return Result.Err(result_err_or(gb, ""))
+    }
+    let global_blob: str = result_unwrap(gb)
+    if global_blob.len() != 66 || global_blob.slice(0, 2) != sig_algo() {
+        return Result.Err("the trusted-comment signature is not Ed(2) + "
+        + "sig(64)")
+    }
+    return Result.Ok(SigInfo {
+        raw_sig: raw_blob.slice(2, 66),
+        global_sig: global_blob.slice(2, 66),
+        trusted: trusted
+    })
+}
+
+struct TwoSig {
+    raw_sig: str,
+    global_sig: str
+}
+
+# fmt_sign_file — the two signatures (payload; payload-sig || comment).
+fn fmt_sign_file(seed: str, public: str, payload: str, trusted_comment: str)
+-> TwoSig {
+    let raw_sig: str = ed_sign(seed, payload)
+    let global_sig: str = ed_sign(seed, raw_sig + trusted_comment)
+    return TwoSig {
+        raw_sig: raw_sig, global_sig: global_sig
+    }
+}
+
+# fmt_verify_signatures — both must hold.
+fn fmt_verify_signatures(public: str, payload: str, raw_sig: str,
+global_sig: str, trusted_comment: str) -> bool {
+    if !ed_verify(public, payload, raw_sig) {
+        return false
+    }
+    return ed_verify(public, raw_sig + trusted_comment, global_sig)
+}
+
+# ============================================================================
+# The audit log (Stage 112, hal_ops/hal_log) — the privilege inventory's
+# sign.* entries: keygen mints, sign signs, release releases; refusals
+# are recorded exactly like successes. One compact JSON line per entry,
+# the family chain hash over prev_hash + canonical entry.
+# ============================================================================
+
+fn is_repo_root(p: str) -> bool uses Fs {
+    return file_exists(p + "/std/str.hls")
+    && file_exists(p + "/core/option.hls")
+    && file_exists(p + "/SPEC.md")
+}
+
+fn which_hit(name: str) -> str uses Fs, Proc {
+    if name == "" || name.contains("/") {
+        return ""
+    }
+    let penv: str = env_get("PATH")
+    if penv == "" {
+        return ""
+    }
+    let dirs: list[str] = penv.split(":")
+    let mut i: int = 0
+    while i < dirs.len() {
+        let mut cand: str = dirs.get(i)
+        if cand == "" {
+            cand = "."
+        }
+        let full: str = cand + "/" + name
+        if file_exists(full) {
+            return full
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn repo_root() -> str uses Fs, Proc, Args {
+    let argv: list[str] = args()
+    if argv.len() > 0 && argv.get(0) != "" {
+        let binp: str = realpath_lex(argv.get(0))
+        let root: str = path_dirname(path_dirname(binp))
+        if is_repo_root(root) {
+            return root
+        }
+        let hit: str = which_hit(argv.get(0))
+        if hit != "" {
+            let root2: str = path_dirname(path_dirname(realpath_lex(hit)))
+            if is_repo_root(root2) {
+                return root2
+            }
+        }
+    }
+    let mut d: str = realpath_lex("")
+    let mut guard: int = 0
+    while guard < 128 {
+        if is_repo_root(d) {
+            return d
+        }
+        let parent: str = path_dirname(d)
+        if parent == d || parent == "." {
+            return realpath_lex("")
+        }
+        d = parent
+        guard = guard + 1
+    }
+    return realpath_lex("")
+}
+
+# audit_log_path() — HLS_AUDIT_LOG or the repo root's .hls-audit.log.
+fn audit_log_path() -> str uses Fs, Proc, Args {
+    let over: str = env_get("HLS_AUDIT_LOG")
+    if over != "" || env_has("HLS_AUDIT_LOG") {
+        return over
+    }
+    return repo_root() + "/.hls-audit.log"
+}
+
+fn audit_strict() -> bool uses Proc {
+    return env_has("HLS_AUDIT_STRICT")
+}
+
+# audit_actor() — "user@host" (HLS_AUDIT_ACTOR overrides; the OS says
+# the rest — whoami through a child, the hostname builtin).
+fn audit_actor() -> str uses Proc {
+    let env: str = env_get("HLS_AUDIT_ACTOR")
+    if env != "" || env_has("HLS_AUDIT_ACTOR") {
+        return env
+    }
+    let mut user: str = env_get("USER")
+    if user == "" {
+        let r: RunCap = spawn_cap("whoami", [])
+        if r.code == 0 {
+            user = r.out.trim()
+        }
+    }
+    if user == "" {
+        user = "<unknown-user>"
+    }
+    let mut host: str = sys_hostname()
+    if host == "" {
+        host = "<unknown-host>"
+    }
+    return user + "@" + host
+}
+
+# tlog_count_lines(text) — the line count (Python's iteration count).
+fn tlog_count_lines(text: str) -> int {
+    if text == "" {
+        return 0
+    }
+    let parts: list[str] = text.split("\n")
+    let mut n: int = parts.len()
+    if parts.get(parts.len() - 1) == "" {
+        n = n - 1
+    }
+    if n < 0 {
+        n = 0
+    }
+    return n
+}
+
+# tlog_head_hash(text) — the last non-blank line's chain_hash (genesis
+# "0"*64 when empty / corrupt).
+fn tlog_head_hash(text: str) -> str {
+    let prev: str = str_repeat("0", 64)
+    if text == "" {
+        return prev
+    }
+    let lines: list[str] = text.split("\n")
+    let mut last: str = ""
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).trim() != "" {
+            last = lines.get(i)
+        }
+        i = i + 1
+    }
+    if last == "" {
+        return prev
+    }
+    let pr: Result[JsonValue, str] = json_parse_result(last)
+    if result_is_ok(pr) {
+        let rec: JsonValue = result_unwrap(pr)
+        let ch: JsonValue = json_object_get(rec, "chain_hash")
+        if json_is_str(ch) {
+            return json_str_value(ch)
+        }
+    }
+    return prev
+}
+
+# audit_record(op, outcome, subject, detail, has_subject, has_detail)
+# — hal_ops.record: the hash-chained entry, fail-open unless
+# HLS_AUDIT_STRICT. Returns Err only in strict mode on a failed write.
+fn audit_record(op: str, outcome: str, subject: str, detail: JDoc,
+has_subject: bool, has_detail: bool) -> Result[bool, str]
+uses Fs, Proc, Clock, Args, IO {
+    let entry: JDoc = jd_obj([], [])
+    obj_set(entry, "kind", jd_str("op"))
+    obj_set(entry, "op", jd_str(op))
+    obj_set(entry, "actor", jd_str(audit_actor()))
+    obj_set(entry, "outcome", jd_str(outcome))
+    obj_set(entry, "tool", jd_str(tool_name()))
+    obj_set(entry, "tool_version", jd_str(audit_tool_version()))
+    if has_subject {
+        obj_set(entry, "subject", jd_str(subject))
+    }
+    if has_detail {
+        obj_set(entry, "detail", detail)
+    }
+    let path: str = audit_log_path()
+    # the write contract: a missing parent directory is the failed write
+    let parent: str = path_dirname(path)
+    if parent != "" && !is_dir_h(parent) {
+        if audit_strict() {
+            return Result.Err("the audit entry for " + op
+            + " was not written: no such directory: " + parent)
+        }
+        eprint("hls-auditlog: warning: the audit entry for " + op
+        + " was not written (no such directory: " + parent + ")\n")
+        return Result.Ok(false)
+    }
+    let lock_path: str = path + ".lock"
+    if !file_exists(lock_path) {
+        write_file(lock_path, "")
+    }
+    let text: str = read_or(path, "")
+    let prev_hash: str = tlog_head_hash(text)
+    let seq: int = tlog_count_lines(text) + 1
+    obj_set(entry, "seq", jd_int(seq))
+    obj_set(entry, "timestamp",
+    jd_int(system_time_now_ms() / 1000))
+    obj_set(entry, "prev_hash", jd_str(prev_hash))
+    let chain: str = sha256_hex(prev_hash + py_json_canon(entry))
+    obj_set(entry, "chain_hash", jd_str(chain))
+    write_file(path, text + py_json_canon(entry) + "\n")
+    return Result.Ok(true)
+}
+
+# ============================================================================
+# The package tree — hls-audit's manifest walk (the TOML subset
+# hpkg_manifest parses), hls-pkg's dependency resolution, the lockfile
+# drift law. The per-package check rides the REAL front-end in a probe
+# child (--probe-audit): a program that does not check is UNAUDITABLE,
+# never a crash of the signer.
+# ============================================================================
+
+struct TomlVal {
+    kind: str, # "none"|"str"|"int"|"float"|"bool"|"list"|"table"
+    sval: str,
+    ival: int,
+    bval: bool,
+    keys: list[str],
+    vals: list[TomlVal]
+}
+
+fn toml_none() -> TomlVal {
+    return TomlVal {
+        kind: "none", sval: "", ival: 0, bval: false,
+        keys: [], vals: []
+    }
+}
+
+fn toml_table() -> TomlVal {
+    return TomlVal {
+        kind: "table", sval: "", ival: 0, bval: false,
+        keys: [], vals: []
+    }
+}
+
+fn toml_get(doc: TomlVal, key: str) -> TomlVal {
+    let mut i: int = 0
+    while i < doc.keys.len() {
+        if doc.keys.get(i) == key {
+            return doc.vals.get(i)
+        }
+        i = i + 1
+    }
+    return toml_none()
+}
+
+fn toml_set(doc: TomlVal, key: str, val: TomlVal) -> void {
+    let mut i: int = 0
+    while i < doc.keys.len() {
+        if doc.keys.get(i) == key {
+            doc.vals.set(i, val)
+            return
+        }
+        i = i + 1
+    }
+    doc.keys.push(key)
+    doc.vals.push(val)
+}
+
+# strip_toml_comment(line) — the strict outside-string comment strip.
+fn strip_toml_comment(line: str) -> Result[str, str] {
+    let mut out: str = ""
+    let mut in_str: bool = false
+    let n: int = line.len()
+    let mut i: int = 0
+    while i < n {
+        let c: int = line.byte_at(i)
+        if in_str {
+            if c == 92 && i + 1 < n {
+                let esc: int = line.byte_at(i + 1)
+                if esc == 98 || esc == 116 || esc == 110 || esc == 102
+                || esc == 114 || esc == 34 || esc == 92 || esc == 117
+                || esc == 85 {
+                    out = out + line.slice(i, i + 2)
+                    i = i + 2
+                    continue
+                }
+                return Result.Err("invalid TOML escape sequence: \\"
+                + chr(esc) + " (TOML only allows \\b, \\t, \\n, \\f, "
+                + "\\r, \\\", \\uXXXX, \\UXXXXXXXX)")
+            }
+            if c == 34 {
+                in_str = false
+            }
+            out = out + line.slice(i, i + 1)
+            i = i + 1
+            continue
+        }
+        if c == 34 {
+            in_str = true
+            out = out + line.slice(i, i + 1)
+            i = i + 1
+            continue
+        }
+        if c == 35 {
+            break
+        }
+        out = out + line.slice(i, i + 1)
+        i = i + 1
+    }
+    return Result.Ok(out)
+}
+
+# toml_is_int_token(tok) — Python's int(tok) acceptance.
+fn toml_is_int_token(tok: str) -> bool {
+    let t: str = tok.trim()
+    if t.len() == 0 {
+        return false
+    }
+    let mut i: int = 0
+    if t.byte_at(0) == 43 || t.byte_at(0) == 45 {
+        i = 1
+    }
+    if i >= t.len() {
+        return false
+    }
+    let mut prev_us: bool = true
+    while i < t.len() {
+        let c: int = t.byte_at(i)
+        if is_digit_b(c) {
+            prev_us = false
+        } else if c == 95 {
+            if prev_us {
+                return false
+            }
+            prev_us = true
+        } else {
+            return false
+        }
+        i = i + 1
+    }
+    if prev_us {
+        return false
+    }
+    return true
+}
+
+fn toml_is_float_token(tok: str) -> bool {
+    if tok.len() == 0 {
+        return false
+    }
+    let mut saw_digit: bool = false
+    let mut saw_dot_exp: bool = false
+    let mut i: int = 0
+    if tok.byte_at(0) == 43 || tok.byte_at(0) == 45 {
+        i = 1
+    }
+    while i < tok.len() {
+        let c: int = tok.byte_at(i)
+        if is_digit_b(c) {
+            saw_digit = true
+        } else if c == 46 || c == 101 || c == 69 {
+            saw_dot_exp = true
+        } else if c != 43 && c != 45 && c != 95 {
+            return false
+        }
+        i = i + 1
+    }
+    return saw_digit && saw_dot_exp
+}
+
+# parse_int_clean — the digits of a signed int token.
+fn parse_int_clean(tok: str) -> int {
+    let mut neg: bool = false
+    let mut i: int = 0
+    if tok.len() > 0 && (tok.byte_at(0) == 43 || tok.byte_at(0) == 45) {
+        neg = tok.byte_at(0) == 45
+        i = 1
+    }
+    let mut v: int = 0
+    while i < tok.len() {
+        let c: int = tok.byte_at(i)
+        if is_digit_b(c) {
+            v = v * 10 + (c - 48)
+        }
+        i = i + 1
+    }
+    if neg {
+        return -v
+    }
+    return v
+}
+
+# hex4_val / hex8_val — \uXXXX / \UXXXXXXXX payloads.
+fn hex4_val(s: str) -> int {
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < s.len() && i < 4 {
+        v = v * 16 + hex_val_b(s.byte_at(i))
+        i = i + 1
+    }
+    return v
+}
+
+fn hex8_val(s: str) -> int {
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < s.len() && i < 8 {
+        v = v * 16 + hex_val_b(s.byte_at(i))
+        i = i + 1
+    }
+    return v
+}
+
+# utf8_encode(cp) — the codepoint as UTF-8 bytes.
+fn utf8_encode(cp: int) -> str {
+    if cp < 0 {
+        return ""
+    }
+    if cp < 128 {
+        return chr(cp)
+    }
+    if cp < 2048 {
+        return chr(192 + cp / 64) + chr(128 + cp % 64)
+    }
+    if cp < 65536 {
+        return chr(224 + cp / 4096) + chr(128 + (cp / 64) % 64)
+        + chr(128 + cp % 64)
+    }
+    return chr(240 + cp / 262144) + chr(128 + (cp / 4096) % 64)
+    + chr(128 + (cp / 64) % 64) + chr(128 + cp % 64)
+}
+
+# py_repr_str(s) — Python's repr of a str (the error detail lines).
+fn py_repr_str(s: str) -> str {
+    let mut out: str = "'"
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c == 39 {
+            out = out + "\\'"
+        } else if c == 92 {
+            out = out + "\\\\"
+        } else if c == 10 {
+            out = out + "\\n"
+        } else if c == 9 {
+            out = out + "\\t"
+        } else if c == 13 {
+            out = out + "\\r"
+        } else if c < 32 || c >= 127 {
+            let h: str = "0123456789abcdef"
+            let b1: int = c / 16
+            let b2: int = c - (c / 16) * 16
+            out = out + "\\x" + h.slice(b1, b1 + 1) + h.slice(b2, b2 + 1)
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out + "'"
+}
+
+struct TomlPair {
+    val: TomlVal,
+    next: int
+}
+
+# toml_bare_value(tok) — true/false/int/float/bare string.
+fn toml_bare_value(tok: str) -> TomlVal {
+    if tok == "true" {
+        return TomlVal {
+            kind: "bool", sval: "", ival: 0, bval: true,
+            keys: [], vals: []
+        }
+    }
+    if tok == "false" {
+        return TomlVal {
+            kind: "bool", sval: "", ival: 0, bval: false,
+            keys: [], vals: []
+        }
+    }
+    if toml_is_int_token(tok) {
+        return TomlVal {
+            kind: "int", sval: "", ival: parse_int_clean(tok), bval: false,
+            keys: [], vals: []
+        }
+    }
+    if toml_is_float_token(tok) {
+        return TomlVal {
+            kind: "float", sval: tok, ival: 0, bval: false,
+            keys: [], vals: []
+        }
+    }
+    return TomlVal {
+        kind: "str", sval: tok, ival: 0, bval: false,
+        keys: [], vals: []
+    }
+}
+
+# parse_toml_value(src, i) — _parse_value: (value, next index).
+fn parse_toml_value(src: str, i: int) -> Result[TomlPair, str] {
+    let n: int = src.len()
+    let mut j: int = i
+    while j < n && (src.byte_at(j) == 32 || src.byte_at(j) == 9
+    || src.byte_at(j) == 13 || src.byte_at(j) == 10) {
+        j = j + 1
+    }
+    if j >= n {
+        return Result.Ok(TomlPair {
+            val: toml_none(), next: j
+        })
+    }
+    let c: int = src.byte_at(j)
+    if c == 34 {
+        let mut k: int = j + 1
+        let mut out: str = ""
+        while k < n && src.byte_at(k) != 34 {
+            if src.byte_at(k) == 92 && k + 1 < n {
+                let nxt: int = src.byte_at(k + 1)
+                if nxt == 110 {
+                    out = out + "\n"
+                    k = k + 2
+                    continue
+                }
+                if nxt == 116 {
+                    out = out + "\t"
+                    k = k + 2
+                    continue
+                }
+                if nxt == 114 {
+                    out = out + chr(13)
+                    k = k + 2
+                    continue
+                }
+                if nxt == 98 {
+                    out = out + chr(8)
+                    k = k + 2
+                    continue
+                }
+                if nxt == 102 {
+                    out = out + chr(12)
+                    k = k + 2
+                    continue
+                }
+                if nxt == 34 {
+                    out = out + "\""
+                    k = k + 2
+                    continue
+                }
+                if nxt == 92 {
+                    out = out + "\\"
+                    k = k + 2
+                    continue
+                }
+                if nxt == 117 && k + 6 <= n {
+                    let cp: int = hex4_val(src.slice(k + 2, k + 6))
+                    out = out + utf8_encode(cp)
+                    k = k + 6
+                    continue
+                }
+                if nxt == 85 && k + 10 <= n {
+                    let cp2: int = hex8_val(src.slice(k + 2, k + 10))
+                    out = out + utf8_encode(cp2)
+                    k = k + 10
+                    continue
+                }
+                out = out + chr(nxt)
+                k = k + 2
+                continue
+            }
+            out = out + src.slice(k, k + 1)
+            k = k + 1
+        }
+        if k >= n {
+            return Result.Err("unterminated string literal at offset "
+            + j.to_str())
+        }
+        return Result.Ok(TomlPair {
+            val: TomlVal {
+                kind: "str", sval: out, ival: 0, bval: false,
+                keys: [], vals: []
+            },
+            next: k + 1
+        })
+    }
+    if c == 91 {
+        let items: list[TomlVal] = []
+        let mut k: int = j + 1
+        while k < n && src.byte_at(k) != 93 {
+            while k < n && (src.byte_at(k) == 32 || src.byte_at(k) == 9
+            || src.byte_at(k) == 13 || src.byte_at(k) == 10
+            || src.byte_at(k) == 44) {
+                k = k + 1
+            }
+            if k >= n || src.byte_at(k) == 93 {
+                break
+            }
+            if src.byte_at(k) == 34 {
+                let pair: Result[TomlPair, str] = parse_toml_value(src, k)
+                if result_is_err(pair) {
+                    return Result.Err(result_err_or(pair, ""))
+                }
+                items.push(result_unwrap(pair).val)
+                k = result_unwrap(pair).next
+            } else {
+                let s0: int = k
+                while k < n && src.byte_at(k) != 32 && src.byte_at(k) != 9
+                && src.byte_at(k) != 13 && src.byte_at(k) != 10
+                && src.byte_at(k) != 44 && src.byte_at(k) != 93 {
+                    k = k + 1
+                }
+                let tok: str = src.slice(s0, k)
+                if tok != "" {
+                    items.push(toml_bare_value(tok))
+                }
+            }
+        }
+        return Result.Ok(TomlPair {
+            val: TomlVal {
+                kind: "list", sval: "", ival: 0, bval: false,
+                keys: [], vals: []
+            },
+            next: k + 1
+        })
+    }
+    if c == 123 {
+        let table: TomlVal = toml_table()
+        let mut k: int = j + 1
+        while k < n && src.byte_at(k) != 125 {
+            while k < n && (src.byte_at(k) == 32 || src.byte_at(k) == 9
+            || src.byte_at(k) == 13 || src.byte_at(k) == 10
+            || src.byte_at(k) == 44) {
+                k = k + 1
+            }
+            if k >= n || src.byte_at(k) == 125 {
+                break
+            }
+            let eq: int = find_from(src, "=", k)
+            if eq < 0 {
+                return Result.Err("substring not found")
+            }
+            let key: str = src.slice(k, eq).trim()
+            let pair2: Result[TomlPair, str] = parse_toml_value(src, eq + 1)
+            if result_is_err(pair2) {
+                return Result.Err(result_err_or(pair2, ""))
+            }
+            toml_set(table, key, result_unwrap(pair2).val)
+            k = result_unwrap(pair2).next
+        }
+        return Result.Ok(TomlPair {
+            val: table, next: k + 1
+        })
+    }
+    let s0: int = j
+    while j < n && src.byte_at(j) != 32 && src.byte_at(j) != 9
+    && src.byte_at(j) != 13 && src.byte_at(j) != 10
+    && src.byte_at(j) != 44 && src.byte_at(j) != 93
+    && src.byte_at(j) != 125 && src.byte_at(j) != 61
+    && src.byte_at(j) != 35 {
+        j = j + 1
+    }
+    let tok: str = src.slice(s0, j)
+    return Result.Ok(TomlPair {
+        val: toml_bare_value(tok), next: j
+    })
+}
+
+# section_cursor(doc, section, creating) — walk to the section table.
+fn section_cursor(doc: TomlVal, section: str, creating: bool)
+-> Result[TomlVal, str] {
+    let parts: list[str] = section.split(".")
+    let mut cursor: TomlVal = doc
+    let mut i: int = 0
+    while i < parts.len() {
+        let p: str = parts.get(i)
+        if cursor.kind != "table" {
+            let mut msg: str = "manifest: section [" + section
+            + "] shadows a non-table value"
+            if creating {
+                msg = msg + " (a key under [" + section
+                + "] was already set)"
+            }
+            return Result.Err(msg)
+        }
+        let nxt: TomlVal = toml_get(cursor, p)
+        if nxt.kind == "none" {
+            let fresh: TomlVal = toml_table()
+            toml_set(cursor, p, fresh)
+            cursor = fresh
+        } else {
+            cursor = nxt
+        }
+        i = i + 1
+    }
+    if cursor.kind != "table" {
+        return Result.Err("manifest: cannot set key under non-table "
+        + "section [" + section + "]")
+    }
+    return Result.Ok(cursor)
+}
+
+# parse_manifest(path) — the tree of sections and keys.
+fn parse_manifest(path: str) -> Result[TomlVal, str] uses Fs {
+    if !is_file_h(path) {
+        return Result.Err("manifest not found: " + path)
+    }
+    let raw: str = read_file(path)
+    let lines: list[str] = raw.split("\n")
+    let mut src: str = ""
+    let mut li: int = 0
+    while li < lines.len() {
+        let sr: Result[str, str] = strip_toml_comment(lines.get(li))
+        if result_is_err(sr) {
+            return Result.Err("manifest: " + result_err_or(sr, "")
+            + " (in line: " + py_repr_str(lines.get(li)) + ")")
+        }
+        src = src + result_unwrap(sr)
+        if li + 1 < lines.len() {
+            src = src + "\n"
+        }
+        li = li + 1
+    }
+    let result: TomlVal = toml_table()
+    let mut current_section: str = ""
+    let n: int = src.len()
+    let mut i: int = 0
+    while i < n {
+        while i < n && (src.byte_at(i) == 32 || src.byte_at(i) == 9
+        || src.byte_at(i) == 13 || src.byte_at(i) == 10) {
+            i = i + 1
+        }
+        if i >= n {
+            break
+        }
+        if src.byte_at(i) == 91 {
+            let j: int = find_from(src, "]", i)
+            if j < 0 {
+                return Result.Err("substring not found")
+            }
+            current_section = src.slice(i + 1, j).trim()
+            if current_section == "" {
+                return Result.Err("manifest: empty section header at "
+                + "offset " + i.to_str())
+            }
+            let cursor: Result[TomlVal, str] = section_cursor(result,
+            current_section, true)
+            if result_is_err(cursor) {
+                return Result.Err(result_err_or(cursor, ""))
+            }
+            i = j + 1
+            continue
+        }
+        let eq: int = find_from(src, "=", i)
+        if eq < 0 {
+            return Result.Err("substring not found")
+        }
+        let key: str = src.slice(i, eq).trim()
+        if key == "" {
+            return Result.Err("manifest: empty key at offset "
+            + i.to_str())
+        }
+        let pv: Result[TomlPair, str] = parse_toml_value(src, eq + 1)
+        if result_is_err(pv) {
+            return Result.Err(result_err_or(pv, ""))
+        }
+        let pair: TomlPair = result_unwrap(pv)
+        if current_section == "" {
+            toml_set(result, key, pair.val)
+        } else {
+            let cursor2: Result[TomlVal, str] = section_cursor(result,
+            current_section, false)
+            if result_is_err(cursor2) {
+                return Result.Err(result_err_or(cursor2, ""))
+            }
+            toml_set(result_unwrap(cursor2), key, pair.val)
+        }
+        i = pair.next
+    }
+    return Result.Ok(result)
+}
+
+# sha256_tree(path) — the lockfile's content hash (file sha256, else
+# the deterministic directory hash).
+fn sha256_tree(path: str) -> str uses Fs {
+    if is_file_h(path) {
+        return sha256_hex(read_or(path, ""))
+    }
+    return sha256_hex(dir_hash_text(path, ""))
+}
+
+fn dir_hash_text(dir: str, prefix: str) -> str uses Fs {
+    if !is_dir_h(dir) {
+        return ""
+    }
+    let names: list[str] = fs_read_dir(dir)
+    let files: list[str] = []
+    let dirs: list[str] = []
+    let mut ni: int = 0
+    while ni < names.len() {
+        let nm: str = names.get(ni)
+        if is_dir_h(path_join2(dir, nm)) {
+            dirs.push(nm)
+        } else {
+            files.push(nm)
+        }
+        ni = ni + 1
+    }
+    let mut h: str = ""
+    let sfiles: list[str] = sort_strs(files)
+    let mut fi: int = 0
+    while fi < sfiles.len() {
+        h = h + prefix + sfiles.get(fi) + chr(0)
+        + read_or(path_join2(dir, sfiles.get(fi)), "") + chr(0)
+        fi = fi + 1
+    }
+    let sdirs: list[str] = sort_strs(dirs)
+    let mut di: int = 0
+    while di < sdirs.len() {
+        h = h + dir_hash_text(path_join2(dir, sdirs.get(di)),
+        prefix + sdirs.get(di) + "/")
+        di = di + 1
+    }
+    return h
+}
+
+# valid_dep_name / confined_join — hpkg_util's laws.
+fn valid_dep_name(name: str) -> bool {
+    if name == "" {
+        return false
+    }
+    let b0: int = name.byte_at(0)
+    if b0 == 46 || b0 == 45 {
+        return false
+    }
+    let mut i: int = 0
+    while i < name.len() {
+        let c: int = name.byte_at(i)
+        if !is_alpha_b(c) && !is_digit_b(c) && c != 46 && c != 95
+        && c != 45 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn confined_join(base: str, rel: str, what: str) -> Result[str, Fail] {
+    if path_is_abs(rel) {
+        return Result.Err(fail(what + ": absolute paths are not allowed: "
+        + rel))
+    }
+    let parts: list[str] = str_replace(rel, "\\", "/").split("/")
+    if sg_has(parts, "..") {
+        return Result.Err(fail(what + ": path must not contain '..' "
+        + "segments: " + rel))
+    }
+    let cand: str = norm_path(path_join2(base, rel))
+    if cand != base && !cand.starts_with(base + "/") {
+        return Result.Err(fail(what + ": path escapes the package "
+        + "directory: " + rel))
+    }
+    return Result.Ok(cand)
+}
+
+# toml_text_of(v) — Python's str() of a parsed TOML value.
+fn toml_text_of(v: TomlVal) -> str {
+    if v.kind == "str" {
+        return v.sval
+    }
+    if v.kind == "int" {
+        return v.ival.to_str()
+    }
+    if v.kind == "bool" {
+        if v.bval {
+            return "True"
+        }
+        return "False"
+    }
+    return ""
+}
+
+struct DepOut {
+    dir: str,
+    content: str
+}
+
+# pkg_cache_dir() — HLS_PKG_CACHE or <repo>/.hls-pkg-cache.
+fn pkg_cache_dir() -> str uses Fs, Proc, Args {
+    let over: str = env_get("HLS_PKG_CACHE")
+    if over != "" || env_has("HLS_PKG_CACHE") {
+        return over
+    }
+    return repo_root() + "/.hls-pkg-cache"
+}
+
+# resolve_dep — one dependency to (package dir, content path): path
+# deps package-relative FIRST then repo-root-relative (both confined);
+# git deps through hls-pkg's cache and git itself.
+fn resolve_dep(dep_name: str, source: TomlVal, declaring_dir: str,
+root: str) -> Result[DepOut, Fail] uses Fs, Proc, Args {
+    if source.kind != "table" {
+        return Result.Err(fail("dependency " + dep_name
+        + ": source must be a table"))
+    }
+    let git_v: TomlVal = toml_get(source, "git")
+    if git_v.kind != "none" {
+        if git_v.kind != "str" {
+            return Result.Err(fail("dependency " + dep_name
+            + " git URL must be a string"))
+        }
+        if !valid_dep_name(dep_name) {
+            return Result.Err(fail("invalid dependency name: '"
+            + dep_name + "' (allowed: letters, digits, '.', '_', '-'; "
+            + "must not start with '.' or '-')"))
+        }
+        let repo_url: str = git_v.sval
+        if repo_url == "" {
+            return Result.Err(fail("dependency " + dep_name
+            + " git URL must not be empty"))
+        }
+        if repo_url.byte_at(0) == 45 {
+            return Result.Err(fail("dependency " + dep_name
+            + " git URL must not start with '-' (git option injection): '"
+            + repo_url + "'"))
+        }
+        let cache: str = pkg_cache_dir()
+        proc_exec("mkdir -p '" + cache + "'")
+        let repo_hash: str = sha256_hex(repo_url).slice(0, 12)
+        let clone_dir: str = path_join2(path_join2(cache, dep_name),
+        repo_hash)
+        if !is_dir_h(clone_dir) {
+            let gc: RunCap = spawn_cap("git", ["clone", "--quiet", "--",
+            repo_url, clone_dir])
+            if gc.code != 0 {
+                return Result.Err(fail("dependency " + dep_name
+                + ": failed to clone git repository (exit "
+                + gc.code.to_str() + ")"))
+            }
+        }
+        let ref_v: TomlVal = toml_get(source, "tag")
+        let mut ref: str = ""
+        if ref_v.kind != "none" {
+            ref = toml_text_of(ref_v)
+        }
+        if ref == "" {
+            let br_v: TomlVal = toml_get(source, "branch")
+            if br_v.kind != "none" {
+                ref = toml_text_of(br_v)
+            }
+        }
+        if ref == "" {
+            ref = "main"
+        }
+        let gf: RunCap = spawn_cap("git", ["-C", clone_dir, "fetch",
+        "--quiet", "origin", "--", ref])
+        if gf.code != 0 {
+            return Result.Err(fail("dependency " + dep_name
+            + ": failed to fetch/checkout git ref '" + ref + "'"))
+        }
+        let gk: RunCap = spawn_cap("git", ["-C", clone_dir, "checkout",
+        "--quiet", ref])
+        if gk.code != 0 {
+            return Result.Err(fail("dependency " + dep_name
+            + ": failed to fetch/checkout git ref '" + ref + "'"))
+        }
+        let path_v: TomlVal = toml_get(source, "path")
+        let mut full: str = clone_dir
+        if path_v.kind != "none" && toml_text_of(path_v) != "" {
+            let cr: Result[str, Fail] = confined_join(clone_dir,
+            toml_text_of(path_v), "dependency " + dep_name)
+            if result_is_err(cr) {
+                return Result.Err(result_err_or(cr, fail("")))
+            }
+            full = result_unwrap(cr)
+        }
+        if is_file_h(full) {
+            return Result.Ok(DepOut {
+                dir: path_dirname(full), content: full
+            })
+        }
+        if is_dir_h(full) {
+            return Result.Ok(DepOut {
+                dir: full, content: full
+            })
+        }
+        return Result.Err(fail("dependency " + dep_name
+        + ": path not found in repo: " + full))
+    }
+    let path_v2: TomlVal = toml_get(source, "path")
+    if path_v2.kind != "none" {
+        let rel: str = toml_text_of(path_v2)
+        let bases: list[str] = [declaring_dir, root]
+        let mut bi: int = 0
+        while bi < bases.len() {
+            let cr: Result[str, Fail] = confined_join(bases.get(bi), rel,
+            "dependency " + dep_name)
+            if result_is_err(cr) {
+                return Result.Err(result_err_or(cr, fail("")))
+            }
+            let cand: str = result_unwrap(cr)
+            if is_dir_h(cand) {
+                let rp: str = realpath_lex(cand)
+                return Result.Ok(DepOut {
+                    dir: rp, content: rp
+                })
+            }
+            if is_file_h(cand) {
+                let full: str = realpath_lex(cand)
+                return Result.Ok(DepOut {
+                    dir: path_dirname(full), content: full
+                })
+            }
+            bi = bi + 1
+        }
+        return Result.Err(fail("dependency " + dep_name
+        + ": path not found: " + rel))
+    }
+    return Result.Err(fail("dependency " + dep_name
+    + " has no git/path source"))
+}
+
+# ---------------------------------------------------------------------------
+# The package TREE walk — hls-audit's _walk_packages.
+# ---------------------------------------------------------------------------
+
+struct PkgNode {
+    dir: str,
+    name: str,
+    version: str,
+    manifest: TomlVal,
+    deps: list[PkgNode],
+    shared: bool,
+    src_kind: str,
+    content_path: str,
+    audited: bool,
+    unauditable: bool
+}
+
+fn pkg_node_new(dir: str, name: str, version: str,
+manifest: TomlVal) -> PkgNode {
+    return PkgNode {
+        dir: dir, name: name, version: version, manifest: manifest,
+        deps: [], shared: false, src_kind: "root",
+        content_path: dir, audited: false, unauditable: false
+    }
+}
+
+fn manifest_name() -> str {
+    return "hls-pkg.toml"
+}
+
+fn lockfile_name() -> str {
+    return "hls-pkg.lock"
+}
+
+# walk_packages — depth-first over the manifest's sorted [dependencies],
+# a directory on the current stack a cycle, the audit cached per dir.
+fn walk_packages(pkg_dir: str, root: str, stack_dirs: list[str],
+stack_names: list[str], cache: map[str, PkgNode])
+-> Result[PkgNode, Fail] uses Fs, Proc, Args {
+    let real: str = realpath_lex(pkg_dir)
+    let mut si: int = 0
+    while si < stack_dirs.len() {
+        if stack_dirs.get(si) == real {
+            let chain: list[str] = []
+            let mut cj: int = si
+            while cj < stack_names.len() {
+                chain.push(stack_names.get(cj))
+                cj = cj + 1
+            }
+            chain.push(stack_names.get(si))
+            return Result.Err(fail("circular package dependency: "
+            + join_strs(chain, " -> ")))
+        }
+        si = si + 1
+    }
+    let manifest_path: str = path_join2(real, manifest_name())
+    if !is_file_h(manifest_path) {
+        return Result.Err(fail("no hls-pkg.toml in " + real))
+    }
+    let mr: Result[TomlVal, str] = parse_manifest(manifest_path)
+    if result_is_err(mr) {
+        return Result.Err(fail("manifest " + manifest_path + ": "
+        + result_err_or(mr, "")))
+    }
+    let manifest: TomlVal = result_unwrap(mr)
+    let pkg_sec: TomlVal = toml_get(manifest, "package")
+    if pkg_sec.kind != "table" && pkg_sec.kind != "none" {
+        return Result.Err(fail("manifest " + manifest_path
+        + ": 'package' section is not a table"))
+    }
+    let name_v: TomlVal = toml_get(pkg_sec, "name")
+    let mut name: str = toml_text_of(name_v)
+    if name == "" {
+        name = path_basename(real)
+    }
+    let version_v: TomlVal = toml_get(pkg_sec, "version")
+    let mut version: str = toml_text_of(version_v)
+    if version == "" {
+        version = "0.0.0"
+    }
+    let node: PkgNode = pkg_node_new(real, name, version, manifest)
+    if cache.has(real) {
+        let prior: PkgNode = cache.get_or(real, node)
+        node.audited = prior.audited
+        node.unauditable = prior.unauditable
+        node.shared = true
+        return Result.Ok(node)
+    }
+    stack_dirs.push(real)
+    stack_names.push(name)
+    let deps_sec: TomlVal = toml_get(manifest, "dependencies")
+    if deps_sec.kind != "table" && deps_sec.kind != "none" {
+        stack_dirs.pop()
+        stack_names.pop()
+        return Result.Err(fail("package " + name
+        + ": [dependencies] section is corrupt"))
+    }
+    let dep_names: list[str] = sort_strs(deps_sec.keys)
+    let mut di: int = 0
+    while di < dep_names.len() {
+        let dep_name: str = dep_names.get(di)
+        let source: TomlVal = toml_get(deps_sec, dep_name)
+        let dr: Result[DepOut, Fail] = resolve_dep(dep_name, source, real,
+        root)
+        if result_is_err(dr) {
+            return Result.Err(result_err_or(dr, fail("")))
+        }
+        let dep: DepOut = result_unwrap(dr)
+        let cr: Result[PkgNode, Fail] = walk_packages(dep.dir, root,
+        stack_dirs, stack_names, cache)
+        if result_is_err(cr) {
+            return Result.Err(result_err_or(cr, fail("")))
+        }
+        let child: PkgNode = result_unwrap(cr)
+        if toml_get(source, "git").kind != "none" {
+            child.src_kind = "git"
+        } else {
+            child.src_kind = "path"
+        }
+        child.content_path = dep.content
+        node.deps.push(child)
+        di = di + 1
+    }
+    stack_dirs.pop()
+    stack_names.pop()
+    return Result.Ok(node)
+}
+
+fn all_nodes(root: PkgNode) -> list[PkgNode] {
+    let out: list[PkgNode] = []
+    all_nodes_into(root, out)
+    return out
+}
+
+fn all_nodes_into(node: PkgNode, out: list[PkgNode]) -> void {
+    out.push(node)
+    let mut i: int = 0
+    while i < node.deps.len() {
+        all_nodes_into(node.deps.get(i), out)
+        i = i + 1
+    }
+}
+
+# ---------------------------------------------------------------------------
+# The per-package check — the REAL front-end in a probe child.
+# ---------------------------------------------------------------------------
+
+# self_path() — this binary as spawned (probe children re-exec it).
+fn self_path() -> str uses Args {
+    let argv: list[str] = args()
+    if argv.len() > 0 {
+        return argv.get(0)
+    }
+    return ""
+}
+
+# probe_audit_spawn(entry_path) — the parent side: spawn the tool with
+# --probe-audit, map the outcome (ok / why).
+fn probe_audit_spawn(entry_path: str) -> Result[bool, str] uses Proc, Args {
+    let selfp: str = self_path()
+    if selfp == "" {
+        return Result.Err("cannot re-exec the tool for the audit probe")
+    }
+    let r: RunCap = spawn_cap(selfp, ["--probe-audit", entry_path])
+    if r.code == 0 {
+        return Result.Ok(true)
+    }
+    let mut why: str = r.err.trim()
+    if why.starts_with("panic: ") {
+        why = why.slice(7, why.len())
+    }
+    return Result.Err(why)
+}
+
+# audit_one_package(node, root) — the entry through the checker; a
+# library entry (no main) through hls-pkg lock's wrapper contract.
+fn audit_one_package(node: PkgNode, root: str) -> Result[bool, str]
+uses Fs, Proc, Args, IO {
+    if node.audited {
+        if node.unauditable {
+            return Result.Err("package " + node.name + " unauditable")
+        }
+        return Result.Ok(true)
+    }
+    let pkg_sec: TomlVal = toml_get(node.manifest, "package")
+    let entry_v: TomlVal = toml_get(pkg_sec, "entry")
+    let mut entry: str = toml_text_of(entry_v)
+    if entry == "" {
+        entry = "main.hls"
+    }
+    let entry_path: str = path_join2(node.dir, entry)
+    if !is_file_h(entry_path) {
+        return Result.Err("package " + node.name
+        + ": entry not found: " + entry)
+    }
+    let direct: Result[bool, str] = probe_audit_spawn(entry_path)
+    if result_is_ok(direct) {
+        return Result.Ok(true)
+    }
+    let msg: str = result_err_or(direct, "")
+    if !msg.contains("missing main function") {
+        return Result.Err("package " + node.name + " unauditable: " + msg)
+    }
+    # a library entry: the wrapper contract hls-pkg lock uses.
+    let wrapper_path: str = node.dir + "/.hls-audit-wrapper-"
+    + proc_pid().to_str() + ".hls"
+    write_file(wrapper_path, "# auto-generated by hls-audit\n"
+    + "import \"" + entry + "\"\n"
+    + "fn main() -> int pure { return 0 }\n")
+    let wr: Result[bool, str] = probe_audit_spawn(wrapper_path)
+    proc_exec("rm -f '" + wrapper_path + "'")
+    if result_is_err(wr) {
+        return Result.Err("package " + node.name + " unauditable: "
+        + result_err_or(wr, ""))
+    }
+    return Result.Ok(true)
+}
+
+# lock_locked_map(lock_path) — the lockfile's name -> sha256 map.
+fn lock_locked_map(lock_path: str) -> Result[map[str, str], Fail] uses Fs {
+    let locked: map[str, str] = map_new()
+    let text: str = read_or(lock_path, "")
+    let pr: Result[JsonValue, str] = json_parse_result(text)
+    if result_is_err(pr) {
+        return Result.Err(fail("cannot read lockfile: "
+        + result_err_or(pr, "")))
+    }
+    let lock: JsonValue = result_unwrap(pr)
+    let pkgs: JsonValue = json_object_get(lock, "packages")
+    if json_is_array(pkgs) {
+        let mut i: int = 0
+        while i < pkgs.arr.len() {
+            let p: JsonValue = pkgs.arr.get(i)
+            if json_is_object(p) {
+                let nm: JsonValue = json_object_get(p, "name")
+                let sha: JsonValue = json_object_get(p, "sha256")
+                if json_is_str(nm) && json_is_str(sha) {
+                    locked.set(json_str_value(nm), json_str_value(sha))
+                } else if json_is_str(nm) {
+                    locked.set(json_str_value(nm), "")
+                }
+            }
+            i = i + 1
+        }
+    }
+    return Result.Ok(locked)
+}
+
+# The package audit report the release flow consumes.
+struct SignAudit {
+    lockfile: str,
+    drift_names: list[str],
+    unaudit_names: list[str],
+    root_name: str,
+    root_version: str
+}
+
+# sign_audit_package(root_dir, root) — audit_package's release slice:
+# walk, per-package check (fail-closed, named), lockfile drift.
+fn sign_audit_package(root_dir: str, root: str)
+-> Result[SignAudit, Fail] uses Fs, Proc, Args, IO {
+    let rp: str = realpath_lex(root_dir)
+    if !is_dir_h(rp) {
+        return Result.Err(fail("not a directory: " + rp))
+    }
+    let empty_cache: map[str, PkgNode] = map_new()
+    let wr: Result[PkgNode, Fail] = walk_packages(rp, root, [], [],
+    empty_cache)
+    if result_is_err(wr) {
+        return Result.Err(result_err_or(wr, fail("")))
+    }
+    let root_node: PkgNode = result_unwrap(wr)
+    let nodes: list[PkgNode] = all_nodes(root_node)
+
+    # Audit every unique package; failures are recorded fail-closed.
+    let audited: map[str, bool] = map_new()
+    let unaudit_names: list[str] = []
+    let mut ni: int = 0
+    while ni < nodes.len() {
+        let node: PkgNode = nodes.get(ni)
+        if audited.has(node.dir) {
+            ni = ni + 1
+            continue
+        }
+        let ar: Result[bool, str] = audit_one_package(node, root)
+        if result_is_err(ar) {
+            node.unauditable = true
+            node.audited = true
+            unaudit_names.push(node.name)
+        } else {
+            node.audited = true
+        }
+        audited.set(node.dir, true)
+        ni = ni + 1
+    }
+
+    # Lockfile drift: every top-level dep's recorded sha256 must still
+    # match the tree it names.
+    let lock_path: str = path_join2(rp, lockfile_name())
+    let mut lockfile: str = "absent"
+    let drift_names: list[str] = []
+    if is_file_h(lock_path) {
+        lockfile = "present"
+        let lm: Result[map[str, str], Fail] = lock_locked_map(lock_path)
+        if result_is_err(lm) {
+            return Result.Err(result_err_or(lm, fail("")))
+        }
+        let locked: map[str, str] = result_unwrap(lm)
+        let mut ci: int = 0
+        while ci < root_node.deps.len() {
+            let child: PkgNode = root_node.deps.get(ci)
+            if !locked.has(child.name) {
+                drift_names.push(child.name)
+            } else {
+                let was: str = locked.get_or(child.name, "")
+                let now: str = sha256_tree(child.content_path)
+                if now != was {
+                    drift_names.push(child.name)
+                }
+            }
+            ci = ci + 1
+        }
+    }
+    return Result.Ok(SignAudit {
+        lockfile: lockfile,
+        drift_names: sorted_unique(drift_names),
+        unaudit_names: sorted_unique(unaudit_names),
+        root_name: root_node.name,
+        root_version: root_node.version
+    })
+}
+
+# ============================================================================
+# The release layer — hlsign_release.py.
+# ============================================================================
+
+# content_digest(pkg_dir) — hls-pkg publish's own walk: sorted .hls
+# files (hidden dirs skipped), rel-path \0 bytes \0 per file.
+struct ContentDigest {
+    hex: str,
+    files: int
+}
+
+fn collect_hls_sources(dir: str, out: list[str]) -> void uses Fs {
+    if !is_dir_h(dir) {
+        return
+    }
+    let names: list[str] = fs_read_dir(dir)
+    let mut i: int = 0
+    while i < names.len() {
+        let nm: str = names.get(i)
+        if nm == "" {
+            i = i + 1
+            continue
+        }
+        if nm.byte_at(0) == 46 {
+            i = i + 1
+            continue
+        }
+        let full: str = path_join2(dir, nm)
+        if is_dir_h(full) {
+            collect_hls_sources(full, out)
+        } else if nm.ends_with(".hls") {
+            out.push(full)
+        }
+        i = i + 1
+    }
+}
+
+fn content_digest(pkg_dir: str) -> ContentDigest uses Fs {
+    let sources: list[str] = []
+    collect_hls_sources(pkg_dir, sources)
+    let sorted_sources: list[str] = sort_strs(sources)
+    let mut h: str = ""
+    let mut i: int = 0
+    while i < sorted_sources.len() {
+        let s: str = sorted_sources.get(i)
+        let mut rel: str = s
+        if s.starts_with(pkg_dir + "/") {
+            rel = s.slice(pkg_dir.len() + 1, s.len())
+        }
+        h = h + rel + chr(0) + read_or(s, "") + chr(0)
+        i = i + 1
+    }
+    return ContentDigest {
+        hex: sha256_hex(h), files: sorted_sources.len()
+    }
+}
+
+# rel_build_statement(pkg_dir, keyid_hex) — audit the tree, require the
+# lockfile, refuse drift, derive the deterministic statement.
+fn rel_build_statement(pkg_dir: str, keyid_hex: str) -> Result[JDoc, Fail]
+uses Fs, Proc, Args, IO {
+    let rp: str = realpath_lex(pkg_dir)
+    let manifest_path: str = path_join2(rp, manifest_name())
+    if !is_file_h(manifest_path) {
+        return Result.Err(fail("no hls-pkg.toml in " + rp
+        + " — a release signs a package"))
+    }
+    let ar: Result[SignAudit, Fail] = sign_audit_package(rp, repo_root())
+    if result_is_err(ar) {
+        return Result.Err(result_err_or(ar, fail("")))
+    }
+    let audit: SignAudit = result_unwrap(ar)
+    if audit.drift_names.len() > 0 {
+        return Result.Err(fail("drift between the lockfile and the tree ("
+        + join_strs(audit.drift_names, ", ")
+        + ") — re-lock; a signature over drifted content is a lie"))
+    }
+    if audit.unaudit_names.len() > 0 {
+        return Result.Err(fail("unauditable package(s) in the tree ("
+        + join_strs(audit.unaudit_names, ", ")
+        + ") — fail closed; no key signs a package nobody could check"))
+    }
+    if audit.lockfile != "present" {
+        return Result.Err(fail("a release ships pinned content — no "
+        + "lockfile next to the manifest; run hls-pkg lock first"))
+    }
+    let lock_path: str = path_join2(rp, lockfile_name())
+    let cd: ContentDigest = content_digest(rp)
+    let statement: JDoc = jd_obj([], [])
+    obj_set(statement, "schema", jd_str(statement_schema()))
+    obj_set(statement, "kind", jd_str("halis-package-release"))
+    obj_set(statement, "name", jd_str(audit.root_name))
+    obj_set(statement, "version", jd_str(audit.root_version))
+    obj_set(statement, "content_sha256", jd_str(cd.hex))
+    obj_set(statement, "files", jd_int(cd.files))
+    obj_set(statement, "lockfile_sha256", jd_str(sha256_file_h(lock_path)))
+    obj_set(statement, "algorithm", jd_str("ed25519"))
+    obj_set(statement, "key_id", jd_str(keyid_hex))
+    obj_set(statement, "tool", jd_str(tool_name()))
+    obj_set(statement, "tool_version", jd_str(tool_version()))
+    return Result.Ok(statement)
+}
+
+# rel_statement_bytes — the canonical bytes that get signed.
+fn rel_statement_bytes(statement: JDoc) -> str {
+    return py_json_dump(statement) + "\n"
+}
+
+# ---------------------------------------------------------------------------
+# The transparency log — hpkg_log.transparency_log_append (one chained
+# record; the .lock sidecar created, the flock advisory-only here —
+# single-writer runs, the byte law of the log itself, unchanged).
+# ---------------------------------------------------------------------------
+
+# transparency_log_path() — HLS_PKG_TRANSPARENCY_LOG or the repo's log.
+fn transparency_log_path() -> str uses Fs, Proc, Args {
+    let over: str = env_get("HLS_PKG_TRANSPARENCY_LOG")
+    if over != "" || env_has("HLS_PKG_TRANSPARENCY_LOG") {
+        return over
+    }
+    return repo_root() + "/.hls-pkg-transparency.log"
+}
+
+struct TlogRec {
+    seq: int,
+    chain_hash: str
+}
+
+# tlog_append(record) — build the chained record, append the line.
+fn tlog_append(record: JDoc) -> Result[TlogRec, Fail]
+uses Fs, Proc, Clock, Args {
+    let log_path: str = transparency_log_path()
+    let lock_path: str = log_path + ".lock"
+    if !file_exists(lock_path) {
+        write_file(lock_path, "")
+    }
+    let text: str = read_or(log_path, "")
+    let prev_hash: str = tlog_head_hash(text)
+    let seq: int = tlog_count_lines(text) + 1
+    let rec: JDoc = jd_obj(record.keys, record.vals)
+    obj_set(rec, "seq", jd_int(seq))
+    obj_set(rec, "timestamp",
+    jd_int(system_time_now_ms() / 1000))
+    obj_set(rec, "prev_hash", jd_str(prev_hash))
+    let chain: str = sha256_hex(prev_hash + py_json_canon(rec))
+    obj_set(rec, "chain_hash", jd_str(chain))
+    write_file(log_path, text + py_json_line(rec) + "\n")
+    return Result.Ok(TlogRec {
+        seq: seq, chain_hash: chain
+    })
+}
+
+# ---------------------------------------------------------------------------
+# release / verify-release.
+# ---------------------------------------------------------------------------
+
+struct RelOut {
+    statement: JDoc,
+    st_path: str,
+    sig_path: str,
+    rec: TlogRec
+}
+
+# rel_release(pkg_dir, secret_path, password, out_dir, trusted) — audit
+# -> lock -> statement -> two signatures -> versioned files -> ONE
+# ledger record.
+fn rel_release(pkg_dir: str, secret_path: str, password: str,
+out_dir: str, trusted_in: str, has_trusted: bool) -> Result[RelOut, Fail]
+uses Fs, Proc, Clock, Args, IO {
+    let sr: Result[SecretInfo, str] = fmt_read_secret(secret_path, password)
+    if result_is_err(sr) {
+        return Result.Err(fail(result_err_or(sr, "")))
+    }
+    let secret: SecretInfo = result_unwrap(sr)
+    let st_r: Result[JDoc, Fail] = rel_build_statement(pkg_dir,
+    fmt_key_id_hex(secret.public))
+    if result_is_err(st_r) {
+        return Result.Err(result_err_or(st_r, fail("")))
+    }
+    let statement: JDoc = result_unwrap(st_r)
+    let payload: str = rel_statement_bytes(statement)
+
+    let rp: str = realpath_lex(pkg_dir)
+    let mut outd: str = rp
+    if out_dir != "" {
+        outd = realpath_lex(out_dir)
+    }
+    if !is_dir_h(outd) {
+        return Result.Err(fail("output directory does not exist: " + outd))
+    }
+    let base: str = "hls-sign-" + obj_get_str(statement, "name") + "-"
+    + obj_get_str(statement, "version")
+    let st_path: str = path_join2(outd, base + statement_suffix())
+    let sig_path: str = path_join2(outd, base + sig_suffix())
+
+    let mut trusted: str = trusted_in
+    if !has_trusted {
+        trusted = fmt_default_trusted_comment(base + statement_suffix())
+    }
+    let two: TwoSig = fmt_sign_file(secret.seed, secret.public, payload,
+    trusted)
+    write_file(st_path, payload)
+    fmt_write_signature(sig_path, secret.public, two.raw_sig,
+    two.global_sig, trusted)
+
+    let rec_doc: JDoc = jd_obj([], [])
+    obj_set(rec_doc, "kind", jd_str("sign"))
+    obj_set(rec_doc, "name", jd_str(obj_get_str(statement, "name")))
+    obj_set(rec_doc, "version", jd_str(obj_get_str(statement, "version")))
+    obj_set(rec_doc, "content_sha256",
+    jd_str(obj_get_str(statement, "content_sha256")))
+    obj_set(rec_doc, "key_id", jd_str(obj_get_str(statement, "key_id")))
+    obj_set(rec_doc, "statement_sha256", jd_str(sha256_hex(payload)))
+    obj_set(rec_doc, "sig_sha256", jd_str(sha256_file_h(sig_path)))
+    obj_set(rec_doc, "files", jd_int(obj_get_int(statement, "files")))
+    let tr: Result[TlogRec, Fail] = tlog_append(rec_doc)
+    if result_is_err(tr) {
+        return Result.Err(result_err_or(tr, fail("")))
+    }
+    return Result.Ok(RelOut {
+        statement: statement,
+        st_path: st_path,
+        sig_path: sig_path,
+        rec: result_unwrap(tr)
+    })
+}
+
+# rel_find_release_pair(pkg_dir) — exactly one statement/signature pair.
+fn rel_find_release_pair(pkg_dir: str) -> Result[Fail2Str, Fail] uses Fs {
+    let statements: list[str] = []
+    let names: list[str] = fs_read_dir(pkg_dir)
+    let mut i: int = 0
+    while i < names.len() {
+        if names.get(i).ends_with(statement_suffix()) {
+            statements.push(names.get(i))
+        }
+        i = i + 1
+    }
+    let sorted_st: list[str] = sort_strs(statements)
+    if sorted_st.len() == 0 {
+        return Result.Err(fail("no hls-sign-<name>-<version>*"
+        + statement_suffix() + " in " + pkg_dir + " — nothing to verify"))
+    }
+    if sorted_st.len() > 1 {
+        return Result.Err(fail("several release statements in " + pkg_dir
+        + " (" + join_strs(sorted_st, ", ")
+        + ") — verify one directory per release"))
+    }
+    let st_path: str = path_join2(pkg_dir, sorted_st.get(0))
+    let sig_path: str = st_path.slice(0,
+    st_path.len() - statement_suffix().len()) + sig_suffix()
+    if !is_file_h(sig_path) {
+        return Result.Err(fail("the statement's signature is missing ("
+        + path_basename(sig_path) + ")"))
+    }
+    return Result.Ok(Fail2Str {
+        a: st_path, b: sig_path
+    })
+}
+
+struct Fail2Str {
+    a: str,
+    b: str
+}
+
+# rel_verify_release(pkg_dir, public) — signature first, then the
+# lockfile bytes, then the audit's drift check, then the content digest
+# re-derived from the CURRENT tree.
+fn rel_verify_release(pkg_dir: str, public: str) -> Result[JDoc, Fail]
+uses Fs, Proc, Args, IO {
+    let rp: str = realpath_lex(pkg_dir)
+    let pr: Result[Fail2Str, Fail] = rel_find_release_pair(rp)
+    if result_is_err(pr) {
+        return Result.Err(result_err_or(pr, fail("")))
+    }
+    let pair: Fail2Str = result_unwrap(pr)
+    let st_path: str = pair.a
+    let sig_path: str = pair.b
+
+    let payload: str = read_or(st_path, "")
+    let sr: Result[SigInfo, str] = fmt_read_signature(sig_path)
+    if result_is_err(sr) {
+        return Result.Err(fail(result_err_or(sr, "")))
+    }
+    let sig: SigInfo = result_unwrap(sr)
+    if !fmt_verify_signatures(public, payload, sig.raw_sig, sig.global_sig,
+    sig.trusted) {
+        return Result.Err(fail("the release signature does not verify "
+        + "against this key — the statement was tampered with or signed "
+        + "by another key"))
+    }
+
+    let jr: Result[JsonValue, str] = json_parse_result(payload)
+    if result_is_err(jr) {
+        return Result.Err(fail("the signed statement is not JSON ("
+        + result_err_or(jr, "") + ")"))
+    }
+    let jv: JsonValue = result_unwrap(jr)
+    let schema: JsonValue = json_object_get(jv, "schema")
+    let kind: JsonValue = json_object_get(jv, "kind")
+    if !(json_is_str(schema) && json_str_value(schema) == statement_schema())
+    || !(json_is_str(kind)
+    && json_str_value(kind) == "halis-package-release") {
+        return Result.Err(fail("not a " + statement_schema()
+        + " statement"))
+    }
+    let algo: JsonValue = json_object_get(jv, "algorithm")
+    if !(json_is_str(algo) && json_str_value(algo) == "ed25519") {
+        return Result.Err(fail("the statement names an unknown algorithm"))
+    }
+    let statement: JDoc = jv_to_jdoc(jv)
+
+    let lock_path: str = path_join2(rp, lockfile_name())
+    if !is_file_h(lock_path) {
+        return Result.Err(fail("the lockfile is gone — the release names "
+        + "one"))
+    }
+    let lock_sha: JsonValue = json_object_get(jv, "lockfile_sha256")
+    if !(json_is_str(lock_sha)
+    && sha256_file_h(lock_path) == json_str_value(lock_sha)) {
+        return Result.Err(fail("the lockfile is not the one the release "
+        + "names — the pinned content changed after signing"))
+    }
+
+    # the tree must still BE the lockfile's content — the same
+    # fail-closed walk the signer ran before signing anything.
+    let ar: Result[SignAudit, Fail] = sign_audit_package(rp, repo_root())
+    if result_is_err(ar) {
+        return Result.Err(result_err_or(ar, fail("")))
+    }
+    let audit: SignAudit = result_unwrap(ar)
+    if audit.drift_names.len() > 0 {
+        return Result.Err(fail("drift between the lockfile and the tree ("
+        + join_strs(audit.drift_names, ", ")
+        + ") — the release's own lock no longer describes the content"))
+    }
+
+    let cd: ContentDigest = content_digest(rp)
+    let content_sha: JsonValue = json_object_get(jv, "content_sha256")
+    if !(json_is_str(content_sha)
+    && cd.hex == json_str_value(content_sha)) {
+        return Result.Err(fail("the tree is not what the release describes "
+        + "(content digest mismatch) — drift after signing"))
+    }
+    let key_id_v: JsonValue = json_object_get(jv, "key_id")
+    if !(json_is_str(key_id_v)
+    && fmt_key_id_hex(public) == json_str_value(key_id_v)) {
+        return Result.Err(fail("the statement's key id does not name the "
+        + "verifying key"))
+    }
+    return Result.Ok(statement)
+}
+
+# ============================================================================
+# The selftests — the RFCs' own numbers (the exact signature bytes, the
+# sunscreen ciphertext), plus the tamper refusals and round trips.
+# ============================================================================
+
+# ed_selftest() — RFC 8032 section 7.1, all four vectors.
+fn ed_selftest() -> list[str] {
+    let seeds: list[str] = [
+    "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+    "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+    "c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7",
+    "833fe62409237b9d62ec77587520911e9a759cec1d19755b7da901b96dca3d42"
+    ]
+    let pubs: list[str] = [
+    "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+    "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+    "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025",
+    "ec172b93ad5e563bf4932c70e1245034c35467ef2efd4d64ebf819683467e2bf"
+    ]
+    let msgs: list[str] = [
+    "",
+    "72",
+    "af82",
+    "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a"
+    + "2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+    ]
+    let sigs: list[str] = [
+    "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155"
+    + "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+    "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da"
+    + "085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00",
+    "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac"
+    + "18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a",
+    "dc2a4459e7369633a52b1bf277839a00201009a3efbf3ecb69bea2186c26b589"
+    + "09351fc9ac90b3ecfdfbc7c66431e0303dca179c138ac17ad9bef1177331a704"
+    ]
+    let passed: list[str] = []
+    let mut vi: int = 1
+    while vi <= 4 {
+        let name: str = "RFC 8032 vector " + vi.to_str()
+        let seed: str = hex_decode(seeds.get(vi - 1))
+        let pk: str = hex_decode(pubs.get(vi - 1))
+        let msg: str = hex_decode(msgs.get(vi - 1))
+        let want: str = hex_decode(sigs.get(vi - 1))
+        if ed_public_from_seed(seed) != pk {
+            panic(name + ": public key mismatch")
+        }
+        let produced: str = ed_sign(seed, msg)
+        if produced != want {
+            panic(name + ": signature mismatch (determinism)")
+        }
+        if !ed_verify(pk, msg, want) {
+            panic(name + ": verify refused a good signature")
+        }
+        # one flipped signature byte must refuse
+        let bad: str = want.slice(0, 10)
+        + chr(int_xor(want.byte_at(10), 64))
+        + want.slice(11, 64)
+        if ed_verify(pk, msg, bad) {
+            panic(name + ": verify accepted a flipped byte")
+        }
+        # one flipped message byte must refuse
+        if msg.len() > 0 {
+            let bad_msg: str = chr(int_xor(msg.byte_at(0), 1))
+            + msg.slice(1, msg.len())
+            if ed_verify(pk, bad_msg, want) {
+                panic(name + ": verify accepted a flipped message byte")
+            }
+        }
+        passed.push(name)
+        vi = vi + 1
+    }
+    return passed
+}
+
+# ed_selftest_fresh() — a fresh pair round-trips; a foreign key refuses.
+fn ed_selftest_fresh() -> list[str] uses Proc, Clock, Rand {
+    let passed: list[str] = []
+    let seed: str = urandom_bytes(32)
+    let pk: str = ed_public_from_seed(seed)
+    let msg: str = urandom_bytes(37)
+    let sig: str = ed_sign(seed, msg)
+    if !ed_verify(pk, msg, sig) {
+        panic("fresh keypair round-trip: verify refused")
+    }
+    passed.push("fresh keypair round-trip")
+    let other_seed: str = urandom_bytes(32)
+    let other_pk: str = ed_public_from_seed(other_seed)
+    if ed_verify(other_pk, msg, sig) {
+        panic("foreign key refusal: a foreign key must refuse")
+    }
+    passed.push("foreign key refusal")
+    return passed
+}
+
+# aead_selftest() — RFC 8439's own vectors + the tamper refusals.
+fn aead_selftest() -> list[str] {
+    # 2.3.2 — the block function.
+    let kb: str = hex_decode(
+    "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+    let nonce: str = hex_decode("000000090000004a00000000")
+    let want_block: str = hex_decode(
+    "10f1e7e4d13b5915500fdd1fa32071c4c7d1f4c733c068030422aa9ac3d46c4e"
+    + "d2826446079faa0914c2d705d98b02a2b5129cd1de164eb9cbd083e8a2503c4e")
+    if chacha20_block(kb, 1, nonce) != want_block {
+        panic("RFC 8439 block: keystream mismatch")
+    }
+    # 2.5.2 — the Poly1305 example.
+    let pkey: str = hex_decode(
+    "85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b")
+    let pmsg: str = "Cryptographic Forum Research Group"
+    if poly1305(pkey, pmsg) != hex_decode("a8061dc1305136c6c22b8baf0c0127a9") {
+        panic("RFC 8439 poly1305: tag mismatch")
+    }
+    # 2.6.2 — the one-time key generation.
+    let okey: str = hex_decode(
+    "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+    let ononce: str = hex_decode("000000000001020304050607")
+    if poly1305_key_gen(okey, ononce) != hex_decode(
+    "8ad5a08b905f81cc815040274ab29471a833b637e3fd0da508dbb8e2fdd1a646") {
+        panic("RFC 8439 otk: one-time key mismatch")
+    }
+    # 2.8.2 — the full AEAD: the sunscreen sentence.
+    let akey: str = okey
+    let anonce: str = hex_decode("070000004041424344454647")
+    let aad: str = hex_decode("50515253c0c1c2c3c4c5c6c7")
+    let pt: str = "Ladies and Gentlemen of the class of '99: If I could "
+    + "offer you only one tip for the future, sunscreen would be it."
+    let want_ct: str = hex_decode(
+    "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d6"
+    + "3dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b36"
+    + "92ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc"
+    + "3ff4def08e4b7a9de576d26586cec64b6116")
+    let want_tag: str = hex_decode("1ae10b594f09e26a7e902ecbd0600691")
+    let enc: EncOut = aead_encrypt(akey, anonce, aad, pt)
+    if enc.ct != want_ct {
+        panic("RFC 8439 AEAD: ciphertext mismatch")
+    }
+    if enc.tag != want_tag {
+        panic("RFC 8439 AEAD: tag mismatch")
+    }
+    let dr: Result[str, str] = aead_decrypt(akey, anonce, aad, enc.ct,
+    enc.tag)
+    if result_is_err(dr) {
+        panic("RFC 8439 AEAD: round trip")
+    }
+    if result_unwrap(dr) != pt {
+        panic("RFC 8439 AEAD: round trip")
+    }
+    # tamper with the ciphertext: the MAC must refuse.
+    let bad_ct: str = chr(int_xor(enc.ct.byte_at(0), 1))
+    + enc.ct.slice(1, enc.ct.len())
+    if result_is_ok(aead_decrypt(akey, anonce, aad, bad_ct, enc.tag)) {
+        panic("RFC 8439 AEAD: a flipped ciphertext byte decrypted")
+    }
+    # tamper with the AAD: the MAC must refuse.
+    let bad_aad: str = chr(int_xor(aad.byte_at(0), 1))
+    + aad.slice(1, aad.len())
+    if result_is_ok(aead_decrypt(akey, anonce, bad_aad, enc.ct, enc.tag)) {
+        panic("RFC 8439 AEAD: a flipped AAD byte decrypted")
+    }
+    let passed: list[str] = []
+    passed.push("RFC 8439 block")
+    passed.push("RFC 8439 poly1305")
+    passed.push("RFC 8439 otk")
+    passed.push("RFC 8439 AEAD + tamper refusals")
+    return passed
+}
+
+# ============================================================================
+# The CLI — argparse's grammar (subcommands, the flags each takes), the
+# .py's exact report bytes, exit codes 0 / 1 / 2.
+# ============================================================================
+
+fn usage_text() -> str {
+    return "usage: hls-sign [-h]\n"
+    + "                {keygen,sign,verify,release,verify-release,selftest}\n"
+    + "                ...\n"
+}
+
+# password_for(what, password_env) — the .py's _password order: the
+# variable --password-env names, then HLS_SIGN_PASSWORD, then a prompt
+# on a terminal, then empty.
+fn password_for(what: str, password_env: str) -> Result[str, str]
+uses Proc, IO {
+    if password_env != "" {
+        if !env_has(password_env) {
+            return Result.Err("the environment variable " + password_env
+            + " is not set — it should hold the " + what + " passphrase")
+        }
+        return Result.Ok(env_get(password_env))
+    }
+    if env_has("HLS_SIGN_PASSWORD") {
+        return Result.Ok(env_get("HLS_SIGN_PASSWORD"))
+    }
+    if isatty(0) {
+        eprint("passphrase for " + what + " (empty ok): ")
+        return Result.Ok(taint_unwrap(read_line()))
+    }
+    return Result.Ok("")
+}
+
+# resolve_secret_path(flagged) — flag, then HLS_SIGN_KEY, then default.
+fn resolve_secret_path(flagged: str) -> str uses Proc {
+    if flagged != "" {
+        return flagged
+    }
+    if env_has("HLS_SIGN_KEY") {
+        return env_get("HLS_SIGN_KEY")
+    }
+    return default_secret_name()
+}
+
+struct PubAnchor {
+    public: str,
+    anchor: str
+}
+
+# resolve_public(flag_pub, raw_pub) — the trust anchor (-p file, -P hex,
+# then the default file).
+fn resolve_public(flag_pub: str, raw_pub: str) -> Result[PubAnchor, str]
+uses Fs, Proc {
+    if raw_pub != "" {
+        if raw_pub.len() != 64 {
+            return Result.Err("-P wants 64 hex characters (a raw Ed25519 "
+            + "public key)")
+        }
+        let mut ok: bool = true
+        let mut i: int = 0
+        while i < 64 {
+            if hex_val_b(raw_pub.byte_at(i)) < 0 {
+                ok = false
+            }
+            i = i + 1
+        }
+        if !ok {
+            return Result.Err("-P wants 64 hex characters (a raw Ed25519 "
+            + "public key)")
+        }
+        let raw: str = hex_decode(raw_pub)
+        return Result.Ok(PubAnchor {
+            public: raw, anchor: "hex"
+        })
+    }
+    let mut pub_path: str = flag_pub
+    if pub_path == "" {
+        if env_has("HLS_SIGN_PUB") {
+            pub_path = env_get("HLS_SIGN_PUB")
+        } else {
+            pub_path = default_pub_name()
+        }
+    }
+    if !is_file_h(pub_path) {
+        return Result.Err("no public key at " + pub_path
+        + " — pass -p FILE or -P HEX (verification verifies AGAINST "
+        + "something)")
+    }
+    let pr: Result[PubInfo, str] = fmt_read_public(pub_path)
+    if result_is_err(pr) {
+        return Result.Err(result_err_or(pr, ""))
+    }
+    let info: PubInfo = result_unwrap(pr)
+    return Result.Ok(PubAnchor {
+        public: info.public, anchor: pub_path
+    })
+}
+
+# parse_iterations(text) — argparse's type=int (digits only here).
+fn parse_iterations(text: str) -> Result[int, str] {
+    if text.len() == 0 {
+        return Result.Err("invalid int value: '" + text + "'")
+    }
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < text.len() {
+        if !is_digit_b(text.byte_at(i)) {
+            return Result.Err("invalid int value: '" + text + "'")
+        }
+        v = v * 10 + (text.byte_at(i) - 48)
+        i = i + 1
+    }
+    return Result.Ok(v)
+}
+
+# ---------------------------------------------------------------------------
+# The commands.
+# ---------------------------------------------------------------------------
+
+# audit_record_ok(op, subject, detail, has_subject, has_detail) — the
+# record call, fail-open (strict mode refuses the op instead).
+fn audit_record_ok(op: str, subject: str, detail: JDoc, has_subject: bool,
+has_detail: bool) -> Result[bool, str]
+uses Fs, Proc, Clock, Args, IO {
+    return audit_record(op, "ok", subject, detail, has_subject, has_detail)
+}
+
+fn audit_record_refused(op: str, reason: str) -> Result[bool, str]
+uses Fs, Proc, Clock, Args, IO {
+    let detail: JDoc = jd_obj([], [])
+    let mut capped: str = reason
+    if capped.len() > 400 {
+        capped = capped.slice(0, 400)
+    }
+    obj_set(detail, "reason", jd_str(capped))
+    return audit_record(op, "refused", "", detail, false, true)
+}
+
+struct Cli {
+    cmd: str,
+    positional: list[str],
+    secret: str,
+    pub: str,
+    raw_pub: str,
+    comment: str,
+    password_env: str,
+    iterations: int,
+    force: bool,
+    sig_out: str,
+    trusted_comment: str,
+    has_trusted: bool,
+    out_dir: str,
+    key: str,
+    json: bool
+}
+
+fn cli_new() -> Cli {
+    return Cli {
+        cmd: "", positional: [], secret: "", pub: "", raw_pub: "",
+        comment: "", password_env: "", iterations: default_iterations(),
+        force: false, sig_out: "", trusted_comment: "", has_trusted: false,
+        out_dir: "", key: "", json: false
+    }
+}
+
+# cmd_keygen(cli) — write a new keypair.
+fn cmd_keygen(cli: Cli) -> int uses Fs, Proc, Clock, Args, IO, Rand {
+    let pw_r: Result[str, str] = password_for("the new secret key",
+    cli.password_env)
+    if result_is_err(pw_r) {
+        eprint(tool_name() + ": " + result_err_or(pw_r, "") + "\n")
+        return 1
+    }
+    let password: str = result_unwrap(pw_r)
+    if cli.iterations < 1 {
+        eprint(tool_name() + ": --iterations wants a positive number\n")
+        let _a: Result[bool, str] = audit_record_refused("sign.keygen",
+        "--iterations wants a positive number")
+        return 1
+    }
+    let mut secret_path: str = cli.secret
+    if secret_path == "" {
+        secret_path = default_secret_name()
+    }
+    let mut pub_path: str = cli.pub
+    if pub_path == "" {
+        pub_path = default_pub_name()
+    }
+    if !cli.force {
+        if file_exists(secret_path) {
+            eprint(tool_name() + ": " + secret_path + " already exists — "
+            + "keygen does not overwrite keys (--force to say it)\n")
+            let _a: Result[bool, str] = audit_record_refused("sign.keygen",
+            secret_path + " already exists — keygen does not overwrite "
+            + "keys (--force to say it)")
+            return 1
+        }
+        if file_exists(pub_path) {
+            eprint(tool_name() + ": " + pub_path + " already exists — "
+            + "keygen does not overwrite keys (--force to say it)\n")
+            let _a: Result[bool, str] = audit_record_refused("sign.keygen",
+            pub_path + " already exists — keygen does not overwrite keys "
+            + "(--force to say it)")
+            return 1
+        }
+    }
+    let seed: str = urandom_bytes(32)
+    let public: str = ed_public_from_seed(seed)
+    fmt_write_secret(secret_path, seed, public, password, cli.iterations,
+    cli.comment)
+    fmt_write_public(pub_path, public, cli.comment)
+    # Stage 112: the audit entry names the key id, never the passphrase
+    # or the seed.
+    let detail: JDoc = jd_obj([], [])
+    obj_set(detail, "public", jd_str(pub_path))
+    obj_set(detail, "comment", jd_str(cli.comment))
+    let ar: Result[bool, str] = audit_record_ok("sign.keygen",
+    fmt_key_id_hex(public), detail, true, true)
+    if result_is_err(ar) {
+        eprint(tool_name() + ": " + result_err_or(ar, "") + "\n")
+        return 1
+    }
+    println("== hls-sign keygen ==")
+    println("  key id:   " + fmt_key_id_hex(public))
+    println("  secret:   " + secret_path + " (encrypted, 0600)")
+    println("  public:   " + pub_path)
+    println("  the public key is the trust anchor — publish it; the "
+    + "secret key is the name behind every signature — guard it")
+    return 0
+}
+
+# cmd_sign(cli) — a detached minisign signature.
+fn cmd_sign(cli: Cli) -> int uses Fs, Proc, Clock, Args, IO, Rand {
+    if cli.positional.len() < 1 {
+        eprint(usage_text())
+        eprint("hls-sign: error: the following arguments are required: "
+        + "file\n")
+        return 2
+    }
+    let file_arg: str = cli.positional.get(0)
+    let secret_path: str = resolve_secret_path(cli.secret)
+    if !is_file_h(secret_path) {
+        eprint(tool_name() + ": no secret key at " + secret_path
+        + " — run `hls-sign keygen` (or pass -s/--key)\n")
+        let _a: Result[bool, str] = audit_record_refused("sign.sign",
+        "no secret key at " + secret_path)
+        return 1
+    }
+    let pw_r: Result[str, str] = password_for("the secret key",
+    cli.password_env)
+    if result_is_err(pw_r) {
+        eprint(tool_name() + ": " + result_err_or(pw_r, "") + "\n")
+        return 1
+    }
+    let password: str = result_unwrap(pw_r)
+    let sr: Result[SecretInfo, str] = fmt_read_secret(secret_path, password)
+    if result_is_err(sr) {
+        eprint(tool_name() + ": " + result_err_or(sr, "") + "\n")
+        let _a: Result[bool, str] = audit_record_refused("sign.sign",
+        result_err_or(sr, ""))
+        return 1
+    }
+    let secret: SecretInfo = result_unwrap(sr)
+    if !is_file_h(file_arg) {
+        eprint(tool_name() + ": no such file: " + file_arg + "\n")
+        let _a: Result[bool, str] = audit_record_refused("sign.sign",
+        "no such file: " + file_arg)
+        return 1
+    }
+    let payload: str = read_file(file_arg)
+    let mut sig_path: str = cli.sig_out
+    if sig_path == "" {
+        sig_path = file_arg + ".minisig"
+    }
+    let mut trusted: str = cli.trusted_comment
+    if !cli.has_trusted {
+        trusted = fmt_default_trusted_comment(file_arg)
+    }
+    let two: TwoSig = fmt_sign_file(secret.seed, secret.public, payload,
+    trusted)
+    fmt_write_signature(sig_path, secret.public, two.raw_sig, two.global_sig,
+    trusted)
+    let detail: JDoc = jd_obj([], [])
+    obj_set(detail, "signature", jd_str(sig_path))
+    obj_set(detail, "key_id", jd_str(fmt_key_id_hex(secret.public)))
+    obj_set(detail, "bytes", jd_int(payload.len()))
+    let ar: Result[bool, str] = audit_record_ok("sign.sign", file_arg,
+    detail, true, true)
+    if result_is_err(ar) {
+        eprint(tool_name() + ": " + result_err_or(ar, "") + "\n")
+        return 1
+    }
+    if cli.json {
+        let report: JDoc = jd_obj([], [])
+        obj_set(report, "schema", jd_str("hls-sign/v1"))
+        obj_set(report, "tool", jd_str(tool_name()))
+        obj_set(report, "tool_version", jd_str(tool_version()))
+        obj_set(report, "file", jd_str(file_arg))
+        obj_set(report, "signature", jd_str(sig_path))
+        obj_set(report, "key_id", jd_str(fmt_key_id_hex(secret.public)))
+        obj_set(report, "trusted_comment", jd_str(trusted))
+        obj_set(report, "sig_sha256", jd_str(sha256_file_h(sig_path)))
+        println(py_json_dump(report))
+        return 0
+    }
+    println("== hls-sign ==")
+    println("  signed:  " + file_arg + " (" + payload.len().to_str()
+    + " byte(s))")
+    println("  key:     " + fmt_key_id_hex(secret.public))
+    println("  wrote:   " + sig_path)
+    return 0
+}
+
+# cmd_verify(cli) — verify a detached signature.
+fn cmd_verify(cli: Cli) -> int uses Fs, Proc, Args, IO {
+    if cli.positional.len() < 1 {
+        eprint(usage_text())
+        eprint("hls-sign: error: the following arguments are required: "
+        + "file\n")
+        return 2
+    }
+    let file_arg: str = cli.positional.get(0)
+    let pr: Result[PubAnchor, str] = resolve_public(cli.pub, cli.raw_pub)
+    if result_is_err(pr) {
+        eprint(tool_name() + ": " + result_err_or(pr, "") + "\n")
+        return 1
+    }
+    let anchor: PubAnchor = result_unwrap(pr)
+    let mut sig_path: str = ""
+    if cli.positional.len() >= 2 {
+        sig_path = cli.positional.get(1)
+    } else {
+        sig_path = file_arg + ".minisig"
+    }
+    if !is_file_h(file_arg) {
+        eprint(tool_name() + ": no such file: " + file_arg + "\n")
+        return 1
+    }
+    if !is_file_h(sig_path) {
+        eprint(tool_name() + ": no signature at " + sig_path + "\n")
+        return 1
+    }
+    let payload: str = read_file(file_arg)
+    let sr: Result[SigInfo, str] = fmt_read_signature(sig_path)
+    if result_is_err(sr) {
+        eprint(tool_name() + ": " + result_err_or(sr, "") + "\n")
+        return 1
+    }
+    let sig: SigInfo = result_unwrap(sr)
+    let ok: bool = fmt_verify_signatures(anchor.public, payload,
+    sig.raw_sig, sig.global_sig, sig.trusted)
+    if cli.json {
+        let report: JDoc = jd_obj([], [])
+        obj_set(report, "schema", jd_str("hls-sign-verify/v1"))
+        obj_set(report, "tool", jd_str(tool_name()))
+        obj_set(report, "tool_version", jd_str(tool_version()))
+        obj_set(report, "file", jd_str(file_arg))
+        obj_set(report, "signature", jd_str(sig_path))
+        obj_set(report, "anchor", jd_str(anchor.anchor))
+        obj_set(report, "verified", jd_bool(ok))
+        obj_set(report, "trusted_comment", jd_str(sig.trusted))
+        println(py_json_dump(report))
+        if ok {
+            return 0
+        }
+        return 1
+    }
+    if !ok {
+        eprint("hls-sign: the signature does NOT verify — the payload, "
+        + "the trusted comment or the key is not what it claims\n")
+        return 1
+    }
+    println("== hls-sign ==")
+    println("  verified: " + file_arg)
+    println("  key:      " + fmt_key_id_hex(anchor.public) + " (anchor: "
+    + anchor.anchor + ")")
+    println("  trusted:  " + sig.trusted)
+    return 0
+}
+
+# cmd_release(cli) — sign a package release.
+fn cmd_release(cli: Cli) -> int
+uses Fs, Proc, Clock, Args, IO {
+    if cli.positional.len() < 1 {
+        eprint(usage_text())
+        eprint("hls-sign: error: the following arguments are required: "
+        + "dir\n")
+        return 2
+    }
+    let dir_arg: str = cli.positional.get(0)
+    let secret_path: str = resolve_secret_path(cli.key)
+    if !is_file_h(secret_path) {
+        eprint(tool_name() + ": no secret key at " + secret_path
+        + " — a release is signed, run keygen first\n")
+        let _a: Result[bool, str] = audit_record_refused("sign.release",
+        "no secret key at " + secret_path)
+        return 1
+    }
+    let pw_r: Result[str, str] = password_for("the secret key",
+    cli.password_env)
+    if result_is_err(pw_r) {
+        eprint(tool_name() + ": " + result_err_or(pw_r, "") + "\n")
+        return 1
+    }
+    let password: str = result_unwrap(pw_r)
+    let rr: Result[RelOut, Fail] = rel_release(dir_arg, secret_path,
+    password, cli.out_dir, cli.trusted_comment, cli.has_trusted)
+    if result_is_err(rr) {
+        let why: str = result_err_or(rr, fail("")).msg
+        eprint(tool_name() + ": " + why + "\n")
+        let _a: Result[bool, str] = audit_record_refused("sign.release", why)
+        return 1
+    }
+    let out: RelOut = result_unwrap(rr)
+    let name: str = obj_get_str(out.statement, "name")
+    let version: str = obj_get_str(out.statement, "version")
+    let content: str = obj_get_str(out.statement, "content_sha256")
+    let detail: JDoc = jd_obj([], [])
+    obj_set(detail, "content_sha256", jd_str(content))
+    obj_set(detail, "key_id",
+    jd_str(obj_get_str(out.statement, "key_id")))
+    obj_set(detail, "ledger_seq", jd_int(out.rec.seq))
+    let ar: Result[bool, str] = audit_record_ok("sign.release",
+    name + "@" + version, detail, true, true)
+    if result_is_err(ar) {
+        eprint(tool_name() + ": " + result_err_or(ar, "") + "\n")
+        return 1
+    }
+    if cli.json {
+        let report: JDoc = jd_obj([], [])
+        obj_set(report, "schema", jd_str("hls-sign-release/v1"))
+        obj_set(report, "tool", jd_str(tool_name()))
+        obj_set(report, "tool_version", jd_str(tool_version()))
+        obj_set(report, "statement", out.statement)
+        obj_set(report, "statement_sha256",
+        jd_str(sha256_file_h(out.st_path)))
+        obj_set(report, "sig_sha256", jd_str(sha256_file_h(out.sig_path)))
+        obj_set(report, "written", jd_arr([jd_str(out.st_path),
+        jd_str(out.sig_path)]))
+        obj_set(report, "ledger_seq", jd_int(out.rec.seq))
+        obj_set(report, "ledger_chain", jd_str(out.rec.chain_hash))
+        println(py_json_dump(report))
+        return 0
+    }
+    println("== hls-sign release ==")
+    println("  package:  " + name + "@" + version)
+    println("  content:  " + content.slice(0, 24) + "... ("
+    + obj_get_int(out.statement, "files").to_str() + " file(s))")
+    println("  key:      " + obj_get_str(out.statement, "key_id"))
+    println("  wrote:    " + out.st_path)
+    println("  wrote:    " + out.sig_path)
+    println("  transparency log seq: " + out.rec.seq.to_str() + " (chain "
+    + out.rec.chain_hash.slice(0, 16) + "...)")
+    return 0
+}
+
+# cmd_verify_release(cli) — the counterparty's side.
+fn cmd_verify_release(cli: Cli) -> int uses Fs, Proc, Args, IO {
+    if cli.positional.len() < 1 {
+        eprint(usage_text())
+        eprint("hls-sign: error: the following arguments are required: "
+        + "dir\n")
+        return 2
+    }
+    let dir_arg: str = cli.positional.get(0)
+    let pr: Result[PubAnchor, str] = resolve_public(cli.pub, cli.raw_pub)
+    if result_is_err(pr) {
+        eprint(tool_name() + ": " + result_err_or(pr, "") + "\n")
+        return 1
+    }
+    let anchor: PubAnchor = result_unwrap(pr)
+    let vr: Result[JDoc, Fail] = rel_verify_release(dir_arg, anchor.public)
+    if result_is_err(vr) {
+        eprint(tool_name() + ": " + result_err_or(vr, fail("")).msg + "\n")
+        return 1
+    }
+    let statement: JDoc = result_unwrap(vr)
+    let name: str = obj_get_str(statement, "name")
+    let version: str = obj_get_str(statement, "version")
+    let keyid: str = obj_get_str(statement, "key_id")
+    let content: str = obj_get_str(statement, "content_sha256")
+    if cli.json {
+        let report: JDoc = jd_obj([], [])
+        obj_set(report, "schema", jd_str("hls-sign-verify-release/v1"))
+        obj_set(report, "tool", jd_str(tool_name()))
+        obj_set(report, "tool_version", jd_str(tool_version()))
+        obj_set(report, "dir", jd_str(realpath_lex(dir_arg)))
+        obj_set(report, "anchor", jd_str(anchor.anchor))
+        obj_set(report, "verified", jd_bool(true))
+        obj_set(report, "statement", statement)
+        println(py_json_dump(report))
+        return 0
+    }
+    println("== hls-sign verify-release ==")
+    println("  verified: " + name + "@" + version + " signed with key "
+    + keyid + " (anchor: " + anchor.anchor + ")")
+    println("  content:  " + content.slice(0, 24)
+    + "... — the tree IS the signed bytes")
+    return 0
+}
+
+# cmd_selftest() — the RFC vectors through the front door.
+fn cmd_selftest() -> int uses Proc, Clock, IO, Rand {
+    println("== hls-sign selftest ==")
+    let e_names: list[str] = ed_selftest()
+    let mut i: int = 0
+    while i < e_names.len() {
+        println("  ok: " + e_names.get(i))
+        i = i + 1
+    }
+    let a_names: list[str] = aead_selftest()
+    i = 0
+    while i < a_names.len() {
+        println("  ok: " + a_names.get(i))
+        i = i + 1
+    }
+    let f_names: list[str] = ed_selftest_fresh()
+    i = 0
+    while i < f_names.len() {
+        println("  ok: " + f_names.get(i))
+        i = i + 1
+    }
+    println("  the primitives are the RFCs' numbers, not the docs' promises")
+    return 0
+}
+
+# ============================================================================
+# The probe modes — the module front doors a native binary has (the
+# gate's drivers, the audit's child).
+# ============================================================================
+
+# probe_audit(entry_path) — load + check one entry through the REAL
+# front-end; prints AUDIT-OK (a panic exits non-zero with the reason).
+fn probe_audit(entry_path: str) -> int uses IO, Fs, Proc {
+    let ctx: Ctx = hl_load_crate(entry_path)
+    hl_check(ctx)
+    println("AUDIT-OK")
+    return 0
+}
+
+# probe_sign(mode, rest) — the gate driver's four modes.
+fn probe_sign(mode: str, rest: list[str]) -> int
+uses Fs, Proc, Clock, IO, Rand {
+    if mode == "vectors" {
+        let e_names: list[str] = ed_selftest()
+        let a_names: list[str] = aead_selftest()
+        let f_names: list[str] = ed_selftest_fresh()
+        let all_e: list[str] = []
+        let mut i: int = 0
+        while i < e_names.len() {
+            all_e.push(e_names.get(i))
+            i = i + 1
+        }
+        i = 0
+        while i < f_names.len() {
+            all_e.push(f_names.get(i))
+            i = i + 1
+        }
+        println("E " + all_e.len().to_str() + "|" + join_strs(all_e, "|"))
+        println("A " + a_names.len().to_str() + "|"
+        + join_strs(a_names, "|"))
+        let seed1: str = hex_decode(
+        "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+        let pk1: str = hex_decode(
+        "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+        let sig1_want: str = hex_decode(
+        "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155"
+        + "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b")
+        println("SIG1 " + hex_encode(ed_sign(seed1, "")))
+        if ed_verify(pk1, "", sig1_want) {
+            println("VER1 1")
+        } else {
+            println("VER1 0")
+        }
+        if ed_sign(seed1, "") == ed_sign(seed1, "") {
+            println("DET 1")
+        } else {
+            println("DET 0")
+        }
+        println("KDF1 " + hex_encode(pbkdf2_key("password", "salt", 1)))
+        println("KDF4096 "
+        + hex_encode(pbkdf2_key("password", "salt", 4096)))
+        return 0
+    }
+    if mode == "roundtrip" {
+        if rest.len() < 3 {
+            eprint("probe roundtrip wants SECRET PASSWORD PUB\n")
+            return 2
+        }
+        let sr: Result[SecretInfo, str] = fmt_read_secret(rest.get(0),
+        rest.get(1))
+        let pr: Result[PubInfo, str] = fmt_read_public(rest.get(2))
+        if result_is_ok(sr) {
+            if result_is_ok(pr) {
+                let secret: SecretInfo = result_unwrap(sr)
+                let pub_info: PubInfo = result_unwrap(pr)
+                let ok: bool = ed_public_from_seed(secret.seed) == pub_info.public
+                && secret.public == pub_info.public
+                if ok {
+                    println("RT 1 " + hex_encode(secret.public))
+                } else {
+                    println("RT 0 " + hex_encode(secret.public))
+                }
+                return 0
+            }
+        }
+        println("RT 0 ")
+        return 0
+    }
+    if mode == "contract" {
+        if rest.len() < 3 {
+            eprint("probe contract wants PUB PAYLOAD SIG\n")
+            return 2
+        }
+        let pr: Result[PubInfo, str] = fmt_read_public(rest.get(0))
+        if result_is_err(pr) {
+            eprint(tool_name() + ": " + result_err_or(pr, "") + "\n")
+            return 1
+        }
+        let pub_info: PubInfo = result_unwrap(pr)
+        let payload: str = read_or(rest.get(1), "")
+        let sr: Result[SigInfo, str] = fmt_read_signature(rest.get(2))
+        if result_is_err(sr) {
+            eprint(tool_name() + ": " + result_err_or(sr, "") + "\n")
+            return 1
+        }
+        let sig: SigInfo = result_unwrap(sr)
+        if fmt_verify_signatures(pub_info.public, payload, sig.raw_sig,
+        sig.global_sig, sig.trusted) {
+            println("VS 1")
+        } else {
+            println("VS 0")
+        }
+        if !ed_verify(pub_info.public, payload, sig.global_sig) {
+            println("GLOBOK 1")
+        } else {
+            println("GLOBOK 0")
+        }
+        return 0
+    }
+    if mode == "canonical" {
+        if rest.len() < 1 {
+            eprint("probe canonical wants STATEMENT\n")
+            return 2
+        }
+        let text: str = read_or(rest.get(0), "")
+        let jr: Result[JsonValue, str] = json_parse_result(text)
+        if result_is_err(jr) {
+            println("CANON 0")
+            return 0
+        }
+        let statement: JDoc = jv_to_jdoc(result_unwrap(jr))
+        if py_json_dump(statement) + "\n" == text {
+            println("CANON 1")
+        } else {
+            println("CANON 0")
+        }
+        return 0
+    }
+    eprint("probe: unknown mode " + mode + "\n")
+    return 2
+}
+
+# ============================================================================
+# main — the CLI grammar.
+# ============================================================================
+
+fn main() -> int uses IO, Fs, Proc, Clock, Args, Exit, Rand {
+    let argv: list[str] = args()
+    if argv.len() < 2 {
+        eprint(usage_text())
+        eprint("error: a command is required (keygen, sign, verify, "
+        + "release, verify-release, selftest)\n")
+        return 2
+    }
+    # the private probe modes (the gate drivers, the audit child)
+    if argv.get(1) == "--probe-audit" {
+        if argv.len() < 3 {
+            eprint("probe-audit wants ENTRY\n")
+            return 2
+        }
+        return probe_audit(argv.get(2))
+    }
+    if argv.get(1) == "--probe-sign" {
+        if argv.len() < 3 {
+            eprint("probe-sign wants MODE [args...]\n")
+            return 2
+        }
+        let rest: list[str] = []
+        let mut i: int = 3
+        while i < argv.len() {
+            rest.push(argv.get(i))
+            i = i + 1
+        }
+        return probe_sign(argv.get(2), rest)
+    }
+    # -h/--help anywhere before the command is argparse's own help
+    # (stdout, exit 0), not an invalid choice.
+    if argv.get(1) == "-h" || argv.get(1) == "--help" {
+        print(usage_text())
+        return 0
+    }
+    let cli: Cli = cli_new()
+    cli.cmd = argv.get(1)
+    if cli.cmd != "keygen" && cli.cmd != "sign" && cli.cmd != "verify"
+    && cli.cmd != "release" && cli.cmd != "verify-release"
+    && cli.cmd != "selftest" {
+        eprint(usage_text())
+        eprint("hls-sign: error: argument command: invalid choice: '"
+        + cli.cmd + "' (choose from 'keygen', 'sign', 'verify', "
+        + "'release', 'verify-release', 'selftest')\n")
+        return 2
+    }
+    let mut i: int = 2
+    while i < argv.len() {
+        let a: str = argv.get(i)
+        if a == "-h" || a == "--help" {
+            print(usage_text())
+            return 0
+        }
+        if a == "--json" {
+            cli.json = true
+            i = i + 1
+            continue
+        }
+        if a == "--force" {
+            cli.force = true
+            i = i + 1
+            continue
+        }
+        if a == "-f" || a == "--secret" || a == "-s" {
+            if i + 1 >= argv.len() {
+                eprint("hls-sign: error: argument " + a
+                + ": expected one argument\n")
+                return 2
+            }
+            cli.secret = argv.get(i + 1)
+            i = i + 2
+            continue
+        }
+        if a == "--key" {
+            if i + 1 >= argv.len() {
+                eprint("hls-sign: error: argument " + a
+                + ": expected one argument\n")
+                return 2
+            }
+            cli.key = argv.get(i + 1)
+            i = i + 2
+            continue
+        }
+        if a == "-p" || a == "--pub" {
+            if i + 1 >= argv.len() {
+                eprint("hls-sign: error: argument " + a
+                + ": expected one argument\n")
+                return 2
+            }
+            cli.pub = argv.get(i + 1)
+            i = i + 2
+            continue
+        }
+        if a == "-P" || a == "--raw-pub" {
+            if i + 1 >= argv.len() {
+                eprint("hls-sign: error: argument " + a
+                + ": expected one argument\n")
+                return 2
+            }
+            cli.raw_pub = argv.get(i + 1)
+            i = i + 2
+            continue
+        }
+        if a == "-c" || a == "--comment" {
+            if i + 1 >= argv.len() {
+                eprint("hls-sign: error: argument " + a
+                + ": expected one argument\n")
+                return 2
+            }
+            cli.comment = argv.get(i + 1)
+            i = i + 2
+            continue
+        }
+        if a == "--password-env" {
+            if i + 1 >= argv.len() {
+                eprint("hls-sign: error: argument " + a
+                + ": expected one argument\n")
+                return 2
+            }
+            cli.password_env = argv.get(i + 1)
+            i = i + 2
+            continue
+        }
+        if a == "--iterations" {
+            if i + 1 >= argv.len() {
+                eprint("hls-sign: error: argument " + a
+                + ": expected one argument\n")
+                return 2
+            }
+            let ir: Result[int, str] = parse_iterations(argv.get(i + 1))
+            if result_is_err(ir) {
+                eprint("hls-sign: error: argument --iterations: "
+                + result_err_or(ir, "") + "\n")
+                return 2
+            }
+            cli.iterations = result_unwrap(ir)
+            i = i + 2
+            continue
+        }
+        if a == "--sig-out" {
+            if i + 1 >= argv.len() {
+                eprint("hls-sign: error: argument " + a
+                + ": expected one argument\n")
+                return 2
+            }
+            cli.sig_out = argv.get(i + 1)
+            i = i + 2
+            continue
+        }
+        if a == "--trusted-comment" {
+            if i + 1 >= argv.len() {
+                eprint("hls-sign: error: argument " + a
+                + ": expected one argument\n")
+                return 2
+            }
+            cli.trusted_comment = argv.get(i + 1)
+            cli.has_trusted = true
+            i = i + 2
+            continue
+        }
+        if a == "--out" {
+            if i + 1 >= argv.len() {
+                eprint("hls-sign: error: argument " + a
+                + ": expected one argument\n")
+                return 2
+            }
+            cli.out_dir = argv.get(i + 1)
+            i = i + 2
+            continue
+        }
+        if a.len() > 1 && a.byte_at(0) == 45 {
+            eprint(usage_text())
+            eprint("hls-sign: error: unrecognized arguments: " + a + "\n")
+            return 2
+        }
+        cli.positional.push(a)
+        i = i + 1
+    }
+    if cli.cmd == "selftest" {
+        return cmd_selftest()
+    }
+    if cli.cmd == "keygen" {
+        return cmd_keygen(cli)
+    }
+    if cli.cmd == "sign" {
+        return cmd_sign(cli)
+    }
+    if cli.cmd == "verify" {
+        return cmd_verify(cli)
+    }
+    if cli.cmd == "release" {
+        return cmd_release(cli)
+    }
+    return cmd_verify_release(cli)
+}

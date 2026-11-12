@@ -1,0 +1,5527 @@
+# ============================================================================
+# tools/hls-tlog.hls — Stage 107 transparency log gossip (multi-source
+# verify), the native Halis twin of the retired tools/hls-tlog.py +
+# tools/hltlog_parts/ (chain, common, selftest, sources, witness).
+#
+# Same CLI, same wire, same exits:
+#   hls-tlog verify [LOG] [--json]
+#   hls-tlog summary [LOG] [--json]
+#   hls-tlog gossip SOURCE... [--timeout S] [--max-bytes N]
+#                       [--max-lag N] [--require N] [--json]
+#   hls-tlog witness [LOG] --sign SECRET [--password-env VAR]
+#                       [--out DIR] [--trusted-comment STR] [--force] [--json]
+#   hls-tlog witness-verify WITNESS [-p PUB | -P HEX] [--against LOG] [--json]
+#   hls-tlog prove NAME [VERSION] [--log LOG] [--seq N] [--out DIR] [--json]
+#   hls-tlog prove-verify PROOF [--log LOG] [--json]
+#   hls-tlog selftest
+#
+# The chain arithmetic is ONE definition — sha256(prev_hash +
+# canonical-json(record minus chain_hash)), byte-identical to hpkg_log's
+# writer since Stage 13 — and the acceptance gate pins hls-tlog verify to
+# hls-pkg log --verify on the same file.
+#
+# The port carries its own crypto stack (the .py leaned on hlsign_parts):
+# SHA-512 (RFC 6384 arithmetic on 32-bit half-words), a 16-bit-limb
+# bignum, Ed25519 (RFC 8032, extended homogeneous coordinates), ChaCha20
+# + Poly1305 (RFC 8439) and PBKDF2-HMAC-SHA256 — the minisign secret-key
+# box and the two-signature witness files are byte-compatible with
+# tools/hls-sign.py's, pinned by the acceptance gate.
+#
+# The private probe legs (the house pattern, cf. tools/hltest.hls
+# --probe-hltest) expose the old hltlog_parts entry points the gate's
+# fixture driver used to reach through a python3 child:
+#   --probe-mklog <mode> [args...]   mk / mk_evil_mid / evilapp / consts /
+#                                    selftest / onedeff / fetch / view /
+#                                    tamper_w / tamper_prec / tamper_ptail
+#   --probe-https <url>              tls_get in a child (a panic there is a
+#                                    refused source, never a dead gossip)
+#   --probe-ed25519                  the RFC 8032 vectors (dev parity leg)
+# ============================================================================
+
+import "std.sha256"
+import "std.str"
+import "std.json"
+import "std.base64"
+import "std.hex"
+import "std.http"
+
+# ----------------------------------------------------------------------------
+# Constants (HLS has no globals — every constant is a fn).
+# ----------------------------------------------------------------------------
+
+fn tl_tool() -> str {
+    return "hls-tlog"
+}
+
+fn tl_version() -> str {
+    return "0.126.0-alpha"
+}
+
+fn tl_view_schema() -> str {
+    return "hls-tlog-view/v1"
+}
+
+fn tl_verify_schema() -> str {
+    return "hls-tlog-verify/v1"
+}
+
+fn tl_witness_schema() -> str {
+    return "hls-tlog-witness/v1"
+}
+
+fn tl_witness_verify_schema() -> str {
+    return "hls-tlog-witness-verify/v1"
+}
+
+fn tl_gossip_schema() -> str {
+    return "hls-tlog-gossip/v1"
+}
+
+fn tl_proof_schema() -> str {
+    return "hls-tlog-proof/v1"
+}
+
+fn tl_proof_verify_schema() -> str {
+    return "hls-tlog-proof-verify/v1"
+}
+
+fn tl_genesis() -> str {
+    return str_repeat("0", 64)
+}
+
+fn tl_hex_len() -> int {
+    return 64
+}
+
+fn tl_default_max_bytes() -> int {
+    return 67108864
+}
+
+fn tl_witness_suffix() -> str {
+    return ".witness.json"
+}
+
+fn tl_proof_suffix() -> str {
+    return ".proof.json"
+}
+
+fn tl_ledger_name() -> str {
+    return ".hls-pkg-transparency.log"
+}
+
+fn tl_default_pub_name() -> str {
+    return "hls-sign.pub"
+}
+
+# ----------------------------------------------------------------------------
+# Small string / path / number helpers.
+# ----------------------------------------------------------------------------
+
+# tl_hex64(c) — one character repeated 64 times (the battery's "1"*64).
+fn tl_hex64(c: str) -> str {
+    return str_repeat(c, 64)
+}
+
+# tl_is_hex64(s) — exactly 64 lowercase hex characters.
+fn tl_is_hex64(s: str) -> bool {
+    if s.len() != 64 {
+        return false
+    }
+    let mut i: int = 0
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        if !((b >= 48 && b <= 57) || (b >= 97 && b <= 102)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn tl_hex4(n: int) -> str {
+    let digits: str = "0123456789abcdef"
+    return digits.slice((n / 4096) % 16, (n / 4096) % 16 + 1)
+    + digits.slice((n / 256) % 16, (n / 256) % 16 + 1)
+    + digits.slice((n / 16) % 16, (n / 16) % 16 + 1)
+    + digits.slice(n % 16, n % 16 + 1)
+}
+
+# tl_utf8_at(s, i) — the codepoint at i (len 1..4); [-1, -1] on bad UTF-8.
+fn tl_utf8_at(s: str, i: int) -> list[int] {
+    let n: int = s.len()
+    let b0: int = s.byte_at(i)
+    if b0 < 128 {
+        return[b0, 1]
+    }
+    if b0 >= 192 && b0 < 224 && i + 1 < n {
+        let b1: int = s.byte_at(i + 1)
+        if b1 >= 128 && b1 < 192 {
+            return[(b0 - 192) * 64 + (b1 - 128), 2]
+        }
+        return[-1, -1]
+    }
+    if b0 >= 224 && b0 < 240 && i + 2 < n {
+        let b1: int = s.byte_at(i + 1)
+        let b2: int = s.byte_at(i + 2)
+        if b1 >= 128 && b1 < 192 && b2 >= 128 && b2 < 192 {
+            return[(b0 - 224) * 4096 + (b1 - 128) * 64 + (b2 - 128), 3]
+        }
+        return[-1, -1]
+    }
+    if b0 >= 240 && b0 < 248 && i + 3 < n {
+        let b1: int = s.byte_at(i + 1)
+        let b2: int = s.byte_at(i + 2)
+        let b3: int = s.byte_at(i + 3)
+        if b1 >= 128 && b1 < 192 && b2 >= 128 && b2 < 192
+        && b3 >= 128 && b3 < 192 {
+            return[(b0 - 240) * 262144 + (b1 - 128) * 4096
+            + (b2 - 128) * 64 + (b3 - 128), 4]
+        }
+        return[-1, -1]
+    }
+    return[-1, -1]
+}
+
+# tl_str_replace(s, from, to) — every occurrence (str has no replace).
+fn tl_str_replace(s: str, old: str, new: str) -> str {
+    if old == "" || old == new {
+        return s
+    }
+    let mut out: str = ""
+    let mut i: int = 0
+    let fl: int = old.len()
+    while i < s.len() {
+        if i + fl <= s.len() && s.slice(i, i + fl) == old {
+            out = out + new
+            i = i + fl
+        } else {
+            out = out + s.slice(i, i + 1)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+# tl_int_parse(s) — argparse's type=int, without to_int's panic.
+fn tl_int_parse(s: str) -> Result[int, str] {
+    if s == "" {
+        return Result.Err("empty")
+    }
+    let mut i: int = 0
+    if s.byte_at(0) == 45 {
+        i = 1
+        if s.len() == 1 {
+            return Result.Err(s)
+        }
+    }
+    let mut digits: int = 0
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        if b < 48 || b > 57 {
+            return Result.Err(s)
+        }
+        digits = digits + 1
+        i = i + 1
+    }
+    if digits > 18 {
+        return Result.Err(s)
+    }
+    return Result.Ok(s.to_int())
+}
+
+# tl_float_ok(s) — argparse's type=float, shape-checked only (the value
+# is accepted and stored raw; the native HTTP client has no timeout knob).
+fn tl_float_ok(s: str) -> bool {
+    if s == "" {
+        return false
+    }
+    let mut i: int = 0
+    if s.byte_at(0) == 43 || s.byte_at(0) == 45 {
+        i = 1
+        if s.len() == 1 {
+            return false
+        }
+    }
+    let mut saw_digit: bool = false
+    let mut saw_dot: bool = false
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        if b >= 48 && b <= 57 {
+            saw_digit = true
+        } else if b == 46 && !saw_dot {
+            saw_dot = true
+        } else if(b == 101 || b == 69) && saw_digit {
+            let rest: str = s.slice(i + 1, s.len())
+            if rest == "" {
+                return false
+            }
+            let mut j: int = 0
+            if rest.byte_at(0) == 43 || rest.byte_at(0) == 45 {
+                j = 1
+                if rest.len() == 1 {
+                    return false
+                }
+            }
+            while j < rest.len() {
+                let b2: int = rest.byte_at(j)
+                if b2 < 48 || b2 > 57 {
+                    return false
+                }
+                j = j + 1
+            }
+            return true
+        } else {
+            return false
+        }
+        i = i + 1
+    }
+    return saw_digit
+}
+
+fn tl_path_is_abs(p: str) -> bool {
+    if p.len() == 0 {
+        return false
+    }
+    return p.byte_at(0) == 47
+}
+
+fn tl_path_dirname(p: str) -> str {
+    let n: int = p.len()
+    if n == 0 {
+        return "."
+    }
+    let mut k: int = n - 1
+    while k > 0 && p.byte_at(k) == 47 {
+        k = k - 1
+    }
+    while k >= 0 {
+        if p.byte_at(k) == 47 {
+            if k == 0 {
+                return "/"
+            }
+            return p.slice(0, k)
+        }
+        k = k - 1
+    }
+    return "."
+}
+
+fn tl_path_basename(p: str) -> str {
+    let n: int = p.len()
+    if n == 0 {
+        return ""
+    }
+    let mut k: int = n - 1
+    while k > 0 && p.byte_at(k) == 47 {
+        k = k - 1
+    }
+    let mut j: int = k
+    while j >= 0 {
+        if p.byte_at(j) == 47 {
+            return p.slice(j + 1, k + 1)
+        }
+        j = j - 1
+    }
+    return p.slice(0, k + 1)
+}
+
+fn tl_path_join(a: str, b: str) -> str {
+    if a == "" {
+        return b
+    }
+    if a.byte_at(a.len() - 1) == 47 {
+        return a + b
+    }
+    return a + "/" + b
+}
+
+# tl_norm_path(p) — the lexical normpath (no symlink knowledge).
+fn tl_norm_path(p: str) -> str {
+    if p == "" {
+        return "."
+    }
+    let abs: bool = tl_path_is_abs(p)
+    let comps: list[str] = p.split("/")
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < comps.len() {
+        let c: str = comps.get(i)
+        if c == "" || c == "." {
+            i = i + 1
+            continue
+        }
+        if c == ".." {
+            if out.len() > 0 && out.get(out.len() - 1) != ".." {
+                out.pop()
+            } else if !abs {
+                out.push("..")
+            }
+            i = i + 1
+            continue
+        }
+        out.push(c)
+        i = i + 1
+    }
+    if out.len() == 0 {
+        if abs {
+            return "/"
+        }
+        return "."
+    }
+    let mut r: str = ""
+    if abs {
+        r = "/"
+    }
+    let mut j: int = 0
+    while j < out.len() {
+        r = r + out.get(j)
+        if j + 1 < out.len() {
+            r = r + "/"
+        }
+        j = j + 1
+    }
+    return r
+}
+
+# tl_realpath_lex(p) — abspath + lexical normpath.
+fn tl_realpath_lex(p: str) -> str uses Proc {
+    let mut raw: str = p
+    if !tl_path_is_abs(raw) {
+        raw = cwd_get() + "/" + raw
+    }
+    return tl_norm_path(raw)
+}
+
+# tl_is_repo_root(p) — the checkout marker.
+fn tl_is_repo_root(p: str) -> bool uses Fs {
+    return file_exists(p + "/std/str.hls")
+    && file_exists(p + "/core/option.hls")
+    && file_exists(p + "/SPEC.md")
+}
+
+# tl_repo_root() — the .py's REPO_ROOT: the binary's grandparent (with
+# fallbacks), the same law hls-sbom rides.
+fn tl_repo_root() -> str uses Fs, Proc, Args {
+    let argv: list[str] = args()
+    if argv.len() > 0 && argv.get(0) != "" {
+        let binp: str = tl_realpath_lex(argv.get(0))
+        let root: str = tl_path_dirname(tl_path_dirname(binp))
+        if tl_is_repo_root(root) {
+            return root
+        }
+    }
+    let mut d: str = tl_realpath_lex("")
+    let mut guard: int = 0
+    while guard < 128 {
+        if tl_is_repo_root(d) {
+            return d
+        }
+        let parent: str = tl_path_dirname(d)
+        if parent == d || parent == "." {
+            return tl_realpath_lex("")
+        }
+        d = parent
+        guard = guard + 1
+    }
+    return tl_realpath_lex("")
+}
+
+# tl_transparency_log_path() — hpkg_common's law: the
+# HLS_PKG_TRANSPARENCY_LOG override, else <repo>/.hls-pkg-transparency.log.
+fn tl_transparency_log_path() -> str uses Fs, Proc, Args {
+    if env_has("HLS_PKG_TRANSPARENCY_LOG") {
+        return env_get("HLS_PKG_TRANSPARENCY_LOG")
+    }
+    return tl_repo_root() + "/.hls-pkg-transparency.log"
+}
+
+# tl_shell_quote(s) — single quotes neutralised.
+fn tl_shell_quote(s: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < s.len() {
+        if s.byte_at(i) == 39 {
+            out = out + "'\\''"
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn tl_mkdirs(path: str) -> void uses Proc {
+    proc_exec("mkdir -p '" + tl_shell_quote(path) + "'")
+}
+
+# tl_py_repr(v) — Python's %r of a JSON value (the shape-error wording).
+fn tl_py_repr(v: JsonValue) -> str {
+    if v.kind == "null" {
+        return "None"
+    }
+    if v.kind == "bool" {
+        if v.bval {
+            return "True"
+        }
+        return "False"
+    }
+    if v.kind == "int" {
+        return v.ival.to_str()
+    }
+    if v.kind == "float" {
+        return v.fval.to_str()
+    }
+    if v.kind == "str" {
+        return "'" + v.sval + "'"
+    }
+    if v.kind == "array" {
+        let mut out: str = "["
+        let mut i: int = 0
+        while i < v.arr.len() {
+            if i > 0 {
+                out = out + ", "
+            }
+            out = out + tl_py_repr(v.arr.get(i))
+            i = i + 1
+        }
+        return out + "]"
+    }
+    let mut out2: str = "{"
+    let mut j: int = 0
+    while j < v.obj_keys.len() {
+        if j > 0 {
+            out2 = out2 + ", "
+        }
+        out2 = out2 + "'" + v.obj_keys.get(j) + "': "
+        + tl_py_repr(v.obj_vals.get(j))
+        j = j + 1
+    }
+    return out2 + "}"
+}
+
+# ----------------------------------------------------------------------------
+# Python-compatible JSON serialisation over std.json's JsonValue — the
+# three forms the .py used: json.dumps(d, indent=2, sort_keys=True) (the
+# documents), json.dumps(d, sort_keys=True, separators=(",", ":")) (the
+# chain hash) and json.dumps(d, sort_keys=True) (the appended log line).
+# ----------------------------------------------------------------------------
+
+# tl_obj_set(obj, key, val) — set/replace one key.
+fn tl_obj_set(obj: JsonValue, key: str, val: JsonValue) -> void {
+    let mut i: int = 0
+    while i < obj.obj_keys.len() {
+        if obj.obj_keys.get(i) == key {
+            obj.obj_vals.set(i, val)
+            return
+        }
+        i = i + 1
+    }
+    obj.obj_keys.push(key)
+    obj.obj_vals.push(val)
+}
+
+# tl_obj_del(obj, key) — remove one key (the battery's `del rec[...]`).
+fn tl_obj_del(obj: JsonValue, key: str) -> void {
+    let mut i: int = 0
+    while i < obj.obj_keys.len() {
+        if obj.obj_keys.get(i) == key {
+            let mut j: int = i
+            while j + 1 < obj.obj_keys.len() {
+                obj.obj_keys.set(j, obj.obj_keys.get(j + 1))
+                obj.obj_vals.set(j, obj.obj_vals.get(j + 1))
+                j = j + 1
+            }
+            obj.obj_keys.pop()
+            obj.obj_vals.pop()
+            return
+        }
+        i = i + 1
+    }
+}
+
+# tl_obj_clone(v) — a deep copy (mutation must not leak to the source).
+fn tl_obj_clone(v: JsonValue) -> JsonValue {
+    let out: JsonValue = JsonValue {
+        kind: v.kind, bval: v.bval, ival: v.ival, fval: v.fval,
+        sval: v.sval, arr: [], obj_keys: [], obj_vals: []
+    }
+    let mut i: int = 0
+    while i < v.arr.len() {
+        out.arr.push(tl_obj_clone(v.arr.get(i)))
+        i = i + 1
+    }
+    let mut j: int = 0
+    while j < v.obj_keys.len() {
+        out.obj_keys.push(v.obj_keys.get(j))
+        out.obj_vals.push(tl_obj_clone(v.obj_vals.get(j)))
+        j = j + 1
+    }
+    return out
+}
+
+# tl_jstr(v, key) / tl_jint(v, key) — kind-guarded accessors.
+fn tl_jstr(v: JsonValue, key: str) -> str {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_str(x) {
+        return json_str_value(x)
+    }
+    return ""
+}
+
+fn tl_jint(v: JsonValue, key: str) -> int {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_int(x) {
+        return json_int_value(x)
+    }
+    return 0
+}
+
+fn tl_jhas(v: JsonValue, key: str) -> bool {
+    let x: JsonValue = json_object_get(v, key)
+    if x.kind == "null" && !json_object_has(v, key) {
+        return false
+    }
+    return true
+}
+
+# tl_py_escape(s) — the string body between quotes, ensure_ascii.
+fn tl_py_escape(s: str) -> str {
+    let out: list[str] = []
+    let n: int = s.len()
+    let mut i: int = 0
+    while i < n {
+        let c: int = s.byte_at(i)
+        if c == 34 {
+            out.push("\\\"")
+            i = i + 1
+            continue
+        }
+        if c == 92 {
+            out.push("\\\\")
+            i = i + 1
+            continue
+        }
+        if c == 8 {
+            out.push("\\b")
+            i = i + 1
+            continue
+        }
+        if c == 9 {
+            out.push("\\t")
+            i = i + 1
+            continue
+        }
+        if c == 10 {
+            out.push("\\n")
+            i = i + 1
+            continue
+        }
+        if c == 12 {
+            out.push("\\f")
+            i = i + 1
+            continue
+        }
+        if c == 13 {
+            out.push("\\r")
+            i = i + 1
+            continue
+        }
+        if c < 32 {
+            out.push("\\u" + tl_hex4(c))
+            i = i + 1
+            continue
+        }
+        if c < 127 {
+            out.push(s.slice(i, i + 1))
+            i = i + 1
+            continue
+        }
+        let cp: list[int] = tl_utf8_at(s, i)
+        if cp.get(0) < 0 {
+            out.push(s.slice(i, i + 1))
+            i = i + 1
+            continue
+        }
+        if cp.get(0) < 65536 {
+            out.push("\\u" + tl_hex4(cp.get(0)))
+        } else {
+            let v: int = cp.get(0) - 65536
+            let hi: int = 55296 + v / 1024
+            let lo: int = 56320 + v % 1024
+            out.push("\\u" + tl_hex4(hi) + "\\u" + tl_hex4(lo))
+        }
+        i = i + cp.get(1)
+    }
+    return str_join(out, "")
+}
+
+fn tl_scalar_text(v: JsonValue) -> str {
+    if v.kind == "null" {
+        return "null"
+    }
+    if v.kind == "bool" {
+        if v.bval {
+            return "true"
+        }
+        return "false"
+    }
+    if v.kind == "int" {
+        return v.ival.to_str()
+    }
+    if v.kind == "float" {
+        return v.fval.to_str()
+    }
+    return "\"" + tl_py_escape(v.sval) + "\""
+}
+
+# tl_sorted_order(keys) — indices sorted by key (insertion sort; the key
+# sets here are tiny).
+fn tl_sorted_order(keys: list[str]) -> list[int] {
+    let order: list[int] = []
+    let mut i: int = 0
+    while i < keys.len() {
+        order.push(i)
+        i = i + 1
+    }
+    let mut a: int = 1
+    while a < order.len() {
+        let k: int = order.get(a)
+        let kv: str = keys.get(k)
+        let mut b: int = a - 1
+        while b >= 0 && keys.get(order.get(b)) > kv {
+            order.set(b + 1, order.get(b))
+            b = b - 1
+        }
+        order.set(b + 1, k)
+        a = a + 1
+    }
+    return order
+}
+
+# tl_dump_at(v, indent, pretty) — the recursive serializer.
+fn tl_dump_at(v: JsonValue, indent: int, pretty: bool) -> str {
+    if v.kind == "array" {
+        if v.arr.len() == 0 {
+            return "[]"
+        }
+        let mut pad: str = ""
+        let mut k: int = 0
+        while k < indent {
+            pad = pad + "  "
+            k = k + 1
+        }
+        let in_pad: str = pad + "  "
+        if pretty {
+            let mut out: str = "[\n"
+            let mut i: int = 0
+            while i < v.arr.len() {
+                out = out + in_pad
+                + tl_dump_at(v.arr.get(i), indent + 1, true)
+                if i + 1 < v.arr.len() {
+                    out = out + ","
+                }
+                out = out + "\n"
+                i = i + 1
+            }
+            return out + pad + "]"
+        }
+        let mut out2: str = "["
+        let mut j: int = 0
+        while j < v.arr.len() {
+            out2 = out2 + tl_dump_at(v.arr.get(j), indent, false)
+            if j + 1 < v.arr.len() {
+                out2 = out2 + ","
+            }
+            j = j + 1
+        }
+        return out2 + "]"
+    }
+    if v.kind == "object" {
+        if v.obj_keys.len() == 0 {
+            return "{}"
+        }
+        let order: list[int] = tl_sorted_order(v.obj_keys)
+        let mut pad2: str = ""
+        let mut k2: int = 0
+        while k2 < indent {
+            pad2 = pad2 + "  "
+            k2 = k2 + 1
+        }
+        let in_pad2: str = pad2 + "  "
+        if pretty {
+            let mut out3: str = "{\n"
+            let mut j2: int = 0
+            while j2 < order.len() {
+                let idx: int = order.get(j2)
+                out3 = out3 + in_pad2 + "\""
+                + tl_py_escape(v.obj_keys.get(idx)) + "\": "
+                + tl_dump_at(v.obj_vals.get(idx), indent + 1, true)
+                if j2 + 1 < order.len() {
+                    out3 = out3 + ","
+                }
+                out3 = out3 + "\n"
+                j2 = j2 + 1
+            }
+            return out3 + pad2 + "}"
+        }
+        let mut out4: str = "{"
+        let mut j3: int = 0
+        while j3 < order.len() {
+            let idx2: int = order.get(j3)
+            out4 = out4 + "\"" + tl_py_escape(v.obj_keys.get(idx2))
+            + "\":" + tl_dump_at(v.obj_vals.get(idx2), indent, false)
+            if j3 + 1 < order.len() {
+                out4 = out4 + ","
+            }
+            j3 = j3 + 1
+        }
+        return out4 + "}"
+    }
+    return tl_scalar_text(v)
+}
+
+# tl_py_dump(v) — json.dumps(v, indent=2, sort_keys=True).
+fn tl_py_dump(v: JsonValue) -> str {
+    return tl_dump_at(v, 0, true)
+}
+
+# tl_py_canon(v) — json.dumps(v, sort_keys=True, separators=(",", ":")).
+fn tl_py_canon(v: JsonValue) -> str {
+    return tl_dump_at(v, 0, false)
+}
+
+# tl_py_line(v) — json.dumps(v, sort_keys=True) (default ", " / ": ").
+fn tl_py_line(v: JsonValue) -> str {
+    if v.kind == "object" && v.obj_keys.len() > 0 {
+        let order: list[int] = tl_sorted_order(v.obj_keys)
+        let mut out: str = "{"
+        let mut j: int = 0
+        while j < order.len() {
+            let idx: int = order.get(j)
+            out = out + "\"" + tl_py_escape(v.obj_keys.get(idx))
+            + "\": " + tl_py_line(v.obj_vals.get(idx))
+            if j + 1 < order.len() {
+                out = out + ", "
+            }
+            j = j + 1
+        }
+        return out + "}"
+    }
+    if v.kind == "array" && v.arr.len() > 0 {
+        let mut out2: str = "["
+        let mut k: int = 0
+        while k < v.arr.len() {
+            out2 = out2 + tl_py_line(v.arr.get(k))
+            if k + 1 < v.arr.len() {
+                out2 = out2 + ", "
+            }
+            k = k + 1
+        }
+        return out2 + "]"
+    }
+    if v.kind == "array" {
+        return "[]"
+    }
+    if v.kind == "object" {
+        return "{}"
+    }
+    return tl_scalar_text(v)
+}
+
+# ----------------------------------------------------------------------------
+# SHA-512 (FIPS 180-4) — 64-bit words as (hi, lo) 32-bit halves; every
+# intermediate stays below 2^33, the widest sum below 2^35, all inside
+# the int64 the runtime checks. Only Ed25519 leans on this.
+# ----------------------------------------------------------------------------
+
+struct W64 {
+    hi: int,
+    lo: int
+}
+
+fn w64(hi: int, lo: int) -> W64 {
+    return W64 {
+        hi: hi, lo: lo
+    }
+}
+
+fn w64_add(a: W64, b: W64) -> W64 {
+    let ls: int = a.lo + b.lo
+    let carry: int = int_shr(ls, 32)
+    let lo: int = int_and(ls, 4294967295)
+    let hs: int = a.hi + b.hi + carry
+    return W64 {
+        hi: int_and(hs, 4294967295), lo: lo
+    }
+}
+
+fn w64_xor(a: W64, b: W64) -> W64 {
+    return W64 {
+        hi: int_and(int_xor(a.hi, b.hi), 4294967295),
+        lo: int_and(int_xor(a.lo, b.lo), 4294967295)
+    }
+}
+
+fn w64_and(a: W64, b: W64) -> W64 {
+    return W64 {
+        hi: int_and(int_and(a.hi, b.hi), 4294967295),
+        lo: int_and(int_and(a.lo, b.lo), 4294967295)
+    }
+}
+
+fn w64_not(a: W64) -> W64 {
+    return W64 {
+        hi: int_and(int_not(a.hi), 4294967295),
+        lo: int_and(int_not(a.lo), 4294967295)
+    }
+}
+
+# w64_rotr(a, n) — right-rotate the 64-bit value by n (1..63).
+fn w64_rotr(a: W64, n: int) -> W64 {
+    if n == 32 {
+        return W64 {
+            hi: a.lo, lo: a.hi
+        }
+    }
+    if n < 32 {
+        let k: int = 32 - n
+        let lo: int = int_and(int_or(int_shr(a.lo, n), int_shl(a.hi, k)),
+        4294967295)
+        let hi: int = int_and(int_or(int_shr(a.hi, n), int_shl(a.lo, k)),
+        4294967295)
+        return W64 {
+            hi: hi, lo: lo
+        }
+    }
+    let m: int = n - 32
+    let k2: int = 32 - m
+    let s: W64 = W64 {
+        hi: a.lo, lo: a.hi
+    }
+    let lo2: int = int_and(int_or(int_shr(s.lo, m), int_shl(s.hi, k2)),
+    4294967295)
+    let hi2: int = int_and(int_or(int_shr(s.hi, m), int_shl(s.lo, k2)),
+    4294967295)
+    return W64 {
+        hi: hi2, lo: lo2
+    }
+}
+
+# w64_shr(a, n) — logical right shift of the 64-bit value by n (1..63).
+fn w64_shr(a: W64, n: int) -> W64 {
+    if n < 32 {
+        let lo: int = int_and(int_or(int_shr(a.lo, n),
+        int_shl(a.hi, 32 - n)), 4294967295)
+        return W64 {
+            hi: int_shr(a.hi, n), lo: lo
+        }
+    }
+    return W64 {
+        hi: 0, lo: int_shr(a.hi, n - 32)
+    }
+}
+
+fn w64_eq(a: W64, b: W64) -> bool {
+    return a.hi == b.hi && a.lo == b.lo
+}
+
+# The 80 round constants (first 64 bits of the fractional parts of the
+# cube roots of the first 80 primes), hi and lo halves as decimals.
+fn s512_k_hi() -> list[int] {
+    return[
+    1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993, 2453635748, 2870763221,
+    3624381080, 310598401, 607225278, 1426881987, 1925078388, 2162078206, 2614888103, 3248222580,
+    3835390401, 4022224774, 264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986,
+    2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711, 113926993, 338241895,
+    666307205, 773529912, 1294757372, 1396182291, 1695183700, 1986661051, 2177026350, 2456956037,
+    2730485921, 2820302411, 3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344,
+    430227734, 506948616, 659060556, 883997877, 958139571, 1322822218, 1537002063, 1747873779,
+    1955562222, 2024104815, 2227730452, 2361852424, 2428436474, 2756734187, 3204031479, 3329325298,
+    3391569614, 3515267271, 3940187606, 4118630271, 116418474, 174292421, 289380356, 460393269,
+    685471733, 852142971, 1017036298, 1126000580, 1288033470, 1501505948, 1607167915, 1816402316
+    ]
+}
+
+fn s512_k_lo() -> list[int] {
+    return[
+    3609767458, 602891725, 3964484399, 2173295548, 4081628472, 3053834265, 2937671579, 3664609560,
+    2734883394, 1164996542, 1323610764, 3590304994, 4068182383, 991336113, 633803317, 3479774868,
+    2666613458, 944711139, 2341262773, 2007800933, 1495990901, 1856431235, 3175218132, 2198950837,
+    3999719339, 766784016, 2566594879, 3203337956, 1034457026, 2466948901, 3758326383, 168717936,
+    1188179964, 1546045734, 1522805485, 2643833823, 2343527390, 1014477480, 1206759142, 344077627,
+    1290863460, 3158454273, 3505952657, 106217008, 3606008344, 1432725776, 1467031594, 851169720,
+    3100823752, 1363258195, 3750685593, 3785050280, 3318307427, 3812723403, 2003034995, 3602036899,
+    1575990012, 1125592928, 2716904306, 442776044, 593698344, 3733110249, 2999351573, 3815920427,
+    3928383900, 566280711, 3454069534, 4000239992, 1914138554, 2731055270, 3203993006, 320620315,
+    587496836, 1086792851, 365543100, 2618297676, 3409855158, 4234509866, 987167468, 1246189591
+    ]
+}
+
+# The initial state (fractional parts of the square roots of the first
+# 8 primes).
+fn s512_h_init() -> list[W64] {
+    let h: list[W64] = []
+    h.push(w64(1779033703, 4089235720))
+    h.push(w64(3144134277, 2227873595))
+    h.push(w64(1013904242, 4271175723))
+    h.push(w64(2773480762, 1595750129))
+    h.push(w64(1359893119, 2917565137))
+    h.push(w64(2600822924, 725511199))
+    h.push(w64(528734635, 4215389547))
+    h.push(w64(1541459225, 327033209))
+    return h
+}
+
+fn s512_ch(x: W64, y: W64, z: W64) -> W64 {
+    return w64_xor(w64_and(x, y), w64_and(w64_not(x), z))
+}
+
+fn s512_maj(x: W64, y: W64, z: W64) -> W64 {
+    return w64_xor(w64_xor(w64_and(x, y), w64_and(x, z)), w64_and(y, z))
+}
+
+fn s512_sigma0_upper(x: W64) -> W64 {
+    return w64_xor(w64_xor(w64_rotr(x, 28), w64_rotr(x, 34)), w64_rotr(x, 39))
+}
+
+fn s512_sigma1_upper(x: W64) -> W64 {
+    return w64_xor(w64_xor(w64_rotr(x, 14), w64_rotr(x, 18)), w64_rotr(x, 41))
+}
+
+fn s512_sigma0_lower(x: W64) -> W64 {
+    return w64_xor(w64_xor(w64_rotr(x, 1), w64_rotr(x, 8)), w64_shr(x, 7))
+}
+
+fn s512_sigma1_lower(x: W64) -> W64 {
+    return w64_xor(w64_xor(w64_rotr(x, 19), w64_rotr(x, 61)), w64_shr(x, 6))
+}
+
+# s512_word_be(block, t) — the t-th big-endian 64-bit word (t in 0..15).
+fn s512_word_be(block: str, t: int) -> W64 {
+    let o: int = t * 8
+    let hi: int = int_or(
+    int_or(int_shl(block.byte_at(o), 24), int_shl(block.byte_at(o + 1), 16)),
+    int_or(int_shl(block.byte_at(o + 2), 8), block.byte_at(o + 3))
+    )
+    let lo: int = int_or(
+    int_or(int_shl(block.byte_at(o + 4), 24),
+    int_shl(block.byte_at(o + 5), 16)),
+    int_or(int_shl(block.byte_at(o + 6), 8), block.byte_at(o + 7))
+    )
+    return W64 {
+        hi: hi, lo: lo
+    }
+}
+
+fn s512_message_schedule(block: str) -> list[W64] {
+    let w: list[W64] = []
+    let mut t: int = 0
+    while t < 16 {
+        w.push(s512_word_be(block, t))
+        t = t + 1
+    }
+    while t < 80 {
+        let w2: W64 = w.get(t - 2)
+        let w7: W64 = w.get(t - 7)
+        let w15: W64 = w.get(t - 15)
+        let w16: W64 = w.get(t - 16)
+        let x: W64 = w64_add(
+        w64_add(s512_sigma1_lower(w2), w7),
+        w64_add(s512_sigma0_lower(w15), w16)
+        )
+        w.push(x)
+        t = t + 1
+    }
+    return w
+}
+
+fn s512_compress_block(state: list[W64], block: str, khi: list[int],
+klo: list[int]) -> void {
+    let w: list[W64] = s512_message_schedule(block)
+    let mut a: W64 = state.get(0)
+    let mut b: W64 = state.get(1)
+    let mut c: W64 = state.get(2)
+    let mut d: W64 = state.get(3)
+    let mut e: W64 = state.get(4)
+    let mut f: W64 = state.get(5)
+    let mut g: W64 = state.get(6)
+    let mut h: W64 = state.get(7)
+    let mut t: int = 0
+    while t < 80 {
+        let k: W64 = w64(khi.get(t), klo.get(t))
+        let t1: W64 = w64_add(
+        w64_add(w64_add(h, s512_sigma1_upper(e)),
+        w64_add(s512_ch(e, f, g), k)),
+        w.get(t)
+        )
+        let t2: W64 = w64_add(s512_sigma0_upper(a), s512_maj(a, b, c))
+        h = g
+        g = f
+        f = e
+        e = w64_add(d, t1)
+        d = c
+        c = b
+        b = a
+        a = w64_add(t1, t2)
+        t = t + 1
+    }
+    state.set(0, w64_add(state.get(0), a))
+    state.set(1, w64_add(state.get(1), b))
+    state.set(2, w64_add(state.get(2), c))
+    state.set(3, w64_add(state.get(3), d))
+    state.set(4, w64_add(state.get(4), e))
+    state.set(5, w64_add(state.get(5), f))
+    state.set(6, w64_add(state.get(6), g))
+    state.set(7, w64_add(state.get(7), h))
+}
+
+# s512_pad(data) — one 0x80 byte, zeros to 112 mod 128, the 128-bit
+# big-endian bit length (the high 64 bits are zero for any input the
+# runtime can carry).
+fn s512_pad(data: str) -> str {
+    let orig_len: int = data.len()
+    let bit_len: int = orig_len * 8
+    let after: int = orig_len + 1
+    let rem: int = after - (after / 128) * 128
+    let zeros: int = (112 - rem + 128) - ((112 - rem + 128) / 128) * 128
+    let mut out: str = data + chr(128)
+    let mut i: int = 0
+    while i < zeros {
+        out = out + chr(0)
+        i = i + 1
+    }
+    let mut hi8: str = ""
+    let mut z: int = 0
+    while z < 8 {
+        hi8 = hi8 + chr(0)
+        z = z + 1
+    }
+    let lo8: str = chr(int_and(int_shr(bit_len, 56), 255))
+    + chr(int_and(int_shr(bit_len, 48), 255))
+    + chr(int_and(int_shr(bit_len, 40), 255))
+    + chr(int_and(int_shr(bit_len, 32), 255))
+    + chr(int_and(int_shr(bit_len, 24), 255))
+    + chr(int_and(int_shr(bit_len, 16), 255))
+    + chr(int_and(int_shr(bit_len, 8), 255))
+    + chr(int_and(bit_len, 255))
+    return out + hi8 + lo8
+}
+
+fn w64_to_be8(x: W64) -> str {
+    return chr(int_and(int_shr(x.hi, 24), 255))
+    + chr(int_and(int_shr(x.hi, 16), 255))
+    + chr(int_and(int_shr(x.hi, 8), 255))
+    + chr(int_and(x.hi, 255))
+    + chr(int_and(int_shr(x.lo, 24), 255))
+    + chr(int_and(int_shr(x.lo, 16), 255))
+    + chr(int_and(int_shr(x.lo, 8), 255))
+    + chr(int_and(x.lo, 255))
+}
+
+# sha512_hash(data) — the 64-byte digest.
+fn sha512_hash(data: str) -> str {
+    let padded: str = s512_pad(data)
+    let khi: list[int] = s512_k_hi()
+    let klo: list[int] = s512_k_lo()
+    let mut state: list[W64] = s512_h_init()
+    let n_blocks: int = padded.len() / 128
+    let mut bi: int = 0
+    while bi < n_blocks {
+        let block: str = padded.slice(bi * 128, (bi + 1) * 128)
+        s512_compress_block(state, block, khi, klo)
+        bi = bi + 1
+    }
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < 8 {
+        out = out + w64_to_be8(state.get(i))
+        i = i + 1
+    }
+    return out
+}
+
+fn sha512_hex(data: str) -> str {
+    let digits: str = "0123456789abcdef"
+    let digest: str = sha512_hash(data)
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < digest.len() {
+        let b: int = digest.byte_at(i)
+        out.push(digits.slice(b / 16, b / 16 + 1))
+        out.push(digits.slice(b % 16, b % 16 + 1))
+        i = i + 1
+    }
+    return str_join(out, "")
+}
+
+# ----------------------------------------------------------------------------
+# Bignum — 16-bit limbs, little-endian, variable length. Wide enough for
+# the 512-bit SHA-512 integers; every product of two < 2^32 limb values
+# fits an int64 with room for the carry.
+# ----------------------------------------------------------------------------
+
+fn bn_zero() -> list[int] {
+    return[]
+}
+
+fn bn_one() -> list[int] {
+    return[1]
+}
+
+# bn_len(a) — the top nonzero limb index + 1 (normalised length, no
+# mutation of the caller's list).
+fn bn_len(a: list[int]) -> int {
+    let mut n: int = a.len()
+    while n > 0 && a.get(n - 1) == 0 {
+        n = n - 1
+    }
+    return n
+}
+
+# bn_cmp(a, b) — -1 / 0 / 1.
+fn bn_cmp(a: list[int], b: list[int]) -> int {
+    let la: int = bn_len(a)
+    let lb: int = bn_len(b)
+    if la != lb {
+        if la < lb {
+            return -1
+        }
+        return 1
+    }
+    let mut i: int = la - 1
+    while i >= 0 {
+        if a.get(i) != b.get(i) {
+            if a.get(i) < b.get(i) {
+                return -1
+            }
+            return 1
+        }
+        i = i - 1
+    }
+    return 0
+}
+
+fn bn_eq(a: list[int], b: list[int]) -> bool {
+    return bn_cmp(a, b) == 0
+}
+
+# bn_from_int(v) — v >= 0.
+fn bn_from_int(v: int) -> list[int] {
+    if v == 0 {
+        return[]
+    }
+    let out: list[int] = []
+    let mut x: int = v
+    while x > 0 {
+        out.push(int_and(x, 65535))
+        x = int_shr(x, 16)
+    }
+    return out
+}
+
+# bn_pow2(k) — 2^k for k <= 500.
+fn bn_pow2(k: int) -> list[int] {
+    let out: list[int] = []
+    let limb: int = k / 16
+    let bit: int = k % 16
+    let mut i: int = 0
+    while i < limb {
+        out.push(0)
+        i = i + 1
+    }
+    out.push(int_shl(1, bit))
+    return out
+}
+
+# bn_add(a, b) — a + b (fresh list).
+fn bn_add(a: list[int], b: list[int]) -> list[int] {
+    let out: list[int] = []
+    let mut carry: int = 0
+    let mut i: int = 0
+    let n: int = a.len()
+    let m: int = b.len()
+    while i < n || i < m || carry != 0 {
+        let mut x: int = carry
+        if i < n {
+            x = x + a.get(i)
+        }
+        if i < m {
+            x = x + b.get(i)
+        }
+        out.push(int_and(x, 65535))
+        carry = int_shr(x, 16)
+        i = i + 1
+    }
+    return out
+}
+
+# bn_sub(a, b) — a - b, requires a >= b.
+fn bn_sub(a: list[int], b: list[int]) -> list[int] {
+    let out: list[int] = []
+    let mut borrow: int = 0
+    let mut i: int = 0
+    let n: int = a.len()
+    let m: int = b.len()
+    while i < n {
+        let mut x: int = a.get(i) - borrow
+        if i < m {
+            x = x - b.get(i)
+        }
+        if x < 0 {
+            out.push(x + 65536)
+            borrow = 1
+        } else {
+            out.push(x)
+            borrow = 0
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# bn_mul(a, b) — schoolbook.
+fn bn_mul(a: list[int], b: list[int]) -> list[int] {
+    let la: int = bn_len(a)
+    let lb: int = bn_len(b)
+    if la == 0 || lb == 0 {
+        return[]
+    }
+    let out: list[int] = []
+    let mut z: int = 0
+    while z < la + lb {
+        out.push(0)
+        z = z + 1
+    }
+    let mut i: int = 0
+    while i < la {
+        let mut carry: int = 0
+        let ai: int = a.get(i)
+        if ai != 0 {
+            let mut j: int = 0
+            while j < lb {
+                let t: int = out.get(i + j) + ai * b.get(j) + carry
+                out.set(i + j, int_and(t, 65535))
+                carry = int_shr(t, 16)
+                j = j + 1
+            }
+            let mut k: int = i + lb
+            while carry != 0 {
+                let t2: int = out.get(k) + carry
+                out.set(k, int_and(t2, 65535))
+                carry = int_shr(t2, 16)
+                k = k + 1
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# bn_mul_small(a, c) — a * c for a small c (fits a limb).
+fn bn_mul_small(a: list[int], c: int) -> list[int] {
+    if c == 0 {
+        return[]
+    }
+    let out: list[int] = []
+    let mut carry: int = 0
+    let mut i: int = 0
+    while i < a.len() {
+        let t: int = a.get(i) * c + carry
+        out.push(int_and(t, 65535))
+        carry = int_shr(t, 16)
+        i = i + 1
+    }
+    while carry != 0 {
+        out.push(int_and(carry, 65535))
+        carry = int_shr(carry, 16)
+    }
+    return out
+}
+
+# bn_shr(a, k) — logical right shift by k bits.
+fn bn_shr(a: list[int], k: int) -> list[int] {
+    let limb: int = k / 16
+    let bit: int = k % 16
+    if limb >= a.len() {
+        return[]
+    }
+    let out: list[int] = []
+    let mut i: int = limb
+    while i < a.len() {
+        let mut v: int = int_shr(a.get(i), bit)
+        if bit > 0 && i + 1 < a.len() {
+            v = int_or(v, int_and(int_shl(a.get(i + 1), 16 - bit), 65535))
+        }
+        out.push(v)
+        i = i + 1
+    }
+    return out
+}
+
+# bn_low_bits(a, k) — a mod 2^k.
+fn bn_low_bits(a: list[int], k: int) -> list[int] {
+    let limb: int = k / 16
+    let bit: int = k % 16
+    let out: list[int] = []
+    let mut i: int = 0
+    while i < limb && i < a.len() {
+        out.push(a.get(i))
+        i = i + 1
+    }
+    if bit > 0 && limb < a.len() {
+        out.push(int_and(a.get(limb), int_sub_mask(bit)))
+        i = i + 1
+    }
+    return out
+}
+
+# int_sub_mask(bits) — 2^bits - 1 for bits in 1..16.
+fn int_sub_mask(bits: int) -> int {
+    if bits >= 16 {
+        return 65535
+    }
+    return int_shl(1, bits) - 1
+}
+
+# bn_bit(a, k) — bit k of a.
+fn bn_bit(a: list[int], k: int) -> int {
+    let i: int = k / 16
+    if i >= a.len() {
+        return 0
+    }
+    return int_and(int_shr(a.get(i), k % 16), 1)
+}
+
+# bn_lt_pow2(a, k) — a < 2^k (all limbs above bit k are zero).
+fn bn_lt_pow2(a: list[int], k: int) -> bool {
+    let limb: int = k / 16
+    let bit: int = k % 16
+    let mut i: int = limb + 1
+    while i < a.len() {
+        if a.get(i) != 0 {
+            return false
+        }
+        i = i + 1
+    }
+    if limb < a.len() {
+        if bit == 0 {
+            if a.get(limb) != 0 {
+                return false
+            }
+        } else {
+            if int_shr(a.get(limb), bit) != 0 {
+                return false
+            }
+        }
+    }
+    return true
+}
+
+# bn_to_bytes_le(a, n) — n bytes little-endian (high limbs dropped; the
+# caller guarantees the value fits).
+fn bn_to_bytes_le(a: list[int], n: int) -> str {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < n {
+        let limb_i: int = i / 2
+        let mut limb: int = 0
+        if limb_i < a.len() {
+            limb = a.get(limb_i)
+        }
+        if i % 2 == 0 {
+            out.push(chr(int_and(limb, 255)))
+        } else {
+            out.push(chr(int_and(int_shr(limb, 8), 255)))
+        }
+        i = i + 1
+    }
+    return str_join(out, "")
+}
+
+# bn_from_bytes_le(b) — bytes (odd length allowed) to a bignum.
+fn bn_from_bytes_le(b: str) -> list[int] {
+    let out: list[int] = []
+    let n: int = b.len()
+    let mut i: int = 0
+    while i < n {
+        let mut v: int = b.byte_at(i)
+        if i + 1 < n {
+            v = int_or(v, int_shl(b.byte_at(i + 1), 8))
+        }
+        out.push(v)
+        i = i + 2
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# The two "2^k - c" reduction domains: Ed25519's field P = 2^255 - 19 and
+# Poly1305's P130 = 2^130 - 5. The fold: 2^k = c (mod 2^k - c).
+# ----------------------------------------------------------------------------
+
+# fe_p() — 2^255 - 19 (16 limbs).
+fn fe_p() -> list[int] {
+    return[65517, 65535, 65535, 65535, 65535, 65535, 65535, 65535,
+    65535, 65535, 65535, 65535, 65535, 65535, 65535, 32767]
+}
+
+# fe_l() — the group order 2^252 + 27742317777372353535851937790883648493.
+fn fe_l() -> list[int] {
+    return[54253, 23797, 25370, 22546, 40150, 41719, 63966, 5342,
+    0, 0, 0, 0, 0, 0, 0, 4096]
+}
+
+# fe_d() — the curve constant (-121665 / 121666) mod P.
+fn fe_d() -> list[int] {
+    return[30883, 4953, 19914, 30187, 55467, 16705, 2637, 112,
+    59544, 30585, 16505, 36039, 65139, 11119, 27886, 20995]
+}
+
+# fe_d2() — 2*D mod P (the add formula's constant).
+fn fe_d2() -> list[int] {
+    return[61785, 9906, 39828, 60374, 45398, 33411, 5274, 224,
+    53552, 61171, 33010, 6542, 64743, 22239, 55772, 9222]
+}
+
+# fe_sqrt_m1() — sqrt(-1) in the field, 2^((P-1)/4).
+fn fe_sqrt_m1() -> list[int] {
+    return[41136, 18958, 6951, 50414, 58488, 44335, 6150, 12099,
+    55207, 15867, 153, 11085, 57099, 20417, 9344, 11139]
+}
+
+# fe_bx(), fe_by() — the RFC 8032 base point coordinates.
+fn fe_bx() -> list[int] {
+    return[54554, 36645, 11616, 51542, 42930, 38181, 51040, 26924,
+    56412, 64982, 57905, 49316, 21502, 52590, 14035, 8553]
+}
+
+fn fe_by() -> list[int] {
+    return[26200, 26214, 26214, 26214, 26214, 26214, 26214, 26214,
+    26214, 26214, 26214, 26214, 26214, 26214, 26214, 26214]
+}
+
+# fe_poly_p() — Poly1305's prime 2^130 - 5.
+fn fe_poly_p() -> list[int] {
+    return[65531, 65535, 65535, 65535, 65535, 65535, 65535, 65535, 3]
+}
+
+# fe_poly_clamp() — the Poly1305 r clamp mask
+# 0x0ffffffc0ffffffc0ffffffc0fffffff.
+fn fe_poly_clamp() -> list[int] {
+    return[65535, 4095, 65532, 4095, 65532, 4095, 65532, 4095]
+}
+
+# bn_mod_pow2k_c(x, k, c, mod) — x reduced into [0, 2^k - c) by folding
+# 2^k = c until the value is below 2^k, then subtracting the modulus.
+fn bn_mod_pow2k_c(x: list[int], k: int, c: int, modulus: list[int]) -> list[int] {
+    let mut v: list[int] = x
+    let mut guard: int = 0
+    while guard < 16 {
+        if bn_lt_pow2(v, k) {
+            break
+        }
+        let hi: list[int] = bn_shr(v, k)
+        let lo: list[int] = bn_low_bits(v, k)
+        v = bn_add(lo, bn_mul_small(hi, c))
+        guard = guard + 1
+    }
+    while bn_cmp(v, modulus) >= 0 {
+        v = bn_sub(v, modulus)
+    }
+    return v
+}
+
+# fe_norm(x) — x mod P.
+fn fe_norm(x: list[int]) -> list[int] {
+    return bn_mod_pow2k_c(x, 255, 19, fe_p())
+}
+
+fn fe_add(a: list[int], b: list[int]) -> list[int] {
+    return fe_norm(bn_add(a, b))
+}
+
+# fe_sub(a, b) — (a - b) mod P for a, b in [0, P).
+fn fe_sub(a: list[int], b: list[int]) -> list[int] {
+    if bn_cmp(a, b) >= 0 {
+        return fe_norm(bn_sub(a, b))
+    }
+    return fe_norm(bn_sub(fe_p(), bn_sub(b, a)))
+}
+
+fn fe_mul(a: list[int], b: list[int]) -> list[int] {
+    return fe_norm(bn_mul(a, b))
+}
+
+# fe_modpow(base, e) — base^e mod P, top-down square-and-multiply.
+fn fe_modpow(base: list[int], e: list[int]) -> list[int] {
+    let mut result: list[int] = bn_one()
+    let total: int = bn_len(e) * 16
+    let mut i: int = total - 1
+    while i >= 0 {
+        result = fe_mul(result, result)
+        if bn_bit(e, i) == 1 {
+            result = fe_mul(result, base)
+        }
+        i = i - 1
+    }
+    return result
+}
+
+# fe_inv(a) — a^(P-2) mod P (0 maps to 0, like Fermat).
+fn fe_inv(a: list[int]) -> list[int] {
+    return fe_modpow(a, bn_sub(fe_p(), bn_from_int(2)))
+}
+
+# bn_mod_l(x) — x mod L by bit-by-bit reduction (x up to 512 bits).
+fn bn_mod_l(x: list[int]) -> list[int] {
+    let mut r: list[int] = []
+    let total: int = bn_len(x) * 16
+    let mut i: int = total - 1
+    while i >= 0 {
+        r = bn_add(r, r)
+        if bn_bit(x, i) == 1 {
+            r = bn_add(r, bn_one())
+        }
+        if bn_cmp(r, fe_l()) >= 0 {
+            r = bn_sub(r, fe_l())
+        }
+        i = i - 1
+    }
+    return r
+}
+
+# ----------------------------------------------------------------------------
+# Ed25519 (RFC 8032) — extended homogeneous coordinates, the .py's own
+# formulas verbatim. Deterministic signing: the nonce is SHA-512 of the
+# seed prefix and the message, never an RNG.
+# ----------------------------------------------------------------------------
+
+struct EdPt {
+    x: list[int],
+    y: list[int],
+    z: list[int],
+    t: list[int]
+}
+
+fn ed_ident() -> EdPt {
+    return EdPt {
+        x: bn_zero(), y: bn_one(), z: bn_one(), t: bn_zero()
+    }
+}
+
+# ed_base() — (BX, BY, 1, BX*BY mod P).
+fn ed_base() -> EdPt {
+    return EdPt {
+        x: fe_bx(), y: fe_by(), z: bn_one(), t: fe_mul(fe_bx(), fe_by())
+    }
+}
+
+fn ed_pt_add(p1: EdPt, p2: EdPt) -> EdPt {
+    let a: list[int] = fe_mul(fe_sub(p1.y, p1.x), fe_sub(p2.y, p2.x))
+    let b: list[int] = fe_mul(fe_add(p1.y, p1.x), fe_add(p2.y, p2.x))
+    let c: list[int] = fe_mul(fe_mul(p1.t, p2.t), fe_d2())
+    let dd: list[int] = fe_mul(bn_add(p1.z, p1.z), p2.z)
+    let e: list[int] = fe_sub(b, a)
+    let f: list[int] = fe_sub(dd, c)
+    let g: list[int] = fe_add(dd, c)
+    let h: list[int] = fe_add(b, a)
+    return EdPt {
+        x: fe_mul(e, f), y: fe_mul(g, h), z: fe_mul(f, g), t: fe_mul(e, h)
+    }
+}
+
+fn ed_pt_double(p: EdPt) -> EdPt {
+    let a: list[int] = fe_mul(p.x, p.x)
+    let b: list[int] = fe_mul(p.y, p.y)
+    let c: list[int] = fe_norm(bn_mul(bn_add(p.z, p.z), p.z))
+    let h: list[int] = fe_add(a, b)
+    let xy: list[int] = fe_add(p.x, p.y)
+    let e: list[int] = fe_sub(h, fe_mul(xy, xy))
+    let g: list[int] = fe_sub(a, b)
+    let f: list[int] = fe_add(c, g)
+    return EdPt {
+        x: fe_mul(e, f), y: fe_mul(g, h), z: fe_mul(f, g), t: fe_mul(e, h)
+    }
+}
+
+# ed_scalarmult(p, e) — [e]p by double-and-add from bit 255 down.
+fn ed_scalarmult(p: EdPt, e: list[int]) -> EdPt {
+    let mut q: EdPt = ed_ident()
+    let mut i: int = 255
+    while i >= 0 {
+        q = ed_pt_double(q)
+        if bn_bit(e, i) == 1 {
+            q = ed_pt_add(q, p)
+        }
+        i = i - 1
+    }
+    return q
+}
+
+# ed_compress(p) — the 32-byte little-endian y with x's parity on bit 255.
+fn ed_compress(p: EdPt) -> str {
+    let zinv: list[int] = fe_inv(p.z)
+    let x: list[int] = fe_mul(p.x, zinv)
+    let y: list[int] = fe_mul(p.y, zinv)
+    let mut val: list[int] = y
+    if bn_bit(x, 0) == 1 {
+        val = bn_add(y, bn_pow2(255))
+    }
+    return bn_to_bytes_le(val, 32)
+}
+
+struct FeOpt {
+    ok: bool,
+    v: list[int]
+}
+
+# ed_x_of(y) — x^2 = (y^2 - 1) / (d*y^2 + 1), the root the RFC picks.
+fn ed_x_of(y: list[int]) -> FeOpt {
+    let num: list[int] = fe_sub(fe_mul(y, y), bn_one())
+    let den: list[int] = fe_add(fe_mul(fe_mul(fe_d(), y), y), bn_one())
+    let x2: list[int] = fe_mul(num, fe_inv(den))
+    # (P + 3) / 8 = 2^252 - 2
+    let exp: list[int] = bn_sub(bn_pow2(252), bn_from_int(2))
+    let mut x: list[int] = fe_modpow(x2, exp)
+    if !bn_eq(fe_mul(x, x), x2) {
+        x = fe_mul(x, fe_sqrt_m1())
+    }
+    if !bn_eq(fe_mul(x, x), x2) {
+        return FeOpt {
+            ok: false, v: []
+        }
+    }
+    return FeOpt {
+        ok: true, v: x
+    }
+}
+
+struct EdOpt {
+    ok: bool,
+    p: EdPt
+}
+
+# ed_decompress(b32) — bytes to a point, None on not-on-curve.
+fn ed_decompress(b32: str) -> EdOpt {
+    if b32.len() != 32 {
+        return EdOpt {
+            ok: false, p: ed_ident()
+        }
+    }
+    let val: list[int] = bn_from_bytes_le(b32)
+    let sign: int = bn_bit(val, 255)
+    let y: list[int] = bn_low_bits(val, 255)
+    if bn_cmp(y, fe_p()) >= 0 {
+        return EdOpt {
+            ok: false, p: ed_ident()
+        }
+    }
+    let xo: FeOpt = ed_x_of(y)
+    if !xo.ok {
+        return EdOpt {
+            ok: false, p: ed_ident()
+        }
+    }
+    let mut x: list[int] = xo.v
+    if bn_len(x) == 0 && sign == 1 {
+        return EdOpt {
+            ok: false, p: ed_ident()
+        }
+    }
+    if bn_bit(x, 0) != sign {
+        x = fe_sub(fe_p(), x)
+    }
+    return EdOpt {
+        ok: true,
+        p: EdPt {
+            x: x, y: y, z: bn_one(), t: fe_mul(x, y)
+        }
+    }
+}
+
+# ed_clamp(prefix32) — the clamped scalar of the seed's first half.
+fn ed_clamp(prefix32: str) -> list[int] {
+    let a: str = chr(int_and(prefix32.byte_at(0), 248))
+    + prefix32.slice(1, 31)
+    + chr(int_or(int_and(prefix32.byte_at(31), 127), 64))
+    return bn_from_bytes_le(a)
+}
+
+struct EdSec {
+    a: list[int],
+    prefix: str
+}
+
+# ed_secret_expand(seed) — the clamped scalar and the nonce prefix.
+fn ed_secret_expand(seed: str) -> EdSec {
+    let h: str = sha512_hash(seed)
+    return EdSec {
+        a: ed_clamp(h.slice(0, 32)), prefix: h.slice(32, 64)
+    }
+}
+
+# ed_public_from_seed(seed) — the compressed [a]B.
+fn ed_public_from_seed(seed: str) -> str {
+    let sec: EdSec = ed_secret_expand(seed)
+    return ed_compress(ed_scalarmult(ed_base(), sec.a))
+}
+
+# ed_sign(seed, msg) — RFC 8032 5.1.6, deterministic.
+fn ed_sign(seed: str, msg: str) -> str {
+    let sec: EdSec = ed_secret_expand(seed)
+    let pk: str = ed_compress(ed_scalarmult(ed_base(), sec.a))
+    let r: list[int] = bn_mod_l(bn_from_bytes_le(sha512_hash(sec.prefix + msg)))
+    let r_enc: str = ed_compress(ed_scalarmult(ed_base(), r))
+    let k: list[int] = bn_mod_l(bn_from_bytes_le(sha512_hash(r_enc + pk + msg)))
+    let s: list[int] = bn_mod_l(bn_add(r, bn_mul(k, sec.a)))
+    return r_enc + bn_to_bytes_le(s, 32)
+}
+
+# ed_verify(pk, msg, sig) — RFC 8032 5.1.7, the cofactored equation.
+fn ed_verify(pk: str, msg: str, sig: str) -> bool {
+    if sig.len() != 64 {
+        return false
+    }
+    let a_opt: EdOpt = ed_decompress(pk)
+    if !a_opt.ok {
+        return false
+    }
+    let r_opt: EdOpt = ed_decompress(sig.slice(0, 32))
+    if !r_opt.ok {
+        return false
+    }
+    let s: list[int] = bn_from_bytes_le(sig.slice(32, 64))
+    if bn_cmp(s, fe_l()) >= 0 {
+        return false
+    }
+    let k: list[int] = bn_mod_l(bn_from_bytes_le(
+    sha512_hash(sig.slice(0, 32) + pk + msg)))
+    let left: EdPt = ed_scalarmult(ed_scalarmult(ed_base(), s), bn_from_int(8))
+    let right: EdPt = ed_scalarmult(
+    ed_pt_add(r_opt.p, ed_scalarmult(a_opt.p, k)), bn_from_int(8))
+    return ed_compress(left) == ed_compress(right)
+}
+
+# ----------------------------------------------------------------------------
+# ChaCha20 + Poly1305 + PBKDF2-HMAC-SHA256 (RFC 8439) — the secret-key
+# box. 32-bit words via the native int_* builtins.
+# ----------------------------------------------------------------------------
+
+fn cc_m32() -> int {
+    return 4294967295
+}
+
+fn cc_rotl32(v: int, n: int) -> int {
+    return int_or(int_and(int_shl(v, n), cc_m32()), int_shr(v, 32 - n))
+}
+
+# cc_quarter(state, a, b, c, d) — the quarter round, in place.
+fn cc_quarter(s: list[int], a: int, b: int, c: int, d: int) -> void {
+    s.set(a, int_and(s.get(a) + s.get(b), cc_m32()))
+    s.set(d, cc_rotl32(int_xor(s.get(d), s.get(a)), 16))
+    s.set(c, int_and(s.get(c) + s.get(d), cc_m32()))
+    s.set(b, cc_rotl32(int_xor(s.get(b), s.get(c)), 12))
+    s.set(a, int_and(s.get(a) + s.get(b), cc_m32()))
+    s.set(d, cc_rotl32(int_xor(s.get(d), s.get(a)), 8))
+    s.set(c, int_and(s.get(c) + s.get(d), cc_m32()))
+    s.set(b, cc_rotl32(int_xor(s.get(b), s.get(c)), 7))
+}
+
+fn cc_le32(b: str, o: int) -> int {
+    return int_or(
+    int_or(b.byte_at(o), int_shl(b.byte_at(o + 1), 8)),
+    int_or(int_shl(b.byte_at(o + 2), 16), int_shl(b.byte_at(o + 3), 24))
+    )
+}
+
+fn cc_word_le(w: int) -> str {
+    return chr(int_and(w, 255)) + chr(int_and(int_shr(w, 8), 255))
+    + chr(int_and(int_shr(w, 16), 255))
+    + chr(int_and(int_shr(w, 24), 255))
+}
+
+# cc_block(key, counter, nonce) — one 64-byte keystream block.
+fn cc_block(key: str, counter: int, nonce: str) -> str {
+    let s: list[int] = [1634760805, 857760878, 2036477234, 1797285236,
+    cc_le32(key, 0), cc_le32(key, 4), cc_le32(key, 8), cc_le32(key, 12),
+    cc_le32(key, 16), cc_le32(key, 20), cc_le32(key, 24), cc_le32(key, 28),
+    int_and(counter, cc_m32()),
+    cc_le32(nonce, 0), cc_le32(nonce, 4), cc_le32(nonce, 8)]
+    let work: list[int] = []
+    let mut i: int = 0
+    while i < 16 {
+        work.push(s.get(i))
+        i = i + 1
+    }
+    let mut round: int = 0
+    while round < 10 {
+        cc_quarter(work, 0, 4, 8, 12)
+        cc_quarter(work, 1, 5, 9, 13)
+        cc_quarter(work, 2, 6, 10, 14)
+        cc_quarter(work, 3, 7, 11, 15)
+        cc_quarter(work, 0, 5, 10, 15)
+        cc_quarter(work, 1, 6, 11, 12)
+        cc_quarter(work, 2, 7, 8, 13)
+        cc_quarter(work, 3, 4, 9, 14)
+        round = round + 1
+    }
+    let out: list[str] = []
+    let mut j: int = 0
+    while j < 16 {
+        out.push(cc_word_le(int_and(work.get(j) + s.get(j), cc_m32())))
+        j = j + 1
+    }
+    return str_join(out, "")
+}
+
+# cc_xor(key, counter, nonce, data) — the stream cipher.
+fn cc_xor(key: str, counter: int, nonce: str, data: str) -> str {
+    let out: list[str] = []
+    let n: int = data.len()
+    let mut block_index: int = 0
+    while block_index * 64 < n {
+        let ks: str = cc_block(key, counter + block_index, nonce)
+        let start: int = block_index * 64
+        let mut end: int = start + 64
+        if end > n {
+            end = n
+        }
+        let mut i: int = start
+        while i < end {
+            out.push(chr(int_xor(data.byte_at(i), ks.byte_at(i - start))))
+            i = i + 1
+        }
+        block_index = block_index + 1
+    }
+    return str_join(out, "")
+}
+
+# poly_and_mask(a, mask) — a & mask over bignums (mask's limbs beyond
+# a's are dropped).
+fn poly_and_mask(a: list[int], mask: list[int]) -> list[int] {
+    let out: list[int] = []
+    let mut n: int = a.len()
+    if mask.len() < n {
+        n = mask.len()
+    }
+    let mut i: int = 0
+    while i < n {
+        out.push(int_and(a.get(i), mask.get(i)))
+        i = i + 1
+    }
+    return out
+}
+
+# poly1305(key, msg) — the one-time authenticator, bignum fold mod
+# 2^130 - 5.
+fn poly1305(key: str, msg: str) -> str {
+    let r: list[int] = poly_and_mask(bn_from_bytes_le(key.slice(0, 16)),
+    fe_poly_clamp())
+    let s: list[int] = bn_from_bytes_le(key.slice(16, 32))
+    let mut acc: list[int] = bn_zero()
+    let n: int = msg.len()
+    let mut i: int = 0
+    while i < n {
+        let mut end: int = i + 16
+        if end > n {
+            end = n
+        }
+        let blk: list[int] = bn_from_bytes_le(
+        msg.slice(i, end) + chr(1))
+        acc = bn_mod_pow2k_c(bn_mul(bn_add(acc, blk), r), 130, 5,
+        fe_poly_p())
+        i = i + 16
+    }
+    let out_val: list[int] = bn_low_bits(bn_add(acc, s), 128)
+    return bn_to_bytes_le(out_val, 16)
+}
+
+# poly1305_key_gen(key, nonce) — block 0's first 32 bytes.
+fn poly1305_key_gen(key: str, nonce: str) -> str {
+    return cc_block(key, 0, nonce).slice(0, 32)
+}
+
+# aead_lengths(aad_len, ct_len) — the two 8-byte little-endian lengths.
+fn aead_lengths(aad_len: int, ct_len: int) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < 8 {
+        out = out + chr(int_and(int_shr(aad_len, i * 8), 255))
+        i = i + 1
+    }
+    let mut j: int = 0
+    while j < 8 {
+        out = out + chr(int_and(int_shr(ct_len, j * 8), 255))
+        j = j + 1
+    }
+    return out
+}
+
+# aead_mac_data(aad, ct) — AAD || pad || ct || pad || both lengths.
+fn aead_mac_data(aad: str, ct: str) -> str {
+    let mut out: str = aad
+    let rem_a: int = aad.len() - (aad.len() / 16) * 16
+    if rem_a != 0 {
+        out = out + str_repeat(chr(0), 16 - rem_a)
+    }
+    out = out + ct
+    let rem_c: int = ct.len() - (ct.len() / 16) * 16
+    if rem_c != 0 {
+        out = out + str_repeat(chr(0), 16 - rem_c)
+    }
+    return out + aead_lengths(aad.len(), ct.len())
+}
+
+struct AeadOut {
+    ct: str,
+    tag: str
+}
+
+# aead_encrypt(key, nonce, aad, pt) — (ciphertext, tag).
+fn aead_encrypt(key: str, nonce: str, aad: str, pt: str) -> AeadOut {
+    let otk: str = poly1305_key_gen(key, nonce)
+    let ct: str = cc_xor(key, 1, nonce, pt)
+    let tag: str = poly1305(otk, aead_mac_data(aad, ct))
+    return AeadOut {
+        ct: ct, tag: tag
+    }
+}
+
+# aead_decrypt(key, nonce, aad, ct, tag) — MAC first, then the stream.
+fn aead_decrypt(key: str, nonce: str, aad: str, ct: str, tag: str) -> Result[str, str] {
+    let otk: str = poly1305_key_gen(key, nonce)
+    let want: str = poly1305(otk, aead_mac_data(aad, ct))
+    if want != tag {
+        return Result.Err("the AEAD tag does not verify — the box was "
+        + "tampered with or the passphrase is wrong")
+    }
+    return Result.Ok(cc_xor(key, 1, nonce, ct))
+}
+
+# hmac_sha256(key, msg) — RFC 2104 over std.sha256.
+fn hmac_sha256(key: str, msg: str) -> str {
+    let mut k: str = key
+    if k.len() > 64 {
+        k = sha256_hash(k)
+    }
+    while k.len() < 64 {
+        k = k + chr(0)
+    }
+    let mut ipad: str = ""
+    let mut opad: str = ""
+    let mut i: int = 0
+    while i < 64 {
+        ipad = ipad + chr(int_xor(k.byte_at(i), 54))
+        opad = opad + chr(int_xor(k.byte_at(i), 92))
+        i = i + 1
+    }
+    let inner: str = sha256_hash(ipad + msg)
+    return sha256_hash(opad + inner)
+}
+
+# pbkdf2_sha256_32(password, salt, iterations) — one block, 32 bytes.
+fn pbkdf2_sha256_32(password: str, salt: str, iterations: int) -> Result[str, str] {
+    if iterations < 1 {
+        return Result.Err("the KDF needs at least one iteration")
+    }
+    let msg: str = salt + chr(0) + chr(0) + chr(0) + chr(1)
+    let mut u: str = hmac_sha256(password, msg)
+    let mut t: str = u
+    let mut i: int = 1
+    while i < iterations {
+        u = hmac_sha256(password, u)
+        let out: list[str] = []
+        let mut j: int = 0
+        while j < t.len() {
+            out.push(chr(int_xor(t.byte_at(j), u.byte_at(j))))
+            j = j + 1
+        }
+        t = str_join(out, "")
+        i = i + 1
+    }
+    return Result.Ok(t)
+}
+
+# ----------------------------------------------------------------------------
+# The minisign format layer — the hls-sign file contract, byte for byte
+# (public key, signature, encrypted secret key).
+# ----------------------------------------------------------------------------
+
+fn mi_sig_algo() -> str {
+    return "Ed"
+}
+
+fn mi_secret_marker() -> str {
+    return "hs"
+}
+
+fn mi_kdf_id() -> str {
+    return "PD"
+}
+
+fn mi_kdf_aad() -> str {
+    return "hls-sign-key"
+}
+
+# mi_unb64(s, what) — a non-panicking base64 decode.
+fn mi_unb64(s: str, what: str) -> Result[str, str] {
+    let text: str = s.trim()
+    if text.len() == 0 {
+        return Result.Err(what + " is not valid base64 (empty)")
+    }
+    let mut acc: int = 0
+    let mut nbits: int = 0
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < text.len() {
+        let c: int = text.byte_at(i)
+        if c == 10 || c == 13 || c == 9 || c == 32 {
+            i = i + 1
+            continue
+        }
+        if c == 61 {
+            break
+        }
+        let v: int = b64_decode_char(c)
+        if v < 0 {
+            return Result.Err(what + " is not valid base64")
+        }
+        acc = int_or(int_shl(acc, 6), v)
+        nbits = nbits + 6
+        if nbits >= 8 {
+            nbits = nbits - 8
+            out.push(chr(int_and(int_shr(acc, nbits), 255)))
+        }
+        i = i + 1
+    }
+    return Result.Ok(str_join(out, ""))
+}
+
+# mi_b64(data) — base64 with padding, the standard alphabet.
+fn mi_b64(data: str) -> str {
+    return base64_encode(data)
+}
+
+# mi_key_id(public) — SHA-256(public)[:8].
+fn mi_key_id(public: str) -> str {
+    return sha256_hash(public).slice(0, 8)
+}
+
+fn mi_key_id_hex(public: str) -> str {
+    let digits: str = "0123456789abcdef"
+    let kid: str = mi_key_id(public)
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < kid.len() {
+        let b: int = kid.byte_at(i)
+        out.push(digits.slice(b / 16, b / 16 + 1))
+        out.push(digits.slice(b % 16, b % 16 + 1))
+        i = i + 1
+    }
+    return str_join(out, "")
+}
+
+# mi_read_lines(path, what) — the file's lines, \n stripped.
+fn mi_read_lines(path: str, what: str) -> Result[list[str], str] uses Fs {
+    if !file_exists(path) {
+        return Result.Err("cannot read the " + what + " " + path
+        + " (no such file)")
+    }
+    let text: str = read_file(path)
+    let raw: list[str] = text.split("\n")
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < raw.len() {
+        let mut ln: str = raw.get(i)
+        if ln.len() > 0 && ln.byte_at(ln.len() - 1) == 13 {
+            ln = ln.slice(0, ln.len() - 1)
+        }
+        out.push(ln)
+        i = i + 1
+    }
+    return Result.Ok(out)
+}
+
+struct MiPub {
+    public: str,
+    comment: str
+}
+
+# mi_read_public(path) — (public_bytes, comment); the blob's key id must
+# name the key it carries.
+fn mi_read_public(path: str) -> Result[MiPub, str] uses Fs {
+    let lr: Result[list[str], str] = mi_read_lines(path, "public key")
+    if !result_is_ok(lr) {
+        return Result.Err(result_err_or(lr, "cannot read the public key "
+        + path))
+    }
+    let lines: list[str] = result_unwrap(lr)
+    if lines.len() < 2 || !lines.get(0).starts_with("untrusted comment:") {
+        return Result.Err(path + " is not a public key file")
+    }
+    let br: Result[str, str] = mi_unb64(lines.get(1), "the public key blob")
+    if !result_is_ok(br) {
+        return Result.Err(result_err_or(br, "bad blob"))
+    }
+    let blob: str = result_unwrap(br)
+    if blob.len() != 42 || blob.slice(0, 2) != mi_sig_algo() {
+        return Result.Err("the public key blob is not Ed(2) + id(8) + pk(32)")
+    }
+    let public: str = blob.slice(10, 42)
+    if blob.slice(2, 10) != mi_key_id(public) {
+        return Result.Err("the public key file's id does not name its key")
+    }
+    return Result.Ok(MiPub {
+        public: public,
+        comment: lines.get(0).slice(18, lines.get(0).len()).trim()
+    })
+}
+
+# mi_write_public(path, public, comment) — the minisign public key file.
+fn mi_write_public(path: str, public: str, comment: str) -> void uses Fs {
+    let mut header: str = "untrusted comment: minisign public key "
+    + mi_key_id_hex(public)
+    if comment != "" {
+        header = header + " " + tl_str_replace(comment, chr(10), " ")
+    }
+    write_file(path, header + "\n" + mi_b64(mi_sig_algo() + mi_key_id(public)
+    + public) + "\n")
+}
+
+# mi_random_bytes(n) — n random bytes. The runtime's PRNG is a fixed
+# point per process, so it is seeded from the wall clock first (the
+# .py's os.urandom stands in); keygen is the only consumer.
+fn mi_random_bytes(n: int) -> str uses Rand, Clock {
+    rand_seed(system_time_now_ms())
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < n {
+        out.push(chr(rand_int(256)))
+        i = i + 1
+    }
+    return str_join(out, "")
+}
+
+# mi_write_secret(path, seed, public, password, iterations, comment) —
+# the encrypted box: "hs" || "PD" || iter(4 BE) || salt(16) || nonce(12)
+# || ChaCha20-Poly1305(aad="hls-sign-key", plaintext) || tag(16).
+fn mi_write_secret(path: str, seed: str, public: str, password: str,
+iterations: int, comment: str) -> Result[bool, str] uses Fs, Rand, Clock {
+    if iterations < 1 {
+        return Result.Err("--iterations wants a positive number")
+    }
+    let plaintext: str = mi_sig_algo() + mi_key_id(public) + seed + public
+    + sha256_hash(seed + public).slice(0, 8)
+    let salt: str = mi_random_bytes(16)
+    let nonce: str = mi_random_bytes(12)
+    let kr: Result[str, str] = pbkdf2_sha256_32(password, salt, iterations)
+    if !result_is_ok(kr) {
+        return Result.Err(result_err_or(kr, "kdf failed"))
+    }
+    let box_key: str = result_unwrap(kr)
+    let out: AeadOut = aead_encrypt(box_key, nonce, mi_kdf_aad(), plaintext)
+    let iter_be: str = chr(int_and(int_shr(iterations, 24), 255))
+    + chr(int_and(int_shr(iterations, 16), 255))
+    + chr(int_and(int_shr(iterations, 8), 255))
+    + chr(int_and(iterations, 255))
+    let blob: str = mi_secret_marker() + mi_kdf_id() + iter_be + salt
+    + nonce + out.ct + out.tag
+    let mut header: str = "untrusted comment: hls-sign secret key "
+    + mi_key_id_hex(public)
+    if comment != "" {
+        header = header + " " + tl_str_replace(comment, chr(10), " ")
+    }
+    write_file(path, header + "\n" + mi_b64(blob) + "\n")
+    fs_set_perms(path, 384)
+    return Result.Ok(true)
+}
+
+struct MiSec {
+    seed: str,
+    public: str,
+    keyid: str,
+    comment: str
+}
+
+# mi_read_secret(path, password) — open the box, check the checksum, the
+# key id and the re-derived public key.
+fn mi_read_secret(path: str, password: str) -> Result[MiSec, str] uses Fs {
+    let lr: Result[list[str], str] = mi_read_lines(path, "secret key")
+    if !result_is_ok(lr) {
+        return Result.Err(result_err_or(lr, "cannot read the secret key "
+        + path))
+    }
+    let lines: list[str] = result_unwrap(lr)
+    if lines.len() < 2 || !lines.get(0).starts_with("untrusted comment:") {
+        return Result.Err(path + " is not a secret key file")
+    }
+    let br: Result[str, str] = mi_unb64(lines.get(1), "the secret key box")
+    if !result_is_ok(br) {
+        return Result.Err(result_err_or(br, "bad box"))
+    }
+    let blob: str = result_unwrap(br)
+    if blob.len() < 68 {
+        return Result.Err("the secret key box is not a Halis key (too small)")
+    }
+    if blob.slice(0, 2) != mi_secret_marker() {
+        return Result.Err("the secret key box is not a Halis key (marker "
+        + tl_py_repr(json_str(blob.slice(0, 2))) + ")")
+    }
+    if blob.slice(2, 4) != mi_kdf_id() {
+        return Result.Err("the secret key's KDF ("
+        + tl_py_repr(json_str(blob.slice(2, 4))) + ") is not supported")
+    }
+    let iterations: int = int_shl(blob.byte_at(4), 24)
+    + int_shl(blob.byte_at(5), 16)
+    + int_shl(blob.byte_at(6), 8)
+    + blob.byte_at(7)
+    let salt: str = blob.slice(8, 24)
+    let nonce: str = blob.slice(24, 36)
+    let body: str = blob.slice(36, blob.len() - 16)
+    let tag: str = blob.slice(blob.len() - 16, blob.len())
+    let kr: Result[str, str] = pbkdf2_sha256_32(password, salt, iterations)
+    if !result_is_ok(kr) {
+        return Result.Err(result_err_or(kr, "kdf"))
+    }
+    let box_key: str = result_unwrap(kr)
+    let dr: Result[str, str] = aead_decrypt(box_key, nonce, mi_kdf_aad(),
+    body, tag)
+    if !result_is_ok(dr) {
+        return Result.Err("the secret key cannot be opened ("
+        + result_err_or(dr, "") + ")")
+    }
+    let pt: str = result_unwrap(dr)
+    if pt.len() != 82 || pt.slice(0, 2) != mi_sig_algo() {
+        return Result.Err("the decrypted secret key is not the expected box")
+    }
+    let keyid: str = pt.slice(2, 10)
+    let seed: str = pt.slice(10, 42)
+    let public: str = pt.slice(42, 74)
+    let checksum: str = pt.slice(74, 82)
+    if sha256_hash(seed + public).slice(0, 8) != checksum {
+        return Result.Err("the secret key's checksum does not match")
+    }
+    if ed_public_from_seed(seed) != public {
+        return Result.Err("the secret key's seed does not derive its public "
+        + "key")
+    }
+    if keyid != mi_key_id(public) {
+        return Result.Err("the secret key's id does not name its key")
+    }
+    return Result.Ok(MiSec {
+        seed: seed,
+        public: public,
+        keyid: keyid,
+        comment: lines.get(0).slice(18, lines.get(0).len()).trim()
+    })
+}
+
+# mi_default_trusted_comment(path) — timestamp + file name.
+fn mi_default_trusted_comment(path: str) -> str uses Clock {
+    let secs: int = system_time_now_ms() / 1000
+    return "timestamp:" + secs.to_str() + chr(9) + "file:"
+    + tl_str_replace(tl_path_basename(path), chr(10), " ")
+}
+
+# mi_write_signature(path, public, raw_sig, global_sig, trusted) — the
+# four-line minisign contract.
+fn mi_write_signature(path: str, public: str, raw_sig: str, global_sig: str,
+trusted: str) -> void uses Fs {
+    let body: str = "untrusted comment: signature from hls-sign key "
+    + mi_key_id_hex(public) + "\n"
+    + mi_b64(mi_sig_algo() + raw_sig) + "\n"
+    + "trusted comment: " + tl_str_replace(trusted, chr(10), " ") + "\n"
+    + mi_b64(mi_sig_algo() + global_sig) + "\n"
+    write_file(path, body)
+}
+
+struct MiSig {
+    raw: str,
+    global: str,
+    keyid: str,
+    trusted: str
+}
+
+# mi_read_signature(path) — the four lines, structure-checked.
+fn mi_read_signature(path: str) -> Result[MiSig, str] uses Fs {
+    let lr: Result[list[str], str] = mi_read_lines(path, "signature")
+    if !result_is_ok(lr) {
+        return Result.Err(result_err_or(lr, "cannot read the signature "
+        + path))
+    }
+    let lines: list[str] = result_unwrap(lr)
+    if lines.len() < 4 || !lines.get(0).starts_with("untrusted comment:") {
+        return Result.Err(path + " is not a signature file")
+    }
+    let rr: Result[str, str] = mi_unb64(lines.get(1), "the signature line")
+    if !result_is_ok(rr) {
+        return Result.Err(result_err_or(rr, "bad sig"))
+    }
+    let raw_blob: str = result_unwrap(rr)
+    if raw_blob.len() != 66 || raw_blob.slice(0, 2) != mi_sig_algo() {
+        return Result.Err("the signature line is not Ed(2) + sig(64)")
+    }
+    if !lines.get(2).starts_with("trusted comment: ") {
+        return Result.Err("the third line of a signature file is the "
+        + "trusted comment")
+    }
+    let trusted: str = lines.get(2).slice(17, lines.get(2).len())
+    let gr: Result[str, str] = mi_unb64(lines.get(3),
+    "the trusted-comment signature line")
+    if !result_is_ok(gr) {
+        return Result.Err(result_err_or(gr, "bad global sig"))
+    }
+    let global_blob: str = result_unwrap(gr)
+    if global_blob.len() != 66 || global_blob.slice(0, 2) != mi_sig_algo() {
+        return Result.Err("the trusted-comment signature is not Ed(2) + "
+        + "sig(64)")
+    }
+    let untrusted: str = lines.get(0).slice(18, lines.get(0).len())
+    let mut keyid: str = ""
+    # "key" — find the last occurrence, take the first word after it
+    let mut ki: int = untrusted.len() - 3
+    while ki >= 0 {
+        if untrusted.slice(ki, ki + 3) == "key" {
+            let rest: str = untrusted.slice(ki + 3, untrusted.len()).trim()
+            let mut w: int = 0
+            while w < rest.len() && rest.byte_at(w) != 32 {
+                w = w + 1
+            }
+            keyid = rest.slice(0, w)
+            break
+        }
+        ki = ki - 1
+    }
+    return Result.Ok(MiSig {
+        raw: raw_blob.slice(2, 66),
+        global: global_blob.slice(2, 66),
+        keyid: keyid,
+        trusted: trusted
+    })
+}
+
+struct MiTwo {
+    raw: str,
+    global: str
+}
+
+# mi_sign_file(seed, public, payload, trusted) — the two signatures.
+fn mi_sign_file(seed: str, public: str, payload: str, trusted: str) -> MiTwo {
+    let raw: str = ed_sign(seed, payload)
+    let global: str = ed_sign(seed, raw + trusted)
+    return MiTwo {
+        raw: raw, global: global
+    }
+}
+
+# mi_verify_signatures(public, payload, raw, global, trusted) — both
+# signatures must hold.
+fn mi_verify_signatures(public: str, payload: str, raw: str, global: str,
+trusted: str) -> bool {
+    if !ed_verify(public, payload, raw) {
+        return false
+    }
+    return ed_verify(public, raw + trusted, global)
+}
+
+# ----------------------------------------------------------------------------
+# The tlog core — the chain arithmetic (ONE definition), the log reader,
+# the view.
+# ----------------------------------------------------------------------------
+
+# tl_canon_bytes(v) — canonical document bytes: sorted keys, indent 2,
+# trailing newline (the signed-document contract).
+fn tl_canon_bytes(v: JsonValue) -> str {
+    return tl_py_dump(v) + "\n"
+}
+
+# tl_chain_of(prev, record) — sha256(prev + canonical-json(record minus
+# chain_hash)) — hpkg_log's writer, the one definition.
+fn tl_chain_of(prev: str, record: JsonValue) -> str {
+    let body: JsonValue = tl_obj_clone(record)
+    tl_obj_del(body, "chain_hash")
+    return sha256_hex(prev + tl_py_canon(body))
+}
+
+# tl_read_log_bytes(path) — the raw bytes, or the named refusal.
+fn tl_read_log_bytes(path: str) -> Result[str, str] uses Fs {
+    if !file_exists(path) {
+        return Result.Err("no transparency log at " + path
+        + " — nothing to read")
+    }
+    return Result.Ok(read_file(path))
+}
+
+# tl_shape_error(rec, origin, line_no) — the record shape every writer
+# agrees on; Err carries the refusal.
+fn tl_shape_error(rec: JsonValue, origin: str, line_no: int) -> Result[bool, str] {
+    let what: str = origin + ": line " + line_no.to_str()
+    if rec.kind != "object" {
+        return Result.Err(what + " is a JSON value, not an object")
+    }
+    if json_object_has(rec, "kind") {
+        let k: JsonValue = json_object_get(rec, "kind")
+        if k.kind != "str" || json_str_value(k) == "" {
+            return Result.Err(what + " has an empty kind")
+        }
+    }
+    let seq: JsonValue = json_object_get(rec, "seq")
+    if seq.kind != "int" || json_int_value(seq) < 1 {
+        return Result.Err(what + " has a bad seq (" + tl_py_repr(seq) + ")")
+    }
+    let ts: JsonValue = json_object_get(rec, "timestamp")
+    if ts.kind != "int" || json_int_value(ts) < 0 {
+        return Result.Err(what + " has a bad timestamp (" + tl_py_repr(ts)
+        + ")")
+    }
+    let prev: JsonValue = json_object_get(rec, "prev_hash")
+    if prev.kind != "str" || !tl_is_hex64(json_str_value(prev)) {
+        return Result.Err(what + " has a bad prev_hash (want 64 hex "
+        + "characters)")
+    }
+    let ch: JsonValue = json_object_get(rec, "chain_hash")
+    if ch.kind != "str" || !tl_is_hex64(json_str_value(ch)) {
+        return Result.Err(what + " has a bad chain_hash (want 64 hex "
+        + "characters)")
+    }
+    return Result.Ok(true)
+}
+
+# tl_parse_log(data, origin) — JSON-lines bytes to records; a refusal
+# names the line and the broken shape.
+fn tl_parse_log(data: str, origin: str) -> Result[list[JsonValue], str] {
+    let records: list[JsonValue] = []
+    let lines: list[str] = data.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i).trim()
+        if line != "" {
+            let pr: Result[JsonValue, str] = json_parse_result(line)
+            if !result_is_ok(pr) {
+                return Result.Err(origin + ": line " + (i + 1).to_str()
+                + " is not JSON (" + result_err_or(pr, "parse error") + ")")
+            }
+            let rec: JsonValue = result_unwrap(pr)
+            let sr: Result[bool, str] = tl_shape_error(rec, origin, i + 1)
+            if !result_is_ok(sr) {
+                return Result.Err(result_err_or(sr, "bad shape"))
+            }
+            records.push(rec)
+        }
+        i = i + 1
+    }
+    return Result.Ok(records)
+}
+
+# tl_compute_view(records, log_sha) — the deterministic view.
+fn tl_compute_view(records: list[JsonValue], log_sha: str) -> JsonValue {
+    let kinds: JsonValue = json_object([], [])
+    let mut i: int = 0
+    while i < records.len() {
+        let rec: JsonValue = records.get(i)
+        let mut kind: str = "untyped"
+        let kv: JsonValue = json_object_get(rec, "kind")
+        if kv.kind == "str" && json_str_value(kv) != "" {
+            kind = json_str_value(kv)
+        }
+        let cur: JsonValue = json_object_get(kinds, kind)
+        let mut n: int = 1
+        if cur.kind == "int" {
+            n = json_int_value(cur) + 1
+        }
+        tl_obj_set(kinds, kind, json_int(n))
+        i = i + 1
+    }
+    let mut head: str = tl_genesis()
+    if records.len() > 0 {
+        head = tl_jstr(records.get(records.len() - 1), "chain_hash")
+    }
+    let mut first_seq: int = 0
+    let mut last_seq: int = 0
+    let mut head_val: str = tl_genesis()
+    if records.len() > 0 {
+        first_seq = tl_jint(records.get(0), "seq")
+        last_seq = tl_jint(records.get(records.len() - 1), "seq")
+        head_val = head
+    }
+    let view: JsonValue = json_object([], [])
+    tl_obj_set(view, "schema", json_str(tl_view_schema()))
+    tl_obj_set(view, "length", json_int(records.len()))
+    tl_obj_set(view, "head", json_str(head_val))
+    tl_obj_set(view, "log_sha256", json_str(log_sha))
+    tl_obj_set(view, "kinds", kinds)
+    tl_obj_set(view, "first_seq", json_int(first_seq))
+    tl_obj_set(view, "last_seq", json_int(last_seq))
+    return view
+}
+
+# ----------------------------------------------------------------------------
+# The chain, the gossip classification and the inclusion proofs.
+# ----------------------------------------------------------------------------
+
+struct ChainErr {
+    spot: str,
+    msg: str
+}
+
+struct ChainOut {
+    head: str,
+    errors: list[ChainErr]
+}
+
+# tl_verify_chain(records, origin) — the replay; every break named.
+fn tl_verify_chain(records: list[JsonValue], origin: str) -> ChainOut {
+    let errors: list[ChainErr] = []
+    let mut prev: str = tl_genesis()
+    let mut expect_seq: int = 1
+    let mut head: str = tl_genesis()
+    let mut i: int = 0
+    while i < records.len() {
+        let rec: JsonValue = records.get(i)
+        let spot: str = origin + ": record " + (i + 1).to_str()
+        let seq_v: JsonValue = json_object_get(rec, "seq")
+        if seq_v.kind != "int" || json_int_value(seq_v) != expect_seq {
+            errors.push(ChainErr {
+                spot: spot,
+                msg: "seq " + tl_py_repr(seq_v) + " out of order (want "
+                + expect_seq.to_str() + ")"
+            })
+            if seq_v.kind == "int" {
+                expect_seq = json_int_value(seq_v)
+            }
+        }
+        let prev_hash: str = tl_jstr(rec, "prev_hash")
+        if prev_hash != prev {
+            errors.push(ChainErr {
+                spot: spot,
+                msg: "prev_hash does not chain to the record before it"
+            })
+        }
+        let want: str = tl_chain_of(prev_hash, rec)
+        let have: str = tl_jstr(rec, "chain_hash")
+        if have != want {
+            errors.push(ChainErr {
+                spot: spot,
+                msg: "chain_hash does not match the record's content "
+                + "(recomputed " + want.slice(0, 12) + "...)"
+            })
+        }
+        if have != "" {
+            prev = have
+        }
+        if have != "" {
+            head = have
+        }
+        expect_seq = expect_seq + 1
+        i = i + 1
+    }
+    return ChainOut {
+        head: head, errors: errors
+    }
+}
+
+# tl_heads_of(records) — the seq -> chain_hash map as a list (seq n at
+# index n-1; the log is verified before gossip runs).
+fn tl_heads_of(records: list[JsonValue]) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < records.len() {
+        out.push(tl_jstr(records.get(i), "chain_hash"))
+        i = i + 1
+    }
+    return out
+}
+
+fn tl_heads_at(heads: list[str], seq: int) -> str {
+    if seq < 1 || seq > heads.len() {
+        return ""
+    }
+    return heads.get(seq - 1)
+}
+
+fn tl_heads_has(heads: list[str], h: str) -> bool {
+    let mut i: int = 0
+    while i < heads.len() {
+        if heads.get(i) == h {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn tl_class_agree() -> str {
+    return "agree"
+}
+
+fn tl_class_lag() -> str {
+    return "lag"
+}
+
+fn tl_class_fork() -> str {
+    return "fork"
+}
+
+fn tl_class_diverged() -> str {
+    return "diverged"
+}
+
+# tl_classify(s_head, s_len, l_head, l_len, l_heads) — is the SHORTER
+# view's history contained in the LONGER's?
+fn tl_classify(s_head: str, s_len: int, l_head: str, l_len: int,
+l_heads: list[str]) -> str {
+    if s_len == l_len {
+        if s_head == l_head {
+            return tl_class_agree()
+        }
+        return tl_class_fork()
+    }
+    let at: str = tl_heads_at(l_heads, s_len)
+    if at == s_head {
+        return tl_class_lag()
+    }
+    if tl_heads_has(l_heads, s_head) {
+        return tl_class_fork()
+    }
+    return tl_class_diverged()
+}
+
+struct GView {
+    source: str,
+    length: int,
+    head: str
+}
+
+struct GPair {
+    a: str,
+    b: str,
+    cls: str,
+    lag: int,
+    has_lag: bool
+}
+
+struct GossipOut {
+    verdict: str,
+    head: str,
+    max_lag: int,
+    pairs: list[GPair]
+}
+
+# tl_gossip_verdict(views, heads_per) — every pair classified, reduced
+# to one verdict; evidence outranks health.
+fn tl_gossip_verdict(views: list[GView], heads_per: list[list[str]]) -> GossipOut {
+    let pairs: list[GPair] = []
+    let mut worst: int = 0
+    let mut max_lag: int = 0
+    let mut i: int = 0
+    while i < views.len() {
+        let mut j: int = i + 1
+        while j < views.len() {
+            let a: GView = views.get(i)
+            let b: GView = views.get(j)
+            let mut cls: str = tl_class_agree()
+            let mut lag: int = 0
+            if a.length <= b.length {
+                cls = tl_classify(a.head, a.length, b.head, b.length,
+                heads_per.get(j))
+                if cls == tl_class_lag() {
+                    lag = b.length - a.length
+                }
+            } else {
+                cls = tl_classify(b.head, b.length, a.head, a.length,
+                heads_per.get(i))
+                if cls == tl_class_lag() {
+                    lag = a.length - b.length
+                }
+            }
+            if cls == tl_class_fork() || cls == tl_class_diverged() {
+                lag = 0
+            }
+            if lag > max_lag {
+                max_lag = lag
+            }
+            let entry: GPair = GPair {
+                a: a.source, b: b.source, cls: cls, lag: lag,
+                has_lag: cls == tl_class_lag()
+            }
+            pairs.push(entry)
+            if cls == tl_class_fork() || cls == tl_class_diverged() {
+                worst = 2
+            } else if cls == tl_class_lag() && worst == 0 {
+                worst = 1
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let mut verdict: str = "insufficient"
+    if views.len() >= 2 {
+        if worst == 0 || worst == 1 {
+            verdict = "consensus"
+        } else {
+            verdict = "fork"
+        }
+    }
+    let mut longest_head: str = tl_genesis()
+    let mut have_longest: bool = false
+    let mut best_len: int = 0
+    let mut best_head: str = ""
+    let mut k: int = 0
+    while k < views.len() {
+        let v: GView = views.get(k)
+        if !have_longest || v.length > best_len
+        || (v.length == best_len && v.head > best_head) {
+            have_longest = true
+            best_len = v.length
+            best_head = v.head
+        }
+        k = k + 1
+    }
+    if have_longest {
+        longest_head = best_head
+    }
+    return GossipOut {
+        verdict: verdict, head: longest_head, max_lag: max_lag, pairs: pairs
+    }
+}
+
+# tl_build_proof(records, index) — the record, the tail, the head.
+fn tl_build_proof(records: list[JsonValue], index: int) -> JsonValue {
+    let rec: JsonValue = records.get(index)
+    let tail: JsonValue = json_array([])
+    let mut i: int = index + 1
+    while i < records.len() {
+        tail.arr.push(records.get(i))
+        i = i + 1
+    }
+    let mut head: str = tl_genesis()
+    if records.len() > 0 {
+        head = tl_jstr(records.get(records.len() - 1), "chain_hash")
+    }
+    let proof: JsonValue = json_object([], [])
+    tl_obj_set(proof, "schema", json_str(tl_proof_schema()))
+    tl_obj_set(proof, "kind", json_str("halis-tlog-inclusion"))
+    tl_obj_set(proof, "seq", json_int(tl_jint(rec, "seq")))
+    tl_obj_set(proof, "record", tl_obj_clone(rec))
+    tl_obj_set(proof, "tail", tail)
+    tl_obj_set(proof, "length", json_int(records.len()))
+    tl_obj_set(proof, "head", json_str(head))
+    tl_obj_set(proof, "tool", json_str(tl_tool()))
+    return proof
+}
+
+# tl_proof_tail(proof) — proof["tail"] as a list (absent -> empty).
+fn tl_proof_tail(proof: JsonValue) -> list[JsonValue] {
+    let t: JsonValue = json_object_get(proof, "tail")
+    if t.kind != "array" {
+        return[]
+    }
+    return t.arr
+}
+
+# tl_verify_proof_offline(proof) — the proof's internal contract.
+fn tl_verify_proof_offline(proof: JsonValue) -> list[ChainErr] {
+    let errors: list[ChainErr] = []
+    let rec: JsonValue = json_object_get(proof, "record")
+    if rec.kind != "object" {
+        errors.push(ChainErr {
+            spot: "proof",
+            msg: "no record in the proof"
+        })
+        return errors
+    }
+    let want: str = tl_chain_of(tl_rec_prev_or_genesis(rec), rec)
+    if tl_jstr(rec, "chain_hash") != want {
+        errors.push(ChainErr {
+            spot: "proof record",
+            msg: "chain_hash does not match the record's content"
+        })
+    }
+    let mut prev: str = tl_jstr(rec, "chain_hash")
+    let tail: list[JsonValue] = tl_proof_tail(proof)
+    let mut k: int = 0
+    while k < tail.len() {
+        let t: JsonValue = tail.get(k)
+        if prev != "" {
+            let want_t: str = tl_chain_of(prev, t)
+            if tl_jstr(t, "chain_hash") != want_t {
+                errors.push(ChainErr {
+                    spot: "tail " + (k + 1).to_str(),
+                    msg: "chain_hash does not chain from the record before it"
+                })
+            }
+        }
+        let tch: str = tl_jstr(t, "chain_hash")
+        if tch != "" {
+            prev = tch
+        }
+        k = k + 1
+    }
+    let mut head: str = tl_genesis()
+    if prev != "" {
+        head = prev
+    }
+    if tl_jstr(proof, "head") != head {
+        errors.push(ChainErr {
+            spot: "proof head",
+            msg: "the tail does not end at the head the proof names"
+        })
+    }
+    let seq_v: JsonValue = json_object_get(proof, "seq")
+    if seq_v.kind == "int" {
+        let len_v: JsonValue = json_object_get(proof, "length")
+        let want_len: int = json_int_value(seq_v) + tail.len()
+        if len_v.kind != "int" || json_int_value(len_v) != want_len {
+            errors.push(ChainErr {
+                spot: "proof length",
+                msg: "the length does not cover the record's position "
+                + "plus its tail"
+            })
+        }
+    }
+    return errors
+}
+
+# tl_rec_prev_or_genesis(rec) — rec["prev_hash"] or genesis.
+fn tl_rec_prev_or_genesis(rec: JsonValue) -> str {
+    let v: str = tl_jstr(rec, "prev_hash")
+    if v == "" {
+        return tl_genesis()
+    }
+    return v
+}
+
+# tl_verify_proof_live(proof, records) — the real inclusion check.
+fn tl_verify_proof_live(proof: JsonValue, records: list[JsonValue]) -> list[ChainErr] {
+    let errors: list[ChainErr] = tl_verify_proof_offline(proof)
+    if errors.len() > 0 {
+        return errors
+    }
+    let seq: int = tl_jint(proof, "seq")
+    let mut live: JsonValue = json_null()
+    let mut found: bool = false
+    let mut i: int = 0
+    while i < records.len() {
+        if tl_jint(records.get(i), "seq") == seq {
+            live = records.get(i)
+            found = true
+            break
+        }
+        i = i + 1
+    }
+    if !found {
+        errors.push(ChainErr {
+            spot: "live log",
+            msg: "seq " + seq.to_str() + " is not in the log — the record "
+            + "is gone"
+        })
+        return errors
+    }
+    let proof_rec: JsonValue = json_object_get(proof, "record")
+    if tl_canon_bytes(live) != tl_canon_bytes(proof_rec) {
+        errors.push(ChainErr {
+            spot: "live log",
+            msg: "seq " + seq.to_str() + " is a different record — the "
+            + "history was rewritten"
+        })
+        return errors
+    }
+    let live_heads: list[str] = tl_heads_of(records)
+    let proof_len: int = tl_jint(proof, "length")
+    let at: str = tl_heads_at(live_heads, proof_len)
+    if at != tl_jstr(proof, "head") {
+        errors.push(ChainErr {
+            spot: "live log",
+            msg: "the proof's head is not the log's record "
+            + proof_len.to_str() + " anymore — the history was rewritten"
+        })
+    }
+    return errors
+}
+
+# ----------------------------------------------------------------------------
+# Sources — where a log comes from (file, directory, http(s) URL).
+# ----------------------------------------------------------------------------
+
+struct FetchOut {
+    label: str,
+    data: str,
+    reason: str,
+    ok: bool
+}
+
+# tl_spawn — the house piped-child capture.
+struct HtRun2 {
+    code: int,
+    out: str,
+    err: str,
+    spawned: bool
+}
+
+fn tl_spawn(prog: str, cargs: list[str]) -> HtRun2 uses Proc {
+    let r: HtRun2 = HtRun2 {
+        code: -1, out: "", err: "", spawned: false
+    }
+    let pid: int = proc_spawn(prog, cargs, 2, 1, 1)
+    if pid < 1 {
+        return r
+    }
+    r.spawned = true
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    r.code = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    r.out = out
+    r.err = err
+    return r
+}
+
+fn result_err_or2(s: str, default_err: str) -> str {
+    if s != "" {
+        return s
+    }
+    return default_err
+}
+
+# tl_fetch_out(label, reason) — a refused source.
+fn tl_fetch_out(label: str, reason: str) -> FetchOut {
+    return FetchOut {
+        label: label, data: "", reason: reason, ok: false
+    }
+}
+
+# tl_resolve_path_source(source) — file or directory -> the log path.
+fn tl_resolve_path_source(source: str) -> Result[str, str] uses Fs {
+    if fs_is_dir(source) {
+        let inside: str = tl_path_join(source, tl_ledger_name())
+        if !file_exists(inside) {
+            return Result.Err(source + " is a directory with no "
+            + tl_ledger_name() + " in it")
+        }
+        return Result.Ok(inside)
+    }
+    return Result.Ok(source)
+}
+
+struct UrlParts {
+    host: str,
+    port: int,
+    path: str,
+    is_https: bool
+}
+
+# tl_url_split(url) — scheme://host[:port]/path.
+fn tl_url_split(url: str) -> Result[UrlParts, str] {
+    let mut rest: str = ""
+    let mut is_https: bool = false
+    if url.starts_with("http://") {
+        rest = url.slice(7, url.len())
+    } else if url.starts_with("https://") {
+        rest = url.slice(8, url.len())
+        is_https = true
+    } else {
+        return Result.Err("not an http(s) URL: " + url)
+    }
+    let slash: int = rest.find("/")
+    let mut host_part: str = rest
+    let mut path: str = "/"
+    if slash >= 0 {
+        host_part = rest.slice(0, slash)
+        path = rest.slice(slash, rest.len())
+    }
+    if host_part == "" {
+        return Result.Err("the URL has no host: " + url)
+    }
+    let mut host: str = host_part
+    let mut port: int = 80
+    if is_https {
+        port = 443
+    }
+    let colon: int = host_part.find(":")
+    if colon >= 0 {
+        host = host_part.slice(0, colon)
+        let ports: str = host_part.slice(colon + 1, host_part.len())
+        let pr: Result[int, str] = tl_int_parse(ports)
+        if !result_is_ok(pr) {
+            return Result.Err("the URL has a bad port: " + url)
+        }
+        port = result_unwrap(pr)
+    }
+    return Result.Ok(UrlParts {
+        host: host, port: port, path: path, is_https: is_https
+    })
+}
+
+# tl_fetch_http(url, max_bytes) — one plain-HTTP source.
+fn tl_fetch_http(url: str, max_bytes: int) -> FetchOut uses Net {
+    let ur: Result[UrlParts, str] = tl_url_split(url)
+    if !result_is_ok(ur) {
+        return tl_fetch_out(url, result_err_or(ur, "bad URL"))
+    }
+    let u: UrlParts = result_unwrap(ur)
+    if u.is_https {
+        return tl_fetch_out(url, "URLError: https needs the TLS leg")
+    }
+    let gr: Result[HttpResponse, str] = http_get(u.host, u.port, u.path)
+    if !result_is_ok(gr) {
+        return tl_fetch_out(url, "URLError: "
+        + result_err_or(gr, "<urlopen error>"))
+    }
+    let resp: HttpResponse = result_unwrap(gr)
+    if resp.status < 200 || resp.status >= 300 {
+        return tl_fetch_out(url, "HTTPError: HTTP Error "
+        + resp.status.to_str() + ": " + http_status_text(resp.status))
+    }
+    if resp.body.len() > max_bytes {
+        return tl_fetch_out(url, "the source is larger than the "
+        + max_bytes.to_str() + " byte cap")
+    }
+    return FetchOut {
+        label: url, data: resp.body, reason: "", ok: true
+    }
+}
+
+# tl_fetch(source, max_bytes) — one source; a refusal is data, never an
+# exception that kills the gossip.
+fn tl_fetch(source: str, max_bytes: int) -> FetchOut uses Fs, Proc, Net, Args {
+    if source.starts_with("http://") {
+        return tl_fetch_http(source, max_bytes)
+    }
+    if source.starts_with("https://") {
+        # tls_get panics on transport errors — run it in a probe child so
+        # a hostile source is a refused source, not a dead conversation.
+        let argv: list[str] = args()
+        let mut self_path: str = "./bin/hls-tlog"
+        if argv.len() > 0 {
+            self_path = argv.get(0)
+        }
+        let r: HtRun2 = tl_spawn(self_path, ["--probe-https", source])
+        if !r.spawned || r.code != 0 {
+            let mut why: str = result_err_or2(r.err, "the TLS fetch failed")
+            if why.starts_with("panic: ") {
+                why = why.slice(7, why.len())
+            }
+            return tl_fetch_out(source, "URLError: " + why)
+        }
+        if r.out.len() > max_bytes {
+            return tl_fetch_out(source, "the source is larger than the "
+            + max_bytes.to_str() + " byte cap")
+        }
+        return FetchOut {
+            label: source, data: r.out, reason: "", ok: true
+        }
+    }
+    let pr: Result[str, str] = tl_resolve_path_source(source)
+    if !result_is_ok(pr) {
+        return tl_fetch_out(source, result_err_or(pr, "bad source"))
+    }
+    let path: str = result_unwrap(pr)
+    if !file_exists(path) {
+        return tl_fetch_out(path, "no such file: " + path)
+    }
+    let size: int = fs_size(path)
+    if size > max_bytes {
+        return tl_fetch_out(path, "the file is larger than the "
+        + max_bytes.to_str() + " byte cap")
+    }
+    return FetchOut {
+        label: path, data: read_file(path), reason: "", ok: true
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Witnesses — a view with a name behind it, the Stage 106 keys.
+# ----------------------------------------------------------------------------
+
+# tl_make_witness(view, public) — the witness document over a view.
+fn tl_make_witness(view: JsonValue, public: str) -> Result[JsonValue, str] {
+    if tl_jstr(view, "schema") != tl_view_schema() {
+        return Result.Err("a witness signs a " + tl_view_schema()
+        + " view, not " + tl_py_repr(json_object_get(view, "schema")))
+    }
+    let w: JsonValue = json_object([], [])
+    tl_obj_set(w, "schema", json_str(tl_witness_schema()))
+    tl_obj_set(w, "kind", json_str("halis-tlog-witness"))
+    tl_obj_set(w, "length", json_int(tl_jint(view, "length")))
+    tl_obj_set(w, "head", json_str(tl_jstr(view, "head")))
+    tl_obj_set(w, "log_sha256", json_str(tl_jstr(view, "log_sha256")))
+    tl_obj_set(w, "kinds", tl_obj_clone(json_object_get(view, "kinds")))
+    tl_obj_set(w, "algorithm", json_str("ed25519"))
+    tl_obj_set(w, "key_id", json_str(mi_key_id_hex(public)))
+    tl_obj_set(w, "tool", json_str(tl_tool()))
+    tl_obj_set(w, "tool_version", json_str(tl_version()))
+    return Result.Ok(w)
+}
+
+# tl_witness_base(length, head) — the content-named file stem.
+fn tl_witness_base(length: int, head: str) -> str {
+    let mut h16: str = head
+    if h16.len() > 16 {
+        h16 = h16.slice(0, 16)
+    }
+    return "hls-tlog-witness-" + length.to_str() + "-" + h16
+}
+
+struct TlPair {
+    doc: str,
+    sig: str
+}
+
+# tl_write_witness(witness, seed, public, out_dir, trusted, force) — sign
+# the canonical bytes, write the pair.
+fn tl_write_witness(witness: JsonValue, seed: str, public: str, out_dir: str,
+trusted: str, force: bool) -> Result[TlPair, str] uses Fs, Proc {
+    let payload: str = tl_canon_bytes(witness)
+    let base: str = tl_witness_base(tl_jint(witness, "length"),
+    tl_jstr(witness, "head"))
+    let doc_path: str = tl_path_join(out_dir, base + tl_witness_suffix())
+    let sig_path: str = doc_path + ".minisig"
+    if !force {
+        if file_exists(doc_path) {
+            return Result.Err(doc_path + " already exists — a witness over "
+            + "the same view is the same bytes (--force to re-write)")
+        }
+        if file_exists(sig_path) {
+            return Result.Err(sig_path + " already exists — a witness over "
+            + "the same view is the same bytes (--force to re-write)")
+        }
+    }
+    let two: MiTwo = mi_sign_file(seed, public, payload, trusted)
+    tl_mkdirs(out_dir)
+    write_file(doc_path, payload)
+    mi_write_signature(sig_path, public, two.raw, two.global, trusted)
+    return Result.Ok(TlPair {
+        doc: doc_path, sig: sig_path
+    })
+}
+
+struct TlWitness {
+    doc: JsonValue,
+    trusted: str
+}
+
+# tl_read_witness(path) — the document plus its signature's comment.
+fn tl_read_witness(path: str) -> Result[TlWitness, str] uses Fs {
+    if !file_exists(path) {
+        return Result.Err("no witness at " + path)
+    }
+    let sig_path: str = path + ".minisig"
+    if !file_exists(sig_path) {
+        return Result.Err("no signature at " + sig_path + " — an unsigned "
+        + "witness is a rumor with a file name")
+    }
+    let text: str = read_file(path)
+    let pr: Result[JsonValue, str] = json_parse_result(text)
+    if !result_is_ok(pr) {
+        return Result.Err(path + " is not JSON ("
+        + result_err_or(pr, "parse error") + ")")
+    }
+    let doc: JsonValue = result_unwrap(pr)
+    if doc.kind != "object" || tl_jstr(doc, "schema") != tl_witness_schema() {
+        return Result.Err(path + " is not a " + tl_witness_schema()
+        + " document")
+    }
+    let fields: list[str] = ["length", "head", "log_sha256", "kinds",
+    "algorithm", "key_id"]
+    let mut i: int = 0
+    while i < fields.len() {
+        if !json_object_has(doc, fields.get(i)) {
+            return Result.Err(path + " has no " + fields.get(i)
+            + " — not a witness this tool wrote")
+        }
+        i = i + 1
+    }
+    let sr: Result[MiSig, str] = mi_read_signature(sig_path)
+    if !result_is_ok(sr) {
+        return Result.Err(result_err_or(sr, "cannot read the signature"))
+    }
+    let sig: MiSig = result_unwrap(sr)
+    return Result.Ok(TlWitness {
+        doc: doc, trusted: sig.trusted
+    })
+}
+
+# tl_verify_witness_signature(doc_path, public) — both signatures.
+fn tl_verify_witness_signature(doc_path: str, public: str) -> bool uses Fs {
+    let payload: str = read_file(doc_path)
+    let sr: Result[MiSig, str] = mi_read_signature(doc_path + ".minisig")
+    if !result_is_ok(sr) {
+        return false
+    }
+    let sig: MiSig = result_unwrap(sr)
+    return mi_verify_signatures(public, payload, sig.raw, sig.global,
+    sig.trusted)
+}
+
+struct TsOpt {
+    has: bool,
+    ts: int
+}
+
+# tl_trusted_timestamp(trusted) — the signed `timestamp:<unix>` comment.
+fn tl_trusted_timestamp(trusted: str) -> TsOpt {
+    if trusted == "" {
+        return TsOpt {
+            has: false, ts: 0
+        }
+    }
+    let parts: list[str] = trusted.split(" ")
+    let mut i: int = 0
+    while i < parts.len() {
+        let p: str = parts.get(i)
+        if p.starts_with("timestamp:") {
+            let raw: str = p.slice(10, p.len())
+            let pr: Result[int, str] = tl_int_parse(raw)
+            if !result_is_ok(pr) {
+                return TsOpt {
+                    has: false, ts: 0
+                }
+            }
+            return TsOpt {
+                has: true, ts: result_unwrap(pr)
+            }
+        }
+        i = i + 1
+    }
+    return TsOpt {
+        has: false, ts: 0
+    }
+}
+
+struct CheckOut {
+    verdict: str,
+    detail: str
+}
+
+# tl_check_against_log(witness, records, log_sha) — rollback, rewritten,
+# held, byte-identical.
+fn tl_check_against_log(witness: JsonValue, records: list[JsonValue],
+log_sha: str) -> CheckOut {
+    let w_len: int = tl_jint(witness, "length")
+    let w_head: str = tl_jstr(witness, "head")
+    let cur_len: int = records.len()
+    if cur_len < w_len {
+        return CheckOut {
+            verdict: "rollback",
+            detail: "the log holds " + cur_len.to_str() + " record(s), the "
+            + "witness signed " + w_len.to_str() + " — record(s) "
+            + (cur_len + 1).to_str() + ".." + w_len.to_str()
+            + " are gone under a signed promise"
+        }
+    }
+    let mut at: JsonValue = json_null()
+    let mut found: bool = false
+    let mut i: int = 0
+    while i < records.len() {
+        if tl_jint(records.get(i), "seq") == w_len {
+            at = records.get(i)
+            found = true
+            break
+        }
+        i = i + 1
+    }
+    if !found {
+        return CheckOut {
+            verdict: "rewritten",
+            detail: "seq " + w_len.to_str() + " is not in the log — the "
+            + "history was renumbered under the witness"
+        }
+    }
+    if tl_jstr(at, "chain_hash") != w_head {
+        return CheckOut {
+            verdict: "rewritten",
+            detail: "seq " + w_len.to_str() + " carries a different "
+            + "chain_hash than the witness signed — the history was "
+            + "rewritten"
+        }
+    }
+    if cur_len == w_len {
+        if log_sha != "" && log_sha == tl_jstr(witness, "log_sha256") {
+            return CheckOut {
+                verdict: "byte-identical",
+                detail: "the log IS the witnessed bytes"
+            }
+        }
+        return CheckOut {
+            verdict: "held",
+            detail: "the log is exactly the witnessed length with the "
+            + "witnessed head"
+        }
+    }
+    return CheckOut {
+        verdict: "held",
+        detail: "the witnessed history is a prefix of the log ("
+        + w_len.to_str() + " of " + cur_len.to_str() + " record(s))"
+    }
+}
+
+# ----------------------------------------------------------------------------
+# The loaded log — parse AND replay; nothing downstream reasons over an
+# unverified chain.
+# ----------------------------------------------------------------------------
+
+struct TlLoaded {
+    records: list[JsonValue],
+    head: str,
+    log_sha: str
+}
+
+fn tl_load_log(path: str) -> Result[TlLoaded, str] uses Fs {
+    let dr: Result[str, str] = tl_read_log_bytes(path)
+    if !result_is_ok(dr) {
+        return Result.Err(result_err_or(dr, "cannot read " + path))
+    }
+    let data: str = result_unwrap(dr)
+    let pr: Result[list[JsonValue], str] = tl_parse_log(data, path)
+    if !result_is_ok(pr) {
+        return Result.Err(result_err_or(pr, "cannot parse " + path))
+    }
+    let records: list[JsonValue] = result_unwrap(pr)
+    let out: ChainOut = tl_verify_chain(records, path)
+    if out.errors.len() > 0 {
+        let first: ChainErr = out.errors.get(0)
+        let mut more: str = ""
+        if out.errors.len() > 1 {
+            more = " (and " + (out.errors.len() - 1).to_str()
+            + " more break(s))"
+        }
+        return Result.Err(first.spot + ": " + first.msg + more
+        + " — run `hls-tlog verify` for the full report")
+    }
+    return Result.Ok(TlLoaded {
+        records: records, head: out.head, log_sha: sha256_hex(data)
+    })
+}
+
+# ----------------------------------------------------------------------------
+# The audit log (Stage 112, hal_ops/hal_log) — the tlog.witness entries:
+# minting a signed view is a privileged op, and a refused witness chains
+# exactly like a successful one (hal_ops.record / record_refused). One
+# compact JSON line per entry, the family chain hash over prev_hash +
+# canonical entry — hal_log's writer rides hltlog_common.chain_of, the
+# ONE definition tl_chain_of runs, so the entries chain into a log the
+# python writers built.
+# ----------------------------------------------------------------------------
+
+# hlaudit_parts/hal_common.VERSION — the toolchain release the AUDIT
+# log's entries stamp (hal_ops.record's default tool_version).
+fn tl_audit_tool_version() -> str {
+    return "0.131.0-alpha"
+}
+
+# tl_audit_log_path() — HLS_AUDIT_LOG or the repo root's .hls-audit.log.
+fn tl_audit_log_path() -> str uses Fs, Proc, Args {
+    if env_has("HLS_AUDIT_LOG") {
+        return env_get("HLS_AUDIT_LOG")
+    }
+    return tl_repo_root() + "/.hls-audit.log"
+}
+
+fn tl_audit_strict() -> bool uses Proc {
+    return env_has("HLS_AUDIT_STRICT")
+}
+
+# tl_audit_actor() — "user@host" (HLS_AUDIT_ACTOR overrides; the OS says
+# the rest — whoami through a child, the hostname builtin).
+fn tl_audit_actor() -> str uses Proc {
+    let over: str = env_get("HLS_AUDIT_ACTOR")
+    if over != "" || env_has("HLS_AUDIT_ACTOR") {
+        return over
+    }
+    let mut user: str = env_get("USER")
+    if user == "" {
+        let r: HtRun2 = tl_spawn("whoami", [])
+        if r.code == 0 {
+            user = r.out.trim()
+        }
+    }
+    if user == "" {
+        user = "<unknown-user>"
+    }
+    let mut host: str = sys_hostname()
+    if host == "" {
+        host = "<unknown-host>"
+    }
+    return user + "@" + host
+}
+
+# tl_audit_count_lines(text) — the line count (hal_log._next_seq's law).
+fn tl_audit_count_lines(text: str) -> int {
+    if text == "" {
+        return 0
+    }
+    let parts: list[str] = text.split("\n")
+    let mut n: int = parts.len()
+    if parts.get(parts.len() - 1) == "" {
+        n = n - 1
+    }
+    if n < 0 {
+        n = 0
+    }
+    return n
+}
+
+# tl_audit_head_hash(text) — the last non-blank line's chain_hash (the
+# genesis "0"*64 when the log is empty, absent or corrupt).
+fn tl_audit_head_hash(text: str) -> str {
+    let prev: str = tl_genesis()
+    if text == "" {
+        return prev
+    }
+    let lines: list[str] = text.split("\n")
+    let mut last: str = ""
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).trim() != "" {
+            last = lines.get(i)
+        }
+        i = i + 1
+    }
+    if last == "" {
+        return prev
+    }
+    let pr: Result[JsonValue, str] = json_parse_result(last)
+    if result_is_ok(pr) {
+        let ch: JsonValue = json_object_get(result_unwrap(pr), "chain_hash")
+        if json_is_str(ch) {
+            let v: str = json_str_value(ch)
+            if v != "" {
+                return v
+            }
+        }
+    }
+    return prev
+}
+
+# tl_audit_record(op, outcome, subject, detail, has_subject, has_detail)
+# — hal_ops.record: the hash-chained entry, fail-open unless
+# HLS_AUDIT_STRICT (a refused op is recorded exactly like an ok one).
+fn tl_audit_record(op: str, outcome: str, subject: str, detail: JsonValue,
+has_subject: bool, has_detail: bool) -> Result[bool, str]
+uses Fs, Proc, Clock, Args, IO {
+    let entry: JsonValue = json_object([], [])
+    tl_obj_set(entry, "kind", json_str("op"))
+    tl_obj_set(entry, "op", json_str(op))
+    tl_obj_set(entry, "actor", json_str(tl_audit_actor()))
+    tl_obj_set(entry, "outcome", json_str(outcome))
+    tl_obj_set(entry, "tool", json_str(tl_tool()))
+    tl_obj_set(entry, "tool_version", json_str(tl_audit_tool_version()))
+    if has_subject {
+        tl_obj_set(entry, "subject", json_str(subject))
+    }
+    if has_detail {
+        tl_obj_set(entry, "detail", detail)
+    }
+    let path: str = tl_audit_log_path()
+    # the write contract: a missing parent directory is the failed write
+    let parent: str = tl_path_dirname(path)
+    if parent != "" && !fs_is_dir(parent) {
+        if tl_audit_strict() {
+            return Result.Err("the audit entry for " + op
+            + " was not written: no such directory: " + parent)
+        }
+        eprint("hls-auditlog: warning: the audit entry for " + op
+        + " was not written (no such directory: " + parent + ")\n")
+        return Result.Ok(false)
+    }
+    let lock_path: str = path + ".lock"
+    if !file_exists(lock_path) {
+        write_file(lock_path, "")
+    }
+    let mut text: str = ""
+    if file_exists(path) {
+        text = read_file(path)
+    }
+    let prev_hash: str = tl_audit_head_hash(text)
+    let seq: int = tl_audit_count_lines(text) + 1
+    tl_obj_set(entry, "seq", json_int(seq))
+    tl_obj_set(entry, "timestamp", json_int(system_time_now_ms() / 1000))
+    tl_obj_set(entry, "prev_hash", json_str(prev_hash))
+    tl_obj_set(entry, "chain_hash", json_str(tl_chain_of(prev_hash, entry)))
+    write_file(path, text + tl_py_canon(entry) + "\n")
+    return Result.Ok(true)
+}
+
+# tl_audit_record_ok(op, subject, detail, has_subject, has_detail) — the
+# successful-op call, fail-open (strict mode refuses the op instead).
+fn tl_audit_record_ok(op: str, subject: str, detail: JsonValue,
+has_subject: bool, has_detail: bool) -> Result[bool, str]
+uses Fs, Proc, Clock, Args, IO {
+    return tl_audit_record(op, "ok", subject, detail, has_subject,
+    has_detail)
+}
+
+# tl_audit_record_refused(op, reason) — the refusal shorthand the CLI
+# handler runs from its except path; the reason capped at 400.
+fn tl_audit_record_refused(op: str, reason: str) -> Result[bool, str]
+uses Fs, Proc, Clock, Args, IO {
+    let detail: JsonValue = json_object([], [])
+    let mut capped: str = reason
+    if capped.len() > 400 {
+        capped = capped.slice(0, 400)
+    }
+    tl_obj_set(detail, "reason", json_str(capped))
+    return tl_audit_record(op, "refused", "", detail, false, true)
+}
+
+# ----------------------------------------------------------------------------
+# The selftest battery — the fifteen vectors, pinned to constants.
+# ----------------------------------------------------------------------------
+
+# st_record(seq, prev, kind, ts, name, has_version, version) — one
+# synthetic record, chain_hash attached.
+fn st_record(seq: int, prev: str, kind: str, ts: int, name: str,
+has_version: bool, version: str) -> JsonValue {
+    let rec: JsonValue = json_object([], [])
+    tl_obj_set(rec, "kind", json_str(kind))
+    tl_obj_set(rec, "name", json_str(name))
+    if has_version {
+        tl_obj_set(rec, "version", json_str(version))
+    }
+    tl_obj_set(rec, "prev_hash", json_str(prev))
+    tl_obj_set(rec, "seq", json_int(seq))
+    tl_obj_set(rec, "timestamp", json_int(ts))
+    tl_obj_set(rec, "chain_hash", json_str(tl_chain_of(prev, rec)))
+    return rec
+}
+
+# st_synthetic_log(n) — n records, seqs 1..n, deterministic timestamps.
+fn st_synthetic_log(n: int) -> list[JsonValue] {
+    let recs: list[JsonValue] = []
+    let mut prev: str = tl_genesis()
+    let mut i: int = 1
+    while i <= n {
+        let rec: JsonValue = st_record(i, prev, "publish", 1700000000 + i,
+        "app", true, "1.0.0")
+        recs.push(rec)
+        prev = tl_jstr(rec, "chain_hash")
+        i = i + 1
+    }
+    return recs
+}
+
+# st_rec_clone(rec) — a deep copy of one record.
+fn st_rec_clone(rec: JsonValue) -> JsonValue {
+    return tl_obj_clone(rec)
+}
+
+# st_make_witness_dict(view) — the witness fields check_against_log reads
+# (no key material; that layer is hls-sign's, pinned by its own gate).
+fn st_make_witness_dict(view: JsonValue) -> JsonValue {
+    let w: JsonValue = json_object([], [])
+    tl_obj_set(w, "schema", json_str(tl_witness_schema()))
+    tl_obj_set(w, "length", json_int(tl_jint(view, "length")))
+    tl_obj_set(w, "head", json_str(tl_jstr(view, "head")))
+    tl_obj_set(w, "log_sha256", json_str(tl_jstr(view, "log_sha256")))
+    tl_obj_set(w, "kinds", json_object([], []))
+    tl_obj_set(w, "algorithm", json_str("ed25519"))
+    tl_obj_set(w, "key_id", json_str(tl_hex64("0").slice(0, 16)))
+    tl_obj_set(w, "tool", json_str(tl_tool()))
+    tl_obj_set(w, "tool_version", json_str(tl_version()))
+    return w
+}
+
+# tl_selftest() — run every vector, return the names; panic on the first
+# broken vector (a selftest that silently skips is a selftest that lies).
+fn tl_selftest() -> list[str] {
+    let names: list[str] = []
+
+    # 1. The hash itself, against the standard vectors.
+    if sha256_hex("") != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" {
+        panic("SHA-256 of the empty string mismatch")
+    }
+    names.push("SHA-256 of the empty string (FIPS vector)")
+    if sha256_hex("abc") != "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" {
+        panic("SHA-256 of abc mismatch")
+    }
+    names.push("SHA-256 of abc (FIPS vector)")
+
+    # 2. The chain hash over a HAND-BUILT canonical string.
+    let hand: str = "{\"kind\":\"publish\",\"name\":\"v\",\"prev_hash\":\""
+    + tl_genesis() + "\",\"seq\":1,\"timestamp\":0}"
+    let want: str = sha256_hex(tl_genesis() + hand)
+    if want != "a0e90c3bad49e0bed31d7d94eb3c148ad634d6bbe8d6c185e62dcd2a289e106d" {
+        panic("the hand-built canonical digest moved")
+    }
+    let rec2: JsonValue = st_record(1, tl_genesis(), "publish", 0, "v",
+    false, "")
+    if tl_chain_of(tl_genesis(), rec2) != want {
+        panic("chain hash over the hand-built canonical record mismatch")
+    }
+    names.push("chain hash over the hand-built canonical record")
+
+    # 3. The replay: a sound log, and three tamper classes.
+    let recs: list[JsonValue] = st_synthetic_log(3)
+    let out: ChainOut = tl_verify_chain(recs, "selftest")
+    if out.errors.len() != 0
+    || out.head != tl_jstr(recs.get(2), "chain_hash") {
+        panic("the replay does not verify a sound log")
+    }
+    names.push("the replay verifies a sound log to its head")
+    let bad1: list[JsonValue] = []
+    let mut bi: int = 0
+    while bi < recs.len() {
+        bad1.push(st_rec_clone(recs.get(bi)))
+        bi = bi + 1
+    }
+    let mut1: JsonValue = bad1.get(1)
+    tl_obj_set(mut1, "name", json_str("tampered"))
+    bad1.set(1, mut1)
+    let out1: ChainOut = tl_verify_chain(bad1, "selftest")
+    if out1.errors.len() != 1
+    || !out1.errors.get(0).msg.contains("chain_hash") {
+        panic("a flipped record field did not break the chain")
+    }
+    names.push("a flipped record field breaks the chain")
+    let bad2: list[JsonValue] = []
+    let mut bi2: int = 0
+    while bi2 < recs.len() {
+        bad2.push(st_rec_clone(recs.get(bi2)))
+        bi2 = bi2 + 1
+    }
+    let mut2: JsonValue = bad2.get(2)
+    tl_obj_set(mut2, "seq", json_int(4))
+    bad2.set(2, mut2)
+    let out2: ChainOut = tl_verify_chain(bad2, "selftest")
+    let mut saw_seq: bool = false
+    let mut ei: int = 0
+    while ei < out2.errors.len() {
+        if out2.errors.get(ei).msg.contains("seq") {
+            saw_seq = true
+        }
+        ei = ei + 1
+    }
+    if !saw_seq {
+        panic("a renumbered seq was not named by the replay")
+    }
+    names.push("a renumbered seq is named by the replay")
+    let bad3: list[JsonValue] = []
+    let mut bi3: int = 0
+    while bi3 < recs.len() {
+        bad3.push(st_rec_clone(recs.get(bi3)))
+        bi3 = bi3 + 1
+    }
+    let mut3: JsonValue = bad3.get(1)
+    tl_obj_set(mut3, "prev_hash", json_str(tl_hex64("1")))
+    bad3.set(1, mut3)
+    let out3: ChainOut = tl_verify_chain(bad3, "selftest")
+    let mut saw_prev: bool = false
+    let mut ei2: int = 0
+    while ei2 < out3.errors.len() {
+        if out3.errors.get(ei2).msg.contains("prev_hash") {
+            saw_prev = true
+        }
+        ei2 = ei2 + 1
+    }
+    if !saw_prev {
+        panic("a broken link was not named by the replay")
+    }
+    names.push("a broken link is named by the replay")
+
+    # 4. The classification table.
+    let long_log: list[JsonValue] = st_synthetic_log(4)
+    let short_log: list[JsonValue] = []
+    short_log.push(st_rec_clone(long_log.get(0)))
+    short_log.push(st_rec_clone(long_log.get(1)))
+    let lag_map: list[str] = tl_heads_of(long_log)
+    if tl_classify(tl_jstr(short_log.get(1), "chain_hash"), 2,
+    tl_jstr(long_log.get(3), "chain_hash"), 4, lag_map) != tl_class_lag() {
+        panic("the lag classification moved")
+    }
+    if tl_classify(tl_jstr(long_log.get(3), "chain_hash"), 4,
+    tl_jstr(long_log.get(3), "chain_hash"), 4, lag_map) != tl_class_agree() {
+        panic("the agree classification moved")
+    }
+    let fork_map: list[str] = [tl_jstr(long_log.get(0), "chain_hash"),
+    tl_hex64("b")]
+    if tl_classify(tl_jstr(short_log.get(1), "chain_hash"), 2, tl_hex64("c"),
+    2, fork_map) != tl_class_fork() {
+        panic("the same-length fork classification moved")
+    }
+    let renum: list[str] = tl_heads_of(long_log)
+    if tl_classify(tl_jstr(long_log.get(2), "chain_hash"), 2,
+    tl_jstr(long_log.get(3), "chain_hash"), 4, renum) != tl_class_fork() {
+        panic("the renumbered fork classification moved")
+    }
+    if tl_classify(tl_hex64("d"), 2, tl_jstr(long_log.get(3), "chain_hash"),
+    4, renum) != tl_class_diverged() {
+        panic("the diverged classification moved")
+    }
+    names.push("the four-way classification table")
+
+    # 5. The gossip reduction.
+    let va: GView = GView {
+        source: "a", length: 4, head: tl_jstr(long_log.get(3), "chain_hash")
+    }
+    let vb: GView = GView {
+        source: "b", length: 4, head: tl_jstr(long_log.get(3), "chain_hash")
+    }
+    let vc: GView = GView {
+        source: "c", length: 2, head: tl_jstr(short_log.get(1), "chain_hash")
+    }
+    let long_map: list[str] = tl_heads_of(long_log)
+    let maps: list[list[str]] = [long_map, long_map, lag_map]
+    let g1: GossipOut = tl_gossip_verdict([va, vb, vc], maps)
+    if g1.verdict != "consensus" || g1.max_lag != 2 {
+        panic("gossip does not reduce agreement plus lag to consensus")
+    }
+    names.push("gossip reduces agreement plus lag to consensus")
+    let evil: GView = GView {
+        source: "evil", length: 4, head: tl_hex64("f")
+    }
+    let evil_map: list[str] = [tl_hex64("f")]
+    let g2: GossipOut = tl_gossip_verdict([va, vb, evil],
+    [long_map, long_map, evil_map])
+    if g2.verdict != "fork" {
+        panic("a forked pair did not flip the whole verdict")
+    }
+    names.push("one forked pair flips the whole verdict")
+    let g3: GossipOut = tl_gossip_verdict([va], [long_map])
+    if g3.verdict != "insufficient" {
+        panic("a single view is not insufficient")
+    }
+    names.push("gossip alone is not gossip (insufficient)")
+
+    # 6. The proofs.
+    let proof: JsonValue = tl_build_proof(recs, 0)
+    if tl_verify_proof_offline(proof).len() != 0 {
+        panic("a sound proof does not verify offline")
+    }
+    let tam1: JsonValue = tl_obj_clone(proof)
+    let tam_rec: JsonValue = tl_obj_clone(json_object_get(proof, "record"))
+    tl_obj_set(tam_rec, "name", json_str("evil"))
+    tl_obj_set(tam1, "record", tam_rec)
+    if tl_verify_proof_offline(tam1).len() == 0 {
+        panic("a tampered proof record verified offline")
+    }
+    let tam2: JsonValue = tl_obj_clone(proof)
+    let tam_tail: JsonValue = json_array([])
+    let old_tail: list[JsonValue] = tl_proof_tail(proof)
+    let mut ti: int = 0
+    while ti < old_tail.len() {
+        let t: JsonValue = tl_obj_clone(old_tail.get(ti))
+        if ti == 0 {
+            tl_obj_set(t, "kind", json_str("evil"))
+        }
+        tam_tail.arr.push(t)
+        ti = ti + 1
+    }
+    tl_obj_set(tam2, "tail", tam_tail)
+    if tl_verify_proof_offline(tam2).len() == 0 {
+        panic("a tampered proof tail verified offline")
+    }
+    names.push("offline proof verify catches the record and the tail")
+    if tl_verify_proof_live(proof, recs).len() != 0 {
+        panic("the live check refused a sound proof")
+    }
+    let grown: list[JsonValue] = st_synthetic_log(5)
+    if tl_verify_proof_live(proof, grown).len() != 0 {
+        panic("the live check refused a grown log")
+    }
+    names.push("a proof stays valid over a grown log")
+    let rewritten: list[JsonValue] = st_synthetic_log(3)
+    let rw0: JsonValue = st_rec_clone(rewritten.get(0))
+    tl_obj_set(rw0, "name", json_str("evil"))
+    let rw_prev: str = tl_jstr(rw0, "prev_hash")
+    tl_obj_set(rw0, "chain_hash", json_str(tl_chain_of(rw_prev, rw0)))
+    let rewritten2: list[JsonValue] = [rw0, rewritten.get(1), rewritten.get(2)]
+    if tl_verify_proof_live(proof, rewritten2).len() == 0 {
+        panic("a rewritten history kept the proof alive")
+    }
+    names.push("a rewritten history kills the proof")
+
+    # 7. The witness verdicts.
+    let view_w: JsonValue = json_object([], [])
+    tl_obj_set(view_w, "length", json_int(3))
+    tl_obj_set(view_w, "head", json_str(tl_jstr(recs.get(2), "chain_hash")))
+    tl_obj_set(view_w, "log_sha256", json_str(tl_hex64("a")))
+    let w: JsonValue = st_make_witness_dict(view_w)
+    if tl_check_against_log(w, recs, tl_hex64("a")).verdict != "byte-identical" {
+        panic("the byte-identical verdict moved")
+    }
+    let short2: list[JsonValue] = [recs.get(0), recs.get(1)]
+    if tl_check_against_log(w, short2, "").verdict != "rollback" {
+        panic("the rollback verdict moved")
+    }
+    let grown2: list[JsonValue] = []
+    let mut gi: int = 0
+    while gi < recs.len() {
+        grown2.push(st_rec_clone(recs.get(gi)))
+        gi = gi + 1
+    }
+    grown2.push(st_record(4, tl_jstr(recs.get(2), "chain_hash"), "publish",
+    0, "app", true, "1.0.0"))
+    if tl_check_against_log(w, grown2, "").verdict != "held" {
+        panic("the held verdict moved")
+    }
+    let shortlog2: list[JsonValue] = st_synthetic_log(2)
+    let forked: list[JsonValue] = [shortlog2.get(0), shortlog2.get(1),
+    st_record(3, tl_jstr(shortlog2.get(1), "chain_hash"), "publish", 0,
+    "evil", true, "1.0.0")]
+    if tl_jstr(forked.get(2), "chain_hash")
+    == tl_jstr(recs.get(2), "chain_hash") {
+        panic("the forked fixture is not a fork")
+    }
+    if tl_check_against_log(w, forked, "").verdict != "rewritten" {
+        panic("the rewritten verdict moved")
+    }
+    names.push("the witness verdicts: rollback, rewritten, held, "
+    + "byte-identical")
+
+    return names
+}
+
+# ----------------------------------------------------------------------------
+# The CLI.
+# ----------------------------------------------------------------------------
+
+fn tl_usage_line() -> str {
+    return "usage: hls-tlog [-h] {verify,summary,gossip,witness,"
+    + "witness-verify,prove,prove-verify,selftest} ..."
+}
+
+fn tl_usage() -> str {
+    return tl_usage_line() + "\n"
+    + "\n"
+    + "the transparency-log gossip protocol: verify a ledger's chain,\n"
+    + "compare views across sources, sign a view (witness), and carry\n"
+    + "one record home (prove).\n"
+    + "\n"
+    + "commands:\n"
+    + "  verify [LOG]            replay a log's hash chain\n"
+    + "  summary [LOG]           the view of a verified log\n"
+    + "  gossip SOURCE...        compare views across sources\n"
+    + "  witness [LOG] --sign K  sign a log's view (Stage 106 keys)\n"
+    + "  witness-verify W        verify a signed view\n"
+    + "  prove NAME [VERSION]    an inclusion proof for one record\n"
+    + "  prove-verify PROOF      verify a proof (offline, or --log)\n"
+    + "  selftest                the stage's pinned numbers\n"
+}
+
+struct Cli {
+    cmd: str,
+    log: str,
+    json_out: bool,
+    sources: list[str],
+    timeout: str,
+    max_bytes: int,
+    has_max_lag: bool,
+    max_lag: int,
+    require: int,
+    sign: str,
+    password_env: str,
+    out: str,
+    trusted_comment: str,
+    force: bool,
+    witness: str,
+    pub: str,
+    raw_pub: str,
+    against: str,
+    name: str,
+    version: str,
+    seq: int,
+    has_seq: bool,
+    proof: str
+}
+
+fn tl_cli_new() -> Cli {
+    return Cli {
+        cmd: "", log: "", json_out: false, sources: [], timeout: "",
+        max_bytes: tl_default_max_bytes(), has_max_lag: false, max_lag: 0,
+        require: 2, sign: "", password_env: "", out: "",
+        trusted_comment: "", force: false, witness: "", pub: "",
+        raw_pub: "", against: "", name: "", version: "", seq: 0,
+        has_seq: false, proof: ""
+    }
+}
+
+# tl_cli_int_value(argv, i) — the next argv slot as an int (Err = usage).
+fn tl_cli_int_value(argv: list[str], i: int, flag: str) -> Result[int, str] {
+    if i + 1 >= argv.len() {
+        return Result.Err("argument " + flag + ": expected one argument")
+    }
+    let pr: Result[int, str] = tl_int_parse(argv.get(i + 1))
+    if !result_is_ok(pr) {
+        return Result.Err("argument " + flag + ": invalid int value: "
+        + argv.get(i + 1))
+    }
+    return Result.Ok(result_unwrap(pr))
+}
+
+# tl_cli_str_value(argv, i, flag) — the next argv slot as a string.
+fn tl_cli_str_value(argv: list[str], i: int, flag: str) -> Result[str, str] {
+    if i + 1 >= argv.len() {
+        return Result.Err("argument " + flag + ": expected one argument")
+    }
+    return Result.Ok(argv.get(i + 1))
+}
+
+# tl_parse_cli(argv) — the argparse grammar. Err is the usage-error line
+# printed after the usage block (exit 2).
+fn tl_parse_cli(argv: list[str]) -> Result[Cli, str] {
+    let n: int = argv.len()
+    if n < 2 {
+        return Result.Err("a command is required (verify, summary, gossip, "
+        + "witness, witness-verify, prove, prove-verify, selftest)")
+    }
+    let cmd: str = argv.get(1)
+    let cli: Cli = tl_cli_new()
+    if cmd == "-h" || cmd == "--help" {
+        cli.cmd = "help"
+        return Result.Ok(cli)
+    }
+    if cmd != "verify" && cmd != "summary" && cmd != "gossip"
+    && cmd != "witness" && cmd != "witness-verify" && cmd != "prove"
+    && cmd != "prove-verify" && cmd != "selftest" {
+        return Result.Err("argument cmd: invalid choice: '" + cmd
+        + "' (choose from 'verify', 'summary', 'gossip', 'witness', "
+        + "'witness-verify', 'prove', 'prove-verify', 'selftest')")
+    }
+    cli.cmd = cmd
+    let mut i: int = 2
+    while i < n {
+        let a: str = argv.get(i)
+        if cmd == "gossip" {
+            if a == "--json" {
+                cli.json_out = true
+                i = i + 1
+                continue
+            }
+            if a == "--timeout" {
+                let vr: Result[str, str] = tl_cli_str_value(argv, i, a)
+                if !result_is_ok(vr) {
+                    return Result.Err(result_err_or(vr, "bad --timeout"))
+                }
+                let v: str = result_unwrap(vr)
+                if !tl_float_ok(v) {
+                    return Result.Err("argument --timeout: invalid float "
+                    + "value: " + v)
+                }
+                cli.timeout = v
+                i = i + 2
+                continue
+            }
+            if a == "--max-bytes" {
+                let ir: Result[int, str] = tl_cli_int_value(argv, i, a)
+                if !result_is_ok(ir) {
+                    return Result.Err(result_err_or(ir, "bad --max-bytes"))
+                }
+                cli.max_bytes = result_unwrap(ir)
+                i = i + 2
+                continue
+            }
+            if a == "--max-lag" {
+                let ir2: Result[int, str] = tl_cli_int_value(argv, i, a)
+                if !result_is_ok(ir2) {
+                    return Result.Err(result_err_or(ir2, "bad --max-lag"))
+                }
+                cli.max_lag = result_unwrap(ir2)
+                cli.has_max_lag = true
+                i = i + 2
+                continue
+            }
+            if a == "--require" {
+                let ir3: Result[int, str] = tl_cli_int_value(argv, i, a)
+                if !result_is_ok(ir3) {
+                    return Result.Err(result_err_or(ir3, "bad --require"))
+                }
+                cli.require = result_unwrap(ir3)
+                i = i + 2
+                continue
+            }
+            if a.starts_with("-") {
+                return Result.Err("unrecognized arguments: " + a)
+            }
+            cli.sources.push(a)
+            i = i + 1
+            continue
+        }
+        if a == "--json" {
+            cli.json_out = true
+            i = i + 1
+            continue
+        }
+        if cmd == "verify" || cmd == "summary" || cmd == "witness" {
+            if a == "--log" && cmd == "witness" {
+                return Result.Err("unrecognized arguments: " + a)
+            }
+            if a.starts_with("-") {
+                if cmd == "witness" {
+                    if a == "--sign" {
+                        let vr: Result[str, str] = tl_cli_str_value(argv, i, a)
+                        if !result_is_ok(vr) {
+                            return Result.Err(result_err_or(vr, "bad --sign"))
+                        }
+                        cli.sign = result_unwrap(vr)
+                        i = i + 2
+                        continue
+                    }
+                    if a == "--password-env" {
+                        let vr2: Result[str, str] = tl_cli_str_value(argv, i, a)
+                        if !result_is_ok(vr2) {
+                            return Result.Err(result_err_or(vr2,
+                            "bad --password-env"))
+                        }
+                        cli.password_env = result_unwrap(vr2)
+                        i = i + 2
+                        continue
+                    }
+                    if a == "--out" {
+                        let vr3: Result[str, str] = tl_cli_str_value(argv, i, a)
+                        if !result_is_ok(vr3) {
+                            return Result.Err(result_err_or(vr3, "bad --out"))
+                        }
+                        cli.out = result_unwrap(vr3)
+                        i = i + 2
+                        continue
+                    }
+                    if a == "--trusted-comment" {
+                        let vr4: Result[str, str] = tl_cli_str_value(argv, i, a)
+                        if !result_is_ok(vr4) {
+                            return Result.Err(result_err_or(vr4,
+                            "bad --trusted-comment"))
+                        }
+                        cli.trusted_comment = result_unwrap(vr4)
+                        i = i + 2
+                        continue
+                    }
+                    if a == "--force" {
+                        cli.force = true
+                        i = i + 1
+                        continue
+                    }
+                }
+                return Result.Err("unrecognized arguments: " + a)
+            }
+            if cli.log != "" {
+                return Result.Err("unrecognized arguments: " + a)
+            }
+            cli.log = a
+            i = i + 1
+            continue
+        }
+        if cmd == "witness-verify" {
+            if a == "-p" || a == "--pub" {
+                let vr: Result[str, str] = tl_cli_str_value(argv, i, a)
+                if !result_is_ok(vr) {
+                    return Result.Err(result_err_or(vr, "bad -p"))
+                }
+                cli.pub = result_unwrap(vr)
+                i = i + 2
+                continue
+            }
+            if a == "-P" || a == "--raw-pub" {
+                let vr2: Result[str, str] = tl_cli_str_value(argv, i, a)
+                if !result_is_ok(vr2) {
+                    return Result.Err(result_err_or(vr2, "bad -P"))
+                }
+                cli.raw_pub = result_unwrap(vr2)
+                i = i + 2
+                continue
+            }
+            if a == "--against" {
+                let vr3: Result[str, str] = tl_cli_str_value(argv, i, a)
+                if !result_is_ok(vr3) {
+                    return Result.Err(result_err_or(vr3, "bad --against"))
+                }
+                cli.against = result_unwrap(vr3)
+                i = i + 2
+                continue
+            }
+            if a.starts_with("-") {
+                return Result.Err("unrecognized arguments: " + a)
+            }
+            if cli.witness != "" {
+                return Result.Err("unrecognized arguments: " + a)
+            }
+            cli.witness = a
+            i = i + 1
+            continue
+        }
+        if cmd == "prove" {
+            if a == "--log" {
+                let vr: Result[str, str] = tl_cli_str_value(argv, i, a)
+                if !result_is_ok(vr) {
+                    return Result.Err(result_err_or(vr, "bad --log"))
+                }
+                cli.log = result_unwrap(vr)
+                i = i + 2
+                continue
+            }
+            if a == "--seq" {
+                let ir: Result[int, str] = tl_cli_int_value(argv, i, a)
+                if !result_is_ok(ir) {
+                    return Result.Err(result_err_or(ir, "bad --seq"))
+                }
+                cli.seq = result_unwrap(ir)
+                cli.has_seq = true
+                i = i + 2
+                continue
+            }
+            if a == "--out" {
+                let vr2: Result[str, str] = tl_cli_str_value(argv, i, a)
+                if !result_is_ok(vr2) {
+                    return Result.Err(result_err_or(vr2, "bad --out"))
+                }
+                cli.out = result_unwrap(vr2)
+                i = i + 2
+                continue
+            }
+            if a.starts_with("-") {
+                return Result.Err("unrecognized arguments: " + a)
+            }
+            if cli.name == "" {
+                cli.name = a
+            } else if cli.version == "" {
+                cli.version = a
+            } else {
+                return Result.Err("unrecognized arguments: " + a)
+            }
+            i = i + 1
+            continue
+        }
+        if cmd == "prove-verify" {
+            if a == "--log" {
+                let vr: Result[str, str] = tl_cli_str_value(argv, i, a)
+                if !result_is_ok(vr) {
+                    return Result.Err(result_err_or(vr, "bad --log"))
+                }
+                cli.log = result_unwrap(vr)
+                i = i + 2
+                continue
+            }
+            if a.starts_with("-") {
+                return Result.Err("unrecognized arguments: " + a)
+            }
+            if cli.proof != "" {
+                return Result.Err("unrecognized arguments: " + a)
+            }
+            cli.proof = a
+            i = i + 1
+            continue
+        }
+        # selftest takes nothing
+        return Result.Err("unrecognized arguments: " + a)
+    }
+    if cmd == "witness-verify" && cli.witness == "" {
+        return Result.Err("the following arguments are required: witness")
+    }
+    if cmd == "prove-verify" && cli.proof == "" {
+        return Result.Err("the following arguments are required: proof")
+    }
+    return Result.Ok(cli)
+}
+
+# tl_password(cli, what) — hls-sign's passphrase order.
+fn tl_password(cli: Cli, what: str) -> Result[str, str] uses IO, Proc {
+    if cli.password_env != "" {
+        if !env_has(cli.password_env) {
+            return Result.Err("the environment variable " + cli.password_env
+            + " is not set — it should hold the " + what + " passphrase")
+        }
+        return Result.Ok(env_get(cli.password_env))
+    }
+    if env_has("HLS_SIGN_PASSWORD") {
+        return Result.Ok(env_get("HLS_SIGN_PASSWORD"))
+    }
+    if isatty(0) {
+        eprint("passphrase for " + what + " (empty ok): ")
+        return Result.Ok(taint_unwrap(read_line()))
+    }
+    return Result.Ok("")
+}
+
+# tl_resolve_public(cli) — -P raw hex or -p file; never a fallback key.
+fn tl_resolve_public(cli: Cli) -> Result[MiPub, str] uses Fs, Proc {
+    if cli.raw_pub != "" {
+        if cli.raw_pub.len() != 64 {
+            return Result.Err("-P wants 64 hex characters (a raw Ed25519 "
+            + "public key)")
+        }
+        let mut i: int = 0
+        while i < 64 {
+            let b: int = cli.raw_pub.byte_at(i)
+            let okd: bool = (b >= 48 && b <= 57) || (b >= 97 && b <= 102)
+            if !okd {
+                return Result.Err("-P wants 64 hex characters (a raw "
+                + "Ed25519 public key)")
+            }
+            i = i + 1
+        }
+        let raw: str = hex_decode(cli.raw_pub)
+        return Result.Ok(MiPub {
+            public: raw, comment: "hex"
+        })
+    }
+    let mut pub_path: str = cli.pub
+    if pub_path == "" && env_has("HLS_SIGN_PUB") {
+        pub_path = env_get("HLS_SIGN_PUB")
+    }
+    if pub_path == "" {
+        pub_path = tl_default_pub_name()
+    }
+    if !file_exists(pub_path) {
+        return Result.Err("no public key at " + pub_path + " — pass -p FILE "
+        + "or -P HEX (verification verifies AGAINST something)")
+    }
+    let pr: Result[MiPub, str] = mi_read_public(pub_path)
+    if !result_is_ok(pr) {
+        return Result.Err(result_err_or(pr, "cannot read the public key"))
+    }
+    let out: MiPub = result_unwrap(pr)
+    return Result.Ok(MiPub {
+        public: out.public, comment: pub_path
+    })
+}
+
+# tl_safe_name(name) — filename-safe, or "unnamed".
+fn tl_safe_name(name: str) -> str {
+    if name == "" {
+        return "unnamed"
+    }
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < name.len() {
+        let b: int = name.byte_at(i)
+        if(b >= 48 && b <= 57) || (b >= 65 && b <= 90)
+        || (b >= 97 && b <= 122) || b == 46 || b == 95 || b == 45 {
+            out.push(name.slice(i, i + 1))
+        } else {
+            out.push("_")
+        }
+        i = i + 1
+    }
+    let joined: str = str_join(out, "")
+    if joined == "" {
+        return "unnamed"
+    }
+    return joined
+}
+
+# tl_errors_json(errors, cap) — [{"where", "error"}, ...].
+fn tl_errors_json(errors: list[ChainErr], cap: int) -> JsonValue {
+    let arr: JsonValue = json_array([])
+    let mut i: int = 0
+    while i < errors.len() && i < cap {
+        let e: JsonValue = json_object([], [])
+        tl_obj_set(e, "where", json_str(errors.get(i).spot))
+        tl_obj_set(e, "error", json_str(errors.get(i).msg))
+        arr.arr.push(e)
+        i = i + 1
+    }
+    return arr
+}
+
+# tl_cmd_verify(cli) -> Result[int, str].
+fn tl_cmd_verify(cli: Cli) -> Result[int, str] uses IO, Fs, Proc, Args {
+    let mut path: str = cli.log
+    if path == "" {
+        path = tl_transparency_log_path()
+    }
+    let dr: Result[str, str] = tl_read_log_bytes(path)
+    if !result_is_ok(dr) {
+        return Result.Err(result_err_or(dr, "cannot read " + path))
+    }
+    let data: str = result_unwrap(dr)
+    let pr: Result[list[JsonValue], str] = tl_parse_log(data, path)
+    if !result_is_ok(pr) {
+        return Result.Err(result_err_or(pr, "cannot parse " + path))
+    }
+    let records: list[JsonValue] = result_unwrap(pr)
+    let out: ChainOut = tl_verify_chain(records, path)
+    if cli.json_out {
+        let rep: JsonValue = json_object([], [])
+        tl_obj_set(rep, "schema", json_str(tl_verify_schema()))
+        tl_obj_set(rep, "tool", json_str(tl_tool()))
+        tl_obj_set(rep, "tool_version", json_str(tl_version()))
+        tl_obj_set(rep, "log", json_str(path))
+        tl_obj_set(rep, "records", json_int(records.len()))
+        tl_obj_set(rep, "head", json_str(out.head))
+        tl_obj_set(rep, "sound", json_bool(out.errors.len() == 0))
+        tl_obj_set(rep, "errors", tl_errors_json(out.errors, 50))
+        tl_obj_set(rep, "error_count", json_int(out.errors.len()))
+        println(tl_py_dump(rep))
+        if out.errors.len() == 0 {
+            return Result.Ok(0)
+        }
+        return Result.Ok(1)
+    }
+    println("== hls-tlog verify ==")
+    println("  log:     " + path)
+    println("  records: " + records.len().to_str())
+    println("  head:    " + out.head)
+    if out.errors.len() == 0 {
+        println("  the chain is sound: every record chains from the one "
+        + "before it, seq 1.." + records.len().to_str() + " with no gaps")
+        return Result.Ok(0)
+    }
+    println("  BROKEN — " + out.errors.len().to_str() + " error(s):")
+    let mut i: int = 0
+    while i < out.errors.len() && i < 10 {
+        println("    " + out.errors.get(i).spot + ": "
+        + out.errors.get(i).msg)
+        i = i + 1
+    }
+    if out.errors.len() > 10 {
+        println("    ... and " + (out.errors.len() - 10).to_str() + " more")
+    }
+    return Result.Ok(1)
+}
+
+# tl_cmd_summary(cli).
+fn tl_cmd_summary(cli: Cli) -> Result[int, str] uses IO, Fs, Proc, Args {
+    let mut path: str = cli.log
+    if path == "" {
+        path = tl_transparency_log_path()
+    }
+    let lr: Result[TlLoaded, str] = tl_load_log(path)
+    if !result_is_ok(lr) {
+        return Result.Err(result_err_or(lr, "cannot load " + path))
+    }
+    let loaded: TlLoaded = result_unwrap(lr)
+    let view: JsonValue = tl_compute_view(loaded.records, loaded.log_sha)
+    if cli.json_out {
+        let rep: JsonValue = json_object([], [])
+        tl_obj_set(rep, "schema", json_str(tl_view_schema()))
+        tl_obj_set(rep, "tool", json_str(tl_tool()))
+        tl_obj_set(rep, "tool_version", json_str(tl_version()))
+        tl_obj_set(rep, "log", json_str(path))
+        tl_obj_set(rep, "sound", json_bool(true))
+        tl_obj_set(rep, "view", view)
+        println(tl_py_dump(rep))
+        return Result.Ok(0)
+    }
+    println("== hls-tlog summary ==")
+    println("  log:     " + path + " (chain verified)")
+    println("  length:  " + tl_jint(view, "length").to_str())
+    println("  head:    " + tl_jstr(view, "head"))
+    println("  bytes:   sha256 " + tl_jstr(view, "log_sha256"))
+    let kinds: JsonValue = json_object_get(view, "kinds")
+    let order: list[int] = tl_sorted_order(kinds.obj_keys)
+    let mut ks: str = ""
+    let mut i: int = 0
+    while i < order.len() {
+        if i > 0 {
+            ks = ks + ", "
+        }
+        ks = ks + kinds.obj_keys.get(order.get(i)) + " x"
+        + kinds.obj_vals.get(order.get(i)).ival.to_str()
+        i = i + 1
+    }
+    if ks == "" {
+        ks = "(none)"
+    }
+    println("  kinds:   " + ks)
+    return Result.Ok(0)
+}
+
+# tl_cmd_gossip(cli).
+fn tl_cmd_gossip(cli: Cli) -> Result[int, str] uses IO, Fs, Proc, Net, Args {
+    if cli.sources.len() == 0 {
+        eprint(tl_tool() + ": gossip needs at least one source\n")
+        return Result.Ok(2)
+    }
+    # one row per source: label + (view+heads | reason)
+    let labels: list[str] = []
+    let oks: list[int] = []
+    let reasons: list[str] = []
+    let views: list[JsonValue] = []
+    let heads_per: list[list[str]] = []
+    let mut si: int = 0
+    while si < cli.sources.len() {
+        let src: str = cli.sources.get(si)
+        let f: FetchOut = tl_fetch(src, cli.max_bytes)
+        labels.push(f.label)
+        if !f.ok {
+            reasons.push(f.reason)
+            si = si + 1
+            continue
+        }
+        let pr: Result[list[JsonValue], str] = tl_parse_log(f.data, f.label)
+        if !result_is_ok(pr) {
+            reasons.push(result_err_or(pr, "the log did not parse"))
+            si = si + 1
+            continue
+        }
+        let records: list[JsonValue] = result_unwrap(pr)
+        let out: ChainOut = tl_verify_chain(records, f.label)
+        if out.errors.len() > 0 {
+            reasons.push("the chain is broken ("
+            + out.errors.len().to_str() + " error(s))")
+            si = si + 1
+            continue
+        }
+        let view: JsonValue = tl_compute_view(records, sha256_hex(f.data))
+        views.push(view)
+        heads_per.push(tl_heads_of(records))
+        oks.push(si)
+        reasons.push("")
+        si = si + 1
+    }
+    let gviews: list[GView] = []
+    let mut oi: int = 0
+    while oi < oks.len() {
+        let v: JsonValue = views.get(oi)
+        gviews.push(GView {
+            source: labels.get(oks.get(oi)),
+            length: tl_jint(v, "length"),
+            head: tl_jstr(v, "head")
+        })
+        oi = oi + 1
+    }
+    let result: GossipOut = tl_gossip_verdict(gviews, heads_per)
+    let mut verdict: str = result.verdict
+    let stale: bool = cli.has_max_lag && result.max_lag > cli.max_lag
+    if oks.len() < cli.require {
+        verdict = "insufficient"
+    } else if oks.len() == 1 {
+        verdict = "isolated"
+    } else if verdict != tl_class_fork() && stale {
+        verdict = "stale"
+    }
+    if cli.json_out {
+        let rep: JsonValue = json_object([], [])
+        tl_obj_set(rep, "schema", json_str(tl_gossip_schema()))
+        tl_obj_set(rep, "tool", json_str(tl_tool()))
+        tl_obj_set(rep, "tool_version", json_str(tl_version()))
+        let srcs: JsonValue = json_array([])
+        let mut i: int = 0
+        while i < labels.len() {
+            let row: JsonValue = json_object([], [])
+            tl_obj_set(row, "source", json_str(labels.get(i)))
+            let mut ok_here: bool = false
+            let mut j: int = 0
+            while j < oks.len() {
+                if oks.get(j) == i {
+                    ok_here = true
+                }
+                j = j + 1
+            }
+            tl_obj_set(row, "ok", json_bool(ok_here))
+            if ok_here {
+                let mut vidx: int = 0
+                let mut k: int = 0
+                while k < oks.len() {
+                    if oks.get(k) == i {
+                        vidx = k
+                    }
+                    k = k + 1
+                }
+                tl_obj_set(row, "view", views.get(vidx))
+            } else {
+                tl_obj_set(row, "error", json_str(reasons.get(i)))
+            }
+            srcs.arr.push(row)
+            i = i + 1
+        }
+        tl_obj_set(rep, "sources", srcs)
+        tl_obj_set(rep, "ok_sources", json_int(oks.len()))
+        tl_obj_set(rep, "verdict", json_str(verdict))
+        tl_obj_set(rep, "head", json_str(result.head))
+        tl_obj_set(rep, "max_lag", json_int(result.max_lag))
+        let pairs: JsonValue = json_array([])
+        let mut p: int = 0
+        while p < result.pairs.len() {
+            let pr2: GPair = result.pairs.get(p)
+            let row2: JsonValue = json_object([], [])
+            tl_obj_set(row2, "a", json_str(pr2.a))
+            tl_obj_set(row2, "b", json_str(pr2.b))
+            tl_obj_set(row2, "class", json_str(pr2.cls))
+            if pr2.has_lag {
+                tl_obj_set(row2, "lag", json_int(pr2.lag))
+            }
+            pairs.arr.push(row2)
+            p = p + 1
+        }
+        tl_obj_set(rep, "pairs", pairs)
+        tl_obj_set(rep, "require", json_int(cli.require))
+        if cli.has_max_lag {
+            tl_obj_set(rep, "max_lag_limit", json_int(cli.max_lag))
+        } else {
+            tl_obj_set(rep, "max_lag_limit", json_null())
+        }
+        println(tl_py_dump(rep))
+        if verdict == "consensus" || verdict == "isolated" {
+            return Result.Ok(0)
+        }
+        return Result.Ok(1)
+    }
+    println("== hls-tlog gossip ==")
+    println("  sources: " + labels.len().to_str() + " asked, "
+    + oks.len().to_str() + " answered")
+    let mut i2: int = 0
+    while i2 < labels.len() {
+        let mut ok_here: bool = false
+        let mut j2: int = 0
+        while j2 < oks.len() {
+            if oks.get(j2) == i2 {
+                ok_here = true
+            }
+            j2 = j2 + 1
+        }
+        if ok_here {
+            let mut vidx: int = 0
+            let mut k2: int = 0
+            while k2 < oks.len() {
+                if oks.get(k2) == i2 {
+                    vidx = k2
+                }
+                k2 = k2 + 1
+            }
+            let v: JsonValue = views.get(vidx)
+            let mut h16: str = tl_jstr(v, "head")
+            if h16.len() > 16 {
+                h16 = h16.slice(0, 16)
+            }
+            println("    ok      " + labels.get(i2) + "  (length "
+            + tl_jint(v, "length").to_str() + ", head " + h16 + "...)")
+        } else {
+            println("    refused " + labels.get(i2) + "  ("
+            + reasons.get(i2) + ")")
+        }
+        i2 = i2 + 1
+    }
+    let mut p2: int = 0
+    while p2 < result.pairs.len() {
+        let pair: GPair = result.pairs.get(p2)
+        if pair.cls == tl_class_fork() || pair.cls == tl_class_diverged() {
+            println("  CONFLICT " + pair.a + " vs " + pair.b + ": "
+            + pair.cls)
+        } else if pair.cls == tl_class_lag() && pair.has_lag {
+            println("    lag    " + pair.a + " vs " + pair.b + ": "
+            + pair.lag.to_str() + " record(s) behind")
+        }
+        p2 = p2 + 1
+    }
+    if verdict == "fork" {
+        println("  head:    none — the sources disagree about the history")
+        println("  verdict: FORK — the sources disagree about the history; "
+        + "a quorum cannot outvote the evidence")
+        return Result.Ok(1)
+    }
+    println("  head:    " + result.head + " (the longest answered view)")
+    if verdict == "consensus" {
+        println("  verdict: consensus — every answered source holds the "
+        + "same history (max lag " + result.max_lag.to_str() + ")")
+        return Result.Ok(0)
+    }
+    if verdict == "stale" {
+        println("  verdict: stale — lag " + result.max_lag.to_str()
+        + " exceeds the " + cli.max_lag.to_str() + " record limit")
+        return Result.Ok(1)
+    }
+    if verdict == "isolated" {
+        println("  verdict: isolated — one source answered (--require 1 "
+        + "allowed it); nothing was compared, nothing was proven")
+        return Result.Ok(0)
+    }
+    println("  verdict: insufficient — " + oks.len().to_str() + " of "
+    + cli.require.to_str() + " required source(s) answered; gossip alone "
+    + "is not gossip")
+    return Result.Ok(1)
+}
+
+# tl_cmd_witness(cli).
+fn tl_cmd_witness(cli: Cli) -> Result[int, str] uses IO, Fs, Proc, Clock, Args {
+    if cli.sign == "" {
+        eprint(tl_tool() + ": witness needs --sign SECRET (the Stage 106 "
+        + "key signs the view)\n")
+        return Result.Ok(2)
+    }
+    if !file_exists(cli.sign) {
+        return Result.Err("no secret key at " + cli.sign
+        + " — run `hls-sign keygen` first")
+    }
+    let pw: Result[str, str] = tl_password(cli, "the secret key")
+    if !result_is_ok(pw) {
+        return Result.Err(result_err_or(pw, "no passphrase"))
+    }
+    let sr: Result[MiSec, str] = mi_read_secret(cli.sign, result_unwrap(pw))
+    if !result_is_ok(sr) {
+        return Result.Err(result_err_or(sr, "cannot read the secret key"))
+    }
+    let sec: MiSec = result_unwrap(sr)
+    let mut path: str = cli.log
+    if path == "" {
+        path = tl_transparency_log_path()
+    }
+    let lr: Result[TlLoaded, str] = tl_load_log(path)
+    if !result_is_ok(lr) {
+        return Result.Err(result_err_or(lr, "cannot load " + path))
+    }
+    let loaded: TlLoaded = result_unwrap(lr)
+    let view: JsonValue = tl_compute_view(loaded.records, loaded.log_sha)
+    let wr: Result[JsonValue, str] = tl_make_witness(view, sec.public)
+    if !result_is_ok(wr) {
+        return Result.Err(result_err_or(wr, "cannot build the witness"))
+    }
+    let witness: JsonValue = result_unwrap(wr)
+    let mut trusted: str = cli.trusted_comment
+    if trusted == "" {
+        trusted = mi_default_trusted_comment(path)
+    }
+    let mut out_dir: str = cli.out
+    if out_dir == "" {
+        out_dir = tl_path_dirname(tl_realpath_lex(path))
+    }
+    let pr: Result[TlPair, str] = tl_write_witness(witness, sec.seed,
+    sec.public, out_dir, trusted, cli.force)
+    if !result_is_ok(pr) {
+        return Result.Err(result_err_or(pr, "cannot write the witness"))
+    }
+    let written: TlPair = result_unwrap(pr)
+    # Stage 112: minting a signed view is a privileged op — the witness
+    # promises the log will never shrink below this head.
+    let detail: JsonValue = json_object([], [])
+    tl_obj_set(detail, "length", json_int(tl_jint(view, "length")))
+    tl_obj_set(detail, "head", json_str(tl_jstr(view, "head")))
+    tl_obj_set(detail, "key_id", json_str(tl_jstr(witness, "key_id")))
+    tl_obj_set(detail, "witness", json_str(written.doc))
+    let ar: Result[bool, str] = tl_audit_record_ok("tlog.witness", path,
+    detail, true, true)
+    if !result_is_ok(ar) {
+        return Result.Err(result_err_or(ar, "the audit entry failed"))
+    }
+    if cli.json_out {
+        let rep: JsonValue = json_object([], [])
+        tl_obj_set(rep, "schema", json_str(tl_witness_schema()))
+        tl_obj_set(rep, "tool", json_str(tl_tool()))
+        tl_obj_set(rep, "tool_version", json_str(tl_version()))
+        tl_obj_set(rep, "witness", witness)
+        let arr: JsonValue = json_array([])
+        arr.arr.push(json_str(written.doc))
+        arr.arr.push(json_str(written.sig))
+        tl_obj_set(rep, "written", arr)
+        tl_obj_set(rep, "trusted_comment", json_str(trusted))
+        println(tl_py_dump(rep))
+        return Result.Ok(0)
+    }
+    println("== hls-tlog witness ==")
+    println("  log:     " + path + " (chain verified, "
+    + tl_jint(view, "length").to_str() + " record(s))")
+    let mut h16: str = tl_jstr(view, "head")
+    if h16.len() > 16 {
+        h16 = h16.slice(0, 16)
+    }
+    println("  view:    length " + tl_jint(view, "length").to_str()
+    + ", head " + h16 + "...")
+    println("  key:     " + tl_jstr(witness, "key_id"))
+    println("  wrote:   " + written.doc)
+    println("  wrote:   " + written.sig)
+    println("  a signed view is a promise: if this log ever shrinks below "
+    + "seq " + tl_jint(view, "length").to_str() + ", every holder has "
+    + "evidence")
+    return Result.Ok(0)
+}
+
+# tl_cmd_witness_verify(cli).
+fn tl_cmd_witness_verify(cli: Cli) -> Result[int, str] uses IO, Fs, Proc, Args {
+    let pubr: Result[MiPub, str] = tl_resolve_public(cli)
+    if !result_is_ok(pubr) {
+        return Result.Err(result_err_or(pubr, "no public key"))
+    }
+    let pub: MiPub = result_unwrap(pubr)
+    let anchor: str = pub.comment
+    let wr: Result[TlWitness, str] = tl_read_witness(cli.witness)
+    if !result_is_ok(wr) {
+        return Result.Err(result_err_or(wr, "cannot read the witness"))
+    }
+    let wdoc: TlWitness = result_unwrap(wr)
+    if !tl_verify_witness_signature(cli.witness, pub.public) {
+        return Result.Err("the witness signature does NOT verify against "
+        + "this key — the view was tampered with or signed by another key")
+    }
+    let ts: TsOpt = tl_trusted_timestamp(wdoc.trusted)
+    let mut check: CheckOut = CheckOut {
+        verdict: "", detail: ""
+    }
+    let mut has_check: bool = false
+    if cli.against != "" {
+        let lr: Result[TlLoaded, str] = tl_load_log(cli.against)
+        if !result_is_ok(lr) {
+            return Result.Err(result_err_or(lr, "cannot load the log"))
+        }
+        let loaded: TlLoaded = result_unwrap(lr)
+        check = tl_check_against_log(wdoc.doc, loaded.records, loaded.log_sha)
+        has_check = true
+    }
+    if cli.json_out {
+        let rep: JsonValue = json_object([], [])
+        tl_obj_set(rep, "schema", json_str(tl_witness_verify_schema()))
+        tl_obj_set(rep, "tool", json_str(tl_tool()))
+        tl_obj_set(rep, "tool_version", json_str(tl_version()))
+        tl_obj_set(rep, "witness", wdoc.doc)
+        tl_obj_set(rep, "anchor", json_str(anchor))
+        if ts.has {
+            tl_obj_set(rep, "signed_timestamp", json_int(ts.ts))
+        } else {
+            tl_obj_set(rep, "signed_timestamp", json_null())
+        }
+        tl_obj_set(rep, "trusted_comment", json_str(wdoc.trusted))
+        if has_check {
+            let c: JsonValue = json_object([], [])
+            tl_obj_set(c, "verdict", json_str(check.verdict))
+            tl_obj_set(c, "detail", json_str(check.detail))
+            tl_obj_set(rep, "check", c)
+        }
+        tl_obj_set(rep, "verified", json_bool(true))
+        println(tl_py_dump(rep))
+        if has_check && (check.verdict == "rollback"
+        || check.verdict == "rewritten") {
+            return Result.Ok(1)
+        }
+        return Result.Ok(0)
+    }
+    println("== hls-tlog witness-verify ==")
+    println("  witness: " + cli.witness + " (signature verified, key "
+    + tl_jstr(wdoc.doc, "key_id") + ")")
+    let mut h16: str = tl_jstr(wdoc.doc, "head")
+    if h16.len() > 16 {
+        h16 = h16.slice(0, 16)
+    }
+    println("  view:    length " + tl_jint(wdoc.doc, "length").to_str()
+    + ", head " + h16 + "...")
+    if ts.has {
+        println("  signed:  at unix second " + ts.ts.to_str()
+        + " (from the signed comment)")
+    }
+    if has_check {
+        println("  against: " + cli.against)
+        println("  check:   " + check.verdict + " — " + check.detail)
+        if check.verdict == "held" || check.verdict == "byte-identical" {
+            return Result.Ok(0)
+        }
+        return Result.Ok(1)
+    }
+    return Result.Ok(0)
+}
+
+# tl_find_record(records, name, version, seq) — the LAST match wins.
+fn tl_find_record(records: list[JsonValue], name: str, version: str,
+seq: int, has_seq: bool) -> JsonValue {
+    let mut found: JsonValue = json_null()
+    let mut have: bool = false
+    let mut i: int = 0
+    while i < records.len() {
+        let rec: JsonValue = records.get(i)
+        if has_seq {
+            if tl_jint(rec, "seq") == seq {
+                found = rec
+                have = true
+            }
+            i = i + 1
+            continue
+        }
+        if name != "" && tl_jstr(rec, "name") != name {
+            i = i + 1
+            continue
+        }
+        if version != "" && tl_jstr(rec, "version") != version {
+            i = i + 1
+            continue
+        }
+        if name == "" && version == "" {
+            i = i + 1
+            continue
+        }
+        found = rec
+        have = true
+        i = i + 1
+    }
+    if !have {
+        return json_null()
+    }
+    return found
+}
+
+# tl_record_index(records, rec) — the FIRST record equal (canonical
+# bytes) to the found one, Python's records.index semantics.
+fn tl_record_index(records: list[JsonValue], rec: JsonValue) -> int {
+    let canon: str = tl_py_canon(rec)
+    let mut i: int = 0
+    while i < records.len() {
+        if tl_py_canon(records.get(i)) == canon {
+            return i
+        }
+        i = i + 1
+    }
+    return records.len() - 1
+}
+
+# tl_cmd_prove(cli).
+fn tl_cmd_prove(cli: Cli) -> Result[int, str] uses IO, Fs, Proc, Args {
+    if !cli.has_seq && cli.name == "" {
+        eprint(tl_tool() + ": prove needs a NAME (and optionally a "
+        + "VERSION) or --seq N\n")
+        return Result.Ok(2)
+    }
+    let mut path: str = cli.log
+    if path == "" {
+        path = tl_transparency_log_path()
+    }
+    let lr: Result[TlLoaded, str] = tl_load_log(path)
+    if !result_is_ok(lr) {
+        return Result.Err(result_err_or(lr, "cannot load " + path))
+    }
+    let loaded: TlLoaded = result_unwrap(lr)
+    let rec: JsonValue = tl_find_record(loaded.records, cli.name, cli.version,
+    cli.seq, cli.has_seq)
+    if rec.kind == "null" {
+        let mut what: str = cli.name
+        if what == "" {
+            what = "seq " + cli.seq.to_str()
+        }
+        return Result.Err("no record matches " + what + " in " + path
+        + " — nothing to prove")
+    }
+    let index: int = tl_record_index(loaded.records, rec)
+    let proof: JsonValue = tl_build_proof(loaded.records, index)
+    let mut out_path: str = ""
+    if cli.out != "" {
+        tl_mkdirs(cli.out)
+        let mut stem_name: str = tl_jstr(rec, "name")
+        if stem_name == "" {
+            stem_name = "record"
+        }
+        let stem: str = "hls-tlog-proof-" + tl_safe_name(stem_name) + "-"
+        + tl_jint(rec, "seq").to_str()
+        out_path = tl_path_join(cli.out, stem + tl_proof_suffix())
+        write_file(out_path, tl_canon_bytes(proof))
+    }
+    if cli.json_out {
+        let rep: JsonValue = json_object([], [])
+        tl_obj_set(rep, "schema", json_str(tl_proof_schema()))
+        tl_obj_set(rep, "tool", json_str(tl_tool()))
+        tl_obj_set(rep, "tool_version", json_str(tl_version()))
+        tl_obj_set(rep, "proof", proof)
+        if out_path != "" {
+            tl_obj_set(rep, "written", json_str(out_path))
+        }
+        println(tl_py_dump(rep))
+        return Result.Ok(0)
+    }
+    println("== hls-tlog prove ==")
+    println("  log:     " + path + " (chain verified)")
+    let mut kind: str = tl_jstr(rec, "kind")
+    if kind == "" {
+        kind = "untyped"
+    }
+    let mut suffix: str = ""
+    if tl_jstr(rec, "name") != "" {
+        suffix = ", name " + tl_jstr(rec, "name")
+    }
+    println("  record:  seq " + tl_jint(rec, "seq").to_str() + ", kind "
+    + kind + suffix)
+    let mut h16: str = loaded.head
+    if h16.len() > 16 {
+        h16 = h16.slice(0, 16)
+    }
+    println("  head:    " + h16 + "... (the tail chains there: "
+    + tl_proof_tail(proof).len().to_str() + " record(s) after)")
+    if out_path != "" {
+        println("  wrote:   " + out_path)
+    }
+    println("  the proof verifies offline for coherence; prove-verify "
+    + "--log checks it against the live history")
+    return Result.Ok(0)
+}
+
+# tl_cmd_prove_verify(cli).
+fn tl_cmd_prove_verify(cli: Cli) -> Result[int, str] uses IO, Fs, Proc, Args {
+    if !file_exists(cli.proof) {
+        return Result.Err("no proof at " + cli.proof)
+    }
+    let text: str = read_file(cli.proof)
+    let pr: Result[JsonValue, str] = json_parse_result(text)
+    if !result_is_ok(pr) {
+        return Result.Err(cli.proof + " is not JSON ("
+        + result_err_or(pr, "parse error") + ")")
+    }
+    let proof: JsonValue = result_unwrap(pr)
+    if proof.kind != "object" || tl_jstr(proof, "schema") != tl_proof_schema() {
+        return Result.Err(cli.proof + " is not a " + tl_proof_schema()
+        + " document")
+    }
+    let mut errors: list[ChainErr] = tl_verify_proof_offline(proof)
+    let mut live_checked: bool = false
+    if errors.len() == 0 && cli.log != "" {
+        let lr: Result[TlLoaded, str] = tl_load_log(cli.log)
+        if !result_is_ok(lr) {
+            return Result.Err(result_err_or(lr, "cannot load the log"))
+        }
+        let loaded: TlLoaded = result_unwrap(lr)
+        errors = tl_verify_proof_live(proof, loaded.records)
+        live_checked = true
+    }
+    if cli.json_out {
+        let rep: JsonValue = json_object([], [])
+        tl_obj_set(rep, "schema", json_str(tl_proof_verify_schema()))
+        tl_obj_set(rep, "tool", json_str(tl_tool()))
+        tl_obj_set(rep, "tool_version", json_str(tl_version()))
+        tl_obj_set(rep, "proof", json_str(cli.proof))
+        let seq_v: JsonValue = json_object_get(proof, "seq")
+        if seq_v.kind == "int" {
+            tl_obj_set(rep, "seq", json_int(json_int_value(seq_v)))
+        } else {
+            tl_obj_set(rep, "seq", json_null())
+        }
+        tl_obj_set(rep, "live", json_bool(live_checked))
+        tl_obj_set(rep, "verified", json_bool(errors.len() == 0))
+        tl_obj_set(rep, "errors", tl_errors_json(errors, 10000))
+        println(tl_py_dump(rep))
+        if errors.len() == 0 {
+            return Result.Ok(0)
+        }
+        return Result.Ok(1)
+    }
+    println("== hls-tlog prove-verify ==")
+    let seq_v2: JsonValue = json_object_get(proof, "seq")
+    let mut seq_str: str = "None"
+    if seq_v2.kind == "int" {
+        seq_str = json_int_value(seq_v2).to_str()
+    }
+    println("  proof:   " + cli.proof + " (seq " + seq_str + ")")
+    if live_checked {
+        println("  live:    checked against " + cli.log)
+    } else {
+        println("  offline: the record and its tail chain coherently to "
+        + "the head (pass --log to check the live history)")
+    }
+    if errors.len() > 0 {
+        println("  REFUSED — " + errors.len().to_str() + " error(s):")
+        let mut i: int = 0
+        while i < errors.len() && i < 10 {
+            println("    " + errors.get(i).spot + ": "
+            + errors.get(i).msg)
+            i = i + 1
+        }
+        return Result.Ok(1)
+    }
+    println("  verified: the record stands in a history that chains to "
+    + "the head")
+    return Result.Ok(0)
+}
+
+# tl_cmd_selftest() — the fifteen vectors.
+fn tl_cmd_selftest() -> int uses IO {
+    println("== hls-tlog selftest ==")
+    let names: list[str] = tl_selftest()
+    let mut i: int = 0
+    while i < names.len() {
+        println("  ok: " + names.get(i))
+        i = i + 1
+    }
+    println("  the chain arithmetic is hpkg_log's writer, pinned to a "
+    + "hand-built canonical string")
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# The probe legs (the house pattern: private modes, same functions the
+# python fixture driver printed).
+# ----------------------------------------------------------------------------
+
+# tl_probe_build(path, n, name, start, prev, ts0, append, evil_seq) — the
+# gate's fixture builder: kind alternates publish/sign by seq parity,
+# version 1.<seq>.0, chain through the previous head; returns the new
+# head.
+fn tl_probe_build(path: str, n: int, name: str, start: int, prev: str,
+ts0: int, append: bool, evil_seq: int) -> str uses Fs {
+    let lines: list[str] = []
+    let mut p: str = prev
+    let mut i: int = start
+    while i < start + n {
+        let rec: JsonValue = json_object([], [])
+        let mut kind: str = "sign"
+        if i - (i / 2) * 2 == 1 {
+            kind = "publish"
+        }
+        let mut rname: str = name
+        if evil_seq != 0 && i == evil_seq {
+            rname = "evil"
+        }
+        tl_obj_set(rec, "kind", json_str(kind))
+        tl_obj_set(rec, "name", json_str(rname))
+        tl_obj_set(rec, "version", json_str("1." + i.to_str() + ".0"))
+        tl_obj_set(rec, "prev_hash", json_str(p))
+        tl_obj_set(rec, "seq", json_int(i))
+        tl_obj_set(rec, "timestamp", json_int(ts0 + i))
+        tl_obj_set(rec, "chain_hash", json_str(tl_chain_of(p, rec)))
+        p = tl_jstr(rec, "chain_hash")
+        lines.push(tl_py_line(rec))
+        i = i + 1
+    }
+    let mut body: str = ""
+    if append && file_exists(path) {
+        body = read_file(path)
+        if body.len() > 0 && body.byte_at(body.len() - 1) != 10 {
+            body = body + "\n"
+        }
+    }
+    let mut out: str = body
+    let mut j: int = 0
+    while j < lines.len() {
+        out = out + lines.get(j) + "\n"
+        j = j + 1
+    }
+    write_file(path, out)
+    return p
+}
+
+# tl_probe_mklog(argv) — the fixture driver's modes, one per leg.
+fn tl_probe_mklog(argv: list[str]) -> int uses IO, Fs, Proc, Net, Args, Clock {
+    let n: int = argv.len()
+    if n < 3 {
+        eprint("usage: hls-tlog --probe-mklog <mode> [args...]\n")
+        return 2
+    }
+    let mode: str = argv.get(2)
+    if mode == "consts" {
+        println(tl_genesis())
+        println(tl_view_schema())
+        println(tl_proof_schema())
+        return 0
+    }
+    if mode == "selftest" {
+        let names: list[str] = tl_selftest()
+        println(names.len().to_str())
+        return 0
+    }
+    if mode == "mk" {
+        if n < 10 {
+            eprint("mk needs path n name start prev ts0 append\n")
+            return 2
+        }
+        let head: str = tl_probe_build(argv.get(3), result_unwrap(tl_int_parse(argv.get(4))),
+        argv.get(5), result_unwrap(tl_int_parse(argv.get(6))), argv.get(7),
+        result_unwrap(tl_int_parse(argv.get(8))), argv.get(9) == "1", 0)
+        println(head)
+        return 0
+    }
+    if mode == "mk_evil_mid" {
+        if n < 10 {
+            eprint("mk_evil_mid needs path n name start prev ts0 evil_seq\n")
+            return 2
+        }
+        tl_probe_build(argv.get(3), result_unwrap(tl_int_parse(argv.get(4))),
+        argv.get(5), result_unwrap(tl_int_parse(argv.get(6))), argv.get(7),
+        result_unwrap(tl_int_parse(argv.get(8))), false,
+        result_unwrap(tl_int_parse(argv.get(9))))
+        return 0
+    }
+    if mode == "evilapp" {
+        if n < 4 {
+            eprint("evilapp needs a path\n")
+            return 2
+        }
+        let p: str = argv.get(3)
+        let text: str = read_file(p)
+        let lines: list[str] = text.split("\n")
+        let mut last: str = ""
+        let mut i: int = 0
+        while i < lines.len() {
+            if lines.get(i).trim() != "" {
+                last = lines.get(i)
+            }
+            i = i + 1
+        }
+        if last == "" {
+            eprint("evilapp: the log is empty\n")
+            return 1
+        }
+        let pr: Result[JsonValue, str] = json_parse_result(last)
+        if !result_is_ok(pr) {
+            eprint("evilapp: the last line is not JSON\n")
+            return 1
+        }
+        let evil: JsonValue = tl_obj_clone(result_unwrap(pr))
+        tl_obj_set(evil, "name", json_str("evil"))
+        tl_obj_set(evil, "chain_hash",
+        json_str(tl_chain_of(tl_jstr(evil, "prev_hash"), evil)))
+        let mut body: str = text
+        if body.len() > 0 && body.byte_at(body.len() - 1) != 10 {
+            body = body + "\n"
+        }
+        write_file(p, body + tl_py_line(evil) + "\n")
+        return 0
+    }
+    if mode == "onedeff" {
+        # ONE DEFINITION: build a record through hpkg_log's own writer
+        # law (next seq from the repo ledger, the current second, then
+        # the chained canonical hash) and re-verify it twice under the
+        # shared arithmetic.
+        let probe: JsonValue = json_object([], [])
+        tl_obj_set(probe, "kind", json_str("publish"))
+        tl_obj_set(probe, "name", json_str("probe"))
+        tl_obj_set(probe, "version", json_str("9.9.9"))
+        let log_path: str = tl_transparency_log_path()
+        let mut seq: int = 1
+        if file_exists(log_path) {
+            let text: str = read_file(log_path)
+            let lines: list[str] = text.split("\n")
+            let mut count: int = 0
+            let mut i: int = 0
+            while i < lines.len() {
+                if lines.get(i).trim() != "" {
+                    count = count + 1
+                }
+                i = i + 1
+            }
+            seq = count + 1
+        }
+        let ts: int = system_time_now_ms() / 1000
+        tl_obj_set(probe, "seq", json_int(seq))
+        tl_obj_set(probe, "timestamp", json_int(ts))
+        tl_obj_set(probe, "prev_hash", json_str(tl_genesis()))
+        let built: str = tl_chain_of(tl_genesis(), probe)
+        tl_obj_set(probe, "chain_hash", json_str(built))
+        println(built)
+        println(tl_chain_of(tl_jstr(probe, "prev_hash"), probe))
+        println(tl_chain_of(tl_jstr(probe, "prev_hash"), probe))
+        return 0
+    }
+    if mode == "fetch" {
+        if n < 4 {
+            eprint("fetch needs a source\n")
+            return 2
+        }
+        let f: FetchOut = tl_fetch(argv.get(3), tl_default_max_bytes())
+        if f.ok {
+            println("reason=NONE")
+            println("sha=" + sha256_hex(f.data))
+        } else {
+            println("reason=" + f.reason)
+            println("sha=")
+        }
+        return 0
+    }
+    if mode == "view" {
+        if n < 4 {
+            eprint("view needs a path\n")
+            return 2
+        }
+        let path: str = argv.get(3)
+        if !file_exists(path) {
+            eprint("no transparency log at " + path + " — nothing to read\n")
+            return 1
+        }
+        let data: str = read_file(path)
+        let pr: Result[list[JsonValue], str] = tl_parse_log(data, path)
+        if !result_is_ok(pr) {
+            eprint(result_err_or(pr, "parse error") + "\n")
+            return 1
+        }
+        let view: JsonValue = tl_compute_view(result_unwrap(pr),
+        sha256_hex(data))
+        println(tl_py_line(view))
+        return 0
+    }
+    if mode == "tamper_w" {
+        if n < 4 {
+            eprint("tamper_w needs a path\n")
+            return 2
+        }
+        let p: str = argv.get(3)
+        let pr: Result[JsonValue, str] = json_parse_result(read_file(p))
+        if !result_is_ok(pr) {
+            eprint("tamper_w: not JSON\n")
+            return 1
+        }
+        let d: JsonValue = result_unwrap(pr)
+        tl_obj_set(d, "length", json_int(99))
+        write_file(p, tl_py_dump(d) + "\n")
+        return 0
+    }
+    if mode == "tamper_prec" || mode == "tamper_ptail" {
+        if n < 5 {
+            eprint(mode + " needs a proof and an out path\n")
+            return 2
+        }
+        let pr: Result[JsonValue, str] = json_parse_result(read_file(argv.get(3)))
+        if !result_is_ok(pr) {
+            eprint(mode + ": not JSON\n")
+            return 1
+        }
+        let d: JsonValue = result_unwrap(pr)
+        if mode == "tamper_prec" {
+            let rec: JsonValue = tl_obj_clone(json_object_get(d, "record"))
+            tl_obj_set(rec, "name", json_str("evil"))
+            tl_obj_set(d, "record", rec)
+        } else {
+            let tail: JsonValue = json_object_get(d, "tail")
+            let new_tail: JsonValue = json_array([])
+            if tail.kind == "array" && tail.arr.len() > 0 {
+                let t0: JsonValue = tl_obj_clone(tail.arr.get(0))
+                tl_obj_set(t0, "kind", json_str("evil"))
+                new_tail.arr.push(t0)
+                let mut i: int = 1
+                while i < tail.arr.len() {
+                    new_tail.arr.push(tail.arr.get(i))
+                    i = i + 1
+                }
+            }
+            tl_obj_set(d, "tail", new_tail)
+        }
+        write_file(argv.get(4), tl_py_dump(d) + "\n")
+        return 0
+    }
+    eprint("hls-tlog: unknown probe mode: " + mode + "\n")
+    return 2
+}
+
+# tl_probe_https(url) — tls_get in a child; a panic here is a non-zero
+# exit the parent turns into a refused source.
+fn tl_probe_https(url: str) -> int uses IO, Net {
+    let ur: Result[UrlParts, str] = tl_url_split(url)
+    if !result_is_ok(ur) {
+        eprint(result_err_or(ur, "bad URL") + "\n")
+        return 1
+    }
+    let u: UrlParts = result_unwrap(ur)
+    if !u.is_https {
+        eprint("not an https URL\n")
+        return 1
+    }
+    let body: str = tls_get(u.host, u.port, u.path)
+    print(body)
+    return 0
+}
+
+# tl_probe_keygen(argv) — mint a minisign keypair with the hls-sign file
+# contract (the gate's fixture leg; keygen's stdout is not asserted).
+fn tl_probe_keygen(argv: list[str]) -> int uses IO, Fs, Rand, Clock, Proc {
+    let mut secret: str = ""
+    let mut pub: str = ""
+    let mut comment: str = ""
+    let mut password_env: str = ""
+    let mut iterations: int = 200000
+    let mut force: bool = false
+    let mut i: int = 2
+    while i < argv.len() {
+        let a: str = argv.get(i)
+        if a == "-f" && i + 1 < argv.len() {
+            secret = argv.get(i + 1)
+            i = i + 2
+            continue
+        }
+        if a == "-p" && i + 1 < argv.len() {
+            pub = argv.get(i + 1)
+            i = i + 2
+            continue
+        }
+        if a == "-c" && i + 1 < argv.len() {
+            comment = argv.get(i + 1)
+            i = i + 2
+            continue
+        }
+        if a == "--password-env" && i + 1 < argv.len() {
+            password_env = argv.get(i + 1)
+            i = i + 2
+            continue
+        }
+        if a == "--iterations" && i + 1 < argv.len() {
+            let pr: Result[int, str] = tl_int_parse(argv.get(i + 1))
+            if result_is_ok(pr) {
+                iterations = result_unwrap(pr)
+            }
+            i = i + 2
+            continue
+        }
+        if a == "--force" {
+            force = true
+            i = i + 1
+            continue
+        }
+        i = i + 1
+    }
+    if secret == "" || pub == "" {
+        eprint("usage: hls-tlog --probe-keygen -f SECRET -p PUB "
+        + "[-c COMMENT] [--password-env VAR] [--iterations N] [--force]\n")
+        return 2
+    }
+    if !force {
+        if file_exists(secret) {
+            eprint("hls-sign: " + secret + " already exists — keygen "
+            + "does not overwrite keys (--force to say it)\n")
+            return 1
+        }
+        if file_exists(pub) {
+            eprint("hls-sign: " + pub + " already exists — keygen "
+            + "does not overwrite keys (--force to say it)\n")
+            return 1
+        }
+    }
+    let mut password: str = ""
+    if password_env != "" {
+        if !env_has(password_env) {
+            eprint("hls-sign: the environment variable " + password_env
+            + " is not set — it should hold the new secret key "
+            + "passphrase\n")
+            return 1
+        }
+        password = env_get(password_env)
+    } else if env_has("HLS_SIGN_PASSWORD") {
+        password = env_get("HLS_SIGN_PASSWORD")
+    }
+    let seed: str = mi_random_bytes(32)
+    let public: str = ed_public_from_seed(seed)
+    let wr: Result[bool, str] = mi_write_secret(secret, seed, public,
+    password, iterations, comment)
+    if !result_is_ok(wr) {
+        eprint("hls-sign: " + result_err_or(wr, "keygen failed") + "\n")
+        return 1
+    }
+    mi_write_public(pub, public, comment)
+    println("== hls-sign keygen ==")
+    println("  key id:   " + mi_key_id_hex(public))
+    println("  secret:   " + secret + " (encrypted, 0600)")
+    println("  public:   " + pub)
+    return 0
+}
+
+# tl_probe_ed25519() — the RFC 8032 section 7.1 vectors (a dev parity
+# leg; the CLI selftest is the fifteen-vector battery above).
+fn tl_probe_ed25519() -> int uses IO {
+    let seeds: list[str] = [
+    "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+    "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+    "c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7",
+    "833fe62409237b9d62ec77587520911e9a759cec1d19755b7da901b96dca3d42"
+    ]
+    let pks: list[str] = [
+    "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+    "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+    "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025",
+    "ec172b93ad5e563bf4932c70e1245034c35467ef2efd4d64ebf819683467e2bf"
+    ]
+    let msgs: list[str] = ["", "72", "af82",
+    "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a"
+    + "2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"]
+    let sigs: list[str] = [
+    "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155"
+    + "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+    "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da"
+    + "085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00",
+    "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac"
+    + "18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a",
+    "dc2a4459e7369633a52b1bf277839a00201009a3efbf3ecb69bea2186c26b589"
+    + "09351fc9ac90b3ecfdfbc7c66431e0303dca179c138ac17ad9bef1177331a704"
+    ]
+    let mut i: int = 0
+    while i < 4 {
+        let seed: str = hex_decode(seeds.get(i))
+        let pk: str = hex_decode(pks.get(i))
+        let msg: str = hex_decode(msgs.get(i))
+        let sig: str = hex_decode(sigs.get(i))
+        if ed_public_from_seed(seed) != pk {
+            println("vector " + (i + 1).to_str() + ": public key mismatch")
+            return 1
+        }
+        if ed_sign(seed, msg) != sig {
+            println("vector " + (i + 1).to_str() + ": signature mismatch")
+            return 1
+        }
+        if !ed_verify(pk, msg, sig) {
+            println("vector " + (i + 1).to_str() + ": verify refused")
+            return 1
+        }
+        let bad: str = sig.slice(0, 10) + chr(int_xor(sig.byte_at(10), 64))
+        + sig.slice(11, 64)
+        if ed_verify(pk, msg, bad) {
+            println("vector " + (i + 1).to_str() + ": accepted a flipped "
+            + "byte")
+            return 1
+        }
+        println("ok: RFC 8032 vector " + (i + 1).to_str())
+        i = i + 1
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Fs, Proc, Net, Rand, Clock, Args, Exit {
+    let argv: list[str] = args()
+    let n: int = argv.len()
+    if n > 1 && argv.get(1) == "--probe-mklog" {
+        return tl_probe_mklog(argv)
+    }
+    if n > 2 && argv.get(1) == "--probe-https" {
+        return tl_probe_https(argv.get(2))
+    }
+    if n > 1 && argv.get(1) == "--probe-ed25519" {
+        return tl_probe_ed25519()
+    }
+    if n > 1 && argv.get(1) == "--probe-keygen" {
+        return tl_probe_keygen(argv)
+    }
+    if n > 1 && (argv.get(1) == "-h" || argv.get(1) == "--help") {
+        print(tl_usage())
+        return 0
+    }
+    let pr: Result[Cli, str] = tl_parse_cli(argv)
+    if !result_is_ok(pr) {
+        eprint(tl_usage_line() + "\n")
+        eprint("hls-tlog: error: " + result_err_or(pr, "bad usage") + "\n")
+        return 2
+    }
+    let cli: Cli = result_unwrap(pr)
+    if cli.cmd == "help" {
+        print(tl_usage())
+        return 0
+    }
+    if cli.cmd == "selftest" {
+        return tl_cmd_selftest()
+    }
+    let mut out: Result[int, str] = Result.Err("no command")
+    if cli.cmd == "verify" {
+        out = tl_cmd_verify(cli)
+    }
+    if cli.cmd == "summary" {
+        out = tl_cmd_summary(cli)
+    }
+    if cli.cmd == "gossip" {
+        out = tl_cmd_gossip(cli)
+    }
+    if cli.cmd == "witness" {
+        out = tl_cmd_witness(cli)
+    }
+    if cli.cmd == "witness-verify" {
+        out = tl_cmd_witness_verify(cli)
+    }
+    if cli.cmd == "prove" {
+        out = tl_cmd_prove(cli)
+    }
+    if cli.cmd == "prove-verify" {
+        out = tl_cmd_prove_verify(cli)
+    }
+    if !result_is_ok(out) {
+        let why: str = result_err_or(out, "internal error")
+        eprint(tl_tool() + ": " + why + "\n")
+        # Stage 112: a refused witness is recorded too — the same rule
+        # every hooked tool runs; read-only commands record nothing.
+        if cli.cmd == "witness" {
+            let _ar: Result[bool, str] = tl_audit_record_refused(
+            "tlog.witness", why)
+        }
+        return 1
+    }
+    return result_unwrap(out)
+}
+
+# ============================================================================
+# End of tools/hls-tlog.hls
+# ============================================================================
