@@ -2018,7 +2018,7 @@ Stage 120 fails a malformed table.
   (default 1 — benches are timing-sensitive, parallelism is for
   throughput, not for quiet numbers). The Stage 32 zero-cost-
   abstractions audit gate — the tool that previously carried the
-  hls-bench name — is now `tools/hls-bench-stdlib.py` (`make
+  hls-bench name — is now `hls-bench-stdlib` (`make
   bench-stdlib` unchanged), and this tool is the user-facing runner
   the roadmap's Stage 124 names.
 - **The gate** (`make bench-acceptance`, 8 sections, 84 checks)

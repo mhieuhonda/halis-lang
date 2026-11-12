@@ -1,0 +1,1238 @@
+# ============================================================================
+# tools/hls-bench-stdlib.hls — Stage 32 zero-cost abstractions audit gate,
+# in Halis — the native twin of tools/hls-bench-stdlib.py (named hls-bench
+# .py through v0.141.0-alpha; renamed when Stage 124 gave that name to the
+# criterion-style runner). Same CLI, same report lines, same exits:
+#
+#   hls-bench-stdlib [--threshold-us F] [--iters N] [--json REPORT]
+#                    [--only a,b,c] [--verbose] [--resume STATE.json]
+#
+# The law is the ROADMAP Stage 32 line: every public stdlib function
+# benchmarks under the threshold (default 1.0 µs/call). The harness
+# catalogues every public fn in std/*.hls, generates a driver that
+# calls it N times with representative inputs, compiles the driver
+# through bin/hlc + gcc -O2, runs it twice and keeps the lower wall
+# clock, then reports the median table sorted slowest-first.
+#
+# What changed with the native era (the .py's subprocess/clock lives
+# on as spawns):
+#   - the driver tree is a scratch dir INSIDE the repo
+#     (.hls-bench-tmp-<pid>/) so `import "std.*"` resolves by the
+#     compiler's own walk-up — no symlink dance;
+#   - a 0 ms reading bumps the iteration count 10x in place (the .py
+#     recursed), capped at 100M the same way;
+#   - the resume cache is still an atomic-replace JSON state file
+#     (a killed run never corrupts it).
+#
+# Exit contract: 0 all under threshold; 1 any function over; 2 any
+# function failed to compile/run (or usage).
+# ============================================================================
+
+import "std.str"
+import "std.result"
+import "std.json"
+import "std.env"
+
+# ----------------------------------------------------------------------------
+# Constants.
+# ----------------------------------------------------------------------------
+
+# The functions NOT directly microbenched, one per line — the .py's
+# SKIP_FUNCS set, verbatim groups: taint sinks, IO-effectful clocks,
+# quickcheck's Rand, the assertion/panic helpers, generics needing
+# explicit instantiation, constructors covered via higher-level
+# wrappers, network/process/Fs-effect work, sleep, macro-ops and the
+# work-doing algorithmic cores (hash rounds, deflate, parsers) where
+# a µs threshold measures the algorithm, not an abstraction.
+fn bs_skip_funcs() -> str {
+    return "\ntaint_check_len\ntaint_check_is_empty\ntaint_check_starts_with\ntaint_check_ends_with\ntaint_check_equals\ntaint_check_contains\ntaint_slice\ntaint_check_byte_at\ntaint_concat\ntaint_concat_clean\ntime_now_ms\ntime_now_seconds\ntime_stopwatch_start\ntime_stopwatch_lap\nqc_int\nqc_int_range\nqc_bool\nqc_str\nqc_str_n\nqc_list_int\nqc_byte\nqc_fail\ncsrf_generate_token\nsession_generate_id\nuuid_v7\nulid\nws_generate_key\nws_generate_mask_key\nassert_eq_int\nassert_eq_int_msg\nassert_ne_int\nassert_eq_str\nassert_eq_str_msg\nassert_ne_str\nassert_eq_bool\nassert_true\nassert_true_msg\nassert_false\nassert_false_msg\nassert_eq_float\nassert_eq_float_msg\nassert_ne_float\nassert_approx_eq_float\nassert_int_range\nassert_len_int\nassert_len_str\nmark_skip\npanic\npanic_msg\noption_unwrap\noption_unwrap_or\noption_is_some\noption_is_none\nresult_unwrap\nresult_unwrap_or\nresult_err_or\nresult_is_ok\nresult_is_err\njson_null\njson_bool\njson_int\njson_float\njson_str\njson_array\njson_object\nsimd_i32x4_from\nsimd_i32x4_splat\nsimd_u8x16_from_bytes\nurl_parse\nurl_parse_authority\nurl_stringify\nurl_query_stringify\nurl_query_parse\nset_str_new\nset_str_from_list\nset_str_add\nset_str_contains\nset_str_size\nset_str_to_list\nset_str_union\nset_str_intersect\nset_str_diff\nset_str_equal\nuuid_v4_deterministic\nuuid_v5_like\nuuid_format_v4\nuuid_format_v5\nhex_digit_value\ncsv_parse_default\ncsv_parse\ncsv_stringify_default\ncsv_stringify\nnew_empty_str_list\ncsv_quote_field\nhtml_tag\nsimd_check_i32\nsimd_check_u8\nsimd_i32x4_lane\nsimd_i32x4_set\nsimd_add32\nsimd_sub32\nsimd_mul32\nsimd_i32x4_add\nsimd_i32x4_sub\nsimd_i32x4_mul\nsimd_i32x4_min\nsimd_i32x4_max\nsimd_i32x4_reduce_add\nsimd_i32x4_reduce_min\nsimd_i32x4_reduce_max\nsimd_i32x4_shuffle\nsimd_i32x4_gather\nsimd_i32x4_scatter\nsimd_f64x2_lane\nsimd_f64x2_add\nsimd_f64x2_sub\nsimd_f64x2_mul\nsimd_f64x2_reduce_add\nsimd_f64x2_gather\nsimd_f64x2_scatter\nsimd_u8x16_byte\nsimd_u8x16_add\nsimd_u8x16_sub\nsimd_transform_sum_i32x4\nsimd_correlate8_sum_i32x4\ntcp_connect\ntcp_connect_or\ntcp_listen\ntcp_listen_or\nudp_open\nudp_open_or\ntls_get\ndns_lookup\ndns_lookup_or\necho_server_start\nhttp_get\nhttp_get_with_tls\nhttp_serve\nproc_exec_safe\nhlscli_main\nhlscli_run\nhlscli_mkdir\nhlscli_find_project_root\nhlscli_load_project\nman_install\ntar_read_file\nzip_read_file\ngzip_decode_file\nbuf_reader_from_file\nman_write\ngzip_decode\nzip_parse\nthread_sleep\nthread_sleep_short\nthread_sleep_long\ntime_sleep_ms_dur\ntime_timeout_ms\nstream_from_list_int\nasync_race_int\nasync_any_ok\ncli_match_overwrite_in_place\nsha1_hash\nsha1_hex\nsha1_pad\nsha1_compress_block\nsha1_message_schedule\ncookie_hmac_sha1\nsession_destroy_cookie\ncsrf_double_submit_cookie\nws_accept_key\nws_validate_accept\nws_handshake_response\nuuid_v7_from\ngzip_encode\narchive_crc32\njson_parse\nhlscli_build_parser\ndom_html_document\ndom_html_document_with_head\ndom_script_inline\ndom_style_inline\nopenapi_docs_html_url\nbuffer_new\nringbuf_str_new\nlog_epoch_ms_to_iso\ncookie_format_http_date\n"
+}
+
+# Curated per-function inputs (the .py's FUNC_INPUTS): functions whose
+# valid domain differs from the generic defaults. One "name=args" per
+# line; args are spliced verbatim into the call.
+fn bs_func_inputs() -> str {
+    return "ar_read_be32=\"ABCDEFGHIJKLMNOP\", 0\nar_read_le32=\"ABCDEFGHIJKLMNOP\", 0\nar_read_octal=\"0000644000\", 0, 7\nbase64_decode=\"aGVsbG8=\"\nbase64url_decode=\"aGVsbG8=\"\nhex_decode=\"deadbeef\"\nio_from_hex=\"deadbeef\"\nbits_set=5, 1, 1\nbits_byte=171, 3\nbits_from_bytes_be=[1,2,3,4,5,6,7,8]\nbits_from_bytes_le=[1,2,3,4,5,6,7,8]\ncolor_level_from_int=1\nhex_nibble=5\nlog_level_from_int=3\nlog_format_from_int=1\nlog_color_from_int=1\nprogress_color_from_int=1\nspinner_style_from_int=2\nstdio_from_int=0\nhasher_new=0\ncookie_last_index=\"a=b; c=d\", \";\"\ncsrf_double_submit_cookie=\"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq\", 3600\ndom_attr_true=\"disabled\"\ndom_attr_false=\"checked\"\ndom_element=\"div\", [], []\ndom_void=\"br\", []\nhash_read_u64_le=\"abcdefghijklmnop\", 0\nhash_read_u32_le=\"abcdefghijklmnop\", 0\ncityhash64_len_17_to_32=\"abcdefghijklmnopqrst\", 0\ncityhash64_len_33_to_64=\"abcdefghijklmnopqrstuvwxyz0123456789ABCD\", 0\ncityhash64_len_65_plus=\"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$\", 0\njson_parse=\"{\\\"a\\\":[1,2,3],\\\"b\\\":\\\"x\\\"}\"\nrouter_compile_pattern=\"/users/{id}/posts\"\nlist_max_float=[1.5, 2.5, 3.5]\nlist_min_float=[1.5, 2.5, 3.5]\nmath_avg_float=[1.5, 2.5, 3.5]\nsha1_block_word=\"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/\", 0\nsha1_message_schedule=\"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/\"\nsha1_compress_block=0, 0, 0, 0, 0, \"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/\"\nurlp_parse_port=\"8080\"\nulid_from=0, \"0123456789\"\nws_apply_mask=\"hello\", \"abcd\"\nws_close_payload=1000, \"bye\"\nenv_set_current_dir=\".\"\n"
+}
+
+# Representative inputs by parameter-type tuple (the .py's
+# SIGNATURE_INPUTS): "type,type=args" per line.
+fn bs_signature_inputs() -> str {
+    return "str=\"hello world\"\nstr,str=\"hello\", \"world\"\nstr,int=\"hello\", 3\nstr,int,int=\"hello\", 1, 3\nint=42\nint,int=7, 11\nint,int,int=5, 1, 10\nbool=true\nfloat=3.14\nfloat,float=1.5, 2.5\nlist[int]=[3,1,4,1,5,9,2,6,5,3,5]\nlist[str]=[\"a\",\"b\",\"c\",\"d\",\"e\"]\nlist[str],str=[\"a\",\"b\",\"c\"], \"b\"\nlist[int],int=[3,1,4,1,5], 4\nlist[str],str,str=[\"a\",\"b\",\"c\"], \"-\", \"x\"\nstr,int,str=\"x\", 5, \"0\"\n"
+}
+
+# ----------------------------------------------------------------------------
+# The catalogue.
+# ----------------------------------------------------------------------------
+
+struct FnSig {
+    module: str,
+    name: str,
+    params: list[str],
+    ret: str
+}
+
+# bs_is_ident_byte(b) — [A-Za-z0-9_].
+fn bs_is_ident_byte(b: int) -> bool {
+    if b >= 97 && b <= 122 {
+        return true
+    }
+    if b >= 65 && b <= 90 {
+        return true
+    }
+    if b >= 48 && b <= 57 {
+        return true
+    }
+    return b == 95
+}
+
+# bs_is_ident_start(b) — [A-Za-z_].
+fn bs_is_ident_start(b: int) -> bool {
+    if b >= 97 && b <= 122 {
+        return true
+    }
+    if b >= 65 && b <= 90 {
+        return true
+    }
+    return b == 95
+}
+
+# bs_skip_listed(name) — membership in the newline-delimited SKIP table.
+fn bs_skip_listed(name: str) -> bool {
+    return bs_skip_funcs().contains("\n" + name + "\n")
+}
+
+# bs_split_params(s) — split on TOP-LEVEL commas only (the deep-scan-20
+# fix: `map[str, str]` must survive as one parameter).
+fn bs_split_params(s: str) -> list[str] {
+    let parts: list[str] = []
+    let mut cur: str = ""
+    let mut depth: int = 0
+    let mut i: int = 0
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        if b == 40 || b == 91 || b == 60 {
+            depth = depth + 1
+        }
+        if b == 41 || b == 93 || b == 62 {
+            depth = depth - 1
+        }
+        if b == 44 && depth == 0 {
+            parts.push(cur.trim())
+            cur = ""
+        } else {
+            cur = cur + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    let tail: str = cur.trim()
+    if tail != "" {
+        parts.push(tail)
+    }
+    return parts
+}
+
+# bs_param_type(p) — the type half of "name: type" ("int" when bare).
+fn bs_param_type(p: str) -> str {
+    let at: int = p.find(":")
+    if at < 0 {
+        return "int"
+    }
+    return p.slice(at + 1, p.len()).trim()
+}
+
+# bs_parse_header(text, start) — one `fn ...` header (from the "fn" at
+# `start` to the "{" that opens the body), the .py's multiline regex as
+# a hand scan. Returns the FnSig or a sig with module "" when the text
+# at `start` is not a function header.
+fn bs_parse_header(module: str, text: str, start: int) -> FnSig {
+    let bad: FnSig = FnSig {
+        module: "", name: "", params: [], ret: ""
+    }
+    let mut i: int = start + 2
+    # "fn" then at least one space
+    if i >= text.len() || text.byte_at(i) != 32 {
+        return bad
+    }
+    while i < text.len() && text.byte_at(i) == 32 {
+        i = i + 1
+    }
+    # the name
+    if i >= text.len() || !bs_is_ident_start(text.byte_at(i)) {
+        return bad
+    }
+    let n0: int = i
+    while i < text.len() && bs_is_ident_byte(text.byte_at(i)) {
+        i = i + 1
+    }
+    let name: str = text.slice(n0, i)
+    # optional [T, E] generics
+    while i < text.len() && text.byte_at(i) == 32 {
+        i = i + 1
+    }
+    if i < text.len() && text.byte_at(i) == 91 {
+        while i < text.len() && text.byte_at(i) != 93 {
+            i = i + 1
+        }
+        if i < text.len() {
+            i = i + 1
+        }
+        while i < text.len() && text.byte_at(i) == 32 {
+            i = i + 1
+        }
+    }
+    # the parameter list
+    if i >= text.len() || text.byte_at(i) != 40 {
+        return bad
+    }
+    let p0: int = i + 1
+    while i < text.len() && text.byte_at(i) != 41 {
+        i = i + 1
+    }
+    if i >= text.len() {
+        return bad
+    }
+    let params_raw: str = text.slice(p0, i).trim()
+    let params: list[str] = []
+    if params_raw != "" {
+        let parts: list[str] = bs_split_params(params_raw)
+        let mut k: int = 0
+        while k < parts.len() {
+            params.push(bs_param_type(parts.get(k)))
+            k = k + 1
+        }
+    }
+    # the rest: optional "-> ret" and optional "uses ..." up to "{"
+    let mut j: int = i + 1
+    while j < text.len() && text.byte_at(j) != 123 {
+        j = j + 1
+    }
+    let rest: str = text.slice(i + 1, j).trim()
+    let mut ret: str = "void"
+    let arrow: int = rest.find("->")
+    if arrow >= 0 {
+        let after: str = rest.slice(arrow + 2, rest.len()).trim()
+        let uses_at: int = after.find(" uses ")
+        if uses_at >= 0 {
+            ret = after.slice(0, uses_at).trim()
+        } else {
+            ret = after.trim()
+        }
+    }
+    if ret == "" {
+        ret = "void"
+    }
+    return FnSig {
+        module: module, name: name, params: params, ret: ret
+    }
+}
+
+# bs_sort_strs(xs) — insertion sort (the .py's sorted()).
+fn bs_sort_strs(xs: list[str]) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < xs.len() {
+        out.push(xs.get(i))
+        i = i + 1
+    }
+    let mut a: int = 1
+    while a < out.len() {
+        let v: str = out.get(a)
+        let mut b: int = a - 1
+        while b >= 0 && out.get(b) > v {
+            out.set(b + 1, out.get(b))
+            b = b - 1
+        }
+        out.set(b + 1, v)
+        a = a + 1
+    }
+    return out
+}
+
+# bs_stem(p) — basename without the last extension.
+fn bs_stem(p: str) -> str {
+    let mut b: str = p
+    let mut i: int = b.len() - 1
+    while i >= 0 {
+        if b.byte_at(i) == 47 {
+            b = b.slice(i + 1, b.len())
+            break
+        }
+        i = i - 1
+    }
+    let mut j: int = b.len() - 1
+    while j > 0 {
+        if b.byte_at(j) == 46 {
+            return b.slice(0, j)
+        }
+        j = j - 1
+    }
+    return b
+}
+
+# bs_find_functions(std_dir) — every public fn in std/*.hls, the
+# catalogue in module order then source order.
+fn bs_find_functions(std_dir: str) -> list[FnSig] uses Fs {
+    let out: list[FnSig] = []
+    let names: list[str] = fs_read_dir(std_dir)
+    let hls: list[str] = []
+    let mut i: int = 0
+    while i < names.len() {
+        if names.get(i).ends_with(".hls") {
+            hls.push(names.get(i))
+        }
+        i = i + 1
+    }
+    let sorted_names: list[str] = bs_sort_strs(hls)
+    let mut n: int = 0
+    while n < sorted_names.len() {
+        let fname: str = sorted_names.get(n)
+        let module: str = bs_stem(fname)
+        let text: str = read_file(std_dir + "/" + fname)
+        let mut at: int = 0
+        while at < text.len() {
+            # a line start: the byte before is '\n' (or the file start)
+            let line_start: bool = at == 0 || text.byte_at(at - 1) == 10
+            if line_start && text.byte_at(at) == 102
+            && at + 1 < text.len() && text.byte_at(at + 1) == 110 {
+                let sig: FnSig = bs_parse_header(module, text, at)
+                if sig.module != "" && !sig.name.starts_with("_")
+                && !bs_skip_listed(sig.name) {
+                    out.push(sig)
+                }
+            }
+            at = at + 1
+        }
+        n = n + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# Driver generation — byte-identical laws to the .py's gen_driver.
+# ----------------------------------------------------------------------------
+
+# bs_table_lookup(table, key) — the "key=value" line tables.
+fn bs_table_lookup(table: str, key: str) -> str {
+    let lines: list[str] = table.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let l: str = lines.get(i)
+        let eq: int = l.find("=")
+        if eq > 0 && l.slice(0, eq) == key {
+            return l.slice(eq + 1, l.len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# bs_types_key(params) — "str,int" (the signature-table key).
+fn bs_types_key(params: list[str]) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < params.len() {
+        if i > 0 {
+            out = out + ","
+        }
+        out = out + params.get(i)
+        i = i + 1
+    }
+    return out
+}
+
+# bs_default_value(p) — the safe-zero fallback per type family; ""
+# when nothing generic can be constructed (a SKIP, never a failure).
+fn bs_default_value(p: str) -> str {
+    if p == "int" {
+        return "0"
+    }
+    if p == "bool" {
+        return "false"
+    }
+    if p == "float" {
+        return "0.0"
+    }
+    if p == "str" {
+        return "\"\""
+    }
+    if p.starts_with("list[") && p.ends_with("]") {
+        return "[]"
+    }
+    if p.starts_with("map[") && p.ends_with("]") {
+        return "map_new()"
+    }
+    return ""
+}
+
+# bs_gen_driver(sig, iters) — the driver source; "" when no safe
+# default can be synthesized for a parameter (the caller SKIPs).
+fn bs_gen_driver(sig: FnSig, iters: int) -> str {
+    let mut args: str = bs_table_lookup(bs_func_inputs(), sig.name)
+    if args == "" {
+        let sig_args: str = bs_table_lookup(bs_signature_inputs(),
+        bs_types_key(sig.params))
+        if sig_args != "" {
+            args = sig_args
+        }
+    }
+    if args == "" {
+        let vals: list[str] = []
+        let mut ok: bool = true
+        let mut i: int = 0
+        while i < sig.params.len() {
+            let d: str = bs_default_value(sig.params.get(i))
+            if d == "" {
+                ok = false
+            } else {
+                vals.push(d)
+            }
+            i = i + 1
+        }
+        if !ok {
+            return ""
+        }
+        let mut joined: str = ""
+        let mut k: int = 0
+        while k < vals.len() {
+            if k > 0 {
+                joined = joined + ", "
+            }
+            joined = joined + vals.get(k)
+            k = k + 1
+        }
+        args = joined
+    }
+
+    # the call statement: void as a statement, everything else bound
+    # to a typed slot (Halis has no untyped let).
+    let mut call_stmt: str = ""
+    if sig.ret == "void" {
+        call_stmt = "        " + sig.name + "(" + args + ")\n"
+    } else {
+        call_stmt = "        let v: " + sig.ret + " = "
+        + sig.name + "(" + args + ")\n"
+    }
+
+    # the sink keeps the loop alive (no DCE): arithmetic only.
+    let mut sink_stmt: str = ""
+    if sig.ret == "int" {
+        sink_stmt = "        sink = sink + (v - (v / 100) * 100)\n"
+    } else if sig.ret == "bool" {
+        sink_stmt = "        if v { sink = sink + 1 }\n"
+    } else if sig.ret == "str" {
+        sink_stmt = "        sink = sink + v.len()\n"
+    } else if sig.ret == "float" {
+        sink_stmt = "        if v > 0.0 { sink = sink + 1 }\n"
+    } else {
+        sink_stmt = "        sink = sink + 1\n"
+    }
+
+    # the full effect set (deep-scan-29): any function's effects are
+    # legal on main, so the checker never spuriously red-flags.
+    return "import \"std." + sig.module + "\"\n"
+    + "import \"std.time\"\n"
+    + "\n"
+    + "fn main() uses IO, Net, Rand, Proc, Conc {\n"
+    + "    let mut sink: int = 0\n"
+    + "    let t0: int = time_now_ms()\n"
+    + "    let mut i: int = 0\n"
+    + "    while i < " + iters.to_str() + " {\n"
+    + call_stmt
+    + sink_stmt
+    + "        i = i + 1\n"
+    + "    }\n"
+    + "    let t1: int = time_now_ms()\n"
+    + "    print(\"iters=" + iters.to_str() + " ms=\" + (t1 - t0).to_str()"
+    + " + \" sink=\" + sink.to_str())\n"
+    + "}\n"
+}
+
+# ----------------------------------------------------------------------------
+# Subprocesses — the repo's spawn_cap discipline.
+# ----------------------------------------------------------------------------
+
+struct BsRun {
+    code: int,
+    out: str,
+    err: str,
+    spawned: bool
+}
+
+fn bs_spawn(prog: str, cargs: list[str]) -> BsRun uses Proc {
+    let r: BsRun = BsRun {
+        code: -1, out: "", err: "", spawned: false
+    }
+    let pid: int = proc_spawn(prog, cargs, 2, 1, 1)
+    if pid < 1 {
+        return r
+    }
+    r.spawned = true
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    r.code = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    r.out = out
+    r.err = err
+    return r
+}
+
+fn bs_shell_quote(s: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < s.len() {
+        if s.byte_at(i) == 39 {
+            out = out + "'\\''"
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# The repo root — the binary's grandparent with a cwd walk-up fallback.
+# ----------------------------------------------------------------------------
+
+fn bs_is_repo_root(p: str) -> bool uses Fs {
+    return file_exists(p + "/std/str.hls")
+    && file_exists(p + "/core/option.hls")
+    && file_exists(p + "/SPEC.md")
+}
+
+fn bs_path_dirname(p: str) -> str {
+    let mut i: int = p.len() - 1
+    while i >= 0 {
+        if p.byte_at(i) == 47 {
+            if i == 0 {
+                return "/"
+            }
+            return p.slice(0, i)
+        }
+        i = i - 1
+    }
+    return "."
+}
+
+fn bs_repo_root() -> str uses Fs, Proc, Args {
+    let cwd_now: str = cwd_get()
+    if bs_is_repo_root(cwd_now) {
+        return cwd_now
+    }
+    let argv: list[str] = args()
+    if argv.len() > 0 && argv.get(0) != "" {
+        let cand: str = bs_path_dirname(bs_path_dirname(argv.get(0)))
+        if bs_is_repo_root(cand) {
+            return cand
+        }
+    }
+    let mut d: str = cwd_now
+    let mut guard: int = 0
+    while guard < 128 {
+        if bs_is_repo_root(d) {
+            return d
+        }
+        let parent: str = bs_path_dirname(d)
+        if parent == d {
+            return d
+        }
+        d = parent
+        guard = guard + 1
+    }
+    return d
+}
+
+# ----------------------------------------------------------------------------
+# One benchmark: compile, run twice, lower wall clock; the 10x bump on
+# a 0 ms reading (capped at 100M, the .py's recursion as a loop).
+# ----------------------------------------------------------------------------
+
+# bs_parse_ms(out) — the "ms=N" field of the driver's report line;
+# -1 when absent.
+fn bs_parse_ms(out: str) -> int {
+    let at: int = out.find("ms=")
+    if at < 0 {
+        return -1
+    }
+    let mut i: int = at + 3
+    let mut v: int = 0
+    let mut any: bool = false
+    while i < out.len() {
+        let b: int = out.byte_at(i)
+        if b >= 48 && b <= 57 {
+            v = v * 10 + (b - 48)
+            any = true
+        } else {
+            if any {
+                return v
+            }
+        }
+        i = i + 1
+    }
+    if any {
+        return v
+    }
+    return -1
+}
+
+# bs_clip_err(text) — the first 200 bytes of the first line (the .py's
+# stderr.decode().strip()[:200]).
+fn bs_clip_err(text: str) -> str {
+    let t: str = text.trim()
+    if t.len() > 200 {
+        return t.slice(0, 200)
+    }
+    return t
+}
+
+struct BsBench {
+    kind: int, # 0 measured, 1 skip, 2 failure
+    us: float,
+    err: str
+}
+
+fn bs_bench_one(root: str, tmpdir: str, sig: FnSig, iters: int) -> BsBench
+uses Fs, Proc {
+    let mut eff_iters: int = iters
+    let mut guard: int = 0
+    while guard < 16 {
+        guard = guard + 1
+        let src: str = bs_gen_driver(sig, eff_iters)
+        if src == "" {
+            return BsBench {
+                kind: 1, us: 0.0, err: ""
+            }
+        }
+        let hls_path: str = tmpdir + "/" + sig.name + ".hls"
+        let c_path: str = tmpdir + "/" + sig.name + ".c"
+        let bin_path: str = tmpdir + "/" + sig.name + ".bin"
+        write_file(hls_path, src)
+
+        # compile through the native compiler
+        let cargs1: list[str] = [hls_path, c_path]
+        let r1: BsRun = bs_spawn(root + "/bin/hlc", cargs1)
+        if r1.code != 0 {
+            return BsBench {
+                kind: 2, us: 0.0,
+                err: "hlc: " + bs_clip_err(r1.err)
+            }
+        }
+
+        # gcc -O2
+        let cargs2: list[str] = ["-O2", "-o", bin_path, c_path,
+        "-lm", "-pthread"]
+        let r2: BsRun = bs_spawn("gcc", cargs2)
+        if r2.code != 0 {
+            return BsBench {
+                kind: 2, us: 0.0,
+                err: "gcc: " + bs_clip_err(r2.err)
+            }
+        }
+
+        # run twice with cwd=tmpdir (an Fs-side-effect driver writes
+        # inside the scratch tree, never the repo); keep the lower ms
+        let mut best_ms: int = -1
+        let mut run_fail: str = ""
+        let mut r: int = 0
+        while r < 2 {
+            let home: str = cwd_get()
+            env_set_current_dir(tmpdir)
+            let rr: BsRun = bs_spawn(bin_path, [])
+            env_set_current_dir(home)
+            if rr.code != 0 {
+                run_fail = "run: " + bs_clip_err(rr.err)
+                break
+            }
+            let ms: int = bs_parse_ms(rr.out)
+            if ms < 0 {
+                run_fail = "no ms= in output: " + bs_clip_err(rr.out)
+                break
+            }
+            if best_ms < 0 || ms < best_ms {
+                best_ms = ms
+            }
+            r = r + 1
+        }
+        if run_fail != "" {
+            return BsBench {
+                kind: 2, us: 0.0, err: run_fail
+            }
+        }
+
+        if best_ms == 0 {
+            # too fast for the 1 ms clock: 10x the iterations, capped
+            # at 100M (int64 headroom); still 0 there = well under the
+            # threshold, declare victory.
+            if eff_iters >= 100000000 {
+                return BsBench {
+                    kind: 0, us: 0.0, err: ""
+                }
+            }
+            eff_iters = eff_iters * 10
+            continue
+        }
+        let us: float = (best_ms.to_float()) * 1000.0
+        / (eff_iters.to_float())
+        return BsBench {
+            kind: 0, us: us, err: ""
+        }
+    }
+    return BsBench {
+        kind: 2, us: 0.0, err: "run: iteration bump exhausted"
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Formatting helpers (the .py's f-string table).
+# ----------------------------------------------------------------------------
+
+# bs_fmt4(f) — "%.4f" for the non-negative numbers this gate prints.
+fn bs_fmt4(f: float) -> str {
+    let scaled: float = f * 10000.0 + 0.5
+    let digits: int = scaled.to_int()
+    let ip: int = digits / 10000
+    let fp: int = digits % 10000
+    let frac: str = str_pad_left(fp.to_str(), 4, "0")
+    return ip.to_str() + "." + frac
+}
+
+# bs_py_float(f) — python's repr shape for the header line ("1.0",
+# "0.5"): trim the display zeros, keep at least one fraction digit.
+fn bs_py_float(f: float) -> str {
+    let s: str = f.to_str()
+    # the runtime's Display is %.6f — trim trailing zeros, then a bare
+    # "." gets one zero back
+    let mut out: str = s
+    while out.ends_with("0") {
+        out = out.slice(0, out.len() - 1)
+    }
+    if out.ends_with(".") {
+        out = out + "0"
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# The JSON report + resume state — python's json.dumps(indent=2,
+# sort_keys=True) shape over std.json values.
+# ----------------------------------------------------------------------------
+
+# bs_json_pretty_at(v, indent) — the recursive pretty printer.
+fn bs_json_pretty_at(v: JsonValue, indent: int) -> str {
+    if json_is_null(v) {
+        return "null"
+    }
+    if json_is_bool(v) {
+        if json_bool_value(v) {
+            return "true"
+        }
+        return "false"
+    }
+    if json_is_int(v) {
+        return json_int_value(v).to_str()
+    }
+    if json_is_float(v) {
+        return bs_py_float(json_float_value(v))
+    }
+    if json_is_str(v) {
+        return "\"" + json_str_value(v) + "\""
+    }
+    let mut pad: str = ""
+    let mut k: int = 0
+    while k < indent {
+        pad = pad + "  "
+        k = k + 1
+    }
+    let in_pad: str = pad + "  "
+    if json_is_array(v) {
+        if v.arr.len() == 0 {
+            return "[]"
+        }
+        let mut out: str = "[\n"
+        let mut i: int = 0
+        while i < v.arr.len() {
+            out = out + in_pad + bs_json_pretty_at(v.arr.get(i),
+            indent + 1)
+            if i + 1 < v.arr.len() {
+                out = out + ","
+            }
+            out = out + "\n"
+            i = i + 1
+        }
+        return out + pad + "]"
+    }
+    if v.obj_keys.len() == 0 {
+        return "{}"
+    }
+    # objects dump with sorted keys (python's sort_keys=True)
+    let keys: list[str] = bs_sort_strs(v.obj_keys)
+    let mut out2: str = "{\n"
+    let mut n: int = 0
+    while n < keys.len() {
+        let key: str = keys.get(n)
+        out2 = out2 + in_pad + "\"" + key + "\": "
+        + bs_json_pretty_at(json_object_get(v, key), indent + 1)
+        if n + 1 < keys.len() {
+            out2 = out2 + ","
+        }
+        out2 = out2 + "\n"
+        n = n + 1
+    }
+    return out2 + pad + "}"
+}
+
+fn bs_json_pretty(v: JsonValue) -> str {
+    return bs_json_pretty_at(v, 0)
+}
+
+# ----------------------------------------------------------------------------
+# The records.
+# ----------------------------------------------------------------------------
+
+struct Rec {
+    module: str,
+    name: str,
+    us: float,
+    error: str # "" ok; "skipped: no safe default" skip; else failure
+}
+
+# bs_state_save(path, iters, recs) — the atomic-replace resume cache
+# (temp file + mv, a killed run never corrupts it).
+fn bs_state_save(path: str, iters: int, recs: list[Rec]) -> void
+uses Fs, Proc {
+    let root: JsonValue = json_object([], [])
+    # json_object(keys, vals) appends in order; python's dict keeps
+    # insertion order and sort_keys sorts on dump — our printer sorts.
+    root.obj_keys.push("iters")
+    root.obj_vals.push(json_int(iters))
+    let results: JsonValue = json_object([], [])
+    let mut i: int = 0
+    while i < recs.len() {
+        let rec: JsonValue = json_object([], [])
+        rec.obj_keys.push("fn")
+        rec.obj_vals.push(json_str(recs.get(i).name))
+        if recs.get(i).error == "" {
+            rec.obj_keys.push("us")
+            rec.obj_vals.push(json_float(recs.get(i).us))
+            rec.obj_keys.push("error")
+            rec.obj_vals.push(json_null())
+        } else if recs.get(i).error == "skipped: no safe default" {
+            rec.obj_keys.push("us")
+            rec.obj_vals.push(json_null())
+            rec.obj_keys.push("error")
+            rec.obj_vals.push(json_str(recs.get(i).error))
+        } else {
+            rec.obj_keys.push("us")
+            rec.obj_vals.push(json_null())
+            rec.obj_keys.push("error")
+            rec.obj_vals.push(json_str(recs.get(i).error))
+        }
+        results.obj_keys.push(recs.get(i).name)
+        results.obj_vals.push(rec)
+        i = i + 1
+    }
+    root.obj_keys.push("results")
+    root.obj_vals.push(results)
+    let tmp: str = path + ".tmp"
+    write_file(tmp, bs_json_pretty(root))
+    proc_exec("mv '" + bs_shell_quote(tmp) + "' '"
+    + bs_shell_quote(path) + "'")
+}
+
+# bs_state_lookup(state, name) — the cached {fn, us, error} record for
+# a name, or a Rec with module "" when not cached.
+fn bs_state_lookup(state: JsonValue, name: str) -> Rec {
+    let miss: Rec = Rec {
+        module: "", name: name, us: 0.0, error: ""
+    }
+    if !json_is_object(state) {
+        return miss
+    }
+    let results: JsonValue = json_object_get(state, "results")
+    if !json_is_object(results) {
+        return miss
+    }
+    if !json_object_has(results, name) {
+        return miss
+    }
+    let rec: JsonValue = json_object_get(results, name)
+    let us_v: JsonValue = json_object_get(rec, "us")
+    let err_v: JsonValue = json_object_get(rec, "error")
+    let mut err: str = ""
+    if json_is_str(err_v) {
+        err = json_str_value(err_v)
+    }
+    if json_is_float(us_v) {
+        return Rec {
+            module: "", name: name, us: json_float_value(us_v),
+            error: err
+        }
+    }
+    return Rec {
+        module: "", name: name, us: 0.0, error: err
+    }
+}
+
+# ----------------------------------------------------------------------------
+# main — the CLI (argparse grammar: --threshold-us, --iters, --json,
+# --only, --verbose, --resume).
+# ----------------------------------------------------------------------------
+
+fn bs_usage_error(msg: str) -> int uses IO, Exit {
+    eprintln("usage: hls-bench-stdlib [--threshold-us F] [--iters N]"
+    + " [--json REPORT] [--only a,b,c] [--verbose] [--resume STATE]")
+    eprintln("hls-bench-stdlib: error: " + msg)
+    return 2
+}
+
+fn bs_parse_int_arg(s: str) -> int uses IO, Exit {
+    let r: Result[int, str] = int_parse(s)
+    if result_is_err(r) {
+        exit(bs_usage_error("invalid int value: '" + s + "'") * 0
+        + 2)
+    }
+    return result_unwrap(r)
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let argv: list[str] = args()
+    let mut threshold: float = 1.0
+    let mut iters: int = 200000
+    let mut json_path: str = ""
+    let mut only: str = ""
+    let mut verbose: bool = false
+    let mut resume_path: str = ""
+
+    let mut i: int = 1
+    while i < argv.len() {
+        let mut a: str = argv.get(i)
+        if a == "--threshold-us" {
+            if i + 1 >= argv.len() {
+                return bs_usage_error("--threshold-us expects a value")
+            }
+            let fr: Result[float, str] = float_parse(argv.get(i + 1))
+            if result_is_err(fr) {
+                return bs_usage_error("invalid float value: '"
+                + argv.get(i + 1) + "'")
+            }
+            threshold = result_unwrap(fr)
+            i = i + 2
+        } else if a == "--iters" {
+            if i + 1 >= argv.len() {
+                return bs_usage_error("--iters expects a value")
+            }
+            iters = bs_parse_int_arg(argv.get(i + 1))
+            i = i + 2
+        } else if a == "--json" {
+            if i + 1 >= argv.len() {
+                return bs_usage_error("--json expects a value")
+            }
+            json_path = argv.get(i + 1)
+            i = i + 2
+        } else if a == "--only" {
+            if i + 1 >= argv.len() {
+                return bs_usage_error("--only expects a value")
+            }
+            only = argv.get(i + 1)
+            i = i + 2
+        } else if a == "--verbose" {
+            verbose = true
+            i = i + 1
+        } else if a == "--resume" {
+            if i + 1 >= argv.len() {
+                return bs_usage_error("--resume expects a value")
+            }
+            resume_path = argv.get(i + 1)
+            i = i + 2
+        } else {
+            return bs_usage_error("unrecognized argument: " + a)
+        }
+    }
+
+    let root: str = bs_repo_root()
+    env_set_current_dir(root)
+
+    # the native compiler must exist (the make rules guarantee it via
+    # the $(BIN)/hlc order-only prerequisite; a bare run bootstraps)
+    if !file_exists(root + "/bin/hlc") {
+        eprintln("ls-bench] bootstrapping native hlc...")
+        let cargs: list[str] = ["bootstrap"]
+        let bsr: BsRun = bs_spawn("make", cargs)
+        if bsr.code != 0 {
+            eprintln(bsr.err)
+        }
+        if !file_exists(root + "/bin/hlc") {
+            eprintln("ls-bench] FAIL: cannot bootstrap native hlc")
+            return 2
+        }
+    }
+
+    let mut fns: list[FnSig] = bs_find_functions(root + "/std")
+    if only != "" {
+        let allow: list[str] = only.split(",")
+        let filtered: list[FnSig] = []
+        let mut f: int = 0
+        while f < fns.len() {
+            let mut keep: bool = false
+            let mut a: int = 0
+            while a < allow.len() {
+                if allow.get(a).trim() == fns.get(f).name {
+                    keep = true
+                }
+                a = a + 1
+            }
+            if keep {
+                filtered.push(fns.get(f))
+            }
+            f = f + 1
+        }
+        fns = filtered
+    }
+    if fns.len() == 0 {
+        eprintln("ls-bench] FAIL: no functions to benchmark")
+        return 2
+    }
+
+    # ---- the resume cache -------------------------------------------------
+    let state: JsonValue = json_object([], [])
+    let mut have_state: bool = false
+    if resume_path != "" && file_exists(resume_path) {
+        let text: str = read_file(resume_path)
+        let pr: Result[JsonValue, str] = json_parse_result(text)
+        if result_is_err(pr) {
+            eprintln("ls-bench] cannot read resume state (parse error);"
+            + " starting fresh")
+        } else {
+            let prev: JsonValue = result_unwrap(pr)
+            let prev_iters: JsonValue = json_object_get(prev, "iters")
+            if json_is_int(prev_iters)
+            && json_int_value(prev_iters) == iters {
+                state.obj_keys = prev.obj_keys
+                state.obj_vals = prev.obj_vals
+                have_state = true
+                let results_v: JsonValue = json_object_get(prev, "results")
+                eprintln("ls-bench] resuming: "
+                + results_v.obj_keys.len().to_str()
+                + " cached result(s) from " + resume_path)
+            } else {
+                eprintln("ls-bench] resume cache has iters="
+                + json_int_value(prev_iters).to_str() + " != "
+                + iters.to_str() + "; starting fresh")
+            }
+        }
+    }
+
+    println("ls-bench] benchmarking " + fns.len().to_str()
+    + " stdlib functions (threshold=" + bs_py_float(threshold)
+    + " µs/call, iters=" + iters.to_str() + ")")
+
+    # ---- the scratch tree (inside the repo: std.* resolves by walk-up) ---
+    let tmpdir: str = root + "/.hls-bench-tmp-" + proc_pid().to_str()
+    proc_exec("rm -rf '" + bs_shell_quote(tmpdir) + "'")
+    proc_exec("mkdir -p '" + bs_shell_quote(tmpdir) + "'")
+
+    let recs: list[Rec] = []
+    let mut fi: int = 0
+    while fi < fns.len() {
+        let sig: FnSig = fns.get(fi)
+        let mut rec: Rec = Rec {
+            module: sig.module, name: sig.name,
+            us: 0.0, error: ""
+        }
+        if have_state {
+            let cached: Rec = bs_state_lookup(state, sig.name)
+            if cached.module == "" && cached.error != ""
+            || cached.module == "" && cached.us != 0.0
+            || cached.module == "" && json_object_has(
+            json_object_get(state, "results"), sig.name) {
+                rec.us = cached.us
+                rec.error = cached.error
+                if verbose {
+                    println("  ... " + sig.module + "." + sig.name
+                    + ": cached")
+                }
+                recs.push(rec)
+                fi = fi + 1
+                continue
+            }
+        }
+        if verbose {
+            println("  ... " + sig.module + "." + sig.name + "("
+            + str_join(sig.params, ", ") + ") -> " + sig.ret)
+        }
+        let mut b: BsBench = bs_bench_one(root, tmpdir, sig, iters)
+        if b.kind == 1 {
+            if verbose {
+                println("    SKIP (no safe default for a parameter type)")
+            }
+            rec.error = "skipped: no safe default"
+        } else if b.kind == 2 {
+            if verbose {
+                println("    FAIL (" + b.err + ")")
+            }
+            rec.error = b.err
+        } else {
+            if verbose {
+                println("    " + bs_fmt4(b.us) + " µs/call")
+            }
+            rec.us = b.us
+        }
+        recs.push(rec)
+        if resume_path != "" {
+            bs_state_save(resume_path, iters, recs)
+        }
+        fi = fi + 1
+    }
+
+    proc_exec("rm -rf '" + bs_shell_quote(tmpdir) + "'")
+
+    # ---- the table: measured, slowest first --------------------------------
+    let measured: list[Rec] = []
+    let mut mi: int = 0
+    while mi < recs.len() {
+        if recs.get(mi).error == "" {
+            measured.push(recs.get(mi))
+        }
+        mi = mi + 1
+    }
+    let mut a: int = 1
+    while a < measured.len() {
+        let v: Rec = measured.get(a)
+        let mut b: int = a - 1
+        while b >= 0 && measured.get(b).us < v.us {
+            measured.set(b + 1, measured.get(b))
+            b = b - 1
+        }
+        measured.set(b + 1, v)
+        a = a + 1
+    }
+
+    let failures: list[Rec] = []
+    let skipped: list[Rec] = []
+    let mut ri: int = 0
+    while ri < recs.len() {
+        let e: str = recs.get(ri).error
+        if e != "" && e != "skipped: no safe default" {
+            failures.push(recs.get(ri))
+        } else if e != "" {
+            skipped.push(recs.get(ri))
+        }
+        ri = ri + 1
+    }
+
+    println("")
+    println("========================================================================")
+    println("function                                          µs/call    status")
+    println("========================================================================")
+    let mut ti: int = 0
+    while ti < measured.len() {
+        let r: Rec = measured.get(ti)
+        let mut status: str = "OK"
+        if r.us > threshold {
+            status = "SLOW"
+        }
+        let mut nm: str = r.module + "." + r.name
+        if nm.len() > 47 {
+            nm = nm.slice(0, 44) + "..."
+        }
+        println(str_pad_right(nm, 48, " ") + " "
+        + str_pad_left(bs_fmt4(r.us), 10, " ") + "  "
+        + str_pad_left(status, 8, " "))
+        ti = ti + 1
+    }
+    println("------------------------------------------------------------------------")
+    if failures.len() > 0 {
+        println("")
+        println(failures.len().to_str()
+        + " function(s) failed to compile or run:")
+        let mut x: int = 0
+        while x < failures.len() {
+            println("  " + failures.get(x).module + "."
+            + failures.get(x).name + ": " + failures.get(x).error)
+            x = x + 1
+        }
+    }
+
+    let mut n_slow: int = 0
+    let mut si: int = 0
+    while si < measured.len() {
+        if measured.get(si).us > threshold {
+            n_slow = n_slow + 1
+        }
+        si = si + 1
+    }
+
+    println("")
+    println(measured.len().to_str() + " measured, " + n_slow.to_str()
+    + " over threshold, " + skipped.len().to_str()
+    + " skipped (no safe default), " + failures.len().to_str()
+    + " failed.")
+
+    if json_path != "" {
+        let report: JsonValue = json_object([], [])
+        report.obj_keys.push("iters")
+        report.obj_vals.push(json_int(iters))
+        report.obj_keys.push("results")
+        let rarr: JsonValue = json_array([])
+        let mut xi: int = 0
+        while xi < recs.len() {
+            let rec: JsonValue = json_object([], [])
+            rec.obj_keys.push("error")
+            if recs.get(xi).error == "" {
+                rec.obj_vals.push(json_null())
+            } else {
+                rec.obj_vals.push(json_str(recs.get(xi).error))
+            }
+            rec.obj_keys.push("fn")
+            rec.obj_vals.push(json_str(recs.get(xi).name))
+            rec.obj_keys.push("module")
+            rec.obj_vals.push(json_str(recs.get(xi).module))
+            rec.obj_keys.push("us")
+            if recs.get(xi).error == "" {
+                rec.obj_vals.push(json_float(recs.get(xi).us))
+            } else {
+                rec.obj_vals.push(json_null())
+            }
+            rarr.arr.push(rec)
+            xi = xi + 1
+        }
+        report.obj_vals.push(rarr)
+        report.obj_keys.push("summary")
+        let summ: JsonValue = json_object([], [])
+        summ.obj_keys.push("failed")
+        summ.obj_vals.push(json_int(failures.len()))
+        summ.obj_keys.push("measured")
+        summ.obj_vals.push(json_int(measured.len()))
+        summ.obj_keys.push("over_threshold")
+        summ.obj_vals.push(json_int(n_slow))
+        report.obj_vals.push(summ)
+        report.obj_keys.push("threshold_us")
+        report.obj_vals.push(json_float(threshold))
+        write_file(json_path, bs_json_pretty(report))
+        println("full report written to " + json_path)
+    }
+
+    if failures.len() > 0 {
+        return 2
+    }
+    if n_slow > 0 {
+        return 1
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# End of tools/hls-bench-stdlib.hls
+# ============================================================================
