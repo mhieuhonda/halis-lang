@@ -173,11 +173,41 @@ $(BIN)/ll_validate: tools/ll_validate.hls $(wildcard std/*.hls) $(wildcard core/
 	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
 	@rm -f $@.c
 
-# The suite gates that drive these tools build them first.
-$(BIN)/acc-suite_02_differential: $(BIN)/ll_validate
-$(BIN)/acc-suite_03_selfhost: $(BIN)/hlpgo
+# The suite gates that drive these tools build them first. Every
+# binary a gate spawns rides as a prerequisite of the gate itself, so
+# a standalone run (run_one_suite.sh builds bin/acc-<gate> alone)
+# provisions its whole fleet -- rc=127 legs are missing deps, and a
+# gate must never depend on what an earlier job happened to leave in
+# bin/.
+$(BIN)/acc-suite_02_differential: $(BIN)/ll_validate $(BIN)/hls-sbom $(BIN)/hls-repro $(BIN)/hlboot
+$(BIN)/acc-suite_03_selfhost: $(BIN)/hlpgo $(BIN)/hlcov $(BIN)/hltest $(BIN)/hlboot $(BIN)/hls-fuzz
 $(BIN)/acc-suite_05_backends: $(BIN)/hlaarch64
 $(BIN)/acc-suite_06_advanced: $(BIN)/hlriscv
+
+# hltest -- the in-language test runner, in Halis (the native twin of
+# the Python hltest that retired; same CLI, same report, same snapshot
+# stores, same exits). Discovery rides the compiler's own front-end
+# (tools/hlfront.hls); every test invocation runs in a fresh
+# bin/hlboot child -- the .py years' fresh-Interp law with a process
+# boundary for the isolation and the pipes for the stdout capture.
+$(BIN)/hltest: tools/hltest.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hltest] hlc compiles the test runner (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hltest.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
+# hls-fuzz -- the AST-level differential fuzzer, in Halis (the native
+# twin of the Python hls-fuzz that retired; same grammar, same
+# differential law — evaluator vs compiler, byte for byte — same
+# minimiser, same report lines). The Stage 134 mutator rides inside
+# (the seeder imports a stripped copy of this file, fn main cut).
+$(BIN)/hls-fuzz: tools/hls-fuzz.hls $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hls-fuzz] hlc compiles the differential fuzzer (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hls-fuzz.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
 
 # hls-lts — the LTS policy tool, in Halis (the native twin of the
 # Python hls-lts that retired; the render it pins is the committed
@@ -681,14 +711,14 @@ lint-fix-acceptance: $(BIN)/acc-lint_fix bin/hlc
 # Stage 119 (v0.138.0-alpha): snapshot-testing acceptance gate.
 # The differential half compiles the stage's ok fixture on
 # bin/hlc and gcc, so the native build is a prerequisite.
-snapshot-acceptance: $(BIN)/acc-snapshot bin/hlc
+snapshot-acceptance: $(BIN)/acc-snapshot bin/hlc $(BIN)/hltest $(BIN)/hlboot
 	@echo "[Stage 119 acceptance] running tests/acc/snapshot_acceptance.hls..."
 	@$(BIN)/acc-snapshot
 
 # Stage 120 (v0.139.0-alpha): parameterised (table-driven) testing
 # acceptance gate. The differential half compiles the stage's ok
 # fixture on bin/hlc and gcc, so the native build is a prerequisite.
-cases-acceptance: $(BIN)/acc-cases bin/hlc
+cases-acceptance: $(BIN)/acc-cases bin/hlc $(BIN)/hltest $(BIN)/hlboot
 	@echo "[Stage 120 acceptance] running tests/acc/cases_acceptance.hls..."
 	@$(BIN)/acc-cases
 
@@ -791,7 +821,7 @@ rt-acceptance: $(BIN)/acc-rt $(BIN)/hls-rt bin/hlc
 # (stdout/trace/exit identical across backends for the whole fixture
 # set, hlfmt/hllint/checker green, no litter). The gate compiles on
 # bin/hlc and gcc, so the native build is a prerequisite.
-det-acceptance: $(BIN)/acc-det $(BIN)/hls-det bin/hlc
+det-acceptance: $(BIN)/acc-det $(BIN)/hls-det bin/hlc $(BIN)/hltest $(BIN)/hlboot
 	@echo "[Stage 127 acceptance] running tests/acc/det_acceptance.hls..."
 	@$(BIN)/acc-det
 	@echo "ACCEPTANCE OK: Stage 127 -- deterministic-scheduler option (testing concurrency)"

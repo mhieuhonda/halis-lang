@@ -7,7 +7,7 @@
 #   U=1 adds --update-snapshots (Stage 119): record new and changed
 #   assert_snapshot values, prune obsolete ones. The default verifies
 #   the committed stores and fails on any drift.
-hltest:
+hltest: $(BIN)/hltest $(BIN)/hlboot
 	# deep-scan-23: the session file-store tests write .sess files to
 	# /tmp/hls_session_test; create it (session-acceptance already did
 	# this) and clear stale files so runs stay deterministic.
@@ -18,20 +18,20 @@ hltest:
 	  if [ -n "$(JUNIT)" ]; then J="--junit $(JUNIT)"; fi; \
 	  if [ -n "$(J)" ]; then P="-j $(J)"; fi; \
 	  if [ -n "$(U)" ]; then UP="--update-snapshots"; fi; \
-	  $(PYTHON) tools/hltest.py -r $$P $$G $$J $$UP $$F
+	  $(BIN)/hltest -r $$P $$G $$J $$UP $$F
 
 # hls-fuzz: AST-level differential fuzzer. Default 60s smoke run;
 # CI runs `make fuzz-acceptance` for the 1-hour acceptance run.
-fuzz:
+fuzz: $(BIN)/hls-fuzz
 	@if [ -n "$(SEED)" ]; then S="--seed $(SEED)"; else S=""; fi; \
-	$(PYTHON) tools/hls-fuzz.py --time $(or $(TIME),60) $$S
+	$(BIN)/hls-fuzz --time $(or $(TIME),60) $$S
 
 # fuzz-acceptance: the Stage 18 acceptance criterion — fuzzer runs for
 # 1 hour without finding any semantic discrepancy between the
 # interpreter and the native compiler.
-fuzz-acceptance:
+fuzz-acceptance: $(BIN)/hls-fuzz
 	@echo "[Stage 18 acceptance] running hls-fuzz for 1 hour..."
-	@$(PYTHON) tools/hls-fuzz.py --time 3600
+	@$(BIN)/hls-fuzz --time 3600
 	@echo "ACCEPTANCE OK: 1-hour fuzz run produced no divergences"
 
 # hlcov: HLIR-level coverage report for a single file.

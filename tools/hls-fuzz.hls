@@ -1,0 +1,1347 @@
+# ============================================================================
+# tools/hls-fuzz.hls — the AST-level differential fuzzer, in Halis (the
+# native twin of the Python hls-fuzz that retired; same grammar, same
+# differential law, same report lines, same exits).
+# ----------------------------------------------------------------------------
+# The fuzzer generates small random HLS programs (a tiny grammar tuned
+# to the surface that matters: arithmetic, control flow, strings),
+# runs each program TWO ways:
+#
+#   (1) the evaluator:   bin/hlboot prog.hls
+#   (2) the compiler:    bin/hlboot src/hlc.hls -> out.c -> gcc -> run
+#
+# and compares stdout + exit code byte for byte. Any divergence is a
+# soundness bug in EITHER implementation; the fuzzer delta-minimises
+# the failing program (one statement at a time, the divergence
+# preserved) and writes the case to fuzz-corpus/.
+#
+# Stage 134 rides along: --seed-corpus points the fuzzer at a corpus
+# seeded from real packages; a --seed-ratio fraction of the programs
+# comes from the corpus, mutation included — the same eight ops the
+# seeder applies, carried here so one loader serves both sides of the
+# corpus boundary (the seeder imports this file's mutator, fn main
+# cut). The counters report the two populations separately.
+#
+# The PRNG is the tool's own (a splitmix64 stream) — the .py years
+# rode CPython's Mersenne Twister; --seed is still the determinism
+# knob, and the corpus the fuzzer explores is a function of the seed
+# exactly as before.
+#
+# Usage:
+#   bin/hls-fuzz --time 3600                # the 1-hour acceptance law
+#   bin/hls-fuzz --seed 42 --n 1000         # deterministic
+#   bin/hls-fuzz --seed-corpus fuzz-corpus/seed --time 600
+#   bin/hls-fuzz --minimize case.hls
+#
+# Exit codes: 0 no divergence, 1 one or more, 2 usage.
+# ============================================================================
+
+import "std.bits"
+
+# ----------------------------------------------------------------------------
+# The small helpers the whole tool rides (self-contained: the fuzzer
+# links no other tool — one main per binary).
+# ----------------------------------------------------------------------------
+
+# fz_dir_of(path) — everything before the last "/".
+fn fz_dir_of(path: str) -> str {
+    let mut i: int = path.len() - 1
+    while i >= 0 {
+        if path.byte_at(i) == 47 {
+            if i == 0 {
+                return "/"
+            }
+            return path.slice(0, i)
+        }
+        i = i - 1
+    }
+    return "."
+}
+
+# fz_join(dir, rel) — one slash between them.
+fn fz_join(dir: str, rel: str) -> str {
+    if dir == "." {
+        return rel
+    }
+    if dir.len() == 0 {
+        return rel
+    }
+    if dir.byte_at(dir.len() - 1) == 47 {
+        return dir + rel
+    }
+    return dir + "/" + rel
+}
+
+# fz_clip(s, n) — the first n bytes, or fewer.
+fn fz_clip(s: str, n: int) -> str {
+    if s.len() <= n {
+        return s
+    }
+    return s.slice(0, n)
+}
+
+# the piped-child capture (the hlcov law)
+struct HtRun {
+    code: int,
+    out: str,
+    err: str,
+    spawned: bool
+}
+
+fn ht_spawn(prog: str, cargs: list[str]) -> HtRun uses Proc {
+    let r: HtRun = HtRun {
+        code: -1,
+        out: "",
+        err: "",
+        spawned: false
+    }
+    let pid: int = proc_spawn(prog, cargs, 2, 1, 1)
+    if pid < 1 {
+        return r
+    }
+    r.spawned = true
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    r.code = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    r.out = out
+    r.err = err
+    return r
+}
+
+# ----------------------------------------------------------------------------
+# The PRNG (splitmix64).
+# ----------------------------------------------------------------------------
+
+# A 31-bit xorshift stream — every intermediate stays inside int64
+# (Halis arithmetic is checked; a 64-bit mixer would overflow-panic),
+# and --seed pins the stream exactly.
+struct Rng {
+    state: int
+}
+
+fn rng_next(r: Rng) -> int {
+    let mut x: int = bits_and(r.state, 2147483647)
+    x = bits_and(bits_xor(x, bits_and(x * 8192, 2147483647)), 2147483647)
+    x = bits_and(bits_xor(x, bits_shr(x, 17)), 2147483647)
+    x = bits_and(bits_xor(x, bits_and(x * 32, 2147483647)), 2147483647)
+    r.state = x
+    return x
+}
+
+# rng_below(r, n) — unbiased [0, n).
+fn rng_below(r: Rng, n: int) -> int {
+    if n <= 0 {
+        return 0
+    }
+    return rng_next(r) % n
+}
+
+# rng_pick(r, items) — one list element.
+fn rng_pick(r: Rng, items: list[str]) -> str {
+    if items.len() == 0 {
+        return ""
+    }
+    return items.get(rng_below(r, items.len()))
+}
+
+# rng_unit(r) — [0, 10000) as the .py's random() stand-in.
+fn rng_unit(r: Rng) -> int {
+    return rng_below(r, 10000)
+}
+
+# rng_range(r, lo, hi) — inclusive [lo, hi].
+fn rng_range(r: Rng, lo: int, hi: int) -> int {
+    if hi < lo {
+        return lo
+    }
+    return lo + rng_below(r, hi - lo + 1)
+}
+
+# ----------------------------------------------------------------------------
+# The generator — a SMALL but type-correct HLS program.
+# ----------------------------------------------------------------------------
+# Every generated program is type-correct by construction: a main()
+# that prints integer results, fresh variable names only (the
+# use-after-move rule can never fire on a generator bug).
+
+struct Gen {
+    rng: Rng,
+    next_id: int,
+    live_ints: list[str],
+    live_strs: list[str]
+}
+
+fn gen_fresh(g: Gen, prefix: str) -> str {
+    g.next_id = g.next_id + 1
+    return prefix + g.next_id.to_str()
+}
+
+fn gen_int_lit(g: Gen) -> str {
+    let r: int = rng_unit(g.rng)
+    if r < 1000 {
+        return "0"
+    }
+    if r < 1500 {
+        return "1"
+    }
+    if r < 2000 {
+        return "-1"
+    }
+    if r < 2500 {
+        return "9223372036854775807"
+    }
+    if r < 3000 {
+        return "-9223372036854775808"
+    }
+    return rng_range(g.rng, -1000, 1000).to_str()
+}
+
+fn gen_str_lit(g: Gen) -> str {
+    let n: int = rng_range(g.rng, 0, 8)
+    let alphabet: str = "abcdefghijklmnopqrstuvwxyz"
+    let mut s: str = ""
+    let mut i: int = 0
+    while i < n {
+        let k: int = rng_below(g.rng, 26)
+        s = s + alphabet.slice(k, k + 1)
+        i = i + 1
+    }
+    return "\"" + s + "\""
+}
+
+fn gen_int_expr(g: Gen, depth: int) -> str {
+    if depth <= 0 || rng_unit(g.rng) < 3000 {
+        if g.live_ints.len() > 0 && rng_unit(g.rng) < 6000 {
+            return rng_pick(g.rng, g.live_ints)
+        }
+        return gen_int_lit(g)
+    }
+    let mut op: str = rng_pick(g.rng, ["+", "-", "*", "%"])
+    if rng_unit(g.rng) < 2000 {
+        op = "/"
+    }
+    let a: str = gen_int_expr(g, depth - 1)
+    let b: str = gen_int_expr(g, depth - 1)
+    return "(" + a + " " + op + " " + b + ")"
+}
+
+fn gen_bool_expr(g: Gen, depth: int) -> str {
+    if depth <= 0 || rng_unit(g.rng) < 4000 {
+        if g.live_ints.len() > 0 && rng_unit(g.rng) < 5000 {
+            let a: str = rng_pick(g.rng, g.live_ints)
+            let b: str = gen_int_expr(g, 0)
+            let op: str = rng_pick(g.rng, ["<", "<=", ">", ">=", "==", "!="])
+            return "(" + a + " " + op + " " + b + ")"
+        }
+        if rng_unit(g.rng) < 5000 {
+            return "true"
+        }
+        return "false"
+    }
+    let op: str = rng_pick(g.rng, ["&&", "||"])
+    let a: str = gen_bool_expr(g, depth - 1)
+    let b: str = gen_bool_expr(g, depth - 1)
+    return "(" + a + " " + op + " " + b + ")"
+}
+
+fn gen_stmt(g: Gen, depth: int) -> str {
+    let r: int = rng_unit(g.rng)
+    if r < 4000 {
+        let name: str = gen_fresh(g, "v")
+        let expr: str = gen_int_expr(g, hfz_min3(depth))
+        g.live_ints.push(name)
+        return "    let " + name + ": int = " + expr
+    }
+    if r < 5500 {
+        let name2: str = gen_fresh(g, "s")
+        let expr2: str = gen_str_lit(g)
+        g.live_strs.push(name2)
+        return "    let " + name2 + ": str = " + expr2
+    }
+    if r < 7500 && g.live_ints.len() > 0 {
+        let v: str = rng_pick(g.rng, g.live_ints)
+        return "    println(" + v + ".to_str())"
+    }
+    if r < 8500 && g.live_strs.len() > 0 {
+        let v2: str = rng_pick(g.rng, g.live_strs)
+        return "    println(" + v2 + ")"
+    }
+    if r < 9500 {
+        let cond: str = gen_bool_expr(g, hfz_min2(depth))
+        let mut then_s: str = "    let _z: int = 0"
+        let mut els_s: str = "    let _w: int = 0"
+        if depth > 0 {
+            then_s = gen_stmt(g, depth - 1)
+            els_s = gen_stmt(g, depth - 1)
+        }
+        return "    if " + cond + " {\n" + then_s + "\n    } else {\n" + els_s + "\n    }"
+    }
+    # a bounded while loop — the counter starts at 0 and climbs to a
+    # constant, so the program terminates
+    let counter: str = gen_fresh(g, "i")
+    let limit: int = rng_range(g.rng, 0, 5)
+    let mut body: str = "    let _q: int = 0"
+    if g.live_ints.len() > 0 {
+        let v3: str = rng_pick(g.rng, g.live_ints)
+        body = "    " + v3 + " = " + v3 + " + 1"
+    }
+    return "    let mut " + counter + ": int = 0\n    while " + counter + " < " + limit.to_str() + " {\n" + body + "\n        " + counter + " = " + counter + " + 1\n    }"
+}
+
+fn hfz_min3(d: int) -> int {
+    if d < 3 {
+        return d
+    }
+    return 3
+}
+
+fn hfz_min2(d: int) -> int {
+    if d < 2 {
+        return d
+    }
+    return 2
+}
+
+fn gen_program(g: Gen) -> str {
+    let n_stmts: int = rng_range(g.rng, 3, 10)
+    let mut body: str = ""
+    let mut i: int = 0
+    while i < n_stmts {
+        if i > 0 {
+            body = body + "\n"
+        }
+        body = body + gen_stmt(g, 3)
+        i = i + 1
+    }
+    return "fn main() -> int uses IO {\n" + body + "\n    return 0\n}\n"
+}
+
+# ----------------------------------------------------------------------------
+# The mutator (Stage 134) — lexical ops applied OUTSIDE string literals
+# and comments, the same eight the seeder applies.
+# ----------------------------------------------------------------------------
+
+fn mut_int_corners() -> list[str] {
+    return["0", "1", "-1", "2", "10", "100", "9223372036854775807", "-9223372036854775808", "65536", "1000000007"]
+}
+
+fn mut_str_corners() -> list[str] {
+    return["", "a", "xyz", "héllo¥", "hello world", "aaaaaaaaaa"]
+}
+
+# hfz_mask(src) — a copy with string contents and comments blanked;
+# lexical scans never touch them, positions preserved.
+fn hfz_mask(src: str) -> str {
+    let n: int = src.len()
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < n {
+        let c: int = src.byte_at(i)
+        if c == 34 {
+            # keep the quote, blank the contents
+            out = out + "\""
+            i = i + 1
+            while i < n && src.byte_at(i) != 34 {
+                out = out + " "
+                if src.byte_at(i) == 92 && i + 1 < n {
+                    out = out + " "
+                    i = i + 1
+                }
+                i = i + 1
+            }
+            if i < n {
+                out = out + "\""
+                i = i + 1
+            }
+            continue
+        }
+        if c == 35 {
+            while i < n && src.byte_at(i) != 10 {
+                out = out + " "
+                i = i + 1
+            }
+            continue
+        }
+        out = out + src.slice(i, i + 1)
+        i = i + 1
+    }
+    return out
+}
+
+fn hfz_is_word_byte(b: int) -> bool {
+    return(b >= 97 && b <= 122) || (b >= 65 && b <= 90)
+    || (b >= 48 && b <= 57) || b == 95
+}
+
+# hfz_int_spans(masked) — the \b\d+\b spans.
+fn hfz_int_spans(masked: str) -> list[list[int]] {
+    let out: list[list[int]] = []
+    let n: int = masked.len()
+    let mut i: int = 0
+    while i < n {
+        let b: int = masked.byte_at(i)
+        if b >= 48 && b <= 57 {
+            let before_ok: bool = i == 0 || !hfz_is_word_byte(masked.byte_at(i - 1))
+            let mut j: int = i
+            while j < n && masked.byte_at(j) >= 48 && masked.byte_at(j) <= 57 {
+                j = j + 1
+            }
+            let after_ok: bool = j >= n || !hfz_is_word_byte(masked.byte_at(j))
+            if before_ok && after_ok {
+                out.push([i, j])
+            }
+            i = j
+            continue
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# hfz_bool_spans(masked) — the \b(true|false)\b spans, with the word.
+fn hfz_bool_spans(masked: str) -> list[list[int]] {
+    let out: list[list[int]] = []
+    let n: int = masked.len()
+    let mut i: int = 0
+    while i < n {
+        let mut two: str = ""
+        if i + 4 <= n {
+            two = masked.slice(i, i + 4)
+        }
+        let mut five: str = ""
+        if i + 5 <= n {
+            five = masked.slice(i, i + 5)
+        }
+        if two == "true" && (i == 0 || !hfz_is_word_byte(masked.byte_at(i - 1)))
+        && (i + 4 >= n || !hfz_is_word_byte(masked.byte_at(i + 4))) {
+            out.push([i, i + 4])
+            i = i + 4
+            continue
+        }
+        if five == "false" && (i == 0 || !hfz_is_word_byte(masked.byte_at(i - 1)))
+        && (i + 5 >= n || !hfz_is_word_byte(masked.byte_at(i + 5))) {
+            out.push([i, i + 5])
+            i = i + 5
+            continue
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# hfz_binop_spans(masked) — the operator spans of the .py's _BINOP_RE:
+# an op whose nearest non-space left neighbour is word/)/] and whose
+# nearest non-space right neighbour is word/(/"/[. Each span carries
+# its swap partner: [start, end, partner].
+fn hfz_binop_spans(masked: str) -> list[list[str]] {
+    let out: list[list[str]] = []
+    let n: int = masked.len()
+    let mut i: int = 0
+    while i < n {
+        let mut two: str = ""
+        if i + 2 <= n {
+            two = masked.slice(i, i + 2)
+        }
+        let mut op: str = ""
+        let mut oplen: int = 0
+        let mut partner: str = ""
+        if two == "==" || two == "!=" || two == "<=" || two == ">=" || two == "&&" || two == "||" {
+            op = two
+            oplen = 2
+        } else {
+            let c: int = masked.byte_at(i)
+            if c == 43 || c == 45 || c == 42 || c == 47 || c == 37 || c == 60 || c == 62 {
+                op = masked.slice(i, i + 1)
+                oplen = 1
+            }
+        }
+        if op != "" {
+            # the left neighbour
+            let mut j: int = i - 1
+            while j >= 0 && masked.byte_at(j) == 32 {
+                j = j - 1
+            }
+            let left_ok: bool = j >= 0 && (hfz_is_word_byte(masked.byte_at(j))
+            || masked.byte_at(j) == 41 || masked.byte_at(j) == 93)
+            # the right neighbour
+            let mut k: int = i + oplen
+            while k < n && masked.byte_at(k) == 32 {
+                k = k + 1
+            }
+            let rk: int = masked.byte_at(k)
+            let right_ok: bool = k < n && (hfz_is_word_byte(rk) || rk == 40
+            || rk == 34 || rk == 91)
+            if left_ok && right_ok {
+                if op == "==" {
+                    partner = "!="
+                } else if op == "!=" {
+                    partner = "=="
+                } else if op == "<" {
+                    partner = ">"
+                } else if op == ">" {
+                    partner = "<"
+                } else if op == "<=" {
+                    partner = ">="
+                } else if op == ">=" {
+                    partner = "<="
+                } else if op == "&&" {
+                    partner = "||"
+                } else if op == "||" {
+                    partner = "&&"
+                } else if op == "+" {
+                    partner = "-"
+                } else if op == "-" {
+                    partner = "+"
+                } else if op == "*" {
+                    partner = "/"
+                } else if op == "/" {
+                    partner = "*"
+                }
+                out.push([op, i.to_str(), (i + oplen).to_str(), partner])
+            }
+            i = i + oplen
+            continue
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# hfz_str_spans(src) — the contents spans of every string literal
+# (quotes excluded).
+fn hfz_str_spans(src: str) -> list[list[int]] {
+    let out: list[list[int]] = []
+    let n: int = src.len()
+    let mut i: int = 0
+    while i < n {
+        if src.byte_at(i) == 34 {
+            let mut j: int = i + 1
+            while j < n && src.byte_at(j) != 34 {
+                if src.byte_at(j) == 92 {
+                    j = j + 1
+                }
+                j = j + 1
+            }
+            out.push([i + 1, j])
+            i = j + 1
+            continue
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# hfz_list_spans(src) — flat [a, b, c] literals (no nesting, no struct
+# braces inside): [start_with_bracket, end_after_bracket, inner].
+fn hfz_list_spans(src: str) -> list[list[str]] {
+    let out: list[list[str]] = []
+    let n: int = src.len()
+    let mut i: int = 0
+    while i < n {
+        let c: int = src.byte_at(i)
+        if c == 34 {
+            i = i + 1
+            while i < n && src.byte_at(i) != 34 {
+                if src.byte_at(i) == 92 {
+                    i = i + 1
+                }
+                i = i + 1
+            }
+            i = i + 1
+            continue
+        }
+        if c == 35 {
+            while i < n && src.byte_at(i) != 10 {
+                i = i + 1
+            }
+            continue
+        }
+        if c == 91 {
+            let mut depth: int = 0
+            let mut j: int = i
+            while j < n {
+                let cj: int = src.byte_at(j)
+                if cj == 34 {
+                    j = j + 1
+                    while j < n && src.byte_at(j) != 34 {
+                        if src.byte_at(j) == 92 {
+                            j = j + 1
+                        }
+                        j = j + 1
+                    }
+                    j = j + 1
+                    continue
+                }
+                if cj == 91 {
+                    depth = depth + 1
+                } else if cj == 93 {
+                    depth = depth - 1
+                    if depth == 0 {
+                        break
+                    }
+                }
+                j = j + 1
+            }
+            if j < n {
+                let inner: str = src.slice(i + 1, j)
+                if inner.find("[") < 0 && inner.find("{") < 0 {
+                    out.push([i.to_str(), (j + 1).to_str(), inner])
+                }
+            }
+            i = j + 1
+            continue
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# hfz_main_line(lines) — the LAST line that starts with "fn main"
+# (seeded programs carry closures above main; -1 = none).
+fn hfz_main_line(lines: list[str]) -> int {
+    let mut mi: int = -1
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).starts_with("fn main") {
+            mi = i
+        }
+        i = i + 1
+    }
+    return mi
+}
+
+# hfz_is_ident_byte(b) — [A-Za-z0-9_].
+fn hfz_is_ident_byte(b: int) -> bool {
+    return hfz_is_word_byte(b)
+}
+
+# hfz_shuffle(r, items) — Fisher-Yates.
+fn hfz_shuffle(r: Rng, items: list[str]) -> void {
+    let mut i: int = items.len() - 1
+    while i > 0 {
+        let j: int = rng_below(r, i + 1)
+        let tmp: str = items.get(i)
+        items.set(i, items.get(j))
+        items.set(j, tmp)
+        i = i - 1
+    }
+}
+
+# hfz_mutate(src, r) — one random mutation op, applied: (new_src, op)
+# or ("", op) when no candidate existed for any op.
+fn hfz_mutate(src: str, r: Rng) -> list[str] {
+    let ops: list[str] = ["int_corner", "op_swap", "str_mut", "bool_flip", "list_mut", "line_dup", "line_drop", "param_corner"]
+    hfz_shuffle(r, ops)
+    let masked: str = hfz_mask(src)
+    let lines: list[str] = src.split("\n")
+    let mut oi: int = 0
+    while oi < ops.len() {
+        let op: str = ops.get(oi)
+        if op == "int_corner" {
+            let cands: list[list[int]] = hfz_int_spans(masked)
+            if cands.len() > 0 {
+                let m: list[int] = cands.get(rng_below(r, cands.len()))
+                return[src.slice(0, m.get(0)) + rng_pick(r, mut_int_corners()) + src.slice(m.get(1), src.len()), op]
+            }
+        } else if op == "op_swap" {
+            let cands2: list[list[str]] = hfz_binop_spans(masked)
+            if cands2.len() > 0 {
+                let m2: list[str] = cands2.get(rng_below(r, cands2.len()))
+                let s: int = m2.get(1).to_int()
+                let e: int = m2.get(2).to_int()
+                return[src.slice(0, s) + m2.get(3) + src.slice(e, src.len()), op]
+            }
+        } else if op == "str_mut" {
+            let cands3: list[list[int]] = hfz_str_spans(src)
+            if cands3.len() > 0 {
+                let m3: list[int] = cands3.get(rng_below(r, cands3.len()))
+                return[src.slice(0, m3.get(0)) + rng_pick(r, mut_str_corners()) + src.slice(m3.get(1), src.len()), op]
+            }
+        } else if op == "bool_flip" {
+            let cands4: list[list[int]] = hfz_bool_spans(masked)
+            if cands4.len() > 0 {
+                let m4: list[int] = cands4.get(rng_below(r, cands4.len()))
+                let mut flip: str = "true"
+                if masked.slice(m4.get(0), m4.get(1)) == "true" {
+                    flip = "false"
+                }
+                return[src.slice(0, m4.get(0)) + flip + src.slice(m4.get(1), src.len()), op]
+            }
+        } else if op == "list_mut" {
+            let cands5: list[list[str]] = hfz_list_spans(src)
+            if cands5.len() > 0 {
+                let m5: list[str] = cands5.get(rng_below(r, cands5.len()))
+                let s5: int = m5.get(0).to_int()
+                let e5: int = m5.get(1).to_int()
+                let inner: str = m5.get(2)
+                # elems = the non-empty trimmed splits
+                let elems: list[str] = []
+                let parts: list[str] = inner.split(",")
+                let mut pi: int = 0
+                while pi < parts.len() {
+                    let p: str = parts.get(pi).trim()
+                    if p != "" {
+                        elems.push(p)
+                    }
+                    pi = pi + 1
+                }
+                if rng_unit(r) < 4000 && elems.len() > 0 {
+                    elems.pop()
+                } else {
+                    elems.push(rng_pick(r, ["0", "1", "-1", "10", "\"a\"", "true"]))
+                }
+                let mut joined: str = ""
+                let mut ei: int = 0
+                while ei < elems.len() {
+                    if ei > 0 {
+                        joined = joined + ", "
+                    }
+                    joined = joined + elems.get(ei)
+                    ei = ei + 1
+                }
+                return[src.slice(0, s5) + "[" + joined + "]" + src.slice(e5, src.len()), op]
+            }
+        } else if op == "line_dup" || op == "line_drop" {
+            let mi: int = hfz_main_line(lines)
+            if mi < 0 {
+                oi = oi + 1
+                continue
+            }
+            # single-line simple statements only: never a brace-bearing
+            # line, never a parameter let, never the contract tail
+            let body: list[int] = []
+            let mut li: int = mi + 1
+            while li < lines.len() {
+                let ln: str = lines.get(li)
+                let trimmed: str = ln.trim()
+                if trimmed != "" && trimmed != "return 0" && trimmed != "}"
+                && ln.find("{") < 0 && ln.find("}") < 0
+                && !hfz_is_param_let(ln) {
+                    body.push(li)
+                }
+                li = li + 1
+            }
+            if body.len() == 0 {
+                oi = oi + 1
+                continue
+            }
+            let pick: int = body.get(rng_below(r, body.len()))
+            let out: list[str] = []
+            let mut xi: int = 0
+            while xi < lines.len() {
+                out.push(lines.get(xi))
+                if op == "line_dup" && xi == pick {
+                    out.push(lines.get(xi))
+                }
+                if op == "line_drop" && xi == pick {
+                    out.pop()
+                }
+                xi = xi + 1
+            }
+            let mut joined2: str = ""
+            let mut yi: int = 0
+            while yi < out.len() {
+                if yi > 0 {
+                    joined2 = joined2 + "\n"
+                }
+                joined2 = joined2 + out.get(yi)
+                yi = yi + 1
+            }
+            return[joined2, op]
+        } else if op == "param_corner" {
+            let mi2: int = hfz_main_line(lines)
+            if mi2 < 0 {
+                oi = oi + 1
+                continue
+            }
+            # candidates: \s*let (\w+): (int|str|bool) = (.+)
+            let pcands: list[int] = []
+            let mut li2: int = mi2 + 1
+            while li2 < lines.len() {
+                if hfz_is_param_let(lines.get(li2)) {
+                    pcands.push(li2)
+                }
+                li2 = li2 + 1
+            }
+            if pcands.len() == 0 {
+                oi = oi + 1
+                continue
+            }
+            let pick2: int = pcands.get(rng_below(r, pcands.len()))
+            let ln2: str = lines.get(pick2)
+            let m6: list[str] = hfz_param_let_parts(ln2)
+            # m6: [indent, name, ty, value]
+            let pool: list[str] = []
+            if m6.get(2) == "int" {
+                let mut ci: int = 0
+                let corners: list[str] = mut_int_corners()
+                while ci < corners.len() {
+                    if corners.get(ci) != m6.get(3) {
+                        pool.push(corners.get(ci))
+                    }
+                    ci = ci + 1
+                }
+            } else if m6.get(2) == "str" {
+                let mut ci2: int = 0
+                let scorners: list[str] = mut_str_corners()
+                while ci2 < scorners.len() {
+                    if "\"" + scorners.get(ci2) + "\"" != m6.get(3) {
+                        pool.push("\"" + scorners.get(ci2) + "\"")
+                    }
+                    ci2 = ci2 + 1
+                }
+            } else {
+                if m6.get(3) == "false" {
+                    pool.push("true")
+                } else {
+                    pool.push("false")
+                }
+            }
+            if pool.len() == 0 {
+                oi = oi + 1
+                continue
+            }
+            lines.set(pick2, m6.get(0) + "let " + m6.get(1) + ": " + m6.get(2) + " = " + rng_pick(r, pool))
+            let mut joined3: str = ""
+            let mut zi: int = 0
+            while zi < lines.len() {
+                if zi > 0 {
+                    joined3 = joined3 + "\n"
+                }
+                joined3 = joined3 + lines.get(zi)
+                zi = zi + 1
+            }
+            return[joined3, op]
+        }
+        oi = oi + 1
+    }
+    return["", "none"]
+}
+
+# hfz_is_param_let(line) — the \s*let \w+: (int|str|bool) = ... shape.
+fn hfz_is_param_let(line: str) -> bool {
+    return hfz_param_let_parts(line).len() == 4
+}
+
+# hfz_param_let_parts(line) — [indent, name, type, value] or [].
+fn hfz_param_let_parts(line: str) -> list[str] {
+    let mut indent_end: int = 0
+    while indent_end < line.len() && line.byte_at(indent_end) == 32 {
+        indent_end = indent_end + 1
+    }
+    let rest: str = line.slice(indent_end, line.len())
+    if !rest.starts_with("let ") {
+        return[]
+    }
+    let after_let: str = rest.slice(4, rest.len())
+    # the name: \w+
+    let mut ne: int = 0
+    while ne < after_let.len() && hfz_is_ident_byte(after_let.byte_at(ne)) {
+        ne = ne + 1
+    }
+    if ne == 0 {
+        return[]
+    }
+    let name: str = after_let.slice(0, ne)
+    let after_name: str = after_let.slice(ne, after_let.len())
+    if !after_name.starts_with(": ") {
+        return[]
+    }
+    let after_colon: str = after_name.slice(2, after_name.len())
+    let mut ty: str = ""
+    if after_colon.starts_with("int") {
+        ty = "int"
+    } else if after_colon.starts_with("str") {
+        ty = "str"
+    } else if after_colon.starts_with("bool") {
+        ty = "bool"
+    } else {
+        return[]
+    }
+    let after_ty: str = after_colon.slice(ty.len(), after_colon.len())
+    if !after_ty.starts_with(" = ") {
+        return[]
+    }
+    let value: str = after_ty.slice(3, after_ty.len()).trim()
+    if value == "" {
+        return[]
+    }
+    return[line.slice(0, indent_end), name, ty, value]
+}
+
+# ----------------------------------------------------------------------------
+# Differential execution.
+# ----------------------------------------------------------------------------
+
+# hfz_run_interp(prog_path) — the evaluator leg: (stdout, rc).
+fn hfz_run_interp(hlboot: str, prog_path: str) -> HtRun uses Proc {
+    return ht_spawn(hlboot, [prog_path])
+}
+
+# hfz_run_native(hlboot, prog_path, tmpdir) — the compiler leg: the
+# evaluator drives src/hlc.hls to emit C, gcc builds it, the binary
+# runs. ok=false when either compile step refuses (not a divergence).
+struct NatRun {
+    ok: bool,
+    out: str,
+    rc: int
+}
+
+fn hfz_run_native(hlboot: str, prog_path: str, tmpdir: str) -> NatRun uses Proc {
+    let out_c: str = tmpdir + "/out.c"
+    let out_bin: str = tmpdir + "/out.bin"
+    let p1: HtRun = ht_spawn(hlboot, ["src/hlc.hls", prog_path, out_c])
+    if p1.code != 0 {
+        return NatRun {
+            ok: false, out: "", rc: 0
+        }
+    }
+    let p2: HtRun = ht_spawn("gcc", ["-O2", "-o", out_bin, out_c, "-lm", "-pthread"])
+    if p2.code != 0 {
+        return NatRun {
+            ok: false, out: "", rc: 0
+        }
+    }
+    let p3: HtRun = ht_spawn(out_bin, [])
+    return NatRun {
+        ok: true, out: p3.out, rc: p3.code
+    }
+}
+
+# hfz_checks(hlboot, prog_path) — the quick gate: the evaluator's own
+# --check (the .py parsed + checked in-process; a child is the same
+# law with a wall).
+fn hfz_checks(hlboot: str, prog_path: str) -> bool uses Proc {
+    let r: HtRun = ht_spawn(hlboot, ["--check", prog_path])
+    return r.code == 0
+}
+
+# hfz_differs(a_out, a_rc, b_out, b_rc) — the byte law.
+fn hfz_differs(a_out: str, a_rc: int, b_out: str, b_rc: int) -> bool {
+    return a_out != b_out || a_rc != b_rc
+}
+
+# ----------------------------------------------------------------------------
+# Delta-debugging minimiser.
+# ----------------------------------------------------------------------------
+
+# hfz_minimize(hlboot, src, tmpdir) — try removing one statement at a
+# time from main's body while preserving the divergence. The region
+# under minimisation is located by name (seeded programs carry
+# provenance above fn main — those lines are part of the case).
+fn hfz_minimize(hlboot: str, src: str, tmpdir: str) -> str uses IO, Fs, Proc {
+    let lines: list[str] = src.split("\n")
+    let mut mi: int = -1
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).starts_with("fn main") {
+            mi = i
+            break
+        }
+        i = i + 1
+    }
+    if mi < 0 {
+        return src
+    }
+    # the tail is `return 0` + `}` (the harness contract)
+    let mut ri: int = -1
+    let mut j: int = lines.len() - 1
+    while j > mi {
+        if lines.get(j).trim() == "return 0" {
+            ri = j
+            break
+        }
+        j = j - 1
+    }
+    if ri < 0 || ri - mi < 2 {
+        return src
+    }
+    # body = lines[mi+1 .. ri]
+    let mut body: list[str] = []
+    let mut bi: int = mi + 1
+    while bi < ri {
+        body.push(lines.get(bi))
+        bi = bi + 1
+    }
+    let mut cur: str = src
+    let mut changed: bool = true
+    while changed && body.len() > 1 {
+        changed = false
+        # try removing each body line, last first
+        let mut k: int = body.len() - 1
+        while k >= 0 {
+            let cand: list[str] = []
+            let mut ci: int = 0
+            while ci < body.len() {
+                if ci != k {
+                    cand.push(body.get(ci))
+                }
+                ci = ci + 1
+            }
+            # rebuild the source: head + cand + tail
+            let mut new_src: str = ""
+            let mut hi: int = 0
+            while hi <= mi {
+                new_src = new_src + lines.get(hi) + "\n"
+                hi = hi + 1
+            }
+            let mut gi: int = 0
+            while gi < cand.len() {
+                new_src = new_src + cand.get(gi) + "\n"
+                gi = gi + 1
+            }
+            let mut ti: int = ri
+            while ti < lines.len() {
+                new_src = new_src + lines.get(ti)
+                if ti < lines.len() - 1 {
+                    new_src = new_src + "\n"
+                }
+                ti = ti + 1
+            }
+            let prog_path: str = tmpdir + "/prog_min.hls"
+            write_file(prog_path, new_src)
+            if hfz_checks(hlboot, prog_path) {
+                let iout: HtRun = hfz_run_interp(hlboot, prog_path)
+                let nat: NatRun = hfz_run_native(hlboot, prog_path, tmpdir)
+                if nat.ok && hfz_differs(iout.out, iout.code, nat.out, nat.rc) {
+                    body = cand
+                    cur = new_src
+                    changed = true
+                }
+            }
+            k = k - 1
+        }
+    }
+    return cur
+}
+
+# ----------------------------------------------------------------------------
+# The seeded corpus (Stage 134).
+# ----------------------------------------------------------------------------
+
+# hfz_load_seed_corpus(hlboot, corpus_dir, cap) — every file is
+# re-checked through the real pipeline; the rejected count is
+# reported, never swallowed.
+fn hfz_load_seed_corpus(hlboot: str, corpus_dir: str, cap: int) -> list[str] uses IO, Fs, Proc {
+    let sources: list[str] = []
+    let paths: list[str] = []
+    hfz_walk(corpus_dir, paths)
+    let mut i: int = 0
+    while i < paths.len() && sources.len() < cap {
+        let p: str = paths.get(i)
+        let tmp: str = "/tmp/hlsfuzz-seed-" + i.to_str() + ".hls"
+        let src: str = read_file(p)
+        write_file(tmp, src)
+        if hfz_checks(hlboot, tmp) {
+            sources.push(src)
+        }
+        proc_exec("rm -f '" + tmp + "'")
+        i = i + 1
+    }
+    return sources
+}
+
+fn hfz_walk(dir: str, out: list[str]) -> void uses Fs {
+    if !fs_is_dir(dir) {
+        return
+    }
+    let names: list[str] = fs_read_dir(dir)
+    let mut i: int = 0
+    while i < names.len() {
+        let nm: str = names.get(i)
+        let p: str = fz_join(dir, nm)
+        if fs_is_dir(p) {
+            hfz_walk(p, out)
+        } else if nm.ends_with(".hls") {
+            out.push(p)
+        }
+        i = i + 1
+    }
+}
+
+# hfz_seeded_program(sources, r) — one corpus program, 0..2 mutator
+# ops applied (30% none, 50% one, 20% two).
+fn hfz_seeded_program(sources: list[str], r: Rng) -> str {
+    let mut src: str = rng_pick(r, sources)
+    let roll: int = rng_unit(r)
+    let mut n_ops: int = 0
+    if roll < 8000 {
+        n_ops = 1
+    }
+    if roll >= 8000 {
+        if roll < 10000 {
+            # two ops: apply the mutator twice below
+            let mut applied: int = 0
+            while applied < 2 {
+                let m: list[str] = hfz_mutate(src, r)
+                if m.get(0) != "" {
+                    src = m.get(0)
+                }
+                applied = applied + 1
+            }
+            return src
+        }
+        return src
+    }
+    if n_ops == 1 {
+        let m2: list[str] = hfz_mutate(src, r)
+        if m2.get(0) != "" {
+            src = m2.get(0)
+        }
+    }
+    return src
+}
+
+# ----------------------------------------------------------------------------
+# main — the CLI law.
+# ----------------------------------------------------------------------------
+
+fn hfz_usage() -> str {
+    return "usage: hls-fuzz [--time N] [--seed N] [--n N] [--corpus DIR]\n"
+    + "                [--seed-corpus DIR] [--seed-ratio F] [--minimize F]\n"
+    + "                [--quiet]\n"
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let argv: list[str] = args()
+    let n: int = argv.len()
+    # the evaluator
+    let self_path: str = argv.get(0)
+    let mut hlboot: str = fz_join(fz_dir_of(self_path), "hlboot")
+    if !file_exists(hlboot) {
+        if file_exists("./bin/hlboot") {
+            hlboot = "./bin/hlboot"
+        }
+    }
+    if !file_exists(hlboot) {
+        eprint("hls-fuzz: no bin/hlboot - run make bootstrap\n")
+        return 2
+    }
+    let mut time_s: int = 60
+    let mut seed: int = -1
+    let mut max_n: int = -1
+    let mut corpus_dir: str = "fuzz-corpus"
+    let mut seed_corpus: str = ""
+    let mut seed_ratio: int = 5000
+    let mut minimize_path: str = ""
+    let mut quiet: bool = false
+    let mut i: int = 1
+    while i < n {
+        let a: str = argv.get(i)
+        if a == "--time" {
+            if i + 1 >= n {
+                eprint("error: --time expects seconds\n")
+                return 2
+            }
+            time_s = argv.get(i + 1).to_int()
+            i = i + 2
+            continue
+        }
+        if a == "--seed" {
+            if i + 1 >= n {
+                eprint("error: --seed expects a number\n")
+                return 2
+            }
+            seed = argv.get(i + 1).to_int()
+            i = i + 2
+            continue
+        }
+        if a == "--n" {
+            if i + 1 >= n {
+                eprint("error: --n expects a count\n")
+                return 2
+            }
+            max_n = argv.get(i + 1).to_int()
+            i = i + 2
+            continue
+        }
+        if a == "--corpus" {
+            if i + 1 >= n {
+                eprint("error: --corpus expects a directory\n")
+                return 2
+            }
+            corpus_dir = argv.get(i + 1)
+            i = i + 2
+            continue
+        }
+        if a == "--seed-corpus" {
+            if i + 1 >= n {
+                eprint("error: --seed-corpus expects a directory\n")
+                return 2
+            }
+            seed_corpus = argv.get(i + 1)
+            i = i + 2
+            continue
+        }
+        if a == "--seed-ratio" {
+            if i + 1 >= n {
+                eprint("error: --seed-ratio expects a fraction\n")
+                return 2
+            }
+            # a plain decimal fraction: "0.5" -> 5000 basis points
+            let fr: str = argv.get(i + 1)
+            let dot: int = fr.find(".")
+            let mut bp: int = 0
+            if dot < 0 {
+                bp = fr.to_int() * 10000
+            } else {
+                let whole: int = fr.slice(0, dot).to_int()
+                let frac: str = fr.slice(dot + 1, fr.len()) + "0000"
+                bp = whole * 10000 + frac.slice(0, 4).to_int()
+            }
+            seed_ratio = bp
+            i = i + 2
+            continue
+        }
+        if a == "--minimize" {
+            if i + 1 >= n {
+                eprint("error: --minimize expects a file\n")
+                return 2
+            }
+            minimize_path = argv.get(i + 1)
+            i = i + 2
+            continue
+        }
+        if a == "--quiet" {
+            quiet = true
+            i = i + 1
+            continue
+        }
+        if a == "-h" || a == "--help" {
+            print(hfz_usage())
+            return 0
+        }
+        eprint("hls-fuzz: error: unrecognized argument: " + a + "\n" + hfz_usage())
+        return 2
+    }
+    if seed < 0 {
+        seed = system_time_now_ms()
+    }
+    # ---- minimize mode ----
+    if minimize_path != "" {
+        if !file_exists(minimize_path) {
+            eprint("hls-fuzz: no such file: " + minimize_path + "\n")
+            return 2
+        }
+        let src: str = read_file(minimize_path)
+        let tmpdir: str = "/tmp/hlsfuzz-" + system_time_now_ms().to_str()
+        proc_exec("mkdir -p '" + tmpdir + "'")
+        let minimised: str = hfz_minimize(hlboot, src, tmpdir)
+        print(minimised)
+        proc_exec("rm -rf '" + tmpdir + "'")
+        return 0
+    }
+    if !quiet {
+        println("== hls-fuzz: seed=" + seed.to_str() + ", time=" + time_s.to_str() + "s ==")
+    }
+    proc_exec("mkdir -p '" + corpus_dir + "'")
+    # ---- the seeded corpus, validated up front ----
+    let seed_sources: list[str] = []
+    if seed_corpus != "" {
+        let loaded: list[str] = hfz_load_seed_corpus(hlboot, seed_corpus, 4000)
+        let mut li: int = 0
+        while li < loaded.len() {
+            seed_sources.push(loaded.get(li))
+            li = li + 1
+        }
+        if !quiet {
+            println("== seed corpus: " + seed_sources.len().to_str() + " programs loaded ==")
+        }
+    }
+    let tmpdir2: str = "/tmp/hlsfuzz-" + system_time_now_ms().to_str()
+    proc_exec("mkdir -p '" + tmpdir2 + "'")
+    let r: Rng = Rng {
+        state: seed
+    }
+    let mut n_run: int = 0
+    let mut n_gen: int = 0
+    let mut n_seeded: int = 0
+    let mut n_diverge: int = 0
+    let mut n_skip: int = 0
+    let prog_path: str = tmpdir2 + "/prog.hls"
+    let start_ms: int = system_time_now_ms()
+    let deadline_ms: int = start_ms + time_s * 1000
+    let mut next_report: int = start_ms + 5000
+    while system_time_now_ms() < deadline_ms {
+        if max_n >= 0 && n_run >= max_n {
+            break
+        }
+        let mut src: str = ""
+        if seed_sources.len() > 0 && rng_unit(r) < seed_ratio {
+            src = hfz_seeded_program(seed_sources, r)
+            n_seeded = n_seeded + 1
+        } else {
+            let g: Gen = Gen {
+                rng: r,
+                next_id: 0,
+                live_ints: [],
+                live_strs: []
+            }
+            src = gen_program(g)
+            n_gen = n_gen + 1
+        }
+        n_run = n_run + 1
+        write_file(prog_path, src)
+        if !hfz_checks(hlboot, prog_path) {
+            n_skip = n_skip + 1
+        } else {
+            let iout: HtRun = hfz_run_interp(hlboot, prog_path)
+            let nat: NatRun = hfz_run_native(hlboot, prog_path, tmpdir2)
+            if !nat.ok {
+                n_skip = n_skip + 1
+            } else if hfz_differs(iout.out, iout.code, nat.out, nat.rc) {
+                n_diverge = n_diverge + 1
+                let minimised: str = hfz_minimize(hlboot, src, tmpdir2)
+                let listing: list[str] = fs_read_dir(corpus_dir)
+                let case_path: str = fz_join(corpus_dir, "case-" + listing.len().to_str() + ".hls")
+                write_file(case_path, minimised)
+                if !quiet {
+                    println("")
+                    println("!! DIVERGENCE #" + n_diverge.to_str() + " saved to " + case_path)
+                    println("   interp rc=" + iout.code.to_str() + " out=" + fz_clip(iout.out, 200))
+                    println("   native rc=" + nat.rc.to_str() + " out=" + fz_clip(nat.out, 200))
+                    println("   minimised program:")
+                    let mlines: list[str] = minimised.split("\n")
+                    let mut mi2: int = 0
+                    while mi2 < mlines.len() {
+                        println("   | " + mlines.get(mi2))
+                        mi2 = mi2 + 1
+                    }
+                }
+            }
+        }
+        let now: int = system_time_now_ms()
+        if now >= next_report {
+            let elapsed_s: int = (now - start_ms) / 1000
+            let mut rate: int = 0
+            if elapsed_s > 0 {
+                rate = n_run / elapsed_s
+            }
+            println("  [" + elapsed_s.to_str() + "s] " + n_run.to_str() + " run (" + n_gen.to_str() + " gen, " + n_seeded.to_str() + " seeded), " + n_skip.to_str() + " skip, " + n_diverge.to_str() + " diverge (" + rate.to_str() + " prog/s)")
+            next_report = now + 5000
+        }
+    }
+    println("")
+    println("== hls-fuzz done: " + n_run.to_str() + " run (" + n_gen.to_str() + " gen, " + n_seeded.to_str() + " seeded), " + n_skip.to_str() + " skip, " + n_diverge.to_str() + " diverge ==")
+    proc_exec("rm -rf '" + tmpdir2 + "'")
+    if n_diverge == 0 {
+        return 0
+    }
+    return 1
+}
+
+# ----------------------------------------------------------------------------
+# End of tools/hls-fuzz.hls
+# ============================================================================

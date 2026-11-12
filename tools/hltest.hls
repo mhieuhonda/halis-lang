@@ -1,0 +1,2240 @@
+# ============================================================================
+# tools/hltest.hls — the Stage 18 test runner, in Halis (the native twin
+# of the Python hltest that retired; same CLI, same report grammar, same
+# snapshot-store bytes, same exit law).
+# ----------------------------------------------------------------------------
+# A test is a top-level fn whose name begins with test_; a parameterised
+# test takes exactly one row parameter and reads its rows from a
+# cases_<name> companion table (Stage 120). Every invocation runs in a
+# FRESH bin/hlboot child — the .py years built a fresh Interp per test
+# inside one process; a process boundary is the same law with cleaner
+# walls, and the pipes are the stdout buffer the __SNAP__ records ride
+# on. Discovery parses the entry file alone (the .py's isolated parse,
+# stdlib helpers invisible) through the compiler's own front-end.
+#
+# Snapshot testing (Stage 119): assert_snapshot writes length-framed
+# __SNAP__ records to the test's stdout; this runner parses them out of
+# the child's captured stdout and verifies them against the store at
+# __snapshots__/<stem>.snap next to the test file. Verify mode never
+# writes; -u records new and changed values and prunes obsolete ones,
+# rewriting a store only when its bytes change. Only a PASSING test's
+# records count — a panicked test's partial records are never pinned.
+#
+# The private legs (the probe family) are the runner re-invoking itself
+# or bin/hlboot; the front-door CLI is the one users and gates drive:
+#
+#   bin/hltest [OPTIONS] <file.hls>...      bin/hltest -r tests/ok
+#   bin/hltest --grep map file.hls          bin/hltest -u file.hls
+#   bin/hltest --junit out.xml file.hls     bin/hltest --det file.hls
+#
+# Exit codes: 0 all pass (or skip), 1 one or more fail, 2 usage/IO.
+# ============================================================================
+
+import "./hlfront.hls"
+import "std.str"
+
+# ----------------------------------------------------------------------------
+# Small shared helpers.
+# ----------------------------------------------------------------------------
+
+# ht_spawn(prog, cargs) — piped child capture (the hlcov law).
+struct HtRun {
+    code: int,
+    out: str,
+    err: str,
+    spawned: bool
+}
+
+fn ht_spawn(prog: str, cargs: list[str]) -> HtRun uses Proc {
+    let r: HtRun = HtRun {
+        code: -1,
+        out: "",
+        err: "",
+        spawned: false
+    }
+    let pid: int = proc_spawn(prog, cargs, 2, 1, 1)
+    if pid < 1 {
+        return r
+    }
+    r.spawned = true
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    r.code = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    r.out = out
+    r.err = err
+    return r
+}
+
+# ht_first_line(s) — everything before the first newline.
+fn ht_first_line(s: str) -> str {
+    let pos: int = s.find("\n")
+    if pos < 0 {
+        return s
+    }
+    return s.slice(0, pos)
+}
+
+# ht_find_from(s, needle, from) — find with a start offset.
+fn ht_find_from(s: str, needle: str, from: int) -> int {
+    if from >= s.len() {
+        return -1
+    }
+    let idx: int = s.slice(from, s.len()).find(needle)
+    if idx < 0 {
+        return -1
+    }
+    return idx + from
+}
+
+# ht_replace(s, from, to) — every occurrence.
+fn ht_replace(s: str, from_s: str, to_s: str) -> str {
+    if from_s == "" || from_s == to_s {
+        return s
+    }
+    let mut out: str = ""
+    let mut i: int = 0
+    let fl: int = from_s.len()
+    while i < s.len() {
+        if i + fl <= s.len() && s.slice(i, i + fl) == from_s {
+            out = out + to_s
+            i = i + fl
+        } else {
+            out = out + s.slice(i, i + 1)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+# ht_splitlines(s) — Python's str.splitlines on the \n law (a trailing
+# newline does not produce a trailing empty line).
+fn ht_splitlines(s: str) -> list[str] {
+    if s == "" {
+        return[]
+    }
+    let parts: list[str] = s.split("\n")
+    if s.byte_at(s.len() - 1) == 10 {
+        let mut out: list[str] = []
+        let mut i: int = 0
+        while i < parts.len() - 1 {
+            out.push(parts.get(i))
+            i = i + 1
+        }
+        return out
+    }
+    return parts
+}
+
+# ht_all_digits(s) — [0-9]+, non-empty.
+fn ht_all_digits(s: str) -> bool {
+    if s.len() == 0 {
+        return false
+    }
+    let mut i: int = 0
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        if b < 48 || b > 57 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# ht_name_ok(s) — the snapshot-name charset: 1..96 bytes of
+# [A-Za-z0-9_.:-].
+fn ht_name_ok(s: str) -> bool {
+    if s.len() < 1 || s.len() > 96 {
+        return false
+    }
+    let mut i: int = 0
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        let ok: bool = (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+        || (b >= 48 && b <= 57) || b == 95 || b == 46 || b == 58 || b == 45
+        if !ok {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# ht_store_test_ok(s) — the store TEST grammar: <test>[#<case>], both
+# halves in the name charset, at most one #.
+fn ht_store_test_ok(s: str) -> bool {
+    let h: int = s.find("#")
+    if h < 0 {
+        return ht_name_ok(s)
+    }
+    let base: str = s.slice(0, h)
+    let row: str = s.slice(h + 1, s.len())
+    if row.find("#") >= 0 {
+        return false
+    }
+    return ht_name_ok(base) && ht_name_ok(row)
+}
+
+# ht_row_base(k) — the base fn name of a store test key: everything
+# before the first #, or the whole key.
+fn ht_row_base(k: str) -> str {
+    let h: int = k.find("#")
+    if h < 0 {
+        return k
+    }
+    return k.slice(0, h)
+}
+
+# ht_clip(s, n) — the first n bytes, or fewer (slices past the end of
+# a str panic in Halis; the .py's [:32] never did).
+fn ht_clip(s: str, n: int) -> str {
+    if s.len() <= n {
+        return s
+    }
+    return s.slice(0, n)
+}
+
+# ht_repr(s) — the b'...' bytes-repr the .py's %r produced (a display
+# convention, not a value).
+fn ht_repr(s: str) -> str {
+    return "b'" + s + "'"
+}
+
+# ht_norm_type(t) — the comparison form of a declared type string: all
+# whitespace removed (lossless for equality only).
+fn ht_norm_type(t: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < t.len() {
+        let b: int = t.byte_at(i)
+        if b != 32 && b != 9 && b != 10 && b != 13 {
+            out = out + t.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ht_table_row_type(ret) — the declared row payload type of a case
+# table: parse list[TestCase[X]] and return X (whitespace-normalised),
+# "" when the shape is not recognisably a TestCase table (the .py's
+# None — a silent opt-out of the static cross-check, never a
+# diagnostic).
+fn ht_table_row_type(ret: str) -> str {
+    if ret.find("[") < 0 {
+        return ""
+    }
+    if type_base(ret) != "list" {
+        return ""
+    }
+    let args: list[str] = type_args(ret)
+    if args.len() != 1 {
+        return ""
+    }
+    let elem: str = args.get(0)
+    if type_base(elem) != "TestCase" {
+        return ""
+    }
+    let targs: list[str] = type_args(elem)
+    if targs.len() != 1 {
+        return ""
+    }
+    return ht_norm_type(targs.get(0))
+}
+
+# ht_ms1(ms) — "%.1f" of a millisecond count.
+fn ht_ms1(ms: int) -> str {
+    return ms.to_str() + ".0"
+}
+
+# ht_sec3(ms) — "%.3f" of a millisecond count, in seconds.
+fn ht_sec3(ms: int) -> str {
+    let whole: int = ms / 1000
+    let frac: int = ms % 1000
+    let mut fs: str = frac.to_str()
+    while fs.len() < 3 {
+        fs = "0" + fs
+    }
+    return whole.to_str() + "." + fs
+}
+
+# ht_xml_escape(s) — the &, <, > law (attributes and text alike).
+fn ht_xml_escape(s: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        if b == 38 {
+            out = out + "&amp;"
+        } else if b == 60 {
+            out = out + "&lt;"
+        } else if b == 62 {
+            out = out + "&gt;"
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ht_rel(path) — the report path: absolute paths under the cwd wear
+# their relative clothes.
+fn ht_rel(path: str) -> str uses Proc {
+    if path.byte_at(0) != 47 {
+        return path
+    }
+    let cwd: str = cwd_get()
+    if cwd != "" && path.starts_with(cwd + "/") {
+        return path.slice(cwd.len() + 1, path.len())
+    }
+    return path
+}
+
+# ----------------------------------------------------------------------------
+# The snapshot store (Stage 119) — the v1 grammar, byte for byte.
+# ----------------------------------------------------------------------------
+
+# The store: parallel (test, name, value) lists, order preserved.
+struct Store {
+    tests: list[str],
+    names: list[str],
+    vals: list[str],
+    err: str
+}
+
+fn ht_store_get(st: Store, t: str, n: str) -> str {
+    let mut i: int = 0
+    while i < st.tests.len() {
+        if st.tests.get(i) == t && st.names.get(i) == n {
+            return st.vals.get(i)
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn ht_store_has(st: Store, t: str, n: str) -> bool {
+    let mut i: int = 0
+    while i < st.tests.len() {
+        if st.tests.get(i) == t && st.names.get(i) == n {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# ht_store_path(filepath) — __snapshots__/<stem>.snap next to the file.
+fn ht_store_path(filepath: str) -> str {
+    let d: str = dir_of(filepath)
+    let mut stem: str = filepath
+    let mut s: int = filepath.len() - 1
+    while s >= 0 {
+        if filepath.byte_at(s) == 47 {
+            stem = filepath.slice(s + 1, filepath.len())
+            break
+        }
+        s = s - 1
+    }
+    if stem.ends_with(".hls") {
+        stem = stem.slice(0, stem.len() - 4)
+    }
+    return join_path(d, "__snapshots__/" + stem + ".snap")
+}
+
+# ht_load_store(path) — parse the v1 grammar with the .py's every
+# deviation named (corrupt stores are reported, never regenerated).
+fn ht_load_store(path: str) -> Store uses Fs {
+    let st: Store = Store {
+        tests: [], names: [], vals: [], err: ""
+    }
+    let mut raw: str = ""
+    if file_exists(path) {
+        raw = read_file(path)
+    }
+    let magic: str = "# hltest-snapshots v1\n"
+    if !raw.starts_with(magic) {
+        st.err = path + " is not a hltest snapshot store (missing v1 magic line)"
+        return st
+    }
+    let n: int = raw.len()
+    let mut i: int = magic.len()
+    let j: int = ht_find_from(raw, "\n", i)
+    if j < 0 || raw.slice(i, j) != "# generated by `hltest --update-snapshots` - do not edit by hand" {
+        st.err = path + " has a non-canonical store header (line 2 must be the generator note; regenerate with --update-snapshots or git-checkout the file)"
+        return st
+    }
+    i = j + 1
+    while i < n {
+        let j2: int = ht_find_from(raw, "\n", i)
+        if j2 < 0 {
+            st.err = path + ": truncated record header at byte " + i.to_str()
+            return st
+        }
+        let line: str = raw.slice(i, j2)
+        if !line.starts_with("@@@ ") {
+            st.err = path + ": expected a record at byte " + i.to_str() + ", found " + ht_repr(ht_clip(line, 32)) + ""
+            return st
+        }
+        let rest: str = line.slice(4, line.len())
+        let sp1: int = rest.find(" ")
+        if sp1 < 0 {
+            st.err = path + ": malformed record header " + ht_repr(ht_clip(line, 48)) + " (want '@@@ <test> <name> <len>')"
+            return st
+        }
+        let tname: str = rest.slice(0, sp1)
+        let rest2: str = rest.slice(sp1 + 1, rest.len())
+        let sp2: int = rest2.find(" ")
+        if sp2 < 0 {
+            st.err = path + ": malformed record header " + ht_repr(ht_clip(line, 48)) + " (want '@@@ <test> <name> <len>')"
+            return st
+        }
+        let sname: str = rest2.slice(0, sp2)
+        let lenb: str = rest2.slice(sp2 + 1, rest2.len())
+        if !ht_store_test_ok(tname) || !ht_name_ok(sname) {
+            st.err = path + ": invalid test or snapshot name in record header " + ht_repr(ht_clip(line, 48)) + ""
+            return st
+        }
+        if !ht_all_digits(lenb) || (lenb.len() > 1 && lenb.byte_at(0) == 48) {
+            st.err = path + ": malformed record length " + ht_repr(lenb) + " at byte " + i.to_str()
+            return st
+        }
+        let ln: int = lenb.to_int()
+        let vstart: int = j2 + 1
+        let vend: int = vstart + ln
+        if vend > n - 1 {
+            st.err = path + ": record value at byte " + vstart.to_str() + " runs past EOF (declares " + ln.to_str() + " bytes, " + (n - vstart).to_str() + " remain, no room for the frame separator)"
+            return st
+        }
+        if ht_store_has(st, tname, sname) {
+            st.err = path + ": duplicate record for '" + tname + "' / '" + sname + "' at byte " + i.to_str()
+            return st
+        }
+        if raw.byte_at(vend) != 10 {
+            st.err = path + ": record at byte " + i.to_str() + " is missing its frame separator (value bytes must be followed by a newline)"
+            return st
+        }
+        st.tests.push(tname)
+        st.names.push(sname)
+        st.vals.push(raw.slice(vstart, vend))
+        i = vend + 1
+    }
+    return st
+}
+
+# ht_store_serialize(tests, names, vals) — deterministic bytes: header,
+# then records sorted by (test, name) (an insertion sort over the
+# joined view — the corpus is small and the order must be total).
+fn ht_store_serialize(tests: list[str], names: list[str], vals: list[str]) -> str {
+    let mut order: list[int] = []
+    let mut i: int = 0
+    while i < tests.len() {
+        order.push(i)
+        i = i + 1
+    }
+    let mut a: int = 1
+    while a < order.len() {
+        let k: int = order.get(a)
+        let kt: str = tests.get(k)
+        let kn: str = names.get(k)
+        let mut b: int = a - 1
+        while b >= 0 && (tests.get(order.get(b)) > kt
+        || (tests.get(order.get(b)) == kt && names.get(order.get(b)) > kn)) {
+            order.set(b + 1, order.get(b))
+            b = b - 1
+        }
+        order.set(b + 1, k)
+        a = a + 1
+    }
+    let mut out: str = "# hltest-snapshots v1\n"
+    out = out + "# generated by `hltest --update-snapshots` - do not edit by hand\n"
+    let mut oi: int = 0
+    while oi < order.len() {
+        let idx: int = order.get(oi)
+        let v: str = vals.get(idx)
+        out = out + "@@@ " + tests.get(idx) + " " + names.get(idx) + " " + v.len().to_str() + "\n"
+        out = out + v + "\n"
+        oi = oi + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# The record stream parser (the wire std.test.assert_snapshot speaks).
+# ----------------------------------------------------------------------------
+
+# ht_parse_records(stdout) — the ordered (name, value) records of one
+# test's captured stdout, or the protocol error. The scan resumes
+# AFTER each consumed value, so value content is never re-scanned.
+fn ht_parse_records(out: str) -> Store {
+    let st: Store = Store {
+        tests: [], names: [], vals: [], err: ""
+    }
+    let n: int = out.len()
+    let mut i: int = 0
+    while i < n {
+        let k: int = ht_find_from(out, "__SNAP__ ", i)
+        if k < 0 {
+            break
+        }
+        let j: int = ht_find_from(out, "\n", k)
+        if j < 0 {
+            st.err = "snapshot protocol error: unterminated record header at byte " + k.to_str()
+            return st
+        }
+        let rest: str = out.slice(k + 9, j)
+        let sp: int = rest.find(" ")
+        if sp < 0 {
+            st.err = "snapshot protocol error: record header is missing its length field"
+            return st
+        }
+        let name: str = rest.slice(0, sp)
+        let lenb: str = rest.slice(sp + 1, rest.len())
+        if !ht_name_ok(name) {
+            st.err = "snapshot protocol error: invalid snapshot name " + ht_repr(name) + " (names are 1-96 bytes of [A-Za-z0-9_.:-])"
+            return st
+        }
+        if !ht_all_digits(lenb) || (lenb.len() > 1 && lenb.byte_at(0) == 48) {
+            st.err = "snapshot protocol error: malformed record length " + ht_repr(lenb) + ""
+            return st
+        }
+        let ln: int = lenb.to_int()
+        let vstart: int = j + 1
+        let vend: int = vstart + ln
+        if vend > n {
+            st.err = "snapshot protocol error: record '" + name + "' declares " + ln.to_str() + " bytes but only " + (n - vstart).to_str() + " remain"
+            return st
+        }
+        if vend == n || out.byte_at(vend) != 10 {
+            st.err = "snapshot protocol error: record '" + name + "' is missing its frame separator (the " + ln.to_str() + " value bytes must be followed by a newline)"
+            return st
+        }
+        st.names.push(name)
+        st.vals.push(out.slice(vstart, vend))
+        i = vend + 1
+    }
+    return st
+}
+
+# ----------------------------------------------------------------------------
+# The unified diff (difflib's line law: longest matching block, groups
+# of 2 context lines, the @@@ headers of the unified grammar).
+# ----------------------------------------------------------------------------
+
+# ht_lcs_blocks(a, b) — the matching blocks of two line lists, difflib's
+# find_longest_match recursion without the junk heuristics (earliest i,
+# then earliest j, on ties).
+fn ht_lcs_blocks(a: list[str], b: list[str]) -> list[list[int]] {
+    let blocks: list[list[int]] = []
+    let queue: list[list[int]] = [[0, a.len(), 0, b.len()]]
+    let mut qi: int = 0
+    while qi < queue.len() {
+        let rng: list[int] = queue.get(qi)
+        qi = qi + 1
+        let alo: int = rng.get(0)
+        let ahi: int = rng.get(1)
+        let blo: int = rng.get(2)
+        let bhi: int = rng.get(3)
+        # DP over the slice: longest common suffix ending at (i, j)
+        let w: int = ahi - alo
+        let h: int = bhi - blo
+        if w == 0 || h == 0 {
+            continue
+        }
+        let mut best_len: int = 0
+        let mut best_i: int = alo
+        let mut best_j: int = blo
+        let mut prev: list[int] = []
+        let mut z: int = 0
+        while z < w + 1 {
+            prev.push(0)
+            z = z + 1
+        }
+        let mut ii: int = 1
+        while ii < h + 1 {
+            let mut cur: list[int] = []
+            let mut z2: int = 0
+            while z2 < w + 1 {
+                cur.push(0)
+                z2 = z2 + 1
+            }
+            let mut jj: int = 1
+            while jj < w + 1 {
+                if a.get(alo + jj - 1) == b.get(blo + ii - 1) {
+                    let l: int = prev.get(jj - 1) + 1
+                    cur.set(jj, l)
+                    if l > best_len {
+                        best_len = l
+                        best_i = alo + jj - l
+                        best_j = blo + ii - l
+                    }
+                }
+                jj = jj + 1
+            }
+            prev = cur
+            ii = ii + 1
+        }
+        if best_len > 0 {
+            blocks.push([best_i, best_j, best_len])
+            queue.push([alo, best_i, blo, best_j])
+            queue.push([best_i + best_len, ahi, best_j + best_len, bhi])
+        }
+    }
+    # order by a-index (the queue pops unordered)
+    let mut i: int = 1
+    while i < blocks.len() {
+        let k: list[int] = blocks.get(i)
+        let mut j2: int = i - 1
+        while j2 >= 0 && blocks.get(j2).get(0) > k.get(0) {
+            blocks.set(j2 + 1, blocks.get(j2))
+            j2 = j2 - 1
+        }
+        blocks.set(j2 + 1, k)
+        i = i + 1
+    }
+    blocks.push([a.len(), b.len(), 0])
+    return blocks
+}
+
+# ht_grouped_opcodes(a, b) — difflib's get_grouped_opcodes(n=2): runs
+# of ops with up to 2 context lines, split whenever the gap between
+# matching blocks exceeds 2*n.
+fn ht_grouped_opcodes(a: list[str], b: list[str]) -> list[list[list[int]]] {
+    let groups: list[list[list[int]]] = []
+    let blocks: list[list[int]] = ht_lcs_blocks(a, b)
+    # opcodes from adjacent block pairs
+    let ops: list[list[int]] = []
+    let mut i: int = 0
+    let mut ai: int = 0
+    let mut bi: int = 0
+    while i < blocks.len() {
+        let blk: list[int] = blocks.get(i)
+        if blk.get(2) > 0 || i == blocks.len() - 1 {
+            if blk.get(0) > ai || blk.get(1) > bi {
+                ops.push([0, ai, blk.get(0), bi, blk.get(1)]) # replace
+            }
+            if blk.get(2) > 0 {
+                ops.push([1, blk.get(0), blk.get(0) + blk.get(2), blk.get(1), blk.get(1) + blk.get(2)]) # equal
+            }
+            ai = blk.get(0) + blk.get(2)
+            bi = blk.get(1) + blk.get(2)
+        }
+        i = i + 1
+    }
+    if ops.len() == 0 {
+        return groups
+    }
+    # the grouping walk
+    let mut group: list[list[int]] = []
+    let mut oi: int = 0
+    while oi < ops.len() {
+        let op: list[int] = ops.get(oi)
+        let tag: int = op.get(0)
+        if tag == 1 {
+            let i1: int = op.get(1)
+            let i2: int = op.get(2)
+            let j1: int = op.get(3)
+            let j2: int = op.get(4)
+            group.push([tag, i1, i2, j1, j2])
+            if i2 - i1 > 4 {
+                # a big equal run closes any open group at its middle
+                let cut: int = i2 - 2
+                if cut > i1 {
+                    let mut g2: list[list[int]] = []
+                    let mut gi: int = 0
+                    while gi < group.len() {
+                        let g: list[int] = group.get(gi)
+                        if g.get(2) <= cut {
+                            g2.push(g)
+                        }
+                        gi = gi + 1
+                    }
+                    if g2.len() > 0 {
+                        groups.push(g2)
+                    }
+                    let mut g3: list[list[int]] = []
+                    let mut gi2: int = 0
+                    while gi2 < group.len() {
+                        let g4: list[int] = group.get(gi2)
+                        if g4.get(1) >= cut {
+                            g3.push(g4)
+                        }
+                        gi2 = gi2 + 1
+                    }
+                    group = g3
+                }
+            }
+        } else {
+            group.push(op)
+        }
+        oi = oi + 1
+    }
+    if group.len() > 0 {
+        groups.push(group)
+    }
+    # trim each group to the 2-line context window
+    let out: list[list[list[int]]] = []
+    let mut gi3: int = 0
+    while gi3 < groups.len() {
+        let g: list[list[int]] = groups.get(gi3)
+        let trimmed: list[list[int]] = []
+        let mut hi: int = 0
+        while hi < g.len() {
+            let op2: list[int] = g.get(hi)
+            if op2.get(0) == 1 {
+                let ni1: int = op2.get(1)
+                let ni2: int = op2.get(2)
+                let nj1: int = op2.get(3)
+                let nj2: int = op2.get(4)
+                let is_first: bool = hi == 0
+                let is_last: bool = hi == g.len() - 1
+                let mut ci1: int = ni1
+                let mut ci2: int = ni2
+                let mut cj1: int = nj1
+                let mut cj2: int = nj2
+                if is_first {
+                    ci1 = ni1
+                    cj1 = nj1
+                    if ni2 - ni1 > 2 {
+                        ci2 = ni1 + 2
+                        cj2 = nj1 + 2
+                    }
+                }
+                if is_last {
+                    ci2 = ni2
+                    cj2 = nj2
+                    if ni2 - ni1 > 2 {
+                        ci1 = ni2 - 2
+                        cj1 = nj2 - 2
+                    }
+                }
+                if !is_first && !is_last && ni2 - ni1 > 4 {
+                    ci1 = ni2 - 2
+                    cj1 = nj2 - 2
+                    ci2 = ni1 + 2
+                    cj2 = nj1 + 2
+                }
+                trimmed.push([1, ci1, ci2, cj1, cj2])
+            } else {
+                trimmed.push(op2)
+            }
+            hi = hi + 1
+        }
+        if trimmed.len() > 0 {
+            out.push(trimmed)
+        }
+        gi3 = gi3 + 1
+    }
+    return out
+}
+
+# ht_range(start, stop) — difflib's _format_range_unified.
+fn ht_range(start: int, stop: int) -> str {
+    let mut beginning: int = start + 1
+    let length: int = stop - start
+    if length == 1 {
+        return beginning.to_str()
+    }
+    if length == 0 {
+        beginning = beginning - 1
+    }
+    return beginning.to_str() + "," + length.to_str()
+}
+
+# ht_snap_diff(sname, stored, got) — the human report: a unified diff,
+# capped at 60 lines (the comparison itself is byte-exact; the diff is
+# only the report).
+fn ht_snap_diff(sname: str, stored: str, got: str) -> str {
+    let a: list[str] = ht_splitlines(stored)
+    let b: list[str] = ht_splitlines(got)
+    let dl: list[str] = ["--- stored", "+++ received"]
+    let groups: list[list[list[int]]] = ht_grouped_opcodes(a, b)
+    let mut gi: int = 0
+    while gi < groups.len() {
+        let g: list[list[int]] = groups.get(gi)
+        let first: list[int] = g.get(0)
+        let last: list[int] = g.get(g.len() - 1)
+        let file_range: str = ht_range(first.get(1), last.get(2))
+        let got_range: str = ht_range(first.get(3), last.get(4))
+        dl.push("@@ -" + file_range + " +" + got_range + " @@")
+        let mut oi: int = 0
+        while oi < g.len() {
+            let op: list[int] = g.get(oi)
+            if op.get(0) == 1 {
+                let mut li: int = op.get(1)
+                while li < op.get(2) {
+                    dl.push(" " + a.get(li))
+                    li = li + 1
+                }
+            } else if op.get(0) == 0 {
+                let mut li2: int = op.get(1)
+                while li2 < op.get(2) {
+                    dl.push("-" + a.get(li2))
+                    li2 = li2 + 1
+                }
+                let mut li3: int = op.get(3)
+                while li3 < op.get(4) {
+                    dl.push("+" + b.get(li3))
+                    li3 = li3 + 1
+                }
+            }
+            oi = oi + 1
+        }
+        gi = gi + 1
+    }
+    let mut body: str = ""
+    let mut count: int = 0
+    let mut di: int = 0
+    while di < dl.len() && count < 60 {
+        if count > 0 {
+            body = body + "\n"
+        }
+        body = body + dl.get(di)
+        count = count + 1
+        di = di + 1
+    }
+    if dl.len() > 60 {
+        body = body + "\n... (" + (dl.len() - 60).to_str() + " more diff lines)"
+    }
+    return "snapshot '" + sname + "' differs from the stored value (stored " + stored.len().to_str() + " bytes, received " + got.len().to_str() + " bytes):\n" + body
+}
+
+# ----------------------------------------------------------------------------
+# The result record and the runner state.
+# ----------------------------------------------------------------------------
+
+struct TRes {
+    file: str,
+    name: str,
+    status: str,
+    detail: str,
+    ms: int
+}
+
+# ht_cpu_count() — the -j default (cosmetic fidelity: the .py read
+# os.cpu_count(); /proc/cpuinfo is the same number on Linux).
+fn ht_cpu_count() -> int uses IO {
+    if !file_exists("/proc/cpuinfo") {
+        return 2
+    }
+    let raw: str = read_file("/proc/cpuinfo")
+    let lines: list[str] = raw.split("\n")
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).starts_with("processor") {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    if n < 1 {
+        return 2
+    }
+    return n
+}
+
+# ----------------------------------------------------------------------------
+# Discovery (the entry file alone, through the compiler's front-end).
+# ----------------------------------------------------------------------------
+
+struct FnMeta {
+    name: str,
+    arity: int,
+    ptype0: str,
+    ret: str,
+    has_tp: bool,
+    is_extern: bool
+}
+
+# ht_probe_discover(path) — the private leg: parse the entry file in
+# isolation and print its test_/cases_ fns as TSV. A parse panic dies
+# with the panic on stderr (the parent maps it to a <load> failure).
+fn ht_probe_discover(path: str) -> int uses IO, Fs {
+    let ctx: Ctx = hl_parse_file(path)
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < ctx.fn_order.len() {
+        let key: str = ctx.fn_order.get(i)
+        if key.starts_with("test_") || key.starts_with("cases_") {
+            let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+            let mut p0: str = ""
+            if f.ptypes.len() > 0 {
+                p0 = f.ptypes.get(0)
+            }
+            let mut tp: str = "0"
+            if f.typeparams.len() > 0 {
+                tp = "1"
+            }
+            let mut ex: str = "0"
+            if f.is_extern {
+                ex = "1"
+            }
+            out = out + key + "\t" + f.params.len().to_str() + "\t" + p0 + "\t" + f.ret + "\t" + tp + "\t" + ex + "\n"
+        }
+        i = i + 1
+    }
+    print(out)
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# Per-file execution.
+# ----------------------------------------------------------------------------
+
+# The per-file bookkeeping the update-mode commit needs.
+struct RunCtx {
+    file: str,
+    grep: str,
+    update: bool,
+    hlboot: str,
+    # the store
+    st: Store,
+    snap_err: str,
+    snap_path: str,
+    store_existed: bool,
+    # update-mode inputs
+    prod_tests: list[str],
+    prod_names: list[str],
+    prod_vals: list[str],
+    passed_keys: list[str],
+    dead_keys: list[str],
+    stale_keys: list[str],
+    # results sink
+    results: list[TRes]
+}
+
+fn ht_push_res(rc: RunCtx, name: str, status: str, detail: str, ms: int) -> void {
+    rc.results.push(TRes {
+        file: rc.file,
+        name: name,
+        status: status,
+        detail: detail,
+        ms: ms
+    })
+}
+
+fn ht_prod_add(rc: RunCtx, t: str, n: str, v: str) -> void {
+    let mut i: int = 0
+    while i < rc.prod_tests.len() {
+        if rc.prod_tests.get(i) == t && rc.prod_names.get(i) == n {
+            rc.prod_vals.set(i, v)
+            return
+        }
+        i = i + 1
+    }
+    rc.prod_tests.push(t)
+    rc.prod_names.push(n)
+    rc.prod_vals.push(v)
+}
+
+fn ht_prod_has(rc: RunCtx, t: str, n: str) -> bool {
+    let mut i: int = 0
+    while i < rc.prod_tests.len() {
+        if rc.prod_tests.get(i) == t && rc.prod_names.get(i) == n {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn ht_passed_add(rc: RunCtx, t: str) -> void {
+    let mut i: int = 0
+    while i < rc.passed_keys.len() {
+        if rc.passed_keys.get(i) == t {
+            return
+        }
+        i = i + 1
+    }
+    rc.passed_keys.push(t)
+}
+
+fn ht_dead_add(rc: RunCtx, t: str) -> void {
+    let mut i: int = 0
+    while i < rc.dead_keys.len() {
+        if rc.dead_keys.get(i) == t {
+            return
+        }
+        i = i + 1
+    }
+    rc.dead_keys.push(t)
+}
+
+fn ht_stale_add(rc: RunCtx, t: str) -> void {
+    let mut i: int = 0
+    while i < rc.stale_keys.len() {
+        if rc.stale_keys.get(i) == t {
+            return
+        }
+        i = i + 1
+    }
+    rc.stale_keys.push(t)
+}
+
+# ht_invoke(rc, tname, tkey, table_fn, row_index) — ONE test invocation
+# (a plain test or one row), in its own fresh evaluator child, with the
+# Stage 119 snapshot bookkeeping only a PASSING test's records feed.
+fn ht_invoke(rc: RunCtx, tname: str, tkey: str, table_fn: str, row_index: int) -> void uses IO, Fs, Proc {
+    let t0: int = system_time_now_ms()
+    let cargs: list[str] = ["--test-fn", tname]
+    if table_fn != "" {
+        cargs.push("--table")
+        cargs.push(table_fn)
+        cargs.push("--row-index")
+        cargs.push(row_index.to_str())
+    }
+    cargs.push(rc.file)
+    let r: HtRun = ht_spawn(rc.hlboot, cargs)
+    let ms: int = system_time_now_ms() - t0
+    let mut status: str = "pass"
+    let mut detail: str = ""
+    if !r.spawned {
+        status = "fail"
+        detail = "internal error: could not spawn " + rc.hlboot
+    } else if r.code == 3 {
+        status = "skip"
+        let msg: str = r.err
+        let pre: str = "__HLTEST_SKIP__:"
+        if msg.starts_with(pre) {
+            detail = msg.slice(pre.len(), msg.len()).trim()
+        } else {
+            detail = ht_first_line(msg)
+        }
+    } else if r.code == 4 {
+        status = "fail"
+        let n_str: str = ht_first_line(r.err)
+        if n_str.starts_with("__HLTEST_EXIT__:") {
+            detail = "exit(" + n_str.slice(16, n_str.len()) + ")"
+        } else {
+            detail = n_str
+        }
+    } else if r.code == 2 {
+        status = "fail"
+        detail = "compile error: " + ht_first_line(r.err)
+    } else if r.code != 0 {
+        status = "fail"
+        let msg: str = r.err
+        let pre2: str = "__HLTEST_PANIC__:"
+        if msg.starts_with(pre2) {
+            let m: str = msg.slice(pre2.len(), msg.len())
+            if m.byte_at(m.len() - 1) == 10 {
+                detail = m.slice(0, m.len() - 1)
+            } else {
+                detail = m
+            }
+        } else {
+            detail = ht_first_line(msg)
+        }
+    }
+    # ---- the snapshot bookkeeping (only a pass proceeds) ----
+    if status == "pass" {
+        let recs: Store = ht_parse_records(r.out)
+        if recs.err != "" {
+            status = "fail"
+            detail = recs.err
+        } else {
+            let mut seen: list[str] = []
+            let mut ri: int = 0
+            while ri < recs.names.len() {
+                let nm: str = recs.names.get(ri)
+                let mut dup: bool = false
+                let mut si: int = 0
+                while si < seen.len() {
+                    if seen.get(si) == nm {
+                        dup = true
+                    }
+                    si = si + 1
+                }
+                if dup {
+                    status = "fail"
+                    detail = "duplicate snapshot name '" + nm + "' in one test - names must be unique within a test (duplicates mean the two records race for one store slot)"
+                    break
+                }
+                seen.push(nm)
+                ri = ri + 1
+            }
+            if status == "pass" {
+                # the store's records under this key (None-equivalent
+                # when the store is corrupt)
+                let mut old_names: list[str] = []
+                let mut has_old: bool = false
+                if rc.snap_err == "" {
+                    has_old = true
+                    let mut oi: int = 0
+                    while oi < rc.st.tests.len() {
+                        if rc.st.tests.get(oi) == tkey {
+                            old_names.push(rc.st.names.get(oi))
+                        }
+                        oi = oi + 1
+                    }
+                }
+                let mut problems: list[str] = []
+                let mut ann_new: int = 0
+                let mut ann_ch: int = 0
+                let mut ri2: int = 0
+                while ri2 < recs.names.len() {
+                    let nm2: str = recs.names.get(ri2)
+                    let v: str = recs.vals.get(ri2)
+                    if rc.update {
+                        if rc.snap_err != "" {
+                            problems.push("snapshot '" + nm2 + "' not recorded: the store is corrupt (see the <snapshots> entry)")
+                        } else {
+                            if !ht_store_has(rc.st, tkey, nm2) {
+                                ann_new = ann_new + 1
+                            } else if ht_store_get(rc.st, tkey, nm2) != v {
+                                ann_ch = ann_ch + 1
+                            }
+                            ht_prod_add(rc, tkey, nm2, v)
+                        }
+                    } else {
+                        if rc.snap_err != "" {
+                            problems.push("snapshot '" + nm2 + "' not verified: the store is corrupt (see the <snapshots> entry)")
+                        } else if !ht_store_has(rc.st, tkey, nm2) {
+                            problems.push("new snapshot '" + nm2 + "' - no stored value (record it: run hltest --update-snapshots)")
+                        } else if ht_store_get(rc.st, tkey, nm2) != v {
+                            problems.push(ht_snap_diff(nm2, ht_store_get(rc.st, tkey, nm2), v) + "\n(run hltest --update-snapshots to accept the new value)")
+                        }
+                    }
+                    ri2 = ri2 + 1
+                }
+                if !rc.update && has_old {
+                    # stored names this invocation no longer produces
+                    let mut sorted_old: list[str] = []
+                    let mut oi2: int = 0
+                    while oi2 < old_names.len() {
+                        sorted_old.push(old_names.get(oi2))
+                        oi2 = oi2 + 1
+                    }
+                    let mut sa: int = 1
+                    while sa < sorted_old.len() {
+                        let k: str = sorted_old.get(sa)
+                        let mut sb: int = sa - 1
+                        while sb >= 0 && sorted_old.get(sb) > k {
+                            sorted_old.set(sb + 1, sorted_old.get(sb))
+                            sb = sb - 1
+                        }
+                        sorted_old.set(sb + 1, k)
+                        sa = sa + 1
+                    }
+                    let mut so: int = 0
+                    while so < sorted_old.len() {
+                        let nm3: str = sorted_old.get(so)
+                        let mut have: bool = false
+                        let mut hi: int = 0
+                        while hi < seen.len() {
+                            if seen.get(hi) == nm3 {
+                                have = true
+                            }
+                            hi = hi + 1
+                        }
+                        if !have {
+                            problems.push("obsolete snapshot '" + nm3 + "' - the test no longer produces it (prune: run hltest --update-snapshots)")
+                        }
+                        so = so + 1
+                    }
+                }
+                if problems.len() > 0 {
+                    status = "fail"
+                    let mut joined: str = ""
+                    let mut pi: int = 0
+                    while pi < problems.len() {
+                        if pi > 0 {
+                            joined = joined + "\n"
+                        }
+                        joined = joined + problems.get(pi)
+                        pi = pi + 1
+                    }
+                    detail = joined
+                } else if rc.update {
+                    let mut pruned_here: int = 0
+                    let mut oi3: int = 0
+                    while oi3 < old_names.len() {
+                        if !ht_prod_has(rc, tkey, old_names.get(oi3)) {
+                            pruned_here = pruned_here + 1
+                        }
+                        oi3 = oi3 + 1
+                    }
+                    let mut ann: list[str] = []
+                    if ann_new > 0 {
+                        ann.push("+" + ann_new.to_str() + " new")
+                    }
+                    if ann_ch > 0 {
+                        ann.push("~" + ann_ch.to_str() + " changed")
+                    }
+                    if pruned_here > 0 {
+                        ann.push("-" + pruned_here.to_str() + " pruned")
+                    }
+                    if ann.len() > 0 {
+                        let mut joined2: str = ""
+                        let mut ai: int = 0
+                        while ai < ann.len() {
+                            if ai > 0 {
+                                joined2 = joined2 + ", "
+                            }
+                            joined2 = joined2 + ann.get(ai)
+                            ai = ai + 1
+                        }
+                        detail = "snapshots: " + joined2
+                    }
+                }
+                if status == "pass" {
+                    ht_passed_add(rc, tkey)
+                }
+            }
+        }
+    }
+    ht_push_res(rc, tkey, status, detail, ms)
+}
+
+# ht_run_table(rc, tname, meta, cases_meta_ok, cases_meta) — the
+# Stage 120 parameterised leg: static contract, the table probe child,
+# the row universe vs the store, then every selected row.
+fn ht_run_table(rc: RunCtx, tname: str, fmeta: FnMeta, have_cases: bool, cmeta: FnMeta) -> void uses IO, Fs, Proc {
+    let base_matched: bool = rc.grep == "" || tname.find(rc.grep) >= 0
+    let cases_fn: str = "cases_" + tname.slice(5, tname.len())
+    # ---- the static contract (failures land only when selected) ----
+    if !have_cases {
+        if base_matched {
+            ht_push_res(rc, tname, "fail", "parameterised test '" + tname + "' has no case table: add `fn " + cases_fn + "() -> list[std.test.TestCase[...]]` beside it (the convention is test_<name> <-> cases_<name>, same file; each row is TestCase { name, row })", 0)
+        }
+        return
+    }
+    if cmeta.is_extern {
+        if base_matched {
+            ht_push_res(rc, tname, "fail", "case table '" + cases_fn + "' is extern - the table is HLS code the runner executes, not a declaration", 0)
+        }
+        return
+    }
+    if cmeta.arity > 0 {
+        if base_matched {
+            ht_push_res(rc, tname, "fail", "case table '" + cases_fn + "' must take no parameters (the runner calls it with none), got " + cmeta.arity.to_str(), 0)
+        }
+        return
+    }
+    if !cmeta.has_tp && !fmeta.has_tp {
+        let row_t: str = ht_table_row_type(cmeta.ret)
+        if row_t != "" && row_t != ht_norm_type(fmeta.ptype0) {
+            if base_matched {
+                ht_push_res(rc, tname, "fail", "case table '" + cases_fn + "' returns rows of type '" + row_t + "' but '" + tname + "' takes '" + ht_norm_type(fmeta.ptype0) + "' - the TestCase row payload type and the test's parameter type must be the same type", 0)
+            }
+            return
+        }
+    }
+    # ---- the table probe child: execute + validate + universe ----
+    let tp: HtRun = ht_spawn(rc.hlboot, ["--probe-table", cases_fn, rc.file])
+    if tp.code != 0 {
+        let mut msg: str = tp.err
+        let marker: str = "__HLTEST_TABLE__:"
+        if msg.starts_with(marker) {
+            msg = msg.slice(marker.len(), msg.len())
+        }
+        if msg.byte_at(msg.len() - 1) == 10 {
+            msg = msg.slice(0, msg.len() - 1)
+        } else {
+            msg = ht_first_line(msg)
+        }
+        if base_matched {
+            ht_push_res(rc, tname, "fail", msg, 0)
+        }
+        return
+    }
+    let row_names: list[str] = []
+    let trows: list[str] = tp.out.split("\n")
+    let mut ti: int = 0
+    while ti < trows.len() {
+        let row: str = trows.get(ti)
+        if row != "" {
+            let parts: list[str] = row.split("\t")
+            if parts.len() == 2 {
+                row_names.push(parts.get(1))
+            }
+        }
+        ti = ti + 1
+    }
+    # ---- the row universe vs the store ----
+    let mut obsolete: list[str] = []
+    if rc.snap_err == "" {
+        let mut ki: int = 0
+        while ki < rc.st.tests.len() {
+            let t: str = rc.st.tests.get(ki)
+            if t.find("#") >= 0 && ht_row_base(t) == tname {
+                let mut in_universe: bool = false
+                let mut ri: int = 0
+                while ri < row_names.len() {
+                    if tname + "#" + row_names.get(ri) == t {
+                        in_universe = true
+                    }
+                    ri = ri + 1
+                }
+                if !in_universe {
+                    ht_dead_add(rc, t)
+                    if !rc.update && base_matched {
+                        obsolete.push(t)
+                    }
+                }
+            }
+            ki = ki + 1
+        }
+    }
+    if row_names.len() == 0 {
+        if obsolete.len() > 0 {
+            if base_matched {
+                ht_push_res(rc, tname, "fail", "stored snapshot records for case row(s) the table no longer contains: " + ht_join_list(obsolete, ", ") + " (prune them: run hltest --update-snapshots)", 0)
+            }
+        } else if base_matched {
+            ht_push_res(rc, tname, "skip", "empty case table '" + cases_fn + "' (0 rows)", 0)
+        }
+        return
+    }
+    if obsolete.len() > 0 {
+        ht_push_res(rc, tname, "fail", "stored snapshot records for case row(s) the table no longer contains: " + ht_join_list(obsolete, ", ") + " (prune them: run hltest --update-snapshots)", 0)
+    }
+    # ---- run the selected rows ----
+    let mut ri2: int = 0
+    while ri2 < row_names.len() {
+        let nm: str = row_names.get(ri2)
+        let full_name: str = tname + "#" + nm
+        if rc.grep != "" && !base_matched && full_name.find(rc.grep) < 0 {
+            ri2 = ri2 + 1
+            continue
+        }
+        ht_invoke(rc, tname, full_name, cases_fn, ri2)
+        ri2 = ri2 + 1
+    }
+}
+
+fn ht_join_list(items: list[str], sep: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < items.len() {
+        if i > 0 {
+            out = out + sep
+        }
+        out = out + items.get(i)
+        i = i + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# One file, end to end: check, discover, store, run, commit.
+# ----------------------------------------------------------------------------
+
+struct FileStats {
+    store: str,
+    written: bool,
+    removed: bool,
+    new: int,
+    changed: int,
+    pruned: int
+}
+
+fn ht_walk_files(dir: str, out: list[str], seen: list[str]) -> void uses Fs {
+    if !fs_is_dir(dir) {
+        return
+    }
+    let names: list[str] = fs_read_dir(dir)
+    let mut i: int = 0
+    while i < names.len() {
+        let nm: str = names.get(i)
+        let p: str = join_path(dir, nm)
+        if fs_is_dir(p) {
+            ht_walk_files(p, out, seen)
+        } else if nm.ends_with(".hls") {
+            let mut dup: bool = false
+            let mut si: int = 0
+            while si < seen.len() {
+                if seen.get(si) == p {
+                    dup = true
+                }
+                si = si + 1
+            }
+            if !dup {
+                seen.push(p)
+                out.push(p)
+            }
+        }
+        i = i + 1
+    }
+}
+
+# ht_run_file(self, hlboot, filepath, grep, update) — returns the
+# results (appended to acc.results) and the store stats.
+fn ht_run_file(rc: RunCtx, self_path: str, stats: FileStats, fns: map[str, FnMeta], fn_order: list[str]) -> void uses IO, Fs, Proc {
+    # ---- the check leg (one hlboot child; the module law lives here) ----
+    let chk: HtRun = ht_spawn(rc.hlboot, ["--check", rc.file])
+    if chk.code != 0 {
+        let mut msg: str = ht_first_line(chk.err)
+        if msg.starts_with("compile error: ") {
+            msg = msg.slice(15, msg.len())
+        }
+        if msg.find("missing main function") >= 0 {
+            ht_push_res(rc, "<module>", "skip", "module without fn main", 0)
+        } else if msg.starts_with("type error: ") {
+            ht_push_res(rc, "<check>", "fail", msg, 0)
+        } else {
+            ht_push_res(rc, "<load>", "fail", "compile error: " + msg, 0)
+        }
+        return
+    }
+    # ---- discovery (the isolated entry parse, in a probe child) ----
+    let disc: HtRun = ht_spawn(self_path, ["--probe-discover", rc.file])
+    if disc.code != 0 {
+        let mut msg2: str = ht_first_line(disc.err)
+        if msg2.starts_with("panic: ") {
+            msg2 = msg2.slice(7, msg2.len())
+        }
+        ht_push_res(rc, "<load>", "fail", "compile error: " + msg2, 0)
+        return
+    }
+    let lines: list[str] = disc.out.split("\n")
+    let mut li: int = 0
+    while li < lines.len() {
+        let line: str = lines.get(li)
+        if line != "" {
+            let parts: list[str] = line.split("\t")
+            if parts.len() == 6 {
+                let m: FnMeta = FnMeta {
+                    name: parts.get(0),
+                    arity: parts.get(1).to_int(),
+                    ptype0: parts.get(2),
+                    ret: parts.get(3),
+                    has_tp: parts.get(4) == "1",
+                    is_extern: parts.get(5) == "1"
+                }
+                fns.set(m.name, m)
+                fn_order.push(m.name)
+            }
+        }
+        li = li + 1
+    }
+    # ---- the snapshot store ----
+    rc.snap_path = ht_store_path(rc.file)
+    rc.store_existed = file_exists(rc.snap_path)
+    if rc.store_existed {
+        let st2: Store = ht_load_store(rc.snap_path)
+        rc.st = st2
+        if st2.err != "" {
+            rc.snap_err = st2.err
+            ht_push_res(rc, "<snapshots>", "fail", "snapshot store corrupt: " + st2.err + " - the store is a generated artifact; restore it with `git checkout` (or delete it and re-record with --update-snapshots, without --grep)", 0)
+        }
+    }
+    # ---- the test list (pre-filter; the grep-safety laws read it) ----
+    let mut all_tests: list[str] = []
+    let mut fi: int = 0
+    while fi < fn_order.len() {
+        let nm: str = fn_order.get(fi)
+        if nm.starts_with("test_") {
+            all_tests.push(nm)
+        }
+        fi = fi + 1
+    }
+    # stored records for test fns not in the file, or shape-mismatched
+    if rc.snap_err == "" && rc.st.tests.len() > 0 {
+        let mut unknown: list[str] = []
+        let mut ki: int = 0
+        while ki < rc.st.tests.len() {
+            let t: str = rc.st.tests.get(ki)
+            let mut seen_test: bool = false
+            let rbase: str = ht_row_base(t)
+            let mut ti2: int = 0
+            while ti2 < all_tests.len() {
+                if all_tests.get(ti2) == rbase {
+                    seen_test = true
+                }
+                ti2 = ti2 + 1
+            }
+            if !seen_test {
+                unknown.push(t)
+                ht_stale_add(rc, t)
+            } else {
+                let m: FnMeta = fns.get_or(ht_row_base(t), dummy_meta())
+                if t.find("#") >= 0 && m.arity == 0 {
+                    unknown.push(t)
+                    ht_stale_add(rc, t)
+                } else if t.find("#") < 0 && m.arity >= 1 {
+                    unknown.push(t)
+                    ht_stale_add(rc, t)
+                }
+            }
+            ki = ki + 1
+        }
+        # dedup unknown (a test's records may repeat)
+        let mut unk_u: list[str] = []
+        let mut ui: int = 0
+        while ui < unknown.len() {
+            let u: str = unknown.get(ui)
+            let mut have: bool = false
+            let mut uj: int = 0
+            while uj < unk_u.len() {
+                if unk_u.get(uj) == u {
+                    have = true
+                }
+                uj = uj + 1
+            }
+            if !have {
+                unk_u.push(u)
+            }
+            ui = ui + 1
+        }
+        if unk_u.len() > 0 && !rc.update {
+            ht_push_res(rc, "<snapshots>", "fail", "stored snapshots for test function(s) not in the file, or whose record shape no longer matches it (plain vs parameterised): " + ht_join_list(unk_u, ", ") + " (prune them: run hltest --update-snapshots)", 0)
+        }
+    }
+    # ---- entry-file tables without a matching parameterised test ----
+    let mut ci: int = 0
+    while ci < fn_order.len() {
+        let cname: str = fn_order.get(ci)
+        if cname.starts_with("cases_") {
+            let tmatch: str = "test_" + cname.slice(6, cname.len())
+            let have_match: bool = fns.get_or(tmatch, dummy_meta()).name == tmatch
+            if have_match && fns.get_or(tmatch, dummy_meta()).arity == 1 {
+                ci = ci + 1
+                continue
+            }
+            if have_match {
+                ht_push_res(rc, cname, "fail", "case table '" + cname + "' has a matching test '" + tmatch + "', but the test takes no parameters - a case table drives a parameterised test, one whose fn takes exactly one row parameter", 0)
+            } else {
+                ht_push_res(rc, cname, "fail", "case table '" + cname + "' has no matching parameterised test '" + tmatch + "' (the convention is test_<name> <-> cases_<name>, same file)", 0)
+            }
+        }
+        ci = ci + 1
+    }
+    if all_tests.len() == 0 {
+        ht_push_res(rc, "<no-tests>", "skip", "no test_* functions", 0)
+        return
+    }
+    let mut ran_any: bool = false
+    let mut ti3: int = 0
+    while ti3 < all_tests.len() {
+        let tname: str = all_tests.get(ti3)
+        let m2: FnMeta = fns.get_or(tname, dummy_meta())
+        if m2.arity >= 2 {
+            if rc.grep == "" || tname.find(rc.grep) >= 0 {
+                ran_any = true
+                ht_push_res(rc, tname, "fail", "parameterised test '" + tname + "' must take exactly one parameter - the row value - but takes " + m2.arity.to_str() + "; put the case data in a struct and make the table rows TestCase[ThatStruct]", 0)
+            }
+            ti3 = ti3 + 1
+            continue
+        }
+        if m2.arity == 1 {
+            let before: int = rc.results.len()
+            let cases_fn: str = "cases_" + tname.slice(5, tname.len())
+            let have_cases: bool = fns.get_or(cases_fn, dummy_meta()).name == cases_fn
+            ht_run_table(rc, tname, m2, have_cases, fns.get_or(cases_fn, dummy_meta()))
+            if rc.results.len() > before {
+                ran_any = true
+            }
+            ti3 = ti3 + 1
+            continue
+        }
+        if rc.grep != "" && tname.find(rc.grep) < 0 {
+            ti3 = ti3 + 1
+            continue
+        }
+        ran_any = true
+        ht_invoke(rc, tname, tname, "", -1)
+        ti3 = ti3 + 1
+    }
+    if !ran_any {
+        if rc.grep != "" {
+            ht_push_res(rc, "<no-tests>", "skip", "no tests match --grep", 0)
+        } else {
+            ht_push_res(rc, "<no-tests>", "skip", "no test_* functions", 0)
+        }
+    }
+    # ---- the update-mode commit ----
+    if rc.update && rc.snap_err == "" {
+        # kept: old records for tests that did not run (filtered), were
+        # not replaced by this run's passing records, and are not stale
+        # or dead; plus everything this run produced.
+        let mut kt: list[str] = []
+        let mut kn: list[str] = []
+        let mut kv: list[str] = []
+        let mut oldi: int = 0
+        while oldi < rc.st.tests.len() {
+            let t: str = rc.st.tests.get(oldi)
+            let nm: str = rc.st.names.get(oldi)
+            let v: str = rc.st.vals.get(oldi)
+            let mut keep: bool = true
+            let mut base_in_file: bool = false
+            let mut ai2: int = 0
+            while ai2 < all_tests.len() {
+                if all_tests.get(ai2) == ht_row_base(t) {
+                    base_in_file = true
+                }
+                ai2 = ai2 + 1
+            }
+            if !base_in_file {
+                keep = false
+            }
+            let mut ski: int = 0
+            while ski < rc.stale_keys.len() {
+                if rc.stale_keys.get(ski) == t {
+                    keep = false
+                }
+                ski = ski + 1
+            }
+            let mut dki: int = 0
+            while dki < rc.dead_keys.len() {
+                if rc.dead_keys.get(dki) == t {
+                    keep = false
+                }
+                dki = dki + 1
+            }
+            let mut passed: bool = false
+            let mut pki: int = 0
+            while pki < rc.passed_keys.len() {
+                if rc.passed_keys.get(pki) == t {
+                    passed = true
+                }
+                pki = pki + 1
+            }
+            if passed {
+                keep = false
+            }
+            if keep {
+                kt.push(t)
+                kn.push(nm)
+                kv.push(v)
+            }
+            oldi = oldi + 1
+        }
+        # merge: kept + produced (produced wins on collision)
+        let mut nt: list[str] = kt
+        let mut nn: list[str] = kn
+        let mut nv: list[str] = kv
+        let mut pi: int = 0
+        while pi < rc.prod_tests.len() {
+            let mut replaced: bool = false
+            let mut mi: int = 0
+            while mi < nt.len() {
+                if nt.get(mi) == rc.prod_tests.get(pi) && nn.get(mi) == rc.prod_names.get(pi) {
+                    nv.set(mi, rc.prod_vals.get(pi))
+                    replaced = true
+                }
+                mi = mi + 1
+            }
+            if !replaced {
+                nt.push(rc.prod_tests.get(pi))
+                nn.push(rc.prod_names.get(pi))
+                nv.push(rc.prod_vals.get(pi))
+            }
+            pi = pi + 1
+        }
+        # stats: new / changed / pruned
+        let mut snew: int = 0
+        let mut schg: int = 0
+        let mut pi2: int = 0
+        while pi2 < rc.prod_tests.len() {
+            if !ht_store_has(rc.st, rc.prod_tests.get(pi2), rc.prod_names.get(pi2)) {
+                snew = snew + 1
+            } else if ht_store_get(rc.st, rc.prod_tests.get(pi2), rc.prod_names.get(pi2)) != rc.prod_vals.get(pi2) {
+                schg = schg + 1
+            }
+            pi2 = pi2 + 1
+        }
+        let mut spr: int = 0
+        let mut oldi2: int = 0
+        while oldi2 < rc.st.tests.len() {
+            let mut still: bool = false
+            let mut mi2: int = 0
+            while mi2 < nt.len() {
+                if nt.get(mi2) == rc.st.tests.get(oldi2) && nn.get(mi2) == rc.st.names.get(oldi2) {
+                    still = true
+                }
+                mi2 = mi2 + 1
+            }
+            if !still {
+                spr = spr + 1
+            }
+            oldi2 = oldi2 + 1
+        }
+        stats.store = rc.snap_path
+        stats.new = snew
+        stats.changed = schg
+        stats.pruned = spr
+        if nt.len() == 0 {
+            if rc.store_existed {
+                proc_exec("rm -f '" + rc.snap_path + "'")
+                stats.removed = true
+            }
+        } else {
+            let blob: str = ht_store_serialize(nt, nn, nv)
+            let mut cur: str = ""
+            let mut have_cur: bool = false
+            if rc.store_existed {
+                if file_exists(rc.snap_path) {
+                    cur = read_file(rc.snap_path)
+                    have_cur = true
+                }
+            }
+            if !have_cur || cur != blob {
+                let dirp: str = dir_of(rc.snap_path)
+                proc_exec("mkdir -p '" + dirp + "'")
+                write_file(rc.snap_path + ".tmp", blob)
+                proc_exec("mv '" + rc.snap_path + ".tmp' '" + rc.snap_path + "'")
+                stats.written = true
+            }
+        }
+    }
+}
+
+fn dummy_meta() -> FnMeta {
+    return FnMeta {
+        name: "",
+        arity: 0,
+        ptype0: "",
+        ret: "",
+        has_tp: false,
+        is_extern: false
+    }
+}
+
+# ----------------------------------------------------------------------------
+# The JUnit report.
+# ----------------------------------------------------------------------------
+
+fn ht_write_junit(results: list[TRes], path: str, total_ms: int) -> void uses IO, Proc {
+    let mut xml: str = "<?xml version='1.0' encoding='utf-8'?>\n"
+    let total_fail: int = ht_count_status(results, "fail")
+    let total_skip: int = ht_count_status(results, "skip")
+    let total_tests: int = results.len() - total_skip
+    xml = xml + "<testsuites time=\"" + ht_sec3(total_ms) + "\">\n"
+    xml = xml + "<testsuite name=\"hltest\" tests=\"" + total_tests.to_str() + "\" failures=\"" + total_fail.to_str() + "\" skipped=\"" + total_skip.to_str() + "\" time=\"" + ht_sec3(total_ms) + "\">\n"
+    # sorted by (file, name) — the report's own order
+    let mut order: list[int] = []
+    let mut i: int = 0
+    while i < results.len() {
+        order.push(i)
+        i = i + 1
+    }
+    let mut a: int = 1
+    while a < order.len() {
+        let k: int = order.get(a)
+        let kf: str = results.get(k).file
+        let kn: str = results.get(k).name
+        let mut b: int = a - 1
+        while b >= 0 && (results.get(order.get(b)).file > kf
+        || (results.get(order.get(b)).file == kf && results.get(order.get(b)).name > kn)) {
+            order.set(b + 1, order.get(b))
+            b = b - 1
+        }
+        order.set(b + 1, k)
+        a = a + 1
+    }
+    let mut oi: int = 0
+    while oi < order.len() {
+        let r: TRes = results.get(order.get(oi))
+        xml = xml + "<testcase classname=\"" + ht_xml_escape(ht_rel(r.file)) + "\" name=\"" + ht_xml_escape(r.name) + "\" time=\"" + ht_sec3(r.ms) + "\">"
+        if r.status == "fail" {
+            let mut msg200: str = r.detail
+            if msg200.len() > 200 {
+                msg200 = msg200.slice(0, 200)
+            }
+            xml = xml + "<failure message=\"" + ht_xml_escape(msg200) + "\">" + ht_xml_escape(r.detail) + "</failure>"
+        } else if r.status == "skip" {
+            let mut msg200b: str = r.detail
+            if msg200b.len() > 200 {
+                msg200b = msg200b.slice(0, 200)
+            }
+            xml = xml + "<skipped message=\"" + ht_xml_escape(msg200b) + "\" />"
+        }
+        xml = xml + "</testcase>\n"
+        oi = oi + 1
+    }
+    xml = xml + "</testsuite>\n</testsuites>\n"
+    write_file(path, xml)
+}
+
+fn ht_count_status(results: list[TRes], status: str) -> int {
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < results.len() {
+        if results.get(i).status == status {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+# ----------------------------------------------------------------------------
+# The probe family for the acceptance gates (the .py's direct imports,
+# through the front door).
+# ----------------------------------------------------------------------------
+
+fn ht_probe_hltest(argv: list[str]) -> int uses IO, Fs {
+    let n: int = argv.len()
+    if n < 3 {
+        eprint("usage: hltest --probe-hltest <mode> [args...]\n")
+        return 2
+    }
+    let mode: str = argv.get(2)
+    if mode == "rowbase" {
+        if n < 4 {
+            eprint("rowbase needs a key\n")
+            return 2
+        }
+        println(ht_row_base(argv.get(3)))
+        return 0
+    }
+    if mode == "rowtype" {
+        if n < 4 {
+            eprint("rowtype needs a type\n")
+            return 2
+        }
+        let t: str = ht_table_row_type(argv.get(3))
+        if t == "" {
+            println("NONE")
+        } else {
+            println(t)
+        }
+        return 0
+    }
+    if mode == "store_re" {
+        let mut a1: int = 0
+        if ht_store_test_ok("test_add#zero-left") {
+            a1 = 1
+        }
+        let mut a2: int = 0
+        if ht_store_test_ok("test_plain") {
+            a2 = 1
+        }
+        let mut a3: int = 1
+        if ht_store_test_ok("test_add#two#hashes") {
+            a3 = 0
+        }
+        let mut a4: int = 1
+        if ht_store_test_ok("has space") {
+            a4 = 0
+        }
+        println(a1.to_str() + " " + a2.to_str() + " " + a3.to_str() + " " + a4.to_str())
+        return 0
+    }
+    if mode == "store_lines" {
+        if n < 4 {
+            eprint("store_lines needs a store path\n")
+            return 2
+        }
+        let st: Store = ht_load_store(argv.get(3))
+        if st.err != "" {
+            eprint(st.err + "\n")
+            return 1
+        }
+        # sorted by (test, name)
+        let mut order: list[int] = []
+        let mut i: int = 0
+        while i < st.tests.len() {
+            order.push(i)
+            i = i + 1
+        }
+        let mut a: int = 1
+        while a < order.len() {
+            let k: int = order.get(a)
+            let kt: str = st.tests.get(k)
+            let kn: str = st.names.get(k)
+            let mut b: int = a - 1
+            while b >= 0 && (st.tests.get(order.get(b)) > kt
+            || (st.tests.get(order.get(b)) == kt && st.names.get(order.get(b)) > kn)) {
+                order.set(b + 1, order.get(b))
+                b = b - 1
+            }
+            order.set(b + 1, k)
+            a = a + 1
+        }
+        let mut out: str = ""
+        let mut oi: int = 0
+        while oi < order.len() {
+            let idx: int = order.get(oi)
+            out = out + st.tests.get(idx) + "\t" + st.names.get(idx) + "\t" + st.vals.get(idx) + "\n"
+            oi = oi + 1
+        }
+        print(out)
+        return 0
+    }
+    if mode == "store_path" {
+        if n < 4 {
+            eprint("store_path needs a file path\n")
+            return 2
+        }
+        println(ht_store_path(argv.get(3)))
+        return 0
+    }
+    if mode == "cmp_records" {
+        if n < 5 {
+            eprint("cmp_records needs a store and a stdout file\n")
+            return 2
+        }
+        let st2: Store = ht_load_store(argv.get(3))
+        let stdout_txt: str = read_file(argv.get(4))
+        let recs: Store = ht_parse_records(stdout_txt)
+        if recs.err != "" {
+            println("err=" + recs.err)
+        } else {
+            println("err=NONE")
+        }
+        # sorted values
+        let mut va: list[str] = []
+        let mut i2: int = 0
+        while i2 < st2.vals.len() {
+            va.push(st2.vals.get(i2))
+            i2 = i2 + 1
+        }
+        let mut a2: int = 1
+        while a2 < va.len() {
+            let k2: str = va.get(a2)
+            let mut b2: int = a2 - 1
+            while b2 >= 0 && va.get(b2) > k2 {
+                va.set(b2 + 1, va.get(b2))
+                b2 = b2 - 1
+            }
+            va.set(b2 + 1, k2)
+            a2 = a2 + 1
+        }
+        println("A=" + ht_join_list(va, "|"))
+        let mut vb: list[str] = []
+        let mut i3: int = 0
+        while i3 < recs.vals.len() {
+            vb.push(recs.vals.get(i3))
+            i3 = i3 + 1
+        }
+        let mut a3: int = 1
+        while a3 < vb.len() {
+            let k3: str = vb.get(a3)
+            let mut b3: int = a3 - 1
+            while b3 >= 0 && vb.get(b3) > k3 {
+                vb.set(b3 + 1, vb.get(b3))
+                b3 = b3 - 1
+            }
+            vb.set(b3 + 1, k3)
+            a3 = a3 + 1
+        }
+        println("B=" + ht_join_list(vb, "|"))
+        return 0
+    }
+    eprint("unknown probe mode: " + mode + "\n")
+    return 2
+}
+
+# ----------------------------------------------------------------------------
+# main — the CLI law.
+# ----------------------------------------------------------------------------
+
+fn ht_usage() -> str {
+    return "usage: hltest [OPTIONS] <file.hls>...\n"
+    + "  --dir DIR        directory to discover .hls files in\n"
+    + "  -r, --recursive  recurse into directories\n"
+    + "  -j, --jobs N     parallel worker count (default: cpu count)\n"
+    + "  --grep SUB       only run tests whose name contains SUB\n"
+    + "  --junit PATH     write a JUnit XML report\n"
+    + "  -u, --update-snapshots   record new/changed snapshots, prune obsolete\n"
+    + "  -v, --verbose    show skip reasons\n"
+    + "  --det            run under the deterministic scheduler\n"
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let argv: list[str] = args()
+    let n: int = argv.len()
+    let self_path: str = argv.get(0)
+    # ---- the private legs ----
+    if n > 1 && argv.get(1) == "--probe-discover" {
+        if n < 3 {
+            eprint("error: --probe-discover needs a file\n")
+            return 2
+        }
+        return ht_probe_discover(argv.get(2))
+    }
+    if n > 1 && argv.get(1) == "--probe-hltest" {
+        return ht_probe_hltest(argv)
+    }
+    # ---- the evaluator ----
+    let mut hlboot: str = join_path(dir_of(self_path), "hlboot")
+    if !file_exists(hlboot) {
+        if file_exists("./bin/hlboot") {
+            hlboot = "./bin/hlboot"
+        }
+    }
+    if !file_exists(hlboot) {
+        eprint("hltest: no bin/hlboot - run make bootstrap\n")
+        return 2
+    }
+    # ---- flag parse ----
+    let mut inputs: list[str] = []
+    let mut dirs: list[str] = []
+    let mut recursive: bool = false
+    let mut jobs: int = ht_cpu_count()
+    let mut grep: str = ""
+    let mut junit_path: str = ""
+    let mut update: bool = false
+    let mut verbose: bool = false
+    let mut i: int = 1
+    while i < n {
+        let a: str = argv.get(i)
+        if a == "--dir" {
+            if i + 1 >= n {
+                eprint("error: --dir expects a directory\n")
+                return 2
+            }
+            dirs.push(argv.get(i + 1))
+            i = i + 2
+            continue
+        }
+        if a == "-r" || a == "--recursive" {
+            recursive = true
+            i = i + 1
+            continue
+        }
+        if a == "-j" || a == "--jobs" {
+            if i + 1 >= n {
+                eprint("error: -j expects a count\n")
+                return 2
+            }
+            jobs = argv.get(i + 1).to_int()
+            i = i + 2
+            continue
+        }
+        if a == "--grep" {
+            if i + 1 >= n {
+                eprint("error: --grep expects a substring\n")
+                return 2
+            }
+            grep = argv.get(i + 1)
+            i = i + 2
+            continue
+        }
+        if a == "--junit" {
+            if i + 1 >= n {
+                eprint("error: --junit expects a path\n")
+                return 2
+            }
+            junit_path = argv.get(i + 1)
+            i = i + 2
+            continue
+        }
+        if a == "-u" || a == "--update-snapshots" {
+            update = true
+            i = i + 1
+            continue
+        }
+        if a == "-v" || a == "--verbose" {
+            verbose = true
+            i = i + 1
+            continue
+        }
+        if a == "--det" {
+            # arm the deterministic scheduler for every evaluator child
+            env_set("HL_DET_SCHED", "1")
+            i = i + 1
+            continue
+        }
+        if a == "-h" || a == "--help" {
+            print(ht_usage())
+            return 0
+        }
+        if a.starts_with("-") && a != "-" {
+            eprint("hltest: error: unrecognized argument: " + a + "\n" + ht_usage())
+            return 2
+        }
+        inputs.push(a)
+        i = i + 1
+    }
+    let all_inputs: list[str] = inputs
+    let mut di: int = 0
+    while di < dirs.len() {
+        all_inputs.push(dirs.get(di))
+        di = di + 1
+    }
+    if all_inputs.len() == 0 {
+        eprint(ht_usage())
+        eprint("hltest: error: no input files (pass .hls paths or use --dir DIR)\n")
+        return 2
+    }
+    # ---- discovery ----
+    let files: list[str] = []
+    let seen: list[str] = []
+    let mut ii: int = 0
+    while ii < all_inputs.len() {
+        let p: str = all_inputs.get(ii)
+        if fs_is_dir(p) {
+            if recursive {
+                ht_walk_files(p, files, seen)
+            } else {
+                let names: list[str] = fs_read_dir(p)
+                let mut ni: int = 0
+                while ni < names.len() {
+                    let nm: str = names.get(ni)
+                    if nm.ends_with(".hls") {
+                        let fp: str = join_path(p, nm)
+                        let mut dup: bool = false
+                        let mut si: int = 0
+                        while si < seen.len() {
+                            if seen.get(si) == fp {
+                                dup = true
+                            }
+                            si = si + 1
+                        }
+                        if !dup {
+                            seen.push(fp)
+                            files.push(fp)
+                        }
+                    }
+                    ni = ni + 1
+                }
+            }
+        } else if p.ends_with(".hls") && file_exists(p) {
+            let mut dup2: bool = false
+            let mut si2: int = 0
+            while si2 < seen.len() {
+                if seen.get(si2) == p {
+                    dup2 = true
+                }
+                si2 = si2 + 1
+            }
+            if !dup2 {
+                seen.push(p)
+                files.push(p)
+            }
+        } else {
+            eprint("hltest: skip (not .hls or not found): " + p + "\n")
+        }
+        ii = ii + 1
+    }
+    if files.len() == 0 {
+        eprint("hltest: no .hls files found\n")
+        return 2
+    }
+    println("== hltest: " + files.len().to_str() + " file(s), -j " + jobs.to_str() + " ==")
+    let t0: int = system_time_now_ms()
+    let all_results: list[TRes] = []
+    let all_stats: list[FileStats] = []
+    let mut fi: int = 0
+    while fi < files.len() {
+        let f: str = files.get(fi)
+        let rc: RunCtx = RunCtx {
+            file: f,
+            grep: grep,
+            update: update,
+            hlboot: hlboot,
+            st: Store {
+                tests: [], names: [], vals: [], err: ""
+            },
+            snap_err: "",
+            snap_path: "",
+            store_existed: false,
+            prod_tests: [],
+            prod_names: [],
+            prod_vals: [],
+            passed_keys: [],
+            dead_keys: [],
+            stale_keys: [],
+            results: []
+        }
+        let stats: FileStats = FileStats {
+            store: "",
+            written: false,
+            removed: false,
+            new: 0,
+            changed: 0,
+            pruned: 0
+        }
+        let fns: map[str, FnMeta] = map_new()
+        let fn_order: list[str] = []
+        ht_run_file(rc, self_path, stats, fns, fn_order)
+        let mut ri: int = 0
+        while ri < rc.results.len() {
+            all_results.push(rc.results.get(ri))
+            ri = ri + 1
+        }
+        all_stats.push(stats)
+        fi = fi + 1
+    }
+    let total_ms: int = system_time_now_ms() - t0
+    # ---- the report ----
+    let mut order: list[int] = []
+    let mut oi: int = 0
+    while oi < all_results.len() {
+        order.push(oi)
+        oi = oi + 1
+    }
+    let mut a: int = 1
+    while a < order.len() {
+        let k: int = order.get(a)
+        let kf: str = all_results.get(k).file
+        let kn: str = all_results.get(k).name
+        let mut b: int = a - 1
+        while b >= 0 && (all_results.get(order.get(b)).file > kf
+        || (all_results.get(order.get(b)).file == kf && all_results.get(order.get(b)).name > kn)) {
+            order.set(b + 1, order.get(b))
+            b = b - 1
+        }
+        order.set(b + 1, k)
+        a = a + 1
+    }
+    let mut oi2: int = 0
+    while oi2 < order.len() {
+        let r: TRes = all_results.get(order.get(oi2))
+        let mut tag: str = "FAIL"
+        if r.status == "pass" {
+            tag = "PASS"
+        } else if r.status == "skip" {
+            tag = "SKIP"
+        }
+        let line: str = tag + "  " + ht_rel(r.file) + "::" + r.name + "  (" + ht_ms1(r.ms) + " ms)"
+        let mut full: str = line
+        if r.status == "fail" {
+            let indented: str = "        " + ht_replace(r.detail, "\n", "\n        ")
+            full = line + "\n" + indented
+        } else if r.status == "skip" && verbose {
+            full = line + "  " + r.detail
+        } else if r.status == "pass" && r.detail != "" {
+            full = line + "  " + r.detail
+        }
+        println(full)
+        oi2 = oi2 + 1
+    }
+    println("")
+    let n_pass: int = ht_count_status(all_results, "pass")
+    let n_fail: int = ht_count_status(all_results, "fail")
+    let n_skip: int = ht_count_status(all_results, "skip")
+    println("== hltest: " + n_pass.to_str() + " pass, " + n_fail.to_str() + " fail, " + n_skip.to_str() + " skip in " + ht_ms1(total_ms) + " ms ==")
+    if update {
+        let touched: list[str] = []
+        let mut si: int = 0
+        while si < all_stats.len() {
+            let st: FileStats = all_stats.get(si)
+            if st.written || st.removed {
+                touched.push(ht_rel(st.store))
+            }
+            si = si + 1
+        }
+        if touched.len() > 0 {
+            println("== snapshots: " + touched.len().to_str() + " store(s) updated: " + ht_join_list(touched, ", ") + " ==")
+        }
+    }
+    if junit_path != "" {
+        ht_write_junit(all_results, junit_path, total_ms)
+        println("== junit xml written to " + junit_path + " ==")
+    }
+    if n_fail == 0 {
+        return 0
+    }
+    return 1
+}
+
+# ----------------------------------------------------------------------------
+# End of tools/hltest.hls
+# ============================================================================
