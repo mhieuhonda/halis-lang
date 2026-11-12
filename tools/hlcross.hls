@@ -1,0 +1,1058 @@
+# ============================================================================
+# tools/hlcross.hls — Stage 22 (v0.41.0-alpha): the cross-compilation
+# orchestrator, in Halis — the native twin of tools/hlcross.py (same
+# target registry, same linker detection order, same report lines,
+# same exits).
+# ----------------------------------------------------------------------------
+# Usage (the .py's own grammar):
+#   hlcross <input.hls> <output.bin> [--target <triple>]
+#                                    [--linker zig|gcc|clang|cc|auto]
+#                                    [--keep-c PATH] [--dry-run]
+#                                    [--list-targets] [--show-host]
+#                                    [--hlc PATH] [--security auto|pac+bti|bti|off]
+#                                    [--target-feature neon|sse4.2|avx2|native|rvv]
+#                                    [--debug]
+#
+# The pipeline is the .py's: HLS --hlc--> C (the portable ANSI C11
+# backend) --cross-linker--> foreign binary. The C file is written even
+# when the link SKIPs, so it can ship to the target host and compile
+# there. Linker detection: zig cc -target (universal) first, then the
+# target-specific cross-linkers, then the host compiler when the triple
+# IS the host. No linker -> SKIP (exit 3) with the install hint.
+#
+# What changed with the native era: host detection asks uname
+# (machine + system) instead of Python's platform module; `which` is
+# `command -v` — the same PATH question.
+#
+# Exit contract: 0 linked; 1 hlc/linker failure; 2 usage/unknown
+# target; 3 SKIP (no cross-linker).
+# ============================================================================
+
+import "std.str"
+
+# ----------------------------------------------------------------------------
+# The target registry — the canonical Stage 22/25/26/93/94/95 set.
+# ----------------------------------------------------------------------------
+
+struct TargetSpec {
+    arch: str,
+    os_name: str,
+    abi: str,
+    binary_format: str,
+    binary_suffix: str,
+    link_libs: str, # space-joined ("-lm -lpthread"; "" = none)
+    security_flags: str, # space-joined
+    march: str, # "" when the target has no -march law
+    mabi: str,
+    freestanding: bool,
+    general_regs_only: bool
+}
+
+fn xc_spec(t: str) -> TargetSpec {
+    if t == "x86_64-linux-gnu" {
+        return TargetSpec {
+            arch: "x86_64", os_name: "linux", abi: "gnu",
+            binary_format: "ELF x86-64", binary_suffix: "",
+            link_libs: "-lm -lpthread", security_flags: "", march: "",
+            mabi: "", freestanding: false, general_regs_only: false
+        }
+    }
+    if t == "x86_64-unknown-freebsd" {
+        return TargetSpec {
+            arch: "x86_64", os_name: "freebsd",
+            abi: "freebsd", binary_format: "ELF x86-64 (FreeBSD)",
+            binary_suffix: "", link_libs: "-lm -lpthread",
+            security_flags: "", march: "", mabi: "",
+            freestanding: false, general_regs_only: false
+        }
+    }
+    if t == "aarch64-apple-darwin" {
+        return TargetSpec {
+            arch: "arm64", os_name: "macos", abi: "darwin",
+            binary_format: "Mach-O arm64", binary_suffix: "",
+            link_libs: "-lm",
+            security_flags: "-mbranch-protection=pac-ret+bti", march: "",
+            mabi: "", freestanding: false, general_regs_only: false
+        }
+    }
+    if t == "aarch64-linux-gnu" || t == "aarch64-unknown-linux-gnu" {
+        return TargetSpec {
+            arch: "arm64", os_name: "linux", abi: "gnu",
+            binary_format: "ELF aarch64 (Little Endian)",
+            binary_suffix: "", link_libs: "-lm -lpthread",
+            security_flags: "-mbranch-protection=bti", march: "", mabi: "",
+            freestanding: false, general_regs_only: false
+        }
+    }
+    if t == "x86_64-pc-windows-msvc" {
+        return TargetSpec {
+            arch: "x86_64", os_name: "windows", abi: "msvc",
+            binary_format: "PE COFF x86-64 (MSVC ABI)",
+            binary_suffix: ".exe", link_libs: "", security_flags: "",
+            march: "", mabi: "", freestanding: false, general_regs_only: false
+        }
+    }
+    if t == "x86_64-pc-windows-gnu" {
+        return TargetSpec {
+            arch: "x86_64", os_name: "windows", abi: "gnu",
+            binary_format: "PE COFF x86-64 (MinGW ABI)",
+            binary_suffix: ".exe", link_libs: "-lm", security_flags: "",
+            march: "", mabi: "", freestanding: false, general_regs_only: false
+        }
+    }
+    if t == "riscv64gc-unknown-linux-gnu"
+    || t == "riscv64-unknown-linux-gnu" {
+        return TargetSpec {
+            arch: "riscv64", os_name: "linux", abi: "gnu",
+            binary_format: "ELF riscv64 (Little Endian, RV64GC)",
+            binary_suffix: "", link_libs: "-lm -lpthread",
+            security_flags: "", march: "rv64gc", mabi: "lp64d",
+            freestanding: false, general_regs_only: false
+        }
+    }
+    if t == "riscv64-unknown-none" {
+        return TargetSpec {
+            arch: "riscv64", os_name: "none", abi: "none",
+            binary_format:
+            "ELF riscv64 (Little Endian, RV64IMAC, freestanding)",
+            binary_suffix: "", link_libs: "", security_flags: "",
+            march: "rv64imac", mabi: "lp64",
+            freestanding: true, general_regs_only: false
+        }
+    }
+    if t == "x86_64-unknown-none" {
+        return TargetSpec {
+            arch: "x86_64", os_name: "none", abi: "none",
+            binary_format: "ELF x86-64 (freestanding, no-PIE)",
+            binary_suffix: "", link_libs: "", security_flags: "",
+            march: "", mabi: "",
+            freestanding: true, general_regs_only: true
+        }
+    }
+    if t == "aarch64-unknown-none" {
+        return TargetSpec {
+            arch: "aarch64", os_name: "none", abi: "none",
+            binary_format: "ELF aarch64 (Little Endian, freestanding)",
+            binary_suffix: "", link_libs: "", security_flags: "",
+            march: "", mabi: "",
+            freestanding: true, general_regs_only: true
+        }
+    }
+    # unreachable when the caller canonicalised first
+    return TargetSpec {
+        arch: "?", os_name: "?", abi: "?",
+        binary_format: "?", binary_suffix: "", link_libs: "",
+        security_flags: "", march: "", mabi: "",
+        freestanding: false, general_regs_only: false
+    }
+}
+
+# xc_known(t) — a canonical triple.
+fn xc_known(t: str) -> bool {
+    return t == "x86_64-linux-gnu"
+    || t == "x86_64-unknown-freebsd"
+    || t == "aarch64-apple-darwin"
+    || t == "aarch64-linux-gnu"
+    || t == "aarch64-unknown-linux-gnu"
+    || t == "x86_64-pc-windows-msvc"
+    || t == "x86_64-pc-windows-gnu"
+    || t == "riscv64gc-unknown-linux-gnu"
+    || t == "riscv64-unknown-linux-gnu"
+    || t == "riscv64-unknown-none"
+    || t == "x86_64-unknown-none"
+    || t == "aarch64-unknown-none"
+}
+
+# xc_alias(a) — the short forms users commonly type ("" when not one).
+fn xc_alias(a: str) -> str {
+    if a == "linux" || a == "linux64" {
+        return "x86_64-linux-gnu"
+    }
+    if a == "freebsd" {
+        return "x86_64-unknown-freebsd"
+    }
+    if a == "macos" || a == "macos-arm64" || a == "darwin" {
+        return "aarch64-apple-darwin"
+    }
+    if a == "windows" || a == "windows-gnu" {
+        return "x86_64-pc-windows-gnu"
+    }
+    if a == "windows-msvc" {
+        return "x86_64-pc-windows-msvc"
+    }
+    if a == "aarch64-linux" || a == "aarch64" || a == "arm64"
+    || a == "arm64-linux" || a == "graviton" || a == "rpi4"
+    || a == "raspberrypi" {
+        return "aarch64-linux-gnu"
+    }
+    if a == "riscv64-linux" || a == "riscv64" || a == "riscv64gc"
+    || a == "riscv" || a == "visionfive" || a == "sifive" {
+        return "riscv64gc-unknown-linux-gnu"
+    }
+    if a == "riscv64-bare" || a == "riscv64-unknown" || a == "riscv-bare"
+    || a == "riscv-none" {
+        return "riscv64-unknown-none"
+    }
+    if a == "x86_64-none" || a == "x86_64-bare" || a == "x86-bare"
+    || a == "bare-x86_64" {
+        return "x86_64-unknown-none"
+    }
+    if a == "aarch64-none" || a == "aarch64-bare" || a == "bare-aarch64"
+    || a == "arm64-bare" {
+        return "aarch64-unknown-none"
+    }
+    return ""
+}
+
+# ----------------------------------------------------------------------------
+# Host detection — uname instead of Python's platform.
+# ----------------------------------------------------------------------------
+
+struct XcRun {
+    code: int,
+    out: str,
+    spawned: bool
+}
+
+fn xc_capture(prog: str, cargs: list[str]) -> XcRun uses Proc {
+    let r: XcRun = XcRun {
+        code: -1, out: "", spawned: false
+    }
+    let pid: int = proc_spawn(prog, cargs, 2, 1, 2)
+    if pid < 1 {
+        return r
+    }
+    r.spawned = true
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    r.code = proc_wait(pid)
+    proc_child_close(pid, 1)
+    r.out = out
+    return r
+}
+
+# xc_uname(flag) — `uname -m` / `uname -s`, trimmed ("" on failure).
+fn xc_uname(flag: str) -> str uses Proc {
+    let argv: list[str] = [flag]
+    let r: XcRun = xc_capture("uname", argv)
+    if r.code != 0 {
+        return ""
+    }
+    return r.out.trim()
+}
+
+# xc_host_triple() — the host's canonical triple ("" unknown).
+fn xc_host_triple() -> str uses Proc {
+    let machine: str = str_to_lower_ascii(xc_uname("-m"))
+    let system: str = str_to_lower_ascii(xc_uname("-s"))
+    if system == "linux" {
+        if machine == "x86_64" || machine == "amd64" {
+            return "x86_64-linux-gnu"
+        }
+        if machine == "aarch64" || machine == "arm64" {
+            return "aarch64-linux-gnu"
+        }
+        if machine == "riscv64" || machine == "rv64"
+        || machine == "riscv" {
+            return "riscv64gc-unknown-linux-gnu"
+        }
+    }
+    if system == "darwin" {
+        if machine == "arm64" || machine == "aarch64" {
+            return "aarch64-apple-darwin"
+        }
+        if machine == "x86_64" || machine == "amd64" {
+            return "x86_64-apple-darwin"
+        }
+    }
+    if system.starts_with("freebsd") {
+        if machine == "x86_64" || machine == "amd64" {
+            return "x86_64-unknown-freebsd"
+        }
+    }
+    if system == "windows" {
+        return "x86_64-pc-windows-gnu"
+    }
+    return ""
+}
+
+# ----------------------------------------------------------------------------
+# Cross-linker detection — the .py's order: zig, target-specific, host.
+# ----------------------------------------------------------------------------
+
+fn xc_which(name: str) -> bool uses Proc {
+    return proc_exec("command -v '" + name + "' >/dev/null 2>&1") == 0
+}
+
+struct LinkerPlan {
+    prog: str, # "" when not found
+    kind: str # zig / mingw / osxcross / freebsd-gcc / aarch64-linux-gnu-gcc
+    # / riscv64-linux-gnu-gcc / riscv64-unknown-elf-gcc / x86_64-elf-gcc
+    # / aarch64-elf-gcc / native / native-freestanding / host-fallback
+    # / not-found
+}
+
+# xc_find_target_linker(target) — the detection ladder, verbatim.
+fn xc_find_target_linker(target: str) -> LinkerPlan uses Proc {
+    let none: LinkerPlan = LinkerPlan {
+        prog: "", kind: "not-found"
+    }
+    # 1. zig cc — the universal linker.
+    if xc_which("zig") {
+        return LinkerPlan {
+            prog: "zig", kind: "zig"
+        }
+    }
+    # 2. target-specific cross-linkers.
+    if target == "x86_64-pc-windows-gnu" {
+        if xc_which("x86_64-w64-mingw32-gcc") {
+            return LinkerPlan {
+                prog: "x86_64-w64-mingw32-gcc",
+                kind: "mingw"
+            }
+        }
+    }
+    if target == "aarch64-apple-darwin" {
+        if xc_which("aarch64-apple-darwin-clang") {
+            return LinkerPlan {
+                prog: "aarch64-apple-darwin-clang",
+                kind: "osxcross"
+            }
+        }
+    }
+    if target == "x86_64-unknown-freebsd" {
+        if xc_which("x86_64-unknown-freebsd13-gcc") {
+            return LinkerPlan {
+                prog: "x86_64-unknown-freebsd13-gcc",
+                kind: "freebsd-gcc"
+            }
+        }
+        if xc_which("x86_64-unknown-freebsd14-gcc") {
+            return LinkerPlan {
+                prog: "x86_64-unknown-freebsd14-gcc",
+                kind: "freebsd-gcc"
+            }
+        }
+        if xc_which("x86_64-unknown-freebsd-gcc") {
+            return LinkerPlan {
+                prog: "x86_64-unknown-freebsd-gcc",
+                kind: "freebsd-gcc"
+            }
+        }
+    }
+    if target == "aarch64-linux-gnu"
+    || target == "aarch64-unknown-linux-gnu" {
+        if xc_which("aarch64-linux-gnu-gcc") {
+            return LinkerPlan {
+                prog: "aarch64-linux-gnu-gcc",
+                kind: "aarch64-linux-gnu-gcc"
+            }
+        }
+        if xc_which("aarch64-linux-gnu-gcc-12") {
+            return LinkerPlan {
+                prog: "aarch64-linux-gnu-gcc-12",
+                kind: "aarch64-linux-gnu-gcc"
+            }
+        }
+        if xc_which("aarch64-linux-gnu-gcc-11") {
+            return LinkerPlan {
+                prog: "aarch64-linux-gnu-gcc-11",
+                kind: "aarch64-linux-gnu-gcc"
+            }
+        }
+        if xc_which("aarch64-linux-gnu-cc") {
+            return LinkerPlan {
+                prog: "aarch64-linux-gnu-cc",
+                kind: "aarch64-linux-gnu-gcc"
+            }
+        }
+    }
+    if target == "riscv64gc-unknown-linux-gnu"
+    || target == "riscv64-unknown-linux-gnu" {
+        if xc_which("riscv64-linux-gnu-gcc") {
+            return LinkerPlan {
+                prog: "riscv64-linux-gnu-gcc",
+                kind: "riscv64-linux-gnu-gcc"
+            }
+        }
+        if xc_which("riscv64-linux-gnu-gcc-13") {
+            return LinkerPlan {
+                prog: "riscv64-linux-gnu-gcc-13",
+                kind: "riscv64-linux-gnu-gcc"
+            }
+        }
+        if xc_which("riscv64-linux-gnu-gcc-12") {
+            return LinkerPlan {
+                prog: "riscv64-linux-gnu-gcc-12",
+                kind: "riscv64-linux-gnu-gcc"
+            }
+        }
+        if xc_which("riscv64-linux-gnu-cc") {
+            return LinkerPlan {
+                prog: "riscv64-linux-gnu-cc",
+                kind: "riscv64-linux-gnu-gcc"
+            }
+        }
+        if xc_which("riscv64-unknown-linux-gnu-gcc") {
+            return LinkerPlan {
+                prog: "riscv64-unknown-linux-gnu-gcc",
+                kind: "riscv64-linux-gnu-gcc"
+            }
+        }
+    }
+    if target == "riscv64-unknown-none" {
+        if xc_which("riscv64-unknown-elf-gcc") {
+            return LinkerPlan {
+                prog: "riscv64-unknown-elf-gcc",
+                kind: "riscv64-unknown-elf-gcc"
+            }
+        }
+        if xc_which("riscv64-elf-gcc") {
+            return LinkerPlan {
+                prog: "riscv64-elf-gcc",
+                kind: "riscv64-unknown-elf-gcc"
+            }
+        }
+        if xc_which("riscv64-none-elf-gcc") {
+            return LinkerPlan {
+                prog: "riscv64-none-elf-gcc",
+                kind: "riscv64-unknown-elf-gcc"
+            }
+        }
+        if xc_which("riscv64-linux-gnu-gcc") {
+            return LinkerPlan {
+                prog: "riscv64-linux-gnu-gcc",
+                kind: "riscv64-unknown-elf-gcc"
+            }
+        }
+    }
+    if target == "x86_64-unknown-none" {
+        if xc_which("x86_64-unknown-elf-gcc") {
+            return LinkerPlan {
+                prog: "x86_64-unknown-elf-gcc",
+                kind: "x86_64-elf-gcc"
+            }
+        }
+        if xc_which("x86_64-elf-gcc") {
+            return LinkerPlan {
+                prog: "x86_64-elf-gcc",
+                kind: "x86_64-elf-gcc"
+            }
+        }
+        if xc_which("x86_64-none-elf-gcc") {
+            return LinkerPlan {
+                prog: "x86_64-none-elf-gcc",
+                kind: "x86_64-elf-gcc"
+            }
+        }
+        let host0: str = xc_host_triple()
+        if host0.starts_with("x86_64") {
+            if xc_which("gcc") {
+                return LinkerPlan {
+                    prog: "gcc",
+                    kind: "native-freestanding"
+                }
+            }
+            if xc_which("clang") {
+                return LinkerPlan {
+                    prog: "clang",
+                    kind: "native-freestanding"
+                }
+            }
+            if xc_which("cc") {
+                return LinkerPlan {
+                    prog: "cc",
+                    kind: "native-freestanding"
+                }
+            }
+        }
+    }
+    if target == "aarch64-unknown-none" {
+        if xc_which("aarch64-none-elf-gcc") {
+            return LinkerPlan {
+                prog: "aarch64-none-elf-gcc",
+                kind: "aarch64-elf-gcc"
+            }
+        }
+        if xc_which("aarch64-elf-gcc") {
+            return LinkerPlan {
+                prog: "aarch64-elf-gcc",
+                kind: "aarch64-elf-gcc"
+            }
+        }
+        if xc_which("aarch64-unknown-elf-gcc") {
+            return LinkerPlan {
+                prog: "aarch64-unknown-elf-gcc",
+                kind: "aarch64-elf-gcc"
+            }
+        }
+        if xc_which("aarch64-linux-gnu-gcc") {
+            return LinkerPlan {
+                prog: "aarch64-linux-gnu-gcc",
+                kind: "aarch64-elf-gcc"
+            }
+        }
+        if xc_which("aarch64-linux-gnu-gcc-12") {
+            return LinkerPlan {
+                prog: "aarch64-linux-gnu-gcc-12",
+                kind: "aarch64-elf-gcc"
+            }
+        }
+        if xc_which("aarch64-linux-gnu-cc") {
+            return LinkerPlan {
+                prog: "aarch64-linux-gnu-cc",
+                kind: "aarch64-elf-gcc"
+            }
+        }
+    }
+    # 3. host compiler when target == host (a native build).
+    let host: str = xc_host_triple()
+    if target == host {
+        if xc_which("gcc") {
+            return LinkerPlan {
+                prog: "gcc", kind: "native"
+            }
+        }
+        if xc_which("clang") {
+            return LinkerPlan {
+                prog: "clang", kind: "native"
+            }
+        }
+        if xc_which("cc") {
+            return LinkerPlan {
+                prog: "cc", kind: "native"
+            }
+        }
+    }
+    return none
+}
+
+# xc_linker_hint(target) — the install hint for the missing linker.
+fn xc_linker_hint(target: str) -> str {
+    return "no cross-linker found for target '" + target + "'. "
+    + "Install `zig` (https://ziglang.org) for the universal "
+    + "cross-linker, or a target-specific toolchain:\n"
+    + "  - x86_64-pc-windows-gnu: apt install mingw-w64\n"
+    + "  - aarch64-apple-darwin:  install osxcross\n"
+    + "  - x86_64-unknown-freebsd: apt install freebsd-buildutils\n"
+    + "  - x86_64-pc-windows-msvc: requires Windows + MSVC build tools\n"
+    + "  - aarch64-linux-gnu:      apt install gcc-aarch64-linux-gnu\n"
+    + "  - riscv64gc-unknown-linux-gnu: apt install gcc-riscv64-linux-gnu\n"
+    + "  - riscv64-unknown-none:  build the RISC-V GNU toolchain from\n"
+    + "                            github.com/riscv-collab/riscv-gnu-toolchain\n"
+    + "                            (./configure --with-arch=rv64imac --with-abi=lp64)\n"
+    + "  - x86_64-unknown-none:   any x86-64 host gcc links the image\n"
+    + "                            (a static freestanding link needs no\n"
+    + "                            OS support); x86_64-elf-gcc for a real\n"
+    + "                            cross-toolchain\n"
+    + "  - aarch64-unknown-none:  apt install gcc-aarch64-linux-gnu\n"
+    + "                            (or the bare-metal aarch64-none-elf\n"
+    + "                            toolchain)"
+}
+
+# ----------------------------------------------------------------------------
+# Binary format inspection (validate the linker output).
+# ----------------------------------------------------------------------------
+
+# xc_detect_binary_format(path) — the magic-byte read: ELF / Mach-O /
+# PE COFF / unknown ("missing" when the file is not there).
+fn xc_detect_binary_format(path: str) -> str uses Fs {
+    if !file_exists(path) {
+        return "missing"
+    }
+    let magic: str = read_file(path)
+    if magic.len() >= 4 && magic.byte_at(0) == 127
+    && magic.byte_at(1) == 69 && magic.byte_at(2) == 76
+    && magic.byte_at(3) == 70 {
+        let mut bits: str = "64-bit"
+        if magic.byte_at(4) == 1 {
+            bits = "32-bit"
+        }
+        let mut endian: str = "LE"
+        if magic.byte_at(5) == 2 {
+            endian = "BE"
+        }
+        return "ELF " + bits + " " + endian
+    }
+    if magic.len() >= 4 {
+        let a: int = magic.byte_at(0)
+        let b: int = magic.byte_at(1)
+        let c: int = magic.byte_at(2)
+        let d: int = magic.byte_at(3)
+        # Mach-O: FE ED FA CE / FE ED FA CF (and the reversed spells)
+        if(a == 254 && b == 237 && c == 250 && (d == 206 || d == 207))
+        || (d == 254 && c == 237 && b == 250 && (a == 206 || a == 207)) {
+            if(a == 254 && d == 207) || (d == 254 && a == 207) {
+                return "Mach-O 64-bit"
+            }
+            return "Mach-O 32-bit"
+        }
+        # PE/COFF: 'M' 'Z' (the DOS stub).
+        if a == 77 && b == 90 {
+            return "PE COFF (Windows)"
+        }
+    }
+    return "unknown"
+}
+
+# ----------------------------------------------------------------------------
+# The repo root (tools/'s parent, with the cwd walk-up fallback).
+# ----------------------------------------------------------------------------
+
+fn xc_is_repo_root(p: str) -> bool uses Fs {
+    return file_exists(p + "/std/str.hls")
+    && file_exists(p + "/SPEC.md")
+}
+
+fn xc_path_dirname(p: str) -> str {
+    let mut i: int = p.len() - 1
+    while i >= 0 {
+        if p.byte_at(i) == 47 {
+            if i == 0 {
+                return "/"
+            }
+            return p.slice(0, i)
+        }
+        i = i - 1
+    }
+    return "."
+}
+
+fn xc_repo_root() -> str uses Fs, Proc, Args {
+    let cwd_now: str = cwd_get()
+    if xc_is_repo_root(cwd_now) {
+        return cwd_now
+    }
+    let argv: list[str] = args()
+    if argv.len() > 0 && argv.get(0) != "" {
+        let cand: str = xc_path_dirname(xc_path_dirname(argv.get(0)))
+        if xc_is_repo_root(cand) {
+            return cand
+        }
+    }
+    let mut d: str = cwd_now
+    let mut guard: int = 0
+    while guard < 128 {
+        if xc_is_repo_root(d) {
+            return d
+        }
+        let parent: str = xc_path_dirname(d)
+        if parent == d {
+            return d
+        }
+        d = parent
+        guard = guard + 1
+    }
+    return d
+}
+
+# ----------------------------------------------------------------------------
+# The orchestrator.
+# ----------------------------------------------------------------------------
+
+# xc_run_inherit(prog, args) — the .py's run(): stdio inherited, the
+# exit code only.
+fn xc_run_inherit(prog: str, cargs: list[str]) -> int uses Proc {
+    let pid: int = proc_spawn(prog, cargs, 0, 0, 0)
+    if pid < 1 {
+        return -1
+    }
+    return proc_wait(pid)
+}
+
+# xc_push_all(dst, src) — list extend.
+fn xc_push_all(dst: list[str], src: list[str]) -> void {
+    let mut i: int = 0
+    while i < src.len() {
+        dst.push(src.get(i))
+        i = i + 1
+    }
+}
+
+# xc_split_space(s) — split a space-joined flag string ("" -> []).
+fn xc_split_space(s: str) -> list[str] {
+    let out: list[str] = []
+    if s == "" {
+        return out
+    }
+    let parts: list[str] = s.split(" ")
+    let mut i: int = 0
+    while i < parts.len() {
+        if parts.get(i) != "" {
+            out.push(parts.get(i))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+struct XcCli {
+    input: str,
+    output: str,
+    target: str,
+    linker: str,
+    keep_c: str,
+    dry_run: bool,
+    list_targets: bool,
+    show_host: bool,
+    hlc: str,
+    security: str,
+    target_feature: str,
+    debug: bool
+}
+
+# xc_cross_compile(cli) — the pipeline. Prints the .py's exact lines.
+fn xc_cross_compile(cli: XcCli) -> int uses IO, Fs, Proc {
+    if !file_exists(cli.input) {
+        eprintln("error: input file not found: " + cli.input)
+        return 2
+    }
+    let target: str = cli.target
+    let spec: TargetSpec = xc_spec(target)
+
+    # resolve the cross-linker
+    let mut plan: LinkerPlan = LinkerPlan {
+        prog: "", kind: "not-found"
+    }
+    if cli.linker == "auto" {
+        plan = xc_find_target_linker(target)
+    } else if cli.linker == "zig" {
+        if !xc_which("zig") {
+            eprintln("error: --linker zig requested but zig is not"
+            + " installed")
+            return 2
+        }
+        plan = LinkerPlan {
+            prog: "zig", kind: "zig"
+        }
+    } else {
+        if !xc_which(cli.linker) {
+            eprintln("error: --linker " + cli.linker + " not found")
+            return 2
+        }
+        plan = LinkerPlan {
+            prog: cli.linker, kind: "host-fallback"
+        }
+    }
+
+    # where the C file lands
+    let c_real: str = if_or(cli.keep_c != "", cli.keep_c,
+    cli.output + ".c")
+
+    if cli.dry_run {
+        println("[dry-run] hlc " + cli.input + " " + c_real)
+        println("[dry-run] linker: " + if_or(plan.prog != "", plan.prog,
+        "(none)") + " " + c_real + " -o " + cli.output)
+        return 0
+    }
+    println("[1/2] hlc: compiling " + cli.input + " -> " + c_real)
+    # the hlc step: --target rides along for the bare-metal triples,
+    # --target-feature for the SIMD fast paths, --debug for DWARF 5.
+    let hlc_cmd: list[str] = [cli.hlc, cli.input, c_real]
+    if spec.freestanding {
+        hlc_cmd.push("--target")
+        hlc_cmd.push(target)
+    }
+    if cli.target_feature != "" {
+        hlc_cmd.push("--target-feature")
+        hlc_cmd.push(cli.target_feature)
+    }
+    if cli.debug {
+        hlc_cmd.push("--debug")
+    }
+    let code: int = xc_run_inherit(cli.hlc,
+    list_slice(hlc_cmd, 1, hlc_cmd.len()))
+    if code != 0 {
+        eprintln("error: hlc failed (exit " + code.to_str() + ")")
+        return 1
+    }
+    if !file_exists(c_real) {
+        eprintln("error: hlc did not produce " + c_real)
+        return 1
+    }
+    println("      C source: " + c_real + " ("
+    + fs_size(c_real).to_str() + " bytes)")
+
+    # the link step
+    if plan.prog == "" {
+        let hint: str = xc_linker_hint(target)
+        eprintln("[2/2] SKIP: " + hint)
+        eprintln("      The C source at " + c_real + " can be copied to a "
+        + spec.binary_format + " host and compiled there with "
+        + "the platform's native cc.")
+        return 3
+    }
+    let out_path: str = cli.output + spec.binary_suffix
+    println("[2/2] " + plan.kind + ": linking " + c_real + " -> "
+    + out_path)
+
+    # the flag assembly: security, arch, freestanding, debug
+    let cmd: list[str] = [plan.prog]
+    if plan.kind == "zig" {
+        # zig cc -target <triple> -O2; the bare-metal OS spells
+        # freestanding
+        let mut zig_triple: str = target
+        if target.ends_with("-unknown-none") {
+            zig_triple = target.slice(0,
+            target.len() - "-unknown-none".len())
+            + "-freestanding-none"
+        }
+        cmd.push("cc")
+        cmd.push("-target")
+        cmd.push(zig_triple)
+        cmd.push("-O2")
+    } else {
+        cmd.push("-O2")
+    }
+    # security flags
+    if cli.security == "auto" {
+        xc_push_all(cmd, xc_split_space(spec.security_flags))
+    } else if cli.security == "pac+bti" {
+        cmd.push("-mbranch-protection=pac-ret+bti")
+    } else if cli.security == "bti" {
+        cmd.push("-mbranch-protection=bti")
+    }
+    # arch flags (the RISC-V -march/-mabi laws)
+    if target == "riscv64gc-unknown-linux-gnu"
+    || target == "riscv64-unknown-linux-gnu" {
+        let mut march: str = spec.march
+        if cli.target_feature == "rvv" {
+            march = "rv64gcv"
+        }
+        cmd.push("-march=" + march)
+        cmd.push("-mabi=" + spec.mabi)
+    } else if target == "riscv64-unknown-none" {
+        if plan.kind != "zig" {
+            cmd.push("-march=" + spec.march)
+        }
+        cmd.push("-mabi=" + spec.mabi)
+        cmd.push("-mcmodel=medany")
+    }
+    if spec.general_regs_only {
+        cmd.push("-mgeneral-regs-only")
+    }
+    if cli.debug {
+        cmd.push("-g")
+        cmd.push("-gdwarf-5")
+    }
+    # the freestanding link law: no libc, no crt0; the repo's link
+    # script drives the placement when it ships.
+    if spec.freestanding {
+        xc_push_all(cmd, ["-nostdlib", "-nostartfiles", "-ffreestanding",
+        "-fno-stack-protector", "-fno-pie", "-no-pie",
+        "-ffunction-sections", "-Wl,--gc-sections"])
+        let script: str = xc_repo_root() + "/targets/" + target + ".ld"
+        if file_exists(script) {
+            cmd.push("-Wl,-T," + script)
+        }
+    }
+    cmd.push(c_real)
+    cmd.push("-o")
+    cmd.push(out_path)
+    xc_push_all(cmd, xc_split_space(spec.link_libs))
+
+    let lcode: int = xc_run_inherit(cmd.get(0),
+    list_slice(cmd, 1, cmd.len()))
+    if lcode != 0 {
+        eprintln("error: linker failed (exit " + lcode.to_str() + ")")
+        let mut joined: str = ""
+        let mut i: int = 0
+        while i < cmd.len() {
+            if i > 0 {
+                joined = joined + " "
+            }
+            joined = joined + cmd.get(i)
+            i = i + 1
+        }
+        eprintln("      command: " + joined)
+        return 1
+    }
+    if !file_exists(out_path) {
+        eprintln("error: linker reported success but " + out_path
+        + " was not created")
+        return 1
+    }
+    let fmt: str = xc_detect_binary_format(out_path)
+    println("      binary: " + out_path + " ("
+    + fs_size(out_path).to_str() + " bytes, " + fmt
+    + "; target: " + spec.binary_format + ")")
+    return 0
+}
+
+# if_or(cond, a, b) — a when cond else b (no ternary in the language).
+fn if_or(cond: bool, a: str, b: str) -> str {
+    if cond {
+        return a
+    }
+    return b
+}
+
+# list_slice(xs, a, b) — xs[a..b).
+fn list_slice(xs: list[str], a: int, b: int) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = a
+    while i < b && i < xs.len() {
+        out.push(xs.get(i))
+        i = i + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# --list-targets — the registry, the aliases, the host.
+# ----------------------------------------------------------------------------
+
+fn xc_cmd_list_targets() -> int uses IO, Proc {
+    println("Supported cross-compilation targets (Stage 22, extended"
+    + " Stage 25 + 26, bare-metal Stages 93-95):")
+    println("")
+    let triples: list[str] = ["x86_64-linux-gnu", "x86_64-unknown-freebsd",
+    "aarch64-apple-darwin", "aarch64-linux-gnu",
+    "x86_64-pc-windows-msvc", "x86_64-pc-windows-gnu",
+    "riscv64gc-unknown-linux-gnu", "riscv64-unknown-none",
+    "x86_64-unknown-none", "aarch64-unknown-none"]
+    let mut i: int = 0
+    while i < triples.len() {
+        let t: str = triples.get(i)
+        let s: TargetSpec = xc_spec(t)
+        println("  " + t)
+        println("      arch: " + s.arch + ", os: " + s.os_name
+        + ", abi: " + s.abi)
+        println("      format: " + s.binary_format)
+        if s.march != "" {
+            println("      march: " + s.march + ", mabi: " + s.mabi)
+        }
+        if s.freestanding {
+            println("      freestanding: -nostdlib -nostartfiles"
+            + " -ffreestanding")
+        }
+        i = i + 1
+    }
+    println("")
+    println("Aliases (accepted by --target):")
+    let aliases: list[str] = ["linux", "linux64", "freebsd", "macos",
+    "macos-arm64", "darwin", "windows", "windows-msvc", "windows-gnu",
+    "aarch64-linux", "aarch64", "arm64", "arm64-linux", "graviton",
+    "rpi4", "raspberrypi", "riscv64-linux", "riscv64", "riscv64gc",
+    "riscv", "riscv64-bare", "riscv64-unknown", "riscv-bare",
+    "riscv-none", "visionfive", "sifive", "x86_64-none", "x86_64-bare",
+    "x86-bare", "bare-x86_64", "aarch64-none", "aarch64-bare",
+    "bare-aarch64", "arm64-bare"]
+    let mut a: int = 0
+    while a < aliases.len() {
+        let name: str = aliases.get(a)
+        println("  " + str_pad_right(name, 24, " ") + " -> "
+        + xc_alias(name))
+        a = a + 1
+    }
+    println("")
+    let host: str = xc_host_triple()
+    if host != "" {
+        println("Host triple detected: " + host)
+    } else {
+        println("Host triple: (unknown)")
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# main — the argparse grammar.
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let argv: list[str] = args()
+    let mut cli: XcCli = XcCli {
+        input: "", output: "", target: "x86_64-linux-gnu",
+        linker: "auto", keep_c: "", dry_run: false,
+        list_targets: false, show_host: false, hlc: "bin/hlc",
+        security: "auto", target_feature: "", debug: false
+    }
+    let positional: list[str] = []
+    let mut i: int = 1
+    while i < argv.len() {
+        let a: str = argv.get(i)
+        if a == "--target" {
+            cli.target = argv.get(i + 1)
+            i = i + 2
+        } else if a == "--linker" {
+            cli.linker = argv.get(i + 1)
+            i = i + 2
+        } else if a == "--keep-c" {
+            cli.keep_c = argv.get(i + 1)
+            i = i + 2
+        } else if a == "--hlc" {
+            cli.hlc = argv.get(i + 1)
+            i = i + 2
+        } else if a == "--security" {
+            cli.security = argv.get(i + 1)
+            i = i + 2
+        } else if a == "--target-feature" {
+            cli.target_feature = argv.get(i + 1)
+            i = i + 2
+        } else if a == "--dry-run" {
+            cli.dry_run = true
+            i = i + 1
+        } else if a == "--list-targets" {
+            cli.list_targets = true
+            i = i + 1
+        } else if a == "--show-host" {
+            cli.show_host = true
+            i = i + 1
+        } else if a == "--debug" {
+            cli.debug = true
+            i = i + 1
+        } else if a.starts_with("--") {
+            eprintln("usage: hlcross <input.hls> <output.bin>"
+            + " [--target T] [--linker auto|zig|gcc|clang|cc]"
+            + " [--keep-c PATH] [--dry-run] [--list-targets]"
+            + " [--show-host] [--hlc PATH] [--security auto|pac+bti|bti|off]"
+            + " [--target-feature neon|sse4.2|avx2|native|rvv] [--debug]")
+            eprintln("hlcross: error: unrecognized argument: " + a)
+            return 2
+        } else {
+            positional.push(a)
+            i = i + 1
+        }
+    }
+
+    if cli.list_targets {
+        return xc_cmd_list_targets()
+    }
+    if cli.show_host {
+        let host: str = xc_host_triple()
+        if host != "" {
+            println(host)
+            return 0
+        }
+        eprintln("(unknown)")
+        return 1
+    }
+    if positional.len() < 2 {
+        eprintln("usage: hlcross <input.hls> <output.bin> [--target T]"
+        + " ... (or --list-targets / --show-host)")
+        eprintln("hlcross: error: input and output are required")
+        return 2
+    }
+    cli.input = positional.get(0)
+    cli.output = positional.get(1)
+
+    # canonicalise the target (aliases resolve; unknown refuses)
+    if !xc_known(cli.target) {
+        let aliased: str = xc_alias(cli.target)
+        if aliased == "" {
+            eprintln("error: unknown target '" + cli.target + "'."
+            + " Use --list-targets to see the supported set.")
+            return 2
+        }
+        cli.target = aliased
+    }
+    return xc_cross_compile(cli)
+}
+
+# ----------------------------------------------------------------------------
+# End of tools/hlcross.hls
+# ============================================================================
