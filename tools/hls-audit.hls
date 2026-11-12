@@ -1,0 +1,3141 @@
+# ============================================================================
+# tools/hls-audit.hls — Stage 103 supply-chain effect report
+# (transitive), in Halis — the native twin of tools/hls-audit.py.
+# ----------------------------------------------------------------------------
+# Usage (the .py's own grammar):
+#   hls-audit <entry.hls> [--allow E1,E2,...] [--json]
+#   hls-audit --pkg [DIR] [--allow E1,E2,...] [--json]
+#
+# Two modes, one report shape (schema "hls-audit/v1"):
+#
+#   source   walk the transitive import graph of an entry file — every
+#            module classified (toolchain / dependency / workspace),
+#            every function attributed to the module that defines it,
+#            each module's surface split INTRINSIC (its own builtin
+#            calls + the externs it calls) and REACHABLE (the checker
+#            fixpoint). Every effect's introduction points and chains
+#            are drawn.
+#   package  walk the transitive package tree (manifest to manifest),
+#            each entry audited through the real checker — a library
+#            entry through the wrapper contract hls-pkg lock uses.
+#            Fail-closed: an unauditable package is NEVER pure, its
+#            surface is the full effect set and the run fails. Lock
+#            sha256 drift is refused (an audit of drifted content
+#            describes a tree the lock no longer names).
+#
+# What changed with the native era: the interpreter years parsed each
+# module with boot.py's own parser; this port drives the REAL front-end
+# (tools/hlfront.hls, linked) — one grammar, one checker, zero drift
+# with the compiler — and every parse/check that must survive a bad
+# program runs in a probe child that re-execs this binary
+# (--probe-parse / --probe-check), the hls-sign release-gate pattern.
+# The TOML subset, the dependency resolution and the lockfile map are
+# hls-sign's folds of the same hpkg parts, carried over verbatim.
+#
+# Exit contract: 0 report produced, nothing violates the policy; 1 a
+# policy violation, drift, a cycle, an unauditable package or an
+# unauditable source tree; 2 usage errors.
+# ============================================================================
+
+import "./hlfront.hls"
+import "std.str"
+import "std.result"
+import "std.sha256"
+import "std.json"
+import "std.env"
+
+# ============================================================================
+# Shared helpers (hls-sign's own folds: paths, spawn capture, sorting).
+# ============================================================================
+
+struct Fail {
+    msg: str
+}
+
+fn fail(msg: str) -> Fail {
+    return Fail {
+        msg: msg
+    }
+}
+
+fn path_is_abs(p: str) -> bool {
+    return p.len() > 0 && p.byte_at(0) == 47
+}
+
+fn path_join2(base: str, rel: str) -> str {
+    if rel.len() == 0 {
+        if base.len() == 0 {
+            return ""
+        }
+        return base
+    }
+    if path_is_abs(rel) {
+        return rel
+    }
+    if base.len() == 0 {
+        return rel
+    }
+    if base.byte_at(base.len() - 1) == 47 {
+        return base + rel
+    }
+    return base + "/" + rel
+}
+
+fn path_dirname(p: str) -> str {
+    let n: int = p.len()
+    if n == 0 {
+        return "."
+    }
+    let mut k: int = n - 1
+    while k > 0 && p.byte_at(k) == 47 {
+        k = k - 1
+    }
+    while k >= 0 {
+        if p.byte_at(k) == 47 {
+            if k == 0 {
+                return "/"
+            }
+            return p.slice(0, k)
+        }
+        k = k - 1
+    }
+    return "."
+}
+
+fn split_components(p: str) -> list[str] {
+    let out: list[str] = []
+    let n: int = p.len()
+    let mut i: int = 0
+    while i < n {
+        let mut j: int = i
+        while j < n && p.byte_at(j) != 47 {
+            j = j + 1
+        }
+        out.push(p.slice(i, j))
+        i = j + 1
+    }
+    return out
+}
+
+fn norm_path(p: str) -> str {
+    if p == "" {
+        return "."
+    }
+    let abs: bool = path_is_abs(p)
+    let comps: list[str] = split_components(p)
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < comps.len() {
+        let c: str = comps.get(i)
+        if c == "" || c == "." {
+            i = i + 1
+            continue
+        }
+        if c == ".." {
+            if out.len() > 0 && out.get(out.len() - 1) != ".." {
+                out.pop()
+            } else if !abs {
+                out.push("..")
+            }
+            i = i + 1
+            continue
+        }
+        out.push(c)
+        i = i + 1
+    }
+    if out.len() == 0 {
+        if abs {
+            return "/"
+        }
+        return "."
+    }
+    let mut r: str = ""
+    if abs {
+        r = "/"
+    }
+    let mut j: int = 0
+    while j < out.len() {
+        r = r + out.get(j)
+        if j + 1 < out.len() {
+            r = r + "/"
+        }
+        j = j + 1
+    }
+    return r
+}
+
+fn realpath_lex(p: str) -> str uses Proc {
+    let mut raw: str = p
+    if !path_is_abs(raw) {
+        raw = cwd_get() + "/" + raw
+    }
+    return norm_path(raw)
+}
+
+fn which_hit(name: str) -> str uses Fs, Proc {
+    if name == "" || name.contains("/") {
+        return ""
+    }
+    let penv: str = env_get("PATH")
+    if penv == "" {
+        return ""
+    }
+    let dirs: list[str] = penv.split(":")
+    let mut i: int = 0
+    while i < dirs.len() {
+        let mut cand: str = dirs.get(i)
+        if cand == "" {
+            cand = "."
+        }
+        let full: str = cand + "/" + name
+        if file_exists(full) {
+            return full
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn is_repo_root(p: str) -> bool uses Fs {
+    return file_exists(p + "/std/str.hls")
+    && file_exists(p + "/core/option.hls")
+    && file_exists(p + "/SPEC.md")
+}
+
+fn repo_root() -> str uses Fs, Proc, Args {
+    let argv: list[str] = args()
+    if argv.len() > 0 && argv.get(0) != "" {
+        let binp: str = realpath_lex(argv.get(0))
+        let root: str = path_dirname(path_dirname(binp))
+        if is_repo_root(root) {
+            return root
+        }
+        let hit: str = which_hit(argv.get(0))
+        if hit != "" {
+            let root2: str = path_dirname(path_dirname(realpath_lex(hit)))
+            if is_repo_root(root2) {
+                return root2
+            }
+        }
+    }
+    let mut d: str = realpath_lex("")
+    let mut guard: int = 0
+    while guard < 128 {
+        if is_repo_root(d) {
+            return d
+        }
+        let parent: str = path_dirname(d)
+        if parent == d || parent == "." {
+            return realpath_lex("")
+        }
+        d = parent
+        guard = guard + 1
+    }
+    return realpath_lex("")
+}
+
+fn sort_strs(xs: list[str]) -> list[str] {
+    if xs.len() <= 1 {
+        let one: list[str] = []
+        let mut i0: int = 0
+        while i0 < xs.len() {
+            one.push(xs.get(i0))
+            i0 = i0 + 1
+        }
+        return one
+    }
+    let mid: int = xs.len() / 2
+    let left_in: list[str] = []
+    let right_in: list[str] = []
+    let mut i: int = 0
+    while i < mid {
+        left_in.push(xs.get(i))
+        i = i + 1
+    }
+    while i < xs.len() {
+        right_in.push(xs.get(i))
+        i = i + 1
+    }
+    return merge_strs(sort_strs(left_in), sort_strs(right_in))
+}
+
+fn merge_strs(a: list[str], b: list[str]) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    let mut j: int = 0
+    while i < a.len() && j < b.len() {
+        if !(b.get(j) < a.get(i)) {
+            out.push(a.get(i))
+            i = i + 1
+        } else {
+            out.push(b.get(j))
+            j = j + 1
+        }
+    }
+    while i < a.len() {
+        out.push(a.get(i))
+        i = i + 1
+    }
+    while j < b.len() {
+        out.push(b.get(j))
+        j = j + 1
+    }
+    return out
+}
+
+fn is_file_h(p: str) -> bool uses Fs {
+    return file_exists(p) && !fs_is_dir(p)
+}
+
+fn read_or(p: str, default_value: str) -> str uses Fs {
+    if file_exists(p) {
+        return read_file(p)
+    }
+    return default_value
+}
+
+struct RunCap {
+    code: int,
+    out: str,
+    err: str
+}
+
+fn spawn_cap(program: str, argv: list[str]) -> RunCap uses Proc {
+    let r: RunCap = RunCap {
+        code: -1, out: "", err: ""
+    }
+    let pid: int = proc_spawn(program, argv, 2, 1, 1)
+    if pid < 1 {
+        return r
+    }
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    r.code = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    r.out = out
+    r.err = err
+    return r
+}
+
+# clip_str(s, n) — Python's safe slicing s[:n].
+fn is_digit_b(c: int) -> bool {
+    return c >= 48 && c <= 57
+}
+
+fn is_alpha_b(c: int) -> bool {
+    return(c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+}
+
+fn is_dir_h(p: str) -> bool uses Fs {
+    return fs_is_dir(p)
+}
+
+fn sg_has(xs: list[str], x: str) -> bool {
+    let mut i: int = 0
+    while i < xs.len() {
+        if xs.get(i) == x {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn join_strs(parts: list[str], sep: str) -> str {
+    return str_join(parts, sep)
+}
+
+fn path_basename(p: str) -> str {
+    let n: int = p.len()
+    if n == 0 {
+        return ""
+    }
+    let mut k: int = n - 1
+    while k > 0 && p.byte_at(k) == 47 {
+        k = k - 1
+    }
+    let mut j: int = k
+    while j >= 0 {
+        if p.byte_at(j) == 47 {
+            return p.slice(j + 1, k + 1)
+        }
+        j = j - 1
+    }
+    return p.slice(0, k + 1)
+}
+
+fn self_path() -> str uses Args {
+    let argv: list[str] = args()
+    if argv.len() > 0 {
+        return argv.get(0)
+    }
+    return ""
+}
+
+fn find_from(s: str, needle: str, from: int) -> int {
+    let n: int = s.len()
+    let m: int = needle.len()
+    if m == 0 {
+        if from <= n {
+            return from
+        }
+        return -1
+    }
+    let mut i: int = from
+    if i < 0 {
+        i = 0
+    }
+    while i + m <= n {
+        let mut k: int = 0
+        let mut same: bool = true
+        while k < m {
+            if s.byte_at(i + k) != needle.byte_at(k) {
+                same = false
+                k = m
+            }
+            k = k + 1
+        }
+        if same {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn hex_val_b(c: int) -> int {
+    if c >= 48 && c <= 57 {
+        return c - 48
+    }
+    if c >= 97 && c <= 102 {
+        return c - 87
+    }
+    if c >= 65 && c <= 70 {
+        return c - 55
+    }
+    return -1
+}
+
+fn clip_str(s: str, n: int) -> str {
+    if s.len() <= n {
+        return s
+    }
+    return s.slice(0, n)
+}
+
+# The package tree — hls-audit's manifest walk (the TOML subset
+# hpkg_manifest parses), hls-pkg's dependency resolution, the lockfile
+# drift law. The per-package check rides the REAL front-end in a probe
+# child (--probe-audit): a program that does not check is UNAUDITABLE,
+# never a crash of the signer.
+# ============================================================================
+
+struct TomlVal {
+    kind: str, # "none"|"str"|"int"|"float"|"bool"|"list"|"table"
+    sval: str,
+    ival: int,
+    bval: bool,
+    keys: list[str],
+    vals: list[TomlVal]
+}
+
+fn toml_none() -> TomlVal {
+    return TomlVal {
+        kind: "none", sval: "", ival: 0, bval: false,
+        keys: [], vals: []
+    }
+}
+
+fn toml_table() -> TomlVal {
+    return TomlVal {
+        kind: "table", sval: "", ival: 0, bval: false,
+        keys: [], vals: []
+    }
+}
+
+fn toml_get(doc: TomlVal, key: str) -> TomlVal {
+    let mut i: int = 0
+    while i < doc.keys.len() {
+        if doc.keys.get(i) == key {
+            return doc.vals.get(i)
+        }
+        i = i + 1
+    }
+    return toml_none()
+}
+
+fn toml_set(doc: TomlVal, key: str, val: TomlVal) -> void {
+    let mut i: int = 0
+    while i < doc.keys.len() {
+        if doc.keys.get(i) == key {
+            doc.vals.set(i, val)
+            return
+        }
+        i = i + 1
+    }
+    doc.keys.push(key)
+    doc.vals.push(val)
+}
+
+# strip_toml_comment(line) — the strict outside-string comment strip.
+fn strip_toml_comment(line: str) -> Result[str, str] {
+    let mut out: str = ""
+    let mut in_str: bool = false
+    let n: int = line.len()
+    let mut i: int = 0
+    while i < n {
+        let c: int = line.byte_at(i)
+        if in_str {
+            if c == 92 && i + 1 < n {
+                let esc: int = line.byte_at(i + 1)
+                if esc == 98 || esc == 116 || esc == 110 || esc == 102
+                || esc == 114 || esc == 34 || esc == 92 || esc == 117
+                || esc == 85 {
+                    out = out + line.slice(i, i + 2)
+                    i = i + 2
+                    continue
+                }
+                return Result.Err("invalid TOML escape sequence: \\"
+                + chr(esc) + " (TOML only allows \\b, \\t, \\n, \\f, "
+                + "\\r, \\\", \\uXXXX, \\UXXXXXXXX)")
+            }
+            if c == 34 {
+                in_str = false
+            }
+            out = out + line.slice(i, i + 1)
+            i = i + 1
+            continue
+        }
+        if c == 34 {
+            in_str = true
+            out = out + line.slice(i, i + 1)
+            i = i + 1
+            continue
+        }
+        if c == 35 {
+            break
+        }
+        out = out + line.slice(i, i + 1)
+        i = i + 1
+    }
+    return Result.Ok(out)
+}
+
+# toml_is_int_token(tok) — Python's int(tok) acceptance.
+fn toml_is_int_token(tok: str) -> bool {
+    let t: str = tok.trim()
+    if t.len() == 0 {
+        return false
+    }
+    let mut i: int = 0
+    if t.byte_at(0) == 43 || t.byte_at(0) == 45 {
+        i = 1
+    }
+    if i >= t.len() {
+        return false
+    }
+    let mut prev_us: bool = true
+    while i < t.len() {
+        let c: int = t.byte_at(i)
+        if is_digit_b(c) {
+            prev_us = false
+        } else if c == 95 {
+            if prev_us {
+                return false
+            }
+            prev_us = true
+        } else {
+            return false
+        }
+        i = i + 1
+    }
+    if prev_us {
+        return false
+    }
+    return true
+}
+
+fn toml_is_float_token(tok: str) -> bool {
+    if tok.len() == 0 {
+        return false
+    }
+    let mut saw_digit: bool = false
+    let mut saw_dot_exp: bool = false
+    let mut i: int = 0
+    if tok.byte_at(0) == 43 || tok.byte_at(0) == 45 {
+        i = 1
+    }
+    while i < tok.len() {
+        let c: int = tok.byte_at(i)
+        if is_digit_b(c) {
+            saw_digit = true
+        } else if c == 46 || c == 101 || c == 69 {
+            saw_dot_exp = true
+        } else if c != 43 && c != 45 && c != 95 {
+            return false
+        }
+        i = i + 1
+    }
+    return saw_digit && saw_dot_exp
+}
+
+# parse_int_clean — the digits of a signed int token.
+fn parse_int_clean(tok: str) -> int {
+    let mut neg: bool = false
+    let mut i: int = 0
+    if tok.len() > 0 && (tok.byte_at(0) == 43 || tok.byte_at(0) == 45) {
+        neg = tok.byte_at(0) == 45
+        i = 1
+    }
+    let mut v: int = 0
+    while i < tok.len() {
+        let c: int = tok.byte_at(i)
+        if is_digit_b(c) {
+            v = v * 10 + (c - 48)
+        }
+        i = i + 1
+    }
+    if neg {
+        return -v
+    }
+    return v
+}
+
+# hex4_val / hex8_val — \uXXXX / \UXXXXXXXX payloads.
+fn hex4_val(s: str) -> int {
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < s.len() && i < 4 {
+        v = v * 16 + hex_val_b(s.byte_at(i))
+        i = i + 1
+    }
+    return v
+}
+
+fn hex8_val(s: str) -> int {
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < s.len() && i < 8 {
+        v = v * 16 + hex_val_b(s.byte_at(i))
+        i = i + 1
+    }
+    return v
+}
+
+# utf8_encode(cp) — the codepoint as UTF-8 bytes.
+fn utf8_encode(cp: int) -> str {
+    if cp < 0 {
+        return ""
+    }
+    if cp < 128 {
+        return chr(cp)
+    }
+    if cp < 2048 {
+        return chr(192 + cp / 64) + chr(128 + cp % 64)
+    }
+    if cp < 65536 {
+        return chr(224 + cp / 4096) + chr(128 + (cp / 64) % 64)
+        + chr(128 + cp % 64)
+    }
+    return chr(240 + cp / 262144) + chr(128 + (cp / 4096) % 64)
+    + chr(128 + (cp / 64) % 64) + chr(128 + cp % 64)
+}
+
+# py_repr_str(s) — Python's repr of a str (the error detail lines).
+fn py_repr_str(s: str) -> str {
+    let mut out: str = "'"
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c == 39 {
+            out = out + "\\'"
+        } else if c == 92 {
+            out = out + "\\\\"
+        } else if c == 10 {
+            out = out + "\\n"
+        } else if c == 9 {
+            out = out + "\\t"
+        } else if c == 13 {
+            out = out + "\\r"
+        } else if c < 32 || c >= 127 {
+            let h: str = "0123456789abcdef"
+            let b1: int = c / 16
+            let b2: int = c - (c / 16) * 16
+            out = out + "\\x" + h.slice(b1, b1 + 1) + h.slice(b2, b2 + 1)
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out + "'"
+}
+
+struct TomlPair {
+    val: TomlVal,
+    next: int
+}
+
+# toml_bare_value(tok) — true/false/int/float/bare string.
+fn toml_bare_value(tok: str) -> TomlVal {
+    if tok == "true" {
+        return TomlVal {
+            kind: "bool", sval: "", ival: 0, bval: true,
+            keys: [], vals: []
+        }
+    }
+    if tok == "false" {
+        return TomlVal {
+            kind: "bool", sval: "", ival: 0, bval: false,
+            keys: [], vals: []
+        }
+    }
+    if toml_is_int_token(tok) {
+        return TomlVal {
+            kind: "int", sval: "", ival: parse_int_clean(tok), bval: false,
+            keys: [], vals: []
+        }
+    }
+    if toml_is_float_token(tok) {
+        return TomlVal {
+            kind: "float", sval: tok, ival: 0, bval: false,
+            keys: [], vals: []
+        }
+    }
+    return TomlVal {
+        kind: "str", sval: tok, ival: 0, bval: false,
+        keys: [], vals: []
+    }
+}
+
+# parse_toml_value(src, i) — _parse_value: (value, next index).
+fn parse_toml_value(src: str, i: int) -> Result[TomlPair, str] {
+    let n: int = src.len()
+    let mut j: int = i
+    while j < n && (src.byte_at(j) == 32 || src.byte_at(j) == 9
+    || src.byte_at(j) == 13 || src.byte_at(j) == 10) {
+        j = j + 1
+    }
+    if j >= n {
+        return Result.Ok(TomlPair {
+            val: toml_none(), next: j
+        })
+    }
+    let c: int = src.byte_at(j)
+    if c == 34 {
+        let mut k: int = j + 1
+        let mut out: str = ""
+        while k < n && src.byte_at(k) != 34 {
+            if src.byte_at(k) == 92 && k + 1 < n {
+                let nxt: int = src.byte_at(k + 1)
+                if nxt == 110 {
+                    out = out + "\n"
+                    k = k + 2
+                    continue
+                }
+                if nxt == 116 {
+                    out = out + "\t"
+                    k = k + 2
+                    continue
+                }
+                if nxt == 114 {
+                    out = out + chr(13)
+                    k = k + 2
+                    continue
+                }
+                if nxt == 98 {
+                    out = out + chr(8)
+                    k = k + 2
+                    continue
+                }
+                if nxt == 102 {
+                    out = out + chr(12)
+                    k = k + 2
+                    continue
+                }
+                if nxt == 34 {
+                    out = out + "\""
+                    k = k + 2
+                    continue
+                }
+                if nxt == 92 {
+                    out = out + "\\"
+                    k = k + 2
+                    continue
+                }
+                if nxt == 117 && k + 6 <= n {
+                    let cp: int = hex4_val(src.slice(k + 2, k + 6))
+                    out = out + utf8_encode(cp)
+                    k = k + 6
+                    continue
+                }
+                if nxt == 85 && k + 10 <= n {
+                    let cp2: int = hex8_val(src.slice(k + 2, k + 10))
+                    out = out + utf8_encode(cp2)
+                    k = k + 10
+                    continue
+                }
+                out = out + chr(nxt)
+                k = k + 2
+                continue
+            }
+            out = out + src.slice(k, k + 1)
+            k = k + 1
+        }
+        if k >= n {
+            return Result.Err("unterminated string literal at offset "
+            + j.to_str())
+        }
+        return Result.Ok(TomlPair {
+            val: TomlVal {
+                kind: "str", sval: out, ival: 0, bval: false,
+                keys: [], vals: []
+            },
+            next: k + 1
+        })
+    }
+    if c == 91 {
+        let items: list[TomlVal] = []
+        let mut k: int = j + 1
+        while k < n && src.byte_at(k) != 93 {
+            while k < n && (src.byte_at(k) == 32 || src.byte_at(k) == 9
+            || src.byte_at(k) == 13 || src.byte_at(k) == 10
+            || src.byte_at(k) == 44) {
+                k = k + 1
+            }
+            if k >= n || src.byte_at(k) == 93 {
+                break
+            }
+            if src.byte_at(k) == 34 {
+                let pair: Result[TomlPair, str] = parse_toml_value(src, k)
+                if result_is_err(pair) {
+                    return Result.Err(result_err_or(pair, ""))
+                }
+                items.push(result_unwrap(pair).val)
+                k = result_unwrap(pair).next
+            } else {
+                let s0: int = k
+                while k < n && src.byte_at(k) != 32 && src.byte_at(k) != 9
+                && src.byte_at(k) != 13 && src.byte_at(k) != 10
+                && src.byte_at(k) != 44 && src.byte_at(k) != 93 {
+                    k = k + 1
+                }
+                let tok: str = src.slice(s0, k)
+                if tok != "" {
+                    items.push(toml_bare_value(tok))
+                }
+            }
+        }
+        return Result.Ok(TomlPair {
+            val: TomlVal {
+                kind: "list", sval: "", ival: 0, bval: false,
+                keys: [], vals: items
+            },
+            next: k + 1
+        })
+    }
+    if c == 123 {
+        let table: TomlVal = toml_table()
+        let mut k: int = j + 1
+        while k < n && src.byte_at(k) != 125 {
+            while k < n && (src.byte_at(k) == 32 || src.byte_at(k) == 9
+            || src.byte_at(k) == 13 || src.byte_at(k) == 10
+            || src.byte_at(k) == 44) {
+                k = k + 1
+            }
+            if k >= n || src.byte_at(k) == 125 {
+                break
+            }
+            let eq: int = find_from(src, "=", k)
+            if eq < 0 {
+                return Result.Err("substring not found")
+            }
+            let key: str = src.slice(k, eq).trim()
+            let pair2: Result[TomlPair, str] = parse_toml_value(src, eq + 1)
+            if result_is_err(pair2) {
+                return Result.Err(result_err_or(pair2, ""))
+            }
+            toml_set(table, key, result_unwrap(pair2).val)
+            k = result_unwrap(pair2).next
+        }
+        return Result.Ok(TomlPair {
+            val: table, next: k + 1
+        })
+    }
+    let s0: int = j
+    while j < n && src.byte_at(j) != 32 && src.byte_at(j) != 9
+    && src.byte_at(j) != 13 && src.byte_at(j) != 10
+    && src.byte_at(j) != 44 && src.byte_at(j) != 93
+    && src.byte_at(j) != 125 && src.byte_at(j) != 61
+    && src.byte_at(j) != 35 {
+        j = j + 1
+    }
+    let tok: str = src.slice(s0, j)
+    return Result.Ok(TomlPair {
+        val: toml_bare_value(tok), next: j
+    })
+}
+
+# section_cursor(doc, section, creating) — walk to the section table.
+fn section_cursor(doc: TomlVal, section: str, creating: bool)
+-> Result[TomlVal, str] {
+    let parts: list[str] = section.split(".")
+    let mut cursor: TomlVal = doc
+    let mut i: int = 0
+    while i < parts.len() {
+        let p: str = parts.get(i)
+        if cursor.kind != "table" {
+            let mut msg: str = "manifest: section [" + section
+            + "] shadows a non-table value"
+            if creating {
+                msg = msg + " (a key under [" + section
+                + "] was already set)"
+            }
+            return Result.Err(msg)
+        }
+        let nxt: TomlVal = toml_get(cursor, p)
+        if nxt.kind == "none" {
+            let fresh: TomlVal = toml_table()
+            toml_set(cursor, p, fresh)
+            cursor = fresh
+        } else {
+            cursor = nxt
+        }
+        i = i + 1
+    }
+    if cursor.kind != "table" {
+        return Result.Err("manifest: cannot set key under non-table "
+        + "section [" + section + "]")
+    }
+    return Result.Ok(cursor)
+}
+
+# parse_manifest(path) — the tree of sections and keys.
+fn parse_manifest(path: str) -> Result[TomlVal, str] uses Fs {
+    if !is_file_h(path) {
+        return Result.Err("manifest not found: " + path)
+    }
+    let raw: str = read_file(path)
+    let lines: list[str] = raw.split("\n")
+    let mut src: str = ""
+    let mut li: int = 0
+    while li < lines.len() {
+        let sr: Result[str, str] = strip_toml_comment(lines.get(li))
+        if result_is_err(sr) {
+            return Result.Err("manifest: " + result_err_or(sr, "")
+            + " (in line: " + py_repr_str(lines.get(li)) + ")")
+        }
+        src = src + result_unwrap(sr)
+        if li + 1 < lines.len() {
+            src = src + "\n"
+        }
+        li = li + 1
+    }
+    let result: TomlVal = toml_table()
+    let mut current_section: str = ""
+    let n: int = src.len()
+    let mut i: int = 0
+    while i < n {
+        while i < n && (src.byte_at(i) == 32 || src.byte_at(i) == 9
+        || src.byte_at(i) == 13 || src.byte_at(i) == 10) {
+            i = i + 1
+        }
+        if i >= n {
+            break
+        }
+        if src.byte_at(i) == 91 {
+            let j: int = find_from(src, "]", i)
+            if j < 0 {
+                return Result.Err("substring not found")
+            }
+            current_section = src.slice(i + 1, j).trim()
+            if current_section == "" {
+                return Result.Err("manifest: empty section header at "
+                + "offset " + i.to_str())
+            }
+            let cursor: Result[TomlVal, str] = section_cursor(result,
+            current_section, true)
+            if result_is_err(cursor) {
+                return Result.Err(result_err_or(cursor, ""))
+            }
+            i = j + 1
+            continue
+        }
+        let eq: int = find_from(src, "=", i)
+        if eq < 0 {
+            return Result.Err("substring not found")
+        }
+        let key: str = src.slice(i, eq).trim()
+        if key == "" {
+            return Result.Err("manifest: empty key at offset "
+            + i.to_str())
+        }
+        let pv: Result[TomlPair, str] = parse_toml_value(src, eq + 1)
+        if result_is_err(pv) {
+            return Result.Err(result_err_or(pv, ""))
+        }
+        let pair: TomlPair = result_unwrap(pv)
+        if current_section == "" {
+            toml_set(result, key, pair.val)
+        } else {
+            let cursor2: Result[TomlVal, str] = section_cursor(result,
+            current_section, false)
+            if result_is_err(cursor2) {
+                return Result.Err(result_err_or(cursor2, ""))
+            }
+            toml_set(result_unwrap(cursor2), key, pair.val)
+        }
+        i = pair.next
+    }
+    return Result.Ok(result)
+}
+
+# sha256_tree(path) — the lockfile's content hash (file sha256, else
+# the deterministic directory hash).
+fn sha256_tree(path: str) -> str uses Fs {
+    if is_file_h(path) {
+        return sha256_hex(read_or(path, ""))
+    }
+    return sha256_hex(dir_hash_text(path, ""))
+}
+
+fn dir_hash_text(dir: str, prefix: str) -> str uses Fs {
+    if !is_dir_h(dir) {
+        return ""
+    }
+    let names: list[str] = fs_read_dir(dir)
+    let files: list[str] = []
+    let dirs: list[str] = []
+    let mut ni: int = 0
+    while ni < names.len() {
+        let nm: str = names.get(ni)
+        if is_dir_h(path_join2(dir, nm)) {
+            dirs.push(nm)
+        } else {
+            files.push(nm)
+        }
+        ni = ni + 1
+    }
+    let mut h: str = ""
+    let sfiles: list[str] = sort_strs(files)
+    let mut fi: int = 0
+    while fi < sfiles.len() {
+        h = h + prefix + sfiles.get(fi) + chr(0)
+        + read_or(path_join2(dir, sfiles.get(fi)), "") + chr(0)
+        fi = fi + 1
+    }
+    let sdirs: list[str] = sort_strs(dirs)
+    let mut di: int = 0
+    while di < sdirs.len() {
+        h = h + dir_hash_text(path_join2(dir, sdirs.get(di)),
+        prefix + sdirs.get(di) + "/")
+        di = di + 1
+    }
+    return h
+}
+
+# valid_dep_name / confined_join — hpkg_util's laws.
+fn valid_dep_name(name: str) -> bool {
+    if name == "" {
+        return false
+    }
+    let b0: int = name.byte_at(0)
+    if b0 == 46 || b0 == 45 {
+        return false
+    }
+    let mut i: int = 0
+    while i < name.len() {
+        let c: int = name.byte_at(i)
+        if !is_alpha_b(c) && !is_digit_b(c) && c != 46 && c != 95
+        && c != 45 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn confined_join(base: str, rel: str, what: str) -> Result[str, Fail] {
+    if path_is_abs(rel) {
+        return Result.Err(fail(what + ": absolute paths are not allowed: "
+        + rel))
+    }
+    let parts: list[str] = str_replace(rel, "\\", "/").split("/")
+    if sg_has(parts, "..") {
+        return Result.Err(fail(what + ": path must not contain '..' "
+        + "segments: " + rel))
+    }
+    let cand: str = norm_path(path_join2(base, rel))
+    if cand != base && !cand.starts_with(base + "/") {
+        return Result.Err(fail(what + ": path escapes the package "
+        + "directory: " + rel))
+    }
+    return Result.Ok(cand)
+}
+
+# toml_text_of(v) — Python's str() of a parsed TOML value.
+fn toml_text_of(v: TomlVal) -> str {
+    if v.kind == "str" {
+        return v.sval
+    }
+    if v.kind == "int" {
+        return v.ival.to_str()
+    }
+    if v.kind == "bool" {
+        if v.bval {
+            return "True"
+        }
+        return "False"
+    }
+    return ""
+}
+
+struct DepOut {
+    dir: str,
+    content: str
+}
+
+# pkg_cache_dir() — HLS_PKG_CACHE or <repo>/.hls-pkg-cache.
+fn pkg_cache_dir() -> str uses Fs, Proc, Args {
+    let over: str = env_get("HLS_PKG_CACHE")
+    if over != "" || env_has("HLS_PKG_CACHE") {
+        return over
+    }
+    return repo_root() + "/.hls-pkg-cache"
+}
+
+# resolve_dep — one dependency to (package dir, content path): path
+# deps package-relative FIRST then repo-root-relative (both confined);
+# git deps through hls-pkg's cache and git itself.
+fn resolve_dep(dep_name: str, source: TomlVal, declaring_dir: str,
+root: str) -> Result[DepOut, Fail] uses Fs, Proc, Args {
+    if source.kind != "table" {
+        return Result.Err(fail("dependency " + dep_name
+        + ": source must be a table"))
+    }
+    let git_v: TomlVal = toml_get(source, "git")
+    if git_v.kind != "none" {
+        if git_v.kind != "str" {
+            return Result.Err(fail("dependency " + dep_name
+            + " git URL must be a string"))
+        }
+        if !valid_dep_name(dep_name) {
+            return Result.Err(fail("invalid dependency name: '"
+            + dep_name + "' (allowed: letters, digits, '.', '_', '-'; "
+            + "must not start with '.' or '-')"))
+        }
+        let repo_url: str = git_v.sval
+        if repo_url == "" {
+            return Result.Err(fail("dependency " + dep_name
+            + " git URL must not be empty"))
+        }
+        if repo_url.byte_at(0) == 45 {
+            return Result.Err(fail("dependency " + dep_name
+            + " git URL must not start with '-' (git option injection): '"
+            + repo_url + "'"))
+        }
+        let cache: str = pkg_cache_dir()
+        proc_exec("mkdir -p '" + cache + "'")
+        let repo_hash: str = sha256_hex(repo_url).slice(0, 12)
+        let clone_dir: str = path_join2(path_join2(cache, dep_name),
+        repo_hash)
+        if !is_dir_h(clone_dir) {
+            let gc: RunCap = spawn_cap("git", ["clone", "--quiet", "--",
+            repo_url, clone_dir])
+            if gc.code != 0 {
+                return Result.Err(fail("dependency " + dep_name
+                + ": failed to clone git repository (exit "
+                + gc.code.to_str() + ")"))
+            }
+        }
+        let ref_v: TomlVal = toml_get(source, "tag")
+        let mut ref: str = ""
+        if ref_v.kind != "none" {
+            ref = toml_text_of(ref_v)
+        }
+        if ref == "" {
+            let br_v: TomlVal = toml_get(source, "branch")
+            if br_v.kind != "none" {
+                ref = toml_text_of(br_v)
+            }
+        }
+        if ref == "" {
+            ref = "main"
+        }
+        let gf: RunCap = spawn_cap("git", ["-C", clone_dir, "fetch",
+        "--quiet", "origin", "--", ref])
+        if gf.code != 0 {
+            return Result.Err(fail("dependency " + dep_name
+            + ": failed to fetch/checkout git ref '" + ref + "'"))
+        }
+        let gk: RunCap = spawn_cap("git", ["-C", clone_dir, "checkout",
+        "--quiet", ref])
+        if gk.code != 0 {
+            return Result.Err(fail("dependency " + dep_name
+            + ": failed to fetch/checkout git ref '" + ref + "'"))
+        }
+        let path_v: TomlVal = toml_get(source, "path")
+        let mut full: str = clone_dir
+        if path_v.kind != "none" && toml_text_of(path_v) != "" {
+            let cr: Result[str, Fail] = confined_join(clone_dir,
+            toml_text_of(path_v), "dependency " + dep_name)
+            if result_is_err(cr) {
+                return Result.Err(result_err_or(cr, fail("")))
+            }
+            full = result_unwrap(cr)
+        }
+        if is_file_h(full) {
+            return Result.Ok(DepOut {
+                dir: path_dirname(full), content: full
+            })
+        }
+        if is_dir_h(full) {
+            return Result.Ok(DepOut {
+                dir: full, content: full
+            })
+        }
+        return Result.Err(fail("dependency " + dep_name
+        + ": path not found in repo: " + full))
+    }
+    let path_v2: TomlVal = toml_get(source, "path")
+    if path_v2.kind != "none" {
+        let rel: str = toml_text_of(path_v2)
+        let bases: list[str] = [declaring_dir, root]
+        let mut bi: int = 0
+        while bi < bases.len() {
+            let cr: Result[str, Fail] = confined_join(bases.get(bi), rel,
+            "dependency " + dep_name)
+            if result_is_err(cr) {
+                return Result.Err(result_err_or(cr, fail("")))
+            }
+            let cand: str = result_unwrap(cr)
+            if is_dir_h(cand) {
+                let rp: str = realpath_lex(cand)
+                return Result.Ok(DepOut {
+                    dir: rp, content: rp
+                })
+            }
+            if is_file_h(cand) {
+                let full: str = realpath_lex(cand)
+                return Result.Ok(DepOut {
+                    dir: path_dirname(full), content: full
+                })
+            }
+            bi = bi + 1
+        }
+        return Result.Err(fail("dependency " + dep_name
+        + ": path not found: " + rel))
+    }
+    return Result.Err(fail("dependency " + dep_name
+    + " has no git/path source"))
+}
+
+# ---------------------------------------------------------------------------
+# The package TREE walk — hls-audit's _walk_packages.
+# ---------------------------------------------------------------------------
+
+struct PkgNode {
+    dir: str,
+    name: str,
+    version: str,
+    manifest: TomlVal,
+    deps: list[PkgNode],
+    parent_dir: str,
+    depth: int,
+    shared: bool,
+    src_kind: str,
+    content_path: str,
+    audited: bool,
+    unauditable: bool
+}
+
+fn pkg_node_new(dir: str, name: str, version: str,
+manifest: TomlVal) -> PkgNode {
+    return PkgNode {
+        dir: dir, name: name, version: version, manifest: manifest,
+        deps: [], parent_dir: "", depth: 0, shared: false,
+        src_kind: "root",
+        content_path: dir, audited: false, unauditable: false
+    }
+}
+
+fn manifest_name() -> str {
+    return "hls-pkg.toml"
+}
+
+
+# walk_packages — depth-first over the manifest's sorted [dependencies],
+# a directory on the current stack a cycle, the audit cached per dir.
+fn walk_packages(pkg_dir: str, root: str, stack_dirs: list[str],
+stack_names: list[str], cache: map[str, PkgNode])
+-> Result[PkgNode, Fail] uses Fs, Proc, Args {
+    let real: str = realpath_lex(pkg_dir)
+    let mut si: int = 0
+    while si < stack_dirs.len() {
+        if stack_dirs.get(si) == real {
+            let chain: list[str] = []
+            let mut cj: int = si
+            while cj < stack_names.len() {
+                chain.push(stack_names.get(cj))
+                cj = cj + 1
+            }
+            chain.push(stack_names.get(si))
+            return Result.Err(fail("circular package dependency: "
+            + join_strs(chain, " -> ")))
+        }
+        si = si + 1
+    }
+    let manifest_path: str = path_join2(real, manifest_name())
+    if !is_file_h(manifest_path) {
+        return Result.Err(fail("no hls-pkg.toml in " + real))
+    }
+    let mr: Result[TomlVal, str] = parse_manifest(manifest_path)
+    if result_is_err(mr) {
+        return Result.Err(fail("manifest " + manifest_path + ": "
+        + result_err_or(mr, "")))
+    }
+    let manifest: TomlVal = result_unwrap(mr)
+    let pkg_sec: TomlVal = toml_get(manifest, "package")
+    if pkg_sec.kind != "table" && pkg_sec.kind != "none" {
+        return Result.Err(fail("manifest " + manifest_path
+        + ": 'package' section is not a table"))
+    }
+    let name_v: TomlVal = toml_get(pkg_sec, "name")
+    let mut name: str = toml_text_of(name_v)
+    if name == "" {
+        name = path_basename(real)
+    }
+    let version_v: TomlVal = toml_get(pkg_sec, "version")
+    let mut version: str = toml_text_of(version_v)
+    if version == "" {
+        version = "0.0.0"
+    }
+    let node: PkgNode = pkg_node_new(real, name, version, manifest)
+    node.depth = stack_dirs.len()
+    if cache.has(real) {
+        let prior: PkgNode = cache.get_or(real, node)
+        node.audited = prior.audited
+        node.unauditable = prior.unauditable
+        node.shared = true
+        return Result.Ok(node)
+    }
+    stack_dirs.push(real)
+    stack_names.push(name)
+    let deps_sec: TomlVal = toml_get(manifest, "dependencies")
+    if deps_sec.kind != "table" && deps_sec.kind != "none" {
+        stack_dirs.pop()
+        stack_names.pop()
+        return Result.Err(fail("package " + name
+        + ": [dependencies] section is corrupt"))
+    }
+    let dep_names: list[str] = sort_strs(deps_sec.keys)
+    let mut di: int = 0
+    while di < dep_names.len() {
+        let dep_name: str = dep_names.get(di)
+        let source: TomlVal = toml_get(deps_sec, dep_name)
+        let dr: Result[DepOut, Fail] = resolve_dep(dep_name, source, real,
+        root)
+        if result_is_err(dr) {
+            return Result.Err(result_err_or(dr, fail("")))
+        }
+        let dep: DepOut = result_unwrap(dr)
+        let cr: Result[PkgNode, Fail] = walk_packages(dep.dir, root,
+        stack_dirs, stack_names, cache)
+        if result_is_err(cr) {
+            return Result.Err(result_err_or(cr, fail("")))
+        }
+        let child: PkgNode = result_unwrap(cr)
+        if toml_get(source, "git").kind != "none" {
+            child.src_kind = "git"
+        } else {
+            child.src_kind = "path"
+        }
+        child.content_path = dep.content
+        child.parent_dir = node.dir
+        child.depth = node.depth + 1
+        node.deps.push(child)
+        di = di + 1
+    }
+    stack_dirs.pop()
+    stack_names.pop()
+    return Result.Ok(node)
+}
+
+fn all_nodes(root: PkgNode) -> list[PkgNode] {
+    let out: list[PkgNode] = []
+    all_nodes_into(root, out)
+    return out
+}
+
+fn all_nodes_into(node: PkgNode, out: list[PkgNode]) -> void {
+    out.push(node)
+    let mut i: int = 0
+    while i < node.deps.len() {
+        all_nodes_into(node.deps.get(i), out)
+        i = i + 1
+    }
+}
+
+# lock_locked_map(lock_path) — the lockfile's name -> sha256 map.
+fn lock_locked_map(lock_path: str) -> Result[map[str, str], Fail] uses Fs {
+    let locked: map[str, str] = map_new()
+    let text: str = read_or(lock_path, "")
+    let pr: Result[JsonValue, str] = json_parse_result(text)
+    if result_is_err(pr) {
+        return Result.Err(fail("cannot read lockfile: "
+        + result_err_or(pr, "")))
+    }
+    let lock: JsonValue = result_unwrap(pr)
+    let pkgs: JsonValue = json_object_get(lock, "packages")
+    if json_is_array(pkgs) {
+        let mut i: int = 0
+        while i < pkgs.arr.len() {
+            let p: JsonValue = pkgs.arr.get(i)
+            if json_is_object(p) {
+                let nm: JsonValue = json_object_get(p, "name")
+                let sha: JsonValue = json_object_get(p, "sha256")
+                if json_is_str(nm) && json_is_str(sha) {
+                    locked.set(json_str_value(nm), json_str_value(sha))
+                } else if json_is_str(nm) {
+                    locked.set(json_str_value(nm), "")
+                }
+            }
+            i = i + 1
+        }
+    }
+    return Result.Ok(locked)
+}
+
+# ============================================================================
+# hls-audit's own engine — the source-mode walk, the per-package effect
+# read, the report assembly, the renders and the CLI. The probe children
+# (--probe-parse / --probe-check) re-exec this binary so a tree that
+# fails to parse or check is a FINDING, never a crash.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Effects vocabulary + small list helpers.
+# ----------------------------------------------------------------------------
+
+fn au_all_effects() -> list[str] {
+    return["Args", "Clock", "Conc", "Exit", "Fs", "IO", "Net", "Proc",
+    "Rand"]
+}
+
+fn au_effect_known(e: str) -> bool {
+    return e == "Args" || e == "Clock" || e == "Conc" || e == "Exit"
+    || e == "Fs" || e == "IO" || e == "Net" || e == "Proc"
+    || e == "Rand"
+}
+
+fn au_contains(xs: list[str], x: str) -> bool {
+    let mut i: int = 0
+    while i < xs.len() {
+        if xs.get(i) == x {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# au_push_unique(xs, x) — set-style insert.
+fn au_push_unique(xs: list[str], x: str) -> void {
+    if !au_contains(xs, x) {
+        xs.push(x)
+    }
+}
+
+# au_sorted_unique(xs) — sorted() of a set, python semantics.
+fn au_sorted_unique(xs: list[str]) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < xs.len() {
+        au_push_unique(out, xs.get(i))
+        i = i + 1
+    }
+    return sort_strs(out)
+}
+
+# au_index_of(xs, x) — -1 when absent.
+fn au_index_of(xs: list[str], x: str) -> int {
+    let mut i: int = 0
+    while i < xs.len() {
+        if xs.get(i) == x {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# au_shift(xs) — remove and return element 0 ("" when empty).
+fn au_shift(xs: list[str]) -> str {
+    if xs.len() == 0 {
+        return ""
+    }
+    let head: str = xs.get(0)
+    let mut i: int = 1
+    while i < xs.len() {
+        xs.set(i - 1, xs.get(i))
+        i = i + 1
+    }
+    xs.pop()
+    return head
+}
+
+# ----------------------------------------------------------------------------
+# The probe children.
+# ----------------------------------------------------------------------------
+
+# au_probe_parse_child(path) — parse ONE file (the module walk's
+# pre-validation). Panics (exit != 0) on a parse error.
+fn au_probe_parse_child(path: str) -> int uses IO, Exit {
+    let ctx: Ctx = hl_parse_file(path)
+    if ctx.fn_order.len() < 0 {
+        return 1
+    }
+    return 0
+}
+
+# au_probe_check_child(path) — load the crate + check it (the merged
+# fixpoint). Panics on anything that does not check.
+fn au_probe_check_child(path: str) -> int uses Proc, IO, Fs, Exit {
+    let ctx: Ctx = hl_load_crate(path)
+    hl_check(ctx)
+    return 0
+}
+
+# au_probe_fail_text(flag, path) — the parent side: spawn the child,
+# map the outcome. Returns the failure text ("" when ok).
+fn au_probe_fail_text(flag: str, path: str) -> str uses Proc, Args {
+    let selfp: str = self_path()
+    if selfp == "" {
+        return "cannot re-exec the tool for the probe"
+    }
+    let argv: list[str] = [flag, path]
+    let r: RunCap = spawn_cap(selfp, argv)
+    if r.code == 0 {
+        return ""
+    }
+    let mut why: str = r.err.trim()
+    if why.starts_with("panic: ") {
+        why = why.slice(7, why.len())
+    }
+    let nl: int = why.find("\n")
+    if nl > 0 {
+        why = why.slice(0, nl)
+    }
+    return why
+}
+
+# ----------------------------------------------------------------------------
+# The module walk — the import DAG with the compiler's own resolver.
+# ----------------------------------------------------------------------------
+
+struct AuGraph {
+    order: list[str], # module paths, BFS from the entry
+    kids_of: list[list[str]], # parallel: each module's sorted children
+    root_path: str
+}
+
+# au_walk_import_graph(entry) — BFS over the imports; every module is
+# parse-validated in a probe child first (a broken tree is a broken
+# build, not a finding). Edges are sorted-unique per module.
+fn au_walk_import_graph(entry: str) -> Result[AuGraph, Fail]
+uses Fs, Proc, Args {
+    let entry_abs: str = realpath_lex(entry)
+    if !is_file_h(entry_abs) {
+        return Result.Err(fail("no such file: " + entry))
+    }
+    let root: str = repo_root()
+    let order: list[str] = []
+    let kids_of: list[list[str]] = []
+    let queue: list[str] = [entry_abs]
+    while queue.len() > 0 {
+        let cur: str = au_shift(queue)
+        if au_contains(order, cur) {
+            continue
+        }
+        let bad: str = au_probe_fail_text("--probe-parse", cur)
+        if bad != "" {
+            return Result.Err(fail("parse error in " + cur + ": " + bad))
+        }
+        order.push(cur)
+        # the module's own parse (validated above — safe in-process)
+        let mctx: Ctx = hl_parse_file(cur)
+        let kids: list[str] = []
+        let mut ii: int = 0
+        while ii < mctx.imports.len() {
+            let imp: str = mctx.imports.get(ii)
+            let resolved: str = resolve_import_path(imp, path_dirname(cur),
+            root)
+            if resolved == "" {
+                return Result.Err(fail("module not found: " + imp
+                + " (imported by " + cur + ")"))
+            }
+            let kid_abs: str = realpath_lex(resolved)
+            au_push_unique(kids, kid_abs)
+            queue.push(kid_abs)
+            ii = ii + 1
+        }
+        kids_of.push(sort_strs(kids))
+    }
+    return Result.Ok(AuGraph {
+        order: order, kids_of: kids_of,
+        root_path: entry_abs
+    })
+}
+
+# ----------------------------------------------------------------------------
+# Per-module data: fn ownership + extern blocks (a separate parse per
+# module — the merged program flattens ownership away).
+# ----------------------------------------------------------------------------
+
+# au_dummy_fn() — the empty FnInfo for map.get_or defaults.
+fn au_dummy_fn() -> FnInfo {
+    return FnInfo {
+        name: "",
+        params: [],
+        ptypes: [],
+        pmuts: [],
+        ret: "",
+        effects: [],
+        is_pure: false,
+        body: [],
+        is_method: false,
+        struct_of: "",
+        typeparams: [],
+        line: 0,
+        is_extern: false,
+        requires_e: -1,
+        ensures_e: -1,
+        attr_stack_size: -1,
+        attr_no_red_zone: false,
+        attr_irq_handler: false,
+        attr_irq_vector: -1,
+        attr_inline: "",
+        attr_hot: false,
+        attr_cold: false,
+        attr_tail_call: false,
+        attr_panic_handler: false,
+        attr_section: "",
+        attr_align: -1,
+        src_file: "",
+        param_preds: map_new(),
+        ret_pred: "",
+        has_refinements: false,
+        attr_secrets: "",
+        attr_ct: false,
+        attr_deprecated: false,
+        attr_deprecated_msg: "",
+        attr_taint_source: false,
+        attr_taint_sinks: ""
+    }
+}
+
+struct AuModuleData {
+    path: str,
+    fns: list[str],
+    externs: list[str],
+    extern_effects: list[str]
+}
+
+fn au_module_data(path: str) -> AuModuleData uses Fs {
+    let mctx: Ctx = hl_parse_file(path)
+    let fns: list[str] = []
+    let externs: list[str] = []
+    let extern_effects: list[str] = []
+    let mut i: int = 0
+    while i < mctx.fn_order.len() {
+        let key: str = mctx.fn_order.get(i)
+        fns.push(key)
+        let info: FnInfo = mctx.fns.get_or(key, au_dummy_fn())
+        if info.is_extern {
+            externs.push(info.name)
+            let mut e: int = 0
+            while e < info.effects.len() {
+                au_push_unique(extern_effects, info.effects.get(e))
+                e = e + 1
+            }
+        }
+        i = i + 1
+    }
+    return AuModuleData {
+        path: path, fns: fns, externs: externs,
+        extern_effects: extern_effects
+    }
+}
+
+# ----------------------------------------------------------------------------
+# The intrinsic read — effects a fn set performs ITSELF: builtin calls
+# plus the declared effects of externs they call.
+# ----------------------------------------------------------------------------
+
+fn au_intrinsic(ctx: Ctx, keys: list[str]) -> list[str] {
+    let intr: list[str] = []
+    let mut k: int = 0
+    while k < keys.len() {
+        let key: str = keys.get(k)
+        let callees: list[str] = ctx.edges.get_or(key, [])
+        let mut c: int = 0
+        while c < callees.len() {
+            let callee: str = callees.get(c)
+            if callee.starts_with("b:") {
+                let beffs: list[str] = builtin_effect(
+                callee.slice(2, callee.len()))
+                let mut b: int = 0
+                while b < beffs.len() {
+                    au_push_unique(intr, beffs.get(b))
+                    b = b + 1
+                }
+            } else {
+                let fni: FnInfo = ctx.fns.get_or(callee, au_dummy_fn())
+                if fni.is_extern {
+                    let mut e: int = 0
+                    while e < fni.effects.len() {
+                        au_push_unique(intr, fni.effects.get(e))
+                        e = e + 1
+                    }
+                }
+            }
+            c = c + 1
+        }
+        k = k + 1
+    }
+    return sort_strs(intr)
+}
+
+# ----------------------------------------------------------------------------
+# The module key + classification.
+# ----------------------------------------------------------------------------
+
+fn au_module_key(p: str, root: str) -> str {
+    let ap: str = norm_path(p)
+    let rr: str = norm_path(root)
+    if ap.starts_with(rr + "/") {
+        return ap.slice(rr.len() + 1, ap.len())
+    }
+    return ap
+}
+
+fn au_classify(p: str, root: str) -> str uses Proc {
+    let ap: str = realpath_lex(p)
+    let rr: str = realpath_lex(root)
+    if ap.starts_with(rr + "/std/") || ap.starts_with(rr + "/core/") {
+        return "toolchain"
+    }
+    let deps_dir: str = env_get("HLS_PKG_DEPS")
+    if deps_dir != "" {
+        let dd: str = realpath_lex(deps_dir)
+        if ap.starts_with(dd + "/") {
+            return "dependency"
+        }
+    }
+    return "workspace"
+}
+
+# ----------------------------------------------------------------------------
+# JSON helpers for the report tree.
+# ----------------------------------------------------------------------------
+
+fn au_json_list_str(xs: list[str]) -> JsonValue {
+    let arr: JsonValue = json_array([])
+    let mut i: int = 0
+    while i < xs.len() {
+        arr.arr.push(json_str(xs.get(i)))
+        i = i + 1
+    }
+    return arr
+}
+
+# au_set_obj(obj, k, v) — one key/value pair.
+fn au_set_obj(obj: JsonValue, k: str, v: JsonValue) -> void {
+    obj.obj_keys.push(k)
+    obj.obj_vals.push(v)
+}
+
+# jstrs_of(v) — a JSON array of strings as a list.
+fn jstrs_of(v: JsonValue) -> list[str] {
+    let out: list[str] = []
+    if json_is_array(v) {
+        let mut i: int = 0
+        while i < v.arr.len() {
+            out.push(json_str_value(v.arr.get(i)))
+            i = i + 1
+        }
+    }
+    return out
+}
+
+# jstr_or(v, d) — the string value or the default.
+fn jstr_or(v: JsonValue, d: str) -> str {
+    if json_is_str(v) {
+        return json_str_value(v)
+    }
+    return d
+}
+
+# jchain(v) — "a -> b -> c" of a chain array.
+fn jchain(v: JsonValue) -> str {
+    return str_join(jstrs_of(v), " -> ")
+}
+
+# ----------------------------------------------------------------------------
+# Source mode — the report as a JsonValue tree.
+# ----------------------------------------------------------------------------
+
+# au_chain_to_root(graph, target) — shortest import chain root..target.
+fn au_chain_to_root(graph: AuGraph, target: str) -> list[str] {
+    if target == graph.root_path {
+        return[graph.root_path]
+    }
+    let parents_k: list[str] = []
+    let parents_v: list[str] = []
+    let seen: list[str] = [graph.root_path]
+    let queue: list[str] = [graph.root_path]
+    while queue.len() > 0 {
+        let cur: str = au_shift(queue)
+        let idx: int = au_index_of(graph.order, cur)
+        if idx < 0 {
+            continue
+        }
+        let kids: list[str] = graph.kids_of.get(idx)
+        let mut k: int = 0
+        while k < kids.len() {
+            let kid: str = kids.get(k)
+            if !au_contains(seen, kid) {
+                seen.push(kid)
+                parents_k.push(kid)
+                parents_v.push(cur)
+                queue.push(kid)
+            }
+            k = k + 1
+        }
+    }
+    let chain: list[str] = [target]
+    while chain.get(chain.len() - 1) != graph.root_path {
+        let last: str = chain.get(chain.len() - 1)
+        let pi: int = au_index_of(parents_k, last)
+        if pi < 0 {
+            return[graph.root_path, target]
+        }
+        chain.push(parents_v.get(pi))
+    }
+    let out: list[str] = []
+    let mut r: int = chain.len() - 1
+    while r >= 0 {
+        out.push(chain.get(r))
+        r = r - 1
+    }
+    return out
+}
+
+# au_audit_source(entry, allow, has_allow) — the source-mode report.
+fn au_audit_source(entry: str, allow: list[str], has_allow: bool)
+-> Result[JsonValue, Fail] uses Fs, Proc, Args {
+    let gr: Result[AuGraph, Fail] = au_walk_import_graph(entry)
+    if result_is_err(gr) {
+        return Result.Err(result_err_or(gr, fail("?")))
+    }
+    let graph: AuGraph = result_unwrap(gr)
+    let root: str = repo_root()
+
+    # the merged fixpoint — probe first, then in-process for the data
+    let bad: str = au_probe_fail_text("--probe-check", graph.root_path)
+    if bad != "" {
+        return Result.Err(fail("unauditable: " + bad))
+    }
+    let ctx: Ctx = hl_load_crate(graph.root_path)
+    hl_check(ctx)
+
+    let report: JsonValue = json_object([], [])
+    au_set_obj(report, "attribution", json_array([]))
+    au_set_obj(report, "edges", json_object([], []))
+    au_set_obj(report, "extern_blocks", json_array([]))
+    au_set_obj(report, "mode", json_str("source"))
+    au_set_obj(report, "modules", json_array([]))
+    au_set_obj(report, "policy", json_object([], []))
+    au_set_obj(report, "program_surface", json_array([]))
+    au_set_obj(report, "root", json_str(au_module_key(graph.root_path,
+    root)))
+    au_set_obj(report, "schema", json_str("hls-audit/v1"))
+    au_set_obj(report, "violations", json_array([]))
+
+    # the modules array (BFS order)
+    let modules: JsonValue = json_object_get(report, "modules")
+    let mut mi: int = 0
+    while mi < graph.order.len() {
+        let mp: str = graph.order.get(mi)
+        let md: AuModuleData = au_module_data(mp)
+        let surface: list[str] = []
+        let mut fi: int = 0
+        while fi < md.fns.len() {
+            let key: str = md.fns.get(fi)
+            let effs: list[str] = ctx.computed_effects.get_or(key, [])
+            let mut e: int = 0
+            while e < effs.len() {
+                au_push_unique(surface, effs.get(e))
+                e = e + 1
+            }
+            fi = fi + 1
+        }
+        let mobj: JsonValue = json_object([], [])
+        au_set_obj(mobj, "fns", json_int(md.fns.len()))
+        au_set_obj(mobj, "intrinsic", au_json_list_str(
+        au_intrinsic(ctx, md.fns)))
+        au_set_obj(mobj, "key", json_str(au_module_key(mp, root)))
+        au_set_obj(mobj, "kind", json_str(au_classify(mp, root)))
+        au_set_obj(mobj, "root", json_bool(mp == graph.root_path))
+        au_set_obj(mobj, "surface", au_json_list_str(
+        au_sorted_unique(surface)))
+        modules.arr.push(mobj)
+        mi = mi + 1
+    }
+
+    # the edges object
+    let edges_obj: JsonValue = json_object_get(report, "edges")
+    let mut ei: int = 0
+    while ei < graph.order.len() {
+        let mp: str = graph.order.get(ei)
+        let kids: list[str] = graph.kids_of.get(ei)
+        let kid_keys: list[str] = []
+        let mut k: int = 0
+        while k < kids.len() {
+            kid_keys.push(au_module_key(kids.get(k), root))
+            k = k + 1
+        }
+        au_set_obj(edges_obj, au_module_key(mp, root),
+        au_json_list_str(kid_keys))
+        ei = ei + 1
+    }
+
+    # the extern blocks (module, abi, fns, effects)
+    let extern_blocks: JsonValue = json_object_get(report,
+    "extern_blocks")
+    let mut xi: int = 0
+    while xi < graph.order.len() {
+        let mp: str = graph.order.get(xi)
+        let md: AuModuleData = au_module_data(mp)
+        if md.externs.len() > 0 {
+            let bobj: JsonValue = json_object([], [])
+            au_set_obj(bobj, "abi", json_str("C"))
+            au_set_obj(bobj, "effects",
+            au_json_list_str(md.extern_effects))
+            au_set_obj(bobj, "fns", au_json_list_str(sort_strs(
+            md.externs)))
+            au_set_obj(bobj, "module", json_str(au_module_key(mp, root)))
+            extern_blocks.arr.push(bobj)
+        }
+        xi = xi + 1
+    }
+
+    # the program surface, then attribution
+    let program_surface: list[str] = []
+    let mut si: int = 0
+    while si < modules.arr.len() {
+        let effs: list[str] = jstrs_of(json_object_get(
+        modules.arr.get(si), "surface"))
+        let mut e: int = 0
+        while e < effs.len() {
+            au_push_unique(program_surface, effs.get(e))
+            e = e + 1
+        }
+        si = si + 1
+    }
+    let sorted_surface: list[str] = sort_strs(program_surface)
+    au_set_obj(report, "program_surface",
+    au_json_list_str(sorted_surface))
+
+    let attribution: JsonValue = json_object_get(report, "attribution")
+    let mut ai: int = 0
+    while ai < sorted_surface.len() {
+        let eff: str = sorted_surface.get(ai)
+        let mut mi2: int = 0
+        while mi2 < graph.order.len() {
+            let mp: str = graph.order.get(mi2)
+            let md: AuModuleData = au_module_data(mp)
+            let intr: list[str] = au_intrinsic(ctx, md.fns)
+            if au_contains(intr, eff) {
+                let chain: list[str] = au_chain_to_root(graph, mp)
+                let chain_keys: list[str] = []
+                let mut c: int = 0
+                while c < chain.len() {
+                    chain_keys.push(au_module_key(chain.get(c), root))
+                    c = c + 1
+                }
+                let aobj: JsonValue = json_object([], [])
+                au_set_obj(aobj, "chain", au_json_list_str(chain_keys))
+                au_set_obj(aobj, "effect", json_str(eff))
+                au_set_obj(aobj, "kind", json_str(au_classify(mp, root)))
+                au_set_obj(aobj, "module",
+                json_str(au_module_key(mp, root)))
+                au_set_obj(aobj, "root_introduced",
+                json_bool(mp == graph.root_path))
+                attribution.arr.push(aobj)
+            }
+            mi2 = mi2 + 1
+        }
+        ai = ai + 1
+    }
+
+    # the policy
+    let pol: JsonValue = json_object_get(report, "policy")
+    if has_allow {
+        au_set_obj(pol, "allowed", au_json_list_str(
+        au_sorted_unique(allow)))
+    } else {
+        au_set_obj(pol, "allowed", json_null())
+    }
+
+    # violations: chain introductions outside the allow list (the root
+    # is your code — reported, never gated)
+    let violations: JsonValue = json_object_get(report, "violations")
+    if has_allow {
+        let mut vi: int = 0
+        while vi < attribution.arr.len() {
+            let att: JsonValue = attribution.arr.get(vi)
+            let eff: str = jstr_or(json_object_get(att, "effect"), "")
+            let root_introduced: bool = json_object_get(att,
+            "root_introduced").bval
+            if !au_contains(allow, eff) && !root_introduced {
+                let vobj: JsonValue = json_object([], [])
+                au_set_obj(vobj, "chain", json_object_get(att, "chain"))
+                au_set_obj(vobj, "effect", json_str(eff))
+                au_set_obj(vobj, "module",
+                json_object_get(att, "module"))
+                violations.arr.push(vobj)
+            }
+            vi = vi + 1
+        }
+    }
+    return Result.Ok(report)
+}
+
+# ----------------------------------------------------------------------------
+# Package mode — the effect read per package on top of the shared walk.
+# ----------------------------------------------------------------------------
+
+struct AuPkgAudit {
+    declared: list[str],
+    surface: list[str],
+    intrinsic: list[str],
+    wrapper: bool,
+    entry: str,
+    fns: int,
+    unauditable: str # "" when auditable
+}
+
+# au_check_entry(pkg_dir, entry) — the entry (or its wrapper) through
+# the probe child. Returns wrapper_used on success or the failure text.
+fn au_check_entry(pkg_dir: str, entry: str) -> Result[bool, str]
+uses Fs, Proc, Args {
+    let entry_path: str = path_join2(pkg_dir, entry)
+    if !is_file_h(entry_path) {
+        return Result.Err("entry not found: " + entry)
+    }
+    let bad: str = au_probe_fail_text("--probe-check", entry_path)
+    if bad == "" {
+        return Result.Ok(false)
+    }
+    if !bad.contains("missing main function") {
+        return Result.Err(bad)
+    }
+    # a library entry: the wrapper contract hls-pkg lock uses
+    let wrapper_path: str = pkg_dir + "/.hls-audit-wrapper-"
+    + proc_pid().to_str() + ".hls"
+    write_file(wrapper_path, "# auto-generated by hls-audit\n"
+    + "import \"" + entry + "\"\n"
+    + "fn main() -> int pure { return 0 }\n")
+    let wbad: str = au_probe_fail_text("--probe-check", wrapper_path)
+    proc_exec("rm -f '" + wrapper_path + "'")
+    if wbad != "" {
+        return Result.Err(wbad)
+    }
+    return Result.Ok(true)
+}
+
+# au_write_wrapper(pkg_dir, entry) — the wrapper path, written.
+fn au_write_wrapper(pkg_dir: str, entry: str) -> str uses Proc, Fs {
+    let wrapper_path: str = pkg_dir + "/.hls-audit-wrapper-"
+    + proc_pid().to_str() + ".hls"
+    write_file(wrapper_path, "# auto-generated by hls-audit\n"
+    + "import \"" + entry + "\"\n"
+    + "fn main() -> int pure { return 0 }\n")
+    return wrapper_path
+}
+
+# au_pkg_effects(pkg_dir, entry, wrapper_used) — the in-process read
+# (the probe already proved it checks). Intrinsic counts only the
+# package-LOCAL functions.
+fn au_pkg_effects(pkg_dir: str, entry: str, wrapper_used: bool)
+-> AuPkgAudit uses Fs, Proc, Args {
+    let entry_path: str = path_join2(pkg_dir, entry)
+    let mut load_path: str = entry_path
+    if wrapper_used {
+        load_path = au_write_wrapper(pkg_dir, entry)
+    }
+    let ctx: Ctx = hl_load_crate(load_path)
+    hl_check(ctx)
+    if wrapper_used {
+        proc_exec("rm -f '" + load_path + "'")
+    }
+
+    # the entry's import tree: which fns are package-local
+    let gr: Result[AuGraph, Fail] = au_walk_import_graph(entry_path)
+    let local_keys: list[str] = []
+    if result_is_ok(gr) {
+        let graph: AuGraph = result_unwrap(gr)
+        let mut mi: int = 0
+        while mi < graph.order.len() {
+            let mp: str = graph.order.get(mi)
+            let rp: str = realpath_lex(mp)
+            if rp == pkg_dir || rp.starts_with(pkg_dir + "/") {
+                let md: AuModuleData = au_module_data(mp)
+                let mut f: int = 0
+                while f < md.fns.len() {
+                    local_keys.push(md.fns.get(f))
+                    f = f + 1
+                }
+            }
+            mi = mi + 1
+        }
+    }
+
+    let declared: list[str] = []
+    let surface: list[str] = []
+    let mut fi: int = 0
+    while fi < ctx.fn_order.len() {
+        let key: str = ctx.fn_order.get(fi)
+        let fni: FnInfo = ctx.fns.get_or(key, au_dummy_fn())
+        let mut d: int = 0
+        while d < fni.effects.len() {
+            au_push_unique(declared, fni.effects.get(d))
+            d = d + 1
+        }
+        let effs: list[str] = ctx.computed_effects.get_or(key, [])
+        let mut e: int = 0
+        while e < effs.len() {
+            au_push_unique(surface, effs.get(e))
+            e = e + 1
+        }
+        fi = fi + 1
+    }
+    return AuPkgAudit {
+        declared: sort_strs(declared),
+        surface: au_sorted_unique(surface),
+        intrinsic: au_intrinsic(ctx, local_keys),
+        wrapper: wrapper_used, entry: entry, fns: ctx.fn_order.len(),
+        unauditable: ""
+    }
+}
+
+# au_fail_closed(why) — the synthetic full-set audit (never pure).
+fn au_fail_closed(why: str) -> AuPkgAudit {
+    return AuPkgAudit {
+        declared: au_all_effects(),
+        surface: au_all_effects(), intrinsic: au_all_effects(),
+        wrapper: false, entry: "", fns: 0, unauditable: why
+    }
+}
+
+# au_audit_package(root_dir, allow, has_allow) — the package report.
+fn au_audit_package(root_dir: str, allow: list[str], has_allow: bool)
+-> Result[JsonValue, Fail] uses Fs, Proc, Args {
+    let real: str = realpath_lex(root_dir)
+    if !fs_is_dir(real) {
+        return Result.Err(fail("not a directory: " + root_dir))
+    }
+    let root: str = repo_root()
+    let cache: map[str, PkgNode] = map_new()
+    let wr: Result[PkgNode, Fail] = walk_packages(real, root, [], [],
+    cache)
+    if result_is_err(wr) {
+        return Result.Err(result_err_or(wr, fail("?")))
+    }
+    let root_node: PkgNode = result_unwrap(wr)
+    let nodes: list[PkgNode] = all_nodes(root_node)
+
+    # audit every UNIQUE package dir (fail-closed, never pure)
+    let audited: map[str, AuPkgAudit] = map_new()
+    let unauditable: list[str] = [] # "package: why" strings
+    let mut ni: int = 0
+    while ni < nodes.len() {
+        let node: PkgNode = nodes.get(ni)
+        if audited.has(node.dir) {
+            ni = ni + 1
+            continue
+        }
+        let pkg_sec: TomlVal = toml_get(node.manifest, "package")
+        let mut entry: str = toml_text_of(toml_get(pkg_sec, "entry"))
+        if entry == "" {
+            entry = "main.hls"
+        }
+        let cr: Result[bool, str] = au_check_entry(node.dir, entry)
+        if result_is_err(cr) {
+            let why: str = "package " + node.name + " unauditable: "
+            + result_err_or(cr, "?")
+            audited.set(node.dir, AuPkgAudit {
+                declared: au_all_effects(), surface: au_all_effects(),
+                intrinsic: au_all_effects(), wrapper: false, entry: "",
+                fns: 0, unauditable: why
+            })
+            unauditable.push(node.name + ": " + why)
+        } else {
+            let mut a: AuPkgAudit = au_pkg_effects(node.dir, entry,
+            result_unwrap(cr))
+            a.entry = entry
+            audited.set(node.dir, a)
+        }
+        ni = ni + 1
+    }
+
+    # the lockfile drift: every top-level dep's sha256 vs the lock
+    let lock_path: str = path_join2(real, "hls-pkg.lock")
+    let mut lockfile: str = "absent"
+    let drift: list[str] = [] # "package: why"
+    if is_file_h(lock_path) {
+        lockfile = "present"
+        let lr: Result[map[str, str], Fail] = lock_locked_map(lock_path)
+        if result_is_err(lr) {
+            return Result.Err(result_err_or(lr, fail("?")))
+        }
+        let locked: map[str, str] = result_unwrap(lr)
+        let mut ci: int = 0
+        while ci < root_node.deps.len() {
+            let child: PkgNode = root_node.deps.get(ci)
+            if !locked.has(child.name) {
+                drift.push(child.name + ": in the manifest but not in"
+                + " the lockfile")
+            } else {
+                let was: str = locked.get_or(child.name, "")
+                let now: str = sha256_tree(child.content_path)
+                if now != was {
+                    let mut was12: str = clip_str(was, 12)
+                    if was12 == "" {
+                        was12 = "<none>"
+                    }
+                    drift.push(child.name + ": locked sha256 " + was12
+                    + " but the tree now hashes " + clip_str(now, 12)
+                    + " — re-lock")
+                }
+            }
+            ci = ci + 1
+        }
+    }
+
+    # attribution: every (effect, introducing package) pair
+    let all_effects: list[str] = []
+    let mut ei: int = 0
+    while ei < nodes.len() {
+        let a: AuPkgAudit = audited.get_or(nodes.get(ei).dir, au_fail_closed("?"))
+        let mut x: int = 0
+        while x < a.surface.len() {
+            au_push_unique(all_effects, a.surface.get(x))
+            x = x + 1
+        }
+        ei = ei + 1
+    }
+    let sorted_effects: list[str] = sort_strs(all_effects)
+
+    # the policy: --allow or the root manifest's [effects].allowed
+    let allowed: list[str] = []
+    let mut policy_source: str = ""
+    let mut have_policy: bool = false
+    if has_allow {
+        let mut ai2: int = 0
+        while ai2 < allow.len() {
+            au_push_unique(allowed, allow.get(ai2))
+            ai2 = ai2 + 1
+        }
+        policy_source = "--allow"
+        have_policy = true
+    } else {
+        let eff_sec: TomlVal = toml_get(root_node.manifest, "effects")
+        let raw: TomlVal = toml_get(eff_sec, "allowed")
+        if raw.kind == "list" {
+            let mut li: int = 0
+            while li < raw.vals.len() {
+                let v: TomlVal = raw.vals.get(li)
+                if v.kind == "str" {
+                    au_push_unique(allowed, v.sval)
+                }
+                li = li + 1
+            }
+            policy_source = "manifest"
+            have_policy = true
+        }
+    }
+
+    # violations: every NON-ROOT package surface outside the policy
+    let violations: list[str] = [] # "effect|package|chain"
+    if have_policy {
+        let mut vi: int = 0
+        while vi < nodes.len() {
+            let node: PkgNode = nodes.get(vi)
+            let a: AuPkgAudit = audited.get_or(node.dir, au_fail_closed("?"))
+            if node.dir != root_node.dir && a.unauditable == "" {
+                let mut e: int = 0
+                while e < a.surface.len() {
+                    if !au_contains(allowed, a.surface.get(e)) {
+                        violations.push(a.surface.get(e) + "|"
+                        + node.name + "|" + str_join(
+                        au_node_chain(nodes, node), " -> "))
+                    }
+                    e = e + 1
+                }
+            }
+            vi = vi + 1
+        }
+    }
+
+    # ---- the report object -------------------------------------------
+    let report: JsonValue = json_object([], [])
+    let attribution: JsonValue = json_array([])
+    let mut ai: int = 0
+    while ai < sorted_effects.len() {
+        let eff: str = sorted_effects.get(ai)
+        let mut ni2: int = 0
+        while ni2 < nodes.len() {
+            let node: PkgNode = nodes.get(ni2)
+            let a: AuPkgAudit = audited.get_or(node.dir, au_fail_closed("?"))
+            if a.unauditable == "" && au_contains(a.intrinsic, eff) {
+                let aobj: JsonValue = json_object([], [])
+                au_set_obj(aobj, "chain", au_json_list_str(
+                au_node_chain(nodes, node)))
+                au_set_obj(aobj, "depth", json_int(node.depth))
+                au_set_obj(aobj, "effect", json_str(eff))
+                au_set_obj(aobj, "package", json_str(node.name))
+                au_set_obj(aobj, "root_introduced",
+                json_bool(node.dir == root_node.dir))
+                attribution.arr.push(aobj)
+            }
+            ni2 = ni2 + 1
+        }
+        ai = ai + 1
+    }
+    au_set_obj(report, "attribution", attribution)
+    let drift_arr: JsonValue = json_array([])
+    let mut di: int = 0
+    while di < drift.len() {
+        let parts: list[str] = split_once_str(drift.get(di), ": ")
+        let dobj: JsonValue = json_object([], [])
+        au_set_obj(dobj, "package", json_str(parts.get(0)))
+        au_set_obj(dobj, "why", json_str(parts.get(1)))
+        drift_arr.arr.push(dobj)
+        di = di + 1
+    }
+    au_set_obj(report, "drift", drift_arr)
+    au_set_obj(report, "lockfile", json_str(lockfile))
+    au_set_obj(report, "mode", json_str("package"))
+    let packages: JsonValue = json_array([])
+    let mut pi: int = 0
+    while pi < nodes.len() {
+        let node: PkgNode = nodes.get(pi)
+        let a: AuPkgAudit = audited.get_or(node.dir, au_fail_closed("?"))
+        let pobj: JsonValue = json_object([], [])
+        if a.unauditable != "" {
+            au_set_obj(pobj, "unauditable", json_str(a.unauditable))
+        } else {
+            au_set_obj(pobj, "unauditable", json_null())
+        }
+        au_set_obj(pobj, "declared", au_json_list_str(a.declared))
+        au_set_obj(pobj, "depth", json_int(node.depth))
+        au_set_obj(pobj, "entry", json_str(a.entry))
+        au_set_obj(pobj, "intrinsic", au_json_list_str(a.intrinsic))
+        au_set_obj(pobj, "name", json_str(node.name))
+        au_set_obj(pobj, "source", json_str(node.src_kind))
+        au_set_obj(pobj, "surface", au_json_list_str(a.surface))
+        au_set_obj(pobj, "version", json_str(node.version))
+        au_set_obj(pobj, "wrapper", json_bool(a.wrapper))
+        packages.arr.push(pobj)
+        pi = pi + 1
+    }
+    au_set_obj(report, "packages", packages)
+    let pol: JsonValue = json_object([], [])
+    if have_policy {
+        au_set_obj(pol, "allowed",
+        au_json_list_str(au_sorted_unique(allowed)))
+        au_set_obj(pol, "source", json_str(policy_source))
+    } else {
+        au_set_obj(pol, "allowed", json_null())
+        au_set_obj(pol, "source", json_null())
+    }
+    au_set_obj(report, "policy", pol)
+    let ra: AuPkgAudit = audited.get_or(root_node.dir, au_fail_closed("?"))
+    let robj: JsonValue = json_object([], [])
+    au_set_obj(robj, "dir",
+    json_str(au_module_key(root_node.dir, root)))
+    au_set_obj(robj, "intrinsic", au_json_list_str(ra.intrinsic))
+    au_set_obj(robj, "name", json_str(root_node.name))
+    au_set_obj(robj, "surface", au_json_list_str(ra.surface))
+    au_set_obj(robj, "version", json_str(root_node.version))
+    au_set_obj(report, "root", robj)
+    au_set_obj(report, "schema", json_str("hls-audit/v1"))
+    au_set_obj(report, "tree", au_tree_json(root_node))
+    let unaud_arr: JsonValue = json_array([])
+    let mut ui: int = 0
+    while ui < unauditable.len() {
+        let parts2: list[str] = split_once_str(unauditable.get(ui), ": ")
+        let uobj: JsonValue = json_object([], [])
+        au_set_obj(uobj, "package", json_str(parts2.get(0)))
+        au_set_obj(uobj, "why", json_str(parts2.get(1)))
+        unaud_arr.arr.push(uobj)
+        ui = ui + 1
+    }
+    au_set_obj(report, "unauditable", unaud_arr)
+    au_set_obj(report, "program_surface",
+    au_json_list_str(sorted_effects))
+    let viol_arr: JsonValue = json_array([])
+    let mut vi2: int = 0
+    while vi2 < violations.len() {
+        let parts3: list[str] = violations.get(vi2).split("|")
+        let vobj: JsonValue = json_object([], [])
+        au_set_obj(vobj, "chain", au_json_list_str(
+        split_chain(parts3.get(2))))
+        au_set_obj(vobj, "effect", json_str(parts3.get(0)))
+        au_set_obj(vobj, "package", json_str(parts3.get(1)))
+        viol_arr.arr.push(vobj)
+        vi2 = vi2 + 1
+    }
+    au_set_obj(report, "violations", viol_arr)
+    return Result.Ok(report)
+}
+
+# split_once_str(s, sep) — [head, tail] on the first sep.
+fn split_once_str(s: str, sep: str) -> list[str] {
+    let at: int = s.find(sep)
+    let out: list[str] = []
+    if at < 0 {
+        out.push(s)
+        out.push("")
+        return out
+    }
+    out.push(s.slice(0, at))
+    out.push(s.slice(at + sep.len(), s.len()))
+    return out
+}
+
+# split_chain(s) — " -> " back into a list.
+fn split_chain(s: str) -> list[str] {
+    return s.split(" -> ")
+}
+
+# au_node_chain(nodes, node) — the package names root..node (walk up by
+# parent_dir through the node list).
+fn au_node_chain(nodes: list[PkgNode], node: PkgNode) -> list[str] {
+    let rev: list[str] = [node.name]
+    let mut cur: PkgNode = node
+    let mut guard: int = 0
+    while cur.parent_dir != "" && guard < 128 {
+        guard = guard + 1
+        let mut i: int = 0
+        let mut found: bool = false
+        while i < nodes.len() {
+            if nodes.get(i).dir == cur.parent_dir {
+                cur = nodes.get(i)
+                rev.push(cur.name)
+                found = true
+                break
+            }
+            i = i + 1
+        }
+        if !found {
+            break
+        }
+    }
+    let out: list[str] = []
+    let mut r: int = rev.len() - 1
+    while r >= 0 {
+        out.push(rev.get(r))
+        r = r - 1
+    }
+    return out
+}
+
+# au_tree_json(node) — the package tree as JSON.
+fn au_tree_json(node: PkgNode) -> JsonValue {
+    let t: JsonValue = json_object([], [])
+    let kids: JsonValue = json_array([])
+    let mut i: int = 0
+    while i < node.deps.len() {
+        kids.arr.push(au_tree_json(node.deps.get(i)))
+        i = i + 1
+    }
+    au_set_obj(t, "children", kids)
+    au_set_obj(t, "name", json_str(node.name))
+    au_set_obj(t, "source", json_str(node.src_kind))
+    au_set_obj(t, "version", json_str(node.version))
+    return t
+}
+
+# ----------------------------------------------------------------------------
+# Rendering (text) — the .py's lines, needle for needle.
+# ----------------------------------------------------------------------------
+
+# au_fmt_effects(xs) — ", ".join or "(none)".
+fn au_fmt_effects(xs: list[str]) -> str {
+    if xs.len() == 0 {
+        return "(none)"
+    }
+    return str_join(xs, ", ")
+}
+
+# kind_of_module(modules, key) — the kind of a module key.
+fn kind_of_module(modules: list[JsonValue], key: str) -> str {
+    let mut i: int = 0
+    while i < modules.len() {
+        if jstr_or(json_object_get(modules.get(i), "key"), "") == key {
+            return jstr_or(json_object_get(modules.get(i), "kind"), "")
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# render_source(r) — the text report, source mode.
+fn render_source(r: JsonValue) -> str {
+    let lines: list[str] = []
+    lines.push("== hls-audit: supply-chain effect report ==")
+    lines.push("root: " + jstr_or(json_object_get(r, "root"), ""))
+    lines.push("mode: source")
+    let modules: list[JsonValue] = json_object_get(r, "modules").arr
+    let mut n_tool: int = 0
+    let mut n_dep: int = 0
+    let mut n_ws: int = 0
+    let mut mi: int = 0
+    while mi < modules.len() {
+        let k: str = jstr_or(json_object_get(modules.get(mi), "kind"), "")
+        if k == "toolchain" {
+            n_tool = n_tool + 1
+        } else if k == "dependency" {
+            n_dep = n_dep + 1
+        } else {
+            n_ws = n_ws + 1
+        }
+        mi = mi + 1
+    }
+    let edges: JsonValue = json_object_get(r, "edges")
+    let mut n_edges: int = 0
+    let mut ei: int = 0
+    while ei < edges.obj_keys.len() {
+        n_edges = n_edges + json_object_get(edges,
+        edges.obj_keys.get(ei)).arr.len()
+        ei = ei + 1
+    }
+    let extern_blocks: list[JsonValue] =
+    json_object_get(r, "extern_blocks").arr
+    let mut n_ext: int = 0
+    let mut xi: int = 0
+    while xi < extern_blocks.len() {
+        n_ext = n_ext + json_object_get(extern_blocks.get(xi),
+        "fns").arr.len()
+        xi = xi + 1
+    }
+    lines.push("modules: " + modules.len().to_str() + " ("
+    + n_tool.to_str() + " toolchain, " + n_dep.to_str()
+    + " dependency, " + n_ws.to_str() + " workspace) — edges: "
+    + n_edges.to_str() + " — extern decls: " + n_ext.to_str())
+    lines.push("")
+    lines.push("tree:")
+    let root_key: str = jstr_or(json_object_get(r, "root"), "")
+    lines.push("  " + root_key + "  [" + kind_of_module(modules,
+    root_key) + "] (this file)")
+    let seen: list[str] = [root_key]
+    au_render_tree_walk(lines, edges, json_object_get(edges, root_key),
+    "", modules, seen)
+    lines.push("")
+    lines.push("effect surface per module:")
+    let mut w: int = 6
+    let mut wi: int = 0
+    while wi < modules.len() {
+        let key: str = jstr_or(json_object_get(modules.get(wi), "key"),
+        "")
+        if key.len() + 4 > w {
+            w = key.len() + 4
+        }
+        wi = wi + 1
+    }
+    lines.push("  " + str_pad_right("module", w, " ")
+    + str_pad_right("intrinsic", 16, " ") + "  "
+    + "reachable (surface)")
+    wi = 0
+    while wi < modules.len() {
+        let m: JsonValue = modules.get(wi)
+        lines.push("  "
+        + str_pad_right(jstr_or(json_object_get(m, "key"), ""), w, " ")
+        + str_pad_right(au_fmt_effects(jstrs_of(
+        json_object_get(m, "intrinsic"))), 16, " ") + "  "
+        + au_fmt_effects(jstrs_of(json_object_get(m, "surface"))))
+        wi = wi + 1
+    }
+    lines.push("")
+    lines.push("attribution:")
+    let atts: list[JsonValue] = json_object_get(r, "attribution").arr
+    if atts.len() == 0 {
+        lines.push("  (no effects anywhere in the tree — a pure supply"
+        + " chain)")
+    }
+    let mut ai: int = 0
+    while ai < atts.len() {
+        let att: JsonValue = atts.get(ai)
+        lines.push("  " + jstr_or(json_object_get(att, "effect"), "")
+        + " — introduced by " + jstr_or(json_object_get(att, "module"), "")
+        + " [" + jstr_or(json_object_get(att, "kind"), "") + "]")
+        lines.push("       via: " + jchain(json_object_get(att, "chain")))
+        ai = ai + 1
+    }
+    if extern_blocks.len() > 0 {
+        lines.push("")
+        lines.push("ffi surface (trusted C/JS, outside the effect"
+        + " algebra):")
+        let mut bi: int = 0
+        while bi < extern_blocks.len() {
+            let b: JsonValue = extern_blocks.get(bi)
+            lines.push("  " + jstr_or(json_object_get(b, "module"), "")
+            + ": extern \"" + jstr_or(json_object_get(b, "abi"), "")
+            + "\" { " + str_join(jstrs_of(json_object_get(b, "fns")),
+            ", ") + " } declared "
+            + au_fmt_effects(jstrs_of(json_object_get(b, "effects"))))
+            bi = bi + 1
+        }
+    }
+    lines.push("")
+    lines.push("totals:")
+    lines.push("  program effect surface: " + au_fmt_effects(
+    jstrs_of(json_object_get(r, "program_surface"))))
+    let kinds: list[str] = ["workspace", "dependency", "toolchain"]
+    let mut kidx: int = 0
+    while kidx < kinds.len() {
+        let kind: str = kinds.get(kidx)
+        let effs: list[str] = []
+        let mut ai2: int = 0
+        while ai2 < atts.len() {
+            let att: JsonValue = atts.get(ai2)
+            if jstr_or(json_object_get(att, "kind"), "") == kind
+            && !json_object_get(att, "root_introduced").bval {
+                au_push_unique(effs, jstr_or(json_object_get(att,
+                "effect"), ""))
+            }
+            ai2 = ai2 + 1
+        }
+        lines.push("  introduced in " + kind + ": "
+        + au_fmt_effects(sort_strs(effs)))
+        kidx = kidx + 1
+    }
+    lines.push("")
+    let pol: JsonValue = json_object_get(r, "policy")
+    let allowed_v: JsonValue = json_object_get(pol, "allowed")
+    let viol: list[JsonValue] = json_object_get(r, "violations").arr
+    if json_is_null(allowed_v) {
+        lines.push("policy: (none — report only)")
+        lines.push("verdict: report only — pass --allow (or audit"
+        + " inside a package with [effects].allowed) to gate the chain")
+    } else {
+        lines.push("policy: allowed = " + au_fmt_effects(
+        jstrs_of(allowed_v)))
+        if viol.len() > 0 {
+            lines.push("violations:")
+            let mut vi: int = 0
+            while vi < viol.len() {
+                lines.push("  " + jstr_or(json_object_get(viol.get(vi),
+                "effect"), "") + " (introduced by "
+                + jstr_or(json_object_get(viol.get(vi), "module"), "")
+                + ")")
+                lines.push("       via: " + jchain(json_object_get(
+                viol.get(vi), "chain")))
+                vi = vi + 1
+            }
+            lines.push("verdict: VIOLATED — " + viol.len().to_str()
+            + " effect(s) outside the allow list")
+        } else {
+            lines.push("verdict: OK — the chain fits the allow list")
+        }
+    }
+    return str_join(lines, "\n")
+}
+
+# au_render_tree_walk — the import tree's kid lines (with (seen)).
+fn au_render_tree_walk(lines: list[str], edges: JsonValue,
+kids: JsonValue, prefix: str, modules: list[JsonValue],
+seen: list[str]) -> void {
+    if !json_is_array(kids) {
+        return
+    }
+    let mut i: int = 0
+    while i < kids.arr.len() {
+        let kid: str = json_str_value(kids.arr.get(i))
+        let last: bool = i + 1 == kids.arr.len()
+        let mut branch: str = "|- "
+        if last {
+            branch = "`- "
+        }
+        if au_contains(seen, kid) {
+            lines.push("  " + prefix + branch + kid + "  (seen)")
+        } else {
+            lines.push("  " + prefix + branch + kid + "  ["
+            + kind_of_module(modules, kid) + "]")
+            seen.push(kid)
+            let sub: JsonValue = json_object_get(edges, kid)
+            if json_is_array(sub) {
+                let mut next_prefix: str = prefix + "|   "
+                if last {
+                    next_prefix = prefix + "   "
+                }
+                au_render_tree_walk(lines, edges, sub, next_prefix,
+                modules, seen)
+            }
+        }
+        i = i + 1
+    }
+}
+
+# render_package(r) — the text report, package mode.
+fn render_package(r: JsonValue) -> str {
+    let lines: list[str] = []
+    lines.push("== hls-audit: supply-chain effect report ==")
+    let root: JsonValue = json_object_get(r, "root")
+    lines.push("root: " + jstr_or(json_object_get(root, "name"), "")
+    + " " + jstr_or(json_object_get(root, "version"), "") + " ("
+    + jstr_or(json_object_get(root, "dir"), "") + ")")
+    lines.push("mode: package — lockfile: " + jstr_or(
+    json_object_get(r, "lockfile"), ""))
+    let packages: list[JsonValue] = json_object_get(r, "packages").arr
+    let mut depth_max: int = 0
+    let mut pi: int = 0
+    while pi < packages.len() {
+        let d_v: JsonValue = json_object_get(packages.get(pi), "depth")
+        let mut d: int = 0
+        if json_is_int(d_v) {
+            d = json_int_value(d_v)
+        }
+        if d > depth_max {
+            depth_max = d
+        }
+        pi = pi + 1
+    }
+    lines.push("packages: " + packages.len().to_str()
+    + " (root included) — deepest chain: " + depth_max.to_str()
+    + " dep(s)")
+    lines.push("")
+    lines.push("tree:")
+    lines.push("  " + jstr_or(json_object_get(root, "name"), "") + " "
+    + jstr_or(json_object_get(root, "version"), "") + "  [root]"
+    + " (this package)")
+    au_render_pkg_tree(lines, json_object_get(r, "tree"), "")
+    lines.push("")
+    lines.push("effect surface per package:")
+    let seen_names: list[str] = []
+    let rows: list[JsonValue] = []
+    pi = 0
+    while pi < packages.len() {
+        let nm: str = jstr_or(json_object_get(packages.get(pi),
+        "name"), "")
+        if !au_contains(seen_names, nm) {
+            seen_names.push(nm)
+            rows.push(packages.get(pi))
+        }
+        pi = pi + 1
+    }
+    let mut w: int = 7
+    let mut ri: int = 0
+    while ri < rows.len() {
+        let nm: str = jstr_or(json_object_get(rows.get(ri), "name"), "")
+        if nm.len() + 4 > w {
+            w = nm.len() + 4
+        }
+        ri = ri + 1
+    }
+    lines.push("  " + str_pad_right("package", w, " ")
+    + str_pad_right("intrinsic", 16, " ") + "  "
+    + str_pad_right("reachable (surface)", 22, " ") + "declared")
+    ri = 0
+    while ri < rows.len() {
+        let p: JsonValue = rows.get(ri)
+        let mut note: str = ""
+        let una_v: JsonValue = json_object_get(p, "unauditable")
+        if json_is_str(una_v) {
+            note = "  (UNAUDITABLE — fail closed)"
+        }
+        lines.push("  " + str_pad_right(jstr_or(json_object_get(p,
+        "name"), ""), w, " ") + str_pad_right(au_fmt_effects(
+        jstrs_of(json_object_get(p, "intrinsic"))), 16, " ") + "  "
+        + str_pad_right(au_fmt_effects(jstrs_of(
+        json_object_get(p, "surface"))), 22, " ") + au_fmt_effects(
+        jstrs_of(json_object_get(p, "declared"))) + note)
+        ri = ri + 1
+    }
+    lines.push("")
+    lines.push("attribution:")
+    let atts: list[JsonValue] = json_object_get(r, "attribution").arr
+    if atts.len() == 0 {
+        lines.push("  (no effects anywhere in the tree — a pure supply"
+        + " chain)")
+    }
+    let mut ai: int = 0
+    while ai < atts.len() {
+        let att: JsonValue = atts.get(ai)
+        let d_v2: JsonValue = json_object_get(att, "depth")
+        let mut d2: int = 0
+        if json_is_int(d_v2) {
+            d2 = json_int_value(d_v2)
+        }
+        lines.push("  " + jstr_or(json_object_get(att, "effect"), "")
+        + " — introduced by " + jstr_or(json_object_get(att, "package"),
+        "") + " (depth " + d2.to_str() + ")")
+        lines.push("       via: " + jchain(json_object_get(att, "chain")))
+        ai = ai + 1
+    }
+    lines.push("")
+    lines.push("drift:")
+    let drift: list[JsonValue] = json_object_get(r, "drift").arr
+    if drift.len() == 0 {
+        if jstr_or(json_object_get(r, "lockfile"), "") == "present" {
+            lines.push("  (none)")
+        } else {
+            lines.push("  (no lockfile — nothing to compare; run"
+            + " `hls-pkg lock` to pin the tree)")
+        }
+    }
+    let mut di: int = 0
+    while di < drift.len() {
+        lines.push("  " + jstr_or(json_object_get(drift.get(di),
+        "package"), "") + ": " + jstr_or(json_object_get(
+        drift.get(di), "why"), ""))
+        di = di + 1
+    }
+    let unauditable: list[JsonValue] =
+    json_object_get(r, "unauditable").arr
+    if unauditable.len() > 0 {
+        lines.push("")
+        lines.push("unauditable (fail closed):")
+        let mut ui: int = 0
+        while ui < unauditable.len() {
+            lines.push("  " + jstr_or(json_object_get(
+            unauditable.get(ui), "package"), "") + ": " + jstr_or(
+            json_object_get(unauditable.get(ui), "why"), ""))
+            ui = ui + 1
+        }
+    }
+    lines.push("")
+    let pol: JsonValue = json_object_get(r, "policy")
+    let allowed_v: JsonValue = json_object_get(pol, "allowed")
+    let viol: list[JsonValue] = json_object_get(r, "violations").arr
+    if unauditable.len() > 0 {
+        if !json_is_null(allowed_v) {
+            lines.push("policy: allowed = " + au_fmt_effects(
+            jstrs_of(allowed_v)) + " (from " + jstr_or(
+            json_object_get(pol, "source"), "") + ")")
+            if viol.len() > 0 {
+                lines.push("violations:")
+                let mut vi: int = 0
+                while vi < viol.len() {
+                    lines.push("  " + jstr_or(json_object_get(
+                    viol.get(vi), "effect"), "") + " (introduced by "
+                    + jstr_or(json_object_get(viol.get(vi), "package"),
+                    "") + ")")
+                    lines.push("       via: " + jchain(
+                    json_object_get(viol.get(vi), "chain")))
+                    vi = vi + 1
+                }
+            }
+            lines.push("verdict: FAILED — " + viol.len().to_str()
+            + " effect(s) outside the allowed set, "
+            + unauditable.len().to_str() + " package(s) unauditable")
+        } else {
+            lines.push("policy: (none — the unauditable node fails the"
+            + " run on its own)")
+            lines.push("verdict: UNAUDITABLE — "
+            + unauditable.len().to_str() + " package(s) could not be"
+            + " audited (fail closed)")
+        }
+    } else if json_is_null(allowed_v) {
+        lines.push("policy: (none — report only)")
+        lines.push("verdict: report only — add [effects].allowed to"
+        + " the root manifest (or pass --allow) to gate the chain")
+    } else {
+        lines.push("policy: allowed = " + au_fmt_effects(
+        jstrs_of(allowed_v)) + " (from " + jstr_or(
+        json_object_get(pol, "source"), "") + ")")
+        if viol.len() > 0 {
+            lines.push("violations:")
+            let mut vi: int = 0
+            while vi < viol.len() {
+                lines.push("  " + jstr_or(json_object_get(
+                viol.get(vi), "effect"), "") + " (introduced by "
+                + jstr_or(json_object_get(viol.get(vi), "package"), "")
+                + ")")
+                lines.push("       via: " + jchain(json_object_get(
+                viol.get(vi), "chain")))
+                vi = vi + 1
+            }
+            lines.push("verdict: VIOLATED — " + viol.len().to_str()
+            + " effect(s) outside the allowed set")
+        } else {
+            lines.push("verdict: OK — every package fits the allowed"
+            + " set")
+        }
+    }
+    return str_join(lines, "\n")
+}
+
+# au_render_pkg_tree — the package tree lines.
+fn au_render_pkg_tree(lines: list[str], tree: JsonValue,
+prefix: str) -> void {
+    let kids: JsonValue = json_object_get(tree, "children")
+    if !json_is_array(kids) {
+        return
+    }
+    let mut i: int = 0
+    while i < kids.arr.len() {
+        let ch: JsonValue = kids.arr.get(i)
+        let last: bool = i + 1 == kids.arr.len()
+        let mut branch: str = "|- "
+        if last {
+            branch = "`- "
+        }
+        lines.push("  " + prefix + branch
+        + jstr_or(json_object_get(ch, "name"), "") + " "
+        + jstr_or(json_object_get(ch, "version"), "") + "  ["
+        + jstr_or(json_object_get(ch, "source"), "") + "]")
+        let mut next_prefix: str = prefix + "|   "
+        if last {
+            next_prefix = prefix + "   "
+        }
+        au_render_pkg_tree(lines, ch, next_prefix)
+        i = i + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# The JSON report — python's json.dumps(indent=2, sort_keys=True).
+# ----------------------------------------------------------------------------
+
+fn au_json_pretty_at(v: JsonValue, indent: int) -> str {
+    if json_is_null(v) {
+        return "null"
+    }
+    if json_is_bool(v) {
+        if json_bool_value(v) {
+            return "true"
+        }
+        return "false"
+    }
+    if json_is_int(v) {
+        return json_int_value(v).to_str()
+    }
+    if json_is_float(v) {
+        return json_float_value(v).to_str()
+    }
+    if json_is_str(v) {
+        return au_json_str(json_str_value(v))
+    }
+    let mut pad: str = ""
+    let mut k: int = 0
+    while k < indent {
+        pad = pad + "  "
+        k = k + 1
+    }
+    let in_pad: str = pad + "  "
+    if json_is_array(v) {
+        if v.arr.len() == 0 {
+            return "[]"
+        }
+        let mut out: str = "[\n"
+        let mut i: int = 0
+        while i < v.arr.len() {
+            out = out + in_pad + au_json_pretty_at(v.arr.get(i),
+            indent + 1)
+            if i + 1 < v.arr.len() {
+                out = out + ","
+            }
+            out = out + "\n"
+            i = i + 1
+        }
+        return out + pad + "]"
+    }
+    if v.obj_keys.len() == 0 {
+        return "{}"
+    }
+    let keys: list[str] = sort_strs(v.obj_keys)
+    let mut out2: str = "{\n"
+    let mut n: int = 0
+    while n < keys.len() {
+        let key: str = keys.get(n)
+        out2 = out2 + in_pad + au_json_str(key) + ": "
+        + au_json_pretty_at(json_object_get(v, key), indent + 1)
+        if n + 1 < keys.len() {
+            out2 = out2 + ","
+        }
+        out2 = out2 + "\n"
+        n = n + 1
+    }
+    return out2 + pad + "}"
+}
+
+# au_json_str(s) — the JSON string literal with python's escapes.
+fn au_json_str(s: str) -> str {
+    let mut out: str = "\""
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c == 34 {
+            out = out + "\\\""
+        } else if c == 92 {
+            out = out + "\\\\"
+        } else if c == 10 {
+            out = out + "\\n"
+        } else if c == 9 {
+            out = out + "\\t"
+        } else if c == 13 {
+            out = out + "\\r"
+        } else if c < 32 {
+            let h: str = "0123456789abcdef"
+            let b1: int = c / 16
+            let b2: int = c - (c / 16) * 16
+            out = out + "\\u00" + h.slice(b1, b1 + 1) + h.slice(b2,
+            b2 + 1)
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out + "\""
+}
+
+# ----------------------------------------------------------------------------
+# main — the CLI.
+# ----------------------------------------------------------------------------
+
+fn au_usage_fail(msg: str) -> int uses IO, Exit {
+    eprintln("usage: hls-audit <entry.hls> [--allow E1,E2,...] [--json]")
+    eprintln("       hls-audit --pkg [DIR] [--allow E1,E2,...] [--json]")
+    eprintln("hls-audit: error: " + msg)
+    return 2
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let argv: list[str] = args()
+
+    # the probe children first (re-exec'd by the parent side)
+    if argv.len() > 2 && argv.get(1) == "--probe-parse" {
+        return au_probe_parse_child(argv.get(2))
+    }
+    if argv.len() > 2 && argv.get(1) == "--probe-check" {
+        return au_probe_check_child(argv.get(2))
+    }
+
+    let mut entry: str = ""
+    let mut pkg_dir: str = ""
+    let mut has_pkg: bool = false
+    let mut allow_raw: str = ""
+    let mut has_allow: bool = false
+    let mut as_json: bool = false
+    let mut i: int = 1
+    while i < argv.len() {
+        let a: str = argv.get(i)
+        if a == "--pkg" {
+            has_pkg = true
+            # nargs="?": a following non-flag positional is the dir
+            if i + 1 < argv.len() && !argv.get(i + 1).starts_with("--") {
+                pkg_dir = argv.get(i + 1)
+                i = i + 2
+            } else {
+                pkg_dir = "."
+                i = i + 1
+            }
+        } else if a == "--allow" {
+            if i + 1 >= argv.len() {
+                return au_usage_fail("--allow expects a value")
+            }
+            allow_raw = argv.get(i + 1)
+            has_allow = true
+            i = i + 2
+        } else if a == "--json" {
+            as_json = true
+            i = i + 1
+        } else if a.starts_with("--") {
+            return au_usage_fail("unrecognized argument: " + a)
+        } else {
+            entry = a
+            i = i + 1
+        }
+    }
+    if !has_pkg && entry == "" {
+        return au_usage_fail("give an entry file (source mode) or"
+        + " --pkg [DIR] (package mode)")
+    }
+    if has_pkg && entry != "" {
+        return au_usage_fail("<entry> and --pkg are mutually exclusive"
+        + " (one mode per run)")
+    }
+    let allow: list[str] = []
+    if has_allow {
+        let parts: list[str] = allow_raw.split(",")
+        let mut p: int = 0
+        while p < parts.len() {
+            let x: str = parts.get(p).trim()
+            if x != "" {
+                if !au_effect_known(x) {
+                    return au_usage_fail("unknown effect in --allow: "
+                    + x + " (known: " + str_join(au_all_effects(), ", ")
+                    + ")")
+                }
+                au_push_unique(allow, x)
+            }
+            p = p + 1
+        }
+    }
+
+    if has_pkg {
+        let rr: Result[JsonValue, Fail] = au_audit_package(pkg_dir,
+        allow, has_allow)
+        if result_is_err(rr) {
+            eprintln("hls-audit: " + result_err_or(rr, fail("?")).msg)
+            return 1
+        }
+        let report: JsonValue = result_unwrap(rr)
+        if as_json {
+            println(au_json_pretty_at(report, 0))
+        } else {
+            println(render_package(report))
+        }
+        let failed: bool = json_object_get(report, "violations").arr.len()
+        > 0 || json_object_get(report, "drift").arr.len() > 0
+        || json_object_get(report, "unauditable").arr.len() > 0
+        if failed {
+            return 1
+        }
+        return 0
+    }
+    let sr: Result[JsonValue, Fail] = au_audit_source(entry, allow,
+    has_allow)
+    if result_is_err(sr) {
+        eprintln("hls-audit: " + result_err_or(sr, fail("?")).msg)
+        return 1
+    }
+    let report2: JsonValue = result_unwrap(sr)
+    if as_json {
+        println(au_json_pretty_at(report2, 0))
+    } else {
+        println(render_source(report2))
+    }
+    if json_object_get(report2, "violations").arr.len() > 0 {
+        return 1
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# End of tools/hls-audit.hls
+# ============================================================================

@@ -6616,12 +6616,12 @@ does THIS program do" — `boot.py --audit` prints the per-function
 capability tree, `hls-pkg lock` enforces a manifest's
 `[effects].allowed` over its TOP-LEVEL dependencies. Neither answers
 the supply-chain question: **where does each effect enter my tree,
-and through which chain of trust?** `tools/hls-audit.py` answers it,
+and through which chain of trust?** `hls-audit` answers it,
 transitively, in two modes over one report shape:
 
 ```
-python3 tools/hls-audit.py <entry.hls> [--allow IO,Fs] [--json]
-python3 tools/hls-audit.py --pkg [DIR]  [--allow IO,Fs] [--json]
+hls-audit <entry.hls> [--allow IO,Fs] [--json]
+hls-audit --pkg [DIR]  [--allow IO,Fs] [--json]
 ```
 
 The tool is analysis-only: it loads and checks programs (the real

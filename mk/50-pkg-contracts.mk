@@ -185,7 +185,7 @@ supply-pkg:
 # policy, fail-closed, the package tree, drift, the mode parity, the
 # demos, the tools). Tool-only - no solver, no compiler needed; the
 # native half of the demo parity runs when bin/hlc exists.
-supply-acceptance: $(BIN)/acc-audit
+supply-acceptance: $(BIN)/acc-audit $(BIN)/hls-audit
 	@echo "[Stage 103 acceptance] running tests/acc/audit_acceptance.hls..."
 	@$(BIN)/acc-audit
 
