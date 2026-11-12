@@ -1,0 +1,3154 @@
+# ============================================================================
+# tools/hls-ctime.hls — the Stage 138 per-commit compile-time regression
+# dashboard, in Halis (the native twin of the Python hls-ctime.py that
+# retired; same CLI, same wire, same exits).
+# ----------------------------------------------------------------------------
+# The instrument is the compiler itself, and Halis ships two of them, so
+# they are two INSTRUMENTS, never compared:
+#
+#   stage0  bin/hlboot src/hlc.hls <workload> <out.c>
+#          (the bootstrap chain — the front door every contributor's
+#          `make` walks through)
+#   native  bin/hlc <workload> <out.c>
+#          (the self-hosted compiler — the artifact users run)
+#
+# Both time the SAME quantity — one full HLS-to-C compile of one tracked
+# workload, wall time, milliseconds — but through different machines, so
+# a record names its instrument and the gate refuses to compare across
+# them. Every record also pins the compiler's OWN identity (the sha256
+# over src/hlc.hls + src/hlc/*.hls and the sha256 of the binary actually
+# timed), and the STALE-BINARY LAW bites at record time: a native record
+# whose compiler digest was already filed against a DIFFERENT source
+# digest is refused — bin/hlc was not rebuilt for the commit it claims
+# to measure ("run make bootstrap first").
+#
+#   record    compile every workload of the tracked suite (the tracked
+#             default is benchmarks/ctime_watch/) through the instrument,
+#             --samples timed compiles each after --warmup untimed ones,
+#             and append one entry pinned to `git rev-parse HEAD`
+#             (refused on a dirty tree; --from-report imports a machine
+#             report instead)
+#   sanction  a written excuse for one workload (reason mandatory)
+#   gate      classify the newest record against the prior record of the
+#             same instrument (Welch p, the seeded bootstrap CI against
+#             the --threshold noise band, default 10% — honest about wall
+#             time on a shared machine); exit 1 on any unsanctioned
+#             regressed or vanished workload
+#   dashboard the deterministic COMPILETIME.md render (sha256 ledger
+#             digest embedded; two renders of one ledger are
+#             byte-identical)
+#   history   read the ledger back
+#
+# The ledger is JSONL (default .hlctime/history.jsonl), append-only, one
+# object per line. The statistics are hls-bench's law, restated natively
+# (one implementation of Welch's test and the bootstrap, so the runner's
+# numbers and every ledger's verdicts can never drift apart).
+#
+# Exit codes: 0 verified / 1 named violation / 2 usage or IO error.
+# ============================================================================
+
+import "std.str"
+import "std.json"
+import "std.result"
+import "std.option"
+import "std.fmt"
+import "std.sha256"
+
+# ----------------------------------------------------------------------------
+# Constants (the .py's).
+# ----------------------------------------------------------------------------
+
+fn tool_name() -> str {
+    return "hls-ctime"
+}
+
+fn tool_version() -> str {
+    return "0.156.0"
+}
+
+fn history_default() -> str {
+    return ".hlctime/history.jsonl"
+}
+
+fn default_suite() -> str {
+    return "benchmarks/ctime_watch"
+}
+
+fn default_samples() -> int {
+    return 6
+}
+
+fn default_warmup() -> int {
+    return 1
+}
+
+fn default_noise_pct() -> float {
+    return 10.0
+}
+
+fn default_dash_limit() -> int {
+    return 12
+}
+
+fn min_samples() -> int {
+    return 2
+}
+
+fn bootstrap_b() -> int {
+    return 2000
+}
+
+fn alpha() -> float {
+    return 0.05
+}
+
+fn hlc_source_entry() -> str {
+    return "src/hlc.hls"
+}
+
+fn hlc_source_dir() -> str {
+    return "src/hlc"
+}
+
+fn boot_driver() -> str {
+    return "bin/hlboot"
+}
+
+fn native_compiler() -> str {
+    return "bin/hlc"
+}
+
+# The 8-band sparkline alphabet and the mid band a constant series
+# renders (raw UTF-8 bytes; each block is 3 bytes).
+fn spark_bands() -> str {
+    return "▁▂▃▄▅▆▇█"
+}
+
+fn spark_mid() -> str {
+    return "▄"
+}
+
+# fmt_ms(ms) — a millisecond count fit for a table cell, hls-bench's own
+# time formatter seeded from ns so the dashboards agree.
+fn fmt_ms(ms: float) -> str {
+    return fmt_time(ms * 1000000.0)
+}
+
+# ----------------------------------------------------------------------------
+# The named refusal + the small string/int helpers.
+# ----------------------------------------------------------------------------
+
+struct Err {
+    msg: str,
+    code: int
+}
+
+fn err1(msg: str) -> Err {
+    return Err {
+        msg: msg, code: 1
+    }
+}
+
+fn err2(msg: str) -> Err {
+    return Err {
+        msg: msg, code: 2
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Byte / string helpers.
+# ----------------------------------------------------------------------------
+
+fn is_digit_b(b: int) -> bool {
+    return b >= 48 && b <= 57
+}
+
+fn is_hex_b(b: int) -> bool {
+    if is_digit_b(b) {
+        return true
+    }
+    return(b >= 97 && b <= 102) || (b >= 65 && b <= 70)
+}
+
+fn strip_ws(s: str) -> str {
+    return s.trim()
+}
+
+fn take_s(s: str, n: int) -> str {
+    if s.len() <= n {
+        return s
+    }
+    return s.slice(0, n)
+}
+
+fn repeat_str(s: str, n: int) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < n {
+        out = out + s
+        i = i + 1
+    }
+    return out
+}
+
+fn pad_right(s: str, width: int) -> str {
+    if s.len() >= width {
+        return s
+    }
+    return s + repeat_str(" ", width - s.len())
+}
+
+fn pad_left_num(v: int, width: int) -> str {
+    let s: str = v.to_str()
+    if s.len() >= width {
+        return s
+    }
+    return repeat_str(" ", width - s.len()) + s
+}
+
+# hex_to_int(s) — a non-negative hex string as int (0 on garbage).
+fn hex_to_int(s: str) -> int {
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        if !is_hex_b(b) {
+            return 0
+        }
+        if is_digit_b(b) {
+            v = v * 16 + (b - 48)
+        } else if b >= 97 {
+            v = v * 16 + (b - 87)
+        } else {
+            v = v * 16 + (b - 55)
+        }
+        i = i + 1
+    }
+    return v
+}
+
+fn parse_int_opt(s: str) -> Option[int] {
+    let t: str = strip_ws(s)
+    if t.len() == 0 {
+        return Option.None
+    }
+    let mut i: int = 0
+    let mut neg: bool = false
+    if t.byte_at(0) == 43 || t.byte_at(0) == 45 {
+        neg = t.byte_at(0) == 45
+        i = 1
+    }
+    if i >= t.len() {
+        return Option.None
+    }
+    let mut v: int = 0
+    while i < t.len() {
+        if !is_digit_b(t.byte_at(i)) {
+            return Option.None
+        }
+        v = v * 10 + (t.byte_at(i) - 48)
+        i = i + 1
+    }
+    if neg {
+        return Option.Some(0 - v)
+    }
+    return Option.Some(v)
+}
+
+fn parse_float_opt(s: str) -> Option[float] {
+    let t: str = strip_ws(s)
+    let n: int = t.len()
+    if n == 0 {
+        return Option.None
+    }
+    let mut i: int = 0
+    if t.byte_at(0) == 43 || t.byte_at(0) == 45 {
+        i = 1
+    }
+    let int_start: int = i
+    while i < n && is_digit_b(t.byte_at(i)) {
+        i = i + 1
+    }
+    let saw_digits: bool = i > int_start
+    if i < n && t.byte_at(i) == 46 {
+        i = i + 1
+        let frac_start: int = i
+        while i < n && is_digit_b(t.byte_at(i)) {
+            i = i + 1
+        }
+        if i == frac_start && !saw_digits {
+            return Option.None
+        }
+    }
+    if !saw_digits && !(i > int_start && t.byte_at(i - 1) == 46) {
+        return Option.None
+    }
+    if i < n && (t.byte_at(i) == 101 || t.byte_at(i) == 69) {
+        i = i + 1
+        if i < n && (t.byte_at(i) == 43 || t.byte_at(i) == 45) {
+            i = i + 1
+        }
+        let exp_start: int = i
+        while i < n && is_digit_b(t.byte_at(i)) {
+            i = i + 1
+        }
+        if i == exp_start {
+            return Option.None
+        }
+    }
+    if i != n {
+        return Option.None
+    }
+    return Option.Some(t.to_float())
+}
+# ----------------------------------------------------------------------------
+# Path helpers.
+# ----------------------------------------------------------------------------
+
+fn path_basename(p: str) -> str {
+    let mut i: int = p.len() - 1
+    while i >= 0 {
+        if p.byte_at(i) == 47 {
+            return p.slice(i + 1, p.len())
+        }
+        i = i - 1
+    }
+    return p
+}
+
+fn path_dirname(p: str) -> str {
+    let mut i: int = p.len() - 1
+    while i >= 0 {
+        if p.byte_at(i) == 47 {
+            if i == 0 {
+                return "/"
+            }
+            return p.slice(0, i)
+        }
+        i = i - 1
+    }
+    return "."
+}
+
+fn path_join2(base: str, rel: str) -> str {
+    if base == "" {
+        return rel
+    }
+    if base.byte_at(base.len() - 1) == 47 {
+        return base + rel
+    }
+    return base + "/" + rel
+}
+
+fn path_is_absolute(p: str) -> bool {
+    return p.len() > 0 && p.byte_at(0) == 47
+}
+
+fn path_abs(p: str, cwd: str) -> str {
+    if path_is_absolute(p) {
+        return p
+    }
+    return path_join2(cwd, p)
+}
+
+# ----------------------------------------------------------------------------
+# Number formatting — the Python laws the report and the ledger pin.
+# fmt_fixed(x, p) is %.<p>f; py_float_repr(x) is Python's repr (shortest
+# round-trip, ".0" forced for integral values); fmt_g4 is %.4g.
+# ----------------------------------------------------------------------------
+
+fn fmt_fixed(x: float, p: int) -> str {
+    return fmt_float_with_precision(x, p)
+}
+
+fn py_float_repr(x: float) -> str {
+    if x < 0.0 {
+        return "-" + py_float_repr(0.0 - x)
+    }
+    let mut p: int = 0
+    while p <= 17 {
+        let s: str = fmt_float_with_precision(x, p)
+        if s.to_float() == x {
+            if !s.contains(".") && !s.contains("e") {
+                return s + ".0"
+            }
+            return s
+        }
+        p = p + 1
+    }
+    return x.to_str()
+}
+
+fn strip_trailing_zeros(s: str) -> str {
+    if !s.contains(".") {
+        return s
+    }
+    let mut t: str = s
+    while t.len() > 0 && t.byte_at(t.len() - 1) == 48 {
+        t = t.slice(0, t.len() - 1)
+    }
+    if t.len() > 0 && t.byte_at(t.len() - 1) == 46 {
+        t = t.slice(0, t.len() - 1)
+    }
+    if t == "" || t == "-" {
+        return "0"
+    }
+    return t
+}
+
+# fmt_g4(x) — Python's "%.4g" (4 significant digits, trailing zeros
+# stripped, exponent form when exp < -4 or exp >= 4).
+fn fmt_g4(x: float) -> str {
+    if x < 0.0 {
+        return "-" + fmt_g4(0.0 - x)
+    }
+    if x == 0.0 {
+        return "0"
+    }
+    let mut m: float = x
+    let mut e: int = 0
+    while m >= 10.0 {
+        m = m / 10.0
+        e = e + 1
+    }
+    while m < 1.0 {
+        m = m * 10.0
+        e = e - 1
+    }
+    let mut ms: str = fmt_fixed(m, 3)
+    if ms == "10.000" {
+        ms = "1.000"
+        e = e + 1
+    }
+    if e < -4 || e >= 4 {
+        let mant: str = strip_trailing_zeros(ms)
+        let mut ea: int = e
+        if e < 0 {
+            ea = 0 - e
+        }
+        let es: str = ea.to_str()
+        if es.len() < 2 {
+            if e < 0 {
+                return mant + "e-0" + es
+            }
+            return mant + "e+0" + es
+        }
+        if e < 0 {
+            return mant + "e-" + es
+        }
+        return mant + "e+" + es
+    }
+    let dec: int = 3 - e
+    if dec <= 0 {
+        return strip_trailing_zeros(fmt_fixed(x, 0))
+    }
+    return strip_trailing_zeros(fmt_fixed(x, dec))
+}
+
+# fmt_time(ns) — hls-bench's own time formatter: the largest unit that
+# keeps the value >= 1, 4 significant digits ('us' renders as µs).
+fn fmt_time(ns: float) -> str {
+    if ns >= 1000000000.0 || ns <= -1000000000.0 {
+        return fmt_g4(ns / 1000000000.0) + " s"
+    }
+    if ns >= 1000000.0 || ns <= -1000000.0 {
+        return fmt_g4(ns / 1000000.0) + " ms"
+    }
+    if ns >= 1000.0 || ns <= -1000.0 {
+        return fmt_g4(ns / 1000.0) + " µs"
+    }
+    return fmt_g4(ns) + " ns"
+}
+
+# fmt_pct(x) — hls-bench's signed percent, two decimals.
+fn fmt_pct(x: float) -> str {
+    let mut sign: str = ""
+    if x >= 0.0 {
+        sign = "+"
+    }
+    return sign + fmt_fixed(x, 2) + "%"
+}
+
+# py_repr_str(s) — Python's repr of a str (single quotes, escapes).
+fn py_repr_str(s: str) -> str {
+    let mut out: str = "'"
+    let mut i: int = 0
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        if b == 39 {
+            out = out + "\\'"
+        } else if b == 92 {
+            out = out + "\\\\"
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out + "'"
+}
+# ----------------------------------------------------------------------------
+# Sorts (insertion, stable, small data).
+# ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# Sorting (bottom-up merge for floats, insertion for strings).
+# ----------------------------------------------------------------------------
+
+fn sort_floats(xs: list[float]) -> list[float] {
+    let n: int = xs.len()
+    let mut cur: list[float] = []
+    let mut i: int = 0
+    while i < n {
+        cur.push(xs.get(i))
+        i = i + 1
+    }
+    let mut w: int = 1
+    while w < n {
+        let dst: list[float] = []
+        let mut lo: int = 0
+        while lo < n {
+            let mut mid: int = lo + w
+            let mut hi2: int = lo + w + w
+            if mid > n {
+                mid = n
+            }
+            if hi2 > n {
+                hi2 = n
+            }
+            let mut i1: int = lo
+            let mut i2: int = mid
+            while i1 < mid || i2 < hi2 {
+                if i1 < mid && (i2 >= hi2 || cur.get(i1) <= cur.get(i2)) {
+                    dst.push(cur.get(i1))
+                    i1 = i1 + 1
+                } else {
+                    dst.push(cur.get(i2))
+                    i2 = i2 + 1
+                }
+            }
+            lo = lo + w + w
+        }
+        cur = dst
+        w = w * 2
+    }
+    return cur
+}
+
+fn sort_strs(xs: list[str]) -> list[str] {
+    let n: int = xs.len()
+    let mut out: list[str] = []
+    let mut i: int = 0
+    while i < n {
+        out.push(xs.get(i))
+        i = i + 1
+    }
+    let mut b: int = 1
+    while b < n {
+        let k: str = out.get(b)
+        let mut j: int = b - 1
+        while j >= 0 && out.get(j) > k {
+            out.set(j + 1, out.get(j))
+            j = j - 1
+        }
+        out.set(j + 1, k)
+        b = b + 1
+    }
+    return out
+}
+# ----------------------------------------------------------------------------
+# JSON writing — compact (ledger lines) and pretty (the --json artifacts), keys sorted.
+# ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# JSON emission — Python json.dumps laws: compact lines with ", " / ": "
+# separators and sorted keys; pretty documents with indent=1. Floats ride
+# py_float_repr so 10.0 stays 10.0.
+# ----------------------------------------------------------------------------
+
+fn jesc(s: str) -> str {
+    let mut out: str = "\""
+    let mut i: int = 0
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        if b == 34 {
+            out = out + "\\\""
+        } else if b == 92 {
+            out = out + "\\\\"
+        } else if b == 10 {
+            out = out + "\\n"
+        } else if b == 9 {
+            out = out + "\\t"
+        } else if b == 13 {
+            out = out + "\\r"
+        } else if b == 8 {
+            out = out + "\\b"
+        } else if b == 12 {
+            out = out + "\\f"
+        } else if b < 32 {
+            let h: str = "0123456789abcdef"
+            let hi: int = b / 16
+            let lo: int = b - hi * 16
+            out = out + "\\u00" + h.slice(hi, hi + 1) + h.slice(lo, lo + 1)
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out + "\""
+}
+
+fn jv_num(x: float) -> str {
+    return py_float_repr(x)
+}
+
+struct KeyVals {
+    keys: list[str],
+    vals: list[JsonValue]
+}
+
+fn obj_sorted(v: JsonValue) -> KeyVals {
+    let keys: list[str] = []
+    let mut i: int = 0
+    while i < v.obj_keys.len() {
+        keys.push(v.obj_keys.get(i))
+        i = i + 1
+    }
+    let sorted: list[str] = sort_strs(keys)
+    let vals: list[JsonValue] = []
+    let mut j: int = 0
+    while j < sorted.len() {
+        let kk: str = sorted.get(j)
+        let mut got: JsonValue = json_null()
+        let mut k: int = 0
+        while k < v.obj_keys.len() {
+            if v.obj_keys.get(k) == kk {
+                got = v.obj_vals.get(k)
+            }
+            k = k + 1
+        }
+        vals.push(got)
+        j = j + 1
+    }
+    return KeyVals {
+        keys: sorted, vals: vals
+    }
+}
+
+fn compact_json(v: JsonValue) -> str {
+    if v.kind == "null" {
+        return "null"
+    }
+    if v.kind == "bool" {
+        if v.bval {
+            return "true"
+        }
+        return "false"
+    }
+    if v.kind == "int" {
+        return v.ival.to_str()
+    }
+    if v.kind == "float" {
+        return jv_num(v.fval)
+    }
+    if v.kind == "str" {
+        return jesc(v.sval)
+    }
+    if v.kind == "array" {
+        let parts: list[str] = []
+        let mut i: int = 0
+        while i < v.arr.len() {
+            parts.push(compact_json(v.arr.get(i)))
+            i = i + 1
+        }
+        return "[" + str_join(parts, ", ") + "]"
+    }
+    let kv: KeyVals = obj_sorted(v)
+    let parts: list[str] = []
+    let mut i2: int = 0
+    while i2 < kv.keys.len() {
+        parts.push(jesc(kv.keys.get(i2)) + ": " + compact_json(kv.vals.get(i2)))
+        i2 = i2 + 1
+    }
+    return "{" + str_join(parts, ", ") + "}"
+}
+
+fn pretty_json_at(v: JsonValue, depth: int) -> str {
+    let pad: str = repeat_str(" ", depth)
+    let pad2: str = repeat_str(" ", depth + 1)
+    if v.kind == "array" {
+        if v.arr.len() == 0 {
+            return "[]"
+        }
+        let parts: list[str] = []
+        let mut i: int = 0
+        while i < v.arr.len() {
+            parts.push(pad2 + pretty_json_at(v.arr.get(i), depth + 1))
+            i = i + 1
+        }
+        return "[\n" + str_join(parts, ",\n") + "\n" + pad + "]"
+    }
+    if v.kind == "object" {
+        if v.obj_keys.len() == 0 {
+            return "{}"
+        }
+        let kv: KeyVals = obj_sorted(v)
+        let parts: list[str] = []
+        let mut i2: int = 0
+        while i2 < kv.keys.len() {
+            parts.push(pad2 + jesc(kv.keys.get(i2)) + ": "
+            + pretty_json_at(kv.vals.get(i2), depth + 1))
+            i2 = i2 + 1
+        }
+        return "{\n" + str_join(parts, ",\n") + "\n" + pad + "}"
+    }
+    return compact_json(v)
+}
+
+fn pretty_json(v: JsonValue) -> str {
+    return pretty_json_at(v, 0) + "\n"
+}
+
+# ----------------------------------------------------------------------------
+# JSON tree builders + typed readers.
+# ----------------------------------------------------------------------------
+
+fn jobject(keys: list[str], vals: list[JsonValue]) -> JsonValue {
+    return JsonValue {
+        kind: "object", bval: false, ival: 0, fval: 0.0, sval: "",
+        arr: [], obj_keys: keys, obj_vals: vals
+    }
+}
+
+fn jarr(items: list[JsonValue]) -> JsonValue {
+    return JsonValue {
+        kind: "array", bval: false, ival: 0, fval: 0.0, sval: "",
+        arr: items, obj_keys: [], obj_vals: []
+    }
+}
+
+fn jget(v: JsonValue, key: str) -> JsonValue {
+    return json_object_get(v, key)
+}
+
+fn jstr_of(v: JsonValue, key: str) -> str {
+    let x: JsonValue = jget(v, key)
+    if json_is_str(x) {
+        return json_str_value(x)
+    }
+    return ""
+}
+
+# ----------------------------------------------------------------------------
+# The statistics — hls-bench's law, restated (Welch p via the regularized incomplete beta, linear-interpolation quantiles, the seeded xorshift bootstrap).
+# ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# The statistics — hls-bench's law, restated (Welch p via the regularized
+# incomplete beta, linear-interpolation quantiles, the seeded bootstrap).
+# ----------------------------------------------------------------------------
+
+fn quantile_of(sorted_xs: list[float], q: float) -> float {
+    let n: int = sorted_xs.len()
+    if n == 0 {
+        panic("quantile of empty data")
+    }
+    if n == 1 {
+        return sorted_xs.get(0)
+    }
+    let pos: float = q * (n - 1).to_float()
+    let lo: int = pos.to_int()
+    let mut hi: int = lo + 1
+    if hi > n - 1 {
+        hi = n - 1
+    }
+    let frac: float = pos - lo.to_float()
+    return sorted_xs.get(lo) * (1.0 - frac) + sorted_xs.get(hi) * frac
+}
+
+fn median_of(xs: list[float]) -> float {
+    return quantile_of(sort_floats(xs), 0.5)
+}
+
+fn mean_of(xs: list[float]) -> float {
+    let mut s: float = 0.0
+    let mut i: int = 0
+    while i < xs.len() {
+        s = s + xs.get(i)
+        i = i + 1
+    }
+    if xs.len() == 0 {
+        return 0.0
+    }
+    return s / xs.len().to_float()
+}
+
+fn var_sample(xs: list[float]) -> float {
+    let n: int = xs.len()
+    if n < 2 {
+        return 0.0
+    }
+    let m: float = mean_of(xs)
+    let mut s: float = 0.0
+    let mut i: int = 0
+    while i < n {
+        let d: float = xs.get(i) - m
+        s = s + d * d
+        i = i + 1
+    }
+    return s / (n - 1).to_float()
+}
+
+# The continued fraction for the incomplete beta (Lentz's method, the
+# Numerical Recipes betacf).
+fn betacf(a: float, b: float, x: float) -> float {
+    let maxit: int = 300
+    let eps: float = 0.0000000000000003
+    let fpmin: float = 1e-300
+    let qab: float = a + b
+    let qap: float = a + 1.0
+    let qam: float = a - 1.0
+    let mut c: float = 1.0
+    let mut d: float = 1.0 - qab * x / qap
+    if d < fpmin && d > 0.0 - fpmin {
+        d = fpmin
+    }
+    d = 1.0 / d
+    let mut h: float = d
+    let mut m: int = 1
+    while m <= maxit {
+        let m2: int = 2 * m
+        let mf: float = m.to_float()
+        let mut aa: float = mf * (b - mf) * x / ((qam + m2.to_float())
+        * (a + m2.to_float()))
+        d = 1.0 + aa * d
+        if d < fpmin && d > 0.0 - fpmin {
+            d = fpmin
+        }
+        c = 1.0 + aa / c
+        if c < fpmin && c > 0.0 - fpmin {
+            c = fpmin
+        }
+        d = 1.0 / d
+        h = h * d * c
+        aa = 0.0 - (a + mf) * (qab + mf) * x / ((a + m2.to_float())
+        * (qap + m2.to_float()))
+        d = 1.0 + aa * d
+        if d < fpmin && d > 0.0 - fpmin {
+            d = fpmin
+        }
+        c = 1.0 + aa / c
+        if c < fpmin && c > 0.0 - fpmin {
+            c = fpmin
+        }
+        d = 1.0 / d
+        let dele: float = d * c
+        h = h * dele
+        if dele >= 1.0 - eps && dele <= 1.0 + eps {
+            m = maxit + 1
+        }
+        m = m + 1
+    }
+    return h
+}
+
+fn betainc(a: float, b: float, x: float) -> float {
+    if x <= 0.0 {
+        return 0.0
+    }
+    if x >= 1.0 {
+        return 1.0
+    }
+    let ln_bt: float = math_lgamma(a + b) - math_lgamma(a) - math_lgamma(b)
+    + a * math_log(x) + b * math_log(1.0 - x)
+    let bt: float = math_exp(ln_bt)
+    if x < (a + 1.0) / (a + b + 2.0) {
+        return bt * betacf(a, b, x) / a
+    }
+    return 1.0 - bt * betacf(b, a, 1.0 - x) / b
+}
+
+# welch_p(a, b) — the two-tailed Welch t-test p-value.
+fn welch_p(a: list[float], b: list[float]) -> float {
+    let na: int = a.len()
+    let nb: int = b.len()
+    if na < 2 || nb < 2 {
+        return 1.0
+    }
+    let va: float = var_sample(a)
+    let vb: float = var_sample(b)
+    let denom: float = va / na.to_float() + vb / nb.to_float()
+    if denom <= 0.0 {
+        return 1.0
+    }
+    let t: float = (mean_of(a) - mean_of(b)) / math_sqrt(denom)
+    let num: float = denom * denom
+    let den: float = (va / na.to_float()) * (va / na.to_float())
+    / (na - 1).to_float()
+    + (vb / nb.to_float()) * (vb / nb.to_float()) / (nb - 1).to_float()
+    if den <= 0.0 {
+        return 1.0
+    }
+    let df: float = num / den
+    return betainc(df / 2.0, 0.5, df / (df + t * t))
+}
+
+# The seeded PRNG — the .py seeded random.Random(bench_key); the law that
+# matters is DETERMINISM (the same pair of sample sets always classifies
+# the same way), pinned here by a sha256-derived xorshift state.
+fn rng_seed_of(key: str) -> int {
+    let digest: str = sha256_hex(key)
+    let v: int = hex_to_int(take_s(digest, 15))
+    if v == 0 {
+        return 1
+    }
+    return v
+}
+
+fn xs_next(st: int) -> int {
+    let a: int = int_xor(st, int_shr(st, 12))
+    let b: int = int_xor(a, int_shl(a, 25))
+    return int_xor(b, int_shr(b, 27))
+}
+
+fn xs_pick(st: int, n: int) -> int {
+    let nonneg: int = int_and(st, 9223372036854775807)
+    return nonneg % n
+}
+# ----------------------------------------------------------------------------
+# The spawn/capture idiom (piped children).
+# ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# The spawn/capture idiom (the harness's run_capture).
+# ----------------------------------------------------------------------------
+
+struct HlRun {
+    code: int,
+    out: str,
+    err: str,
+    spawned: bool
+}
+
+fn hl_spawn(prog: str, cargs: list[str]) -> HlRun uses Proc {
+    let r: HlRun = HlRun {
+        code: -1, out: "", err: "", spawned: false
+    }
+    let pid: int = proc_spawn(prog, cargs, 2, 1, 1)
+    if pid < 1 {
+        return r
+    }
+    r.spawned = true
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    r.code = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    r.out = out
+    r.err = err
+    return r
+}
+# ----------------------------------------------------------------------------
+# The git surface.
+# ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# The git surface (None when git is absent or the tree is not a work
+# tree — callers decide whether that is fatal).
+# ----------------------------------------------------------------------------
+
+fn git_out(gargs: list[str], root: str) -> str uses Proc {
+    let argv: list[str] = ["-C", root]
+    let mut i: int = 0
+    while i < gargs.len() {
+        argv.push(gargs.get(i))
+        i = i + 1
+    }
+    let r: HlRun = hl_spawn("git", argv)
+    if !r.spawned || r.code != 0 {
+        return ""
+    }
+    return r.out.trim()
+}
+
+fn git_head(root: str) -> str uses Proc {
+    return git_out(["rev-parse", "HEAD"], root)
+}
+
+fn git_user(root: str) -> str uses Proc {
+    let name: str = git_out(["config", "user.name"], root)
+    if name != "" {
+        return name
+    }
+    return "unknown"
+}
+
+fn git_dirty(root: str) -> bool uses Proc {
+    return git_out(["status", "--porcelain", "-uno"], root) != ""
+}
+# ----------------------------------------------------------------------------
+# sha shape checks.
+# ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# The digests and env fingerprint.
+# ----------------------------------------------------------------------------
+
+fn is_sha1(s: str) -> bool {
+    if s.len() != 40 {
+        return false
+    }
+    let mut i: int = 0
+    while i < s.len() {
+        if !is_hex_b(s.byte_at(i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn is_sha256(s: str) -> bool {
+    if s.len() != 64 {
+        return false
+    }
+    let mut i: int = 0
+    while i < s.len() {
+        if !is_hex_b(s.byte_at(i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+# ----------------------------------------------------------------------------
+# The machine fingerprint bits.
+# ----------------------------------------------------------------------------
+
+fn cpus_of() -> int uses Fs {
+    if !file_exists("/proc/cpuinfo") {
+        return 1
+    }
+    let text: str = read_file("/proc/cpuinfo")
+    let lines: list[str] = text.split("\n")
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).starts_with("processor") {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    if n == 0 {
+        return 1
+    }
+    return n
+}
+
+# python_of() — the interpreter version the bench runner rides (the .py
+# wrote sys.version_info; the instrument chain still runs it).
+fn python_of() -> str uses Proc {
+    let r: HlRun = hl_spawn("python3", ["-c",
+    "import sys; print('%d.%d.%d' % sys.version_info[:3])"])
+    if r.code != 0 {
+        return "0.0.0"
+    }
+    let t: str = r.out.trim()
+    if t == "" {
+        return "0.0.0"
+    }
+    return t
+}
+
+fn cc_line() -> str uses Proc {
+    let cc: str = "gcc"
+    if env_has("CC") {
+        let v: str = env_get("CC")
+        if v != "" {
+            let r: HlRun = hl_spawn(v, ["--version"])
+            if r.code == 0 && r.out != "" {
+                return first_line_of(r.out)
+            }
+            return v
+        }
+    }
+    let r: HlRun = hl_spawn(cc, ["--version"])
+    if r.code == 0 && r.out != "" {
+        return first_line_of(r.out)
+    }
+    return cc
+}
+fn first_line_of(text: str) -> str {
+    let lines: list[str] = text.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let t: str = lines.get(i).trim()
+        if t != "" {
+            return t
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn last_line_of(text: str) -> str {
+    let t: str = text.trim()
+    if t == "" {
+        return ""
+    }
+    let lines: list[str] = t.split("\n")
+    return lines.get(lines.len() - 1)
+}
+fn utc_now() -> str uses Clock {
+    return rfc3339_from_epoch_ms(system_time_now_ms())
+}
+
+fn floor_div(a: int, b: int) -> int {
+    let q: int = a / b
+    if(a % b != 0) && ((a < 0) != (b < 0)) {
+        return q - 1
+    }
+    return q
+}
+
+fn z2(n: int) -> str {
+    if n < 10 {
+        return "0" + n.to_str()
+    }
+    return n.to_str()
+}
+
+fn civil_from_days(z: int) -> list[int] {
+    let zz: int = z + 719468
+    let era: int = floor_div(zz, 146097)
+    let doe: int = zz - era * 146097
+    let yoe: int = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let yy: int = yoe + era * 400
+    let doy: int = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp: int = (5 * doy + 2) / 153
+    let dd: int = doy - (153 * mp + 2) / 5 + 1
+    let mut mm: int = mp + 3
+    if mm > 12 {
+        mm = mm - 12
+    }
+    let mut y2: int = yy
+    if mm <= 2 {
+        y2 = yy + 1
+    }
+    let out: list[int] = [y2, mm, dd]
+    return out
+}
+
+fn rfc3339_from_epoch_ms(ms: int) -> str {
+    let days: int = floor_div(ms, 86400000)
+    let rem: int = ms - days * 86400000
+    let ymd: list[int] = civil_from_days(days)
+    return ymd.get(0).to_str() + "-" + z2(ymd.get(1)) + "-"
+    + z2(ymd.get(2)) + "T" + z2(rem / 3600000) + ":"
+    + z2((rem / 60000) % 60) + ":" + z2((rem / 1000) % 60) + "Z"
+}
+# ----------------------------------------------------------------------------
+# The repo root (argv[0]'s grandparent when it looks like the repo).
+# ----------------------------------------------------------------------------
+
+fn looks_like_repo(p: str) -> bool uses Fs {
+    if !file_exists(path_join2(p, "bin")) {
+        return false
+    }
+    if !file_exists(path_join2(p, "src/hlc.hls")) {
+        return false
+    }
+    return true
+}
+
+fn repo_root(argv0: str) -> str uses Fs, Proc {
+    let cwd: str = cwd_get()
+    let a0: str = path_abs(argv0, cwd)
+    let p1: str = path_dirname(path_dirname(a0))
+    if looks_like_repo(p1) {
+        return p1
+    }
+    if looks_like_repo(cwd) {
+        return cwd
+    }
+    return p1
+}
+# ----------------------------------------------------------------------------
+# tmp_path + the suite + the compiler identity + the instrument.
+# ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# tmp_path(stem, n, suffix) — a dot-prefixed temp path under TMPDIR (or
+# /tmp), one per counter.
+# ----------------------------------------------------------------------------
+
+fn tmp_path(stem: str, n: int, suffix: str) -> str uses Fs, Proc {
+    let base: str = "/tmp"
+    if env_has("TMPDIR") {
+        let t: str = env_get("TMPDIR")
+        if t != "" {
+            let r: HlRun = hl_spawn("sh", ["-c", "test -w '" + t + "'"])
+            if r.code == 0 {
+                return path_join2(t, "." + stem + "-" + n.to_str()
+                + suffix)
+            }
+        }
+    }
+    return path_join2(base, "." + stem + "-" + n.to_str() + suffix)
+}
+
+# ----------------------------------------------------------------------------
+# The suite — the tracked workload directory and its digest (the mem
+# dashboard's law: every *.hls directly in the suite directory, sorted by
+# stem; the digest covers names AND bytes, so a rename or an edit
+# re-baselines).
+# ----------------------------------------------------------------------------
+
+struct Member {
+    name: str,
+    path: str
+}
+
+fn suite_members(root: str, suite: str) -> Result[list[Member], Err]
+uses Fs {
+    let d: str = path_join2(root, suite)
+    if !fs_is_dir(d) {
+        return Result.Err(err2("the suite directory " + suite
+        + " does not exist"))
+    }
+    let names: list[str] = fs_read_dir(d)
+    let out: list[Member] = []
+    let mut i: int = 0
+    while i < names.len() {
+        let n: str = names.get(i)
+        if n.len() > 4 && n.slice(n.len() - 4, n.len()) == ".hls" {
+            out.push(Member {
+                name: n.slice(0, n.len() - 4),
+                path: path_join2(d, n)
+            })
+        }
+        i = i + 1
+    }
+    if out.len() == 0 {
+        return Result.Err(err2("the suite directory " + suite
+        + " carries no .hls workloads"))
+    }
+    return Result.Ok(out)
+}
+
+fn members_digest(members: list[Member]) -> Result[str, Err] uses Fs {
+    let mut body: str = ""
+    let mut i: int = 0
+    while i < members.len() {
+        let m: Member = members.get(i)
+        if !file_exists(m.path) {
+            return Result.Err(err2("cannot read the workload " + m.path
+            + ": [Errno 2] No such file or directory: '" + m.path
+            + "'"))
+        }
+        body = body + m.name + chr(0) + read_file(m.path) + chr(0)
+        i = i + 1
+    }
+    return Result.Ok(sha256_hex(body))
+}
+
+# ----------------------------------------------------------------------------
+# The compiler identity — the two digests every record pins.
+# ----------------------------------------------------------------------------
+
+# compiler_source_digest(root) — sha256 over the sorted (relpath, bytes)
+# walk of the compiler source: src/hlc.hls and every src/hlc/*.hls
+# module. The identity of the CODE BEING TIMED.
+fn compiler_source_digest(root: str) -> Result[str, Err] uses Fs {
+    let entry: str = path_join2(root, hlc_source_entry())
+    if !file_exists(entry) {
+        return Result.Err(err2("the compiler entry " + hlc_source_entry()
+        + " does not exist under " + root))
+    }
+    let srcdir: str = path_join2(root, hlc_source_dir())
+    if !fs_is_dir(srcdir) {
+        return Result.Err(err2("the compiler module directory "
+        + hlc_source_dir() + " does not exist under " + root))
+    }
+    let names: list[str] = fs_read_dir(srcdir)
+    let mut body: str = hlc_source_entry() + chr(0) + read_file(entry)
+    + chr(0)
+    let mut i: int = 0
+    while i < names.len() {
+        let n: str = names.get(i)
+        if n.len() > 4 && n.slice(n.len() - 4, n.len()) == ".hls" {
+            let p: str = path_join2(srcdir, n)
+            if !file_exists(p) {
+                return Result.Err(err2("cannot read the compiler source "
+                + hlc_source_dir() + "/" + n))
+            }
+            body = body + hlc_source_dir() + "/" + n + chr(0)
+            + read_file(p) + chr(0)
+        }
+        i = i + 1
+    }
+    return Result.Ok(sha256_hex(body))
+}
+
+# compiler_binary_digest(root, instrument) — sha256 of the compiler
+# BINARY actually timed: bin/hlc for the native instrument (an untracked
+# build artifact, so the record pins its bytes itself), bin/hlboot for
+# stage0 (the driver the chain runs through).
+fn compiler_binary_digest(root: str, instrument: str) -> Result[str, Err]
+uses Fs {
+    let mut path: str = path_join2(root, native_compiler())
+    if instrument != "native" {
+        path = path_join2(root, boot_driver())
+    }
+    if !file_exists(path) {
+        let mut need: str = native_compiler()
+        if instrument != "native" {
+            need = boot_driver()
+        }
+        return Result.Err(err2("the " + instrument + " instrument needs "
+        + need + " — run `make bootstrap` first"))
+    }
+    return Result.Ok(sha256_hex(read_file(path)))
+}
+
+# ----------------------------------------------------------------------------
+# The instrument — compile one workload once, timed (wall milliseconds).
+# ----------------------------------------------------------------------------
+
+# round_ms3(ns) — the .py's round(elapsed_ms, 3) over a nanosecond delta.
+fn round_ms3(ns: int) -> float {
+    let ms: float = ns.to_float() / 1000000.0
+    let scaled: float = ms * 1000.0
+    let mut r: float = scaled - (scaled % 1.0)
+    if scaled - r >= 0.5 {
+        r = r + 1.0
+    }
+    return r / 1000.0
+}
+
+# compile_once(root, instrument, workload, out_c) — one full HLS-to-C
+# compile through the chosen instrument, wall milliseconds. A compile
+# that does not exit 0 is a named refusal — the suite compiles green or
+# the record does not exist (a dashboard over half a suite is a lie).
+# The C output is thrown away: the artifact of a compile-time record is
+# the time, not the code.
+fn compile_once(root: str, instrument: str, workload: str, out_c: str)
+-> Result[float, Err] uses Proc, Clock {
+    let mut prog: str = path_join2(root, native_compiler())
+    let mut cargs: list[str] = [path_abs(workload, cwd_get()), out_c]
+    if instrument != "native" {
+        prog = path_join2(root, boot_driver())
+        cargs = [path_join2(root, hlc_source_entry()),
+        path_abs(workload, cwd_get()), out_c]
+    }
+    let t0: int = instant_now_ns()
+    let r: HlRun = hl_spawn(prog, cargs)
+    let elapsed: float = round_ms3(instant_now_ns() - t0)
+    if !r.spawned || r.code != 0 {
+        let mut detail: str = last_line_of(r.err)
+        if detail == "" {
+            detail = last_line_of(r.out)
+        }
+        if detail == "" {
+            detail = "(no output)"
+        }
+        return Result.Err(err1("the compile of " + path_basename(workload)
+        + " failed (" + instrument + ", exit " + r.code.to_str()
+        + "): " + detail + " — file a bug, not a record"))
+    }
+    return Result.Ok(elapsed)
+}
+
+# measure_suite(root, instrument, members, samples, warmup, grep) — the
+# real measurement: for every workload, `warmup` untimed compiles (page
+# cache, dynamic loader, interpreter warm path — the first run of a
+# binary is not its steady state), then `samples` timed compiles whose
+# milliseconds are the ledger's distribution.
+fn measure_suite(root: str, instrument: str, members: list[Member],
+samples: int, warmup: int, grep: str, counter: int)
+-> Result[JsonValue, Err] uses Fs, Proc, Clock {
+    let wl_keys: list[str] = []
+    let wl_vals: list[JsonValue] = []
+    let mut mi: int = 0
+    while mi < members.len() {
+        let m: Member = members.get(mi)
+        mi = mi + 1
+        if grep != "" && !m.name.contains(grep) {
+            continue
+        }
+        let tmp: str = tmp_path("hlctime-out", counter, ".c")
+        let mut w: int = 0
+        while w < warmup {
+            let ur: Result[float, Err] = compile_once(root, instrument,
+            m.path, tmp)
+            if result_is_err(ur) {
+                proc_exec("rm -f '" + tmp + "'")
+                return Result.Err(result_err_or(ur, err1("")))
+            }
+            w = w + 1
+        }
+        let ms_vals: list[JsonValue] = []
+        let ms_list: list[float] = []
+        let mut si: int = 0
+        while si < samples {
+            let mr: Result[float, Err] = compile_once(root, instrument,
+            m.path, tmp)
+            if result_is_err(mr) {
+                proc_exec("rm -f '" + tmp + "'")
+                return Result.Err(result_err_or(mr, err1("")))
+            }
+            let ms: float = result_unwrap(mr)
+            ms_vals.push(json_float(ms))
+            ms_list.push(ms)
+            si = si + 1
+        }
+        proc_exec("rm -f '" + tmp + "'")
+        wl_keys.push(m.name)
+        wl_vals.push(jobject(["samples_ms", "median_ms", "samples_count"],
+        [jarr(ms_vals), json_float(median_of(ms_list)),
+        json_int(ms_list.len())]))
+    }
+    if wl_keys.len() == 0 {
+        return Result.Err(err2("--grep " + py_repr_str(grep)
+        + " matched no workload of the suite"))
+    }
+    return Result.Ok(jobject(wl_keys, wl_vals))
+}
+
+# env_fingerprint(root, instrument) — the .py's: python + cpus, plus the
+# cc version line on the stage0 instrument (the chain's driver rides the
+# toolchain that built it).
+fn env_fingerprint(root: str, instrument: str) -> JsonValue uses Fs, Proc {
+    let mut keys: list[str] = ["python", "cpus"]
+    let mut vals: list[JsonValue] = [json_str(python_of()),
+    json_int(cpus_of())]
+    if instrument == "stage0" {
+        keys.push("cc")
+        vals.push(json_str(cc_line()))
+    }
+    return jobject(keys, vals)
+}
+
+# ----------------------------------------------------------------------------
+# The ledger.
+# ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# The ledger — one JSON object per line, append-only.
+# ----------------------------------------------------------------------------
+
+struct Entry {
+    v: JsonValue,
+    line: int
+}
+
+fn load_history(path: str) -> Result[list[Entry], Err] uses Fs {
+    if !file_exists(path) {
+        return Result.Err(err2("the history ledger " + path
+        + " does not exist yet (record something first)"))
+    }
+    let entries: list[Entry] = []
+    let text: str = read_file(path)
+    let lines: list[str] = text.split("\n")
+    let mut lineno: int = 0
+    let mut i: int = 0
+    while i < lines.len() {
+        let ln: str = lines.get(i)
+        i = i + 1
+        lineno = lineno + 1
+        let t: str = strip_ws(ln)
+        if t == "" {
+            continue
+        }
+        let rr: Result[JsonValue, str] = json_parse_result(t)
+        if result_is_err(rr) {
+            return Result.Err(err1("history line " + lineno.to_str()
+            + " is corrupt (" + result_err_or(rr, "parse error")
+            + ") — the ledger is append-only; fix or remove the "
+            + "line by hand"))
+        }
+        let obj: JsonValue = result_unwrap(rr)
+        if !json_is_object(obj) || !json_object_has(obj, "type") {
+            return Result.Err(err1("history line " + lineno.to_str()
+            + " carries no type"))
+        }
+        let typ: str = jstr_of(obj, "type")
+        if typ == "record" {
+            let vr: Result[bool, Err] = validate_record(obj, "history "
+            + "line " + lineno.to_str())
+            if result_is_err(vr) {
+                return Result.Err(result_err_or(vr, err1("")))
+            }
+        } else if typ == "sanction" {
+            let vr2: Result[bool, Err] = validate_sanction(obj, "history "
+            + "line " + lineno.to_str())
+            if result_is_err(vr2) {
+                return Result.Err(result_err_or(vr2, err1("")))
+            }
+        } else {
+            return Result.Err(err1("history line " + lineno.to_str()
+            + " has unknown type " + py_repr_str(typ)))
+        }
+        entries.push(Entry {
+            v: obj, line: lineno
+        })
+    }
+    return Result.Ok(entries)
+}
+
+# workload_names_sorted(rec) — the record's workloads, sorted.
+fn workload_names_sorted(rec: JsonValue) -> list[str] {
+    let w: JsonValue = jget(rec, "workloads")
+    let names: list[str] = []
+    if json_is_object(w) {
+        let mut i: int = 0
+        while i < w.obj_keys.len() {
+            names.push(w.obj_keys.get(i))
+            i = i + 1
+        }
+    }
+    return sort_strs(names)
+}
+
+# samples_ms_of(rec, name) — one workload's samples_ms, as floats.
+fn samples_ms_of(rec: JsonValue, name: str) -> list[float] {
+    let out: list[float] = []
+    let w: JsonValue = json_object_get(jget(rec, "workloads"), name)
+    if !json_is_object(w) {
+        return out
+    }
+    let xs: JsonValue = jget(w, "samples_ms")
+    if !json_is_array(xs) {
+        return out
+    }
+    let mut i: int = 0
+    while i < xs.arr.len() {
+        let v: JsonValue = xs.arr.get(i)
+        if json_is_int(v) {
+            out.push(json_int_value(v).to_float())
+        } else if json_is_float(v) {
+            out.push(json_float_value(v))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn validate_record(rec: JsonValue, place: str) -> Result[bool, Err] {
+    let commit: str = jstr_of(rec, "commit")
+    if commit == "" || !is_sha1(commit) {
+        return Result.Err(err1(place + ": a record without a 40-hex "
+        + "commit pin is not a per-commit record"))
+    }
+    let instrument: str = jstr_of(rec, "instrument")
+    if instrument != "stage0" && instrument != "native" {
+        return Result.Err(err1(place + ": instrument "
+        + py_repr_str(instrument)
+        + " is not one of ['stage0', 'native']"))
+    }
+    let sd: str = jstr_of(rec, "suite_digest")
+    if sd == "" || !is_sha256(sd) {
+        return Result.Err(err1(place + ": a record without a suite "
+        + "digest cannot be compared"))
+    }
+    let srcd: str = jstr_of(rec, "source_digest")
+    if srcd == "" || !is_sha256(srcd) {
+        return Result.Err(err1(place + ": a record without a compiler "
+        + "source digest does not name the compiler it timed"))
+    }
+    let cd: str = jstr_of(rec, "compiler_digest")
+    if cd == "" || !is_sha256(cd) {
+        return Result.Err(err1(place + ": a record without a compiler "
+        + "binary digest does not name the binary it timed"))
+    }
+    let wls: JsonValue = jget(rec, "workloads")
+    if !json_is_object(wls) || wls.obj_keys.len() == 0 {
+        return Result.Err(err1(place + ": a record with no workloads "
+        + "measured nothing"))
+    }
+    let names: list[str] = workload_names_sorted(rec)
+    let mut i: int = 0
+    while i < names.len() {
+        let name: str = names.get(i)
+        let xs: list[float] = samples_ms_of(rec, name)
+        if xs.len() < min_samples() {
+            return Result.Err(err1(place + ": workload " + name
+            + " carries fewer than " + min_samples().to_str()
+            + " samples — a median no sample supports is not a "
+            + "measurement"))
+        }
+        let mut j: int = 0
+        while j < xs.len() {
+            if !(xs.get(j) > 0.0) {
+                return Result.Err(err1(place + ": workload " + name
+                + " has non-positive compile times"))
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return Result.Ok(true)
+}
+
+fn validate_sanction(s: JsonValue, place: str) -> Result[bool, Err] {
+    if jstr_of(s, "workload") == "" {
+        return Result.Err(err1(place + ": a sanction without a workload"))
+    }
+    if jstr_of(s, "reason") == "" {
+        return Result.Err(err1(place + ": a sanction without a written "
+        + "reason is not a sanction"))
+    }
+    return Result.Ok(true)
+}
+
+# append_entry(path, entry) — mkdir -p the parent, then append ONE
+# compact line (the history is JSONL; pretty-printing would shatter an
+# entry across lines and corrupt every later parse).
+fn append_entry(path: str, entry: JsonValue) -> Result[bool, Err]
+uses Fs, Proc {
+    let d: str = path_dirname(path)
+    if d != "" && d != "." {
+        proc_exec("mkdir -p '" + shell_quote(d) + "'")
+    }
+    let line: str = compact_json(entry) + "\n"
+    let mut body: str = ""
+    if file_exists(path) {
+        body = read_file(path)
+    }
+    write_file(path, body + line)
+    return Result.Ok(true)
+}
+
+fn records_of(entries: list[Entry]) -> list[Entry] {
+    let out: list[Entry] = []
+    let mut i: int = 0
+    while i < entries.len() {
+        if jstr_of(entries.get(i).v, "type") == "record" {
+            out.push(entries.get(i))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn sanctions_of(entries: list[Entry]) -> list[Entry] {
+    let out: list[Entry] = []
+    let mut i: int = 0
+    while i < entries.len() {
+        if jstr_of(entries.get(i).v, "type") == "sanction" {
+            out.push(entries.get(i))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# shell_quote(s) — single-quote neutraliser for the one-liners above.
+fn shell_quote(s: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c == 39 {
+            out = out + "'\\''"
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# The CI import path — a machine report is the measuring machine's word.
+# ----------------------------------------------------------------------------
+
+fn read_report(path: str, place: str) -> Result[JsonValue, Err] uses Fs {
+    if !file_exists(path) {
+        return Result.Err(err2("cannot read the report: [Errno 2] No "
+        + "such file or directory: '" + path + "'"))
+    }
+    let rr: Result[JsonValue, str] = json_parse_result(read_file(path))
+    if result_is_err(rr) {
+        return Result.Err(err2("the report is not valid JSON: "
+        + result_err_or(rr, "parse error")))
+    }
+    let report: JsonValue = result_unwrap(rr)
+    if !json_is_object(report) || jstr_of(report, "tool") != tool_name() {
+        let mut toolv: str = "dict"
+        if json_is_object(report) {
+            let t: JsonValue = jget(report, "tool")
+            if json_is_str(t) {
+                toolv = py_repr_str(json_str_value(t))
+            } else if json_is_null(t) {
+                toolv = "None"
+            }
+        }
+        return Result.Err(err2(place + ": the report is not an "
+        + "hls-ctime report (tool=" + toolv + ")"))
+    }
+    let instrument: str = jstr_of(report, "instrument")
+    if instrument != "stage0" && instrument != "native" {
+        return Result.Err(err2(place + ": report instrument "
+        + py_repr_str(instrument)
+        + " is not one of ['stage0', 'native']"))
+    }
+    let keys: list[str] = ["suite_digest", "source_digest",
+    "compiler_digest"]
+    let mut k: int = 0
+    while k < keys.len() {
+        let key: str = keys.get(k)
+        let v: str = jstr_of(report, key)
+        if v == "" || !is_sha256(v) {
+            return Result.Err(err2(place + ": the report carries no "
+            + "valid " + key + " — a machine report must pin what "
+            + "it measured"))
+        }
+        k = k + 1
+    }
+    return Result.Ok(report)
+}
+
+# stale_binary_check(entries, new_rec) — THE STALE-BINARY LAW, the
+# compile-time-specific floor. A native record whose compiler digest was
+# filed earlier against a DIFFERENT source digest is a lie: the same
+# bin/hlc bytes cannot be the build of two different compiler sources.
+# Doc-only commits leave the source digest unchanged, so an identical
+# binary is expected there — the law refuses only the contradiction.
+fn stale_binary_check(entries: list[Entry], new_rec: JsonValue)
+-> Result[bool, Err] {
+    if jstr_of(new_rec, "instrument") != "native" {
+        return Result.Ok(true)
+    }
+    let recs: list[Entry] = records_of(entries)
+    let mut i: int = 0
+    while i < recs.len() {
+        let r: JsonValue = recs.get(i).v
+        i = i + 1
+        if jstr_of(r, "instrument") != "native" {
+            continue
+        }
+        if jstr_of(r, "compiler_digest")
+        == jstr_of(new_rec, "compiler_digest")
+        && jstr_of(r, "source_digest")
+        != jstr_of(new_rec, "source_digest") {
+            return Result.Err(err1("the stale-binary law: bin/hlc "
+            + "(sha256 " + take_s(jstr_of(new_rec, "compiler_digest"), 10)
+            + ") was already filed at commit "
+            + take_s(jstr_of(r, "commit"), 10)
+            + " against a different compiler source ("
+            + take_s(jstr_of(r, "source_digest"), 10) + " vs "
+            + take_s(jstr_of(new_rec, "source_digest"), 10)
+            + ") — the binary was not rebuilt for this commit; "
+            + "run `make bootstrap`, then record"))
+        }
+    }
+    return Result.Ok(true)
+}
+
+# ----------------------------------------------------------------------------
+# The classification + verdict laws.
+# ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# The classification law — Stage 124's, verbatim: Welch p for
+# significance, the seeded bootstrap CI of the median change against the
+# noise band. The seed is derived from the workload key, so the SAME
+# pair of sample sets always classifies the SAME way.
+# ----------------------------------------------------------------------------
+
+struct ClassOut {
+    class: str,
+    p: float,
+    point_pct: float,
+    ci_lo: float,
+    ci_hi: float,
+    cur_med: float,
+    base_med: float
+}
+
+fn classify(cur_est: list[float], base_est: list[float],
+workload_key: str, noise_pct: float) -> Result[ClassOut, Err] {
+    if cur_est.len() < min_samples() || base_est.len() < min_samples() {
+        return Result.Err(err1("classification needs >= "
+        + min_samples().to_str() + " samples per side (workload "
+        + workload_key + ")"))
+    }
+    let p: float = welch_p(cur_est, base_est)
+    let significant: bool = p < alpha()
+    let cur_med: float = median_of(cur_est)
+    let base_med: float = median_of(base_est)
+    if base_med <= 0.0 {
+        return Result.Err(err1("baseline median is not positive "
+        + "(workload " + workload_key + ")"))
+    }
+    let point: float = (cur_med - base_med) / base_med * 100.0
+    let mut st: int = rng_seed_of(workload_key)
+    let nb: int = base_est.len()
+    let diffs: list[float] = []
+    let mut bi: int = 0
+    while bi < bootstrap_b() {
+        # resample both sides with replacement, medians, percent of base
+        let cs: list[float] = []
+        let mut ci: int = 0
+        while ci < cur_est.len() {
+            st = xs_next(st)
+            cs.push(cur_est.get(xs_pick(st, cur_est.len())))
+            ci = ci + 1
+        }
+        let bs: list[float] = []
+        let mut di: int = 0
+        while di < nb {
+            st = xs_next(st)
+            bs.push(base_est.get(xs_pick(st, nb)))
+            di = di + 1
+        }
+        diffs.push((median_of(cs) - median_of(bs)) / base_med * 100.0)
+        bi = bi + 1
+    }
+    let sorted: list[float] = sort_floats(diffs)
+    let lo: float = quantile_of(sorted, 0.025)
+    let hi: float = quantile_of(sorted, 0.975)
+    let mut klass: str = "within-noise"
+    if !significant {
+        klass = "no-change"
+    } else if lo > noise_pct {
+        klass = "regressed"
+    } else if hi < 0.0 - noise_pct {
+        klass = "improved"
+    }
+    return Result.Ok(ClassOut {
+        class: klass, p: p, point_pct: point,
+        ci_lo: lo, ci_hi: hi,
+        cur_med: cur_med, base_med: base_med
+    })
+}
+
+# ----------------------------------------------------------------------------
+# pick_baseline + verdict_of — the instrument law and the full machine
+# verdict.
+# ----------------------------------------------------------------------------
+
+fn pick_baseline(new_rec: Entry, entries: list[Entry], want: str)
+-> Result[Entry, Err] {
+    let recs: list[Entry] = records_of(entries)
+    let mut idx: int = 0
+    let mut i: int = 0
+    while i < recs.len() {
+        if recs.get(i).line == new_rec.line {
+            idx = i
+        }
+        i = i + 1
+    }
+    if want != "" {
+        let cands: list[Entry] = []
+        i = 0
+        while i < recs.len() {
+            if jstr_of(recs.get(i).v, "commit").starts_with(want) {
+                cands.push(recs.get(i))
+            }
+            i = i + 1
+        }
+        if cands.len() == 0 {
+            return Result.Err(err2("no record carries commit prefix "
+            + py_repr_str(want)))
+        }
+        if cands.len() > 1 {
+            return Result.Err(err2("commit prefix " + py_repr_str(want)
+            + " is ambiguous (" + cands.len().to_str() + " records)"))
+        }
+        let base0: Entry = cands.get(0)
+        if base0.line == new_rec.line {
+            return Result.Err(err2("the baseline is the record itself "
+            + "— a record does not regress against itself"))
+        }
+        return check_baseline(base0, new_rec)
+    }
+    let earlier: list[Entry] = []
+    i = 0
+    while i < idx {
+        let r: Entry = recs.get(i)
+        if jstr_of(r.v, "instrument") == jstr_of(new_rec.v, "instrument")
+        && jstr_of(r.v, "suite_digest")
+        == jstr_of(new_rec.v, "suite_digest") {
+            earlier.push(r)
+        }
+        i = i + 1
+    }
+    if earlier.len() == 0 {
+        return Result.Err(err2("no earlier record of the same instrument "
+        + "to compare against (instrument="
+        + jstr_of(new_rec.v, "instrument") + " suite_digest="
+        + take_s(jstr_of(new_rec.v, "suite_digest"), 12)
+        + ") — record one first"))
+    }
+    return check_baseline(earlier.get(earlier.len() - 1), new_rec)
+}
+
+# check_baseline(base, new_rec) — the instrument law, for BOTH paths.
+fn check_baseline(base: Entry, new_rec: Entry) -> Result[Entry, Err] {
+    if jstr_of(base.v, "instrument")
+    != jstr_of(new_rec.v, "instrument") {
+        return Result.Err(err1("different instruments: the baseline is "
+        + jstr_of(base.v, "instrument") + ", the record is "
+        + jstr_of(new_rec.v, "instrument")
+        + " — the bootstrap chain and the self-hosted compiler are "
+        + "different machines"))
+    }
+    if jstr_of(base.v, "suite_digest")
+    != jstr_of(new_rec.v, "suite_digest") {
+        return Result.Err(err1("the suite changed since the baseline "
+        + "(digest " + take_s(jstr_of(base.v, "suite_digest"), 12)
+        + " vs " + take_s(jstr_of(new_rec.v, "suite_digest"), 12)
+        + ") — re-baseline, do not compare"))
+    }
+    return Result.Ok(base)
+}
+
+# active_sanction(entries, name) — the FIRST sanction naming the
+# workload.
+fn active_sanction(entries: list[Entry], name: str) -> Option[Entry] {
+    let sancs: list[Entry] = sanctions_of(entries)
+    let mut i: int = 0
+    while i < sancs.len() {
+        if jstr_of(sancs.get(i).v, "workload") == name {
+            return Option.Some(sancs.get(i))
+        }
+        i = i + 1
+    }
+    return Option.None
+}
+
+# obj_with(v, key, val) — a copy of the object with one key set.
+fn obj_with(v: JsonValue, key: str, val: JsonValue) -> JsonValue {
+    let keys: list[str] = []
+    let vals: list[JsonValue] = []
+    let mut i: int = 0
+    let mut replaced: bool = false
+    while i < v.obj_keys.len() {
+        if v.obj_keys.get(i) == key {
+            keys.push(key)
+            vals.push(val)
+            replaced = true
+        } else {
+            keys.push(v.obj_keys.get(i))
+            vals.push(v.obj_vals.get(i))
+        }
+        i = i + 1
+    }
+    if !replaced {
+        keys.push(key)
+        vals.push(val)
+    }
+    return jobject(keys, vals)
+}
+
+fn verdict_of(entries: list[Entry], baseline: str, noise_pct: float)
+-> Result[JsonValue, Err] {
+    let recs: list[Entry] = records_of(entries)
+    if recs.len() == 0 {
+        return Result.Err(err2("the ledger carries no records — nothing "
+        + "to gate"))
+    }
+    let new_rec: Entry = recs.get(recs.len() - 1)
+    let base_r: Result[Entry, Err] = pick_baseline(new_rec, entries,
+    baseline)
+    if result_is_err(base_r) {
+        return Result.Err(result_err_or(base_r, err1("")))
+    }
+    let base_rec: Entry = result_unwrap(base_r)
+
+    let new_names: list[str] = workload_names_sorted(new_rec.v)
+    let base_names: list[str] = workload_names_sorted(base_rec.v)
+    let all_names: list[str] = []
+    let mut i: int = 0
+    while i < new_names.len() {
+        all_names.push(new_names.get(i))
+        i = i + 1
+    }
+    i = 0
+    while i < base_names.len() {
+        let n: str = base_names.get(i)
+        let mut found: bool = false
+        let mut j: int = 0
+        while j < all_names.len() {
+            if all_names.get(j) == n {
+                found = true
+            }
+            j = j + 1
+        }
+        if !found {
+            all_names.push(n)
+        }
+        i = i + 1
+    }
+    let names: list[str] = sort_strs(all_names)
+
+    let rows: list[JsonValue] = []
+    let mut ri: int = 0
+    while ri < names.len() {
+        let name: str = names.get(ri)
+        let in_new: bool = json_object_has(jget(new_rec.v, "workloads"),
+        name)
+        let in_base: bool = json_object_has(
+        jget(base_rec.v, "workloads"), name)
+        let mut row: JsonValue = json_null()
+        if in_new && in_base {
+            let cr: Result[ClassOut, Err] = classify(
+            samples_ms_of(new_rec.v, name),
+            samples_ms_of(base_rec.v, name), name, noise_pct)
+            if result_is_err(cr) {
+                return Result.Err(result_err_or(cr, err1("")))
+            }
+            let c: ClassOut = result_unwrap(cr)
+            let samples_count: JsonValue = jget(json_object_get(
+            jget(new_rec.v, "workloads"), name), "samples_count")
+            row = jobject(["workload", "class", "p", "point_pct",
+            "ci_pct", "cur_median_ms", "base_median_ms", "samples"],
+            [json_str(name), json_str(c.class), json_float(c.p),
+            json_float(c.point_pct),
+            jarr([json_float(c.ci_lo), json_float(c.ci_hi)]),
+            json_float(c.cur_med), json_float(c.base_med),
+            samples_count])
+        } else if in_new {
+            let w: JsonValue = json_object_get(
+            jget(new_rec.v, "workloads"), name)
+            let med: JsonValue = jget(w, "median_ms")
+            row = jobject(["workload", "class", "cur_median_ms"],
+            [json_str(name), json_str("new"), med])
+        } else {
+            row = jobject(["workload", "class"],
+            [json_str(name), json_str("vanished")])
+        }
+        let klass: str = jstr_of(row, "class")
+        if klass == "regressed" || klass == "vanished" {
+            let s: Option[Entry] = active_sanction(entries, name)
+            if option_is_some(s) {
+                let sv: JsonValue = option_unwrap(s).v
+                let sanc: JsonValue = jobject(["reason", "author",
+                "commit"],
+                [jget(sv, "reason"), jget(sv, "author"),
+                jget(sv, "commit")])
+                row = obj_with(row, "sanction", sanc)
+            }
+        }
+        rows.push(row)
+        ri = ri + 1
+    }
+
+    let sanctioned: list[str] = []
+    let unsanctioned: list[str] = []
+    let mut si: int = 0
+    while si < rows.len() {
+        let r: JsonValue = rows.get(si)
+        let klass: str = jstr_of(r, "class")
+        if klass == "regressed" || klass == "vanished" {
+            if json_is_object(jget(r, "sanction")) {
+                sanctioned.push(jstr_of(r, "workload"))
+            } else {
+                unsanctioned.push(jstr_of(r, "workload"))
+            }
+        }
+        si = si + 1
+    }
+    let mut verdict: str = "fail"
+    if unsanctioned.len() == 0 {
+        verdict = "pass"
+    }
+    let san_sorted: list[str] = sort_strs(sanctioned)
+    let uns_sorted: list[str] = sort_strs(unsanctioned)
+    let san_vals: list[JsonValue] = []
+    let mut si2: int = 0
+    while si2 < san_sorted.len() {
+        san_vals.push(json_str(san_sorted.get(si2)))
+        si2 = si2 + 1
+    }
+    let uns_vals: list[JsonValue] = []
+    let mut ui: int = 0
+    while ui < uns_sorted.len() {
+        uns_vals.push(json_str(uns_sorted.get(ui)))
+        ui = ui + 1
+    }
+    return Result.Ok(jobject(["tool", "version", "verdict", "record",
+    "baseline", "instrument", "suite", "noise_pct", "workloads",
+    "sanctioned", "unsanctioned"],
+    [json_str(tool_name()), json_str(tool_version()),
+    json_str(verdict), json_str(jstr_of(new_rec.v, "commit")),
+    json_str(jstr_of(base_rec.v, "commit")),
+    json_str(jstr_of(new_rec.v, "instrument")),
+    json_str(jstr_of(new_rec.v, "suite")),
+    json_float(noise_pct), jarr(rows), jarr(san_vals),
+    jarr(uns_vals)]))
+}
+
+# ----------------------------------------------------------------------------
+# The dashboard.
+# ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# The dashboard — the deterministic render of the ledger.
+# ----------------------------------------------------------------------------
+
+fn num_or(v: JsonValue, dflt: float) -> float {
+    if json_is_int(v) {
+        return json_int_value(v).to_float()
+    }
+    if json_is_float(v) {
+        return json_float_value(v)
+    }
+    return dflt
+}
+
+fn replace_all(s: str, from: str, to: str) -> str {
+    if from == "" || !s.contains(from) {
+        return s
+    }
+    let mut out: str = ""
+    let mut i: int = 0
+    let flen: int = from.len()
+    while i < s.len() {
+        if i + flen <= s.len() && s.slice(i, i + flen) == from {
+            out = out + to
+            i = i + flen
+        } else {
+            out = out + s.slice(i, i + 1)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn sparkline(medians: list[float]) -> str {
+    if medians.len() == 0 {
+        return ""
+    }
+    let mut lo: float = medians.get(0)
+    let mut hi: float = medians.get(0)
+    let mut i: int = 0
+    while i < medians.len() {
+        if medians.get(i) < lo {
+            lo = medians.get(i)
+        }
+        if medians.get(i) > hi {
+            hi = medians.get(i)
+        }
+        i = i + 1
+    }
+    if hi <= lo {
+        return repeat_str(spark_mid(), medians.len())
+    }
+    let span: float = hi - lo
+    let mut out: str = ""
+    i = 0
+    while i < medians.len() {
+        let v: float = medians.get(i)
+        let t: float = ((v - lo) * 14.0 + span) / (2.0 * span)
+        let band: int = (t - (t % 1.0)).to_int()
+        out = out + spark_bands().slice(band * 3, band * 3 + 3)
+        i = i + 1
+    }
+    return out
+}
+
+fn render_dashboard(entries: list[Entry], history_path: str, limit: int,
+stamp: str) -> Result[str, Err] uses Fs {
+    let recs: list[Entry] = records_of(entries)
+    if recs.len() == 0 {
+        return Result.Err(err2("the ledger carries no records — nothing "
+        + "to render"))
+    }
+    if !file_exists(history_path) {
+        return Result.Err(err2("cannot read the ledger: "
+        + history_path))
+    }
+    let digest: str = sha256_hex(read_file(history_path))
+    let new_rec: Entry = recs.get(recs.len() - 1)
+    let vr: Result[JsonValue, Err] = verdict_of(entries, "",
+    default_noise_pct())
+    let has_verdict: bool = result_is_ok(vr)
+    let mut verdict: JsonValue = json_null()
+    let mut base: Entry = new_rec
+    if has_verdict {
+        verdict = result_unwrap(vr)
+        base = result_unwrap(pick_baseline(new_rec, entries, ""))
+    }
+
+    let workload_names: list[str] = workload_names_sorted(new_rec.v)
+    let mut shown: list[Entry] = recs
+    if limit > 0 && recs.len() > limit {
+        shown = []
+        let mut i: int = recs.len() - limit
+        while i < recs.len() {
+            shown.push(recs.get(i))
+            i = i + 1
+        }
+    }
+
+    let lines: list[str] = []
+    lines.push("# HLS compile-time dashboard")
+    lines.push("")
+    lines.push("- Tool: " + tool_name() + " " + tool_version())
+    lines.push("- Ledger: `" + history_path + "` (sha256 `" + digest
+    + "`)")
+    lines.push("- Records: " + recs.len().to_str() + " (showing "
+    + shown.len().to_str() + ")")
+    lines.push("- Newest record: `" + jstr_of(new_rec.v, "commit") + "` ("
+    + workload_names.len().to_str() + " workloads, instrument "
+    + jstr_of(new_rec.v, "instrument") + ")")
+    lines.push("- Compiler source: `" + jstr_of(new_rec.v, "source_digest")
+    + "`")
+    lines.push("- Compiler binary: `"
+    + jstr_of(new_rec.v, "compiler_digest") + "`")
+    if has_verdict {
+        lines.push("- Baseline: `" + jstr_of(base.v, "commit") + "`")
+    } else {
+        lines.push("- Baseline: none (no earlier record of this "
+        + "instrument)")
+    }
+    if has_verdict {
+        lines.push("- Gate verdict: **" + jstr_of(verdict, "verdict")
+        + "**")
+        let uns: list[str] = []
+        let uns_arr: JsonValue = jget(verdict, "unsanctioned")
+        if json_is_array(uns_arr) {
+            let mut i: int = 0
+            while i < uns_arr.arr.len() {
+                uns.push(json_str_value(uns_arr.arr.get(i)))
+                i = i + 1
+            }
+        }
+        if uns.len() > 0 {
+            lines.push("- Unsanctioned: " + str_join(uns, ", "))
+        }
+    } else {
+        lines.push("- Gate verdict: n/a (no earlier record of this "
+        + "instrument to compare against)")
+    }
+    if stamp != "" {
+        lines.push("- Generated: " + stamp)
+    }
+    lines.push("")
+    lines.push("## Verdicts (newest record vs baseline)")
+    lines.push("")
+    if !has_verdict {
+        lines.push("No comparison yet: the newest record is the first of "
+        + "its instrument. Record twice and the verdict table fills.")
+    } else {
+        lines.push("| workload | base | now | change | 95% CI | p | "
+        + "class |")
+        lines.push("|---|---|---|---|---|---|---|")
+        let rows: JsonValue = jget(verdict, "workloads")
+        let mut i: int = 0
+        while i < rows.arr.len() {
+            let r: JsonValue = rows.arr.get(i)
+            let klass: str = jstr_of(r, "class")
+            let mut sanc_note: str = ""
+            if json_is_object(jget(r, "sanction")) {
+                sanc_note = " (sanctioned)"
+            }
+            if klass == "no-change" || klass == "within-noise"
+            || klass == "improved" || klass == "regressed" {
+                let ci: JsonValue = jget(r, "ci_pct")
+                let mut lo: float = 0.0
+                let mut hi: float = 0.0
+                if json_is_array(ci) && ci.arr.len() == 2 {
+                    lo = json_float_value(ci.arr.get(0))
+                    hi = json_float_value(ci.arr.get(1))
+                }
+                let mut pv: float = 0.0
+                if json_is_float(jget(r, "p")) {
+                    pv = json_float_value(jget(r, "p"))
+                }
+                lines.push("| " + jstr_of(r, "workload") + " | "
+                + fmt_ms(num_or(jget(r, "base_median_ms"), 0.0))
+                + " | "
+                + fmt_ms(num_or(jget(r, "cur_median_ms"), 0.0))
+                + " | " + fmt_pct(num_or(jget(r, "point_pct"), 0.0))
+                + " | [" + fmt_pct(lo) + " " + fmt_pct(hi) + "] | "
+                + fmt_fixed(pv, 4) + " | " + klass + sanc_note + " |")
+            } else if klass == "new" {
+                lines.push("| " + jstr_of(r, "workload") + " | — | "
+                + fmt_ms(num_or(jget(r, "cur_median_ms"), 0.0))
+                + " | — | — | — | new |")
+            } else {
+                lines.push("| " + jstr_of(r, "workload") + " | "
+                + fmt_ms(num_or(jget(r, "base_median_ms"), 0.0))
+                + " | — | — | — | — | vanished |")
+            }
+            i = i + 1
+        }
+    }
+    lines.push("")
+    lines.push("## Trends (median ms/compile across records, oldest to "
+    + "newest)")
+    lines.push("")
+    let head_cells: list[str] = []
+    let mut i2: int = 0
+    while i2 < shown.len() {
+        head_cells.push(take_s(jstr_of(shown.get(i2).v, "commit"), 7))
+        i2 = i2 + 1
+    }
+
+    lines.push("| workload | trend | " + str_join(head_cells, " | ")
+    + " |")
+    lines.push("|---|---|" + repeat_str("---|", shown.len()))
+    let mut ni: int = 0
+    while ni < workload_names.len() {
+        let name: str = workload_names.get(ni)
+        let series: list[float] = []
+        let known_flags: list[bool] = []
+        let mut i3: int = 0
+        while i3 < shown.len() {
+            let w: JsonValue = json_object_get(
+            jget(shown.get(i3).v, "workloads"), name)
+            if json_is_object(w) {
+                let m: JsonValue = jget(w, "median_ms")
+                if json_is_int(m) || json_is_float(m) {
+                    known_flags.push(true)
+                    series.push(num_or(m, 0.0))
+                } else {
+                    known_flags.push(false)
+                    series.push(0.0)
+                }
+            } else {
+                known_flags.push(false)
+                series.push(0.0)
+            }
+            i3 = i3 + 1
+        }
+        let known: list[float] = []
+        let mut ki: int = 0
+        while ki < series.len() {
+            if known_flags.get(ki) {
+                known.push(series.get(ki))
+            }
+            ki = ki + 1
+        }
+        let mut spark: str = "-"
+        if known.len() > 0 {
+            spark = sparkline(known)
+        }
+        let cells: list[str] = []
+        let mut ci2: int = 0
+        while ci2 < series.len() {
+            if known_flags.get(ci2) {
+                cells.push(fmt_ms(series.get(ci2)))
+            } else {
+                cells.push("—")
+            }
+            ci2 = ci2 + 1
+        }
+        lines.push("| " + name + " | " + spark + " | "
+        + str_join(cells, " | ") + " |")
+        ni = ni + 1
+    }
+    lines.push("")
+    lines.push("## Sanctions")
+    lines.push("")
+    let sancs: list[Entry] = sanctions_of(entries)
+    if sancs.len() == 0 {
+        lines.push("None. Every compile-time regression the ledger has "
+        + "seen was answered, not excused.")
+    } else {
+        lines.push("| workload | author | commit | reason |")
+        lines.push("|---|---|---|---|")
+        let seen_keys: list[str] = []
+        let mut si: int = 0
+        while si < sancs.len() {
+            let sv: JsonValue = sancs.get(si).v
+            let key: str = jstr_of(sv, "workload") + "\n"
+            + jstr_of(sv, "reason")
+            let mut dup: bool = false
+            let mut di: int = 0
+            while di < seen_keys.len() {
+                if seen_keys.get(di) == key {
+                    dup = true
+                }
+                di = di + 1
+            }
+            if !dup {
+                seen_keys.push(key)
+                let mut author: str = jstr_of(sv, "author")
+                if author == "" {
+                    author = "unknown"
+                }
+                let mut commit_cell: str = "—"
+                let cv: JsonValue = jget(sv, "commit")
+                if json_is_str(cv) && json_str_value(cv) != "" {
+                    commit_cell = "`" + take_s(json_str_value(cv), 10)
+                    + "`"
+                }
+                let reason: str = replace_all(jstr_of(sv, "reason"), "|",
+                "\\|")
+                lines.push("| " + jstr_of(sv, "workload") + " | "
+                + author + " | " + commit_cell + " | " + reason
+                + " |")
+            }
+            si = si + 1
+        }
+    }
+    lines.push("")
+    lines.push("## Reading this dashboard")
+    lines.push("")
+    lines.push("- A record is one compile-time measurement pinned to one "
+    + "clean commit: the tool compiled every workload of the "
+    + "tracked suite through one instrument and kept the samples. "
+    + "The ledger is append-only and this document is a pure render "
+    + "of it (the sha256 above pins the bytes).")
+    lines.push("- The instrument is the compiler itself. `stage0` is the "
+    + "bootstrap chain (bin/hlboot running src/hlc.hls); `native` "
+    + "is bin/hlc. They time the same quantity through different "
+    + "machines and are never compared to each other.")
+    lines.push("- Every record pins the compiler's identity: the sha256 "
+    + "of the compiler source and of the binary timed. A native "
+    + "record whose binary was already filed against a different "
+    + "source is refused at record time (the stale-binary law) — "
+    + "bin/hlc must be rebuilt for the commit it measures.")
+    lines.push("- Classes come from Stage 124's law: Welch p < 0.05 for "
+    + "significance, the seeded bootstrap CI of the median change "
+    + "against the 10% noise band. Non-significant changes are "
+    + "no-change; significant changes inside the band are "
+    + "within-noise.")
+    lines.push("- regressed or vanished workloads fail the gate unless a "
+    + "sanction names them. A sanction is a written excuse with an "
+    + "author — the register above is the audit trail.")
+    lines.push("")
+    return Result.Ok(str_join(lines, "\n"))
+}
+
+# ----------------------------------------------------------------------------
+# The CLI.
+# ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# The CLI — the .py's argparse surface (usage errors exit 2).
+# ----------------------------------------------------------------------------
+
+struct Cli {
+    cmd: str,
+    root: str,
+    suite: str,
+    instrument: str,
+    grep: str,
+    samples: int,
+    warmup: int,
+    from_report: str,
+    commit: str,
+    note: str,
+    allow_dirty: bool,
+    stamp: bool,
+    history: str,
+    json_out: str,
+    workload: str,
+    reason: str,
+    author: str,
+    baseline: str,
+    threshold: float,
+    quiet: bool,
+    out: str,
+    limit: int,
+    workload_filter: str,
+    json_flag: bool
+}
+
+fn usage_error() -> int uses IO {
+    eprintln("usage: hls-ctime {record|sanction|gate|dashboard|history} "
+    + "[options]")
+    return 2
+}
+
+fn need_int(val: str, flag: str) -> Result[int, Err] {
+    let v: Option[int] = parse_int_opt(val)
+    if option_is_none(v) {
+        return Result.Err(err2("invalid int value: '" + val + "' ("
+        + flag + ")"))
+    }
+    return Result.Ok(option_unwrap(v))
+}
+
+fn need_float(val: str, flag: str) -> Result[float, Err] {
+    let v: Option[float] = parse_float_opt(val)
+    if option_is_none(v) {
+        return Result.Err(err2("invalid float value: '" + val + "' ("
+        + flag + ")"))
+    }
+    return Result.Ok(option_unwrap(v))
+}
+
+fn parse_cli(argv: list[str]) -> Result[Cli, Err] {
+    if argv.len() < 2 {
+        return Result.Err(err2("usage"))
+    }
+    let c: Cli = Cli {
+        cmd: argv.get(1),
+        root: "",
+        suite: default_suite(),
+        instrument: "stage0",
+        grep: "",
+        samples: default_samples(),
+        warmup: default_warmup(),
+        from_report: "",
+        commit: "",
+        note: "",
+        allow_dirty: false,
+        stamp: false,
+        history: "",
+        json_out: "",
+        workload: "",
+        reason: "",
+        author: "",
+        baseline: "",
+        threshold: default_noise_pct(),
+        quiet: false,
+        out: "",
+        limit: default_dash_limit(),
+        workload_filter: "",
+        json_flag: false
+    }
+    let known: list[str] = ["record", "sanction", "gate", "dashboard",
+    "history"]
+    let mut is_known: bool = false
+    let mut k: int = 0
+    while k < known.len() {
+        if known.get(k) == c.cmd {
+            is_known = true
+        }
+        k = k + 1
+    }
+    if !is_known {
+        return Result.Err(err2("usage"))
+    }
+    let mut i: int = 2
+    while i < argv.len() {
+        let a: str = argv.get(i)
+        if a == "--json" {
+            # history's --json is a flag; every other subcommand's is a
+            # path (the .py's argparse shapes).
+            if c.cmd == "history" {
+                c.json_flag = true
+                i = i + 1
+            } else {
+                if i + 1 >= argv.len() {
+                    return Result.Err(err2("usage: --json expects a "
+                    + "value"))
+                }
+                c.json_out = argv.get(i + 1)
+                i = i + 2
+            }
+        } else if a == "--root" || a == "--suite" || a == "--instrument"
+        || a == "--grep" || a == "--from-report" || a == "--commit"
+        || a == "--note" || a == "--history" || a == "--reason"
+        || a == "--author" || a == "--baseline"
+        || a == "--threshold" || a == "--out" || a == "--limit"
+        || a == "--workload" || a == "--samples"
+        || a == "--warmup" {
+            if i + 1 >= argv.len() {
+                return Result.Err(err2("usage: " + a + " expects a value"))
+            }
+            let val: str = argv.get(i + 1)
+            if a == "--root" {
+                c.root = val
+            } else if a == "--suite" {
+                c.suite = val
+            } else if a == "--instrument" {
+                if val != "stage0" && val != "native" {
+                    return Result.Err(err2("usage: invalid choice: '"
+                    + val + "' (choose from 'stage0', 'native')"))
+                }
+                c.instrument = val
+            } else if a == "--grep" {
+                c.grep = val
+            } else if a == "--from-report" {
+                c.from_report = val
+            } else if a == "--commit" {
+                c.commit = val
+            } else if a == "--note" {
+                c.note = val
+            } else if a == "--history" {
+                c.history = val
+            } else if a == "--reason" {
+                c.reason = val
+            } else if a == "--author" {
+                c.author = val
+            } else if a == "--baseline" {
+                c.baseline = val
+            } else if a == "--threshold" {
+                let fv: Result[float, Err] = need_float(val, a)
+                if result_is_err(fv) {
+                    return Result.Err(result_err_or(fv, err2("")))
+                }
+                c.threshold = result_unwrap(fv)
+            } else if a == "--out" {
+                c.out = val
+            } else if a == "--limit" {
+                let iv: Result[int, Err] = need_int(val, a)
+                if result_is_err(iv) {
+                    return Result.Err(result_err_or(iv, err2("")))
+                }
+                c.limit = result_unwrap(iv)
+            } else if a == "--workload" {
+                c.workload_filter = val
+            } else if a == "--samples" {
+                let iv: Result[int, Err] = need_int(val, a)
+                if result_is_err(iv) {
+                    return Result.Err(result_err_or(iv, err2("")))
+                }
+                c.samples = result_unwrap(iv)
+            } else if a == "--warmup" {
+                let iv: Result[int, Err] = need_int(val, a)
+                if result_is_err(iv) {
+                    return Result.Err(result_err_or(iv, err2("")))
+                }
+                c.warmup = result_unwrap(iv)
+            }
+            i = i + 2
+        } else if a == "--allow-dirty" {
+            c.allow_dirty = true
+            i = i + 1
+        } else if a == "--stamp" {
+            c.stamp = true
+            i = i + 1
+        } else if a == "--quiet" {
+            c.quiet = true
+            i = i + 1
+        } else {
+            # a positional (the sanction workload)
+            if c.cmd == "sanction" && c.workload == "" && a.len() > 0
+            && a.byte_at(0) != 45 {
+                c.workload = a
+                i = i + 1
+            } else {
+                return Result.Err(err2("usage: unknown argument " + a))
+            }
+        }
+    }
+    return Result.Ok(c)
+}
+
+# ----------------------------------------------------------------------------
+# The commands.
+# ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# record — measure now, or import a report, and pin it to a commit.
+# ----------------------------------------------------------------------------
+
+fn cmd_record(c: Cli, root: str) -> Result[int, Err]
+uses IO, Fs, Proc, Clock {
+    let mut history: str = c.history
+    if history == "" {
+        history = history_default()
+    }
+
+    # The pinning law: every record names one clean commit. Explicit
+    # --commit wins (the CI import path); otherwise the ambient git
+    # must supply a HEAD, and a dirty tree is a refusal, not a note.
+    let mut commit: str = ""
+    if c.commit != "" {
+        commit = str_to_lower_ascii(strip_ws(c.commit))
+        if !is_sha1(commit) {
+            return Result.Err(err2("--commit must be a 40-hex sha (got "
+            + py_repr_str(c.commit) + ")"))
+        }
+    } else {
+        commit = git_head(root)
+        if commit == "" {
+            return Result.Err(err2(root + " is not a git work tree — "
+            + "pass --commit to pin the record explicitly"))
+        }
+        if git_dirty(root) && !c.allow_dirty {
+            return Result.Err(err1("the work tree carries tracked "
+            + "modifications — a per-commit record pins a clean "
+            + "commit (--allow-dirty to record anyway)"))
+        }
+    }
+
+    let mr: Result[list[Member], Err] = suite_members(root, c.suite)
+    if result_is_err(mr) {
+        return Result.Err(result_err_or(mr, err2("")))
+    }
+    let members: list[Member] = result_unwrap(mr)
+    let dr: Result[str, Err] = members_digest(members)
+    if result_is_err(dr) {
+        return Result.Err(result_err_or(dr, err2("")))
+    }
+    let digest: str = result_unwrap(dr)
+
+    let mut instrument: str = c.instrument
+    let mut source_digest: str = ""
+    let mut compiler_digest: str = ""
+    let mut workloads: JsonValue = json_null()
+    let mut plan: JsonValue = json_null()
+    let mut env: JsonValue = json_null()
+    let mut source: str = ""
+    if c.from_report != "" {
+        let rr: Result[JsonValue, Err] = read_report(c.from_report,
+        "the report")
+        if result_is_err(rr) {
+            return Result.Err(result_err_or(rr, err2("")))
+        }
+        let report: JsonValue = result_unwrap(rr)
+        instrument = jstr_of(report, "instrument")
+        if jstr_of(report, "suite_digest") != digest {
+            return Result.Err(err1("the report's suite digest ("
+            + take_s(jstr_of(report, "suite_digest"), 10)
+            + ") does not match the local suite ("
+            + take_s(digest, 10) + ") — the machine measured a "
+            + "different suite; re-baseline, do not file"))
+        }
+        source_digest = jstr_of(report, "source_digest")
+        compiler_digest = jstr_of(report, "compiler_digest")
+        workloads = jget(report, "workloads")
+        if !json_is_object(workloads) || workloads.obj_keys.len() == 0 {
+            return Result.Err(err2("the report carries no measured "
+            + "workloads"))
+        }
+        # re-derive the medians and counts from the report's samples
+        let w_keys: list[str] = []
+        let w_vals: list[JsonValue] = []
+        let mut wi: int = 0
+        while wi < workloads.obj_keys.len() {
+            let name: str = workloads.obj_keys.get(wi)
+            let w: JsonValue = workloads.obj_vals.get(wi)
+            wi = wi + 1
+            if !json_is_object(w) || !json_object_has(w, "samples_ms") {
+                return Result.Err(err2("the report's workload " + name
+                + " carries no samples_ms"))
+            }
+            let xs: list[float] = samples_ms_of(report, name)
+            # an empty samples list has no median to derive — the floor
+            # law below refuses the record with a named error naming
+            # the workload (never a crash on empty data).
+            let mut med_val: JsonValue = json_null()
+            if xs.len() > 0 {
+                med_val = json_float(median_of(xs))
+            }
+            w_keys.push(name)
+            w_vals.push(jobject(["samples_ms", "median_ms",
+            "samples_count"],
+            [jget(w, "samples_ms"), med_val,
+            json_int(xs.len())]))
+        }
+        workloads = jobject(w_keys, w_vals)
+        plan = jget(report, "plan")
+        if !json_is_object(plan) || plan.obj_keys.len() == 0 {
+            plan = jobject(["samples", "warmup"], [json_int(c.samples),
+            json_int(c.warmup)])
+        }
+        env = jget(report, "env")
+        if !json_is_object(env) || env.obj_keys.len() == 0 {
+            env = env_fingerprint(root, instrument)
+        }
+        source = "report " + c.from_report
+    } else {
+        if instrument == "native"
+        && !file_exists(path_join2(root, native_compiler())) {
+            return Result.Err(err2("the native instrument needs "
+            + native_compiler() + " — run `make bootstrap` first "
+            + "(or record with --instrument stage0)"))
+        }
+        let msr: Result[JsonValue, Err] = measure_suite(root, instrument,
+        members, c.samples, c.warmup, c.grep, 1)
+        if result_is_err(msr) {
+            return Result.Err(result_err_or(msr, err2("")))
+        }
+        workloads = result_unwrap(msr)
+        let sdr: Result[str, Err] = compiler_source_digest(root)
+        if result_is_err(sdr) {
+            return Result.Err(result_err_or(sdr, err2("")))
+        }
+        source_digest = result_unwrap(sdr)
+        let cdr: Result[str, Err] = compiler_binary_digest(root,
+        instrument)
+        if result_is_err(cdr) {
+            return Result.Err(result_err_or(cdr, err2("")))
+        }
+        compiler_digest = result_unwrap(cdr)
+        plan = jobject(["samples", "warmup"], [json_int(c.samples),
+        json_int(c.warmup)])
+        env = env_fingerprint(root, instrument)
+        source = instrument
+    }
+
+    let mut stamp_val: JsonValue = json_null()
+    if c.stamp {
+        stamp_val = json_str(utc_now())
+    }
+    let mut note_val: JsonValue = json_null()
+    if c.note != "" {
+        note_val = json_str(c.note)
+    }
+    let entry: JsonValue = jobject(["type", "tool", "version", "commit",
+    "instrument", "suite", "suite_digest", "source_digest",
+    "compiler_digest", "plan", "noise_pct", "env", "workloads",
+    "note", "stamp"],
+    [json_str("record"), json_str(tool_name()),
+    json_str(tool_version()), json_str(commit),
+    json_str(instrument), json_str(c.suite), json_str(digest),
+    json_str(source_digest), json_str(compiler_digest), plan,
+    json_float(default_noise_pct()), env, workloads, note_val,
+    stamp_val])
+    # The floor laws bite HERE, at record time — a record that its own
+    # ledger would refuse never enters the ledger, and a stale binary
+    # never gets the chance to pretend it was rebuilt.
+    let vr: Result[bool, Err] = validate_record(entry, "the new record")
+    if result_is_err(vr) {
+        return Result.Err(result_err_or(vr, err1("")))
+    }
+    let mut prior: list[Entry] = []
+    if file_exists(history) {
+        let lr: Result[list[Entry], Err] = load_history(history)
+        if result_is_err(lr) {
+            return Result.Err(result_err_or(lr, err1("")))
+        }
+        prior = result_unwrap(lr)
+    }
+    let sb: Result[bool, Err] = stale_binary_check(prior, entry)
+    if result_is_err(sb) {
+        return Result.Err(result_err_or(sb, err1("")))
+    }
+    let ar: Result[bool, Err] = append_entry(history, entry)
+    if result_is_err(ar) {
+        return Result.Err(result_err_or(ar, err1("")))
+    }
+    if c.json_out != "" {
+        write_file(c.json_out, pretty_json(entry))
+    }
+    let names: list[str] = workload_names_sorted(entry)
+    println("recorded " + take_s(commit, 10) + " (" + commit
+    + ") instrument=" + instrument + " suite=" + c.suite
+    + " workloads=" + names.len().to_str() + " source=" + source)
+    let mut i: int = 0
+    while i < names.len() {
+        let name: str = names.get(i)
+        let w: JsonValue = json_object_get(jget(entry, "workloads"),
+        name)
+        let med: JsonValue = jget(w, "median_ms")
+        let mut count: int = 0
+        let sc: JsonValue = jget(w, "samples_count")
+        if json_is_int(sc) {
+            count = json_int_value(sc)
+        }
+        println("  " + pad_right(name, 16) + " median "
+        + fmt_ms(num_or(med, 0.0)) + "  (" + count.to_str()
+        + " samples)")
+        i = i + 1
+    }
+    return Result.Ok(0)
+}
+
+# ----------------------------------------------------------------------------
+# sanction — a written excuse, one workload at a time.
+# ----------------------------------------------------------------------------
+
+fn cmd_sanction(c: Cli, root: str) -> Result[int, Err]
+uses IO, Fs, Proc, Clock {
+    let mut history: str = c.history
+    if history == "" {
+        history = history_default()
+    }
+    let lr: Result[list[Entry], Err] = load_history(history)
+    if result_is_err(lr) {
+        return Result.Err(result_err_or(lr, err1("")))
+    }
+    let entries: list[Entry] = result_unwrap(lr)
+    if c.workload == "" {
+        return Result.Err(err2("usage: sanction WORKLOAD --reason TEXT"))
+    }
+    let known: list[str] = []
+    let recs: list[Entry] = records_of(entries)
+    let mut ri: int = 0
+    while ri < recs.len() {
+        let names: list[str] = workload_names_sorted(recs.get(ri).v)
+        let mut ni: int = 0
+        while ni < names.len() {
+            let n: str = names.get(ni)
+            let mut found: bool = false
+            let mut j: int = 0
+            while j < known.len() {
+                if known.get(j) == n {
+                    found = true
+                }
+                j = j + 1
+            }
+            if !found {
+                known.push(n)
+            }
+            ni = ni + 1
+        }
+        ri = ri + 1
+    }
+    let sorted_known: list[str] = sort_strs(known)
+    let mut has: bool = false
+    let mut ki: int = 0
+    while ki < sorted_known.len() {
+        if sorted_known.get(ki) == c.workload {
+            has = true
+        }
+        ki = ki + 1
+    }
+    if !has {
+        let mut list_str: str = "(none)"
+        if sorted_known.len() > 0 {
+            list_str = str_join(sorted_known, ", ")
+        }
+        return Result.Err(err2("unknown workload "
+        + py_repr_str(c.workload) + " — the ledger knows: "
+        + list_str))
+    }
+    if c.reason == "" {
+        return Result.Err(err2("a sanction without a written reason is "
+        + "not a sanction (--reason TEXT)"))
+    }
+    let mut author: str = c.author
+    if author == "" {
+        author = git_user(root)
+    }
+    let mut stamp_val: JsonValue = json_null()
+    if c.stamp {
+        stamp_val = json_str(utc_now())
+    }
+    let mut commit_val: JsonValue = json_null()
+    if c.commit != "" {
+        commit_val = json_str(c.commit)
+    }
+    let entry: JsonValue = jobject(["type", "tool", "version", "workload",
+    "reason", "commit", "author", "stamp"],
+    [json_str("sanction"), json_str(tool_name()),
+    json_str(tool_version()), json_str(c.workload),
+    json_str(c.reason), commit_val, json_str(author), stamp_val])
+    let ar: Result[bool, Err] = append_entry(history, entry)
+    if result_is_err(ar) {
+        return Result.Err(result_err_or(ar, err1("")))
+    }
+    println("sanctioned " + c.workload + " (" + author + ")")
+    return Result.Ok(0)
+}
+
+# ----------------------------------------------------------------------------
+# gate — the law: one unsanctioned regression fails.
+# ----------------------------------------------------------------------------
+
+fn cmd_gate(c: Cli) -> Result[int, Err] uses IO, Fs {
+    let mut history: str = c.history
+    if history == "" {
+        history = history_default()
+    }
+    let lr: Result[list[Entry], Err] = load_history(history)
+    if result_is_err(lr) {
+        return Result.Err(result_err_or(lr, err1("")))
+    }
+    let entries: list[Entry] = result_unwrap(lr)
+    let vr: Result[JsonValue, Err] = verdict_of(entries, c.baseline,
+    c.threshold)
+    if result_is_err(vr) {
+        return Result.Err(result_err_or(vr, err1("")))
+    }
+    let v: JsonValue = result_unwrap(vr)
+    if !c.quiet {
+        println("gate " + str_to_upper_ascii(jstr_of(v, "verdict"))
+        + ": record " + take_s(jstr_of(v, "record"), 10)
+        + " vs baseline " + take_s(jstr_of(v, "baseline"), 10)
+        + " (instrument " + jstr_of(v, "instrument") + ", threshold "
+        + fmt_fixed(num_or(jget(v, "noise_pct"), 0.0), 1) + "%)")
+        let rows: JsonValue = jget(v, "workloads")
+        let mut i: int = 0
+        while i < rows.arr.len() {
+            let r: JsonValue = rows.arr.get(i)
+            let klass: str = jstr_of(r, "class")
+            let mut line: str = "  "
+            + pad_right(jstr_of(r, "workload"), 16)
+            if klass == "no-change" || klass == "within-noise"
+            || klass == "improved" || klass == "regressed" {
+                let ci: JsonValue = jget(r, "ci_pct")
+                let mut lo: float = 0.0
+                let mut hi: float = 0.0
+                if json_is_array(ci) && ci.arr.len() == 2 {
+                    lo = json_float_value(ci.arr.get(0))
+                    hi = json_float_value(ci.arr.get(1))
+                }
+                line = line + " " + pad_right(klass, 12) + " "
+                + fmt_pct(num_or(jget(r, "point_pct"), 0.0))
+                + "  [" + fmt_pct(lo) + " " + fmt_pct(hi) + "]  p="
+                + fmt_fixed(num_or(jget(r, "p"), 0.0), 4)
+            } else {
+                line = line + " " + klass
+                if klass == "new" {
+                    line = line + " ("
+                    + fmt_ms(num_or(jget(r, "cur_median_ms"), 0.0))
+                    + ")"
+                }
+            }
+            if json_is_object(jget(r, "sanction")) {
+                let s: JsonValue = jget(r, "sanction")
+                line = line + "  sanctioned: " + jstr_of(s, "reason")
+                + " (" + jstr_of(s, "author") + ")"
+            }
+            println(line)
+            i = i + 1
+        }
+    }
+    let uns_arr: JsonValue = jget(v, "unsanctioned")
+    let uns: list[str] = []
+    if json_is_array(uns_arr) {
+        let mut i2: int = 0
+        while i2 < uns_arr.arr.len() {
+            uns.push(json_str_value(uns_arr.arr.get(i2)))
+            i2 = i2 + 1
+        }
+    }
+    let rows: JsonValue = jget(v, "workloads")
+    if uns.len() > 0 {
+        println("GATE FAIL: " + uns.len().to_str()
+        + " regressed without a sanction: " + str_join(uns, ", "))
+    } else if !c.quiet {
+        println("GATE PASS: no unsanctioned regression across "
+        + rows.arr.len().to_str() + " workloads")
+    }
+    if c.json_out != "" {
+        write_file(c.json_out, pretty_json(v))
+    }
+    if uns.len() > 0 {
+        return Result.Ok(1)
+    }
+    return Result.Ok(0)
+}
+
+# ----------------------------------------------------------------------------
+# dashboard — the deterministic render of the ledger.
+# ----------------------------------------------------------------------------
+
+fn cmd_dashboard(c: Cli) -> Result[int, Err] uses IO, Fs, Clock {
+    if c.out == "" {
+        return Result.Err(err2("usage: dashboard --out FILE.md"))
+    }
+    let mut history: str = c.history
+    if history == "" {
+        history = history_default()
+    }
+    let lr: Result[list[Entry], Err] = load_history(history)
+    if result_is_err(lr) {
+        return Result.Err(result_err_or(lr, err1("")))
+    }
+    let entries: list[Entry] = result_unwrap(lr)
+    let mut stamp: str = ""
+    if c.stamp {
+        stamp = utc_now()
+    }
+    let dr: Result[str, Err] = render_dashboard(entries, history, c.limit,
+    stamp)
+    if result_is_err(dr) {
+        return Result.Err(result_err_or(dr, err1("")))
+    }
+    write_file(c.out, result_unwrap(dr))
+    if c.json_out != "" {
+        let vr: Result[JsonValue, Err] = verdict_of(entries, "",
+        default_noise_pct())
+        if result_is_err(vr) {
+            return Result.Err(result_err_or(vr, err1("")))
+        }
+        write_file(c.json_out, pretty_json(result_unwrap(vr)))
+    }
+    println("dashboard written to " + c.out)
+    return Result.Ok(0)
+}
+
+# ----------------------------------------------------------------------------
+# history — read the ledger back.
+# ----------------------------------------------------------------------------
+
+fn cmd_history(c: Cli) -> Result[int, Err] uses IO, Fs {
+    let mut history: str = c.history
+    if history == "" {
+        history = history_default()
+    }
+    let lr: Result[list[Entry], Err] = load_history(history)
+    if result_is_err(lr) {
+        return Result.Err(result_err_or(lr, err1("")))
+    }
+    let entries: list[Entry] = result_unwrap(lr)
+    let mut shown: list[Entry] = entries
+    if c.workload_filter != "" {
+        shown = []
+        let mut i: int = 0
+        while i < entries.len() {
+            let e: Entry = entries.get(i)
+            let typ: str = jstr_of(e.v, "type")
+            let keep: bool = (typ == "record"
+            && json_object_has(jget(e.v, "workloads"),
+            c.workload_filter))
+            || (typ == "sanction"
+            && jstr_of(e.v, "workload") == c.workload_filter)
+            if keep {
+                shown.push(e)
+            }
+            i = i + 1
+        }
+    }
+    if c.json_flag {
+        let vals: list[JsonValue] = []
+        let mut i2: int = 0
+        while i2 < shown.len() {
+            vals.push(shown.get(i2).v)
+            i2 = i2 + 1
+        }
+        print(pretty_json(jarr(vals)))
+        return Result.Ok(0)
+    }
+    let mut i3: int = 0
+    while i3 < shown.len() {
+        let e: Entry = shown.get(i3)
+        if jstr_of(e.v, "type") == "record" {
+            let n_wls: int = workload_names_sorted(e.v).len()
+            println("line " + pad_left_num(e.line, 4) + " record  "
+            + jstr_of(e.v, "commit") + "  "
+            + pad_right(jstr_of(e.v, "instrument"), 7) + " suite="
+            + path_basename(jstr_of(e.v, "suite")) + " workloads="
+            + n_wls.to_str())
+        } else {
+            println("line " + pad_left_num(e.line, 4) + " sanction "
+            + jstr_of(e.v, "workload") + "  "
+            + jstr_of(e.v, "reason"))
+        }
+        i3 = i3 + 1
+    }
+    println(shown.len().to_str() + " entries")
+    return Result.Ok(0)
+}
+
+# ----------------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Fs, Proc, Clock, Args, Exit {
+    let argv: list[str] = args()
+    let pr: Result[Cli, Err] = parse_cli(argv)
+    if result_is_err(pr) {
+        return usage_error()
+    }
+    let c: Cli = result_unwrap(pr)
+    let root: str = repo_root(argv.get(0))
+    let mut rc: Result[int, Err] = Result.Ok(0)
+    if c.cmd == "record" {
+        let mut r: str = c.root
+        if r == "" {
+            r = root
+        }
+        rc = cmd_record(c, r)
+    } else if c.cmd == "sanction" {
+        let mut r: str = c.root
+        if r == "" {
+            r = root
+        }
+        rc = cmd_sanction(c, r)
+    } else if c.cmd == "gate" {
+        rc = cmd_gate(c)
+    } else if c.cmd == "dashboard" {
+        rc = cmd_dashboard(c)
+    } else {
+        rc = cmd_history(c)
+    }
+    if result_is_err(rc) {
+        let e: Err = result_err_or(rc, err1(""))
+        eprintln(tool_name() + ": " + e.msg)
+        return e.code
+    }
+    return result_unwrap(rc)
+}

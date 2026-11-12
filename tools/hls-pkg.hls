@@ -1,0 +1,5250 @@
+# ============================================================================
+# tools/hls-pkg.hls — the package manager for Halis (HLS), native.
+# ----------------------------------------------------------------------------
+# The port of tools/hls-pkg.py + tools/hpkg_parts/ (hpkg_cli, hpkg_cmds,
+# hpkg_common, hpkg_deps, hpkg_log, hpkg_manifest, hpkg_semver, hpkg_util —
+# folded in here, sectioned like the .py). Same CLI surface, same
+# lockfile/manifest/ledger bytes, same exit codes:
+#
+#   hls-pkg init NAME            create a new package skeleton
+#   hls-pkg add NAME GIT PATH    add a git dependency (--tag XOR --branch,
+#                                --version REQ for a semver requirement)
+#   hls-pkg lock [--target T]    resolve deps, write lockfile, append to log
+#   hls-pkg audit                print the total effect report of the tree
+#   hls-pkg verify [--target T]  verify lockfile hashes + commits + log
+#   hls-pkg build [...]          compile the package with resolved deps
+#   hls-pkg publish              append the package to the transparency log
+#   hls-pkg log [--verify]       print the transparency log / verify chain
+#   hls-pkg semver ...           check / cmp / bump / sat — the semver laws
+#
+# What changed with the native era (the .py's interpreter imports are gone):
+#   - effect extraction spawns ./bin/hlboot --audit on a generated wrapper
+#     (boot.py is retired; hlboot is the evaluator the repo ships), and
+#     `build` spawns ./bin/hlboot / ./bin/hlc instead of the interpreter;
+#   - the audit hooks (Stage 112's hal_ops family) are inlined below —
+#     same entry shape, same chain arithmetic (sha256 over prev_hash +
+#     canonical JSON), same fail-open/HLS_AUDIT_STRICT contract;
+#   - the wasm/cross build legs still spawn tools/hlwasm.py / hlcross.py.
+#
+# Private probe modes (the gates' front door to the module internals the
+# batteries imported directly):
+#   --probe-semver MODE [args]   the hpkg_semver module probes
+#   --probe-dirhash ROOT DIR...  hpkg_cmds._sha256_directory
+# ============================================================================
+
+import "std.result"
+import "std.str"
+import "std.json"
+import "std.sha256"
+
+# ----------------------------------------------------------------------------
+# Constants (HLS has no globals — every constant is a fn).
+# ----------------------------------------------------------------------------
+
+fn pk_tool() -> str {
+    return "hls-pkg"
+}
+
+# hal_common.VERSION — the toolchain release the audit log's entries stamp.
+fn pk_audit_tool_version() -> str {
+    return "0.131.0-alpha"
+}
+
+fn pk_genesis() -> str {
+    return str_repeat("0", 64)
+}
+
+# The privilege inventory (hal_ops' pkg.* constants).
+fn op_pkg_init() -> str {
+    return "pkg.init"
+}
+
+fn op_pkg_add() -> str {
+    return "pkg.add"
+}
+
+fn op_pkg_lock() -> str {
+    return "pkg.lock"
+}
+
+fn op_pkg_publish() -> str {
+    return "pkg.publish"
+}
+
+fn sv_grammar() -> str {
+    return "MAJOR.MINOR.PATCH[-PRERELEASE][+BUILD] per semver 2.0.0 "
+        + "(no leading zeros in the core or in numeric pre-release "
+        + "identifiers)"
+}
+
+fn sv_req_grammar() -> str {
+    return "requirement grammar: ^1.2.3, ~1.2, >=1.2.3, >1.2.3, "
+        + "<=1.2.3, <1.2.3, =1.2.3, exact 1.2.3, partials 1.2 / 1, "
+        + "wildcards * / 1.x / 1.2.*, hyphen ranges '1.2.3 - 2.0' — "
+        + "space or comma separated for AND; '||' alternatives are not "
+        + "supported"
+}
+
+# ----------------------------------------------------------------------------
+# Small path / string helpers.
+# ----------------------------------------------------------------------------
+
+fn pk_path_is_abs(p: str) -> bool {
+    return p.len() > 0 && p.byte_at(0) == 47
+}
+
+fn pk_path_dirname(p: str) -> str {
+    let n: int = p.len()
+    if n == 0 {
+        return "."
+    }
+    let mut k: int = n - 1
+    while k > 0 && p.byte_at(k) == 47 {
+        k = k - 1
+    }
+    while k >= 0 {
+        if p.byte_at(k) == 47 {
+            if k == 0 {
+                return "/"
+            }
+            return p.slice(0, k)
+        }
+        k = k - 1
+    }
+    return "."
+}
+
+fn pk_path_basename(p: str) -> str {
+    let n: int = p.len()
+    if n == 0 {
+        return ""
+    }
+    let mut k: int = n - 1
+    while k > 0 && p.byte_at(k) == 47 {
+        k = k - 1
+    }
+    let mut j: int = k
+    while j >= 0 {
+        if p.byte_at(j) == 47 {
+            return p.slice(j + 1, k + 1)
+        }
+        j = j - 1
+    }
+    return p.slice(0, k + 1)
+}
+
+fn pk_path_join(a: str, b: str) -> str {
+    if a == "" {
+        return b
+    }
+    if b == "" {
+        return a
+    }
+    if a.byte_at(a.len() - 1) == 47 {
+        return a + b
+    }
+    return a + "/" + b
+}
+
+# pk_norm_path(p) — the lexical normpath (no symlink knowledge).
+fn pk_norm_path(p: str) -> str {
+    if p == "" {
+        return "."
+    }
+    let abs: bool = pk_path_is_abs(p)
+    let comps: list[str] = p.split("/")
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < comps.len() {
+        let c: str = comps.get(i)
+        if c == "" || c == "." {
+            i = i + 1
+            continue
+        }
+        if c == ".." {
+            if out.len() > 0 && out.get(out.len() - 1) != ".." {
+                out.pop()
+            } else if !abs {
+                out.push("..")
+            }
+            i = i + 1
+            continue
+        }
+        out.push(c)
+        i = i + 1
+    }
+    if out.len() == 0 {
+        if abs {
+            return "/"
+        }
+        return "."
+    }
+    let mut r: str = ""
+    if abs {
+        r = "/"
+    }
+    let mut j: int = 0
+    while j < out.len() {
+        r = r + out.get(j)
+        if j + 1 < out.len() {
+            r = r + "/"
+        }
+        j = j + 1
+    }
+    return r
+}
+
+# pk_realpath_lex(p) — abspath + lexical normpath (the port's realpath: no
+# symlinks in the gates' trees; lexical containment stops every ../ walk).
+fn pk_realpath_lex(p: str) -> str uses Proc {
+    let mut raw: str = p
+    if !pk_path_is_abs(raw) {
+        raw = cwd_get() + "/" + raw
+    }
+    return pk_norm_path(raw)
+}
+
+fn pk_shell_quote(s: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c == 39 {
+            out = out + "'\\''"
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn pk_sh(cmd: str) -> int uses Proc {
+    return proc_exec(cmd)
+}
+
+fn pk_mkdirs(path: str) -> int uses Proc {
+    return proc_exec("mkdir -p '" + pk_shell_quote(path) + "'")
+}
+
+fn pk_rm(path: str) -> int uses Proc {
+    return proc_exec("rm -rf '" + pk_shell_quote(path) + "'")
+}
+
+# find_from(s, needle, from) — str.find with a start index.
+fn find_from(s: str, needle: str, from: int) -> int {
+    let mut start: int = from
+    if start >= s.len() {
+        return -1
+    }
+    if start < 0 {
+        start = 0
+    }
+    let idx: int = s.slice(start, s.len()).find(needle)
+    if idx >= 0 {
+        return idx + start
+    }
+    return -1
+}
+
+# split_sub(s, sep) — Python's str.split(sep) for any separator length.
+fn split_sub(s: str, sep: str) -> list[str] {
+    let out: list[str] = []
+    if sep == "" {
+        out.push(s)
+        return out
+    }
+    let mut rest: str = s
+    let mut at: int = rest.find(sep)
+    while at >= 0 {
+        out.push(rest.slice(0, at))
+        rest = rest.slice(at + sep.len(), rest.len())
+        at = rest.find(sep)
+    }
+    out.push(rest)
+    return out
+}
+
+# split_ws(s) — Python's s.split(): runs of spaces/tabs are separators.
+fn split_ws(s: str) -> list[str] {
+    let out: list[str] = []
+    let mut cur: str = ""
+    let mut i: int = 0
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        if b == 32 || b == 9 {
+            if cur != "" {
+                out.push(cur)
+                cur = ""
+            }
+        } else {
+            cur = cur + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    if cur != "" {
+        out.push(cur)
+    }
+    return out
+}
+
+fn sort_strs(xs: list[str]) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < xs.len() {
+        out.push(xs.get(i))
+        i = i + 1
+    }
+    let mut a: int = 1
+    while a < out.len() {
+        let v: str = out.get(a)
+        let mut b: int = a - 1
+        while b >= 0 && out.get(b) > v {
+            out.set(b + 1, out.get(b))
+            b = b - 1
+        }
+        out.set(b + 1, v)
+        a = a + 1
+    }
+    return out
+}
+
+fn list_has_str(xs: list[str], v: str) -> bool {
+    let mut i: int = 0
+    while i < xs.len() {
+        if xs.get(i) == v {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn list_add_uniq(xs: list[str], v: str) -> void {
+    if !list_has_str(xs, v) {
+        xs.push(v)
+    }
+}
+
+# clip_str(s, n) — Python's safe slicing s[:n].
+fn clip_str(s: str, n: int) -> str {
+    if s.len() <= n {
+        return s
+    }
+    return s.slice(0, n)
+}
+
+# py_repr(s) — Python's %r of a str (single quotes).
+fn py_repr(s: str) -> str {
+    return "'" + s + "'"
+}
+
+fn is_digit_b(b: int) -> bool {
+    return b >= 48 && b <= 57
+}
+
+fn is_letter_b(b: int) -> bool {
+    return (b >= 97 && b <= 122) || (b >= 65 && b <= 90)
+}
+
+fn all_digits(s: str) -> bool {
+    if s.len() == 0 {
+        return false
+    }
+    let mut i: int = 0
+    while i < s.len() {
+        if !is_digit_b(s.byte_at(i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn hex4(n: int) -> str {
+    let digits: str = "0123456789abcdef"
+    return digits.slice((n / 4096) % 16, (n / 4096) % 16 + 1)
+        + digits.slice((n / 256) % 16, (n / 256) % 16 + 1)
+        + digits.slice((n / 16) % 16, (n / 16) % 16 + 1)
+        + digits.slice(n % 16, n % 16 + 1)
+}
+
+fn floor_div(a: int, b: int) -> int {
+    let q: int = a / b
+    let r: int = a % b
+    if r != 0 && (r < 0) != (b < 0) {
+        return q - 1
+    }
+    return q
+}
+
+# ----------------------------------------------------------------------------
+# The repo root (the .py's REPO_ROOT): the binary's grandparent with a
+# cwd walk-up fallback, the same law hls-tlog / hls-sbom ride.
+# ----------------------------------------------------------------------------
+
+fn pk_is_repo_root(p: str) -> bool uses Fs {
+    return file_exists(p + "/std/str.hls")
+        && file_exists(p + "/core/option.hls")
+        && file_exists(p + "/SPEC.md")
+}
+
+fn pk_repo_root() -> str uses Fs, Proc, Args {
+    let argv: list[str] = args()
+    if argv.len() > 0 && argv.get(0) != "" {
+        let binp: str = pk_realpath_lex(argv.get(0))
+        let root: str = pk_path_dirname(pk_path_dirname(binp))
+        if pk_is_repo_root(root) {
+            return root
+        }
+    }
+    let mut d: str = pk_realpath_lex("")
+    let mut guard: int = 0
+    while guard < 128 {
+        if pk_is_repo_root(d) {
+            return d
+        }
+        let parent: str = pk_path_dirname(d)
+        if parent == d {
+            return d
+        }
+        d = parent
+        guard = guard + 1
+    }
+    return d
+}
+
+fn pk_cache_dir() -> str uses Fs, Proc, Args {
+    let over: str = env_get("HLS_PKG_CACHE")
+    if over != "" {
+        return over
+    }
+    return pk_path_join(pk_repo_root(), ".hls-pkg-cache")
+}
+
+fn pk_transparency_log() -> str uses Fs, Proc, Args {
+    let over: str = env_get("HLS_PKG_TRANSPARENCY_LOG")
+    if over != "" {
+        return over
+    }
+    return pk_path_join(pk_repo_root(), ".hls-pkg-transparency.log")
+}
+
+fn pk_audit_log_path() -> str uses Fs, Proc, Args {
+    let over: str = env_get("HLS_AUDIT_LOG")
+    if over != "" {
+        return over
+    }
+    return pk_path_join(pk_repo_root(), ".hls-audit.log")
+}
+
+fn read_or(p: str, default_value: str) -> str uses Fs {
+    if !file_exists(p) {
+        return default_value
+    }
+    return read_file(p)
+}
+
+fn is_file_h(p: str) -> bool uses Fs {
+    return file_exists(p) && !fs_is_dir(p)
+}
+
+fn is_dir_h(p: str) -> bool uses Fs {
+    return fs_is_dir(p)
+}
+
+# ----------------------------------------------------------------------------
+# Subprocess capture — the repo's spawn_cap discipline.
+# ----------------------------------------------------------------------------
+
+struct PkRun {
+    code: int,
+    out: str,
+    err: str,
+    spawned: bool
+}
+
+fn pk_spawn(prog: str, cargs: list[str]) -> PkRun uses Proc {
+    let r: PkRun = PkRun {
+        code: -1, out: "", err: "", spawned: false
+    }
+    let pid: int = proc_spawn(prog, cargs, 2, 1, 1)
+    if pid < 1 {
+        return r
+    }
+    r.spawned = true
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    r.code = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    r.out = out
+    r.err = err
+    return r
+}
+
+# pk_spawn_inherit — subprocess.run with inherited stdio (the build legs):
+# the child's output flows into our own stdout, exactly the .py's law.
+fn pk_spawn_inherit(prog: str, cargs: list[str]) -> int uses Proc {
+    let pid: int = proc_spawn(prog, cargs, 0, 0, 0)
+    if pid < 1 {
+        return -1
+    }
+    return proc_wait(pid)
+}
+
+# ----------------------------------------------------------------------------
+# Python-JSON serialization — json.dumps' exact bytes (ensure_ascii,
+# sorted keys, the three separator/indent modes the family writes).
+# ----------------------------------------------------------------------------
+
+fn pk_utf8_at(s: str, i: int) -> list[int] {
+    let n: int = s.len()
+    let b0: int = s.byte_at(i)
+    if b0 < 128 {
+        return [b0, 1]
+    }
+    if b0 >= 192 && b0 < 224 && i + 1 < n {
+        let b1: int = s.byte_at(i + 1)
+        if b1 >= 128 && b1 < 192 {
+            return [(b0 - 192) * 64 + (b1 - 128), 2]
+        }
+    }
+    if b0 >= 224 && b0 < 240 && i + 2 < n {
+        let b1: int = s.byte_at(i + 1)
+        let b2: int = s.byte_at(i + 2)
+        if b1 >= 128 && b1 < 192 && b2 >= 128 && b2 < 192 {
+            return [(b0 - 224) * 4096 + (b1 - 128) * 64 + (b2 - 128), 3]
+        }
+    }
+    if b0 >= 240 && b0 < 248 && i + 3 < n {
+        let b1: int = s.byte_at(i + 1)
+        let b2: int = s.byte_at(i + 2)
+        let b3: int = s.byte_at(i + 3)
+        if b1 >= 128 && b1 < 192 && b2 >= 128 && b2 < 192
+        && b3 >= 128 && b3 < 192 {
+            return [(b0 - 240) * 262144 + (b1 - 128) * 4096
+                + (b2 - 128) * 64 + (b3 - 128), 4]
+        }
+    }
+    return [-1, 1]
+}
+
+# pk_py_escape(s) — the string body between quotes, ensure_ascii.
+fn pk_py_escape(s: str) -> str {
+    let out: list[str] = []
+    let n: int = s.len()
+    let mut i: int = 0
+    while i < n {
+        let c: int = s.byte_at(i)
+        if c == 34 {
+            out.push("\\\"")
+            i = i + 1
+            continue
+        }
+        if c == 92 {
+            out.push("\\\\")
+            i = i + 1
+            continue
+        }
+        if c == 8 {
+            out.push("\\b")
+            i = i + 1
+            continue
+        }
+        if c == 9 {
+            out.push("\\t")
+            i = i + 1
+            continue
+        }
+        if c == 10 {
+            out.push("\\n")
+            i = i + 1
+            continue
+        }
+        if c == 12 {
+            out.push("\\f")
+            i = i + 1
+            continue
+        }
+        if c == 13 {
+            out.push("\\r")
+            i = i + 1
+            continue
+        }
+        if c < 32 {
+            out.push("\\u" + hex4(c))
+            i = i + 1
+            continue
+        }
+        if c < 127 {
+            out.push(s.slice(i, i + 1))
+            i = i + 1
+            continue
+        }
+        let cp: list[int] = pk_utf8_at(s, i)
+        if cp.get(0) < 0 {
+            out.push(s.slice(i, i + 1))
+            i = i + 1
+            continue
+        }
+        if cp.get(0) < 65536 {
+            out.push("\\u" + hex4(cp.get(0)))
+        } else {
+            let v: int = cp.get(0) - 65536
+            let hi: int = 55296 + v / 1024
+            let lo: int = 56320 + v % 1024
+            out.push("\\u" + hex4(hi) + "\\u" + hex4(lo))
+        }
+        i = i + cp.get(1)
+    }
+    return str_join(out, "")
+}
+
+fn pk_scalar_text(v: JsonValue) -> str {
+    if v.kind == "null" {
+        return "null"
+    }
+    if v.kind == "bool" {
+        if v.bval {
+            return "true"
+        }
+        return "false"
+    }
+    if v.kind == "int" {
+        return v.ival.to_str()
+    }
+    if v.kind == "float" {
+        return v.fval.to_str()
+    }
+    return "\"" + pk_py_escape(v.sval) + "\""
+}
+
+fn pk_sorted_order(keys: list[str]) -> list[int] {
+    let order: list[int] = []
+    let mut i: int = 0
+    while i < keys.len() {
+        order.push(i)
+        i = i + 1
+    }
+    let mut a: int = 1
+    while a < order.len() {
+        let k: int = order.get(a)
+        let kv: str = keys.get(k)
+        let mut b: int = a - 1
+        while b >= 0 && keys.get(order.get(b)) > kv {
+            order.set(b + 1, order.get(b))
+            b = b - 1
+        }
+        order.set(b + 1, k)
+        a = a + 1
+    }
+    return order
+}
+
+# pk_dump_at(v, indent, mode, sorted) — the recursive serializer.
+#   mode 0: compact (separators (",", ":")) — json.dumps(..., separators)
+#   mode 1: spaced  (separators (", ", ": ")) — json.dumps(...) default
+#   mode 2: indent=2 layout
+fn pk_dump_at(v: JsonValue, indent: int, mode: int, sorted: bool) -> str {
+    if v.kind == "array" {
+        if v.arr.len() == 0 {
+            return "[]"
+        }
+        if mode == 2 {
+            let mut pad: str = ""
+            let mut k: int = 0
+            while k < indent {
+                pad = pad + "  "
+                k = k + 1
+            }
+            let in_pad: str = pad + "  "
+            let mut out: str = "[\n"
+            let mut i: int = 0
+            while i < v.arr.len() {
+                out = out + in_pad
+                    + pk_dump_at(v.arr.get(i), indent + 1, mode, sorted)
+                if i + 1 < v.arr.len() {
+                    out = out + ","
+                }
+                out = out + "\n"
+                i = i + 1
+            }
+            return out + pad + "]"
+        }
+        let sep: str = ","
+        if mode == 1 {
+            let mut out2: str = "["
+            let mut j: int = 0
+            while j < v.arr.len() {
+                out2 = out2 + pk_dump_at(v.arr.get(j), indent, mode, sorted)
+                if j + 1 < v.arr.len() {
+                    out2 = out2 + sep + " "
+                }
+                j = j + 1
+            }
+            return out2 + "]"
+        }
+        let mut out3: str = "["
+        let mut j2: int = 0
+        while j2 < v.arr.len() {
+            out3 = out3 + pk_dump_at(v.arr.get(j2), indent, mode, sorted)
+            if j2 + 1 < v.arr.len() {
+                out3 = out3 + sep
+            }
+            j2 = j2 + 1
+        }
+        return out3 + "]"
+    }
+    if v.kind == "object" {
+        if v.obj_keys.len() == 0 {
+            return "{}"
+        }
+        let order: list[int] = []
+        if sorted {
+            let so: list[int] = pk_sorted_order(v.obj_keys)
+            let mut si2: int = 0
+            while si2 < so.len() {
+                order.push(so.get(si2))
+                si2 = si2 + 1
+            }
+        } else {
+            let mut oi: int = 0
+            while oi < v.obj_keys.len() {
+                order.push(oi)
+                oi = oi + 1
+            }
+        }
+        if mode == 2 {
+            let mut pad2: str = ""
+            let mut k2: int = 0
+            while k2 < indent {
+                pad2 = pad2 + "  "
+                k2 = k2 + 1
+            }
+            let in_pad2: str = pad2 + "  "
+            let mut out4: str = "{\n"
+            let mut j3: int = 0
+            while j3 < order.len() {
+                let idx: int = order.get(j3)
+                out4 = out4 + in_pad2 + "\""
+                    + pk_py_escape(v.obj_keys.get(idx)) + "\": "
+                    + pk_dump_at(v.obj_vals.get(idx), indent + 1, mode, sorted)
+                if j3 + 1 < order.len() {
+                    out4 = out4 + ","
+                }
+                out4 = out4 + "\n"
+                j3 = j3 + 1
+            }
+            return out4 + pad2 + "}"
+        }
+        let ksep: str = ":"
+        let vsep: str = ","
+        if mode == 1 {
+            let ksep2: str = ": "
+            let vsep2: str = ", "
+            let mut out5: str = "{"
+            let mut j4: int = 0
+            while j4 < order.len() {
+                let idx2: int = order.get(j4)
+                out5 = out5 + "\"" + pk_py_escape(v.obj_keys.get(idx2))
+                    + "\"" + ksep2
+                    + pk_dump_at(v.obj_vals.get(idx2), indent, mode, sorted)
+                if j4 + 1 < order.len() {
+                    out5 = out5 + vsep2
+                }
+                j4 = j4 + 1
+            }
+            return out5 + "}"
+        }
+        let mut out6: str = "{"
+        let mut j5: int = 0
+        while j5 < order.len() {
+            let idx3: int = order.get(j5)
+            out6 = out6 + "\"" + pk_py_escape(v.obj_keys.get(idx3))
+                + "\"" + ksep
+                + pk_dump_at(v.obj_vals.get(idx3), indent, mode, sorted)
+            if j5 + 1 < order.len() {
+                out6 = out6 + vsep
+            }
+            j5 = j5 + 1
+        }
+        return out6 + "}"
+    }
+    return pk_scalar_text(v)
+}
+
+# pk_py_canon(v) — json.dumps(v, sort_keys=True, separators=(",", ":")).
+fn pk_py_canon(v: JsonValue) -> str {
+    return pk_dump_at(v, 0, 0, true)
+}
+
+# pk_py_line(v) — json.dumps(v, sort_keys=True) (default ", " / ": ").
+fn pk_py_line(v: JsonValue) -> str {
+    return pk_dump_at(v, 0, 1, true)
+}
+
+# pk_json_indent2(v) — json.dump(v, f, indent=2): insertion order.
+fn pk_json_indent2(v: JsonValue) -> str {
+    return pk_dump_at(v, 0, 2, false)
+}
+
+# pk_obj_set(obj, key, val) — replace-or-append (no duplicates).
+fn pk_obj_set(obj: JsonValue, key: str, val: JsonValue) -> void {
+    let mut i: int = 0
+    while i < obj.obj_keys.len() {
+        if obj.obj_keys.get(i) == key {
+            obj.obj_vals.set(i, val)
+            return
+        }
+        i = i + 1
+    }
+    obj.obj_keys.push(key)
+    obj.obj_vals.push(val)
+}
+
+fn pk_obj_get_str(v: JsonValue, key: str) -> str {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_str(x) {
+        return json_str_value(x)
+    }
+    return ""
+}
+
+fn pk_obj_get_int_or(v: JsonValue, key: str, d: int) -> int {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_int(x) {
+        return json_int_value(x)
+    }
+    return d
+}
+
+# pk_py_strval(v) — Python's str() of a JSON value (verify's "got %s").
+fn pk_py_strval(v: JsonValue) -> str {
+    if v.kind == "null" {
+        return "None"
+    }
+    if v.kind == "bool" {
+        if v.bval {
+            return "True"
+        }
+        return "False"
+    }
+    if v.kind == "int" {
+        return v.ival.to_str()
+    }
+    if v.kind == "float" {
+        return v.fval.to_str()
+    }
+    if v.kind == "str" {
+        return v.sval
+    }
+    return pk_py_line(v)
+}
+
+# ----------------------------------------------------------------------------
+# TOML values — the manifest's data model (hpkg_manifest's dicts).
+# ----------------------------------------------------------------------------
+
+struct Tv {
+    kind: str, # "null" | "str" | "int" | "float" | "bool" | "list" | "table"
+    sval: str,
+    ival: int,
+    fval: float,
+    bval: bool,
+    items: list[Tv],
+    keys: list[str],
+    vals: list[Tv]
+}
+
+fn tv_null() -> Tv {
+    return Tv {
+        kind: "null", sval: "", ival: 0, fval: 0.0, bval: false,
+        items: [], keys: [], vals: []
+    }
+}
+
+fn tv_str(s: str) -> Tv {
+    let v: Tv = tv_null()
+    v.kind = "str"
+    v.sval = s
+    return v
+}
+
+fn tv_int(i: int) -> Tv {
+    let v: Tv = tv_null()
+    v.kind = "int"
+    v.ival = i
+    return v
+}
+
+fn tv_float(f: float) -> Tv {
+    let v: Tv = tv_null()
+    v.kind = "float"
+    v.fval = f
+    return v
+}
+
+fn tv_bool(b: bool) -> Tv {
+    let v: Tv = tv_null()
+    v.kind = "bool"
+    v.bval = b
+    return v
+}
+
+fn tv_list(items: list[Tv]) -> Tv {
+    let v: Tv = tv_null()
+    v.kind = "list"
+    v.items = items
+    return v
+}
+
+fn tv_table(keys: list[str], vals: list[Tv]) -> Tv {
+    let v: Tv = tv_null()
+    v.kind = "table"
+    v.keys = keys
+    v.vals = vals
+    return v
+}
+
+fn tv_is_table(v: Tv) -> bool {
+    return v.kind == "table"
+}
+
+fn tv_is_list(v: Tv) -> bool {
+    return v.kind == "list"
+}
+
+fn tv_is_str(v: Tv) -> bool {
+    return v.kind == "str"
+}
+
+fn tv_get(t: Tv, key: str) -> Tv {
+    let mut i: int = 0
+    while i < t.keys.len() {
+        if t.keys.get(i) == key {
+            return t.vals.get(i)
+        }
+        i = i + 1
+    }
+    return tv_null()
+}
+
+fn tv_has(t: Tv, key: str) -> bool {
+    let mut i: int = 0
+    while i < t.keys.len() {
+        if t.keys.get(i) == key {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# tv_put(t, key, val) — t[key] = val, functionally.
+fn tv_put(t: Tv, key: str, val: Tv) -> Tv {
+    let keys: list[str] = []
+    let vals: list[Tv] = []
+    let mut replaced: bool = false
+    let mut i: int = 0
+    while i < t.keys.len() {
+        if t.keys.get(i) == key {
+            keys.push(key)
+            vals.push(val)
+            replaced = true
+        } else {
+            keys.push(t.keys.get(i))
+            vals.push(t.vals.get(i))
+        }
+        i = i + 1
+    }
+    if !replaced {
+        keys.push(key)
+        vals.push(val)
+    }
+    return tv_table(keys, vals)
+}
+
+# tv_setdefault_table(t, key) — the child table for cursor.setdefault:
+# the existing table, a fresh empty one (the caller inserts it), or Err
+# when the key shadows a non-table.
+fn tv_setdefault_table(t: Tv, key: str) -> Result[Tv, str] {
+    if tv_has(t, key) {
+        let v: Tv = tv_get(t, key)
+        if !tv_is_table(v) {
+            return Result.Err("shadows a non-table value")
+        }
+        return Result.Ok(v)
+    }
+    return Result.Ok(tv_table([], []))
+}
+
+# tv_ensure_path(root, parts, idx, section) — walk/insert the section's
+# table path (the .py's cursor walk for [a.b.c] headers).
+fn tv_ensure_path(root: Tv, parts: list[str], idx: int, section: str)
+    -> Result[Tv, str] {
+    if idx >= parts.len() {
+        return Result.Ok(root)
+    }
+    if !tv_is_table(root) {
+        return Result.Err("manifest: section [" + section
+            + "] shadows a non-table value (a key under [" + section
+            + "] was already set)")
+    }
+    let child_r: Result[Tv, str] = tv_setdefault_table(root, parts.get(idx))
+    if !result_is_ok(child_r) {
+        return Result.Err("manifest: section [" + section
+            + "] shadows a non-table value (a key under [" + section
+            + "] was already set)")
+    }
+    let child: Tv = result_unwrap(child_r)
+    let rest_r: Result[Tv, str] = tv_ensure_path(child, parts, idx + 1,
+                                                 section)
+    if !result_is_ok(rest_r) {
+        return rest_r
+    }
+    return Result.Ok(tv_put(root, parts.get(idx), result_unwrap(rest_r)))
+}
+
+# tv_set_at(root, parts, idx, key, val, section) — assign key = val under
+# the section path (creating the path's tables on the way).
+fn tv_set_at(root: Tv, parts: list[str], idx: int, key: str, val: Tv,
+             section: str) -> Result[Tv, str] {
+    if idx >= parts.len() {
+        return Result.Ok(tv_put(root, key, val))
+    }
+    if !tv_is_table(root) {
+        return Result.Err("manifest: cannot set key under non-table "
+            + "section [" + section + "]")
+    }
+    let child_r: Result[Tv, str] = tv_setdefault_table(root, parts.get(idx))
+    if !result_is_ok(child_r) {
+        return Result.Err("manifest: cannot set key under non-table "
+            + "section [" + section + "]")
+    }
+    let child: Tv = result_unwrap(child_r)
+    let rest_r: Result[Tv, str] = tv_set_at(child, parts, idx + 1, key, val,
+                                            section)
+    if !result_is_ok(rest_r) {
+        return rest_r
+    }
+    return Result.Ok(tv_put(root, parts.get(idx), result_unwrap(rest_r)))
+}
+
+# tv_to_json(v) — the TOML value as a JSON value (the lockfile's source
+# tables ride through this).
+fn tv_to_json(v: Tv) -> JsonValue {
+    if v.kind == "str" {
+        return json_str(v.sval)
+    }
+    if v.kind == "int" {
+        return json_int(v.ival)
+    }
+    if v.kind == "float" {
+        return json_float(v.fval)
+    }
+    if v.kind == "bool" {
+        return json_bool(v.bval)
+    }
+    if v.kind == "list" {
+        let items: list[JsonValue] = []
+        let mut i: int = 0
+        while i < v.items.len() {
+            items.push(tv_to_json(v.items.get(i)))
+            i = i + 1
+        }
+        return json_array(items)
+    }
+    if v.kind == "table" {
+        let keys: list[str] = []
+        let vals: list[JsonValue] = []
+        let mut j: int = 0
+        while j < v.keys.len() {
+            keys.push(v.keys.get(j))
+            vals.push(tv_to_json(v.vals.get(j)))
+            j = j + 1
+        }
+        return json_object(keys, vals)
+    }
+    return json_null()
+}
+
+# ----------------------------------------------------------------------------
+# Manifest parsing (minimal TOML parser — the subset hls-pkg.toml uses).
+# ----------------------------------------------------------------------------
+
+# strip_toml_comment(line) — strip a `#` comment, only OUTSIDE double
+# quotes; invalid TOML escapes are refused by name.
+fn strip_toml_comment(line: str) -> Result[str, str] {
+    let mut out: str = ""
+    let mut in_str: bool = false
+    let mut i: int = 0
+    let n: int = line.len()
+    while i < n {
+        let c: int = line.byte_at(i)
+        if in_str {
+            if c == 92 && i + 1 < n {
+                let esc: int = line.byte_at(i + 1)
+                if esc == 98 || esc == 116 || esc == 110 || esc == 102
+                || esc == 114 || esc == 34 || esc == 92 || esc == 117
+                || esc == 85 {
+                    out = out + line.slice(i, i + 2)
+                    i = i + 2
+                    continue
+                }
+                return Result.Err("invalid TOML escape sequence: \\"
+                    + line.slice(i + 1, i + 2)
+                    + " (TOML only allows \\b, \\t, \\n, \\f, \\r, \\\", "
+                    + "\\uXXXX, \\UXXXXXXXX)")
+            }
+            if c == 34 {
+                in_str = false
+            }
+            out = out + line.slice(i, i + 1)
+            i = i + 1
+            continue
+        }
+        if c == 34 {
+            in_str = true
+            out = out + line.slice(i, i + 1)
+            i = i + 1
+            continue
+        }
+        if c == 35 {
+            break
+        }
+        out = out + line.slice(i, i + 1)
+        i = i + 1
+    }
+    return Result.Ok(out)
+}
+
+fn parse_hex4(s: str, at: int) -> int {
+    let mut v: int = 0
+    let mut i: int = at
+    while i < at + 4 {
+        let b: int = s.byte_at(i)
+        let mut d: int = 0
+        if b >= 48 && b <= 57 {
+            d = b - 48
+        } else if b >= 97 && b <= 102 {
+            d = b - 87
+        } else if b >= 65 && b <= 70 {
+            d = b - 55
+        } else {
+            return -1
+        }
+        v = v * 16 + d
+        i = i + 1
+    }
+    return v
+}
+
+# bare_token(tok) — true/false/int/float/str, the .py's bare branch.
+fn bare_token(tok: str) -> Tv {
+    if tok == "true" {
+        return tv_bool(true)
+    }
+    if tok == "false" {
+        return tv_bool(false)
+    }
+    # int: optional leading '-', digits only.
+    let mut body: str = tok
+    if tok.len() > 1 && tok.byte_at(0) == 45 {
+        body = tok.slice(1, tok.len())
+    }
+    if all_digits(body) {
+        return tv_int(tok.to_int())
+    }
+    # float: digits with a '.' and/or exponent.
+    let mut has_digit: bool = false
+    let mut ok: bool = true
+    let mut i: int = 0
+    while i < tok.len() {
+        let b: int = tok.byte_at(i)
+        if is_digit_b(b) {
+            has_digit = true
+        } else if b == 46 || b == 101 || b == 69 || b == 43 || b == 45 {
+            ok = true
+        } else {
+            ok = false
+        }
+        i = i + 1
+    }
+    if ok && has_digit && (tok.find(".") >= 0 || tok.find("e") >= 0
+        || tok.find("E") >= 0) {
+        return tv_float(tok.to_float())
+    }
+    return tv_str(tok)
+}
+
+struct Pv {
+    val: Tv,
+    at: int
+}
+
+# parse_toml_string(src, i) — a double-quoted string with escape decoding.
+fn parse_toml_string(src: str, i: int) -> Result[Pv, str] {
+    let n: int = src.len()
+    let mut j: int = i + 1
+    let mut out: str = ""
+    while j < n && src.byte_at(j) != 34 {
+        if src.byte_at(j) == 92 && j + 1 < n {
+            let nxt: int = src.byte_at(j + 1)
+            if nxt == 110 {
+                out = out + "\n"
+                j = j + 2
+            } else if nxt == 116 {
+                out = out + "\t"
+                j = j + 2
+            } else if nxt == 114 {
+                out = out + chr(13)
+                j = j + 2
+            } else if nxt == 98 {
+                out = out + chr(8)
+                j = j + 2
+            } else if nxt == 102 {
+                out = out + chr(12)
+                j = j + 2
+            } else if nxt == 34 {
+                out = out + "\""
+                j = j + 2
+            } else if nxt == 92 {
+                out = out + "\\"
+                j = j + 2
+            } else if nxt == 117 && j + 6 <= n {
+                let cp: int = parse_hex4(src, j + 2)
+                if cp < 0 {
+                    return Result.Err("invalid \\u escape at offset "
+                        + j.to_str())
+                }
+                out = out + chr(cp)
+                j = j + 6
+            } else if nxt == 85 && j + 10 <= n {
+                let hi: int = parse_hex4(src, j + 2)
+                let lo: int = parse_hex4(src, j + 6)
+                if hi < 0 || lo < 0 {
+                    return Result.Err("invalid \\U escape at offset "
+                        + j.to_str())
+                }
+                out = out + chr(hi * 65536 + lo)
+                j = j + 10
+            } else {
+                out = out + src.slice(j + 1, j + 2)
+                j = j + 2
+            }
+        } else {
+            out = out + src.slice(j, j + 1)
+            j = j + 1
+        }
+    }
+    if j >= n {
+        return Result.Err("unterminated string literal at offset "
+            + i.to_str())
+    }
+    return Result.Ok(Pv {
+        val: tv_str(out), at: j + 1
+    })
+}
+
+# parse_value(src, i) — a TOML value: string / list / inline table / bare.
+fn parse_value(src: str, i: int) -> Result[Pv, str] {
+    let n: int = src.len()
+    let mut at: int = i
+    while at < n {
+        let b: int = src.byte_at(at)
+        if b == 32 || b == 9 || b == 13 || b == 10 {
+            at = at + 1
+        } else {
+            break
+        }
+    }
+    if at >= n {
+        return Result.Ok(Pv {
+            val: tv_null(), at: at
+        })
+    }
+    let c: int = src.byte_at(at)
+    if c == 34 {
+        return parse_toml_string(src, at)
+    }
+    if c == 91 {
+        # List of strings / bare tokens.
+        let mut j: int = at + 1
+        let items: list[Tv] = []
+        while j < n && src.byte_at(j) != 93 {
+            while j < n {
+                let b2: int = src.byte_at(j)
+                if b2 == 32 || b2 == 9 || b2 == 13 || b2 == 10 || b2 == 44 {
+                    j = j + 1
+                } else {
+                    break
+                }
+            }
+            if j >= n || src.byte_at(j) == 93 {
+                break
+            }
+            if src.byte_at(j) == 34 {
+                let s_r: Result[Pv, str] = parse_toml_string(src, j)
+                if !result_is_ok(s_r) {
+                    return s_r
+                }
+                let sp: Pv = result_unwrap(s_r)
+                items.push(sp.val)
+                j = sp.at
+            } else {
+                let mut k: int = j
+                while k < n {
+                    let b3: int = src.byte_at(k)
+                    if b3 == 32 || b3 == 9 || b3 == 13 || b3 == 10
+                    || b3 == 44 || b3 == 93 {
+                        break
+                    }
+                    k = k + 1
+                }
+                let tok: str = src.slice(j, k)
+                if tok != "" {
+                    items.push(bare_token(tok))
+                }
+                j = k
+            }
+        }
+        if j >= n {
+            return Result.Ok(Pv {
+                val: tv_list(items), at: j
+            })
+        }
+        return Result.Ok(Pv {
+            val: tv_list(items), at: j + 1
+        })
+    }
+    if c == 123 {
+        # Inline table.
+        let mut j: int = at + 1
+        let keys: list[str] = []
+        let vals: list[Tv] = []
+        while j < n && src.byte_at(j) != 125 {
+            while j < n {
+                let b2: int = src.byte_at(j)
+                if b2 == 32 || b2 == 9 || b2 == 13 || b2 == 10 || b2 == 44 {
+                    j = j + 1
+                } else {
+                    break
+                }
+            }
+            if j >= n || src.byte_at(j) == 125 {
+                break
+            }
+            let eq: int = find_from(src, "=", j)
+            if eq < 0 {
+                return Result.Err("manifest: expected '=' in inline "
+                    + "table at offset " + j.to_str())
+            }
+            let key: str = src.slice(j, eq).trim()
+            let pv: Result[Pv, str] = parse_value(src, eq + 1)
+            if !result_is_ok(pv) {
+                return pv
+            }
+            let pvo: Pv = result_unwrap(pv)
+            keys.push(key)
+            vals.push(pvo.val)
+            j = pvo.at
+        }
+        if j >= n {
+            return Result.Ok(Pv {
+                val: tv_table(keys, vals), at: j
+            })
+        }
+        return Result.Ok(Pv {
+            val: tv_table(keys, vals), at: j + 1
+        })
+    }
+    # Bare token: integer, true/false, or unquoted string.
+    let mut k2: int = at
+    while k2 < n {
+        let b4: int = src.byte_at(k2)
+        if b4 == 32 || b4 == 9 || b4 == 13 || b4 == 10 || b4 == 44
+        || b4 == 93 || b4 == 125 || b4 == 61 || b4 == 35 {
+            break
+        }
+        k2 = k2 + 1
+    }
+    let tok2: str = src.slice(at, k2)
+    return Result.Ok(Pv {
+        val: bare_token(tok2), at: k2
+    })
+}
+
+# parse_manifest(path) — parse a hls-pkg.toml manifest.
+fn parse_manifest(path: str) -> Result[Tv, str] uses Fs {
+    if !is_file_h(path) {
+        return Result.Err("manifest not found: " + path)
+    }
+    let src_raw: str = read_file(path)
+    # Strip comments — only OUTSIDE strings.
+    let lines: list[str] = src_raw.split("\n")
+    let stripped: list[str] = []
+    let mut li: int = 0
+    while li < lines.len() {
+        let r: Result[str, str] = strip_toml_comment(lines.get(li))
+        if !result_is_ok(r) {
+            return Result.Err("manifest: " + result_err_or(r, "bad comment")
+                + " (in line: " + py_repr(lines.get(li)) + ")")
+        }
+        stripped.push(result_unwrap(r))
+        li = li + 1
+    }
+    let src: str = str_join(stripped, "\n")
+    # Parse into a tree of section -> key -> value.
+    let mut result: Tv = tv_table([], [])
+    let mut current_section: str = ""
+    let mut has_section: bool = false
+    let mut parts: list[str] = []
+    let mut i: int = 0
+    let n: int = src.len()
+    while i < n {
+        while i < n {
+            let b: int = src.byte_at(i)
+            if b == 32 || b == 9 || b == 13 || b == 10 {
+                i = i + 1
+            } else {
+                break
+            }
+        }
+        if i >= n {
+            break
+        }
+        if src.byte_at(i) == 91 {
+            # Section header.
+            let j: int = find_from(src, "]", i)
+            if j < 0 {
+                return Result.Err("manifest: missing ']' after section "
+                    + "header at offset " + i.to_str())
+            }
+            current_section = src.slice(i + 1, j).trim()
+            if current_section == "" {
+                return Result.Err("manifest: empty section header at "
+                    + "offset " + i.to_str())
+            }
+            parts = split_sub(current_section, ".")
+            let er: Result[Tv, str] = tv_ensure_path(result, parts, 0,
+                                                     current_section)
+            if !result_is_ok(er) {
+                let inner: str = result_err_or(er, "bad section")
+                if inner == "shadows a non-table value" {
+                    return Result.Err("manifest: section ["
+                        + current_section + "] shadows a non-table value")
+                }
+                return er
+            }
+            result = result_unwrap(er)
+            has_section = true
+            i = j + 1
+            continue
+        }
+        # key = value
+        let eq: int = find_from(src, "=", i)
+        if eq < 0 {
+            return Result.Err("manifest: expected '=' at offset "
+                + i.to_str())
+        }
+        let key: str = src.slice(i, eq).trim()
+        if key == "" {
+            return Result.Err("manifest: empty key at offset " + i.to_str())
+        }
+        let pv: Result[Pv, str] = parse_value(src, eq + 1)
+        if !result_is_ok(pv) {
+            return Result.Err("manifest: " + result_err_or(pv, "bad value"))
+        }
+        let pvo: Pv = result_unwrap(pv)
+        if !has_section {
+            result = tv_put(result, key, pvo.val)
+        } else {
+            let sr: Result[Tv, str] = tv_set_at(result, parts, 0, key,
+                                                pvo.val, current_section)
+            if !result_is_ok(sr) {
+                return sr
+            }
+            result = result_unwrap(sr)
+        }
+        i = pvo.at
+    }
+    return Result.Ok(result)
+}
+
+# fmt_toml_value(v) — the manifest writer's value rendering.
+fn fmt_toml_value(v: Tv) -> str {
+    if v.kind == "str" {
+        let mut out: str = str_replace(v.sval, "\\", "\\\\")
+        out = str_replace(out, "\"", "\\\"")
+        out = str_replace(out, "\n", "\\n")
+        out = str_replace(out, chr(13), "\\r")
+        out = str_replace(out, "\t", "\\t")
+        out = str_replace(out, chr(8), "\\b")
+        out = str_replace(out, chr(12), "\\f")
+        return "\"" + out + "\""
+    }
+    if v.kind == "bool" {
+        if v.bval {
+            return "true"
+        }
+        return "false"
+    }
+    if v.kind == "int" {
+        return v.ival.to_str()
+    }
+    if v.kind == "float" {
+        return v.fval.to_str()
+    }
+    if v.kind == "list" {
+        let parts: list[str] = []
+        let mut i: int = 0
+        while i < v.items.len() {
+            parts.push(fmt_toml_value(v.items.get(i)))
+            i = i + 1
+        }
+        return "[" + str_join(parts, ", ") + "]"
+    }
+    if v.kind == "table" {
+        let parts2: list[str] = []
+        let mut j: int = 0
+        while j < v.keys.len() {
+            parts2.push(v.keys.get(j) + " = "
+                + fmt_toml_value(v.vals.get(j)))
+            j = j + 1
+        }
+        return "{ " + str_join(parts2, ", ") + " }"
+    }
+    return "None"
+}
+
+# write_manifest(manifest, path) — the manifest dict as TOML (top-level
+# scalars first, the known sections in order, unknown sections after).
+fn write_manifest(manifest: Tv, path: str) -> void uses Fs {
+    let lines: list[str] = []
+    let mut i: int = 0
+    while i < manifest.keys.len() {
+        if !tv_is_table(manifest.vals.get(i)) {
+            lines.push(manifest.keys.get(i) + " = "
+                + fmt_toml_value(manifest.vals.get(i)))
+        }
+        i = i + 1
+    }
+    if lines.len() > 0 {
+        lines.push("")
+    }
+    let known: list[str] = ["package", "dependencies", "effects"]
+    let mut k: int = 0
+    while k < known.len() {
+        let section: str = known.get(k)
+        if tv_has(manifest, section) {
+            lines.push("[" + section + "]")
+            let sec: Tv = tv_get(manifest, section)
+            let mut j: int = 0
+            while j < sec.keys.len() {
+                lines.push(sec.keys.get(j) + " = "
+                    + fmt_toml_value(sec.vals.get(j)))
+                j = j + 1
+            }
+            lines.push("")
+        }
+        k = k + 1
+    }
+    let mut m: int = 0
+    while m < manifest.keys.len() {
+        let key: str = manifest.keys.get(m)
+        if list_has_str(known, key) || !tv_is_table(manifest.vals.get(m)) {
+            m = m + 1
+            continue
+        }
+        lines.push("[" + key + "]")
+        let sec2: Tv = manifest.vals.get(m)
+        let mut j2: int = 0
+        while j2 < sec2.keys.len() {
+            lines.push(sec2.keys.get(j2) + " = "
+                + fmt_toml_value(sec2.vals.get(j2)))
+            j2 = j2 + 1
+        }
+        lines.push("")
+        m = m + 1
+    }
+    write_file(path, str_join(lines, "\n"))
+}
+
+# ----------------------------------------------------------------------------
+# Content hashing — sha256_file / hpkg_cmds._sha256_directory (the
+# deterministic sorted walk: rel + \0 + bytes + \0 per file).
+# ----------------------------------------------------------------------------
+
+fn sha256_file(path: str) -> str uses Fs {
+    return sha256_hex(read_or(path, ""))
+}
+
+fn dir_hash_text(dir: str, prefix: str) -> str uses Fs {
+    if !is_dir_h(dir) {
+        return ""
+    }
+    let names: list[str] = fs_read_dir(dir)
+    let files: list[str] = []
+    let dirs: list[str] = []
+    let mut ni: int = 0
+    while ni < names.len() {
+        let nm: str = names.get(ni)
+        if is_dir_h(pk_path_join(dir, nm)) {
+            dirs.push(nm)
+        } else {
+            files.push(nm)
+        }
+        ni = ni + 1
+    }
+    let mut h: str = ""
+    let sfiles: list[str] = sort_strs(files)
+    let mut fi: int = 0
+    while fi < sfiles.len() {
+        h = h + prefix + sfiles.get(fi) + chr(0)
+            + read_or(pk_path_join(dir, sfiles.get(fi)), "") + chr(0)
+        fi = fi + 1
+    }
+    let sdirs: list[str] = sort_strs(dirs)
+    let mut di: int = 0
+    while di < sdirs.len() {
+        h = h + dir_hash_text(pk_path_join(dir, sdirs.get(di)),
+                              prefix + sdirs.get(di) + "/")
+        di = di + 1
+    }
+    return h
+}
+
+fn sha256_tree(path: str) -> str uses Fs {
+    if is_file_h(path) {
+        return sha256_file(path)
+    }
+    return sha256_hex(dir_hash_text(path, ""))
+}
+
+# ----------------------------------------------------------------------------
+# The transparency log (Stage 13 release, hpkg_log) — append-only,
+# content-addressed, SHA-256 chained.
+# ----------------------------------------------------------------------------
+
+fn tlog_count_lines(text: str) -> int {
+    if text == "" {
+        return 0
+    }
+    let parts: list[str] = text.split("\n")
+    let mut n: int = parts.len()
+    if parts.get(parts.len() - 1) == "" {
+        n = n - 1
+    }
+    if n < 0 {
+        n = 0
+    }
+    return n
+}
+
+fn tlog_head_hash(text: str) -> str {
+    let prev: str = pk_genesis()
+    if text == "" {
+        return prev
+    }
+    let lines: list[str] = text.split("\n")
+    let mut last: str = ""
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).trim() != "" {
+            last = lines.get(i)
+        }
+        i = i + 1
+    }
+    if last == "" {
+        return prev
+    }
+    let pr: Result[JsonValue, str] = json_parse_result(last)
+    if result_is_ok(pr) {
+        let ch: JsonValue = json_object_get(result_unwrap(pr), "chain_hash")
+        if json_is_str(ch) {
+            let v: str = json_str_value(ch)
+            if v != "" {
+                return v
+            }
+        }
+    }
+    return prev
+}
+
+struct TlogRec {
+    seq: int,
+    chain_hash: str
+}
+
+# tlog_append(record) — build the chained record and append the line
+# (json.dumps(record, sort_keys=True) + "\n"; the .py holds an flock on
+# the sidecar lock file — this port creates it, single-writer runs).
+fn tlog_append(record: JsonValue) -> Result[TlogRec, str]
+    uses Fs, Proc, Clock, Args {
+    let log_path: str = pk_transparency_log()
+    let lock_path: str = log_path + ".lock"
+    if !file_exists(lock_path) {
+        write_file(lock_path, "")
+    }
+    let text: str = read_or(log_path, "")
+    let prev_hash: str = tlog_head_hash(text)
+    let seq: int = tlog_count_lines(text) + 1
+    let rec: JsonValue = json_object(record.obj_keys, record.obj_vals)
+    pk_obj_set(rec, "seq", json_int(seq))
+    pk_obj_set(rec, "timestamp",
+               json_int(floor_div(system_time_now_ms(), 1000)))
+    pk_obj_set(rec, "prev_hash", json_str(prev_hash))
+    let canon: str = pk_py_canon(rec)
+    let chain: str = sha256_hex(prev_hash + canon)
+    pk_obj_set(rec, "chain_hash", json_str(chain))
+    write_file(log_path, text + pk_py_line(rec) + "\n")
+    return Result.Ok(TlogRec {
+        seq: seq, chain_hash: chain
+    })
+}
+
+# tlog_lookup(name, version) — the latest log entry for name (optionally
+# version), walking from the end; null when absent.
+fn tlog_lookup(name: str, version: str) -> JsonValue uses Fs, Proc, Args {
+    let path: str = pk_transparency_log()
+    if !file_exists(path) {
+        return json_null()
+    }
+    let lines: list[str] = read_file(path).split("\n")
+    let mut i: int = lines.len() - 1
+    while i >= 0 {
+        let ln: str = lines.get(i).trim()
+        if ln != "" {
+            let pr: Result[JsonValue, str] = json_parse_result(ln)
+            if result_is_ok(pr) {
+                let rec: JsonValue = result_unwrap(pr)
+                let nm: JsonValue = json_object_get(rec, "name")
+                if json_is_str(nm) && json_str_value(nm) == name {
+                    if version == "" {
+                        return rec
+                    }
+                    let vv: JsonValue = json_object_get(rec, "version")
+                    if json_is_str(vv) && json_str_value(vv) == version {
+                        return rec
+                    }
+                }
+            }
+        }
+        i = i - 1
+    }
+    return json_null()
+}
+
+# tlog_verify_chain() — replay from genesis; the error list (empty =
+# sound). No log = nothing to verify.
+fn tlog_verify_chain() -> list[str] uses Fs, Proc, Args {
+    let errors: list[str] = []
+    let path: str = pk_transparency_log()
+    if !file_exists(path) {
+        return errors
+    }
+    let lines: list[str] = read_file(path).split("\n")
+    let mut prev_hash: str = pk_genesis()
+    let mut expected_seq: int = 1
+    let mut i: int = 0
+    while i < lines.len() {
+        let ln: str = lines.get(i).trim()
+        if ln != "" {
+            let pr: Result[JsonValue, str] = json_parse_result(ln)
+            if !result_is_ok(pr) {
+                errors.push("line " + (i + 1).to_str() + ": invalid JSON ("
+                    + result_err_or(pr, "parse error") + ")")
+            } else {
+                let rec: JsonValue = result_unwrap(pr)
+                let nm: JsonValue = json_object_get(rec, "name")
+                let mut name_disp: str = "?"
+                if json_is_str(nm) {
+                    name_disp = json_str_value(nm)
+                }
+                let prev_v: JsonValue = json_object_get(rec, "prev_hash")
+                if !(json_is_str(prev_v)
+                        && json_str_value(prev_v) == prev_hash) {
+                    errors.push("line " + (i + 1).to_str() + " ("
+                        + name_disp + "): prev_hash mismatch (expected "
+                        + clip_str(prev_hash, 12) + ", got "
+                        + clip_str(pk_py_strval(prev_v), 12) + ")")
+                }
+                let seq_v: JsonValue = json_object_get(rec, "seq")
+                if !(json_is_int(seq_v)
+                        && json_int_value(seq_v) == expected_seq) {
+                    errors.push("line " + (i + 1).to_str() + " ("
+                        + name_disp + "): seq mismatch (expected "
+                        + expected_seq.to_str() + ", got "
+                        + pk_py_strval(seq_v) + ")")
+                }
+                # Recompute the chain hash over the record minus
+                # chain_hash.
+                let body: JsonValue = json_object(rec.obj_keys,
+                                                  rec.obj_vals)
+                let keys: list[str] = []
+                let vals: list[JsonValue] = []
+                let mut bi: int = 0
+                while bi < rec.obj_keys.len() {
+                    if rec.obj_keys.get(bi) != "chain_hash" {
+                        keys.push(rec.obj_keys.get(bi))
+                        vals.push(rec.obj_vals.get(bi))
+                    }
+                    bi = bi + 1
+                }
+                body.obj_keys = keys
+                body.obj_vals = vals
+                let mut prev_str: str = pk_genesis()
+                if json_is_str(prev_v) {
+                    prev_str = json_str_value(prev_v)
+                }
+                let want: str = sha256_hex(prev_str + pk_py_canon(body))
+                let ch_v: JsonValue = json_object_get(rec, "chain_hash")
+                if !(json_is_str(ch_v) && json_str_value(ch_v) == want) {
+                    errors.push("line " + (i + 1).to_str() + " ("
+                        + name_disp + "): chain_hash mismatch")
+                }
+                if json_is_str(ch_v) && json_str_value(ch_v) != "" {
+                    prev_hash = json_str_value(ch_v)
+                }
+            }
+            expected_seq = expected_seq + 1
+        }
+        i = i + 1
+    }
+    return errors
+}
+
+# ----------------------------------------------------------------------------
+# The audit log (Stage 112, hal_ops/hal_log) — every privileged op
+# hashed + chained, fail-open unless HLS_AUDIT_STRICT.
+# ----------------------------------------------------------------------------
+
+fn audit_strict() -> bool uses Proc {
+    return env_has("HLS_AUDIT_STRICT")
+}
+
+# audit_actor() — "user@host" (HLS_AUDIT_ACTOR overrides; the OS says
+# the rest — whoami through a child, the hostname builtin).
+fn audit_actor() -> str uses Proc {
+    let over: str = env_get("HLS_AUDIT_ACTOR")
+    if over != "" {
+        return over
+    }
+    let mut user: str = env_get("USER")
+    if user == "" {
+        let r: PkRun = pk_spawn("whoami", [])
+        if r.code == 0 {
+            user = r.out.trim()
+        }
+    }
+    if user == "" {
+        user = "<unknown-user>"
+    }
+    let mut host: str = sys_hostname()
+    if host == "" {
+        host = "<unknown-host>"
+    }
+    return user + "@" + host
+}
+
+# audit_record(op, outcome, subject, has_subject, detail, has_detail) —
+# hal_ops.record: the hash-chained entry, fail-open unless strict.
+fn audit_record(op: str, outcome: str, subject: str, has_subject: bool,
+                detail: JsonValue, has_detail: bool) -> Result[bool, str]
+    uses Fs, Proc, Clock, Args, IO {
+    let entry: JsonValue = json_object([], [])
+    pk_obj_set(entry, "kind", json_str("op"))
+    pk_obj_set(entry, "op", json_str(op))
+    pk_obj_set(entry, "actor", json_str(audit_actor()))
+    pk_obj_set(entry, "outcome", json_str(outcome))
+    pk_obj_set(entry, "tool", json_str(pk_tool()))
+    pk_obj_set(entry, "tool_version", json_str(pk_audit_tool_version()))
+    if has_subject {
+        pk_obj_set(entry, "subject", json_str(subject))
+    }
+    if has_detail {
+        pk_obj_set(entry, "detail", detail)
+    }
+    let path: str = pk_audit_log_path()
+    # the write contract: a missing parent directory is the failed write
+    let parent: str = pk_path_dirname(path)
+    if parent != "" && !fs_is_dir(parent) {
+        if audit_strict() {
+            return Result.Err("the audit entry for " + op
+                + " was not written: no such directory: " + parent)
+        }
+        eprintln("hls-auditlog: warning: the audit entry for " + op
+            + " was not written (no such directory: " + parent + ")")
+        return Result.Ok(false)
+    }
+    let lock_path: str = path + ".lock"
+    if !file_exists(lock_path) {
+        write_file(lock_path, "")
+    }
+    let text: str = read_or(path, "")
+    let prev_hash: str = tlog_head_hash(text)
+    let seq: int = tlog_count_lines(text) + 1
+    pk_obj_set(entry, "seq", json_int(seq))
+    pk_obj_set(entry, "timestamp",
+               json_int(floor_div(system_time_now_ms(), 1000)))
+    pk_obj_set(entry, "prev_hash", json_str(prev_hash))
+    let canon: str = pk_py_canon(entry)
+    pk_obj_set(entry, "chain_hash", json_str(sha256_hex(prev_hash + canon)))
+    write_file(path, text + pk_py_canon(entry) + "\n")
+    return Result.Ok(true)
+}
+
+fn audit_record_ok(op: str, subject: str, has_subject: bool,
+                   detail: JsonValue, has_detail: bool) -> Result[bool, str]
+    uses Fs, Proc, Clock, Args, IO {
+    return audit_record(op, "ok", subject, has_subject, detail, has_detail)
+}
+
+# audit_record_refused(op, reason) — the refusal shorthand; the reason
+# capped at 400 (hal_ops.record_refused).
+fn audit_record_refused(op: str, reason: str) -> Result[bool, str]
+    uses Fs, Proc, Clock, Args, IO {
+    let detail: JsonValue = json_object([], [])
+    let mut capped: str = reason
+    if capped.len() > 400 {
+        capped = capped.slice(0, 400)
+    }
+    pk_obj_set(detail, "reason", json_str(capped))
+    return audit_record(op, "refused", "", false, detail, true)
+}
+
+# ----------------------------------------------------------------------------
+# The semver laws (Stage 131, hpkg_semver) — grammar, precedence,
+# compatibility.
+# ----------------------------------------------------------------------------
+
+struct SemVer {
+    major: int,
+    minor: int,
+    patch: int,
+    prerelease: list[str],
+    build: list[str],
+    text: str
+}
+
+fn sv_new(major: int, minor: int, patch: int, prerelease: list[str],
+          build: list[str], text: str) -> SemVer {
+    return SemVer {
+        major: major, minor: minor, patch: patch,
+        prerelease: prerelease, build: build, text: text
+    }
+}
+
+# parse_num_id_at(s, i) — "0" or [1-9][0-9]*: end index or -1.
+fn parse_num_id_at(s: str, i: int) -> int {
+    let n: int = s.len()
+    if i >= n {
+        return -1
+    }
+    let b: int = s.byte_at(i)
+    if b == 48 {
+        return i + 1
+    }
+    if b >= 49 && b <= 57 {
+        let mut j: int = i + 1
+        while j < n && is_digit_b(s.byte_at(j)) {
+            j = j + 1
+        }
+        return j
+    }
+    return -1
+}
+
+struct CoreOut {
+    major: int,
+    minor: int,
+    patch: int,
+    at: int,
+    ok: bool
+}
+
+# parse_core_at(s, i) — MAJOR.MINOR.PATCH with no leading zeros.
+fn parse_core_at(s: str, i: int) -> CoreOut {
+    let bad: CoreOut = CoreOut {
+        major: 0, minor: 0, patch: 0, at: i, ok: false
+    }
+    let n: int = s.len()
+    let e1: int = parse_num_id_at(s, i)
+    if e1 < 0 || e1 >= n || s.byte_at(e1) != 46 {
+        return bad
+    }
+    let e2: int = parse_num_id_at(s, e1 + 1)
+    if e2 < 0 || e2 >= n || s.byte_at(e2) != 46 {
+        return bad
+    }
+    let e3: int = parse_num_id_at(s, e2 + 1)
+    if e3 < 0 {
+        return bad
+    }
+    let maj: int = s.slice(i, e1).to_int()
+    let mino: int = s.slice(e1 + 1, e2).to_int()
+    let pat: int = s.slice(e2 + 1, e3).to_int()
+    return CoreOut {
+        major: maj, minor: mino, patch: pat, at: e3, ok: true
+    }
+}
+
+# parse_pre_id_at(s, i) — a pre-release identifier (numeric, or
+# alphanumeric with at least one letter/hyphen): end or -1.
+fn parse_pre_id_at(s: str, i: int) -> int {
+    let n: int = s.len()
+    if i >= n {
+        return -1
+    }
+    let mut j: int = i
+    while j < n && is_digit_b(s.byte_at(j)) {
+        j = j + 1
+    }
+    if j < n && (is_letter_b(s.byte_at(j)) || s.byte_at(j) == 45) {
+        while j < n && (is_digit_b(s.byte_at(j)) || is_letter_b(s.byte_at(j))
+                || s.byte_at(j) == 45) {
+            j = j + 1
+        }
+        return j
+    }
+    if j > i {
+        # all digits — must be a valid numeric identifier
+        return parse_num_id_at(s, i)
+    }
+    return -1
+}
+
+# parse_build_id_at(s, i) — [0-9A-Za-z-]+: end or -1.
+fn parse_build_id_at(s: str, i: int) -> int {
+    let n: int = s.len()
+    let mut j: int = i
+    while j < n {
+        let b: int = s.byte_at(j)
+        if is_digit_b(b) || is_letter_b(b) || b == 45 {
+            j = j + 1
+        } else {
+            break
+        }
+    }
+    if j == i {
+        return -1
+    }
+    return j
+}
+
+# parse_version(text, what) — a strict semver 2.0.0 version; Err names
+# the precise failing clause.
+fn parse_version(text: str, what: str) -> Result[SemVer, str] {
+    let s: str = text.trim()
+    if s == "" {
+        return Result.Err(what + " is empty (the grammar is: "
+            + sv_grammar() + ")")
+    }
+    let core: CoreOut = parse_core_at(s, 0)
+    if !core.ok {
+        return Result.Err(what + " " + py_repr(text)
+            + " is not MAJOR.MINOR.PATCH (the grammar is: "
+            + sv_grammar() + ")")
+    }
+    let n: int = s.len()
+    let mut i: int = core.at
+    let pre: list[str] = []
+    let build: list[str] = []
+    let mut ok: bool = true
+    if i < n && s.byte_at(i) == 45 {
+        # pre-release clause
+        i = i + 1
+        let mut parsing: bool = true
+        while parsing {
+            let e: int = parse_pre_id_at(s, i)
+            if e < 0 {
+                ok = false
+                parsing = false
+                break
+            }
+            pre.push(s.slice(i, e))
+            i = e
+            if i < n && s.byte_at(i) == 46 {
+                i = i + 1
+            } else {
+                parsing = false
+            }
+        }
+    }
+    if ok && i < n && s.byte_at(i) == 43 {
+        # build clause
+        i = i + 1
+        let mut parsing2: bool = true
+        while parsing2 {
+            let e: int = parse_build_id_at(s, i)
+            if e < 0 {
+                ok = false
+                parsing2 = false
+                break
+            }
+            build.push(s.slice(i, e))
+            i = e
+            if i < n && s.byte_at(i) == 46 {
+                i = i + 1
+            } else {
+                parsing2 = false
+            }
+        }
+    }
+    if !ok || i != n {
+        # Name the clause that failed.
+        let dash: int = s.find("-")
+        let plus: int = s.find("+")
+        if plus >= 0 && dash >= 0 && dash < plus {
+            let before_dash: str = s.slice(0, dash)
+            if parse_core_at(before_dash, 0).ok {
+                return Result.Err(what + " " + py_repr(text)
+                    + " has a malformed PRERELEASE clause (identifiers "
+                    + "must be [0-9A-Za-z-], dot-separated; numeric ones "
+                    + "without leading zeros)")
+            }
+        }
+        return Result.Err(what + " " + py_repr(text)
+            + " is not a valid semantic version (the grammar is: "
+            + sv_grammar() + ")")
+    }
+    return Result.Ok(sv_new(core.major, core.minor, core.patch, pre, build,
+                            text))
+}
+
+# try_parse_version(text) — None (null marker) instead of an error.
+fn try_parse_version(text: str) -> SemVer {
+    let r: Result[SemVer, str] = parse_version(text, "version")
+    if result_is_ok(r) {
+        return result_unwrap(r)
+    }
+    return sv_new(-1, -1, -1, [], [], "")
+}
+
+fn sv_is_none(v: SemVer) -> bool {
+    return v.major < 0
+}
+
+fn version_string(v: SemVer) -> str {
+    let mut s: str = v.major.to_str() + "." + v.minor.to_str() + "."
+        + v.patch.to_str()
+    if v.prerelease.len() > 0 {
+        s = s + "-" + str_join(v.prerelease, ".")
+    }
+    if v.build.len() > 0 {
+        s = s + "+" + str_join(v.build, ".")
+    }
+    return s
+}
+
+# cmp_pre_ident(a, b) — §11.4: numeric < alphanumeric; numeric compares
+# numerically, alphanumeric ASCII-lexically.
+fn cmp_pre_ident(a: str, b: str) -> int {
+    let a_num: bool = all_digits(a)
+    let b_num: bool = all_digits(b)
+    if a_num && b_num {
+        let av: int = a.to_int()
+        let bv: int = b.to_int()
+        if av < bv {
+            return -1
+        }
+        if av > bv {
+            return 1
+        }
+        return 0
+    }
+    if a_num {
+        return -1
+    }
+    if b_num {
+        return 1
+    }
+    if a < b {
+        return -1
+    }
+    if a > b {
+        return 1
+    }
+    return 0
+}
+
+# compare_versions(a, b) — -1 / 0 / 1 by spec §11 (build ignored).
+fn compare_versions(a: SemVer, b: SemVer) -> int {
+    if a.major != b.major {
+        if a.major < b.major {
+            return -1
+        }
+        return 1
+    }
+    if a.minor != b.minor {
+        if a.minor < b.minor {
+            return -1
+        }
+        return 1
+    }
+    if a.patch != b.patch {
+        if a.patch < b.patch {
+            return -1
+        }
+        return 1
+    }
+    # §11.2: any pre-release sorts below its own release.
+    let a_pre: bool = a.prerelease.len() > 0
+    let b_pre: bool = b.prerelease.len() > 0
+    if a_pre && !b_pre {
+        return -1
+    }
+    if !a_pre && b_pre {
+        return 1
+    }
+    if a_pre && b_pre {
+        let mut i: int = 0
+        while i < a.prerelease.len() && i < b.prerelease.len() {
+            let c: int = cmp_pre_ident(a.prerelease.get(i),
+                                       b.prerelease.get(i))
+            if c != 0 {
+                return c
+            }
+            i = i + 1
+        }
+        if a.prerelease.len() < b.prerelease.len() {
+            return -1
+        }
+        if a.prerelease.len() > b.prerelease.len() {
+            return 1
+        }
+    }
+    return 0
+}
+
+# bump_version(v, part) — bump major/minor/patch; lower components reset
+# and the pre-release/build drop.
+fn bump_version(v: SemVer, part: str) -> Result[SemVer, str] {
+    if part == "major" {
+        return Result.Ok(sv_new(v.major + 1, 0, 0, [], [],
+                                version_string(v)))
+    }
+    if part == "minor" {
+        return Result.Ok(sv_new(v.major, v.minor + 1, 0, [], [],
+                                version_string(v)))
+    }
+    if part == "patch" {
+        return Result.Ok(sv_new(v.major, v.minor, v.patch + 1, [], [],
+                                version_string(v)))
+    }
+    return Result.Err("bump part must be major, minor or patch, got "
+        + py_repr(part))
+}
+
+# tag_version(tag) — a v-prefixed tag's version, or none.
+fn tag_version(tag: str) -> SemVer {
+    if tag == "" {
+        return sv_new(-1, -1, -1, [], [], "")
+    }
+    let mut body: str = tag
+    if tag.byte_at(0) == 118 || tag.byte_at(0) == 86 {
+        body = tag.slice(1, tag.len())
+    }
+    return try_parse_version(body)
+}
+
+# ---------------------------------------------------------------------------
+# Requirements.
+# ---------------------------------------------------------------------------
+
+struct Cmp {
+    op: str,
+    bound: SemVer
+}
+
+struct Req {
+    comps: list[Cmp],
+    any_nonpre: bool,
+    text: str
+}
+
+fn cmp_holds(c: Cmp, v: SemVer) -> bool {
+    let c2: int = compare_versions(v, c.bound)
+    if c.op == ">=" {
+        return c2 >= 0
+    }
+    if c.op == ">" {
+        return c2 > 0
+    }
+    if c.op == "<=" {
+        return c2 <= 0
+    }
+    if c.op == "<" {
+        return c2 < 0
+    }
+    return c2 == 0
+}
+
+fn req_of(comps: list[Cmp], any_nonpre: bool, text: str) -> Req {
+    return Req {
+        comps: comps, any_nonpre: any_nonpre, text: text
+    }
+}
+
+# requirement_string(req) — the canonical rendering.
+fn requirement_string(req: Req) -> str {
+    let parts: list[str] = []
+    let mut i: int = 0
+    while i < req.comps.len() {
+        parts.push(req.comps.get(i).op
+            + version_string(req.comps.get(i).bound))
+        i = i + 1
+    }
+    if req.any_nonpre {
+        parts.push(">=0.0.0 (any non-prerelease)")
+    }
+    if parts.len() == 0 {
+        return "*"
+    }
+    return str_join(parts, " ")
+}
+
+struct PartialOut {
+    maj: int,
+    mino: int,
+    pat: int,
+    given: int,
+    wildcard: bool
+}
+
+# parse_partial(s, what) — 1 / 1.2 / 1.2.3 / 1.2.*.
+fn parse_partial(s: str, what: str) -> Result[PartialOut, str] {
+    let parts: list[str] = split_sub(s, ".")
+    if parts.len() > 3 {
+        return Result.Err(what + " " + py_repr(s)
+            + " has too many dots (at most MAJOR.MINOR.PATCH)")
+    }
+    let nums: list[int] = []
+    let mut wildcard: bool = false
+    let mut i: int = 0
+    while i < parts.len() {
+        let p: str = parts.get(i)
+        if p == "*" || p == "x" || p == "X" {
+            wildcard = true
+            break
+        }
+        if !all_digits(p) {
+            return Result.Err(what + " " + py_repr(s) + ": " + py_repr(p)
+                + " is not a number (the core allows digits only, no "
+                + "leading zeros)")
+        }
+        if p.len() > 1 && p.byte_at(0) == 48 {
+            return Result.Err(what + " " + py_repr(s) + ": " + py_repr(p)
+                + " has a leading zero (semver 2.0.0 refuses it)")
+        }
+        nums.push(p.to_int())
+        i = i + 1
+    }
+    let given: int = nums.len()
+    while nums.len() < 3 {
+        nums.push(0)
+    }
+    return Result.Ok(PartialOut {
+        maj: nums.get(0), mino: nums.get(1), pat: nums.get(2),
+        given: given, wildcard: wildcard
+    })
+}
+
+# is_dotted_digits(s) — fullmatch of \d+(\.\d+)*.
+fn is_dotted_digits(s: str) -> bool {
+    if s == "" {
+        return false
+    }
+    let parts: list[str] = split_sub(s, ".")
+    let mut i: int = 0
+    while i < parts.len() {
+        if !all_digits(parts.get(i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# full_version_after(op, rest, what) — the bound of an explicit
+# comparator: a FULL core, or the named partial refusal.
+fn full_version_after(op: str, rest: str, what: str) -> Result[SemVer, str] {
+    let r: Result[SemVer, str] = parse_version(rest, what)
+    if result_is_ok(r) {
+        return r
+    }
+    # Distinguish "partial" (named advice) from "garbage".
+    let mut core: str = rest
+    let d: int = rest.find("-")
+    if d >= 0 {
+        core = rest.slice(0, d)
+    }
+    let p: int = core.find("+")
+    if p >= 0 {
+        core = core.slice(0, p)
+    }
+    core = core.trim()
+    let n_parts: int = split_sub(core, ".").len()
+    if core != "" && n_parts < 3 && is_dotted_digits(core) {
+        return Result.Err(what + ": " + op + rest
+            + " needs a full MAJOR.MINOR.PATCH bound — a partial after "
+            + op + " is ambiguous (write " + core + ".0 explicitly)")
+    }
+    return r
+}
+
+# caret_range(maj, mino, pat, given, pre) — ^ semantics: the first
+# non-zero component pins the range.
+fn caret_range(maj: int, mino: int, pat: int, given: int, pre: list[str])
+    -> list[Cmp] {
+    let low: SemVer = sv_new(maj, mino, pat, pre, [], "")
+    let mut high: SemVer = sv_new(0, 0, 0, [], [], "")
+    if maj > 0 {
+        high = sv_new(maj + 1, 0, 0, [], [], "")
+    } else if given == 1 {
+        high = sv_new(1, 0, 0, [], [], "")
+    } else if mino > 0 || given == 2 {
+        high = sv_new(0, mino + 1, 0, [], [], "")
+    } else {
+        high = sv_new(0, 0, pat + 1, [], [], "")
+    }
+    let out: list[Cmp] = []
+    out.push(Cmp {
+        op: ">=", bound: low
+    })
+    out.push(Cmp {
+        op: "<", bound: high
+    })
+    return out
+}
+
+# pre_id_ok(p) — a valid pre-release identifier.
+fn pre_id_ok(p: str) -> bool {
+    return parse_pre_id_at(p, 0) == p.len()
+}
+
+# split_tokens(s) — split on commas and/or whitespace.
+fn split_tokens(s: str) -> list[str] {
+    let out: list[str] = []
+    let chunks: list[str] = split_sub(s, ",")
+    let mut i: int = 0
+    while i < chunks.len() {
+        let c: str = chunks.get(i).trim()
+        if c != "" {
+            let ws: list[str] = split_ws(c)
+            let mut j: int = 0
+            while j < ws.len() {
+                out.push(ws.get(j))
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# parse_token(tok, what) — one requirement clause.
+fn parse_token(tok: str, what: str) -> Result[list[Cmp], str] {
+    let empty: list[Cmp] = []
+    if tok == "" {
+        return Result.Ok(empty)
+    }
+    if tok == "*" || tok == "x" || tok == "X" {
+        return Result.Ok(empty)
+    }
+    let b0: int = tok.byte_at(0)
+    if b0 == 94 || b0 == 126 {
+        # Caret / tilde.
+        let mut body: str = tok.slice(1, tok.len())
+        if body == "" {
+            return Result.Err(what + ": " + py_repr(tok)
+                + " has no version after " + py_repr(tok.slice(0, 1))
+                + " (" + sv_req_grammar() + ")")
+        }
+        # Split the pre-release off FIRST.
+        let pre: list[str] = []
+        let mut core_body: str = body
+        let d: int = body.find("-")
+        if d >= 0 {
+            core_body = body.slice(0, d)
+            let pre_part: str = body.slice(d + 1, body.len())
+            if pre_part != "" {
+                let ids: list[str] = split_sub(pre_part, ".")
+                let mut i: int = 0
+                while i < ids.len() {
+                    pre.push(ids.get(i))
+                    i = i + 1
+                }
+            }
+            if pre.len() == 0 {
+                return Result.Err(what + ": " + py_repr(tok)
+                    + " has a malformed pre-release identifier")
+            }
+            let mut j: int = 0
+            while j < pre.len() {
+                if !pre_id_ok(pre.get(j)) {
+                    return Result.Err(what + ": " + py_repr(tok)
+                        + " has a malformed pre-release identifier")
+                }
+                j = j + 1
+            }
+        }
+        let p_r: Result[PartialOut, str] = parse_partial(core_body, what)
+        if !result_is_ok(p_r) {
+            return Result.Err(result_err_or(p_r, "bad partial"))
+        }
+        let po: PartialOut = result_unwrap(p_r)
+        if po.wildcard {
+            return Result.Err(what + ": wildcards under "
+                + py_repr(tok.slice(0, 1))
+                + " are not supported (write the bare partial instead)")
+        }
+        if b0 == 94 {
+            return Result.Ok(caret_range(po.maj, po.mino, po.pat, po.given,
+                                         pre))
+        }
+        # Tilde: the given components are the floor, patch floats.
+        let low: SemVer = sv_new(po.maj, po.mino, po.pat, pre, [], "")
+        let mut high: SemVer = sv_new(0, 0, 0, [], [], "")
+        if po.given >= 2 {
+            high = sv_new(po.maj, po.mino + 1, 0, [], [], "")
+        } else {
+            high = sv_new(po.maj + 1, 0, 0, [], [], "")
+        }
+        let out: list[Cmp] = []
+        out.push(Cmp {
+            op: ">=", bound: low
+        })
+        out.push(Cmp {
+            op: "<", bound: high
+        })
+        return Result.Ok(out)
+    }
+    # Explicit comparators.
+    if tok.len() >= 2 && ((tok.byte_at(0) == 62 && tok.byte_at(1) == 61)
+            || (tok.byte_at(0) == 60 && tok.byte_at(1) == 61)) {
+        let op: str = tok.slice(0, 2)
+        let b_r: Result[SemVer, str] = full_version_after(op,
+            tok.slice(2, tok.len()), what)
+        if !result_is_ok(b_r) {
+            return Result.Err(result_err_or(b_r, "bad bound"))
+        }
+        let out2: list[Cmp] = []
+        out2.push(Cmp {
+            op: op, bound: result_unwrap(b_r)
+        })
+        return Result.Ok(out2)
+    }
+    if b0 == 60 || b0 == 62 {
+        let op2: str = tok.slice(0, 1)
+        let b_r2: Result[SemVer, str] = full_version_after(op2,
+            tok.slice(1, tok.len()), what)
+        if !result_is_ok(b_r2) {
+            return Result.Err(result_err_or(b_r2, "bad bound"))
+        }
+        let out3: list[Cmp] = []
+        out3.push(Cmp {
+            op: op2, bound: result_unwrap(b_r2)
+        })
+        return Result.Ok(out3)
+    }
+    if b0 == 61 {
+        let b_r3: Result[SemVer, str] = full_version_after("=",
+            tok.slice(1, tok.len()), what)
+        if !result_is_ok(b_r3) {
+            return Result.Err(result_err_or(b_r3, "bad bound"))
+        }
+        let out4: list[Cmp] = []
+        out4.push(Cmp {
+            op: "=", bound: result_unwrap(b_r3)
+        })
+        return Result.Ok(out4)
+    }
+    # Bare: exact / partial / wildcard forms.
+    let p_r2: Result[PartialOut, str] = parse_partial(tok, what)
+    if !result_is_ok(p_r2) {
+        return Result.Err(result_err_or(p_r2, "bad partial"))
+    }
+    let po2: PartialOut = result_unwrap(p_r2)
+    let out5: list[Cmp] = []
+    if po2.wildcard {
+        let low: SemVer = sv_new(po2.maj, po2.mino, po2.pat, [], [], "")
+        if po2.given == 1 {
+            out5.push(Cmp {
+                op: ">=", bound: low
+            })
+            out5.push(Cmp {
+                op: "<", bound: sv_new(po2.maj + 1, 0, 0, [], [], "")
+            })
+        } else {
+            out5.push(Cmp {
+                op: ">=", bound: low
+            })
+            out5.push(Cmp {
+                op: "<", bound: sv_new(po2.maj, po2.mino + 1, 0, [], [], "")
+            })
+        }
+        return Result.Ok(out5)
+    }
+    if po2.given == 3 {
+        out5.push(Cmp {
+            op: "=", bound: sv_new(po2.maj, po2.mino, po2.pat, [], [], "")
+        })
+        return Result.Ok(out5)
+    }
+    if po2.given == 2 {
+        out5.push(Cmp {
+            op: ">=", bound: sv_new(po2.maj, po2.mino, 0, [], [], "")
+        })
+        out5.push(Cmp {
+            op: "<", bound: sv_new(po2.maj, po2.mino + 1, 0, [], [], "")
+        })
+        return Result.Ok(out5)
+    }
+    out5.push(Cmp {
+        op: ">=", bound: sv_new(po2.maj, 0, 0, [], [], "")
+    })
+    out5.push(Cmp {
+        op: "<", bound: sv_new(po2.maj + 1, 0, 0, [], [], "")
+    })
+    return Result.Ok(out5)
+}
+
+# parse_requirement(text, what) — a version requirement.
+fn parse_requirement(text: str, what: str) -> Result[Req, str] {
+    let s: str = text.trim()
+    if s.find("||") >= 0 {
+        return Result.Err(what + " " + py_repr(text)
+            + " uses '||' alternatives — " + sv_req_grammar())
+    }
+    if s == "" || s == "*" {
+        return Result.Ok(req_of([], true, s))
+    }
+    # Hyphen range: ` - ` with surrounding spaces.
+    if s.find(" - ") >= 0 {
+        let pieces: list[str] = split_sub(s, " - ")
+        if pieces.len() != 2 {
+            return Result.Err(what + " " + py_repr(text)
+                + ": a hyphen range takes exactly two bounds ("
+                + sv_req_grammar() + ")")
+        }
+        let lo_s: str = pieces.get(0).trim()
+        let mut hi_s: str = pieces.get(1).trim()
+        let mut extra: str = ""
+        let ws: list[str] = split_ws(hi_s)
+        if ws.len() == 2 {
+            hi_s = ws.get(0).trim()
+            extra = ws.get(1).trim()
+        }
+        let lo_r: Result[PartialOut, str] = parse_partial(lo_s, what)
+        if !result_is_ok(lo_r) {
+            return Result.Err(result_err_or(lo_r, "bad lower bound"))
+        }
+        let lo: PartialOut = result_unwrap(lo_r)
+        let comps: list[Cmp] = []
+        comps.push(Cmp {
+            op: ">=", bound: sv_new(lo.maj, lo.mino, lo.pat, [], [], "")
+        })
+        let hi_r: Result[PartialOut, str] = parse_partial(hi_s, what)
+        if !result_is_ok(hi_r) {
+            return Result.Err(result_err_or(hi_r, "bad upper bound"))
+        }
+        let hi: PartialOut = result_unwrap(hi_r)
+        if hi.given == 3 {
+            comps.push(Cmp {
+                op: "<=", bound: sv_new(hi.maj, hi.mino, hi.pat, [], [], "")
+            })
+        } else if hi.given == 2 {
+            comps.push(Cmp {
+                op: "<", bound: sv_new(hi.maj, hi.mino + 1, 0, [], [], "")
+            })
+        } else {
+            comps.push(Cmp {
+                op: "<", bound: sv_new(hi.maj + 1, 0, 0, [], [], "")
+            })
+        }
+        if extra != "" {
+            let toks: list[str] = split_tokens(extra)
+            let mut i: int = 0
+            while i < toks.len() {
+                let cr: Result[list[Cmp], str] = parse_token(toks.get(i),
+                                                             what)
+                if !result_is_ok(cr) {
+                    return Result.Err(result_err_or(cr, "bad clause"))
+                }
+                let cs: list[Cmp] = result_unwrap(cr)
+                let mut j: int = 0
+                while j < cs.len() {
+                    comps.push(cs.get(j))
+                    j = j + 1
+                }
+                i = i + 1
+            }
+        }
+        return Result.Ok(req_of(comps, false, text))
+    }
+    let comps2: list[Cmp] = []
+    let toks2: list[str] = split_tokens(s)
+    let mut i2: int = 0
+    while i2 < toks2.len() {
+        let cr2: Result[list[Cmp], str] = parse_token(toks2.get(i2), what)
+        if !result_is_ok(cr2) {
+            return Result.Err(result_err_or(cr2, "bad clause"))
+        }
+        let cs2: list[Cmp] = result_unwrap(cr2)
+        let mut j2: int = 0
+        while j2 < cs2.len() {
+            comps2.push(cs2.get(j2))
+            j2 = j2 + 1
+        }
+        i2 = i2 + 1
+    }
+    if comps2.len() == 0 {
+        # Only wildcards — matches any non-prerelease.
+        return Result.Ok(req_of([], true, text))
+    }
+    return Result.Ok(req_of(comps2, false, text))
+}
+
+# requirement_holds(req, v) — does v satisfy req? Spec precedence plus
+# the npm pre-release opt-in rule.
+fn requirement_holds(req: Req, v: SemVer) -> bool {
+    let mut i: int = 0
+    while i < req.comps.len() {
+        if !cmp_holds(req.comps.get(i), v) {
+            return false
+        }
+        i = i + 1
+    }
+    if v.prerelease.len() > 0 {
+        let mut opted: bool = false
+        let mut j: int = 0
+        while j < req.comps.len() {
+            let c: Cmp = req.comps.get(j)
+            if c.bound.prerelease.len() > 0 && c.bound.major == v.major
+            && c.bound.minor == v.minor && c.bound.patch == v.patch {
+                opted = true
+                break
+            }
+            j = j + 1
+        }
+        if !opted {
+            return false
+        }
+    }
+    if req.any_nonpre && req.comps.len() == 0 && v.prerelease.len() > 0 {
+        return false
+    }
+    return true
+}
+
+# ---------------------------------------------------------------------------
+# Semver enforcement helpers (called by the commands).
+# ---------------------------------------------------------------------------
+
+# require_package_version(manifest, what, required) — validate
+# [package].version when present; when required, refuse its absence.
+# Returns Ok(null-ish marker) for absent-not-required.
+struct PkgVer {
+    ver: SemVer,
+    present: bool
+}
+
+fn require_package_version(manifest: Tv, what: str, required: bool)
+    -> Result[PkgVer, str] {
+    if tv_has(manifest, "package") {
+        let pkg: Tv = tv_get(manifest, "package")
+        if !tv_is_table(pkg) {
+            return Result.Err(what + ": [package] section is corrupt "
+                + "(not a table)")
+        }
+        if !tv_has(pkg, "version") {
+            if required {
+                return Result.Err(what + ": no [package].version — a "
+                    + "publish must name its version (" + sv_grammar()
+                    + ")")
+            }
+            return Result.Ok(PkgVer {
+                ver: sv_new(-1, -1, -1, [], [], ""), present: false
+            })
+        }
+        let vv: Tv = tv_get(pkg, "version")
+        if !tv_is_str(vv) {
+            return Result.Err(what + ": package version must be a string, "
+                + "got " + vv.kind)
+        }
+        let r: Result[SemVer, str] = parse_version(vv.sval,
+            what + ": package version")
+        if !result_is_ok(r) {
+            return Result.Err(result_err_or(r, "bad version"))
+        }
+        return Result.Ok(PkgVer {
+            ver: result_unwrap(r), present: true
+        })
+    }
+    if required {
+        return Result.Err(what + ": no [package].version — a publish "
+            + "must name its version (" + sv_grammar() + ")")
+    }
+    return Result.Ok(PkgVer {
+        ver: sv_new(-1, -1, -1, [], [], ""), present: false
+    })
+}
+
+# require_dependency_requirements(deps) — validate every dependency's
+# `version` requirement; {name: Requirement} for those carrying one.
+struct DepReqs {
+    names: list[str],
+    reqs: list[Req]
+}
+
+fn dep_reqs_get(dr: DepReqs, name: str) -> Req {
+    let mut i: int = 0
+    while i < dr.names.len() {
+        if dr.names.get(i) == name {
+            return dr.reqs.get(i)
+        }
+        i = i + 1
+    }
+    return req_of([], false, "")
+}
+
+fn dep_reqs_has(dr: DepReqs, name: str) -> bool {
+    let mut i: int = 0
+    while i < dr.names.len() {
+        if dr.names.get(i) == name {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn require_dependency_requirements(deps: Tv) -> Result[DepReqs, str] {
+    let out: DepReqs = DepReqs {
+        names: [], reqs: []
+    }
+    if !tv_is_table(deps) {
+        return Result.Ok(out)
+    }
+    let mut i: int = 0
+    while i < deps.keys.len() {
+        let name: str = deps.keys.get(i)
+        let source: Tv = deps.vals.get(i)
+        if !tv_is_table(source) {
+            i = i + 1
+            continue
+        }
+        if !tv_has(source, "version") {
+            i = i + 1
+            continue
+        }
+        let vv: Tv = tv_get(source, "version")
+        if !tv_is_str(vv) {
+            i = i + 1
+            continue
+        }
+        let r: Result[Req, str] = parse_requirement(vv.sval,
+            "dependency " + name + " version requirement")
+        if !result_is_ok(r) {
+            return Result.Err(result_err_or(r, "bad requirement"))
+        }
+        out.names.push(name)
+        out.reqs.push(result_unwrap(r))
+        i = i + 1
+    }
+    return Result.Ok(out)
+}
+
+# manifest_version_of(resolved_path) — the self-declared version of a
+# resolved dependency (its directory's hls-pkg.toml).
+fn manifest_version_of(resolved_path: str) -> SemVer uses Fs {
+    let mut d: str = resolved_path
+    if is_file_h(d) {
+        d = pk_path_dirname(d)
+    }
+    let mpath: str = pk_path_join(d, "hls-pkg.toml")
+    if !is_file_h(mpath) {
+        return sv_new(-1, -1, -1, [], [], "")
+    }
+    let mr: Result[Tv, str] = parse_manifest(mpath)
+    if !result_is_ok(mr) {
+        return sv_new(-1, -1, -1, [], [], "")
+    }
+    let manifest: Tv = result_unwrap(mr)
+    if !tv_has(manifest, "package") {
+        return sv_new(-1, -1, -1, [], [], "")
+    }
+    let pkg: Tv = tv_get(manifest, "package")
+    if !tv_is_table(pkg) || !tv_has(pkg, "version") {
+        return sv_new(-1, -1, -1, [], [], "")
+    }
+    let vv: Tv = tv_get(pkg, "version")
+    if !tv_is_str(vv) {
+        return sv_new(-1, -1, -1, [], [], "")
+    }
+    let r: Result[SemVer, str] = parse_version(vv.sval,
+        "dependency manifest version")
+    if !result_is_ok(r) {
+        return sv_new(-1, -1, -1, [], [], "")
+    }
+    return result_unwrap(r)
+}
+
+# enforce_dep_requirement(name, req, source, resolved_path) — the
+# lock-time law: the pinned ref must satisfy the requirement.
+fn enforce_dep_requirement(name: str, req: Req, source: Tv,
+                           resolved_path: str) -> Result[SemVer, str]
+    uses Fs {
+    let mut tag: str = ""
+    if tv_is_table(source) && tv_has(source, "tag") {
+        let tv: Tv = tv_get(source, "tag")
+        if tv_is_str(tv) {
+            tag = tv.sval
+        }
+    }
+    if tag != "" {
+        let v: SemVer = tag_version(tag)
+        if sv_is_none(v) {
+            return Result.Err("dependency " + name + ": requirement "
+                + py_repr(req.text) + " cannot be checked against tag "
+                + py_repr(tag) + " — the tag is not a semantic version ("
+                + sv_grammar() + ")")
+        }
+        if !requirement_holds(req, v) {
+            return Result.Err("dependency " + name + ": tag " + tag
+                + " does not satisfy requirement " + py_repr(req.text)
+                + " (semver requires a compatible pin)")
+        }
+        return Result.Ok(v)
+    }
+    # Moving ref: the dependency's own manifest is the claim.
+    let mv: SemVer = manifest_version_of(resolved_path)
+    if sv_is_none(mv) {
+        return Result.Err("dependency " + name + ": requirement "
+            + py_repr(req.text) + " cannot be checked — the resolved "
+            + "path has no hls-pkg.toml with [package].version (pin a "
+            + "semver tag, or give the dependency a version)")
+    }
+    if !requirement_holds(req, mv) {
+        return Result.Err("dependency " + name + ": its manifest version "
+            + version_string(mv) + " does not satisfy requirement "
+            + py_repr(req.text))
+    }
+    return Result.Ok(mv)
+}
+
+# check_publish_immutability — the publish-time law: name@version is a
+# contract with the content it was first published with.
+struct PubVerdict {
+    kind: int, # 0 nothing / 1 identical / 2 refuse
+    seq: int,
+    msg: str,
+    rec_sha: str
+}
+
+fn check_publish_immutability(name: str, version: SemVer, content_sha: str,
+                              log_path: str) -> PubVerdict uses Fs {
+    let none_v: PubVerdict = PubVerdict {
+        kind: 0, seq: -1, msg: "", rec_sha: ""
+    }
+    if !file_exists(log_path) {
+        return none_v
+    }
+    let lines: list[str] = read_file(log_path).split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let ln: str = lines.get(i).trim()
+        if ln == "" || ln.find("\"kind\": \"publish\"") < 0 {
+            i = i + 1
+            continue
+        }
+        let pr: Result[JsonValue, str] = json_parse_result(ln)
+        if !result_is_ok(pr) {
+            i = i + 1
+            continue
+        }
+        let rec: JsonValue = result_unwrap(pr)
+        if pk_obj_get_str(rec, "name") != name
+        || pk_obj_get_str(rec, "kind") != "publish" {
+            i = i + 1
+            continue
+        }
+        let rv: Result[SemVer, str] = parse_version(
+            pk_obj_get_str(rec, "version"), "transparency log version")
+        if !result_is_ok(rv) {
+            i = i + 1
+            continue
+        }
+        let v2: SemVer = result_unwrap(rv)
+        if v2.major != version.major || v2.minor != version.minor
+        || v2.patch != version.patch
+        || str_join(v2.prerelease, ".") != str_join(version.prerelease, ".") {
+            i = i + 1
+            continue
+        }
+        let seq: int = pk_obj_get_int_or(rec, "seq", -1)
+        let rec_sha: str = pk_obj_get_str(rec, "sha256")
+        if rec_sha == content_sha {
+            return PubVerdict {
+                kind: 1, seq: seq, msg: "", rec_sha: rec_sha
+            }
+        }
+        return PubVerdict {
+            kind: 2, seq: seq,
+            msg: "refusing to publish " + name + "@"
+                + version_string(version) + ": this version is already "
+                + "published with different content (sha256 "
+                + clip_str(rec_sha, 12) + ", this build "
+                + clip_str(content_sha, 12) + ") — semver requires a "
+                + "version bump, not a rewrite",
+            rec_sha: rec_sha
+        }
+    }
+    return none_v
+}
+
+# ----------------------------------------------------------------------------
+# Util validations (hpkg_util) — dependency names, git args, confinement.
+# ----------------------------------------------------------------------------
+
+# validate_dep_name — dependency names become cache DIRECTORY components.
+fn validate_dep_name(name: str) -> Result[bool, str] {
+    if name == "" {
+        return Result.Err("invalid dependency name: " + py_repr(name)
+            + " (allowed: letters, digits, '.', '_', '-'; must not start "
+            + "with '.' or '-')")
+    }
+    let mut i: int = 0
+    while i < name.len() {
+        let b: int = name.byte_at(i)
+        if !(is_digit_b(b) || is_letter_b(b) || b == 46 || b == 95
+                || b == 45) {
+            return Result.Err("invalid dependency name: " + py_repr(name)
+                + " (allowed: letters, digits, '.', '_', '-'; must not "
+                + "start with '.' or '-')")
+        }
+        i = i + 1
+    }
+    let b0: int = name.byte_at(0)
+    if b0 == 46 || b0 == 45 {
+        return Result.Err("invalid dependency name: " + py_repr(name)
+            + " (allowed: letters, digits, '.', '_', '-'; must not start "
+            + "with '.' or '-')")
+    }
+    return Result.Ok(true)
+}
+
+# validate_git_arg — reject git option injection (leading '-', NULs).
+fn validate_git_arg(value: str, what: str) -> Result[bool, str] {
+    if value == "" {
+        return Result.Err(what + " must not be empty")
+    }
+    if value.byte_at(0) == 45 {
+        return Result.Err(what + " must not start with '-' (git option "
+            + "injection): " + py_repr(value))
+    }
+    if value.find(chr(0)) >= 0 {
+        return Result.Err(what + " must not contain NUL bytes")
+    }
+    return Result.Ok(true)
+}
+
+# confine(base, rel, what) — resolve rel under base and refuse escapes.
+fn confine(base_dir: str, rel: str, what: str) -> Result[str, str]
+    uses Proc {
+    if pk_path_is_abs(rel) {
+        return Result.Err(what + ": absolute paths are not allowed: "
+            + rel)
+    }
+    let parts: list[str] = split_sub(str_replace(rel, "\\", "/"), "/")
+    let mut i: int = 0
+    while i < parts.len() {
+        if parts.get(i) == ".." {
+            return Result.Err(what + ": '..' traversal is not allowed: "
+                + rel)
+        }
+        i = i + 1
+    }
+    let joined: str = pk_path_join(base_dir, rel)
+    let full: str = pk_realpath_lex(joined)
+    let base_real: str = pk_realpath_lex(base_dir)
+    if !(full == base_real || full.starts_with(base_real + "/")) {
+        return Result.Err(what + ": path escapes the allowed directory: "
+            + rel + " (resolves to " + full + ")")
+    }
+    return Result.Ok(full)
+}
+
+# ----------------------------------------------------------------------------
+# Dependency resolution (hpkg_deps).
+# ----------------------------------------------------------------------------
+
+# resolve_dependency(name, source) — resolve to a local file (or
+# directory) path: git deps clone into the cache; bare path deps are
+# confined to the repo root.
+fn resolve_dependency(name: str, source: Tv) -> Result[str, str]
+    uses Fs, Proc, Args {
+    let nr: Result[bool, str] = validate_dep_name(name)
+    if !result_is_ok(nr) {
+        return Result.Err(result_err_or(nr, "bad name"))
+    }
+    if !tv_is_table(source) {
+        return Result.Err("dependency " + name + ": source must be a "
+            + "table, got " + source.kind)
+    }
+    if tv_has(source, "git") {
+        let gv: Tv = tv_get(source, "git")
+        if !tv_is_str(gv) {
+            return Result.Err("dependency " + name
+                + " git URL must be a string, got " + gv.kind)
+        }
+        let gr: Result[bool, str] = validate_git_arg(gv.sval,
+            "dependency " + name + " git URL")
+        if !result_is_ok(gr) {
+            return Result.Err(result_err_or(gr, "bad git URL"))
+        }
+        # Git dependency. Clone into cache.
+        let cache_dir: str = pk_cache_dir()
+        pk_mkdirs(cache_dir)
+        let repo_url: str = gv.sval
+        let repo_hash: str = clip_str(sha256_hex(repo_url), 12)
+        let clone_dir: str = pk_path_join(pk_path_join(cache_dir, name),
+                                          repo_hash)
+        if !is_dir_h(clone_dir) {
+            let r: PkRun = pk_spawn("git",
+                ["clone", "--quiet", "--", repo_url, clone_dir])
+            if r.code != 0 {
+                return Result.Err("dependency " + name
+                    + ": git clone failed (exit " + r.code.to_str()
+                    + "): " + r.err.trim())
+            }
+        }
+        # Checkout tag/branch if specified.
+        let mut ref: str = "main"
+        if tv_has(source, "tag") {
+            let tvv: Tv = tv_get(source, "tag")
+            if tv_is_str(tvv) && tvv.sval != "" {
+                ref = tvv.sval
+            }
+        }
+        if ref == "main" && tv_has(source, "branch") {
+            let bv: Tv = tv_get(source, "branch")
+            if tv_is_str(bv) && bv.sval != "" {
+                ref = bv.sval
+            }
+        }
+        let rr: Result[bool, str] = validate_git_arg(ref,
+            "dependency " + name + " git ref")
+        if !result_is_ok(rr) {
+            return Result.Err(result_err_or(rr, "bad git ref"))
+        }
+        let f1: PkRun = pk_spawn("git",
+            ["-C", clone_dir, "fetch", "--quiet", "origin", "--", ref])
+        let f2: PkRun = pk_spawn("git",
+            ["-C", clone_dir, "checkout", "--quiet", ref])
+        if f1.code != 0 || f2.code != 0 {
+            return Result.Err("dependency " + name
+                + ": failed to fetch/checkout git ref '" + ref
+                + "' (declared in hls-pkg.lock). The previous behaviour "
+                + "silently fell back to 'main' — a supply-chain risk "
+                + "if the ref was force-pushed or the tag was moved. "
+                + "Inspect the upstream repository or update the "
+                + "lockfile. Git stderr: " + f1.err.trim() + " "
+                + f2.err.trim())
+        }
+        let mut path: str = ""
+        if tv_has(source, "path") {
+            let pv: Tv = tv_get(source, "path")
+            if tv_is_str(pv) {
+                path = pv.sval
+            }
+        }
+        let mut full: str = clone_dir
+        if path != "" {
+            let cr: Result[str, str] = confine(clone_dir, path,
+                "dependency " + name)
+            if !result_is_ok(cr) {
+                return Result.Err(result_err_or(cr, "bad path"))
+            }
+            full = result_unwrap(cr)
+        }
+        if is_dir_h(full) {
+            return Result.Ok(full)
+        }
+        if !is_file_h(full) {
+            return Result.Err("dependency " + name
+                + ": path not found in repo: " + full)
+        }
+        return Result.Ok(full)
+    }
+    if tv_has(source, "path") {
+        # Path dependency, confined to the repo root.
+        let pv2: Tv = tv_get(source, "path")
+        if !tv_is_str(pv2) {
+            return Result.Err("dependency " + name + ": path must be a "
+                + "string, got " + pv2.kind)
+        }
+        let cr2: Result[str, str] = confine(pk_repo_root(), pv2.sval,
+            "dependency " + name)
+        if !result_is_ok(cr2) {
+            return Result.Err(result_err_or(cr2, "bad path"))
+        }
+        let p: str = result_unwrap(cr2)
+        if is_dir_h(p) {
+            return Result.Ok(p)
+        }
+        if !is_file_h(p) {
+            return Result.Err("dependency " + name + ": path not found: "
+                + p)
+        }
+        return Result.Ok(p)
+    }
+    return Result.Err("dependency " + name + " has no git/path source")
+}
+
+# git_resolve_commit(clone_dir, ref) — a 40-char commit SHA or "".
+fn git_resolve_commit(clone_dir: str, ref: str) -> str uses Proc {
+    let r: PkRun = pk_spawn("git", ["-C", clone_dir, "rev-parse", ref])
+    if r.code != 0 {
+        return ""
+    }
+    let mut sha: str = r.out.trim()
+    if sha.len() != 40 {
+        return ""
+    }
+    let mut i: int = 0
+    while i < 40 {
+        let b: int = sha.byte_at(i)
+        if !((b >= 48 && b <= 57) || (b >= 97 && b <= 102)) {
+            return ""
+        }
+        i = i + 1
+    }
+    return sha
+}
+
+fn git_current_commit(clone_dir: str) -> str uses Proc {
+    return git_resolve_commit(clone_dir, "HEAD")
+}
+
+# ----------------------------------------------------------------------------
+# Effect extraction — run `hlboot --audit` on a generated wrapper, parse
+# the function table. Fail-closed: an unauditable dependency records the
+# FULL effect family.
+# ----------------------------------------------------------------------------
+
+struct Effects {
+    declared: list[str],
+    computed: list[str]
+}
+
+fn fail_closed_effects() -> Effects {
+    let fc: list[str] = ["Args", "Clock", "Exit", "Fs", "IO", "Net",
+                         "Proc", "Rand"]
+    return Effects {
+        declared: fc, computed: fc
+    }
+}
+
+fn known_effects() -> list[str] {
+    return ["IO", "Fs", "Clock", "Args", "Exit", "Net", "Rand", "Proc"]
+}
+
+# split_multi_space(s) — split on runs of 2+ spaces (the audit table's
+# column separator; single spaces stay inside tokens).
+fn split_multi_space(s: str) -> list[str] {
+    let tokens: list[str] = []
+    let mut cur: str = ""
+    let mut i: int = 0
+    let n: int = s.len()
+    while i < n {
+        if s.byte_at(i) == 32 {
+            let mut j: int = i
+            while j < n && s.byte_at(j) == 32 {
+                j = j + 1
+            }
+            if j - i >= 2 {
+                if cur != "" {
+                    tokens.push(cur)
+                    cur = ""
+                }
+            } else {
+                cur = cur + " "
+            }
+            i = j
+            continue
+        }
+        cur = cur + s.slice(i, i + 1)
+        i = i + 1
+    }
+    if cur != "" {
+        tokens.push(cur)
+    }
+    return tokens
+}
+
+# effects_of_column(col) — the KNOWN effect names in a declared column
+# ("pure", "(none - pure)", "(none)" and their prefixes stripped).
+fn effects_of_declared(col: str) -> list[str] {
+    let mut decl: str = col
+    let prefixes: list[str] = ["pure + ", "pure", "(none - pure)", "(none)"]
+    let mut i: int = 0
+    while i < prefixes.len() {
+        if decl.starts_with(prefixes.get(i)) {
+            decl = decl.slice(prefixes.get(i).len(), decl.len())
+        }
+        i = i + 1
+    }
+    let known: list[str] = known_effects()
+    let out: list[str] = []
+    let parts: list[str] = split_sub(decl, ",")
+    let mut j: int = 0
+    while j < parts.len() {
+        let eff: str = parts.get(j).trim()
+        if list_has_str(known, eff) {
+            list_add_uniq(out, eff)
+        }
+        j = j + 1
+    }
+    return out
+}
+
+fn effects_of_computed(col: str) -> list[str] {
+    let comp: str = str_replace(col, "(none)", "")
+    let known: list[str] = known_effects()
+    let out: list[str] = []
+    let parts: list[str] = split_sub(comp, ",")
+    let mut j: int = 0
+    while j < parts.len() {
+        let eff: str = parts.get(j).trim()
+        if list_has_str(known, eff) {
+            list_add_uniq(out, eff)
+        }
+        j = j + 1
+    }
+    return out
+}
+
+# extract_effects(file_path) — declared + computed effect sets.
+fn extract_effects(file_path: str) -> Effects
+    uses IO, Fs, Proc, Args {
+    let root: str = pk_repo_root()
+    let hlboot: str = pk_path_join(root, "bin/hlboot")
+    if !is_file_h(hlboot) {
+        eprintln("warning: cannot audit " + file_path
+            + " (hlboot not found) — recording the full effect set "
+            + "(fail closed)")
+        return fail_closed_effects()
+    }
+    # Generate a wrapper file alongside the target so relative imports
+    # work; the PID keeps concurrent audits apart.
+    let abs_target: str = pk_realpath_lex(file_path)
+    let target_dir: str = pk_path_dirname(abs_target)
+    let target_name: str = pk_path_basename(abs_target)
+    let wrapper_path: str = pk_path_join(target_dir,
+        ".hls-pkg-audit-wrapper-" + proc_pid().to_str() + ".hls")
+    write_file(wrapper_path, "# auto-generated by hls-pkg audit\n"
+        + "import \"" + target_name + "\"\n"
+        + "fn main() -> int pure { return 0 }\n")
+    let home: str = cwd_get()
+    cwd_set(root)
+    let r: PkRun = pk_spawn(hlboot, ["--audit", wrapper_path])
+    cwd_set(home)
+    pk_rm(wrapper_path)
+    if !r.spawned {
+        eprintln("warning: cannot audit " + file_path
+            + " (hlboot failed to spawn) — recording the full effect "
+            + "set (fail closed)")
+        return fail_closed_effects()
+    }
+    if r.code != 0 {
+        eprintln("warning: audit of " + file_path + " failed (exit "
+            + r.code.to_str() + ") — recording the full effect set "
+            + "(fail closed)")
+        return fail_closed_effects()
+    }
+    # Parse the audit output: the function table between the ===
+    # separators (name / declared / computed columns).
+    let declared: list[str] = []
+    let computed: list[str] = []
+    let mut rows_seen: int = 0
+    let lines: list[str] = r.out.split("\n")
+    let mut sep_count: int = 0
+    let mut li: int = 0
+    while li < lines.len() {
+        let line: str = lines.get(li)
+        let trimmed: str = line.trim()
+        let is_sep: bool = trimmed.len() >= 2
+            && trimmed.byte_at(0) == 61 && trimmed.byte_at(1) == 61
+        if is_sep {
+            sep_count = sep_count + 1
+            li = li + 1
+            continue
+        }
+        if sep_count == 2 && line.starts_with("  ") && trimmed != "" {
+            let cols: list[str] = split_multi_space(trimmed)
+            if cols.len() >= 3 && cols.get(0) != "function" {
+                rows_seen = rows_seen + 1
+                let decls: list[str] = effects_of_declared(cols.get(1))
+                let mut di: int = 0
+                while di < decls.len() {
+                    list_add_uniq(declared, decls.get(di))
+                    di = di + 1
+                }
+                let comps: list[str] = effects_of_computed(cols.get(2))
+                let mut ci: int = 0
+                while ci < comps.len() {
+                    list_add_uniq(computed, comps.get(ci))
+                    ci = ci + 1
+                }
+            }
+        }
+        li = li + 1
+    }
+    # Soundness: zero parsed rows means format drift — fail closed.
+    if rows_seen == 0 {
+        let known: list[str] = known_effects()
+        let mut hit: bool = false
+        let mut ki: int = 0
+        while ki < known.len() {
+            if r.out.find(known.get(ki)) >= 0 {
+                hit = true
+            }
+            ki = ki + 1
+        }
+        if hit || r.out.trim() != "" {
+            eprintln("warning: audit of " + file_path
+                + " produced unparseable output — recording the full "
+                + "effect set (fail closed)")
+            return fail_closed_effects()
+        }
+    }
+    return Effects {
+        declared: sort_strs(declared), computed: sort_strs(computed)
+    }
+}
+
+# ----------------------------------------------------------------------------
+# The commands (hpkg_cmds).
+# ----------------------------------------------------------------------------
+
+# cmd_init — create a new package skeleton.
+fn cmd_init(name: str) -> Result[int, str] uses IO, Fs, Proc, Clock, Args {
+    let nr: Result[bool, str] = validate_dep_name(name)
+    if !result_is_ok(nr) {
+        eprintln("error: invalid package name: "
+            + result_err_or(nr, "bad name"))
+        return Result.Ok(1)
+    }
+    let pkg_dir: str = pk_path_join(cwd_get(), name)
+    if file_exists(pkg_dir) {
+        eprintln("error: directory " + pkg_dir + " already exists")
+        return Result.Ok(1)
+    }
+    pk_mkdirs(pkg_dir)
+    # Manifest.
+    let pkg_keys: list[str] = ["name", "version", "authors", "description"]
+    let pkg_vals: list[Tv] = [tv_str(name), tv_str("0.1.0"),
+                              tv_list([]), tv_str("A HLS package.")]
+    let eff_keys: list[str] = ["allowed"]
+    let eff_vals: list[Tv] = [tv_list([])]
+    let manifest: Tv = tv_table(["package", "dependencies", "effects"],
+        [tv_table(pkg_keys, pkg_vals), tv_table([], []),
+         tv_table(eff_keys, eff_vals)])
+    write_manifest(manifest, pk_path_join(pkg_dir, "hls-pkg.toml"))
+    # Entry source.
+    write_file(pk_path_join(pkg_dir, "main.hls"),
+        "# " + name + " — generated by hls-pkg init.\n"
+        + "\n"
+        + "fn main() -> int uses IO {\n"
+        + "    println(\"Hello from " + name + "!\")\n"
+        + "    return 0\n"
+        + "}\n")
+    write_file(pk_path_join(pkg_dir, "README.md"),
+        "# " + name + "\n\nA Halis package.\n")
+    write_file(pk_path_join(pkg_dir, ".gitignore"),
+        ".hls-pkg-cache/\nhls-pkg.lock\n")
+    println("Created package skeleton in " + name + "/")
+    println("  hls-pkg.toml   — manifest")
+    println("  main.hls       — entry source")
+    println("  README.md      — package README")
+    println("  .gitignore     — ignores cache + lockfile")
+    println("")
+    println("Next steps:")
+    println("  cd " + name)
+    println("  hls-pkg add std.str https://github.com/mhieuhonda/halis-lang.git std/str.hls")
+    println("  hls-pkg lock")
+    println("  hls-pkg audit")
+    println("  hls-pkg build")
+    # Stage 112: creating a package tree is a privileged op.
+    let detail: JsonValue = json_object([], [])
+    pk_obj_set(detail, "dir", json_str(pkg_dir))
+    let ar: Result[bool, str] = audit_record_ok(op_pkg_init(), name, true,
+                                                detail, true)
+    if !result_is_ok(ar) {
+        return Result.Err(result_err_or(ar, "audit failed"))
+    }
+    return Result.Ok(0)
+}
+
+# py_dict_repr(keys, vals) — Python's %s of a dict (cmd_add's source
+# line).
+fn py_dict_repr(keys: list[str], vals: list[str]) -> str {
+    let parts: list[str] = []
+    let mut i: int = 0
+    while i < keys.len() {
+        parts.push(py_repr(keys.get(i)) + ": " + py_repr(vals.get(i)))
+        i = i + 1
+    }
+    return "{" + str_join(parts, ", ") + "}"
+}
+
+# cmd_add — add a git dependency to the manifest.
+fn cmd_add(name: str, git: str, path: str, tag: str, branch: str,
+           version: str) -> Result[int, str]
+    uses IO, Fs, Proc, Clock, Args {
+    let manifest_path: str = pk_path_join(cwd_get(), "hls-pkg.toml")
+    if !is_file_h(manifest_path) {
+        eprintln("error: no hls-pkg.toml in current directory")
+        return Result.Ok(1)
+    }
+    if tag != "" && branch != "" {
+        eprintln("error: --tag and --branch are mutually exclusive")
+        return Result.Ok(1)
+    }
+    let mr: Result[Tv, str] = parse_manifest(manifest_path)
+    if !result_is_ok(mr) {
+        return Result.Err(result_err_or(mr, "bad manifest"))
+    }
+    let mut manifest: Tv = result_unwrap(mr)
+    let mut deps: Tv = tv_table([], [])
+    if tv_has(manifest, "dependencies") {
+        let d: Tv = tv_get(manifest, "dependencies")
+        if !tv_is_table(d) {
+            eprintln("error: [dependencies] section is corrupt (not a "
+                + "table)")
+            return Result.Ok(1)
+        }
+        deps = d
+    }
+    # Validate name + git args BEFORE writing.
+    let nr: Result[bool, str] = validate_dep_name(name)
+    if !result_is_ok(nr) {
+        eprintln("error: " + result_err_or(nr, "bad name"))
+        return Result.Ok(1)
+    }
+    let gr: Result[bool, str] = validate_git_arg(git,
+        "dependency " + name + " git URL")
+    if !result_is_ok(gr) {
+        eprintln("error: " + result_err_or(gr, "bad git URL"))
+        return Result.Ok(1)
+    }
+    if tag != "" {
+        let tr: Result[bool, str] = validate_git_arg(tag,
+            "dependency " + name + " tag")
+        if !result_is_ok(tr) {
+            eprintln("error: " + result_err_or(tr, "bad tag"))
+            return Result.Ok(1)
+        }
+    }
+    if branch != "" {
+        let br: Result[bool, str] = validate_git_arg(branch,
+            "dependency " + name + " branch")
+        if !result_is_ok(br) {
+            eprintln("error: " + result_err_or(br, "bad branch"))
+            return Result.Ok(1)
+        }
+    }
+    # --version REQ: the grammar is checked at the keyboard.
+    let mut req: Req = req_of([], false, "")
+    if version != "" {
+        let rr: Result[Req, str] = parse_requirement(version,
+            "dependency " + name + " version requirement")
+        if !result_is_ok(rr) {
+            eprintln("error: " + result_err_or(rr, "bad requirement"))
+            return Result.Ok(1)
+        }
+        req = result_unwrap(rr)
+    }
+    # The source table, insertion order git, path, [tag], [branch],
+    # [version].
+    let skeys: list[str] = ["git", "path"]
+    let svals: list[Tv] = [tv_str(git), tv_str(path)]
+    let source: Tv = tv_table(skeys, svals)
+    if tag != "" {
+        source.keys.push("tag")
+        source.vals.push(tv_str(tag))
+    }
+    if branch != "" {
+        source.keys.push("branch")
+        source.vals.push(tv_str(branch))
+    }
+    if version != "" {
+        source.keys.push("version")
+        source.vals.push(tv_str(version))
+    }
+    deps = tv_put(deps, name, source)
+    manifest = tv_put(manifest, "dependencies", deps)
+    write_manifest(manifest, manifest_path)
+    println("Added dependency: " + name)
+    # The source line: Python's %s of the source dict.
+    let rkeys: list[str] = []
+    let rvals: list[str] = []
+    let mut si: int = 0
+    while si < source.keys.len() {
+        rkeys.push(source.keys.get(si))
+        rvals.push(fmt_toml_value(source.vals.get(si)))
+        si = si + 1
+    }
+    println("  source: " + py_dict_repr(rkeys, rvals))
+    if version != "" {
+        println("  requirement: " + version + " (Requirement("
+            + requirement_string(req) + "))")
+    }
+    # Stage 112: editing the manifest's dependency set is privileged.
+    let detail: JsonValue = json_object([], [])
+    pk_obj_set(detail, "git", json_str(git))
+    pk_obj_set(detail, "tag", json_str(tag))
+    pk_obj_set(detail, "branch", json_str(branch))
+    let ar: Result[bool, str] = audit_record_ok(op_pkg_add(), name, true,
+                                                detail, true)
+    if !result_is_ok(ar) {
+        return Result.Err(result_err_or(ar, "audit failed"))
+    }
+    return Result.Ok(0)
+}
+
+# load_lockfile(path) — read + validate the lockfile shape; Err carries
+# the already-printed refusal.
+fn load_lockfile(path: str) -> Result[JsonValue, str] uses IO, Fs {
+    if !file_exists(path) {
+        return Result.Err("__missing__")
+    }
+    let pr: Result[JsonValue, str] = json_parse_result(read_file(path))
+    if !result_is_ok(pr) {
+        eprintln("error: cannot read lockfile " + path + ": "
+            + result_err_or(pr, "parse error"))
+        return Result.Err("__printed__")
+    }
+    let lockfile: JsonValue = result_unwrap(pr)
+    if !json_is_object(lockfile) {
+        eprintln("error: lockfile is not a JSON object")
+        return Result.Err("__printed__")
+    }
+    let pkgs: JsonValue = json_object_get(lockfile, "packages")
+    if !json_is_array(pkgs) {
+        eprintln("error: lockfile 'packages' is not a list")
+        return Result.Err("__printed__")
+    }
+    return Result.Ok(lockfile)
+}
+
+# tv_str_or(t, key, d) — a string field of a TOML table.
+fn tv_str_or(t: Tv, key: str, d: str) -> str {
+    if tv_has(t, key) {
+        let v: Tv = tv_get(t, key)
+        if tv_is_str(v) {
+            return v.sval
+        }
+    }
+    return d
+}
+
+# cmd_lock — resolve dependencies and write hls-pkg.lock.
+fn cmd_lock(target: str, has_target: bool) -> Result[int, str]
+    uses IO, Fs, Proc, Clock, Args {
+    let cwd: str = cwd_get()
+    let manifest_path: str = pk_path_join(cwd, "hls-pkg.toml")
+    if !is_file_h(manifest_path) {
+        eprintln("error: no hls-pkg.toml in current directory")
+        return Result.Ok(1)
+    }
+    let mr: Result[Tv, str] = parse_manifest(manifest_path)
+    if !result_is_ok(mr) {
+        return Result.Err(result_err_or(mr, "bad manifest"))
+    }
+    let manifest: Tv = result_unwrap(mr)
+    let mut deps: Tv = tv_table([], [])
+    if tv_has(manifest, "dependencies") {
+        let d: Tv = tv_get(manifest, "dependencies")
+        if tv_is_table(d) {
+            deps = d
+        } else {
+            eprintln("error: [dependencies] section is corrupt (not a "
+                + "table)")
+            return Result.Ok(1)
+        }
+    }
+    let mut pkg_version: str = "0.0.0"
+    let mut pkg_name: str = "<unnamed>"
+    if tv_has(manifest, "package") {
+        let pkg: Tv = tv_get(manifest, "package")
+        if tv_is_table(pkg) {
+            pkg_version = tv_str_or(pkg, "version", "0.0.0")
+            pkg_name = tv_str_or(pkg, "name", "<unnamed>")
+        }
+    }
+    # Stage 131: the package's own version and every dependency's
+    # requirement must parse BEFORE anything is resolved.
+    let vr: Result[PkgVer, str] = require_package_version(manifest,
+        "hls-pkg lock", false)
+    if !result_is_ok(vr) {
+        return Result.Err(result_err_or(vr, "bad version"))
+    }
+    let dr: Result[DepReqs, str] = require_dependency_requirements(deps)
+    if !result_is_ok(dr) {
+        return Result.Err(result_err_or(dr, "bad requirement"))
+    }
+    let dep_reqs: DepReqs = result_unwrap(dr)
+    # The lockfile.
+    let lockfile: JsonValue = json_object([], [])
+    pk_obj_set(lockfile, "version", json_int(2))
+    if has_target {
+        pk_obj_set(lockfile, "target", json_str(target))
+    } else {
+        pk_obj_set(lockfile, "target", json_null())
+    }
+    let packages: JsonValue = json_array([])
+    pk_obj_set(lockfile, "packages", packages)
+    let mut di: int = 0
+    while di < deps.keys.len() {
+        let name: str = deps.keys.get(di)
+        let source: Tv = deps.vals.get(di)
+        print("Resolving " + name + "... ")
+        let rr: Result[str, str] = resolve_dependency(name, source)
+        if !result_is_ok(rr) {
+            println("FAILED: " + result_err_or(rr, "resolve failed"))
+            return Result.Ok(1)
+        }
+        let resolved_path: str = result_unwrap(rr)
+        let sha: str = sha256_tree(resolved_path)
+        # Stage 131: the requirement law.
+        let mut req_text: str = ""
+        let mut has_req: bool = false
+        if dep_reqs_has(dep_reqs, name) {
+            let req: Req = dep_reqs_get(dep_reqs, name)
+            req_text = req.text
+            has_req = true
+            let er: Result[SemVer, str] = enforce_dep_requirement(name, req,
+                source, resolved_path)
+            if !result_is_ok(er) {
+                println("FAILED: " + result_err_or(er, "bad pin"))
+                return Result.Ok(1)
+            }
+        }
+        let eff: Effects = extract_effects(resolved_path)
+        # Stage 13 release: the resolved version + commit hash.
+        let mut resolved_version: str = "main"
+        if tv_is_table(source) {
+            resolved_version = tv_str_or(source, "tag",
+                tv_str_or(source, "branch", "main"))
+        }
+        let mut commit: str = ""
+        if tv_is_table(source) && tv_has(source, "git") {
+            let gv: Tv = tv_get(source, "git")
+            if tv_is_str(gv) {
+                let repo_hash: str = clip_str(sha256_hex(gv.sval), 12)
+                let clone_dir: str = pk_path_join(
+                    pk_path_join(pk_cache_dir(), name), repo_hash)
+                if is_dir_h(clone_dir) {
+                    commit = git_current_commit(clone_dir)
+                }
+            }
+        }
+        # Stage 13 release: the transparency-log entry.
+        let mut log_seq: int = -1
+        let rec: JsonValue = json_object([], [])
+        pk_obj_set(rec, "name", json_str(name))
+        pk_obj_set(rec, "version", json_str(resolved_version))
+        pk_obj_set(rec, "sha256", json_str(sha))
+        if commit != "" {
+            pk_obj_set(rec, "commit", json_str(commit))
+        } else {
+            pk_obj_set(rec, "commit", json_str("<path-dep>"))
+        }
+        pk_obj_set(rec, "package", json_str(pkg_name))
+        pk_obj_set(rec, "package_version", json_str(pkg_version))
+        let ar: Result[TlogRec, str] = tlog_append(rec)
+        if result_is_ok(ar) {
+            log_seq = result_unwrap(ar).seq
+        } else {
+            eprintln("warning: transparency log write failed ("
+                + result_err_or(ar, "write failed") + ")")
+        }
+        println("OK (sha256: " + clip_str(sha, 12) + "..)")
+        let entry: JsonValue = json_object([], [])
+        pk_obj_set(entry, "name", json_str(name))
+        pk_obj_set(entry, "source", tv_to_json(source))
+        pk_obj_set(entry, "version", json_str(resolved_version))
+        if has_req {
+            pk_obj_set(entry, "requirement", json_str(req_text))
+        } else {
+            pk_obj_set(entry, "requirement", json_null())
+        }
+        if commit != "" {
+            pk_obj_set(entry, "commit", json_str(commit))
+        } else {
+            pk_obj_set(entry, "commit", json_null())
+        }
+        pk_obj_set(entry, "sha256", json_str(sha))
+        let jdecl: list[JsonValue] = []
+        let mut ei: int = 0
+        while ei < eff.declared.len() {
+            jdecl.push(json_str(eff.declared.get(ei)))
+            ei = ei + 1
+        }
+        pk_obj_set(entry, "effects", json_array(jdecl))
+        let jcomp: list[JsonValue] = []
+        let mut ej: int = 0
+        while ej < eff.computed.len() {
+            jcomp.push(json_str(eff.computed.get(ej)))
+            ej = ej + 1
+        }
+        pk_obj_set(entry, "transitive_effects", json_array(jcomp))
+        pk_obj_set(entry, "resolved_path", json_str(resolved_path))
+        if log_seq >= 0 {
+            pk_obj_set(entry, "log_seq", json_int(log_seq))
+        } else {
+            pk_obj_set(entry, "log_seq", json_null())
+        }
+        packages.arr.push(entry)
+        di = di + 1
+    }
+    # Write lockfile.
+    let lockfile_path: str = pk_path_join(cwd, "hls-pkg.lock")
+    write_file(lockfile_path, pk_json_indent2(lockfile))
+    println("")
+    println("Wrote lockfile: " + lockfile_path + " ("
+        + packages.arr.len().to_str() + " packages)")
+    # Stage 112: re-locking pins the dependency tree.
+    let detail: JsonValue = json_object([], [])
+    pk_obj_set(detail, "packages", json_int(packages.arr.len()))
+    if has_target {
+        pk_obj_set(detail, "target", json_str(target))
+    } else {
+        pk_obj_set(detail, "target", json_null())
+    }
+    let audr: Result[bool, str] = audit_record_ok(op_pkg_lock(),
+        pkg_name + "@" + pkg_version, true, detail, true)
+    if !result_is_ok(audr) {
+        return Result.Err(result_err_or(audr, "audit failed"))
+    }
+    # Effect enforcement: allowed must be a superset of every dep's
+    # computed effects.
+    if tv_has(manifest, "effects") {
+        let eff_sec: Tv = tv_get(manifest, "effects")
+        if !tv_is_table(eff_sec) {
+            eprintln("error: [effects] section is corrupt (not a table)")
+            return Result.Ok(1)
+        }
+        let allowed: list[str] = []
+        if tv_has(eff_sec, "allowed") {
+            let araw: Tv = tv_get(eff_sec, "allowed")
+            if !tv_is_list(araw) {
+                eprintln("error: [effects].allowed must be a list, got "
+                    + araw.kind)
+                return Result.Ok(1)
+            }
+            let mut ai: int = 0
+            while ai < araw.items.len() {
+                let av: Tv = araw.items.get(ai)
+                if !tv_is_str(av) {
+                    eprintln("error: [effects].allowed entries must be "
+                        + "strings, got " + av.kind)
+                    return Result.Ok(1)
+                }
+                list_add_uniq(allowed, av.sval)
+                ai = ai + 1
+            }
+        }
+        let mut violations: int = 0
+        let mut pi: int = 0
+        while pi < packages.arr.len() {
+            let pkg_e: JsonValue = packages.arr.get(pi)
+            let pname: str = pk_obj_get_str(pkg_e, "name")
+            let te: JsonValue = json_object_get(pkg_e,
+                                                "transitive_effects")
+            if json_is_array(te) {
+                let mut ti: int = 0
+                while ti < te.arr.len() {
+                    let effv: JsonValue = te.arr.get(ti)
+                    if json_is_str(effv)
+                    && !list_has_str(allowed, json_str_value(effv)) {
+                        if violations == 0 {
+                            println("")
+                            println("EFFECT VIOLATIONS:")
+                        }
+                        println("  - " + pname + " uses "
+                            + json_str_value(effv)
+                            + " (not in allowed set)")
+                        violations = violations + 1
+                    }
+                    ti = ti + 1
+                }
+            }
+            pi = pi + 1
+        }
+        if violations > 0 {
+            println("")
+            let sorted_allowed: list[str] = sort_strs(allowed)
+            if sorted_allowed.len() == 0 {
+                println("Allowed effects: (none - pure)")
+            } else {
+                println("Allowed effects: "
+                    + str_join(sorted_allowed, ", "))
+            }
+            return Result.Ok(1)
+        }
+    } else {
+        # No [effects] section at all: an empty allowed set.
+    }
+    println("All dependencies respect the package's effect surface.")
+    return Result.Ok(0)
+}
+
+# cmd_audit — print the total effect report of the dependency tree.
+fn cmd_audit() -> Result[int, str] uses IO, Fs, Proc, Clock, Args {
+    let lockfile_path: str = pk_path_join(cwd_get(), "hls-pkg.lock")
+    if !is_file_h(lockfile_path) {
+        eprintln("error: no hls-pkg.lock — run `hls-pkg lock` first")
+        return Result.Ok(1)
+    }
+    let lr: Result[JsonValue, str] = load_lockfile(lockfile_path)
+    if !result_is_ok(lr) {
+        if result_err_or(lr, "") == "__missing__" {
+            eprintln("error: no hls-pkg.lock — run `hls-pkg lock` first")
+        }
+        return Result.Ok(1)
+    }
+    let lockfile: JsonValue = result_unwrap(lr)
+    let pkgs: JsonValue = json_object_get(lockfile, "packages")
+    # Validate each entry's shape.
+    let names: list[str] = []
+    let shas: list[str] = []
+    let decls: list[str] = []
+    let trans: list[str] = []
+    let mut i: int = 0
+    while i < pkgs.arr.len() {
+        let p: JsonValue = pkgs.arr.get(i)
+        if !json_is_object(p) {
+            eprintln("warning: skipping malformed package entry (not an "
+                + "object)")
+        } else if !json_is_str(json_object_get(p, "name")) {
+            eprintln("warning: skipping package entry with "
+                + "missing/non-string name")
+        } else {
+            names.push(pk_obj_get_str(p, "name"))
+            shas.push(clip_str(pk_obj_get_str(p, "sha256"), 12))
+            let eff_list: JsonValue = json_object_get(p, "effects")
+            let mut decl: str = "(none)"
+            if json_is_array(eff_list) && eff_list.arr.len() > 0 {
+                let parts: list[str] = []
+                let mut j: int = 0
+                while j < eff_list.arr.len() {
+                    parts.push(pk_py_strval(eff_list.arr.get(j)))
+                    j = j + 1
+                }
+                decl = str_join(parts, ", ")
+            }
+            decls.push(decl)
+            let trans_list: JsonValue = json_object_get(p,
+                                                        "transitive_effects")
+            let mut tran: str = "(none)"
+            if json_is_array(trans_list) && trans_list.arr.len() > 0 {
+                let parts2: list[str] = []
+                let mut k: int = 0
+                while k < trans_list.arr.len() {
+                    parts2.push(pk_py_strval(trans_list.arr.get(k)))
+                    k = k + 1
+                }
+                tran = str_join(parts2, ", ")
+            }
+            trans.push(tran)
+        }
+        i = i + 1
+    }
+    let mut name_w: int = 4
+    let mut ni: int = 0
+    while ni < names.len() {
+        if names.get(ni).len() > name_w {
+            name_w = names.get(ni).len()
+        }
+        ni = ni + 1
+    }
+    println(str_repeat("=", name_w + 60))
+    println("  " + str_pad_right("package", name_w, " ") + "  "
+        + str_pad_right("sha256[..12]", 12, " ") + "  "
+        + str_pad_right("declared", 12, " ") + "  " + "transitive")
+    println(str_repeat("=", name_w + 60))
+    let all_effects: list[str] = []
+    let mut ri: int = 0
+    while ri < names.len() {
+        println("  " + str_pad_right(names.get(ri), name_w, " ") + "  "
+            + str_pad_right(shas.get(ri), 12, " ") + "  "
+            + str_pad_right(decls.get(ri), 12, " ") + "  "
+            + trans.get(ri))
+        let tl: JsonValue = json_object_get(pkgs.arr.get(ri),
+                                            "transitive_effects")
+        if json_is_array(tl) {
+            let mut tk: int = 0
+            while tk < tl.arr.len() {
+                if json_is_str(tl.arr.get(tk)) {
+                    list_add_uniq(all_effects,
+                                  json_str_value(tl.arr.get(tk)))
+                }
+                tk = tk + 1
+            }
+        }
+        ri = ri + 1
+    }
+    println(str_repeat("=", name_w + 60))
+    let sorted_all: list[str] = sort_strs(all_effects)
+    if sorted_all.len() == 0 {
+        println("  Total transitive effects of dependency tree: "
+            + "(none — pure library)")
+    } else {
+        println("  Total transitive effects of dependency tree: "
+            + str_join(sorted_all, ", "))
+    }
+    return Result.Ok(0)
+}
+
+# cmd_verify — verify the lockfile's hashes, commits and log entries.
+fn cmd_verify(target: str, has_target: bool) -> Result[int, str]
+    uses IO, Fs, Proc, Args {
+    let cwd: str = cwd_get()
+    let lockfile_path: str = pk_path_join(cwd, "hls-pkg.lock")
+    if !is_file_h(lockfile_path) {
+        eprintln("error: no hls-pkg.lock — run `hls-pkg lock` first")
+        return Result.Ok(1)
+    }
+    let lr: Result[JsonValue, str] = load_lockfile(lockfile_path)
+    if !result_is_ok(lr) {
+        if result_err_or(lr, "") == "__missing__" {
+            eprintln("error: no hls-pkg.lock — run `hls-pkg lock` first")
+        }
+        return Result.Ok(1)
+    }
+    let lockfile: JsonValue = result_unwrap(lr)
+    let pkgs: JsonValue = json_object_get(lockfile, "packages")
+    # Stage 22: the target check.
+    let actual_target: str = pk_obj_get_str(lockfile, "target")
+    if has_target {
+        if actual_target != target {
+            eprintln("error: lockfile target mismatch (lockfile has '"
+                + actual_target + "', expected '" + target + "') — run "
+                + "`hls-pkg lock --target " + target + "` to re-resolve "
+                + "for this target")
+            return Result.Ok(1)
+        }
+        println("lockfile target: " + actual_target + " (matches "
+            + "--target)")
+    } else {
+        if actual_target != "" {
+            println("lockfile target: " + actual_target + " (use "
+                + "--target " + actual_target + " to verify a specific "
+                + "target)")
+        }
+    }
+    let mut failures: int = 0
+    let mut warnings: int = 0
+    # Stage 131: the drift law — the manifest's CURRENT requirements.
+    let manifest_reqs: map[str, str] = map_new()
+    let manifest_path: str = pk_path_join(cwd, "hls-pkg.toml")
+    if is_file_h(manifest_path) {
+        let mr: Result[Tv, str] = parse_manifest(manifest_path)
+        if result_is_ok(mr) {
+            let m: Tv = result_unwrap(mr)
+            if tv_has(m, "dependencies") {
+                let d: Tv = tv_get(m, "dependencies")
+                if tv_is_table(d) {
+                    let mut i: int = 0
+                    while i < d.keys.len() {
+                        let src: Tv = d.vals.get(i)
+                        if tv_is_table(src) && tv_has(src, "version") {
+                            let vv: Tv = tv_get(src, "version")
+                            if tv_is_str(vv) && vv.sval != "" {
+                                manifest_reqs.set(d.keys.get(i), vv.sval)
+                            }
+                        }
+                        i = i + 1
+                    }
+                }
+            }
+        }
+    }
+    let mut pi: int = 0
+    while pi < pkgs.arr.len() {
+        let pkg: JsonValue = pkgs.arr.get(pi)
+        if !json_is_object(pkg) {
+            println("  [FAIL] <malformed entry>: not an object")
+            failures = failures + 1
+            pi = pi + 1
+            continue
+        }
+        let mut name: str = pk_obj_get_str(pkg, "name")
+        if name == "" {
+            name = "?"
+        }
+        let path: str = pk_obj_get_str(pkg, "resolved_path")
+        if path == "" || !file_exists(path) {
+            println("  [FAIL] " + name + ": file not found (" + path
+                + ")")
+            failures = failures + 1
+            pi = pi + 1
+            continue
+        }
+        let actual_sha: str = sha256_tree(path)
+        let expected_sha: str = pk_obj_get_str(pkg, "sha256")
+        if actual_sha != expected_sha {
+            println("  [FAIL] " + name + ": hash mismatch (expected "
+                + clip_str(expected_sha, 12) + ", got "
+                + clip_str(actual_sha, 12) + ")")
+            failures = failures + 1
+            pi = pi + 1
+            continue
+        }
+        # Stage 131: the requirement law, re-checked.
+        let locked_req: str = pk_obj_get_str(pkg, "requirement")
+        let has_locked_req: bool = json_is_str(
+            json_object_get(pkg, "requirement"))
+        let current_req: str = manifest_reqs.get_or(name, "")
+        let has_current_req: bool = manifest_reqs.has(name)
+        if !has_locked_req && has_current_req {
+            println("  [FAIL] " + name + ": manifest requires "
+                + py_repr(current_req) + " but the lockfile entry "
+                + "predates requirements — run `hls-pkg lock`")
+            failures = failures + 1
+            pi = pi + 1
+            continue
+        }
+        if has_locked_req && (!has_current_req || current_req != locked_req) {
+            let mut cur_disp: str = "None"
+            if has_current_req {
+                cur_disp = py_repr(current_req)
+            }
+            println("  [FAIL] " + name + ": manifest/lockfile drift "
+                + "(manifest requires " + cur_disp + ", locked with "
+                + py_repr(locked_req) + ") — run `hls-pkg lock`")
+            failures = failures + 1
+            pi = pi + 1
+            continue
+        }
+        if has_locked_req {
+            let lv: SemVer = tag_version(pk_obj_get_str(pkg, "version"))
+            if !sv_is_none(lv) {
+                let rr: Result[Req, str] = parse_requirement(locked_req,
+                    "dependency " + name + " requirement")
+                if !result_is_ok(rr) {
+                    println("  [FAIL] " + name + ": "
+                        + result_err_or(rr, "bad requirement"))
+                    failures = failures + 1
+                    pi = pi + 1
+                    continue
+                }
+                if !requirement_holds(result_unwrap(rr), lv) {
+                    println("  [FAIL] " + name + ": locked "
+                        + pk_obj_get_str(pkg, "version")
+                        + " does not satisfy requirement "
+                        + py_repr(locked_req))
+                    failures = failures + 1
+                    pi = pi + 1
+                    continue
+                }
+            }
+        }
+        # Stage 13 release: verify the git commit (if recorded).
+        let recorded_commit: str = pk_obj_get_str(pkg, "commit")
+        if recorded_commit.len() == 40 {
+            let src: JsonValue = json_object_get(pkg, "source")
+            let git_url: str = pk_obj_get_str(src, "git")
+            if json_is_object(src) && git_url != "" {
+                let nr: Result[bool, str] = validate_dep_name(name)
+                if !result_is_ok(nr) {
+                    println("  [WARN] " + name + ": commit verification "
+                        + "skipped (" + result_err_or(nr, "bad name")
+                        + ") — clone dir may be missing or stale")
+                    warnings = warnings + 1
+                } else {
+                    let repo_hash: str = clip_str(sha256_hex(git_url), 12)
+                    let clone_dir: str = pk_path_join(
+                        pk_path_join(pk_cache_dir(), name), repo_hash)
+                    if is_dir_h(clone_dir) {
+                        let cur: str = git_current_commit(clone_dir)
+                        if cur != recorded_commit {
+                            println("  [FAIL] " + name + ": commit moved "
+                                + "(expected " + clip_str(recorded_commit, 12)
+                                + ", got " + clip_str(cur, 12) + ") — a "
+                                + "moved tag detected")
+                            failures = failures + 1
+                            pi = pi + 1
+                            continue
+                        }
+                    } else {
+                        println("  [WARN] " + name + ": commit "
+                            + "verification skipped (clone dir may be "
+                            + "missing or stale)")
+                        warnings = warnings + 1
+                    }
+                }
+            }
+        }
+        # Stage 13 release: transparency-log lookup.
+        let log_seq_v: JsonValue = json_object_get(pkg, "log_seq")
+        if json_is_int(log_seq_v) {
+            let log_seq: int = json_int_value(log_seq_v)
+            let rec: JsonValue = tlog_lookup(name,
+                pk_obj_get_str(pkg, "version"))
+            if json_is_null(rec) {
+                println("  [WARN] " + name + ": no transparency log "
+                    + "entry found")
+            } else if pk_obj_get_int_or(rec, "seq", -1) != log_seq {
+                println("  [WARN] " + name + ": transparency log seq "
+                    + "drifted (expected " + log_seq.to_str() + ", got "
+                    + pk_py_strval(json_object_get(rec, "seq")) + ")")
+            } else if pk_obj_get_str(rec, "sha256") != expected_sha {
+                println("  [WARN] " + name + ": transparency log SHA-256 "
+                    + "mismatch")
+            }
+        }
+        println("  [ OK ] " + name + ": hash matches ("
+            + clip_str(actual_sha, 12) + ")")
+        pi = pi + 1
+    }
+    if failures > 0 {
+        println("")
+        println("Verification FAILED: " + failures.to_str()
+            + " packages have hash mismatches.")
+        return Result.Ok(1)
+    }
+    println("")
+    println("All " + pkgs.arr.len().to_str() + " packages verified.")
+    return Result.Ok(0)
+}
+
+# z2(n) — zero-padded two digits (the log table's timestamp).
+fn z2(n: int) -> str {
+    if n < 10 {
+        return "0" + n.to_str()
+    }
+    return n.to_str()
+}
+
+# utc_stamp(secs) — "YYYY-MM-DD HH:MM:SS" (UTC; the .py printed local
+# time — the gates never pin the table's timestamp column).
+fn utc_stamp(secs: int) -> str {
+    let days: int = floor_div(secs, 86400)
+    let rem: int = secs - days * 86400
+    let mut year: int = 1970
+    let mut d: int = days
+    while true {
+        let leap: bool = (year % 4 == 0 && year % 100 != 0)
+            || year % 400 == 0
+        let mut ylen: int = 365
+        if leap {
+            ylen = 366
+        }
+        if d >= ylen {
+            d = d - ylen
+            year = year + 1
+        } else {
+            break
+        }
+    }
+    let leap2: bool = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+    let mlens: list[int] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    if leap2 {
+        mlens.set(1, 29)
+    }
+    let mut month: int = 0
+    while d >= mlens.get(month) {
+        d = d - mlens.get(month)
+        month = month + 1
+    }
+    let mday: int = d + 1
+    let mut ystr: str = year.to_str()
+    while ystr.len() < 4 {
+        ystr = "0" + ystr
+    }
+    return ystr + "-" + z2(month + 1) + "-" + z2(mday) + " "
+        + z2(rem / 3600) + ":" + z2((rem / 60) % 60) + ":" + z2(rem % 60)
+}
+
+# cmd_log — print the transparency log (or verify its chain).
+fn cmd_log(verify: bool) -> Result[int, str] uses IO, Fs, Proc, Clock, Args {
+    if verify {
+        let errors: list[str] = tlog_verify_chain()
+        if errors.len() > 0 {
+            println("Transparency log verification FAILED:")
+            let mut i: int = 0
+            while i < errors.len() {
+                println("  - " + errors.get(i))
+                i = i + 1
+            }
+            return Result.Ok(1)
+        }
+        println("Transparency log verification OK (chain is sound).")
+        return Result.Ok(0)
+    }
+    # Print the log.
+    let path: str = pk_transparency_log()
+    if !file_exists(path) {
+        println("(no transparency log; nothing to display)")
+        return Result.Ok(0)
+    }
+    let lines: list[str] = read_file(path).split("\n")
+    let mut any: bool = false
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).trim() != "" {
+            any = true
+        }
+        i = i + 1
+    }
+    if !any {
+        println("(transparency log is empty)")
+        return Result.Ok(0)
+    }
+    println("seq  timestamp            name                  version   "
+        + "sha256[..12]")
+    println(str_repeat("-", 80))
+    let mut j: int = 0
+    while j < lines.len() {
+        let ln: str = lines.get(j).trim()
+        if ln != "" {
+            let pr: Result[JsonValue, str] = json_parse_result(ln)
+            if result_is_ok(pr) {
+                let rec: JsonValue = result_unwrap(pr)
+                let seq: int = pk_obj_get_int_or(rec, "seq", 0)
+                let ts: int = pk_obj_get_int_or(rec, "timestamp", 0)
+                let mut nm: str = "?"
+                if json_is_str(json_object_get(rec, "name")) {
+                    nm = pk_obj_get_str(rec, "name")
+                }
+                let mut ver: str = "?"
+                if json_is_str(json_object_get(rec, "version")) {
+                    ver = pk_obj_get_str(rec, "version")
+                }
+                let sha: str = pk_obj_get_str(rec, "sha256")
+                println(str_pad_left(seq.to_str(), 4, " ") + " "
+                    + str_pad_right(utc_stamp(ts), 20, " ") + " "
+                    + str_pad_right(clip_str(nm, 20), 20, " ") + " "
+                    + str_pad_right(clip_str(ver, 8), 8, " ") + " "
+                    + clip_str(sha, 12))
+            }
+        }
+        j = j + 1
+    }
+    return Result.Ok(0)
+}
+
+# cmd_publish — append the current package's content to the
+# transparency log.
+fn cmd_publish() -> Result[int, str] uses IO, Fs, Proc, Clock, Args {
+    let cwd: str = cwd_get()
+    let manifest_path: str = pk_path_join(cwd, "hls-pkg.toml")
+    if !is_file_h(manifest_path) {
+        eprintln("error: no hls-pkg.toml in current directory")
+        return Result.Ok(1)
+    }
+    let mr: Result[Tv, str] = parse_manifest(manifest_path)
+    if !result_is_ok(mr) {
+        return Result.Err(result_err_or(mr, "bad manifest"))
+    }
+    let manifest: Tv = result_unwrap(mr)
+    let mut pkg_name: str = "<unnamed>"
+    if tv_has(manifest, "package") {
+        let pkg: Tv = tv_get(manifest, "package")
+        if !tv_is_table(pkg) {
+            eprintln("error: [package] section is corrupt")
+            return Result.Ok(1)
+        }
+        pkg_name = tv_str_or(pkg, "name", "<unnamed>")
+    }
+    # Stage 131: a publish NAMES its version.
+    let vr: Result[PkgVer, str] = require_package_version(manifest,
+        "hls-pkg publish", true)
+    if !result_is_ok(vr) {
+        return Result.Err(result_err_or(vr, "bad version"))
+    }
+    let version_v: SemVer = result_unwrap(vr).ver
+    let version: str = version_string(version_v)
+    # Compute the content SHA-256 over the package's HLS sources.
+    let sources: list[str] = []
+    collect_hls_files(cwd, cwd, sources)
+    let sorted_sources: list[str] = sort_strs(sources)
+    let mut h: str = ""
+    let mut i: int = 0
+    while i < sorted_sources.len() {
+        let s: str = sorted_sources.get(i)
+        let rel: str = s.slice(cwd.len() + 1, s.len())
+        h = h + rel + chr(0) + read_or(s, "") + chr(0)
+        i = i + 1
+    }
+    let content_sha: str = sha256_hex(h)
+    # Stage 131: the immutability law.
+    let verdict: PubVerdict = check_publish_immutability(pkg_name,
+        version_v, content_sha, pk_transparency_log())
+    if verdict.kind == 1 {
+        println("Already published " + pkg_name + "@" + version
+            + " — identical content, nothing to do")
+        println("  content sha256: " + content_sha)
+        println("  ledger seq: " + verdict.seq.to_str() + " (unchanged)")
+        let detail: JsonValue = json_object([], [])
+        pk_obj_set(detail, "content_sha256", json_str(content_sha))
+        pk_obj_set(detail, "files", json_int(sorted_sources.len()))
+        pk_obj_set(detail, "ledger_seq", json_int(verdict.seq))
+        pk_obj_set(detail, "already_published", json_bool(true))
+        let ar: Result[bool, str] = audit_record_ok(op_pkg_publish(),
+            pkg_name + "@" + version, true, detail, true)
+        if !result_is_ok(ar) {
+            return Result.Err(result_err_or(ar, "audit failed"))
+        }
+        return Result.Ok(0)
+    }
+    if verdict.kind == 2 {
+        eprintln("error: " + verdict.msg)
+        let detail: JsonValue = json_object([], [])
+        pk_obj_set(detail, "reason", json_str("version already published "
+            + "with different content"))
+        let ar: Result[bool, str] = audit_record(op_pkg_publish(),
+            "refused", pkg_name + "@" + version, true, detail, true)
+        if !result_is_ok(ar) {
+            return Result.Err(result_err_or(ar, "audit failed"))
+        }
+        return Result.Ok(1)
+    }
+    # Append to the transparency log.
+    let rec: JsonValue = json_object([], [])
+    pk_obj_set(rec, "name", json_str(pkg_name))
+    pk_obj_set(rec, "version", json_str(version))
+    pk_obj_set(rec, "sha256", json_str(content_sha))
+    pk_obj_set(rec, "kind", json_str("publish"))
+    pk_obj_set(rec, "files", json_int(sorted_sources.len()))
+    let ar2: Result[TlogRec, str] = tlog_append(rec)
+    if !result_is_ok(ar2) {
+        return Result.Err(result_err_or(ar2, "log write failed"))
+    }
+    let trec: TlogRec = result_unwrap(ar2)
+    println("Published " + pkg_name + "@" + version)
+    println("  content sha256: " + content_sha)
+    println("  transparency log seq: " + trec.seq.to_str())
+    println("  chain hash: " + clip_str(trec.chain_hash, 24) + "...")
+    # Stage 112: publishing chains a claim.
+    let detail2: JsonValue = json_object([], [])
+    pk_obj_set(detail2, "content_sha256", json_str(content_sha))
+    pk_obj_set(detail2, "files", json_int(sorted_sources.len()))
+    pk_obj_set(detail2, "ledger_seq", json_int(trec.seq))
+    let ar3: Result[bool, str] = audit_record_ok(op_pkg_publish(),
+        pkg_name + "@" + version, true, detail2, true)
+    if !result_is_ok(ar3) {
+        return Result.Err(result_err_or(ar3, "audit failed"))
+    }
+    return Result.Ok(0)
+}
+
+# collect_hls_files(root, dir, out) — the *.hls walk (hidden dirs
+# skipped), absolute paths under root.
+fn collect_hls_files(root: str, dir: str, out: list[str]) -> void
+    uses Fs {
+    let names: list[str] = fs_read_dir(dir)
+    let mut i: int = 0
+    while i < names.len() {
+        let nm: str = names.get(i)
+        if nm.starts_with(".") {
+            i = i + 1
+            continue
+        }
+        let full: str = pk_path_join(dir, nm)
+        if is_dir_h(full) {
+            collect_hls_files(root, full, out)
+        } else if nm.ends_with(".hls") {
+            out.push(full)
+        }
+        i = i + 1
+    }
+}
+
+# cmd_build — compile the package with resolved dependencies.
+fn cmd_build(entry: str, lto: bool, target: str, has_target: bool,
+             wasm_opt: str, opt_level: str, glue: str)
+    -> Result[int, str] uses IO, Fs, Proc, Args {
+    let cwd: str = cwd_get()
+    let manifest_path: str = pk_path_join(cwd, "hls-pkg.toml")
+    if !is_file_h(manifest_path) {
+        eprintln("error: no hls-pkg.toml in current directory")
+        return Result.Ok(1)
+    }
+    # Parse + validate the manifest (the Stage 131 laws, before a
+    # single line is compiled).
+    let mr: Result[Tv, str] = parse_manifest(manifest_path)
+    if !result_is_ok(mr) {
+        return Result.Err(result_err_or(mr, "bad manifest"))
+    }
+    let manifest: Tv = result_unwrap(mr)
+    let vr: Result[PkgVer, str] = require_package_version(manifest,
+        "hls-pkg build", false)
+    if !result_is_ok(vr) {
+        return Result.Err(result_err_or(vr, "bad version"))
+    }
+    let mut deps: Tv = tv_table([], [])
+    if tv_has(manifest, "dependencies") {
+        let d: Tv = tv_get(manifest, "dependencies")
+        if tv_is_table(d) {
+            deps = d
+        }
+    }
+    let dr: Result[DepReqs, str] = require_dependency_requirements(deps)
+    if !result_is_ok(dr) {
+        return Result.Err(result_err_or(dr, "bad requirement"))
+    }
+    if !is_file_h(entry) {
+        eprintln("error: entry file not found: " + entry)
+        return Result.Ok(1)
+    }
+    println("Building " + entry + "...")
+    let lock_path: str = pk_path_join(cwd, "hls-pkg.lock")
+    let mut have_deps: bool = false
+    if is_file_h(lock_path) {
+        let lr: Result[JsonValue, str] = load_lockfile(lock_path)
+        if !result_is_ok(lr) {
+            return Result.Ok(1)
+        }
+        let lockfile: JsonValue = result_unwrap(lr)
+        let deps_dir: str = pk_path_join(cwd, ".hls-pkg-deps")
+        pk_mkdirs(deps_dir)
+        let pkgs: JsonValue = json_object_get(lockfile, "packages")
+        let mut i: int = 0
+        while i < pkgs.arr.len() {
+            let pkg: JsonValue = pkgs.arr.get(i)
+            if !json_is_object(pkg) {
+                i = i + 1
+                continue
+            }
+            let rp: str = pk_obj_get_str(pkg, "resolved_path")
+            let mut pname: str = pk_obj_get_str(pkg, "name")
+            if pname == "" {
+                pname = "?"
+            }
+            if rp == "" || !file_exists(rp) {
+                eprintln("error: dependency " + pname + ": resolved "
+                    + "path missing (" + rp + ") — run `hls-pkg lock` "
+                    + "again")
+                return Result.Ok(1)
+            }
+            let nr: Result[bool, str] = validate_dep_name(pname)
+            if !result_is_ok(nr) {
+                eprintln("error: lockfile contains "
+                    + result_err_or(nr, "bad name"))
+                return Result.Ok(1)
+            }
+            # Verify hash (BUG-DS4-24 — fail closed on TOCTOU).
+            let actual_sha: str = sha256_tree(rp)
+            if actual_sha != pk_obj_get_str(pkg, "sha256") {
+                eprintln("error: dependency " + pname + " hash mismatch "
+                    + "(expected "
+                    + clip_str(pk_obj_get_str(pkg, "sha256"), 12)
+                    + ", got " + clip_str(actual_sha, 12) + ") — run "
+                    + "`hls-pkg lock` again, or investigate.")
+                return Result.Ok(1)
+            }
+            # Stage the dep: symlink the whole dir for dir deps, else
+            # link as <name>.hls (copy when symlinks are unavailable).
+            if is_dir_h(rp) {
+                let dst: str = pk_path_join(deps_dir, pname)
+                pk_rm(dst)
+                let rc: int = pk_sh("ln -s '" + pk_shell_quote(
+                    pk_realpath_lex(rp)) + "' '" + pk_shell_quote(dst)
+                    + "'")
+                if rc != 0 {
+                    pk_sh("cp -r '" + pk_shell_quote(rp) + "' '"
+                        + pk_shell_quote(dst) + "'")
+                }
+            } else {
+                let dst2: str = pk_path_join(deps_dir, pname + ".hls")
+                pk_rm(dst2)
+                let rc2: int = pk_sh("ln -s '" + pk_shell_quote(
+                    pk_realpath_lex(rp)) + "' '" + pk_shell_quote(dst2)
+                    + "'")
+                if rc2 != 0 {
+                    pk_sh("cp '" + pk_shell_quote(rp) + "' '"
+                        + pk_shell_quote(dst2) + "'")
+                }
+            }
+            i = i + 1
+        }
+        env_set("HLS_PKG_DEPS", deps_dir)
+        have_deps = true
+    }
+    let root: str = pk_repo_root()
+    # Stage 20: --lto — compile natively with the whole-program LTO
+    # pipeline: hlc --lto -> C -> cc -> run.
+    if lto {
+        let hlc: str = pk_path_join(root, "bin/hlc")
+        if !is_file_h(hlc) {
+            eprintln("error: cannot find bin/hlc (repo layout changed?)")
+            return Result.Ok(1)
+        }
+        let out_dir: str = pk_path_join(cwd, ".hls-pkg-build")
+        pk_mkdirs(out_dir)
+        let out_c: str = pk_path_join(out_dir, "pkg_lto.c")
+        let out_bin: str = pk_path_join(out_dir, "pkg_lto_bin")
+        println("  $ " + hlc + " --lto " + entry + " " + out_c)
+        let r1: int = pk_spawn_inherit(hlc, ["--lto", entry, out_c])
+        if r1 != 0 {
+            return Result.Ok(r1)
+        }
+        let mut cc: str = env_get("CC")
+        if cc == "" {
+            cc = "cc"
+        }
+        println("  $ " + cc + " -O2 -o " + out_bin + " " + out_c
+            + " -lm -pthread")
+        let r2: int = pk_spawn_inherit(cc, ["-O2", "-o", out_bin, out_c,
+                                            "-lm", "-pthread"])
+        if r2 != 0 {
+            return Result.Ok(r2)
+        }
+        println("  $ " + out_bin)
+        let r3: int = pk_spawn_inherit(out_bin, [])
+        return Result.Ok(r3)
+    }
+    # Stage 24: wasm32 targets go through hlwasm (with wasm-opt).
+    if has_target && target.starts_with("wasm32") {
+        let hlwasm: str = pk_path_join(root, "tools/hlwasm.py")
+        if !is_file_h(hlwasm) {
+            eprintln("error: cannot find tools/hlwasm.py (repo layout "
+                + "changed?)")
+            return Result.Ok(1)
+        }
+        let out_dir2: str = pk_path_join(cwd, ".hls-pkg-build")
+        pk_mkdirs(out_dir2)
+        let out_base: str = pk_path_join(out_dir2, "pkg_wasm")
+        let cmd: str = "python3 '" + pk_shell_quote(hlwasm) + "' '"
+            + pk_shell_quote(entry) + "' '" + pk_shell_quote(out_base)
+            + "' --target " + target + " --wasm-opt " + wasm_opt
+            + " --opt-level " + opt_level + " --glue " + glue
+        println("  $ " + cmd)
+        let rc: int = pk_sh(cmd)
+        return Result.Ok(rc)
+    }
+    # Stage 22: --target <triple> — cross-compile via hlcross.
+    if has_target {
+        let hlcross: str = pk_path_join(root, "tools/hlcross.py")
+        if !is_file_h(hlcross) {
+            eprintln("error: cannot find tools/hlcross.py (repo layout "
+                + "changed?)")
+            return Result.Ok(1)
+        }
+        let out_dir3: str = pk_path_join(cwd, ".hls-pkg-build")
+        pk_mkdirs(out_dir3)
+        let out_bin2: str = pk_path_join(out_dir3, "pkg_cross_"
+            + str_replace(target, "-", "_"))
+        let cmd2: str = "python3 '" + pk_shell_quote(hlcross) + "' '"
+            + pk_shell_quote(entry) + "' '" + pk_shell_quote(out_bin2)
+            + "' --target " + target
+        println("  $ " + cmd2)
+        let rc2: int = pk_sh(cmd2)
+        return Result.Ok(rc2)
+    }
+    # The default: run the entry through the evaluator.
+    let hlboot: str = pk_path_join(root, "bin/hlboot")
+    if !is_file_h(hlboot) {
+        eprintln("error: cannot find bin/hlboot (repo layout changed?)")
+        return Result.Ok(1)
+    }
+    println("  $ " + hlboot + " " + entry)
+    let r: int = pk_spawn_inherit(hlboot, [entry])
+    if r < 0 {
+        eprintln("error: failed to spawn " + hlboot)
+        return Result.Ok(1)
+    }
+    return Result.Ok(r)
+}
+
+# cmd_semver — the semver laws as a CLI.
+fn cmd_semver(sub: str, a: str, b: str, part: str) -> Result[int, str]
+    uses IO {
+    if sub == "check" {
+        let r: Result[SemVer, str] = parse_version(a, "version")
+        if !result_is_ok(r) {
+            eprintln("error: " + result_err_or(r, "bad version"))
+            return Result.Ok(1)
+        }
+        println(version_string(result_unwrap(r)))
+        return Result.Ok(0)
+    }
+    if sub == "cmp" {
+        let ra: Result[SemVer, str] = parse_version(a, "first version")
+        if !result_is_ok(ra) {
+            eprintln("error: " + result_err_or(ra, "bad version"))
+            return Result.Ok(2)
+        }
+        let rb: Result[SemVer, str] = parse_version(b, "second version")
+        if !result_is_ok(rb) {
+            eprintln("error: " + result_err_or(rb, "bad version"))
+            return Result.Ok(2)
+        }
+        println(compare_versions(result_unwrap(ra),
+                                 result_unwrap(rb)).to_str())
+        return Result.Ok(0)
+    }
+    if sub == "bump" {
+        let rv: Result[SemVer, str] = parse_version(b, "version")
+        if !result_is_ok(rv) {
+            eprintln("error: " + result_err_or(rv, "bad version"))
+            return Result.Ok(2)
+        }
+        let rb2: Result[SemVer, str] = bump_version(result_unwrap(rv),
+                                                    part)
+        if !result_is_ok(rb2) {
+            eprintln("error: " + result_err_or(rb2, "bad part"))
+            return Result.Ok(2)
+        }
+        println(version_string(result_unwrap(rb2)))
+        return Result.Ok(0)
+    }
+    if sub == "sat" {
+        let rv2: Result[SemVer, str] = parse_version(a, "version")
+        if !result_is_ok(rv2) {
+            eprintln("error: " + result_err_or(rv2, "bad version"))
+            return Result.Ok(2)
+        }
+        let rr: Result[Req, str] = parse_requirement(b, "requirement")
+        if !result_is_ok(rr) {
+            eprintln("error: " + result_err_or(rr, "bad requirement"))
+            return Result.Ok(2)
+        }
+        let v: SemVer = result_unwrap(rv2)
+        let req: Req = result_unwrap(rr)
+        if requirement_holds(req, v) {
+            println(version_string(v) + " satisfies "
+                + requirement_string(req))
+            return Result.Ok(0)
+        }
+        println(version_string(v) + " does NOT satisfy "
+            + requirement_string(req))
+        return Result.Ok(1)
+    }
+    eprintln("error: unknown semver subcommand: " + py_repr(sub))
+    return Result.Ok(2)
+}
+
+# ----------------------------------------------------------------------------
+# The private probe modes (the gates' front door to the module
+# internals the batteries imported directly).
+# ----------------------------------------------------------------------------
+
+# probe_semver(argv) — the hpkg_semver module probes, same printed
+# lines as the gate's retired python driver.
+fn probe_semver(argv: list[str]) -> int uses IO {
+    let mode: str = argv.get(0)
+    if mode == "chain" {
+        let chain: list[str] = ["1.0.0-alpha", "1.0.0-alpha.1",
+                                "1.0.0-alpha.beta", "1.0.0-beta",
+                                "1.0.0-beta.2", "1.0.0-beta.11",
+                                "1.0.0-rc.1", "1.0.0"]
+        let parts: list[str] = []
+        let mut i: int = 0
+        while i < chain.len() - 1 {
+            let a: SemVer = try_parse_version(chain.get(i))
+            let b: SemVer = try_parse_version(chain.get(i + 1))
+            let mut lt: int = 0
+            if compare_versions(a, b) < 0 {
+                lt = 1
+            }
+            parts.push(lt.to_str())
+            i = i + 1
+        }
+        println(str_join(parts, " "))
+        return 0
+    }
+    if mode == "vercmp" {
+        let a: SemVer = try_parse_version(argv.get(1))
+        let b: SemVer = try_parse_version(argv.get(2))
+        if sv_is_none(a) || sv_is_none(b) {
+            eprintln("error: bad version")
+            return 1
+        }
+        println(compare_versions(a, b).to_str())
+        return 0
+    }
+    if mode == "refv" {
+        let v: SemVer = try_parse_version(argv.get(1))
+        if sv_is_none(v) {
+            println("1")
+        } else {
+            println("0")
+        }
+        return 0
+    }
+    if mode == "verstr" {
+        let v2: SemVer = try_parse_version(argv.get(1))
+        if sv_is_none(v2) {
+            eprintln("error: bad version")
+            return 1
+        }
+        println(version_string(v2))
+        return 0
+    }
+    if mode == "tagv" {
+        let tv: SemVer = tag_version(argv.get(1))
+        if sv_is_none(tv) {
+            println("NONE")
+        } else {
+            let mut pre: str = "-"
+            if tv.prerelease.len() > 0 {
+                pre = str_join(tv.prerelease, ".")
+            }
+            println(tv.major.to_str() + "." + tv.minor.to_str() + "."
+                + tv.patch.to_str() + "." + pre)
+        }
+        return 0
+    }
+    if mode == "bumpv" {
+        let v3: SemVer = try_parse_version(argv.get(1))
+        if sv_is_none(v3) {
+            println("ERR")
+            return 0
+        }
+        let rb: Result[SemVer, str] = bump_version(v3, argv.get(2))
+        if !result_is_ok(rb) {
+            println("ERR")
+            return 0
+        }
+        println(version_string(result_unwrap(rb)))
+        return 0
+    }
+    if mode == "sat" {
+        let rr: Result[Req, str] = parse_requirement(argv.get(1),
+                                                     "requirement")
+        let rv: Result[SemVer, str] = parse_version(argv.get(2), "version")
+        if !result_is_ok(rr) || !result_is_ok(rv) {
+            eprintln("error: bad input")
+            return 1
+        }
+        let mut holds: int = 0
+        if requirement_holds(result_unwrap(rr), result_unwrap(rv)) {
+            holds = 1
+        }
+        println(holds.to_str())
+        return 0
+    }
+    if mode == "reqref" {
+        let rr2: Result[Req, str] = parse_requirement(argv.get(1),
+                                                      "requirement")
+        if result_is_ok(rr2) {
+            println("0")
+        } else {
+            println("1")
+        }
+        return 0
+    }
+    if mode == "anynonpre" {
+        let rr3: Result[Req, str] = parse_requirement(argv.get(1),
+                                                      "requirement")
+        if !result_is_ok(rr3) {
+            eprintln("error: bad requirement")
+            return 1
+        }
+        let mut anynp: int = 0
+        if result_unwrap(rr3).any_nonpre {
+            anynp = 1
+        }
+        println(anynp.to_str())
+        return 0
+    }
+    eprintln("error: unknown probe mode: " + mode)
+    return 2
+}
+
+# probe_dirhash(argv) — hpkg_cmds._sha256_directory through the front
+# door: argv = ROOT DIR...; prints "DIRHASH <dir> <sha>" per dir.
+fn probe_dirhash(argv: list[str]) -> int uses IO, Fs {
+    if argv.len() < 2 {
+        eprintln("error: --probe-dirhash needs a root and directories")
+        return 2
+    }
+    let root: str = argv.get(0)
+    let mut i: int = 1
+    while i < argv.len() {
+        let d: str = argv.get(i)
+        let full: str = pk_path_join(root, d)
+        println("DIRHASH " + d + " " + sha256_tree(full))
+        i = i + 1
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# The CLI (hpkg_cli) — argparse's grammar, the same exit codes.
+# ----------------------------------------------------------------------------
+
+# list_slice(xs, a, b) — xs[a..b).
+fn list_slice(xs: list[str], a: int, b: int) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = a
+    while i < b && i < xs.len() {
+        out.push(xs.get(i))
+        i = i + 1
+    }
+    return out
+}
+
+fn pk_usage() -> str {
+    return "usage: hls-pkg [-h] "
+        + "{init,add,lock,audit,verify,build,publish,log,semver} ...\n"
+}
+
+fn pk_usage_error(msg: str) -> int uses IO {
+    eprint(pk_usage())
+    eprintln("hls-pkg: error: " + msg)
+    return 2
+}
+
+# CliArgs — everything every subcommand can carry.
+struct CliArgs {
+    name: str,
+    git: str,
+    path: str,
+    tag: str,
+    branch: str,
+    version: str,
+    target: str,
+    has_target: bool,
+    entry: str,
+    lto: bool,
+    wasm_opt: str,
+    opt_level: str,
+    glue: str,
+    verify: bool,
+    semver_sub: str,
+    a: str,
+    b: str,
+    part: str
+}
+
+fn cli_args_new() -> CliArgs {
+    return CliArgs {
+        name: "", git: "", path: "", tag: "", branch: "", version: "",
+        target: "", has_target: false, entry: "", lto: false,
+        wasm_opt: "auto", opt_level: "O3", glue: "compact",
+        verify: false, semver_sub: "", a: "", b: "", part: ""
+    }
+}
+
+# main() — the CLI dispatch.
+fn main() -> int uses IO, Fs, Proc, Clock, Args, Exit {
+    let argv: list[str] = args()
+    if argv.len() < 2 {
+        return pk_usage_error("the following arguments are required: cmd")
+    }
+    let cmd: str = argv.get(1)
+    # The private probe modes come before the subcommand grammar.
+    if cmd == "--probe-semver" {
+        if argv.len() < 3 {
+            return pk_usage_error("--probe-semver needs a mode")
+        }
+        return probe_semver(list_slice(argv, 2, argv.len()))
+    }
+    if cmd == "--probe-dirhash" {
+        return probe_dirhash(list_slice(argv, 2, argv.len()))
+    }
+    if cmd == "-h" || cmd == "--help" {
+        print(pk_usage())
+        println("")
+        println("Halis package manager (Stage 13 release).")
+        return 0
+    }
+    let cli: CliArgs = cli_args_new()
+    let mut usage_err: str = ""
+    let mut i: int = 2
+    if cmd == "init" {
+        if argv.len() < 3 {
+            return pk_usage_error("the following arguments are required: "
+                + "name")
+        }
+        cli.name = argv.get(2)
+        if argv.len() > 3 {
+            return pk_usage_error("unrecognized arguments: "
+                + argv.get(3))
+        }
+    } else if cmd == "add" {
+        let positional: list[str] = []
+        while i < argv.len() {
+            let a: str = argv.get(i)
+            if a == "--tag" && i + 1 < argv.len() {
+                cli.tag = argv.get(i + 1)
+                i = i + 2
+            } else if a == "--branch" && i + 1 < argv.len() {
+                cli.branch = argv.get(i + 1)
+                i = i + 2
+            } else if a == "--version" && i + 1 < argv.len() {
+                cli.version = argv.get(i + 1)
+                i = i + 2
+            } else if a.starts_with("-") && a != "-" {
+                usage_err = "unrecognized arguments: " + a
+                break
+            } else {
+                positional.push(a)
+                i = i + 1
+            }
+        }
+        if usage_err == "" && positional.len() < 3 {
+            usage_err = "the following arguments are required: name, "
+                + "git, path"
+        }
+        if usage_err == "" && positional.len() > 3 {
+            usage_err = "unrecognized arguments: " + positional.get(3)
+        }
+        if usage_err == "" {
+            cli.name = positional.get(0)
+            cli.git = positional.get(1)
+            cli.path = positional.get(2)
+        }
+    } else if cmd == "lock" || cmd == "verify" {
+        while i < argv.len() {
+            let a: str = argv.get(i)
+            if a == "--target" && i + 1 < argv.len() {
+                cli.target = argv.get(i + 1)
+                cli.has_target = true
+                i = i + 2
+            } else {
+                usage_err = "unrecognized arguments: " + a
+                break
+            }
+        }
+    } else if cmd == "audit" || cmd == "publish" {
+        if argv.len() > 2 {
+            usage_err = "unrecognized arguments: " + argv.get(2)
+        }
+    } else if cmd == "log" {
+        while i < argv.len() {
+            let a: str = argv.get(i)
+            if a == "--verify" {
+                cli.verify = true
+                i = i + 1
+            } else {
+                usage_err = "unrecognized arguments: " + a
+                break
+            }
+        }
+    } else if cmd == "build" {
+        let positional2: list[str] = []
+        cli.entry = ""
+        while i < argv.len() {
+            let a: str = argv.get(i)
+            if a == "--entry" && i + 1 < argv.len() {
+                cli.entry = argv.get(i + 1)
+                i = i + 2
+            } else if a == "--lto" {
+                cli.lto = true
+                i = i + 1
+            } else if a == "--target" && i + 1 < argv.len() {
+                cli.target = argv.get(i + 1)
+                cli.has_target = true
+                i = i + 2
+            } else if a == "--wasm-opt" && i + 1 < argv.len() {
+                cli.wasm_opt = argv.get(i + 1)
+                i = i + 2
+            } else if a == "--opt-level" && i + 1 < argv.len() {
+                cli.opt_level = argv.get(i + 1)
+                i = i + 2
+            } else if a == "--glue" && i + 1 < argv.len() {
+                cli.glue = argv.get(i + 1)
+                i = i + 2
+            } else if a.starts_with("-") && a != "-" {
+                usage_err = "unrecognized arguments: " + a
+                break
+            } else {
+                positional2.push(a)
+                i = i + 1
+            }
+        }
+        if usage_err == "" && positional2.len() > 0 {
+            usage_err = "unrecognized arguments: " + positional2.get(0)
+        }
+        if cli.wasm_opt != "auto" && cli.wasm_opt != "on"
+        && cli.wasm_opt != "off" {
+            usage_err = "argument --wasm-opt: invalid choice: '"
+                + cli.wasm_opt + "' (choose from 'auto', 'on', 'off')"
+        }
+        if usage_err == "" && cli.opt_level != "O1"
+        && cli.opt_level != "O2" && cli.opt_level != "O3"
+        && cli.opt_level != "Os" {
+            usage_err = "argument --opt-level: invalid choice: '"
+                + cli.opt_level + "' (choose from 'O1', 'O2', 'O3', 'Os')"
+        }
+        if usage_err == "" && cli.glue != "compact"
+        && cli.glue != "verbose" {
+            usage_err = "argument --glue: invalid choice: '" + cli.glue
+                + "' (choose from 'compact', 'verbose')"
+        }
+    } else if cmd == "semver" {
+        if argv.len() < 3 {
+            return pk_usage_error("the following arguments are required: "
+                + "semver_cmd")
+        }
+        cli.semver_sub = argv.get(2)
+        if cli.semver_sub == "check" {
+            if argv.len() < 4 {
+                usage_err = "the following arguments are required: "
+                    + "version"
+            } else {
+                cli.a = argv.get(3)
+            }
+        } else if cli.semver_sub == "cmp" {
+            if argv.len() < 5 {
+                usage_err = "the following arguments are required: a, b"
+            } else {
+                cli.a = argv.get(3)
+                cli.b = argv.get(4)
+            }
+        } else if cli.semver_sub == "bump" {
+            if argv.len() < 5 {
+                usage_err = "the following arguments are required: "
+                    + "part, version"
+            } else {
+                cli.part = argv.get(3)
+                cli.b = argv.get(4)
+                if cli.part != "major" && cli.part != "minor"
+                && cli.part != "patch" {
+                    usage_err = "argument part: invalid choice: '"
+                        + cli.part
+                        + "' (choose from 'major', 'minor', 'patch')"
+                }
+            }
+        } else if cli.semver_sub == "sat" {
+            if argv.len() < 5 {
+                usage_err = "the following arguments are required: "
+                    + "version, requirement"
+            } else {
+                cli.a = argv.get(3)
+                cli.b = argv.get(4)
+            }
+        } else {
+            usage_err = "argument semver_cmd: invalid choice: '"
+                + cli.semver_sub + "' (choose from 'check', 'cmp', "
+                + "'bump', 'sat')"
+        }
+    } else {
+        return pk_usage_error("invalid choice: '" + cmd
+            + "' (choose from 'init', 'add', 'lock', 'audit', 'verify', "
+            + "'build', 'publish', 'log', 'semver')")
+    }
+    if usage_err != "" {
+        return pk_usage_error(usage_err)
+    }
+    # Dispatch.
+    let mut rc: int = 0
+    let mut op: str = ""
+    let failed: bool = false
+    if cmd == "init" {
+        op = op_pkg_init()
+        let r: Result[int, str] = cmd_init(cli.name)
+        if result_is_ok(r) {
+            rc = result_unwrap(r)
+        } else {
+            eprintln("error: " + result_err_or(r, "failed"))
+            rc = 1
+        }
+    } else if cmd == "add" {
+        op = op_pkg_add()
+        let r2: Result[int, str] = cmd_add(cli.name, cli.git, cli.path,
+                                           cli.tag, cli.branch, cli.version)
+        if result_is_ok(r2) {
+            rc = result_unwrap(r2)
+        } else {
+            eprintln("error: " + result_err_or(r2, "failed"))
+            rc = 1
+        }
+    } else if cmd == "lock" {
+        op = op_pkg_lock()
+        let r3: Result[int, str] = cmd_lock(cli.target, cli.has_target)
+        if result_is_ok(r3) {
+            rc = result_unwrap(r3)
+        } else {
+            eprintln("error: " + result_err_or(r3, "failed"))
+            rc = 1
+        }
+    } else if cmd == "audit" {
+        let r4: Result[int, str] = cmd_audit()
+        if result_is_ok(r4) {
+            rc = result_unwrap(r4)
+        } else {
+            eprintln("error: " + result_err_or(r4, "failed"))
+            rc = 1
+        }
+    } else if cmd == "verify" {
+        let r5: Result[int, str] = cmd_verify(cli.target, cli.has_target)
+        if result_is_ok(r5) {
+            rc = result_unwrap(r5)
+        } else {
+            eprintln("error: " + result_err_or(r5, "failed"))
+            rc = 1
+        }
+    } else if cmd == "build" {
+        let mut entry: str = cli.entry
+        if entry == "" {
+            entry = "main.hls"
+        }
+        let r6: Result[int, str] = cmd_build(entry, cli.lto, cli.target,
+            cli.has_target, cli.wasm_opt, cli.opt_level, cli.glue)
+        if result_is_ok(r6) {
+            rc = result_unwrap(r6)
+        } else {
+            eprintln("error: " + result_err_or(r6, "failed"))
+            rc = 1
+        }
+    } else if cmd == "publish" {
+        op = op_pkg_publish()
+        let r7: Result[int, str] = cmd_publish()
+        if result_is_ok(r7) {
+            rc = result_unwrap(r7)
+        } else {
+            eprintln("error: " + result_err_or(r7, "failed"))
+            rc = 1
+        }
+    } else if cmd == "log" {
+        let r8: Result[int, str] = cmd_log(cli.verify)
+        if result_is_ok(r8) {
+            rc = result_unwrap(r8)
+        } else {
+            eprintln("error: " + result_err_or(r8, "failed"))
+            rc = 1
+        }
+    } else if cmd == "semver" {
+        let r9: Result[int, str] = cmd_semver(cli.semver_sub, cli.a,
+                                              cli.b, cli.part)
+        if result_is_ok(r9) {
+            rc = result_unwrap(r9)
+        } else {
+            eprintln("error: " + result_err_or(r9, "failed"))
+            rc = 1
+        }
+    }
+    # Stage 112: a privileged op that exited non-zero is a refused op —
+    # recorded like any other.
+    if op != "" && rc != 0 {
+        let ar: Result[bool, str] = audit_record_refused(op,
+            "the command exited " + rc.to_str()
+            + " — the refusal's text is on stderr")
+        if !result_is_ok(ar) {
+            eprintln("error: " + result_err_or(ar, "audit failed"))
+            return 1
+        }
+    }
+    return rc
+}

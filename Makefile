@@ -209,6 +209,249 @@ $(BIN)/hls-fuzz: tools/hls-fuzz.hls $(wildcard std/*.hls) $(wildcard core/*.hls)
 	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
 	@rm -f $@.c
 
+# hls-sign -- in Halis (the native twin of the Python hls-sign.py that
+# retired; same CLI, same wire, same exits).
+$(BIN)/hls-sign: tools/hls-sign.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hls-sign] hlc compiles the tool (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hls-sign.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
+# hls-tlog -- in Halis (the native twin of the Python hls-tlog.py that
+# retired; same CLI, same wire, same exits).
+$(BIN)/hls-tlog: tools/hls-tlog.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hls-tlog] hlc compiles the tool (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hls-tlog.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
+# hls-auditlog -- in Halis (the native twin of the Python hls-auditlog.py that
+# retired; same CLI, same wire, same exits).
+$(BIN)/hls-auditlog: tools/hls-auditlog.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hls-auditlog] hlc compiles the tool (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hls-auditlog.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
+# hls-audit -- in Halis (the native twin of the Python hls-audit.py that
+# retired; same CLI, same wire, same exits).
+$(BIN)/hls-audit: tools/hls-audit.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hls-audit] hlc compiles the tool (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hls-audit.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
+# hls-reverify -- in Halis (the native twin of the Python hls-reverify.py that
+# retired; same CLI, same wire, same exits).
+$(BIN)/hls-reverify: tools/hls-reverify.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hls-reverify] hlc compiles the tool (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hls-reverify.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
+# hls-sandbox -- in Halis (the native twin of the Python hls-sandbox.py that
+# retired; same CLI, same wire, same exits).
+$(BIN)/hls-sandbox: tools/hls-sandbox.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hls-sandbox] hlc compiles the tool (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hls-sandbox.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
+# hlprove -- in Halis (the native twin of the Python hlprove.py that
+# retired; same CLI, same wire, same exits).
+$(BIN)/hlprove: tools/hlprove.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hlprove] hlc compiles the tool (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hlprove.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
+# hls-pkg -- in Halis (the native twin of the Python hls-pkg.py that
+# retired; same CLI, same wire, same exits).
+$(BIN)/hls-pkg: tools/hls-pkg.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hls-pkg] hlc compiles the tool (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hls-pkg.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
+# hls-freeze -- in Halis (the native twin of the Python hls-freeze.py that
+# retired; same CLI, same wire, same exits).
+$(BIN)/hls-freeze: tools/hls-freeze.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hls-freeze] hlc compiles the tool (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hls-freeze.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
+# hls-guarantee -- in Halis (the native twin of the Python hls-guarantee.py that
+# retired; same CLI, same wire, same exits).
+$(BIN)/hls-guarantee: tools/hls-guarantee.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hls-guarantee] hlc compiles the tool (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hls-guarantee.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
+# hls-perf -- in Halis (the native twin of the Python hls-perf.py that
+# retired; same CLI, same wire, same exits).
+$(BIN)/hls-perf: tools/hls-perf.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hls-perf] hlc compiles the tool (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hls-perf.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
+# hls-mem -- in Halis (the native twin of the Python hls-mem.py that
+# retired; same CLI, same wire, same exits).
+$(BIN)/hls-mem: tools/hls-mem.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hls-mem] hlc compiles the tool (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hls-mem.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
+# hls-ctime -- in Halis (the native twin of the Python hls-ctime.py that
+# retired; same CLI, same wire, same exits).
+$(BIN)/hls-ctime: tools/hls-ctime.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hls-ctime] hlc compiles the tool (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hls-ctime.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
+# hls-size -- in Halis (the native twin of the Python hls-size.py that
+# retired; same CLI, same wire, same exits).
+$(BIN)/hls-size: tools/hls-size.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hls-size] hlc compiles the tool (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hls-size.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
+# hls-bench -- in Halis (the native twin of the Python hls-bench.py that
+# retired; same CLI, same wire, same exits).
+$(BIN)/hls-bench: tools/hls-bench.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hls-bench] hlc compiles the tool (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hls-bench.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
+# hls-bench-stdlib -- in Halis (the native twin of the Python hls-bench-stdlib.py that
+# retired; same CLI, same wire, same exits).
+$(BIN)/hls-bench-stdlib: tools/hls-bench-stdlib.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hls-bench-stdlib] hlc compiles the tool (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hls-bench-stdlib.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
+# hls-fuzzseed -- in Halis (the native twin of the Python hls-fuzzseed.py that
+# retired; same CLI, same wire, same exits).
+$(BIN)/hls-fuzzseed: tools/hls-fuzzseed.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hls-fuzzseed] hlc compiles the tool (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hls-fuzzseed.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
+# hls-compat -- in Halis (the native twin of the Python hls-compat.py that
+# retired; same CLI, same wire, same exits).
+$(BIN)/hls-compat: tools/hls-compat.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hls-compat] hlc compiles the tool (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hls-compat.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
+# hls-migrate -- in Halis (the native twin of the Python hls-migrate.py that
+# retired; same CLI, same wire, same exits).
+$(BIN)/hls-migrate: tools/hls-migrate.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hls-migrate] hlc compiles the tool (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hls-migrate.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
+# hls-repl -- in Halis (the native twin of the Python hls-repl.py that
+# retired; same CLI, same wire, same exits).
+$(BIN)/hls-repl: tools/hls-repl.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hls-repl] hlc compiles the tool (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hls-repl.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
+# hls-dap -- in Halis (the native twin of the Python hls-dap.py that
+# retired; same CLI, same wire, same exits).
+$(BIN)/hls-dap: tools/hls-dap.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hls-dap] hlc compiles the tool (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hls-dap.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
+# hls-lsp -- in Halis (the native twin of the Python hls-lsp.py that
+# retired; same CLI, same wire, same exits).
+$(BIN)/hls-lsp: tools/hls-lsp.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hls-lsp] hlc compiles the tool (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hls-lsp.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
+# hlserve -- in Halis (the native twin of the Python hlserve.py that
+# retired; same CLI, same wire, same exits).
+$(BIN)/hlserve: tools/hlserve.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hlserve] hlc compiles the tool (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hlserve.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
+# hlwasm -- in Halis (the native twin of the Python hlwasm.py that
+# retired; same CLI, same wire, same exits).
+$(BIN)/hlwasm: tools/hlwasm.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hlwasm] hlc compiles the tool (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hlwasm.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
+# hlwasm-opt -- in Halis (the native twin of the Python hlwasm-opt.py that
+# retired; same CLI, same wire, same exits).
+$(BIN)/hlwasm-opt: tools/hlwasm-opt.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hlwasm-opt] hlc compiles the tool (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hlwasm-opt.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
+# hlwasm-pack -- in Halis (the native twin of the Python hlwasm-pack.py that
+# retired; same CLI, same wire, same exits).
+$(BIN)/hlwasm-pack: tools/hlwasm-pack.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hlwasm-pack] hlc compiles the tool (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hlwasm-pack.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
+# hlcross -- in Halis (the native twin of the Python hlcross.py that
+# retired; same CLI, same wire, same exits).
+$(BIN)/hlcross: tools/hlcross.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hlcross] hlc compiles the tool (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hlcross.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
 # hls-lts — the LTS policy tool, in Halis (the native twin of the
 # Python hls-lts that retired; the render it pins is the committed
 # LTS.md, byte for byte).
@@ -646,7 +889,7 @@ lint: $(BIN)/hllint
 
 # Stage 14: one-shot LSP diagnostics (for non-LSP editors)
 lsp-check:
-	@$(PYTHON) tools/hls-lsp.py --check $(F)
+	@$(BIN)/hls-lsp --check $(F)
 
 # Stage 113 acceptance gate: the eight-section battery for go-to-
 # definition across packages (the std family, the sibling, the
@@ -1009,7 +1252,7 @@ xdiff-acceptance: $(BIN)/acc-xdiff $(BIN)/hls-xdiff $(BIN)/ll_validate bin/hlc
 # (tests/fuzzseed_pkg) laid out exactly as hls-pkg lays a downloaded
 # dependency out.
 fuzzseed:
-	@$(PYTHON) tools/hls-fuzzseed.py --limit 200 --mutate 1
+	@$(BIN)/hls-fuzzseed --limit 200 --mutate 1
 
 fuzzseed-acceptance: $(BIN)/acc-fuzzseed bin/hlc
 	@echo "[Stage 134 acceptance] running tests/acc/fuzzseed_acceptance.hls..."
@@ -1027,10 +1270,10 @@ fuzzseed-acceptance: $(BIN)/acc-fuzzseed bin/hlc
 # voids its guarantees by name; a violated ledger refuses its
 # report; two reports at one tree are byte-identical).
 guarantee:
-	@$(PYTHON) tools/hls-guarantee.py verify
+	@$(BIN)/hls-guarantee verify
 
 guarantee-report:
-	@$(PYTHON) tools/hls-guarantee.py report --out SOUNDNESS.md
+	@$(BIN)/hls-guarantee report --out SOUNDNESS.md
 
 guarantee-acceptance: $(BIN)/acc-guarantee bin/hlc
 	@echo "[Stage 135 acceptance] running tests/acc/guarantee_acceptance.hls..."
@@ -1055,13 +1298,13 @@ guarantee-acceptance: $(BIN)/acc-guarantee bin/hlc
 # negative space (floor refusals, instrument mismatches, corrupt
 # lines, the dirty-tree refusal on a throwaway clone).
 perf:
-	@$(PYTHON) tools/hls-perf.py record
+	@$(BIN)/hls-perf record
 
 perf-gate:
-	@$(PYTHON) tools/hls-perf.py gate
+	@$(BIN)/hls-perf gate
 
 perf-dashboard:
-	@$(PYTHON) tools/hls-perf.py dashboard --out PERFORMANCE.md
+	@$(BIN)/hls-perf dashboard --out PERFORMANCE.md
 
 perf-acceptance: $(BIN)/acc-perf bin/hlc
 	@echo "[Stage 136 acceptance] running tests/acc/perf_acceptance.hls..."
@@ -1091,13 +1334,13 @@ perf-acceptance: $(BIN)/acc-perf bin/hlc
 # ledgers and the negative space (floor refusals, unit mismatches,
 # corrupt lines, the dirty-tree refusal on a throwaway clone).
 mem:
-	@$(PYTHON) tools/hls-mem.py record
+	@$(BIN)/hls-mem record
 
 mem-gate:
-	@$(PYTHON) tools/hls-mem.py gate
+	@$(BIN)/hls-mem gate
 
 mem-dashboard:
-	@$(PYTHON) tools/hls-mem.py dashboard --out MEMORY.md
+	@$(BIN)/hls-mem dashboard --out MEMORY.md
 
 memdash-acceptance: $(BIN)/acc-memdash bin/hlc
 	@echo "[Stage 137 acceptance] running tests/acc/memdash_acceptance.hls..."
@@ -1137,13 +1380,13 @@ memdash-acceptance: $(BIN)/acc-memdash bin/hlc
 # mismatches, corrupt lines, the dirty-tree refusal on a throwaway
 # clone).
 ctime:
-	@$(PYTHON) tools/hls-ctime.py record
+	@$(BIN)/hls-ctime record
 
 ctime-gate:
-	@$(PYTHON) tools/hls-ctime.py gate
+	@$(BIN)/hls-ctime gate
 
 ctime-dashboard:
-	@$(PYTHON) tools/hls-ctime.py dashboard --out COMPILETIME.md
+	@$(BIN)/hls-ctime dashboard --out COMPILETIME.md
 
 ctime-acceptance: $(BIN)/acc-ctime bin/hlc
 	@echo "[Stage 138 acceptance] running tests/acc/ctime_acceptance.hls..."
@@ -1176,13 +1419,13 @@ ctime-acceptance: $(BIN)/acc-ctime bin/hlc
 # instrument and machine mismatches, corrupt lines, the dirty-tree
 # refusal on a throwaway clone).
 size:
-	@$(PYTHON) tools/hls-size.py record
+	@$(BIN)/hls-size record
 
 size-gate:
-	@$(PYTHON) tools/hls-size.py gate
+	@$(BIN)/hls-size gate
 
 size-dashboard:
-	@$(PYTHON) tools/hls-size.py dashboard --out BINARYSIZE.md
+	@$(BIN)/hls-size dashboard --out BINARYSIZE.md
 
 size-acceptance: $(BIN)/acc-size bin/hlc
 	@echo "[Stage 139 acceptance] running tests/acc/size_acceptance.hls..."
@@ -1235,7 +1478,7 @@ auditkit-acceptance: $(BIN)/acc-auditkit bin/hlc
 
 
 # Stage 141 (v0.159.0-alpha): the API freeze — syntax + stdlib locked.
-# tools/hls-freeze.py derives the language's WHOLE public surface LIVE
+# $(BIN)/hls-freeze derives the language's WHOLE public surface LIVE
 # from the real front-ends (the boot lexer/parser tables, the checker's
 # own builtin tables, the self-hosted keyword chain grepped from
 # src/hlc/types.hls, the attribute vocabulary read out of the parser's
@@ -1250,7 +1493,7 @@ auditkit-acceptance: $(BIN)/acc-auditkit bin/hlc
 # backwards-compatible), the digest must agree with the document's own
 # surface, and the amendment chain (tests/api_freeze_amendments.jsonl,
 # the family's one arithmetic since Stage 13) must replay clean.
-# The surface moves ONLY through `tools/hls-freeze.py amend --reason
+# The surface moves ONLY through `$(BIN)/hls-freeze amend --reason
 # --by` — a ledger entry with the exact delta, not an edit.
 # `make freeze-report` renders the frozen API document (API.md,
 # deterministic per freeze, never rendered from a drifted tree);
@@ -1264,13 +1507,13 @@ auditkit-acceptance: $(BIN)/acc-auditkit bin/hlc
 # the decision procedure pinned in pure HLS, byte-identical on the
 # interpreter and natively).
 freeze:
-	@$(PYTHON) tools/hls-freeze.py status
+	@$(BIN)/hls-freeze status
 
 freeze-verify:
-	@$(PYTHON) tools/hls-freeze.py verify
+	@$(BIN)/hls-freeze verify
 
 freeze-report:
-	@$(PYTHON) tools/hls-freeze.py report --out API.md
+	@$(BIN)/hls-freeze report --out API.md
 
 freeze-acceptance: $(BIN)/acc-freeze bin/hlc
 	@echo "[Stage 141 acceptance] running tests/acc/freeze_acceptance.hls..."

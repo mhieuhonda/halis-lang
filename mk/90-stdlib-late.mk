@@ -1065,7 +1065,7 @@ openapi-acceptance: bin/hlc $(BIN)/hlboot
 jsffi-acceptance:
 	@echo "[Stage 73 acceptance] compiling examples/jsffi_stage73_demo.hls..."
 	@mkdir -p $(BIN)
-	@$(PYTHON) tools/hlwasm.py examples/jsffi_stage73_demo.hls $(BIN)/jsffi73 \
+	@$(BIN)/hlwasm examples/jsffi_stage73_demo.hls $(BIN)/jsffi73 \
 	  >$(BIN)/jsffi73.log 2>&1 || (echo "FAIL: compile"; cat $(BIN)/jsffi73.log; exit 1)
 	@if ! command -v node >/dev/null 2>&1; then \
 	  echo "  node run: SKIP (node not installed)"; \

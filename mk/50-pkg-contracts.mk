@@ -1,7 +1,7 @@
 # ============================================================================
 # Stage 13 (v0.23.0-alpha): hls-pkg package manager targets
 # ============================================================================
-PKG = $(PYTHON) tools/hls-pkg.py
+PKG = $(BIN)/hls-pkg
 
 # Create a new package skeleton: make pkg-init NAME=mylib
 pkg-init:
@@ -59,49 +59,49 @@ pkg-log-verify:
 
 # Proof report: which panic checks the interval prover proved dead
 prove:
-	@python3 tools/hlprove.py $(F)
+	@$(BIN)/hlprove $(F)
 
 # Proof report + SMT-LIB2 files (z3-ready) + loop invariant suggestions
 prove-full:
-	@python3 tools/hlprove.py $(F) --smt --suggest-invariants
+	@$(BIN)/hlprove $(F) --smt --suggest-invariants
 
 # Stage 97 (v0.116.0-alpha): SMT-based loop-invariant inference.
 # Summarises every loop (entry facts + transition relation), generates
 # template candidates and lets z3 decide initiation + preservation.
 infer:
-	@python3 tools/hlprove.py $(F) --infer-invariants
+	@$(BIN)/hlprove $(F) --infer-invariants
 
 # The same, plus one .smt2 obligations file per verified loop (named
 # <fn>__L<line>.smt2, next to the source like the contract bridge).
 infer-smt:
-	@python3 tools/hlprove.py $(F) --infer-invariants --smt
+	@$(BIN)/hlprove $(F) --infer-invariants --smt
 
 # Stage 99 (v0.118.0-alpha): the CVC5 SMT backend. The same bridge and
 # the same obligations, decided by cvc5 instead of z3 (the binary
 # first, then the cvc5 python module). --cvc5 implies --smt; --z3 and
 # --cvc5 are mutually exclusive.
 cvc5:
-	@python3 tools/hlprove.py $(F) --cvc5
+	@$(BIN)/hlprove $(F) --cvc5
 
 # Stage 100 (v0.119.0-alpha): the separation-logic fragment — heap
 # shapes. Footprints over alias classes, separation verdicts
 # (own(a) * own(b), proven from freshness evidence), and cursor-loop
 # shape triples (lseg * cell * lseg) decided by the SMT backend.
 shapes:
-	@python3 tools/hlprove.py $(F) --shapes
+	@$(BIN)/hlprove $(F) --shapes
 
 # The same, plus one .shape.smt2 obligations file per verified loop
 # (named <fn>__L<line>.shape.smt2, next to the source like every
 # bridge dump).
 shapes-smt:
-	@python3 tools/hlprove.py $(F) --shapes --smt
+	@$(BIN)/hlprove $(F) --shapes --smt
 
 # Stage 101 (v0.120.0-alpha): the cryptographic side-channel analysis.
 # The #[secrets(...)] parameters are the taint roots; the report lists
 # every branch / index / loop-bound / division sink a secret reaches,
 # the incoming propagation chain, and the len() policy notes.
 sidechannel:
-	@python3 tools/hlprove.py $(F) --sidechannel
+	@$(BIN)/hlprove $(F) --sidechannel
 
 # Stage 102 (v0.121.0-alpha): the constant-time verifier. Every #[ct]
 # claim is proven in its own taint universe (only the claim's
@@ -109,7 +109,7 @@ sidechannel:
 # with the sink lines and the incoming chains - and a violated claim
 # exits 1, so the run gates a CI pipeline.
 ct:
-	@python3 tools/hlprove.py $(F) --consttime
+	@$(BIN)/hlprove $(F) --consttime
 
 # Exhaustive finite-state model checking of a transition fn
 model:
@@ -121,7 +121,7 @@ model:
 
 # The Stage 17 acceptance example (HMAC envelope, fully proven hot path)
 prove-acceptance:
-	@python3 tools/hlprove.py examples/hmac_proven.hls
+	@$(BIN)/hlprove examples/hmac_proven.hls
 	@test -x $(BIN)/hlc || $(MAKE) bootstrap
 	@$(BIN)/hlc --fast examples/hmac_proven.hls $(BIN)/hmac_fast.c
 	@$(CC) $(CFLAGS) -o $(BIN)/hmac_fast $(BIN)/hmac_fast.c -lm -pthread
@@ -174,12 +174,12 @@ ct-acceptance: $(BIN)/acc-consttime $(BIN)/hlc
 # lockfile for drift, and gates the chain against the root's
 # [effects].allowed. The root is your code - reported, never gated.
 supply:
-	@python3 tools/hls-audit.py $(F)
+	@$(BIN)/hls-audit $(F)
 
 supply-pkg:
 	@if [ -z "$(D)" ]; then echo "Usage: make supply-pkg D=examples/pkg_audit_demo [ALLOW=IO,Fs]" && false; fi; \
 	if [ -n "$(ALLOW)" ]; then A="--allow $(ALLOW)"; else A=""; fi; \
-	python3 tools/hls-audit.py --pkg $(D) $$A
+	$(BIN)/hls-audit --pkg $(D) $$A
 
 # Stage 103 acceptance gate: the eight-section battery (engine,
 # policy, fail-closed, the package tree, drift, the mode parity, the
@@ -313,19 +313,19 @@ repro-acceptance: $(BIN)/acc-repro $(BIN)/hls-sbom
 # comes from HLS_SIGN_PASSWORD (or --password-env via the tool).
 sign-keygen:
 	@if [ -n "$(COMMENT)" ]; then C="-c $(COMMENT)"; else C=""; fi; \
-	python3 tools/hls-sign.py keygen $$C
+	$(BIN)/hls-sign keygen $$C
 
 # Sign any file: make sign F=file.hls — writes file.hls.minisig
 sign:
 	@test "x$(F)" != "x" || (echo "Usage: make sign F=<file>" && false)
-	@python3 tools/hls-sign.py sign $(F)
+	@$(BIN)/hls-sign sign $(F)
 
 # Verify: make sign-verify F=file [SIG=file.minisig] [PUB=key.pub]
 sign-verify:
 	@test "x$(F)" != "x" || (echo "Usage: make sign-verify F=<file> [SIG=<sig>] [PUB=<pub>]" && false); \
 	if [ -n "$(SIG)" ]; then S="$(SIG)"; else S=""; fi; \
 	if [ -n "$(PUB)" ]; then A="-p $(PUB)"; else A=""; fi; \
-	python3 tools/hls-sign.py verify $(F) $$S $$A
+	$(BIN)/hls-sign verify $(F) $$S $$A
 
 # The shipping gate: audit + lockfile required, the versioned statement
 # hls-sign-<name>-<version>.release.json + its minisign signature
@@ -333,18 +333,18 @@ sign-verify:
 sign-release:
 	@test "x$(D)" != "x" || (echo "Usage: make sign-release D=<pkg dir> [OUT=<dir>]" && false); \
 	if [ -n "$(OUT)" ]; then O="--out $(OUT)"; else O=""; fi; \
-	python3 tools/hls-sign.py release $(D) $$O
+	$(BIN)/hls-sign release $(D) $$O
 
 # The counterparty's side: signature, lockfile bytes, audit drift,
 # content digest — against the CURRENT tree.
 sign-verify-release:
 	@test "x$(D)" != "x" || (echo "Usage: make sign-verify-release D=<pkg dir> [PUB=<pub>]" && false); \
 	if [ -n "$(PUB)" ]; then A="-p $(PUB)"; else A=""; fi; \
-	python3 tools/hls-sign.py verify-release $(D) $$A
+	$(BIN)/hls-sign verify-release $(D) $$A
 
 # The RFC 8032 / RFC 8439 vectors, through the tool's front door.
 sign-selftest:
-	@python3 tools/hls-sign.py selftest
+	@$(BIN)/hls-sign selftest
 
 # Stage 106 acceptance gate: the nine-section battery (the primitives
 # against the RFC vectors, the keys, the minisign signature contract,
@@ -365,18 +365,18 @@ sign-acceptance: $(BIN)/acc-signed
 # repo ledger).
 tlog-verify:
 	@if [ -n "$(LOG)" ]; then L="$(LOG)"; else L=""; fi; \
-	python3 tools/hls-tlog.py verify $$L
+	$(BIN)/hls-tlog verify $$L
 
 # The verified view: make tlog [LOG=...]
 tlog:
 	@if [ -n "$(LOG)" ]; then L="$(LOG)"; else L=""; fi; \
-	python3 tools/hls-tlog.py summary $$L
+	$(BIN)/hls-tlog summary $$L
 
 # Compare views across sources (files, dirs, http URLs):
 # make tlog-gossip SOURCES="log1 log2 https://mirror/log"
 tlog-gossip:
 	@test "x$(SOURCES)" != "x" || (echo "Usage: make tlog-gossip SOURCES=<src> <src> ..." && false)
-	@python3 tools/hls-tlog.py gossip $(SOURCES)
+	@$(BIN)/hls-tlog gossip $(SOURCES)
 
 # Sign a log's view with the Stage 106 keys:
 # make tlog-witness LOG=... KEY=... [OUT=dir] — passphrase from
@@ -385,7 +385,7 @@ tlog-witness:
 	@test "x$(KEY)" != "x" || (echo "Usage: make tlog-witness [LOG=<log>] KEY=<secret> [OUT=<dir>]" && false)
 	@if [ -n "$(LOG)" ]; then L="$(LOG)"; else L=""; fi; \
 	if [ -n "$(OUT)" ]; then O="--out $(OUT)"; else O=""; fi; \
-	python3 tools/hls-tlog.py witness $$L --sign $(KEY) $$O
+	$(BIN)/hls-tlog witness $$L --sign $(KEY) $$O
 
 # Verify a signed view; --against checks it against the current log:
 # make tlog-witness-verify WITNESS=... [PUB=...] [AGAINST=log]
@@ -393,7 +393,7 @@ tlog-witness-verify:
 	@test "x$(WITNESS)" != "x" || (echo "Usage: make tlog-witness-verify WITNESS=<file> [PUB=<pub>] [AGAINST=<log>]" && false)
 	@if [ -n "$(PUB)" ]; then A="-p $(PUB)"; else A=""; fi; \
 	if [ -n "$(AGAINST)" ]; then G="--against $(AGAINST)"; else G=""; fi; \
-	python3 tools/hls-tlog.py witness-verify $(WITNESS) $$A $$G
+	$(BIN)/hls-tlog witness-verify $(WITNESS) $$A $$G
 
 # An inclusion proof for one record:
 # make tlog-prove NAME=... [VERSION=...] [LOG=...] [OUT=dir]
@@ -402,18 +402,18 @@ tlog-prove:
 	@if [ -n "$(VERSION)" ]; then V="$(VERSION)"; else V=""; fi; \
 	if [ -n "$(LOG)" ]; then L="--log $(LOG)"; else L=""; fi; \
 	if [ -n "$(OUT)" ]; then O="--out $(OUT)"; else O=""; fi; \
-	python3 tools/hls-tlog.py prove $(NAME) $$V $$L $$O
+	$(BIN)/hls-tlog prove $(NAME) $$V $$L $$O
 
 # Verify a proof (offline, or against the live history):
 # make tlog-prove-verify PROOF=... [LOG=...]
 tlog-prove-verify:
 	@test "x$(PROOF)" != "x" || (echo "Usage: make tlog-prove-verify PROOF=<file> [LOG=<log>]" && false)
 	@if [ -n "$(LOG)" ]; then L="--log $(LOG)"; else L=""; fi; \
-	python3 tools/hls-tlog.py prove-verify $(PROOF) $$L
+	$(BIN)/hls-tlog prove-verify $(PROOF) $$L
 
 # The stage's pinned numbers, through the tool's front door.
 tlog-selftest:
-	python3 tools/hls-tlog.py selftest
+	$(BIN)/hls-tlog selftest
 
 # Stage 107 acceptance gate: the nine-section battery (the chain
 # arithmetic against hpkg_log's own writer, the views, the sources —
@@ -434,27 +434,27 @@ tlog-acceptance: $(BIN)/acc-tlog $(BIN)/hlfmt
 # The replay on any entry file: make reverify F=examples/hmac_proven.hls
 reverify:
 	@test "x$(F)" != "x" || (echo "Usage: make reverify F=<file.hls> [-- extra flags]" && false)
-	@python3 tools/hls-reverify.py $(F)
+	@$(BIN)/hls-reverify $(F)
 
 # The machine report: make reverify-json F=...
 reverify-json:
 	@test "x$(F)" != "x" || (echo "Usage: make reverify-json F=<file.hls>" && false)
-	@python3 tools/hls-reverify.py $(F) --json
+	@$(BIN)/hls-reverify $(F) --json
 
 # The replay under the LTO inline threshold: make reverify-lto F=...
 reverify-lto:
 	@test "x$(F)" != "x" || (echo "Usage: make reverify-lto F=<file.hls>" && false)
-	@python3 tools/hls-reverify.py $(F) --lto
+	@$(BIN)/hls-reverify $(F) --lto
 
 # A written report: make reverify-report F=... OUT=dir
 reverify-report:
 	@test "x$(F)" != "x" || (echo "Usage: make reverify-report F=<file.hls> OUT=<dir>" && false)
 	@if [ -n "$(OUT)" ]; then O="--out $(OUT)"; else O="--out build"; fi; \
-	python3 tools/hls-reverify.py $(F) $$O
+	$(BIN)/hls-reverify $(F) $$O
 
 # The stage's pinned numbers, through the tool's front door.
 reverify-selftest:
-	@python3 tools/hls-reverify.py selftest
+	@$(BIN)/hls-reverify selftest
 
 # Stage 108 acceptance gate: the nine-section battery (the one
 # definition against boot.proof's own arithmetic, the baseline
@@ -473,7 +473,7 @@ reverify-acceptance: $(BIN)/acc-reverify
 # The FFI taint-flow report on any entry file:
 # make ffi-taint F=examples/ffi_taint_demo.hls
 ffi-taint:
-	@python3 tools/hlprove.py $(F) --taint
+	@$(BIN)/hlprove $(F) --taint
 
 # Stage 109 acceptance gate: the parser batteries (both front-ends), the
 # checker rules (source wrap, sink diagnostics, the well-formedness
@@ -511,7 +511,7 @@ sandbox:
 	if [ -n "$(FS)" ]; then A="--fs $(FS)"; else A=""; fi; \
 	if [ -n "$(DEFAULT)" ]; then B="--default $(DEFAULT)"; else B=""; fi; \
 	if [ -n "$(BPF)" ]; then C="--bpf"; else C=""; fi; \
-	python3 tools/hls-sandbox.py profile $$P $$A $$B $$C
+	$(BIN)/hls-sandbox profile $$P $$A $$B $$C
 
 # Run a command under the filter. The profile comes from an entry
 # file (F=), a package (D=), or an explicit surface (EFFECTS=IO,Fs).
@@ -524,7 +524,7 @@ sandbox-run:
 	if [ -n "$(FS)" ]; then A="--fs $(FS)"; else A=""; fi; \
 	if [ -n "$(DEFAULT)" ]; then B="--default $(DEFAULT)"; else B=""; fi; \
 	if [ -n "$(BASELINE)" ]; then E="--baseline $(BASELINE)"; else E=""; fi; \
-	python3 tools/hls-sandbox.py run $$P $$A $$B $$E -- $(CMD) $(ARGS)
+	$(BIN)/hls-sandbox run $$P $$A $$B $$E -- $(CMD) $(ARGS)
 
 # Emit the self-arming C shim (ARCH required — the shim is
 # cross-arch by design; OUT= the output file, default named after
@@ -535,7 +535,7 @@ sandbox-emit:
 	if [ -n "$(D)" ]; then P="--pkg $(D)"; elif [ -n "$(F)" ]; then P="$(F)"; elif [ -n "$(EFFECTS)" ]; then P="--effects $(EFFECTS)"; else echo "error: F=, D= or EFFECTS= required" && false; fi; \
 	if [ -n "$(FS)" ]; then A="--fs $(FS)"; else A=""; fi; \
 	if [ -n "$(OUT)" ]; then O="--out $(OUT)"; else O=""; fi; \
-	python3 tools/hls-sandbox.py emit $$P $$A --arch $(ARCH) $$O
+	$(BIN)/hls-sandbox emit $$P $$A --arch $(ARCH) $$O
 
 # The shipping gate: fail-closed audit, lockfile required, the
 # versioned statement hls-sandbox-<name>-<version>.profile.json
@@ -543,18 +543,18 @@ sandbox-emit:
 sandbox-release:
 	@test "x$(D)" != "x" || (echo "Usage: make sandbox-release D=<pkg dir> [OUT=<dir>]" && false); \
 	if [ -n "$(OUT)" ]; then O="--out $(OUT)"; else O=""; fi; \
-	python3 tools/hls-sandbox.py release --pkg $(D) $$O
+	$(BIN)/hls-sandbox release --pkg $(D) $$O
 
 # The counterparty's side: the ledger record, the lockfile bytes,
 # the content digest, and the re-derived posture — against the
 # CURRENT tree.
 sandbox-verify-release:
 	@test "x$(D)" != "x" || (echo "Usage: make sandbox-verify-release D=<pkg dir>" && false)
-	@python3 tools/hls-sandbox.py verify-release --pkg $(D)
+	@$(BIN)/hls-sandbox verify-release --pkg $(D)
 
 # The stage's pinned numbers, through the tool's front door.
 sandbox-selftest:
-	@python3 tools/hls-sandbox.py selftest
+	@$(BIN)/hls-sandbox selftest
 
 # Stage 110 acceptance gate: the nine-section battery (the one
 # definition, the assembler, the policy, the derivation, the
@@ -573,34 +573,34 @@ sandbox-acceptance: $(BIN)/acc-sandbox
 auditlog-list:
 	@if [ -n "$(OP)" ]; then A="--op $(OP)"; else A=""; fi; \
 	if [ -n "$(OUTCOME)" ]; then B="--outcome $(OUTCOME)"; else B=""; fi; \
-	$(PYTHON) tools/hls-auditlog.py list $$A $$B
+	$(BIN)/hls-auditlog list $$A $$B
 
 # One entry, full detail: make auditlog-show SEQ=7
 auditlog-show:
 	@test "x$(SEQ)" != "x" || (echo "Usage: make auditlog-show SEQ=<n>" && false)
-	@$(PYTHON) tools/hls-auditlog.py show $(SEQ)
+	@$(BIN)/hls-auditlog show $(SEQ)
 
 # Replay the chain: make auditlog-verify
 auditlog-verify:
-	@$(PYTHON) tools/hls-auditlog.py verify
+	@$(BIN)/hls-auditlog verify
 
 # Checkpoint + sign the audit log with the Stage 106 key:
 # make auditlog-sign KEY=hls-sign.key [OUT=dir]
 auditlog-sign:
 	@test "x$(KEY)" != "x" || (echo "Usage: make auditlog-sign KEY=<secret key> [OUT=<dir>]" && false)
 	@if [ -n "$(OUT)" ]; then O="--out $(OUT)"; else O=""; fi; \
-	$(PYTHON) tools/hls-auditlog.py sign -s $(KEY) $$O
+	$(BIN)/hls-auditlog sign -s $(KEY) $$O
 
 # Verify a signed checkpoint against the current log:
 # make auditlog-verify-sign CKPT=<file> [PUB=<pub key>]
 auditlog-verify-sign:
 	@test "x$(CKPT)" != "x" || (echo "Usage: make auditlog-verify-sign CKPT=<file> [PUB=<pub key>]" && false)
 	@if [ -n "$(PUB)" ]; then P="-p $(PUB)"; else P=""; fi; \
-	$(PYTHON) tools/hls-auditlog.py verify-sign $(CKPT) $$P
+	$(BIN)/hls-auditlog verify-sign $(CKPT) $$P
 
 # The stage's pinned numbers, through the tool's front door.
 auditlog-selftest:
-	@$(PYTHON) tools/hls-auditlog.py selftest
+	@$(BIN)/hls-auditlog selftest
 
 # Stage 112 acceptance gate: the nine-section battery (the one
 # definition against hpkg_log's own writer, the log, the hooks, the

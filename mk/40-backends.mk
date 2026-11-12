@@ -54,15 +54,15 @@ cross:
 	@mkdir -p $(BIN)
 	@if [ -z "$(OUT)" ]; then OUT=$(BIN)/cross_$$(basename $(F) .hls); fi; \
 	  if [ -n "$(LINKER)" ]; then L="--linker $(LINKER)"; fi; \
-	  $(PYTHON) tools/hlcross.py $(F) $$OUT --target $(TARGET) $$L
+	  $(BIN)/hlcross $(F) $$OUT --target $(TARGET) $$L
 
 # cross-list: list the supported cross-compilation targets + aliases.
 cross-list:
-	@$(PYTHON) tools/hlcross.py --list-targets
+	@$(BIN)/hlcross --list-targets
 
 # cross-host: print the host's canonical target triple.
 cross-host:
-	@$(PYTHON) tools/hlcross.py --show-host
+	@$(BIN)/hlcross --show-host
 
 # cross-acceptance: the Stage 22 acceptance criterion — cross-compile
 # a small program to the host's NATIVE target (always available, even
@@ -73,9 +73,9 @@ cross-host:
 cross-acceptance:
 	@test -x $(BIN)/hlc || $(MAKE) bootstrap
 	@mkdir -p $(BIN)
-	@HOST=$$($(PYTHON) tools/hlcross.py --show-host); \
+	@HOST=$$($(BIN)/hlcross --show-host); \
 	  echo "[Stage 22 acceptance] cross-compiling to host target: $$HOST"; \
-	  $(PYTHON) tools/hlcross.py examples/hello.hls $(BIN)/cross_hello --target $$HOST --keep-c $(BIN)/cross_hello.c; \
+	  $(BIN)/hlcross examples/hello.hls $(BIN)/cross_hello --target $$HOST --keep-c $(BIN)/cross_hello.c; \
 	  rc=$$?; \
 	  if [ $$rc -ne 0 ]; then echo "FAIL: cross-acceptance (rc=$$rc)"; exit 1; fi; \
 	  echo "--- running the cross-compiled binary:"; \
@@ -102,17 +102,17 @@ wasm:
 	@if [ -z "$(OUT)" ]; then OUT=$$(basename $(F) .hls); fi; \
 	  T=""; if [ -n "$(TARGET)" ]; then T="--target $(TARGET)"; fi; \
 	  R=""; if [ -n "$(GO_RUN)" ]; then R="--run"; fi; \
-	  $(PYTHON) tools/hlwasm.py $(F) $$OUT $$T $$R
+	  $(BIN)/hlwasm $(F) $$OUT $$T $$R
 
 # wasm-run: compile + run in Node.js (if available).
 wasm-run:
 	@test -n "$(F)" || (echo "Usage: make wasm-run F=examples/hello.hls [OUT=/tmp/hello]" && false)
 	@if [ -z "$(OUT)" ]; then OUT=$$(basename $(F) .hls); fi; \
-	  $(PYTHON) tools/hlwasm.py $(F) $$OUT --run
+	  $(BIN)/hlwasm $(F) $$OUT --run
 
 # wasm-list-targets: print the supported WebAssembly target triples.
 wasm-list-targets:
-	@$(PYTHON) tools/hlwasm.py --list-targets
+	@$(BIN)/hlwasm --list-targets
 
 # wasm-acceptance: the Stage 23 acceptance criterion -- examples/hello.hls
 # compiles to a <10 KB wasm binary that prints "Hello, Halis!" correctly.
@@ -122,14 +122,14 @@ wasm-acceptance: $(BIN)/hlboot
 	@test -x $(BIN)/hlc || $(MAKE) bootstrap
 	@mkdir -p $(BIN)
 	@echo "[Stage 23 acceptance] compiling examples/hello.hls to wasm..."
-	@$(PYTHON) tools/hlwasm.py examples/hello.hls $(BIN)/hello_wasm >$(BIN)/wasm_acc.log 2>&1; \
+	@$(BIN)/hlwasm examples/hello.hls $(BIN)/hello_wasm >$(BIN)/wasm_acc.log 2>&1; \
 	rc=$$?; if [ $$rc -ne 0 ]; then echo "FAIL: wasm compile failed"; cat $(BIN)/wasm_acc.log; exit 1; fi
 	@SIZE=$$(stat -c %s $(BIN)/hello_wasm.wasm); \
 	  echo "  wasm binary: $$SIZE bytes"; \
 	  if [ $$SIZE -ge 10240 ]; then echo "FAIL: wasm binary is $$SIZE bytes (>= 10 KB acceptance limit)"; exit 1; fi; \
 	  echo "  size check: OK (< 10 KB)"
 	@echo "[Stage 23 acceptance] running the wasm in Node.js..."
-	@$(PYTHON) tools/hlwasm.py examples/hello.hls $(BIN)/hello_wasm2 --run >$(BIN)/wasm_run.out 2>&1; \
+	@$(BIN)/hlwasm examples/hello.hls $(BIN)/hello_wasm2 --run >$(BIN)/wasm_run.out 2>&1; \
 	rc=$$?; if [ $$rc -ne 0 ]; then echo "FAIL: wasm run failed (rc=$$rc)"; cat $(BIN)/wasm_run.out; exit 1; fi
 	@$(BIN)/hlboot examples/hello.hls </dev/null 2>/dev/null >$(BIN)/interp_out.txt
 	@# Deep-scan-13 fix: also filter the 'wasm-opt: N -> M bytes' info
@@ -159,7 +159,7 @@ webapp:
 	@mkdir -p $(BIN)
 	@if [ -z "$(OUT)" ]; then OUT=$(BIN)/webapp; fi; \
 	  if [ -z "$(WASM_OPT)" ]; then WASM_OPT=auto; fi; \
-	  $(PYTHON) tools/hlwasm.py examples/web_app_1000loc.hls $$OUT \
+	  $(BIN)/hlwasm examples/web_app_1000loc.hls $$OUT \
 	    --wasm-opt $$WASM_OPT --opt-level O3 --glue compact
 
 # webapp-acceptance: the Stage 24 acceptance gate. The 1000-LOC web app
@@ -167,7 +167,7 @@ webapp:
 # >=30%. Verifies all three conditions (plus a Node.js run).
 webapp-acceptance:
 	@echo "[Stage 24 acceptance] compiling examples/web_app_1000loc.hls..."
-	@$(PYTHON) tools/hlwasm.py examples/web_app_1000loc.hls $(BIN)/webapp \
+	@$(BIN)/hlwasm examples/web_app_1000loc.hls $(BIN)/webapp \
 	  >$(BIN)/webapp_acc.log 2>&1; \
 	rc=$$?; if [ $$rc -ne 0 ]; then echo "FAIL: webapp compile failed"; \
 	  cat $(BIN)/webapp_acc.log; exit 1; fi
@@ -185,7 +185,7 @@ webapp-acceptance:
 	    echo "FAIL: example is $$LOC LOC (< 1000)"; exit 1; fi
 	@# Check wasm-opt reduction (input size from --wasm-opt off build,
 	@# output size from the default --wasm-opt auto build).
-	@$(PYTHON) tools/hlwasm.py examples/web_app_1000loc.hls $(BIN)/webapp_no_opt \
+	@$(BIN)/hlwasm examples/web_app_1000loc.hls $(BIN)/webapp_no_opt \
 	  --wasm-opt off >$(BIN)/webapp_no_opt.log 2>&1
 	@RAW_SIZE=$$(stat -c %s $(BIN)/webapp_no_opt.wasm 2>/dev/null || stat -f %z $(BIN)/webapp_no_opt.wasm); \
 	  OPT_SIZE=$$(stat -c %s $(BIN)/webapp.wasm 2>/dev/null || stat -f %z $(BIN)/webapp.wasm); \
@@ -220,7 +220,7 @@ webapp-acceptance:
 serve:
 	@test -n "$(F)" || F=examples/hello.hls; \
 	  if [ -z "$(PORT)" ]; then PORT=8080; fi; \
-	  $(PYTHON) tools/hlserve.py --input $$F --bundle out --port $$PORT
+	  $(BIN)/hlserve --input $$F --bundle out --port $$PORT
 
 # serve-acceptance: Stage 75 gate. Verifies the new dev server's full
 # feature set end-to-end: import surface (Stage 24 compat), config file
