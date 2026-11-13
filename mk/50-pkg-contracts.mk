@@ -131,21 +131,21 @@ prove-acceptance:
 # Stage 97 acceptance gate: the SMT-based loop-invariant inference.
 # Requires a decider — a z3 binary or the z3-solver python module (the
 # gate says which to install when neither exists).
-invariant-acceptance: $(BIN)/acc-invariant $(BIN)/hlc
+invariant-acceptance: $(BIN)/acc-invariant $(BIN)/hlc $(BIN)/hlprove
 	@echo "[Stage 97 acceptance] running tests/acc/invariant_acceptance.hls..."
 	@$(BIN)/acc-invariant
 
 # Stage 99 acceptance gate: the CVC5 SMT backend. Requires the cvc5
 # backend (a binary or pip install cvc5) AND the z3 backend — the whole
 # point of the stage is that the two agree on every verdict.
-cvc5-acceptance: $(BIN)/acc-cvc5
+cvc5-acceptance: $(BIN)/acc-cvc5 $(BIN)/hlprove
 	@echo "[Stage 99 acceptance] running tests/acc/cvc5_acceptance.hls..."
 	@$(BIN)/acc-cvc5
 
 # Stage 100 acceptance gate: the separation-logic fragment. Requires a
 # decider — a z3 binary or the z3-solver python module (the gate says
 # which to install when neither exists).
-shapes-acceptance: $(BIN)/acc-shapes $(BIN)/hlc
+shapes-acceptance: $(BIN)/acc-shapes $(BIN)/hlc $(BIN)/hlprove
 	@echo "[Stage 100 acceptance] running tests/acc/shapes_acceptance.hls..."
 	@$(BIN)/acc-shapes
 
@@ -153,7 +153,7 @@ shapes-acceptance: $(BIN)/acc-shapes $(BIN)/hlc
 # (no solver needed): the engine battery, the soundness flips, the
 # interprocedural chain, the CLI report, the demo parity, the audit
 # parity between the front-ends, the fail tests and the tools.
-sidechannel-acceptance: $(BIN)/acc-sidechannel $(BIN)/hlc
+sidechannel-acceptance: $(BIN)/acc-sidechannel $(BIN)/hlc $(BIN)/hlprove
 	@echo "[Stage 101 acceptance] running tests/acc/sidechannel_acceptance.hls..."
 	@$(BIN)/acc-sidechannel
 
@@ -162,7 +162,7 @@ sidechannel-acceptance: $(BIN)/acc-sidechannel $(BIN)/hlc
 # cannot violate a claim), the chains, the CLI exits (0 verified,
 # 1 violated), the demo parity, the audit parity, the fail tests and
 # the tools.
-ct-acceptance: $(BIN)/acc-consttime $(BIN)/hlc
+ct-acceptance: $(BIN)/acc-consttime $(BIN)/hlc $(BIN)/hlprove
 	@echo "[Stage 102 acceptance] running tests/acc/consttime_acceptance.hls..."
 	@$(BIN)/acc-consttime
 
@@ -479,7 +479,7 @@ ffi-taint:
 # checker rules (source wrap, sink diagnostics, the well-formedness
 # refusals), the audit-parity census, the hlprove --taint report (pinned
 # lines), the demo + ok-test parity, the fail tests and the tools.
-ffi-taint-acceptance: $(BIN)/acc-ffi_taint $(BIN)/hlc
+ffi-taint-acceptance: $(BIN)/acc-ffi_taint $(BIN)/hlc $(BIN)/hlprove
 	@echo "[Stage 109 acceptance] running tests/acc/ffi_taint_acceptance.hls..."
 	@$(BIN)/acc-ffi_taint
 
