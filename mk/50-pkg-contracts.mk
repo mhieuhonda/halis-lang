@@ -457,12 +457,12 @@ reverify-selftest:
 	@$(BIN)/hls-reverify selftest
 
 # Stage 108 acceptance gate: the nine-section battery (the one
-# definition against boot.proof's own arithmetic, the baseline
+# definition against the proof module's own arithmetic, the baseline
 # harvest, the transform, the replay on the optimised IR, the law
 # over the whole positive corpus, the refusals, the demos, the
 # report, the tools). Tool-only — no solver needed; the native half
 # of the demo parity runs when bin/hlc exists.
-reverify-acceptance: $(BIN)/acc-reverify
+reverify-acceptance: $(BIN)/acc-reverify $(BIN)/hls-reverify
 	@echo "[Stage 108 acceptance] running tests/acc/reverify_acceptance.hls..."
 	@$(BIN)/acc-reverify
 
