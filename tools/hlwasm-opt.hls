@@ -1,0 +1,2416 @@
+# ============================================================================
+# tools/hlwasm-opt.hls — the wasm size optimiser, in Halis.
+# ----------------------------------------------------------------------------
+# The native twin of the retired Python tools/hlwasm_opt.py (the .py is the
+# spec; the wopt_parts/ package it facaded lives in git history at
+# 8f757db~1). Same CLI, same report bytes, same exit codes:
+#
+#   hlwasm-opt <input.wasm> <output.wasm>
+#             [--level O1|O2|O3|Os] [--report] [--external-wasm-opt PATH]
+#
+# The passes are the .py's, ported law for law onto the same wasm module
+# model (parallel-list sections; bodies are byte strings):
+#
+#   O1  dead function elimination (mark-and-sweep from exports + start),
+#       dead import elimination (with whole-module renumbering), local
+#       vector compaction (merge adjacent same-type (count, type) runs).
+#   O2  O1 + type-section deduplication, dead data elimination (segments
+#       no live `i32.const` points at), contiguous data-segment merging
+#       (one active segment per string literal is ~6 bytes of header; a
+#       single contiguous region keeps the bytes identical).
+#   O3  O2 + peephole (nop elimination, i32.const N; i32.eqz folding),
+#       the structure-aware code cleanup (local.set+local.get -> tee,
+#       br-0-into-end of a non-loop frame, trailing top-level return),
+#       dead type-section entries after DCE, and the DataCount elision
+#       (the section is only required for memory.init / data.drop).
+#
+# The walker is STRICT, exactly like the .py's _walk_instrs: any opcode it
+# cannot fully parse aborts the pass for that body (the original bytes are
+# kept — never corrupt what you do not understand), including the 0xFC
+# (bulk-memory / reference-types) prefix instructions the emitter uses for
+# memory.copy. A module the model cannot round-trip (custom/table/element
+# sections, imported tables, real memory limits, non-i32/i64 global inits,
+# passive data segments) bypasses the in-tree passes entirely and passes
+# the original bytes through (the .py's deep-scan-30 fix).
+#
+# Idempotent by construction: the second run has nothing left to do.
+#
+# The .py imported nothing to optimise — this twin is fully standalone
+# (no hlfront; the byte helpers live in-file under the wo_
+# prefix). tools/hlwasm.hls does NOT import this file (a tool ships one
+# main); it drives the optimiser by spawning the sibling binary and keeps
+# the .py's "hlwasm_opt not found; skipping optimization" fallback law.
+# ============================================================================
+
+import "std.result"
+
+# ----------------------------------------------------------------------------
+# Byte helpers (the .py's uleb/sleb/read_uleb/read_sleb + buffers).
+# ----------------------------------------------------------------------------
+
+# wo_uleb(n) — unsigned LEB128 as a byte string (n >= 0).
+fn wo_uleb(n: int) -> str {
+    let out: list[int] = []
+    let mut v: int = n
+    while true {
+        let mut b: int = int_and(v, 127)
+        v = int_shr(v, 7)
+        if v != 0 {
+            b = int_or(b, 128)
+        }
+        out.push(b)
+        if v == 0 {
+            break
+        }
+    }
+    return wo_bytes_str(out)
+}
+
+# wo_sleb(n) — signed LEB128 as a byte string.
+fn wo_sleb(n: int) -> str {
+    let out: list[int] = []
+    let mut v: int = n
+    while true {
+        let b: int = int_and(v, 127)
+        v = int_sar(v, 7)
+        if (v == 0 && int_and(b, 64) == 0) || (v == -1 && int_and(b, 64) != 0) {
+            out.push(b)
+            break
+        }
+        out.push(int_or(b, 128))
+    }
+    return wo_bytes_str(out)
+}
+
+# WoCursor — the read position shared by the LEB readers (Halis fns return
+# one value; the cursor is a reference parameter, the .py's (v, pos) pair).
+struct WoCursor {
+    pos: int
+}
+
+# wo_read_uleb(b, cur) — unsigned LEB128 at cur.pos; advances cur.
+fn wo_read_uleb(b: str, cur: WoCursor) -> int {
+    let mut result: int = 0
+    let mut shift: int = 0
+    while true {
+        if cur.pos >= b.len() {
+            panic("truncated uleb")
+        }
+        let by: int = b.byte_at(cur.pos)
+        cur.pos = cur.pos + 1
+        result = int_or(result, int_shl(int_and(by, 127), shift))
+        if int_and(by, 128) == 0 {
+            break
+        }
+        shift = shift + 7
+    }
+    return result
+}
+
+# wo_read_sleb(b, cur) — signed LEB128 at cur.pos; advances cur.
+fn wo_read_sleb(b: str, cur: WoCursor) -> int {
+    let mut result: int = 0
+    let mut shift: int = 0
+    while true {
+        if cur.pos >= b.len() {
+            panic("truncated sleb")
+        }
+        let by: int = b.byte_at(cur.pos)
+        cur.pos = cur.pos + 1
+        result = int_or(result, int_shl(int_and(by, 127), shift))
+        shift = shift + 7
+        if int_and(by, 128) == 0 {
+            if int_and(by, 64) != 0 {
+                result = int_or(result, int_shl(-1, shift))
+            }
+            break
+        }
+    }
+    return result
+}
+
+# wo_bytes_str(buf) — list of byte values -> byte string (single join; the
+# naive per-byte concat is quadratic and the webapp module is ~100 KB).
+fn wo_bytes_str(buf: list[int]) -> str {
+    let parts: list[str] = []
+    let mut i: int = 0
+    while i < buf.len() {
+        parts.push(chr(buf.get(i)))
+        i = i + 1
+    }
+    return join(parts, "")
+}
+
+# Buffer appenders (the .py's bytearray +=).
+fn wo_b(buf: list[int], by: int) -> void {
+    buf.push(by)
+}
+
+fn wo_uleb_b(buf: list[int], n: int) -> void {
+    let s: str = wo_uleb(n)
+    let mut i: int = 0
+    while i < s.len() {
+        buf.push(s.byte_at(i))
+        i = i + 1
+    }
+}
+
+fn wo_sleb_b(buf: list[int], n: int) -> void {
+    let s: str = wo_sleb(n)
+    let mut i: int = 0
+    while i < s.len() {
+        buf.push(s.byte_at(i))
+        i = i + 1
+    }
+}
+
+fn wo_cat_b(buf: list[int], s: str) -> void {
+    let mut i: int = 0
+    while i < s.len() {
+        buf.push(s.byte_at(i))
+        i = i + 1
+    }
+}
+
+# wo_has_int(xs, v) — list membership (the .py's `in` on small lists).
+fn wo_has_int(xs: list[int], v: int) -> bool {
+    let mut i: int = 0
+    while i < xs.len() {
+        if xs.get(i) == v {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+
+# ----------------------------------------------------------------------------
+# The module model (the .py's WasmModule: parallel lists instead of
+# tuples/objects; bodies are byte strings exactly like the .py's bytes).
+# ----------------------------------------------------------------------------
+
+struct WoFuncType {
+    params: list[int],
+    results: list[int]
+}
+
+struct WoImport {
+    module: str,
+    name: str,
+    kind: int,     # 0x00 func, 0x01 table, 0x02 memory, 0x03 global
+    type_idx: int
+}
+
+struct WoExport {
+    name: str,
+    kind: int,
+    index: int
+}
+
+struct WoCode {
+    loc_n: list[int],  # (count, type) pairs, parallel lists
+    loc_t: list[int],
+    body: str          # instructions only; the serializer re-adds OP_END
+}
+
+struct WoDataSeg {
+    offset: int,
+    data: str
+}
+
+struct WoModule {
+    types: list[WoFuncType],
+    imports: list[WoImport],
+    funcs: list[int],          # type indices of defined functions
+    mem_flag: list[int],       # 0 = min only, 1 = min+max
+    mem_min: list[int],
+    mem_max: list[int],        # -1 = none
+    glob_mut: list[bool],
+    glob_ty: list[int],
+    glob_init: list[int],
+    exports: list[WoExport],
+    start: int,                # -1 = none
+    codes: list[WoCode],
+    data: list[WoDataSeg],
+    roundtrip_safe: bool,
+    emit_datacount: bool
+}
+
+# WoReport — the .py's report dict, fields defaulted like report.get(k, 0).
+struct WoReport {
+    in_tree_bypassed: bool,
+    external_ran: bool,
+    external_error: str,
+    input_size: int,
+    output_size: int,
+    bytes_saved: int,
+    reduction_h: int,          # percentage in hundredths (the .py rounds to 2)
+    dead_funcs_removed: int,
+    dead_imports_removed: int,
+    dead_data_removed: int,
+    types_deduped: int,
+    dead_types_removed: int,
+    peephole_saved: int,
+    local_compact_saved: int,
+    data_segments_merged: int,
+    data_merge_saved: int,
+    code_clean_saved: int
+}
+
+fn wo_new_module() -> WoModule {
+    return WoModule {
+        types: [], imports: [], funcs: [],
+        mem_flag: [], mem_min: [], mem_max: [],
+        glob_mut: [], glob_ty: [], glob_init: [],
+        exports: [], start: -1, codes: [], data: [],
+        roundtrip_safe: true, emit_datacount: true
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Parser — turn the wasm binary into the structured module (the .py's
+# WasmModule.parse + per-section helpers, law for law).
+# ----------------------------------------------------------------------------
+
+# wo_sec_modeled(sec_id) — the ids the model fully round-trips. Everything
+# else (custom=0, table=4, element=9, any future id) marks the module as
+# unsafe to re-serialize (the deep-scan-30 fix).
+fn wo_sec_modeled(sec_id: int) -> bool {
+    return sec_id == 1 || sec_id == 2 || sec_id == 3 || sec_id == 5
+    || sec_id == 6 || sec_id == 7 || sec_id == 8 || sec_id == 10
+    || sec_id == 11 || sec_id == 12
+}
+
+# wo_parse(wasm) — Err(text) on magic/version mismatch or truncation (the
+# .py raised ValueError / IndexError; both surfaced as the clean
+# "not a valid wasm module" refusal in main).
+fn wo_parse(wasm: str) -> Result[WoModule, str] {
+    if wasm.len() < 8 || wasm.slice(0, 4) != chr(0) + "asm" {
+        return Result.Err("not a wasm binary (magic mismatch)")
+    }
+    let version: int = int_or(int_or(int_or(int_shl(wasm.byte_at(7), 24),
+    int_shl(wasm.byte_at(6), 16)), int_shl(wasm.byte_at(5), 8)),
+    wasm.byte_at(4))
+    if version != 1 {
+        return Result.Err("unsupported wasm version: " + version.to_str())
+    }
+    let mod: WoModule = wo_new_module()
+    let cur: WoCursor = WoCursor { pos: 8 }
+    while cur.pos < wasm.len() {
+        let sec_id: int = wasm.byte_at(cur.pos)
+        cur.pos = cur.pos + 1
+        let sec_size: int = wo_read_uleb(wasm, cur)
+        let sec_end: int = cur.pos + sec_size
+        if sec_end > wasm.len() {
+            return Result.Err("truncated section (id " + sec_id.to_str() + ")")
+        }
+        if !wo_sec_modeled(sec_id) {
+            mod.roundtrip_safe = false
+        }
+        if sec_id == 1 {
+            let n: int = wo_read_uleb(wasm, cur)
+            let mut i: int = 0
+            while i < n {
+                let form: int = wasm.byte_at(cur.pos)
+                cur.pos = cur.pos + 1
+                if form != 96 {
+                    return Result.Err("expected 0x60 (func), got 0x"
+                    + form.to_str())
+                }
+                let np: int = wo_read_uleb(wasm, cur)
+                let params: list[int] = []
+                let mut p: int = 0
+                while p < np {
+                    params.push(wasm.byte_at(cur.pos))
+                    cur.pos = cur.pos + 1
+                    p = p + 1
+                }
+                let nr: int = wo_read_uleb(wasm, cur)
+                let results: list[int] = []
+                let mut r: int = 0
+                while r < nr {
+                    results.push(wasm.byte_at(cur.pos))
+                    cur.pos = cur.pos + 1
+                    r = r + 1
+                }
+                mod.types.push(WoFuncType { params: params, results: results })
+                i = i + 1
+            }
+        } else if sec_id == 2 {
+            let n2: int = wo_read_uleb(wasm, cur)
+            let mut i2: int = 0
+            while i2 < n2 {
+                let mlen: int = wo_read_uleb(wasm, cur)
+                let module: str = wasm.slice(cur.pos, cur.pos + mlen)
+                cur.pos = cur.pos + mlen
+                let nlen: int = wo_read_uleb(wasm, cur)
+                let name: str = wasm.slice(cur.pos, cur.pos + nlen)
+                cur.pos = cur.pos + nlen
+                let kind: int = wasm.byte_at(cur.pos)
+                cur.pos = cur.pos + 1
+                let mut type_idx: int = 0
+                if kind == 0 {
+                    type_idx = wo_read_uleb(wasm, cur)
+                } else if kind == 1 {
+                    # imported table: elem type + limits — the serializer
+                    # cannot re-emit one at all.
+                    mod.roundtrip_safe = false
+                    cur.pos = cur.pos + 1
+                    let flag: int = wasm.byte_at(cur.pos)
+                    cur.pos = cur.pos + 1
+                    wo_read_uleb(wasm, cur)
+                    if flag == 1 {
+                        wo_read_uleb(wasm, cur)
+                    }
+                } else if kind == 2 {
+                    # imported memory: the serializer hardcodes flag 0 /
+                    # min 1 — anything else would be corrupted.
+                    let flag2: int = wasm.byte_at(cur.pos)
+                    cur.pos = cur.pos + 1
+                    let min_p: int = wo_read_uleb(wasm, cur)
+                    if flag2 == 1 {
+                        wo_read_uleb(wasm, cur)
+                    }
+                    if flag2 != 0 || min_p != 1 {
+                        mod.roundtrip_safe = false
+                    }
+                } else if kind == 3 {
+                    # imported global: the serializer hardcodes
+                    # (i32, immutable).
+                    let ty: int = wasm.byte_at(cur.pos)
+                    cur.pos = cur.pos + 1
+                    let mutb: int = wasm.byte_at(cur.pos)
+                    cur.pos = cur.pos + 1
+                    if ty != 127 || mutb != 0 {
+                        mod.roundtrip_safe = false
+                    }
+                }
+                mod.imports.push(WoImport {
+                    module: module, name: name, kind: kind, type_idx: type_idx
+                })
+                i2 = i2 + 1
+            }
+        } else if sec_id == 3 {
+            let n3: int = wo_read_uleb(wasm, cur)
+            let mut i3: int = 0
+            while i3 < n3 {
+                mod.funcs.push(wo_read_uleb(wasm, cur))
+                i3 = i3 + 1
+            }
+        } else if sec_id == 5 {
+            let n5: int = wo_read_uleb(wasm, cur)
+            let mut i5: int = 0
+            while i5 < n5 {
+                let flag: int = wasm.byte_at(cur.pos)
+                cur.pos = cur.pos + 1
+                let min_p: int = wo_read_uleb(wasm, cur)
+                let mut max_p: int = -1
+                if flag == 1 {
+                    max_p = wo_read_uleb(wasm, cur)
+                }
+                mod.mem_flag.push(flag)
+                mod.mem_min.push(min_p)
+                mod.mem_max.push(max_p)
+                i5 = i5 + 1
+            }
+        } else if sec_id == 6 {
+            let n6: int = wo_read_uleb(wasm, cur)
+            let mut i6: int = 0
+            while i6 < n6 {
+                let ty: int = wasm.byte_at(cur.pos)
+                cur.pos = cur.pos + 1
+                let mutb2: int = wasm.byte_at(cur.pos)
+                cur.pos = cur.pos + 1
+                let mut init_val: int = 0
+                if wasm.byte_at(cur.pos) == 65 {
+                    cur.pos = cur.pos + 1
+                    init_val = wo_read_sleb(wasm, cur)
+                } else if wasm.byte_at(cur.pos) == 66 {
+                    cur.pos = cur.pos + 1
+                    init_val = wo_read_sleb(wasm, cur)
+                } else {
+                    # Non-i32/i64 init expressions cannot be re-serialized
+                    # faithfully — skip generically, mark unsafe.
+                    mod.roundtrip_safe = false
+                    cur.pos = wo_skip_init_expr(wasm, cur.pos)
+                }
+                if cur.pos >= wasm.len() || wasm.byte_at(cur.pos) != 11 {
+                    return Result.Err("malformed global init expression")
+                }
+                cur.pos = cur.pos + 1
+                mod.glob_mut.push(mutb2 != 0)
+                mod.glob_ty.push(ty)
+                mod.glob_init.push(init_val)
+                i6 = i6 + 1
+            }
+        } else if sec_id == 7 {
+            let n7: int = wo_read_uleb(wasm, cur)
+            let mut i7: int = 0
+            while i7 < n7 {
+                let nlen: int = wo_read_uleb(wasm, cur)
+                let name: str = wasm.slice(cur.pos, cur.pos + nlen)
+                cur.pos = cur.pos + nlen
+                let kind: int = wasm.byte_at(cur.pos)
+                cur.pos = cur.pos + 1
+                let idx: int = wo_read_uleb(wasm, cur)
+                mod.exports.push(WoExport {
+                    name: name, kind: kind, index: idx
+                })
+                i7 = i7 + 1
+            }
+        } else if sec_id == 8 {
+            mod.start = wo_read_uleb(wasm, cur)
+        } else if sec_id == 10 {
+            let n10: int = wo_read_uleb(wasm, cur)
+            let mut i10: int = 0
+            while i10 < n10 {
+                let body_size: int = wo_read_uleb(wasm, cur)
+                let body_end: int = cur.pos + body_size
+                if body_end > wasm.len() {
+                    return Result.Err("truncated code body")
+                }
+                let nloc: int = wo_read_uleb(wasm, cur)
+                let loc_n: list[int] = []
+                let loc_t: list[int] = []
+                let mut li: int = 0
+                while li < nloc {
+                    loc_n.push(wo_read_uleb(wasm, cur))
+                    loc_t.push(wasm.byte_at(cur.pos))
+                    cur.pos = cur.pos + 1
+                    li = li + 1
+                }
+                let mut body: str = wasm.slice(cur.pos, body_end)
+                cur.pos = body_end
+                # Strip the trailing OP_END (the .py's convention: the
+                # serializer re-adds it).
+                if body.len() > 0 && body.byte_at(body.len() - 1) == 11 {
+                    body = body.slice(0, body.len() - 1)
+                }
+                mod.codes.push(WoCode {
+                    loc_n: loc_n, loc_t: loc_t, body: body
+                })
+                i10 = i10 + 1
+            }
+        } else if sec_id == 11 {
+            let n11: int = wo_read_uleb(wasm, cur)
+            let mut i11: int = 0
+            while i11 < n11 {
+                let flag: int = wasm.byte_at(cur.pos)
+                cur.pos = cur.pos + 1
+                if flag != 0 {
+                    # passive/declarative segments cannot be re-serialized.
+                    mod.roundtrip_safe = false
+                }
+                let mut offset: int = 0
+                if wasm.byte_at(cur.pos) != 65 {
+                    mod.roundtrip_safe = false
+                } else {
+                    cur.pos = cur.pos + 1
+                    offset = wo_read_sleb(wasm, cur)
+                    if wasm.byte_at(cur.pos) != 11 {
+                        mod.roundtrip_safe = false
+                    } else {
+                        cur.pos = cur.pos + 1
+                    }
+                }
+                let dlen: int = wo_read_uleb(wasm, cur)
+                let data: str = wasm.slice(cur.pos, cur.pos + dlen)
+                cur.pos = cur.pos + dlen
+                mod.data.push(WoDataSeg { offset: offset, data: data })
+                i11 = i11 + 1
+            }
+        }
+        # sec_id 12 (DataCount): just a u32 count; not tracked.
+        cur.pos = sec_end
+    }
+    return Result.Ok(mod)
+}
+
+# wo_skip_init_expr(b, pos) — skip one init expression up to its OP_END
+# (the .py's _skip_init_expr: block/loop/if push a frame, END pops).
+fn wo_skip_init_expr(b: str, pos: int) -> int {
+    let mut p: int = pos
+    let mut depth: int = 0
+    let cur: WoCursor = WoCursor { pos: 0 }
+    while true {
+        if p >= b.len() {
+            panic("truncated init expression")
+        }
+        let op: int = b.byte_at(p)
+        p = p + 1
+        if op == 2 || op == 3 || op == 4 {
+            p = p + 1
+            depth = depth + 1
+        } else if op == 11 {
+            if depth == 0 {
+                return p
+            }
+            depth = depth - 1
+        } else if op == 65 || op == 66 {
+            cur.pos = p
+            wo_read_sleb(b, cur)
+            p = cur.pos
+        } else if op == 67 {
+            p = p + 4
+        } else if op == 68 {
+            p = p + 8
+        } else if op == 35 {
+            cur.pos = p
+            wo_read_uleb(b, cur)
+            p = cur.pos
+        }
+        # Other instructions: no immediates for our use case.
+    }
+    return p
+}
+
+# ----------------------------------------------------------------------------
+# Analysis — find live functions, dead imports, dead data (the .py's
+# wopt_analysis, walkers verbatim including their blind spots).
+# ----------------------------------------------------------------------------
+
+# wo_mem_op(op) — the load/store ops with (align, offset) immediates.
+fn wo_mem_op(op: int) -> bool {
+    return (op >= 40 && op <= 53) || (op >= 54 && op <= 62)
+}
+
+# wo_scan_calls(body) — every function index referenced by a `call` in the
+# body. Linear scan, the .py's opcode table exactly (0xFC bulk ops carry
+# sub-opcode + immediates — the deep-scan-13 fix).
+fn wo_scan_calls(body: str) -> list[int] {
+    let out: list[int] = []
+    let cur: WoCursor = WoCursor { pos: 0 }
+    let n: int = body.len()
+    while cur.pos < n {
+        let op: int = body.byte_at(cur.pos)
+        cur.pos = cur.pos + 1
+        if op == 16 {
+            out.push(wo_read_uleb(body, cur))
+        } else if op == 17 {
+            wo_read_uleb(body, cur)
+            wo_read_uleb(body, cur)
+        } else if op == 2 || op == 3 || op == 4 {
+            cur.pos = cur.pos + 1
+        } else if op == 14 {
+            let n_targets: int = wo_read_uleb(body, cur)
+            let mut i: int = 0
+            while i < n_targets + 1 {
+                wo_read_uleb(body, cur)
+                i = i + 1
+            }
+        } else if op == 32 || op == 33 || op == 34 {
+            wo_read_uleb(body, cur)
+        } else if op == 35 || op == 36 {
+            wo_read_uleb(body, cur)
+        } else if op == 37 || op == 38 {
+            wo_read_uleb(body, cur)
+        } else if op == 12 || op == 13 {
+            wo_read_uleb(body, cur)
+        } else if op == 65 {
+            wo_read_sleb(body, cur)
+        } else if op == 66 {
+            wo_read_sleb(body, cur)
+        } else if op == 67 {
+            cur.pos = cur.pos + 4
+        } else if op == 68 {
+            cur.pos = cur.pos + 8
+        } else if wo_mem_op(op) {
+            wo_read_uleb(body, cur)
+            wo_read_uleb(body, cur)
+        } else if op == 252 {
+            let sub: int = wo_read_uleb(body, cur)
+            if sub == 8 {
+                wo_read_uleb(body, cur)
+                wo_read_uleb(body, cur)
+            } else if sub == 9 || sub == 11 || sub == 13
+            || sub == 16 || sub == 18 || sub == 20 || sub == 21
+            || sub == 22 || sub == 23 {
+                wo_read_uleb(body, cur)
+            } else {
+                wo_read_uleb(body, cur)
+                wo_read_uleb(body, cur)
+            }
+        }
+        # All other ops: no immediates.
+    }
+    return out
+}
+
+# wo_find_live_functions(mod) — mark-and-sweep from exported functions +
+# the start function. Returns the live set as a map (index -> true).
+fn wo_find_live_functions(mod: WoModule) -> map[str, bool] {
+    let n_imports: int = mod.imports.len()
+    let live: map[str, bool] = map_new()
+    let worklist: list[int] = []
+    let mut i: int = 0
+    while i < mod.exports.len() {
+        let exp: WoExport = mod.exports.get(i)
+        if exp.kind == 0 && exp.index >= n_imports {
+            worklist.push(exp.index)
+        }
+        i = i + 1
+    }
+    if mod.start >= 0 && mod.start >= n_imports {
+        worklist.push(mod.start)
+    }
+    while worklist.len() > 0 {
+        let idx: int = worklist.pop()
+        let key: str = idx.to_str()
+        if live.has(key) {
+            continue
+        }
+        live.set(key, true)
+        if idx < n_imports {
+            continue
+        }
+        let code_idx: int = idx - n_imports
+        if code_idx < 0 || code_idx >= mod.codes.len() {
+            continue
+        }
+        let calls: list[int] = wo_scan_calls(mod.codes.get(code_idx).body)
+        let mut c: int = 0
+        while c < calls.len() {
+            if !live.has(calls.get(c).to_str()) {
+                worklist.push(calls.get(c))
+            }
+            c = c + 1
+        }
+    }
+    return live
+}
+
+# wo_find_used_imports(mod, live) — import indices referenced by exports or
+# any live function.
+fn wo_find_used_imports(mod: WoModule, live: map[str, bool]) -> map[str, bool] {
+    let n_imports: int = mod.imports.len()
+    let used: map[str, bool] = map_new()
+    let mut i: int = 0
+    while i < mod.exports.len() {
+        let exp: WoExport = mod.exports.get(i)
+        if exp.kind == 0 && exp.index < n_imports {
+            used.set(exp.index.to_str(), true)
+        }
+        i = i + 1
+    }
+    let keys: list[str] = live.keys()
+    let mut k: int = 0
+    while k < keys.len() {
+        let idx: int = keys.get(k).to_int()
+        if idx < n_imports {
+            used.set(idx.to_str(), true)
+        } else {
+            let code_idx: int = idx - n_imports
+            if code_idx >= 0 && code_idx < mod.codes.len() {
+                let calls: list[int] = wo_scan_calls(
+                mod.codes.get(code_idx).body)
+                let mut c: int = 0
+                while c < calls.len() {
+                    if calls.get(c) < n_imports {
+                        used.set(calls.get(c).to_str(), true)
+                    }
+                    c = c + 1
+                }
+            }
+        }
+        k = k + 1
+    }
+    return used
+}
+
+# wo_find_used_data_offsets(mod, live, offset_to_idx) — data-segment
+# indices referenced by live functions via `i32.const <offset>` (the .py's
+# conservative scanner, walker verbatim).
+fn wo_find_used_data_offsets(mod: WoModule, live: map[str, bool],
+offset_to_idx: map[str, int]) -> map[str, bool] {
+    let n_imports: int = mod.imports.len()
+    let used: map[str, bool] = map_new()
+    if offset_to_idx.len() == 0 {
+        return used
+    }
+    let cur: WoCursor = WoCursor { pos: 0 }
+    let keys: list[str] = live.keys()
+    let mut k: int = 0
+    while k < keys.len() {
+        let idx: int = keys.get(k).to_int()
+        if idx >= n_imports {
+            let code_idx: int = idx - n_imports
+            if code_idx >= 0 && code_idx < mod.codes.len() {
+                let body: str = mod.codes.get(code_idx).body
+                cur.pos = 0
+                let n: int = body.len()
+                while cur.pos < n {
+                    let op: int = body.byte_at(cur.pos)
+                    cur.pos = cur.pos + 1
+                    if op == 65 {
+                        let val: int = wo_read_sleb(body, cur)
+                        let okey: str = val.to_str()
+                        if offset_to_idx.has(okey) {
+                            used.set(offset_to_idx.get_or(okey, 0).to_str(),
+                            true)
+                        }
+                    } else if op == 66 {
+                        wo_read_sleb(body, cur)
+                    } else if op == 67 {
+                        cur.pos = cur.pos + 4
+                    } else if op == 68 {
+                        cur.pos = cur.pos + 8
+                    } else if op == 32 || op == 33 || op == 34
+                    || op == 35 || op == 36 || op == 12 || op == 13
+                    || op == 16 {
+                        wo_read_uleb(body, cur)
+                    } else if op == 17 {
+                        wo_read_uleb(body, cur)
+                        wo_read_uleb(body, cur)
+                    } else if op == 2 || op == 3 || op == 4 {
+                        cur.pos = cur.pos + 1
+                    } else if op == 14 {
+                        let n_targets: int = wo_read_uleb(body, cur)
+                        let mut i: int = 0
+                        while i < n_targets + 1 {
+                            wo_read_uleb(body, cur)
+                            i = i + 1
+                        }
+                    } else if wo_mem_op(op) {
+                        wo_read_uleb(body, cur)
+                        wo_read_uleb(body, cur)
+                    }
+                }
+            }
+        }
+        k = k + 1
+    }
+    return used
+}
+
+# ----------------------------------------------------------------------------
+# Passes (the .py's wopt_passes, byte-exact).
+# ----------------------------------------------------------------------------
+
+# wo_opt_dce — dead function elimination + dead import elimination, with
+# whole-module call/export/start renumbering.
+fn wo_opt_dce(mod: WoModule, rep: WoReport) -> void {
+    let n_imports: int = mod.imports.len()
+    let live: map[str, bool] = wo_find_live_functions(mod)
+    let used_imports: map[str, bool] = wo_find_used_imports(mod, live)
+
+    # Renumbering maps (old import index -> new, old func index -> new).
+    let new_import_indices: map[str, int] = map_new()
+    let new_imports: list[WoImport] = []
+    let mut i: int = 0
+    while i < n_imports {
+        if used_imports.has(i.to_str()) {
+            new_import_indices.set(i.to_str(), new_imports.len())
+            new_imports.push(mod.imports.get(i))
+        }
+        i = i + 1
+    }
+
+    let new_func_indices: map[str, int] = map_new()
+    let new_funcs: list[int] = []
+    let new_codes: list[WoCode] = []
+    let mut fi: int = 0
+    while fi < mod.funcs.len() {
+        let old_idx: int = n_imports + fi
+        if live.has(old_idx.to_str()) {
+            # The new index of a defined function is its position in the
+            # (new_imports || new_funcs) list — NOT n_imports + position.
+            new_func_indices.set(old_idx.to_str(),
+            new_imports.len() + new_funcs.len())
+            new_funcs.push(mod.funcs.get(fi))
+            new_codes.push(mod.codes.get(fi))
+        }
+        fi = fi + 1
+    }
+
+    # Renumber call targets in the surviving bodies.
+    let mut ci: int = 0
+    while ci < new_codes.len() {
+        let code: WoCode = new_codes.get(ci)
+        code.body = wo_renumber_calls(code.body, new_import_indices,
+        new_func_indices)
+        ci = ci + 1
+    }
+
+    # Renumber exports + the start function (a removed target drops the
+    # export / the start section entirely, the .py's law).
+    let new_exports: list[WoExport] = []
+    let mut ei: int = 0
+    while ei < mod.exports.len() {
+        let exp: WoExport = mod.exports.get(ei)
+        if exp.kind == 0 {
+            if exp.index < n_imports {
+                if new_import_indices.has(exp.index.to_str()) {
+                    new_exports.push(WoExport {
+                        name: exp.name, kind: exp.kind,
+                        index: new_import_indices.get_or(
+                        exp.index.to_str(), exp.index)
+                    })
+                }
+            } else {
+                if new_func_indices.has(exp.index.to_str()) {
+                    new_exports.push(WoExport {
+                        name: exp.name, kind: exp.kind,
+                        index: new_func_indices.get_or(
+                        exp.index.to_str(), exp.index)
+                    })
+                }
+            }
+        } else {
+            new_exports.push(exp)
+        }
+        ei = ei + 1
+    }
+    let mut new_start: int = -1
+    if mod.start >= 0 {
+        if mod.start < n_imports {
+            if new_import_indices.has(mod.start.to_str()) {
+                new_start = new_import_indices.get_or(mod.start.to_str(),
+                mod.start)
+            }
+        } else {
+            if new_func_indices.has(mod.start.to_str()) {
+                new_start = new_func_indices.get_or(mod.start.to_str(),
+                mod.start)
+            }
+        }
+    }
+
+    rep.dead_funcs_removed = mod.funcs.len() - new_funcs.len()
+    rep.dead_imports_removed = mod.imports.len() - new_imports.len()
+    mod.imports = new_imports
+    mod.funcs = new_funcs
+    mod.codes = new_codes
+    mod.exports = new_exports
+    mod.start = new_start
+}
+
+# wo_renumber_calls — rewrite `call <idx>` to the renumbered indices (the
+# .py's walker; every other instruction round-trips verbatim).
+fn wo_renumber_calls(body: str, new_import_indices: map[str, int],
+new_func_indices: map[str, int]) -> str {
+    let out: list[int] = []
+    let cur: WoCursor = WoCursor { pos: 0 }
+    let n: int = body.len()
+    while cur.pos < n {
+        let op: int = body.byte_at(cur.pos)
+        cur.pos = cur.pos + 1
+        out.push(op)
+        if op == 16 {
+            let idx: int = wo_read_uleb(body, cur)
+            let mut new_idx: int = idx
+            if new_import_indices.has(idx.to_str()) {
+                new_idx = new_import_indices.get_or(idx.to_str(), idx)
+            } else if new_func_indices.has(idx.to_str()) {
+                new_idx = new_func_indices.get_or(idx.to_str(), idx)
+            }
+            wo_uleb_b(out, new_idx)
+        } else if op == 17 {
+            let type_idx: int = wo_read_uleb(body, cur)
+            let table_idx: int = wo_read_uleb(body, cur)
+            wo_uleb_b(out, type_idx)
+            wo_uleb_b(out, table_idx)
+        } else if op == 2 || op == 3 || op == 4 {
+            out.push(body.byte_at(cur.pos))
+            cur.pos = cur.pos + 1
+        } else if op == 14 {
+            let n_targets: int = wo_read_uleb(body, cur)
+            wo_uleb_b(out, n_targets)
+            let mut i: int = 0
+            while i < n_targets + 1 {
+                let t: int = wo_read_uleb(body, cur)
+                wo_uleb_b(out, t)
+                i = i + 1
+            }
+        } else if op == 32 || op == 33 || op == 34 || op == 35
+        || op == 36 || op == 12 || op == 13 {
+            let v: int = wo_read_uleb(body, cur)
+            wo_uleb_b(out, v)
+        } else if op == 65 {
+            let v: int = wo_read_sleb(body, cur)
+            wo_sleb_b(out, v)
+        } else if op == 66 {
+            let v: int = wo_read_sleb(body, cur)
+            wo_sleb_b(out, v)
+        } else if op == 67 {
+            let mut i: int = 0
+            while i < 4 {
+                out.push(body.byte_at(cur.pos))
+                cur.pos = cur.pos + 1
+                i = i + 1
+            }
+        } else if op == 68 {
+            let mut i: int = 0
+            while i < 8 {
+                out.push(body.byte_at(cur.pos))
+                cur.pos = cur.pos + 1
+                i = i + 1
+            }
+        } else if wo_mem_op(op) {
+            let align: int = wo_read_uleb(body, cur)
+            let off: int = wo_read_uleb(body, cur)
+            wo_uleb_b(out, align)
+            wo_uleb_b(out, off)
+        }
+        # All other ops: no immediates — already appended.
+    }
+    return wo_bytes_str(out)
+}
+
+# wo_type_key(t) — the dedup key: params + results joined.
+fn wo_type_key(t: WoFuncType) -> str {
+    let parts: list[str] = []
+    let mut i: int = 0
+    while i < t.params.len() {
+        parts.push(t.params.get(i).to_str())
+        i = i + 1
+    }
+    parts.push("|")
+    let mut j: int = 0
+    while j < t.results.len() {
+        parts.push(t.results.get(j).to_str())
+        j = j + 1
+    }
+    return join(parts, ",")
+}
+
+# wo_opt_type_dedup — collapse identical signatures into one type entry;
+# rewrite imports, the function section, and call_indirect immediates.
+fn wo_opt_type_dedup(mod: WoModule, rep: WoReport) -> void {
+    let new_types: list[WoFuncType] = []
+    let remap: map[str, int] = map_new()
+    let seen: map[str, int] = map_new()
+    let mut i: int = 0
+    while i < mod.types.len() {
+        let ty: WoFuncType = mod.types.get(i)
+        let key: str = wo_type_key(ty)
+        if seen.has(key) {
+            remap.set(i.to_str(), seen.get_or(key, i))
+        } else {
+            seen.set(key, new_types.len())
+            remap.set(i.to_str(), new_types.len())
+            new_types.push(ty)
+        }
+        i = i + 1
+    }
+    rep.types_deduped = mod.types.len() - new_types.len()
+    let mut ii: int = 0
+    while ii < mod.imports.len() {
+        let imp: WoImport = mod.imports.get(ii)
+        if imp.kind == 0 {
+            imp.type_idx = remap.get_or(imp.type_idx.to_str(), imp.type_idx)
+        }
+        ii = ii + 1
+    }
+    let mut fi: int = 0
+    while fi < mod.funcs.len() {
+        let t: int = mod.funcs.get(fi)
+        mod.funcs.set(fi, remap.get_or(t.to_str(), t))
+        fi = fi + 1
+    }
+    let mut ci: int = 0
+    while ci < mod.codes.len() {
+        let code: WoCode = mod.codes.get(ci)
+        code.body = wo_renumber_call_indirect(code.body, remap)
+        ci = ci + 1
+    }
+    mod.types = new_types
+}
+
+# wo_renumber_call_indirect — rewrite call_indirect type indices (the .py's
+# second walker; call indices pass through untouched).
+fn wo_renumber_call_indirect(body: str, remap: map[str, int]) -> str {
+    let out: list[int] = []
+    let cur: WoCursor = WoCursor { pos: 0 }
+    let n: int = body.len()
+    while cur.pos < n {
+        let op: int = body.byte_at(cur.pos)
+        cur.pos = cur.pos + 1
+        out.push(op)
+        if op == 17 {
+            let type_idx: int = wo_read_uleb(body, cur)
+            let table_idx: int = wo_read_uleb(body, cur)
+            wo_uleb_b(out, remap.get_or(type_idx.to_str(), type_idx))
+            wo_uleb_b(out, table_idx)
+        } else if op == 16 {
+            let idx: int = wo_read_uleb(body, cur)
+            wo_uleb_b(out, idx)
+        } else if op == 2 || op == 3 || op == 4 {
+            out.push(body.byte_at(cur.pos))
+            cur.pos = cur.pos + 1
+        } else if op == 14 {
+            let n_targets: int = wo_read_uleb(body, cur)
+            wo_uleb_b(out, n_targets)
+            let mut i: int = 0
+            while i < n_targets + 1 {
+                let t: int = wo_read_uleb(body, cur)
+                wo_uleb_b(out, t)
+                i = i + 1
+            }
+        } else if op == 32 || op == 33 || op == 34 || op == 35
+        || op == 36 || op == 12 || op == 13 {
+            let v: int = wo_read_uleb(body, cur)
+            wo_uleb_b(out, v)
+        } else if op == 65 {
+            let v: int = wo_read_sleb(body, cur)
+            wo_sleb_b(out, v)
+        } else if op == 66 {
+            let v: int = wo_read_sleb(body, cur)
+            wo_sleb_b(out, v)
+        } else if op == 67 {
+            let mut i: int = 0
+            while i < 4 {
+                out.push(body.byte_at(cur.pos))
+                cur.pos = cur.pos + 1
+                i = i + 1
+            }
+        } else if op == 68 {
+            let mut i: int = 0
+            while i < 8 {
+                out.push(body.byte_at(cur.pos))
+                cur.pos = cur.pos + 1
+                i = i + 1
+            }
+        } else if wo_mem_op(op) {
+            let align: int = wo_read_uleb(body, cur)
+            let off: int = wo_read_uleb(body, cur)
+            wo_uleb_b(out, align)
+            wo_uleb_b(out, off)
+        }
+    }
+    return wo_bytes_str(out)
+}
+
+# wo_opt_local_compact — merge consecutive (count, type) local entries.
+fn wo_opt_local_compact(mod: WoModule, rep: WoReport) -> void {
+    let mut saved: int = 0
+    let mut ci: int = 0
+    while ci < mod.codes.len() {
+        let code: WoCode = mod.codes.get(ci)
+        if code.loc_n.len() > 0 {
+            let m_n: list[int] = []
+            let m_t: list[int] = []
+            let mut i: int = 0
+            while i < code.loc_n.len() {
+                let count: int = code.loc_n.get(i)
+                let ty: int = code.loc_t.get(i)
+                if m_t.len() > 0 && m_t.get(m_t.len() - 1) == ty {
+                    let li: int = m_t.len() - 1
+                    m_n.set(li, m_n.get(li) + count)
+                } else {
+                    m_n.push(count)
+                    m_t.push(ty)
+                }
+                i = i + 1
+            }
+            # The merge never reorders (indices are position-based).
+            saved = saved + (code.loc_n.len() - m_n.len()) * 2
+            code.loc_n = m_n
+            code.loc_t = m_t
+        }
+        ci = ci + 1
+    }
+    rep.local_compact_saved = saved
+}
+
+# wo_opt_dead_data — eliminate data segments no live function references.
+fn wo_opt_dead_data(mod: WoModule, rep: WoReport) -> void {
+    let live: map[str, bool] = wo_find_live_functions(mod)
+    let offset_to_idx: map[str, int] = map_new()
+    let mut i: int = 0
+    while i < mod.data.len() {
+        offset_to_idx.set(mod.data.get(i).offset.to_str(), i)
+        i = i + 1
+    }
+    let used: map[str, bool] = wo_find_used_data_offsets(mod, live,
+    offset_to_idx)
+    let new_data: list[WoDataSeg] = []
+    let mut d: int = 0
+    while d < mod.data.len() {
+        if used.has(d.to_str()) {
+            new_data.push(mod.data.get(d))
+        }
+        d = d + 1
+    }
+    rep.dead_data_removed = mod.data.len() - new_data.len()
+    mod.data = new_data
+}
+
+# WoBodySave — the .py's (new_body, saved) pair.
+struct WoBodySave {
+    body: str,
+    saved: int
+}
+
+# wo_opt_peephole — nop elimination + i32.const N; i32.eqz folding.
+fn wo_opt_peephole(mod: WoModule, rep: WoReport) -> void {
+    let mut saved: int = 0
+    let mut ci: int = 0
+    while ci < mod.codes.len() {
+        let code: WoCode = mod.codes.get(ci)
+        let r: WoBodySave = wo_peephole_body(code.body)
+        saved = saved + r.saved
+        code.body = r.body
+        ci = ci + 1
+    }
+    rep.peephole_saved = saved
+}
+
+# wo_peephole_body — the .py's _peephole_body, walker verbatim (the 0xFC
+# sub-opcode table is the deep-scan-28 fix; unknown sub-opcodes bail out
+# and keep the original body).
+fn wo_peephole_body(body: str) -> WoBodySave {
+    let out: list[int] = []
+    let cur: WoCursor = WoCursor { pos: 0 }
+    let n: int = body.len()
+    let mut saved: int = 0
+    while cur.pos < n {
+        let op: int = body.byte_at(cur.pos)
+        cur.pos = cur.pos + 1
+        if op == 1 {
+            # nop elimination
+            saved = saved + 1
+            continue
+        }
+        if op == 65 {
+            # i32.const: look ahead for i32.eqz
+            let val: int = wo_read_sleb(body, cur)
+            if cur.pos < n && body.byte_at(cur.pos) == 69 {
+                let mut folded: int = 0
+                if val == 0 {
+                    folded = 1
+                }
+                out.push(65)
+                wo_sleb_b(out, folded)
+                saved = saved + 1 + wo_sleb(val).len() - wo_sleb(folded).len()
+                cur.pos = cur.pos + 1
+                continue
+            }
+            out.push(65)
+            wo_sleb_b(out, val)
+            continue
+        }
+        out.push(op)
+        if op == 16 {
+            let idx: int = wo_read_uleb(body, cur)
+            wo_uleb_b(out, idx)
+        } else if op == 17 {
+            let type_idx: int = wo_read_uleb(body, cur)
+            let table_idx: int = wo_read_uleb(body, cur)
+            wo_uleb_b(out, type_idx)
+            wo_uleb_b(out, table_idx)
+        } else if op == 2 || op == 3 || op == 4 {
+            out.push(body.byte_at(cur.pos))
+            cur.pos = cur.pos + 1
+        } else if op == 14 {
+            let n_targets: int = wo_read_uleb(body, cur)
+            wo_uleb_b(out, n_targets)
+            let mut i: int = 0
+            while i < n_targets + 1 {
+                let t: int = wo_read_uleb(body, cur)
+                wo_uleb_b(out, t)
+                i = i + 1
+            }
+        } else if op == 32 || op == 33 || op == 34 || op == 35
+        || op == 36 || op == 12 || op == 13 {
+            let v: int = wo_read_uleb(body, cur)
+            wo_uleb_b(out, v)
+        } else if op == 66 {
+            let v: int = wo_read_sleb(body, cur)
+            wo_sleb_b(out, v)
+        } else if op == 67 {
+            let mut i: int = 0
+            while i < 4 {
+                out.push(body.byte_at(cur.pos))
+                cur.pos = cur.pos + 1
+                i = i + 1
+            }
+        } else if op == 68 {
+            let mut i: int = 0
+            while i < 8 {
+                out.push(body.byte_at(cur.pos))
+                cur.pos = cur.pos + 1
+                i = i + 1
+            }
+        } else if op == 252 {
+            let sub: int = wo_read_uleb(body, cur)
+            wo_uleb_b(out, sub)
+            if sub == 8 {
+                let v: int = wo_read_uleb(body, cur)
+                wo_uleb_b(out, v)
+                let v2: int = wo_read_uleb(body, cur)
+                wo_uleb_b(out, v2)
+            } else if sub == 9 {
+                let v: int = wo_read_uleb(body, cur)
+                wo_uleb_b(out, v)
+            } else if sub == 10 {
+                let v: int = wo_read_uleb(body, cur)
+                wo_uleb_b(out, v)
+                let v2: int = wo_read_uleb(body, cur)
+                wo_uleb_b(out, v2)
+            } else if sub == 11 {
+                let v: int = wo_read_uleb(body, cur)
+                wo_uleb_b(out, v)
+            } else if sub == 12 || sub == 13 || sub == 14
+            || sub == 15 || sub == 16 || sub == 17 || sub == 18
+            || sub == 19 || sub == 20 || sub == 21 || sub == 22
+            || sub == 23 {
+                if sub == 12 || sub == 14 || sub == 15 || sub == 17
+                || sub == 19 || sub == 21 {
+                    let v: int = wo_read_uleb(body, cur)
+                    wo_uleb_b(out, v)
+                    let v2: int = wo_read_uleb(body, cur)
+                    wo_uleb_b(out, v2)
+                } else {
+                    let v: int = wo_read_uleb(body, cur)
+                    wo_uleb_b(out, v)
+                }
+            } else {
+                # Unknown sub-opcode: keep the original (never risk a
+                # corrupt rewrite).
+                return WoBodySave { body: body, saved: 0 }
+            }
+        } else if wo_mem_op(op) {
+            let align: int = wo_read_uleb(body, cur)
+            let off: int = wo_read_uleb(body, cur)
+            wo_uleb_b(out, align)
+            wo_uleb_b(out, off)
+        }
+    }
+    return WoBodySave { body: wo_bytes_str(out), saved: saved }
+}
+
+# ----------------------------------------------------------------------------
+# The strict, structure-aware walker (the .py's _walk_instrs). Returns
+# false on any opcode it cannot fully parse — callers leave that body alone.
+# ----------------------------------------------------------------------------
+
+# WoInstr — one instruction: op at [start, end), top = the kind of the
+# innermost open control frame AFTER the opcode is consumed ("" = none).
+# The .py carried the whole frames tuple; the two decisions that read it
+# only ever look at the innermost frame and at emptiness.
+struct WoInstr {
+    start: int,
+    op: int,
+    end: int,
+    top: str
+}
+
+# wo_plain_op(op) — opcodes with no immediates (the .py's _PLAIN_OPS:
+# ctrl/plain + the numeric/comparison range + ref.*).
+fn wo_plain_op(op: int) -> bool {
+    if op == 0 || op == 1 || op == 11 || op == 15 || op == 26
+    || op == 27 || op == 5 || op == 208 || op == 209 || op == 210 {
+        return true
+    }
+    return op >= 69 && op < 197
+}
+
+# wo_valtype(b) — the blocktype bytes that are plain value types.
+fn wo_valtype(b: int) -> bool {
+    return b == 127 || b == 126 || b == 125 || b == 124 || b == 123
+    || b == 112 || b == 111
+}
+
+fn wo_walk_instrs(body: str, instrs: list[WoInstr]) -> bool {
+    let cur: WoCursor = WoCursor { pos: 0 }
+    let n: int = body.len()
+    let frames: list[str] = []
+    while cur.pos < n {
+        let start: int = cur.pos
+        let op: int = body.byte_at(cur.pos)
+        cur.pos = cur.pos + 1
+        if op == 2 || op == 3 || op == 4 {
+            if cur.pos >= n {
+                return false
+            }
+            let bt: int = body.byte_at(cur.pos)
+            if bt == 64 || wo_valtype(bt) {
+                cur.pos = cur.pos + 1
+            } else {
+                while cur.pos < n && int_and(body.byte_at(cur.pos), 128) != 0 {
+                    cur.pos = cur.pos + 1
+                }
+                cur.pos = cur.pos + 1
+            }
+            let mut kind: str = "block"
+            if op == 3 {
+                kind = "loop"
+            }
+            frames.push(kind)
+            instrs.push(WoInstr {
+                start: start, op: op, end: cur.pos,
+                top: frames.get(frames.len() - 1)
+            })
+            continue
+        }
+        if op == 11 {
+            if frames.len() > 0 {
+                frames.pop()
+            }
+            let mut top: str = ""
+            if frames.len() > 0 {
+                top = frames.get(frames.len() - 1)
+            }
+            instrs.push(WoInstr {
+                start: start, op: op, end: cur.pos, top: top
+            })
+            continue
+        }
+        if op == 5 {
+            let mut top2: str = ""
+            if frames.len() > 0 {
+                top2 = frames.get(frames.len() - 1)
+            }
+            if frames.len() == 0 || top2 != "block" {
+                return false
+            }
+            instrs.push(WoInstr {
+                start: start, op: op, end: cur.pos, top: top2
+            })
+            continue
+        }
+        if wo_plain_op(op) {
+            let mut top3: str = ""
+            if frames.len() > 0 {
+                top3 = frames.get(frames.len() - 1)
+            }
+            instrs.push(WoInstr {
+                start: start, op: op, end: cur.pos, top: top3
+            })
+            continue
+        }
+        if op == 16 || op == 12 || op == 13 || op == 32 || op == 33
+        || op == 34 || op == 35 || op == 36 || op == 37 || op == 38 {
+            wo_read_uleb(body, cur)
+            let mut top4: str = ""
+            if frames.len() > 0 {
+                top4 = frames.get(frames.len() - 1)
+            }
+            instrs.push(WoInstr {
+                start: start, op: op, end: cur.pos, top: top4
+            })
+            continue
+        }
+        if op == 17 {
+            wo_read_uleb(body, cur)
+            wo_read_uleb(body, cur)
+            let mut top5: str = ""
+            if frames.len() > 0 {
+                top5 = frames.get(frames.len() - 1)
+            }
+            instrs.push(WoInstr {
+                start: start, op: op, end: cur.pos, top: top5
+            })
+            continue
+        }
+        if op == 14 {
+            let cnt: int = wo_read_uleb(body, cur)
+            let mut i: int = 0
+            while i < cnt + 1 {
+                wo_read_uleb(body, cur)
+                i = i + 1
+            }
+            let mut top6: str = ""
+            if frames.len() > 0 {
+                top6 = frames.get(frames.len() - 1)
+            }
+            instrs.push(WoInstr {
+                start: start, op: op, end: cur.pos, top: top6
+            })
+            continue
+        }
+        if op == 65 || op == 66 {
+            wo_read_sleb(body, cur)
+            let mut top7: str = ""
+            if frames.len() > 0 {
+                top7 = frames.get(frames.len() - 1)
+            }
+            instrs.push(WoInstr {
+                start: start, op: op, end: cur.pos, top: top7
+            })
+            continue
+        }
+        if op == 67 {
+            cur.pos = cur.pos + 4
+            let mut top8: str = ""
+            if frames.len() > 0 {
+                top8 = frames.get(frames.len() - 1)
+            }
+            instrs.push(WoInstr {
+                start: start, op: op, end: cur.pos, top: top8
+            })
+            continue
+        }
+        if op == 68 {
+            cur.pos = cur.pos + 8
+            let mut top9: str = ""
+            if frames.len() > 0 {
+                top9 = frames.get(frames.len() - 1)
+            }
+            instrs.push(WoInstr {
+                start: start, op: op, end: cur.pos, top: top9
+            })
+            continue
+        }
+        if wo_mem_op(op) {
+            wo_read_uleb(body, cur)
+            wo_read_uleb(body, cur)
+            let mut topa: str = ""
+            if frames.len() > 0 {
+                topa = frames.get(frames.len() - 1)
+            }
+            instrs.push(WoInstr {
+                start: start, op: op, end: cur.pos, top: topa
+            })
+            continue
+        }
+        if op == 28 {
+            # select_t
+            let cnt2: int = wo_read_uleb(body, cur)
+            cur.pos = cur.pos + cnt2
+            let mut topb: str = ""
+            if frames.len() > 0 {
+                topb = frames.get(frames.len() - 1)
+            }
+            instrs.push(WoInstr {
+                start: start, op: op, end: cur.pos, top: topb
+            })
+            continue
+        }
+        if op == 252 {
+            if cur.pos >= n {
+                return false
+            }
+            let sub: int = wo_read_uleb(body, cur)
+            if sub == 8 {
+                wo_read_uleb(body, cur)
+                wo_read_uleb(body, cur)
+            } else if sub == 9 {
+                wo_read_uleb(body, cur)
+            } else if sub == 10 {
+                wo_read_uleb(body, cur)
+                wo_read_uleb(body, cur)
+            } else if sub == 11 {
+                wo_read_uleb(body, cur)
+            } else if sub == 12 || sub == 13 || sub == 14
+            || sub == 15 || sub == 16 || sub == 17 || sub == 18
+            || sub == 19 || sub == 20 || sub == 21 || sub == 22
+            || sub == 23 {
+                if sub == 12 || sub == 14 || sub == 15 || sub == 17
+                || sub == 19 || sub == 21 {
+                    wo_read_uleb(body, cur)
+                    wo_read_uleb(body, cur)
+                } else {
+                    wo_read_uleb(body, cur)
+                }
+            } else {
+                return false
+            }
+            let mut topc: str = ""
+            if frames.len() > 0 {
+                topc = frames.get(frames.len() - 1)
+            }
+            instrs.push(WoInstr {
+                start: start, op: op, end: cur.pos, top: topc
+            })
+            continue
+        }
+        return false
+    }
+    return true
+}
+
+# wo_opt_code_clean — the structure-aware body cleanup:
+#   (1) local.set X; local.get X -> local.tee X;
+#   (2) br 0 immediately before the end of a NON-loop frame -> drop;
+#   (3) a trailing top-level return -> drop.
+fn wo_opt_code_clean(mod: WoModule, rep: WoReport) -> void {
+    let mut saved: int = 0
+    let mut ci: int = 0
+    while ci < mod.codes.len() {
+        let code: WoCode = mod.codes.get(ci)
+        let instrs: list[WoInstr] = []
+        if wo_walk_instrs(code.body, instrs) {
+            let r: WoBodySave = wo_clean_body(code.body, instrs)
+            saved = saved + r.saved
+            code.body = r.body
+        }
+        ci = ci + 1
+    }
+    rep.code_clean_saved = saved
+}
+
+# wo_clean_body — the .py's _clean_body over pre-walked instructions.
+fn wo_clean_body(body: str, instrs: list[WoInstr]) -> WoBodySave {
+    if instrs.len() == 0 {
+        return WoBodySave { body: body, saved: 0 }
+    }
+    let drop: list[int] = []
+    let tee_set: list[int] = []
+    let mut i: int = 0
+    while i < instrs.len() {
+        let ins: WoInstr = instrs.get(i)
+        if ins.op == 33 && i + 1 < instrs.len() {
+            let nxt: WoInstr = instrs.get(i + 1)
+            if nxt.op == 32
+            && body.slice(ins.start + 1, ins.end)
+            == body.slice(nxt.start + 1, nxt.end) {
+                drop.push(nxt.start)
+                tee_set.push(ins.start)
+                i = i + 1
+                continue
+            }
+        }
+        if ins.op == 12 {
+            let cur: WoCursor = WoCursor { pos: ins.start + 1 }
+            let depth: int = wo_read_uleb(body, cur)
+            if depth == 0 && i + 1 < instrs.len() {
+                let nxt2: WoInstr = instrs.get(i + 1)
+                if nxt2.op == 11 && ins.top != "" && ins.top != "loop" {
+                    # br 0 into the immediately following end of a
+                    # block/if frame: control falls through to exactly the
+                    # same place. (A loop frame would make br 0 a BACK
+                    # EDGE — never removed.)
+                    drop.push(ins.start)
+                }
+            }
+        }
+        i = i + 1
+    }
+    # (3) trailing top-level return: the serializer's final `end` returns
+    # the stack top / void identically.
+    let last: WoInstr = instrs.get(instrs.len() - 1)
+    if last.op == 15 && last.top == "" {
+        drop.push(last.start)
+    }
+    if drop.len() == 0 && tee_set.len() == 0 {
+        return WoBodySave { body: body, saved: 0 }
+    }
+    let out: list[int] = []
+    let mut saved: int = 0
+    let mut j: int = 0
+    while j < instrs.len() {
+        let ins2: WoInstr = instrs.get(j)
+        if wo_has_int(drop, ins2.start) {
+            saved = saved + (ins2.end - ins2.start)
+            j = j + 1
+            continue
+        }
+        if wo_has_int(tee_set, ins2.start) {
+            # local.set X -> local.tee X (0x21 -> 0x22, same immediates)
+            out.push(34)
+            wo_cat_b(out, body.slice(ins2.start + 1, ins2.end))
+            j = j + 1
+            continue
+        }
+        wo_cat_b(out, body.slice(ins2.start, ins2.end))
+        j = j + 1
+    }
+    return WoBodySave { body: wo_bytes_str(out), saved: saved }
+}
+
+# wo_opt_data_merge — merge data segments contiguous in memory (gap <= 6
+# bytes is zero-filled, identical to the memory's initial state).
+fn wo_opt_data_merge(mod: WoModule, rep: WoReport) -> void {
+    if mod.data.len() <= 1 {
+        rep.data_segments_merged = 0
+        rep.data_merge_saved = 0
+        return
+    }
+    # Sort by offset (stable index sort; offsets are unique here).
+    let order: list[int] = []
+    let mut i: int = 0
+    while i < mod.data.len() {
+        order.push(i)
+        i = i + 1
+    }
+    let mut a: int = 1
+    while a < order.len() {
+        let va: int = mod.data.get(order.get(a)).offset
+        let mut b: int = a - 1
+        while b >= 0 && mod.data.get(order.get(b)).offset > va {
+            let tmp: int = order.get(b)
+            order.set(b, order.get(b + 1))
+            order.set(b + 1, tmp)
+            b = b - 1
+        }
+        a = a + 1
+    }
+    # Reject overlapping segments outright.
+    let mut k: int = 0
+    while k < order.len() - 1 {
+        let s0: WoDataSeg = mod.data.get(order.get(k))
+        let s1: WoDataSeg = mod.data.get(order.get(k + 1))
+        if s0.offset + s0.data.len() > s1.offset {
+            rep.data_segments_merged = 0
+            rep.data_merge_saved = 0
+            return
+        }
+        k = k + 1
+    }
+    let GAP_LIMIT: int = 6
+    let merged: list[WoDataSeg] = []
+    let mut cur_off: int = mod.data.get(order.get(0)).offset
+    let mut cur_data: list[int] = []
+    wo_cat_b(cur_data, mod.data.get(order.get(0)).data)
+    let mut s: int = 1
+    while s < order.len() {
+        let seg: WoDataSeg = mod.data.get(order.get(s))
+        let gap: int = seg.offset - (cur_off + cur_data.len())
+        if gap <= GAP_LIMIT {
+            let mut z: int = 0
+            while z < gap {
+                cur_data.push(0)
+                z = z + 1
+            }
+            wo_cat_b(cur_data, seg.data)
+        } else {
+            merged.push(WoDataSeg {
+                offset: cur_off, data: wo_bytes_str(cur_data)
+            })
+            cur_off = seg.offset
+            let fresh: list[int] = []
+            wo_cat_b(fresh, seg.data)
+            cur_data = fresh
+        }
+        s = s + 1
+    }
+    merged.push(WoDataSeg {
+        offset: cur_off, data: wo_bytes_str(cur_data)
+    })
+    # Exact byte accounting from the serialized form.
+    let before_bytes: int = wo_sec_bytes(mod.data)
+    let after_bytes: int = wo_sec_bytes(merged)
+    rep.data_segments_merged = mod.data.len() - merged.len()
+    let mut dsave: int = before_bytes - after_bytes
+    if dsave < 0 {
+        dsave = 0
+    }
+    rep.data_merge_saved = dsave
+    mod.data = merged
+}
+
+# wo_sec_bytes(segs) — the serialized size of a data section body.
+fn wo_sec_bytes(segs: list[WoDataSeg]) -> int {
+    let mut n: int = 1
+    let mut i: int = 0
+    while i < segs.len() {
+        let s: WoDataSeg = segs.get(i)
+        n = n + 1 + 1 + wo_sleb(s.offset).len() + 1
+        n = n + wo_uleb(s.data.len()).len() + s.data.len()
+        i = i + 1
+    }
+    return n
+}
+
+# wo_uses_bulk_data_ops — 1 if any body uses memory.init (0xFC 0x08) or
+# data.drop (0xFC 0x09); 0 if definitively not; -1 if a body cannot be
+# parsed (the caller keeps the DataCount section — conservative).
+fn wo_uses_bulk_data_ops(mod: WoModule) -> int {
+    let mut ci: int = 0
+    while ci < mod.codes.len() {
+        let code: WoCode = mod.codes.get(ci)
+        let instrs: list[WoInstr] = []
+        if !wo_walk_instrs(code.body, instrs) {
+            return -1
+        }
+        let mut i: int = 0
+        while i < instrs.len() {
+            let ins: WoInstr = instrs.get(i)
+            if ins.op == 252 {
+                let cur: WoCursor = WoCursor { pos: ins.start + 1 }
+                let sub: int = wo_read_uleb(code.body, cur)
+                if sub == 8 || sub == 9 {
+                    return 1
+                }
+            }
+            i = i + 1
+        }
+        ci = ci + 1
+    }
+    return 0
+}
+
+# wo_opt_dead_types — remove type-section entries no longer referenced
+# after DCE, renumbering imports / funcs / call_indirect consistently.
+fn wo_opt_dead_types(mod: WoModule, rep: WoReport) -> void {
+    let referenced: map[str, bool] = map_new()
+    let mut i: int = 0
+    while i < mod.imports.len() {
+        let imp: WoImport = mod.imports.get(i)
+        if imp.kind == 0 {
+            referenced.set(imp.type_idx.to_str(), true)
+        }
+        i = i + 1
+    }
+    let mut f: int = 0
+    while f < mod.funcs.len() {
+        referenced.set(mod.funcs.get(f).to_str(), true)
+        f = f + 1
+    }
+    # call_indirect type indices from every body (phase 1: any unknown
+    # construct aborts the whole pass — indices must stay consistent).
+    let mut ci: int = 0
+    while ci < mod.codes.len() {
+        let code: WoCode = mod.codes.get(ci)
+        let instrs: list[WoInstr] = []
+        if !wo_walk_instrs(code.body, instrs) {
+            rep.dead_types_removed = 0
+            return
+        }
+        let mut j: int = 0
+        while j < instrs.len() {
+            let ins: WoInstr = instrs.get(j)
+            if ins.op == 17 {
+                let cur: WoCursor = WoCursor { pos: ins.start + 1 }
+                let tidx: int = wo_read_uleb(code.body, cur)
+                referenced.set(tidx.to_str(), true)
+            }
+            j = j + 1
+        }
+        ci = ci + 1
+    }
+    # live = sorted(t for t in referenced if 0 <= t < len(types))
+    let live: list[int] = []
+    let mut t: int = 0
+    while t < mod.types.len() {
+        if referenced.has(t.to_str()) {
+            live.push(t)
+        }
+        t = t + 1
+    }
+    if live.len() == mod.types.len() {
+        rep.dead_types_removed = 0
+        return
+    }
+    let remap: map[str, int] = map_new()
+    let mut n: int = 0
+    while n < live.len() {
+        remap.set(live.get(n).to_str(), n)
+        n = n + 1
+    }
+    # Phase 2: apply (the same bodies walked in phase 1).
+    let mut ci2: int = 0
+    while ci2 < mod.codes.len() {
+        let code2: WoCode = mod.codes.get(ci2)
+        let instrs2: list[WoInstr] = []
+        if !wo_walk_instrs(code2.body, instrs2) {
+            rep.dead_types_removed = 0
+            return
+        }
+        let out: list[int] = []
+        let mut j2: int = 0
+        while j2 < instrs2.len() {
+            let ins2: WoInstr = instrs2.get(j2)
+            if ins2.op == 17 {
+                let cur2: WoCursor = WoCursor { pos: ins2.start + 1 }
+                let tidx2: int = wo_read_uleb(code2.body, cur2)
+                let tbl: int = wo_read_uleb(code2.body, cur2)
+                out.push(17)
+                wo_uleb_b(out, remap.get_or(tidx2.to_str(), tidx2))
+                wo_uleb_b(out, tbl)
+            } else {
+                wo_cat_b(out, code2.body.slice(ins2.start, ins2.end))
+            }
+            j2 = j2 + 1
+        }
+        code2.body = wo_bytes_str(out)
+        ci2 = ci2 + 1
+    }
+    let mut ii: int = 0
+    while ii < mod.imports.len() {
+        let imp: WoImport = mod.imports.get(ii)
+        if imp.kind == 0 {
+            imp.type_idx = remap.get_or(imp.type_idx.to_str(), imp.type_idx)
+        }
+        ii = ii + 1
+    }
+    let n_before: int = mod.types.len()
+    let new_types: list[WoFuncType] = []
+    let mut li: int = 0
+    while li < live.len() {
+        new_types.push(mod.types.get(live.get(li)))
+        li = li + 1
+    }
+    let mut f2: int = 0
+    while f2 < mod.funcs.len() {
+        let tv: int = mod.funcs.get(f2)
+        mod.funcs.set(f2, remap.get_or(tv.to_str(), tv))
+        f2 = f2 + 1
+    }
+    mod.types = new_types
+    rep.dead_types_removed = n_before - mod.types.len()
+}
+
+# ----------------------------------------------------------------------------
+# Serialization — the optimized module back into wasm bytes (the .py's
+# wopt_emit_cli.serialize, byte for byte).
+# ----------------------------------------------------------------------------
+
+fn wo_section(sec_id: int, content: str) -> str {
+    return chr(sec_id) + wo_uleb(content.len()) + content
+}
+
+fn wo_serialize(mod: WoModule) -> str {
+    let mut out: str = chr(0) + "asm" + chr(1) + chr(0) + chr(0) + chr(0)
+    # Type section.
+    if mod.types.len() > 0 {
+        let body: list[int] = []
+        wo_uleb_b(body, mod.types.len())
+        let mut i: int = 0
+        while i < mod.types.len() {
+            let ty: WoFuncType = mod.types.get(i)
+            body.push(96)
+            wo_uleb_b(body, ty.params.len())
+            let mut p: int = 0
+            while p < ty.params.len() {
+                body.push(ty.params.get(p))
+                p = p + 1
+            }
+            wo_uleb_b(body, ty.results.len())
+            let mut r: int = 0
+            while r < ty.results.len() {
+                body.push(ty.results.get(r))
+                r = r + 1
+            }
+            i = i + 1
+        }
+        out = out + wo_section(1, wo_bytes_str(body))
+    }
+    # Import section.
+    if mod.imports.len() > 0 {
+        let body2: list[int] = []
+        wo_uleb_b(body2, mod.imports.len())
+        let mut i2: int = 0
+        while i2 < mod.imports.len() {
+            let imp: WoImport = mod.imports.get(i2)
+            wo_uleb_b(body2, imp.module.len())
+            wo_cat_b(body2, imp.module)
+            wo_uleb_b(body2, imp.name.len())
+            wo_cat_b(body2, imp.name)
+            body2.push(imp.kind)
+            if imp.kind == 0 {
+                wo_uleb_b(body2, imp.type_idx)
+            } else if imp.kind == 2 {
+                body2.push(0)
+                wo_uleb_b(body2, 1)
+            } else if imp.kind == 3 {
+                body2.push(127)
+                body2.push(0)
+            }
+            i2 = i2 + 1
+        }
+        out = out + wo_section(2, wo_bytes_str(body2))
+    }
+    # Function section.
+    if mod.funcs.len() > 0 {
+        let body3: list[int] = []
+        wo_uleb_b(body3, mod.funcs.len())
+        let mut i3: int = 0
+        while i3 < mod.funcs.len() {
+            wo_uleb_b(body3, mod.funcs.get(i3))
+            i3 = i3 + 1
+        }
+        out = out + wo_section(3, wo_bytes_str(body3))
+    }
+    # Memory section.
+    if mod.mem_min.len() > 0 {
+        let body4: list[int] = []
+        wo_uleb_b(body4, mod.mem_min.len())
+        let mut i4: int = 0
+        while i4 < mod.mem_min.len() {
+            body4.push(mod.mem_flag.get(i4))
+            wo_uleb_b(body4, mod.mem_min.get(i4))
+            if mod.mem_flag.get(i4) == 1 {
+                wo_uleb_b(body4, mod.mem_max.get(i4))
+            }
+            i4 = i4 + 1
+        }
+        out = out + wo_section(5, wo_bytes_str(body4))
+    }
+    # Global section.
+    if mod.glob_ty.len() > 0 {
+        let body5: list[int] = []
+        wo_uleb_b(body5, mod.glob_ty.len())
+        let mut i5: int = 0
+        while i5 < mod.glob_ty.len() {
+            body5.push(mod.glob_ty.get(i5))
+            if mod.glob_mut.get(i5) {
+                body5.push(1)
+            } else {
+                body5.push(0)
+            }
+            if mod.glob_ty.get(i5) == 127 {
+                body5.push(65)
+                wo_sleb_b(body5, mod.glob_init.get(i5))
+            } else if mod.glob_ty.get(i5) == 126 {
+                body5.push(66)
+                wo_sleb_b(body5, mod.glob_init.get(i5))
+            }
+            body5.push(11)
+            i5 = i5 + 1
+        }
+        out = out + wo_section(6, wo_bytes_str(body5))
+    }
+    # Export section.
+    if mod.exports.len() > 0 {
+        let body6: list[int] = []
+        wo_uleb_b(body6, mod.exports.len())
+        let mut i6: int = 0
+        while i6 < mod.exports.len() {
+            let exp: WoExport = mod.exports.get(i6)
+            wo_uleb_b(body6, exp.name.len())
+            wo_cat_b(body6, exp.name)
+            body6.push(exp.kind)
+            wo_uleb_b(body6, exp.index)
+            i6 = i6 + 1
+        }
+        out = out + wo_section(7, wo_bytes_str(body6))
+    }
+    # Start section.
+    if mod.start >= 0 {
+        out = out + wo_section(8, wo_uleb(mod.start))
+    }
+    # DataCount (only required for memory.init / data.drop — optimize()
+    # sets mod.emit_datacount; with no data segments there is nothing to
+    # count either).
+    if mod.emit_datacount {
+        out = out + wo_section(12, wo_uleb(mod.data.len()))
+    }
+    # Code section.
+    if mod.codes.len() > 0 {
+        let body7: list[int] = []
+        wo_uleb_b(body7, mod.codes.len())
+        let mut i7: int = 0
+        while i7 < mod.codes.len() {
+            let code: WoCode = mod.codes.get(i7)
+            let func_body: list[int] = []
+            wo_uleb_b(func_body, code.loc_n.len())
+            let mut l: int = 0
+            while l < code.loc_n.len() {
+                wo_uleb_b(func_body, code.loc_n.get(l))
+                func_body.push(code.loc_t.get(l))
+                l = l + 1
+            }
+            wo_cat_b(func_body, code.body)
+            func_body.push(11)
+            wo_uleb_b(body7, func_body.len())
+            wo_cat_b(body7, wo_bytes_str(func_body))
+            i7 = i7 + 1
+        }
+        out = out + wo_section(10, wo_bytes_str(body7))
+    }
+    # Data section.
+    if mod.data.len() > 0 {
+        let body8: list[int] = []
+        wo_uleb_b(body8, mod.data.len())
+        let mut i8: int = 0
+        while i8 < mod.data.len() {
+            let seg: WoDataSeg = mod.data.get(i8)
+            body8.push(0)
+            body8.push(65)
+            wo_sleb_b(body8, seg.offset)
+            body8.push(11)
+            wo_uleb_b(body8, seg.data.len())
+            wo_cat_b(body8, seg.data)
+            i8 = i8 + 1
+        }
+        out = out + wo_section(11, wo_bytes_str(body8))
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# The orchestrator (the .py's optimize).
+# ----------------------------------------------------------------------------
+
+# WoCap — captured child output (the harness's RunCap law, in-file).
+struct WoCap {
+    code: int,
+    out: str,
+    err: str
+}
+
+fn wo_spawn_cap(program: str, argv: list[str]) -> WoCap uses Proc {
+    let r: WoCap = WoCap { code: -1, out: "", err: "" }
+    let pid: int = proc_spawn(program, argv, 2, 1, 1)
+    if pid < 1 {
+        return r
+    }
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    r.code = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    r.out = out
+    r.err = err
+    return r
+}
+
+# wo_which(name) — the PATH probe (the hls-audit which_hit law).
+fn wo_which(name: str) -> str uses Fs, Proc {
+    if name == "" || name.contains("/") {
+        return ""
+    }
+    let penv: str = env_get("PATH")
+    if penv == "" {
+        return ""
+    }
+    let dirs: list[str] = penv.split(":")
+    let mut i: int = 0
+    while i < dirs.len() {
+        let mut cand: str = dirs.get(i)
+        if cand == "" {
+            cand = "."
+        }
+        let full: str = cand + "/" + name
+        if file_exists(full) {
+            return full
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# wo_tmp_path(suffix) — a scratch path under TMPDIR (default /tmp).
+fn wo_tmp_path(suffix: str) -> str uses Proc, Clock {
+    let mut dir: str = env_get("TMPDIR")
+    if dir == "" {
+        dir = "/tmp"
+    }
+    let d: str = dir
+    if d.byte_at(d.len() - 1) == 47 {
+        return d + "hlwasm-opt-" + clock_ms().to_str() + suffix
+    }
+    return d + "/hlwasm-opt-" + clock_ms().to_str() + suffix
+}
+
+# wo_run_external — invoke the external Binaryen wasm-opt on the bytes.
+# Returns "" when the invocation fails (the in-tree result is kept).
+fn wo_run_external(path: str, wasm: str, level: str,
+rep: WoReport) -> str uses IO, Fs, Proc {
+    let mut opt_flag: str = "-O3"
+    if level == "O1" {
+        opt_flag = "-O1"
+    } else if level == "O2" {
+        opt_flag = "-O2"
+    } else if level == "Os" {
+        opt_flag = "-Os"
+    }
+    let in_path: str = wo_tmp_path(".in.wasm")
+    let out_path: str = in_path + ".opt.wasm"
+    write_file(in_path, wasm)
+    # --enable-bulk-memory: our emitter uses memory.copy for string
+    # concatenation. The strip flags remove non-functional sections.
+    let argv: list[str] = [path, opt_flag, "--enable-bulk-memory",
+    "--strip-debug", "--strip-producers", "--strip-target-features",
+    "-o", out_path, in_path]
+    let r: WoCap = wo_spawn_cap(path, argv)
+    if r.code != 0 {
+        let mut msg: str = r.err
+        if msg.len() > 200 {
+            msg = msg.slice(0, 200)
+        }
+        rep.external_error = msg
+        return ""
+    }
+    if !file_exists(out_path) {
+        return ""
+    }
+    let out: str = read_file(out_path)
+    return out
+}
+
+# wo_set_sizes — the report's size bookkeeping (the .py's tail of
+# optimize(): input/output/saved + the 2-decimal reduction).
+fn wo_set_sizes(rep: WoReport, before: int, after: int) -> void {
+    rep.input_size = before
+    rep.output_size = after
+    rep.bytes_saved = before - after
+    if before > 0 {
+        # round((before-after) * 100.0 / before, 2), integer hundredths
+        rep.reduction_h = ((before - after) * 10000 + before / 2) / before
+    } else {
+        rep.reduction_h = 0
+    }
+}
+
+# wo_optimize — the in-tree pass pipeline + the external Binaryen pass.
+# Err(text) is the .py's ValueError surface (main maps it to the clean
+# "not a valid wasm module" refusal).
+fn wo_optimize(wasm: str, level: str, external_wasm_opt: str,
+rep: WoReport) -> Result[str, str] uses IO, Fs, Proc {
+    let before_size: int = wasm.len()
+    let parsed: Result[WoModule, str] = wo_parse(wasm)
+    if result_is_err(parsed) {
+        return Result.Err(result_err_or(parsed, "malformed module"))
+    }
+    let mod: WoModule = result_unwrap(parsed)
+    # A module the model cannot round-trip: bypass the in-tree passes (the
+    # deep-scan-30 fix); the external wasm-opt still gets a chance.
+    if !mod.roundtrip_safe {
+        rep.in_tree_bypassed = true
+        let mut optimized: str = wasm
+        let mut external_path: str = external_wasm_opt
+        if external_path == "" {
+            external_path = wo_which("wasm-opt")
+        }
+        if external_path != "" && (level == "O2" || level == "O3"
+        || level == "Os") {
+            let external_out: str = wo_run_external(external_path, wasm,
+            level, rep)
+            if external_out != "" {
+                optimized = external_out
+                rep.external_ran = true
+            } else {
+                rep.external_ran = false
+            }
+        } else {
+            rep.external_ran = false
+        }
+        wo_set_sizes(rep, before_size, optimized.len())
+        return Result.Ok(optimized)
+    }
+    # O1: DCE + local compaction.
+    wo_opt_dce(mod, rep)
+    wo_opt_local_compact(mod, rep)
+    # O2: type dedup + dead data + data-segment merging.
+    if level == "O2" || level == "O3" || level == "Os" {
+        wo_opt_type_dedup(mod, rep)
+        wo_opt_dead_data(mod, rep)
+        wo_opt_data_merge(mod, rep)
+    }
+    # O3: peephole + structure-aware code cleanup + dead types.
+    if level == "O3" || level == "Os" {
+        wo_opt_peephole(mod, rep)
+        wo_opt_code_clean(mod, rep)
+        wo_opt_dead_types(mod, rep)
+    }
+    # The DataCount section is only REQUIRED for memory.init / data.drop;
+    # our emitter's memory.copy does not need it. Conservative: any
+    # unparseable body keeps the section.
+    mod.emit_datacount = mod.data.len() > 0 && wo_uses_bulk_data_ops(mod) != 0
+    # Serialize.
+    let mut optimized2: str = wo_serialize(mod)
+    # Run the external wasm-opt if available.
+    let mut external_ran: bool = false
+    let mut external_path2: str = external_wasm_opt
+    if external_path2 == "" {
+        external_path2 = wo_which("wasm-opt")
+    }
+    if external_path2 != "" && (level == "O2" || level == "O3"
+    || level == "Os") {
+        let external_out2: str = wo_run_external(external_path2, optimized2,
+        level, rep)
+        if external_out2 != "" {
+            optimized2 = external_out2
+            external_ran = true
+        }
+    }
+    rep.external_ran = external_ran
+    wo_set_sizes(rep, before_size, optimized2.len())
+    return Result.Ok(optimized2)
+}
+
+# ----------------------------------------------------------------------------
+# The CLI (the .py's main + --report printer, bytes verbatim).
+# ----------------------------------------------------------------------------
+
+# wo_fmt_pct2(h) — hundredths -> "D.DD" (the .py's %.2f).
+fn wo_fmt_pct2(h: int) -> str {
+    let mut v: int = h
+    if v < 0 {
+        v = 0
+    }
+    let whole: int = v / 100
+    let frac: int = v % 100
+    let mut f2: str = frac.to_str()
+    if frac < 10 {
+        f2 = "0" + f2
+    }
+    return whole.to_str() + "." + f2
+}
+
+fn wo_print_report(rep: WoReport) -> void uses IO {
+    eprintln("hlwasm-opt report:")
+    eprintln("  input size:       " + rep.input_size.to_str() + " bytes")
+    eprintln("  output size:      " + rep.output_size.to_str() + " bytes")
+    eprintln("  bytes saved:      " + rep.bytes_saved.to_str() + " bytes")
+    eprintln("  reduction:         " + wo_fmt_pct2(rep.reduction_h) + "%")
+    eprintln("  dead funcs removed: " + rep.dead_funcs_removed.to_str())
+    eprintln("  dead imports removed: " + rep.dead_imports_removed.to_str())
+    eprintln("  dead data removed: " + rep.dead_data_removed.to_str())
+    eprintln("  types deduped:     " + rep.types_deduped.to_str())
+    eprintln("  peephole saved:    " + rep.peephole_saved.to_str() + " bytes")
+    eprintln("  local compact:     " + rep.local_compact_saved.to_str()
+    + " bytes")
+    if rep.external_ran {
+        eprintln("  external wasm-opt: ran")
+    } else {
+        eprintln("  external wasm-opt: not run")
+    }
+    if rep.external_error != "" {
+        eprintln("    error: " + rep.external_error)
+    }
+}
+
+# wo_probe_child(input, output, level, external, want_report) — the whole
+# optimize pipeline in a child: a malformed module dies through panic()
+# (the .py's ValueError/IndexError family), and the parent maps the exit
+# to the clean "not a valid wasm module" refusal. On success the child
+# writes the output file and prints the report (when asked) on stderr.
+fn wo_probe_child(input: str, output: str, level: str,
+external: str, want_report: bool) -> int uses IO, Fs, Proc {
+    let wasm: str = read_file(input)
+    let rep: WoReport = WoReport {
+        in_tree_bypassed: false, external_ran: false, external_error: "",
+        input_size: 0, output_size: 0, bytes_saved: 0, reduction_h: 0,
+        dead_funcs_removed: 0, dead_imports_removed: 0,
+        dead_data_removed: 0, types_deduped: 0, dead_types_removed: 0,
+        peephole_saved: 0, local_compact_saved: 0,
+        data_segments_merged: 0, data_merge_saved: 0, code_clean_saved: 0
+    }
+    let optimized: Result[str, str] = wo_optimize(wasm, level, external,
+    rep)
+    if result_is_err(optimized) {
+        # The parse-level refusals (magic / version) ride the same panic
+        # surface as the .py's exceptions so the parent maps them alike.
+        panic(result_err_or(optimized, "malformed module"))
+    }
+    let out_bytes: str = result_unwrap(optimized)
+    write_file(output, out_bytes)
+    if want_report {
+        wo_print_report(rep)
+    }
+    return 0
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let argv: list[str] = args()
+    # The probe child (the private re-exec flag; the parent maps a panic
+    # to the .py's clean "not a valid wasm module" refusal).
+    if argv.len() > 6 && argv.get(1) == "--wo-probe" {
+        let want_rep: bool = argv.get(6) == "1"
+        return wo_probe_child(argv.get(2), argv.get(3), argv.get(4),
+        argv.get(5), want_rep)
+    }
+    let mut input: str = ""
+    let mut output: str = ""
+    let mut level: str = "O3"
+    let mut want_report: bool = false
+    let mut external_wasm_opt: str = ""
+    let mut have_input: bool = false
+    let mut have_output: bool = false
+    let mut i: int = 1
+    while i < argv.len() {
+        let a: str = argv.get(i)
+        if a == "--level" && i + 1 < argv.len() {
+            i = i + 1
+            level = argv.get(i)
+        } else if a.starts_with("--level=") {
+            level = a.slice(8, a.len())
+        } else if a == "--report" {
+            want_report = true
+        } else if a == "--external-wasm-opt" && i + 1 < argv.len() {
+            i = i + 1
+            external_wasm_opt = argv.get(i)
+        } else if a.starts_with("--external-wasm-opt=") {
+            external_wasm_opt = a.slice(21, a.len())
+        } else if a == "-h" || a == "--help" {
+            println("usage: hlwasm-opt <input.wasm> <output.wasm>"
+            + " [--level O1|O2|O3|Os] [--report]"
+            + " [--external-wasm-opt PATH]")
+            return 0
+        } else if a.starts_with("--") {
+            eprintln("usage: hlwasm-opt <input.wasm> <output.wasm>"
+            + " [--level O1|O2|O3|Os] [--report]"
+            + " [--external-wasm-opt PATH]")
+            eprintln("hlwasm-opt: error: unrecognized argument: " + a)
+            return 2
+        } else if !have_input {
+            input = a
+            have_input = true
+        } else if !have_output {
+            output = a
+            have_output = true
+        } else {
+            eprintln("usage: hlwasm-opt <input.wasm> <output.wasm>"
+            + " [--level O1|O2|O3|Os] [--report]"
+            + " [--external-wasm-opt PATH]")
+            eprintln("hlwasm-opt: error: unrecognized argument: " + a)
+            return 2
+        }
+        i = i + 1
+    }
+    if level != "O1" && level != "O2" && level != "O3" && level != "Os" {
+        eprintln("usage: hlwasm-opt <input.wasm> <output.wasm>"
+        + " [--level O1|O2|O3|Os] [--report]"
+        + " [--external-wasm-opt PATH]")
+        eprintln("hlwasm-opt: error: argument --level: invalid choice: '"
+        + level + "' (choose from 'O1', 'O2', 'O3', 'Os')")
+        return 2
+    }
+    if !have_input || !have_output {
+        eprintln("usage: hlwasm-opt <input.wasm> <output.wasm>"
+        + " [--level O1|O2|O3|Os] [--report]"
+        + " [--external-wasm-opt PATH]")
+        eprintln("hlwasm-opt: error: the following arguments are required:"
+        + " input, output")
+        return 2
+    }
+    if !file_exists(input) {
+        eprintln("error: cannot open file " + input)
+        return 1
+    }
+    # The whole pipeline runs in a probe child so a malformed module
+    # surfaces as the .py's clean one-line refusal (deep-scan-25 fix),
+    # never a raw panic. The output file is only written on success.
+    let selfp: str = argv.get(0)
+    if selfp == "" {
+        eprintln("error: cannot re-exec the tool for the probe")
+        return 1
+    }
+    let mut rep_flag: str = "0"
+    if want_report {
+        rep_flag = "1"
+    }
+    let probe_argv: list[str] = ["--wo-probe", input, output, level,
+    external_wasm_opt, rep_flag]
+    let r: WoCap = wo_spawn_cap(selfp, probe_argv)
+    if r.code == 0 {
+        if r.out != "" {
+            print(r.out)
+        }
+        if r.err != "" {
+            eprint(r.err)
+        }
+        return 0
+    }
+    if r.code == 101 {
+        let mut why: str = r.err.trim()
+        if why.starts_with("panic: ") {
+            why = why.slice(7, why.len())
+        }
+        let nl: int = why.find("\n")
+        if nl > 0 {
+            why = why.slice(0, nl)
+        }
+        eprintln("error: " + input + ": not a valid wasm module (" + why
+        + ")")
+        return 1
+    }
+    eprintln("error: " + input + ": not a valid wasm module (" + r.err.trim()
+    + ")")
+    return 1
+}

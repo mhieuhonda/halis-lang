@@ -118,7 +118,7 @@ wasm-list-targets:
 # compiles to a <10 KB wasm binary that prints "Hello, Halis!" correctly.
 # Verifies: (a) the .wasm is produced, (b) it's under 10 KB, (c) running
 # it in Node.js produces output matching the interpreter.
-wasm-acceptance: $(BIN)/hlboot
+wasm-acceptance: $(BIN)/hlboot $(BIN)/hlwasm $(BIN)/hlwasm-opt
 	@test -x $(BIN)/hlc || $(MAKE) bootstrap
 	@mkdir -p $(BIN)
 	@echo "[Stage 23 acceptance] compiling examples/hello.hls to wasm..."
@@ -150,7 +150,7 @@ wasm-opt:
 	@test -n "$(F)" || (echo "Usage: make wasm-opt F=out/foo.wasm [LEVEL=O3] [OUT=out/foo.opt.wasm]" && false)
 	@if [ -z "$(OUT)" ]; then OUT=$(F:.wasm=.opt.wasm); fi; \
 	  if [ -z "$(LEVEL)" ]; then LEVEL=O3; fi; \
-	  $(PYTHON) tools/hlwasm_opt.py $(F) $$OUT --level $$LEVEL --report
+	  $(BIN)/hlwasm-opt $(F) $$OUT --level $$LEVEL --report
 
 # webapp: compile the Stage 24 acceptance 1000-LOC web app to wasm + JS + HTML.
 # Usage: make webapp [OUT=/tmp/webapp] [WASM_OPT=auto|on|off]
@@ -165,7 +165,7 @@ webapp:
 # webapp-acceptance: the Stage 24 acceptance gate. The 1000-LOC web app
 # compiles to <=100 KB wasm + <=5 KB JS glue; wasm-opt reduces size by
 # >=30%. Verifies all three conditions (plus a Node.js run).
-webapp-acceptance:
+webapp-acceptance: $(BIN)/hlwasm $(BIN)/hlwasm-opt
 	@echo "[Stage 24 acceptance] compiling examples/web_app_1000loc.hls..."
 	@$(BIN)/hlwasm examples/web_app_1000loc.hls $(BIN)/webapp \
 	  >$(BIN)/webapp_acc.log 2>&1; \
@@ -189,9 +189,9 @@ webapp-acceptance:
 	  --wasm-opt off >$(BIN)/webapp_no_opt.log 2>&1
 	@RAW_SIZE=$$(stat -c %s $(BIN)/webapp_no_opt.wasm 2>/dev/null || stat -f %z $(BIN)/webapp_no_opt.wasm); \
 	  OPT_SIZE=$$(stat -c %s $(BIN)/webapp.wasm 2>/dev/null || stat -f %z $(BIN)/webapp.wasm); \
-	  PCT=$$(python3 -c "print(round(($$RAW_SIZE - $$OPT_SIZE) * 100.0 / $$RAW_SIZE, 1))"); \
+	  PCT=$$(awk "BEGIN { printf \"%.1f\", ($$RAW_SIZE - $$OPT_SIZE) * 100.0 / $$RAW_SIZE }"); \
 	  echo "  wasm-opt: $$RAW_SIZE -> $$OPT_SIZE bytes ($$PCT% reduction, requirement: >= 25.0%)"; \
-	  python3 -c "import sys; sys.exit(0 if $$PCT >= 25.0 else 1)" \
+	  awk "BEGIN { exit ($$PCT + 0 >= 25.0) ? 0 : 1 }" \
 	    || (echo "FAIL: wasm-opt reduction $$PCT% is below 25% requirement"; exit 1)
 	@# Verify the wasm runs in Node.js (if available).
 	@if command -v node >/dev/null 2>&1; then \

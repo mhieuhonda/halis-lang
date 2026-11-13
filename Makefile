@@ -181,7 +181,7 @@ $(BIN)/ll_validate: tools/ll_validate.hls $(wildcard std/*.hls) $(wildcard core/
 # bin/.
 $(BIN)/acc-suite_02_differential: $(BIN)/ll_validate $(BIN)/hls-sbom $(BIN)/hls-repro $(BIN)/hlboot $(BIN)/hls-audit $(BIN)/hls-sign $(BIN)/hls-bench-stdlib
 $(BIN)/acc-suite_03_selfhost: $(BIN)/hlpgo $(BIN)/hlcov $(BIN)/hltest $(BIN)/hlboot $(BIN)/hls-fuzz
-$(BIN)/acc-suite_05_backends: $(BIN)/hlaarch64 $(BIN)/hlcross
+$(BIN)/acc-suite_05_backends: $(BIN)/hlaarch64 $(BIN)/hlcross $(BIN)/hlwasm $(BIN)/hlwasm-opt $(BIN)/hls-pkg
 $(BIN)/acc-suite_06_advanced: $(BIN)/hlriscv $(BIN)/hlcross
 $(BIN)/acc-suite_08_osdev: $(BIN)/hlcross
 

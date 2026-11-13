@@ -1,0 +1,4107 @@
+# ============================================================================
+# tools/hlwasm.hls — the WebAssembly backend, in Halis (the native twin of
+# the Python hlwasm.py that retired; the CLI, the emitter laws and the glue
+# bytes are the .py's, re-derived on the real front-end).
+# ----------------------------------------------------------------------------
+# Usage:
+#   bin/hlwasm <input.hls> <output_base>
+#              [--target wasm32-unknown-unknown]
+#              [--wasm] [--no-wasm] [--no-js] [--no-html] [--run]
+#              [--list-targets] [--wasm-opt auto|on|off]
+#              [--opt-level O1|O2|O3|Os] [--glue compact|verbose]
+#              [--serve PORT]
+#
+#   bin/hlwasm examples/hello.hls /tmp/hello   # .wasm + .js + .html
+#   bin/hlwasm examples/hello.hls /tmp/hello --run   # + run in Node.js
+#
+# Emits a .wasm binary DIRECTLY from a checked Halis program — no LLVM
+# toolchain, no libc, always available (the roadmap's Stage 23 "direct
+# emitter for the smallest binaries"). The .py leaned on the retired
+# interpreter's dict-AST; this twin leans on the REAL front-end
+# (import "./hlfront.hls": hl_load_crate + hl_check), so the emitter can
+# never disagree with the compiler about what a program says.
+#
+# Type mapping (wasm32): int -> i64, float -> f64, bool -> i32,
+# str -> i32 (pointer to {i32 len, i8 data[len]} in linear memory).
+# list/map/struct/enum literals raise the .py's clean "not yet supported
+# by --emit wasm" refusals (the Stage 23-alpha subset: let / assign /
+# if / while / for-range / return / break / continue / expr; int, float,
+# bool, str, ident, bin, un, call, method expressions; the builtin
+# method surface .to_str/.len/.byte_at/.to_int/.to_float/.abs and the
+# println/print/panic/exit/chr builtins).
+#
+# extern "js" blocks (std.jsffi): every declared fn the program ACTUALLY
+# calls becomes a wasm import from module "env" (deep-scan-23
+# tree-shaking), and the compact JS glue re-injects only the matching
+# default stubs. Structs are never lowered as values, but every
+# non-generic struct's field layout is exported through
+# hl_struct_descriptors() so the glue AUTO-REGISTERS the marshalling
+# descriptors (Stage 73); a fn jsffi_on_callback(cb_id: int, arg: str)
+# -> str is exported as hl_call_halis (the JS->HLS callback entry).
+#
+# The whole compile rides in a probe child (--hw-child): a program that
+# does not parse/check/lower is reported as the .py's clean
+# "compile error: ..." line (exit 1), never a raw panic. --run executes
+# the module in Node.js (the .py's runner .cjs, byte for byte); --serve
+# hands the bundle to bin/hlserve; --wasm-opt auto/on/off spawns the
+# sibling bin/hlwasm-opt (the .py imported the module in-process — a
+# tool ships one main, so the twin spawns the binary and keeps the
+# "hlwasm_opt not found; skipping optimization" fallback law).
+# ============================================================================
+
+import "./hlfront.hls"
+import "std.str"
+
+# ----------------------------------------------------------------------------
+# Byte helpers (the .py's uleb/sleb + struct.pack; bytes are Halis strings,
+# byte_at-addressable, written with write_file byte-transparently).
+# ----------------------------------------------------------------------------
+
+# hw_uleb(n) — unsigned LEB128 as a byte string (n >= 0).
+fn hw_uleb(n: int) -> str {
+    let out: list[int] = []
+    let mut v: int = n
+    while true {
+        let mut b: int = int_and(v, 127)
+        v = int_shr(v, 7)
+        if v != 0 {
+            b = int_or(b, 128)
+        }
+        out.push(b)
+        if v == 0 {
+            break
+        }
+    }
+    return hw_bytes_str(out)
+}
+
+# hw_sleb(n) — signed LEB128 as a byte string.
+fn hw_sleb(n: int) -> str {
+    let out: list[int] = []
+    let mut v: int = n
+    while true {
+        let mut b: int = int_and(v, 127)
+        v = int_sar(v, 7)
+        if (v == 0 && int_and(b, 64) == 0) || (v == -1 && int_and(b, 64) != 0) {
+            out.push(b)
+            break
+        }
+        out.push(int_or(b, 128))
+    }
+    return hw_bytes_str(out)
+}
+
+# hw_bytes_str(buf) — byte values -> byte string (one join; the naive
+# per-byte concat is quadratic and the webapp module is ~100 KB).
+fn hw_bytes_str(buf: list[int]) -> str {
+    let parts: list[str] = []
+    let mut i: int = 0
+    while i < buf.len() {
+        parts.push(chr(buf.get(i)))
+        i = i + 1
+    }
+    return join(parts, "")
+}
+
+# hw_b(buf, by) — append one byte.
+fn hw_b(buf: list[int], by: int) -> void {
+    buf.push(int_and(by, 255))
+}
+
+# hw_uleb_b / hw_sleb_b — LEB append into a byte buffer.
+fn hw_uleb_b(buf: list[int], n: int) -> void {
+    let mut v: int = n
+    while true {
+        let mut b: int = int_and(v, 127)
+        v = int_shr(v, 7)
+        if v != 0 {
+            b = int_or(b, 128)
+        }
+        buf.push(b)
+        if v == 0 {
+            break
+        }
+    }
+}
+
+fn hw_sleb_b(buf: list[int], n: int) -> void {
+    let mut v: int = n
+    while true {
+        let mut b: int = int_and(v, 127)
+        v = int_sar(v, 7)
+        if (v == 0 && int_and(b, 64) == 0) || (v == -1 && int_and(b, 64) != 0) {
+            buf.push(b)
+            break
+        }
+        buf.push(int_or(b, 128))
+    }
+}
+
+# hw_cat_b(buf, s) — append a whole byte string into a byte buffer.
+fn hw_cat_b(buf: list[int], s: str) -> void {
+    let mut i: int = 0
+    while i < s.len() {
+        buf.push(s.byte_at(i))
+        i = i + 1
+    }
+}
+
+# hw_double_bits(f) — the IEEE-754 double's 64-bit pattern, computed with
+# pure arithmetic (Halis has no reinterpret cast). Exact: the exponent is
+# found by power-of-two scaling, the mantissa by exact Sterbenz subtraction
+# ((x - 1.0) is exact for x in [1, 2)), and power-of-two multiplies never
+# round. Subnormals scale up by 2^1074, inf/nan/0 are special-cased.
+fn hw_double_bits(f: float) -> int {
+    let neg: bool = math_signbit(f)
+    let mut x: float = f
+    if x < 0.0 {
+        x = 0.0 - x
+    }
+    let mut sign: int = 0
+    if neg {
+        sign = -9223372036854775808
+    }
+    if x == 0.0 {
+        return sign
+    }
+    if math_isnan(x) {
+        return int_or(sign, 9221120237041099776)
+    }
+    if math_isinf(x) {
+        return int_or(sign, 9218868437227405312)
+    }
+    # Find e with x/2^e in [1, 2).
+    let mut e: int = 0
+    let mut m: float = x
+    if m >= 2.0 {
+        while m >= 2.0 {
+            m = m / 2.0
+            e = e + 1
+        }
+    } else {
+        while m < 1.0 {
+            m = m * 2.0
+            e = e - 1
+        }
+    }
+    if e >= -1022 {
+        # Normal: mantissa = (m - 1) * 2^52, exact.
+        let frac: float = (m - 1.0) * 4503599627370496.0
+        let mant: int = frac.to_int()
+        return int_or(sign, int_or(int_shl(e + 1023, 52), mant))
+    }
+    # Subnormal: value = mant * 2^-1074; mant = x * 2^1074 (exact).
+    let mut sub: float = m
+    let k: int = e + 1074
+    let mut j: int = 0
+    while j < k {
+        sub = sub * 2.0
+        j = j + 1
+    }
+    let smant: int = sub.to_int()
+    return int_or(sign, smant)
+}
+
+# hw_f64_b(buf, f) — append the 8 little-endian bytes of a double.
+fn hw_f64_b(buf: list[int], f: float) -> void {
+    let bits: int = hw_double_bits(f)
+    let mut i: int = 0
+    while i < 8 {
+        buf.push(int_and(int_shr(bits, 8 * i), 255))
+        i = i + 1
+    }
+}
+
+# hw_i32le(n) — 4 little-endian bytes of an i32 (the .py's struct.pack("<i")).
+fn hw_i32le(n: int) -> str {
+    let buf: list[int] = []
+    let mut i: int = 0
+    while i < 4 {
+        buf.push(int_and(int_shr(n, 8 * i), 255))
+        i = i + 1
+    }
+    return hw_bytes_str(buf)
+}
+
+# ----------------------------------------------------------------------------
+# WasmModule — accumulates sections, serialises to bytes (the .py's
+# WasmModule, parallel lists instead of tuples).
+# ----------------------------------------------------------------------------
+
+# Value types: I32=0x7F, I64=0x7E, F32=0x7D, F64=0x7C. Section ids:
+# 1 Type, 2 Import, 3 Function, 4 Table, 5 Memory, 6 Global, 7 Export,
+# 8 Start, 9 Element, 10 Code, 11 Data, 12 DataCount. Opcodes used by
+# the emitter are inlined as decimal literals at each site, named in a
+# comment (the .py's OP_* table).
+
+struct HwModule {
+    # Type section: parallel param/result lists (deduped by add_type).
+    ty_params: list[list[int]],
+    ty_results: list[list[int]],
+    # Import section: (module, name, kind, type_idx) parallel lists.
+    imp_mod: list[str],
+    imp_name: list[str],
+    imp_kind: list[int],
+    imp_ty: list[int],
+    # Function section: type indices of defined functions.
+    funcs: list[int],
+    # Memory section: min pages (limits flag 0, no max — the .py's only use).
+    mems: list[int],
+    # Export section: (name, kind, index).
+    exp_name: list[str],
+    exp_kind: list[int],
+    exp_idx: list[int],
+    # Code section: (locals, body) — locals as parallel (count, valtype)
+    # lists, body as a byte string (final_bytes appends OP_END).
+    code_lc: list[list[int]],
+    code_lt: list[list[int]],
+    code_body: list[str],
+    # Data section: (offset, bytes).
+    data_off: list[int],
+    data_bytes: list[str],
+    # Start function index (-1 = none).
+    start: int
+}
+
+fn hw_mod_new() -> HwModule {
+    return HwModule {
+        ty_params: [], ty_results: [],
+        imp_mod: [], imp_name: [], imp_kind: [], imp_ty: [],
+        funcs: [],
+        mems: [],
+        exp_name: [], exp_kind: [], exp_idx: [],
+        code_lc: [], code_lt: [], code_body: [],
+        data_off: [], data_bytes: [],
+        start: -1
+    }
+}
+
+# hw_types_eq — elementwise (params, results) equality (Halis lists have
+# no ==; the .py compared tuples).
+fn hw_types_eq(a: list[int], b: list[int]) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    let mut i: int = 0
+    while i < a.len() {
+        if a.get(i) != b.get(i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# hw_add_type — register a signature, dedup, return its index.
+fn hw_add_type(mut m: HwModule, params: list[int], results: list[int]) -> int {
+    let mut i: int = 0
+    while i < m.ty_params.len() {
+        if hw_types_eq(m.ty_params.get(i), params)
+        && hw_types_eq(m.ty_results.get(i), results) {
+            return i
+        }
+        i = i + 1
+    }
+    m.ty_params.push(params)
+    m.ty_results.push(results)
+    return m.ty_params.len() - 1
+}
+
+# hw_add_import — declare an import; returns its function index (imports
+# occupy the first function indices).
+fn hw_add_import(mut m: HwModule, module: str, name: str, kind: int,
+type_idx: int) -> int {
+    m.imp_mod.push(module)
+    m.imp_name.push(name)
+    m.imp_kind.push(kind)
+    m.imp_ty.push(type_idx)
+    return m.imp_name.len() - 1
+}
+
+# hw_add_function — declare a defined function; returns its GLOBAL index
+# (after imports).
+fn hw_add_function(mut m: HwModule, type_idx: int) -> int {
+    m.funcs.push(type_idx)
+    return m.imp_name.len() + m.funcs.len() - 1
+}
+
+fn hw_add_memory(mut m: HwModule, min_pages: int) -> void {
+    m.mems.push(min_pages)
+}
+
+fn hw_add_export(mut m: HwModule, name: str, kind: int, index: int) -> void {
+    m.exp_name.push(name)
+    m.exp_kind.push(kind)
+    m.exp_idx.push(index)
+}
+
+fn hw_add_code(mut m: HwModule, lc: list[int], lt: list[int],
+body: str) -> void {
+    m.code_lc.push(lc)
+    m.code_lt.push(lt)
+    m.code_body.push(body)
+}
+
+fn hw_add_data(mut m: HwModule, offset: int, data: str) -> void {
+    m.data_off.push(offset)
+    m.data_bytes.push(data)
+}
+
+# hw_section(id, content) — the (id, size, content) framing.
+fn hw_section(sec_id: int, content: str) -> str {
+    return chr(sec_id) + hw_uleb(content.len()) + content
+}
+
+# hw_final_bytes — assemble the binary module (sections in id order,
+# DataCount before Code, OP_END appended to every body — the .py's law).
+fn hw_final_bytes(m: HwModule) -> str {
+    let out: list[int] = []
+    hw_cat_b(out, chr(0) + "asm" + chr(1) + chr(0) + chr(0) + chr(0))
+    # Section 1: Type.
+    if m.ty_params.len() > 0 {
+        let body: list[int] = []
+        hw_uleb_b(body, m.ty_params.len())
+        let mut i: int = 0
+        while i < m.ty_params.len() {
+            body.push(96)
+            let ps: list[int] = m.ty_params.get(i)
+            hw_uleb_b(body, ps.len())
+            let mut p: int = 0
+            while p < ps.len() {
+                body.push(ps.get(p))
+                p = p + 1
+            }
+            let rs: list[int] = m.ty_results.get(i)
+            hw_uleb_b(body, rs.len())
+            let mut r: int = 0
+            while r < rs.len() {
+                body.push(rs.get(r))
+                r = r + 1
+            }
+            i = i + 1
+        }
+        hw_cat_b(out, hw_section(1, hw_bytes_str(body)))
+    }
+    # Section 2: Import.
+    if m.imp_name.len() > 0 {
+        let body: list[int] = []
+        hw_uleb_b(body, m.imp_name.len())
+        let mut i: int = 0
+        while i < m.imp_name.len() {
+            let mb: str = m.imp_mod.get(i)
+            hw_uleb_b(body, mb.len())
+            hw_cat_b(body, mb)
+            let nb: str = m.imp_name.get(i)
+            hw_uleb_b(body, nb.len())
+            hw_cat_b(body, nb)
+            let kind: int = m.imp_kind.get(i)
+            body.push(kind)
+            if kind == 0 {
+                hw_uleb_b(body, m.imp_ty.get(i))
+            } else if kind == 2 {
+                # memory: limits flag 0 (no max), min pages in the idx slot
+                body.push(0)
+                hw_uleb_b(body, m.imp_ty.get(i))
+            } else if kind == 3 {
+                # global: value type, immutable
+                body.push(int_and(m.imp_ty.get(i), 255))
+                body.push(0)
+            }
+            i = i + 1
+        }
+        hw_cat_b(out, hw_section(2, hw_bytes_str(body)))
+    }
+    # Section 3: Function.
+    if m.funcs.len() > 0 {
+        let body: list[int] = []
+        hw_uleb_b(body, m.funcs.len())
+        let mut i: int = 0
+        while i < m.funcs.len() {
+            hw_uleb_b(body, m.funcs.get(i))
+            i = i + 1
+        }
+        hw_cat_b(out, hw_section(3, hw_bytes_str(body)))
+    }
+    # Section 5: Memory.
+    if m.mems.len() > 0 {
+        let body: list[int] = []
+        hw_uleb_b(body, m.mems.len())
+        let mut i: int = 0
+        while i < m.mems.len() {
+            body.push(0)
+            hw_uleb_b(body, m.mems.get(i))
+            i = i + 1
+        }
+        hw_cat_b(out, hw_section(5, hw_bytes_str(body)))
+    }
+    # Section 7: Export.
+    if m.exp_name.len() > 0 {
+        let body: list[int] = []
+        hw_uleb_b(body, m.exp_name.len())
+        let mut i: int = 0
+        while i < m.exp_name.len() {
+            let nb: str = m.exp_name.get(i)
+            hw_uleb_b(body, nb.len())
+            hw_cat_b(body, nb)
+            body.push(m.exp_kind.get(i))
+            hw_uleb_b(body, m.exp_idx.get(i))
+            i = i + 1
+        }
+        hw_cat_b(out, hw_section(7, hw_bytes_str(body)))
+    }
+    # Section 8: Start.
+    if m.start >= 0 {
+        hw_cat_b(out, hw_section(8, hw_uleb(m.start)))
+    }
+    # Section 12: DataCount (before Code whenever Data is present).
+    if m.data_off.len() > 0 {
+        hw_cat_b(out, hw_section(12, hw_uleb(m.data_off.len())))
+    }
+    # Section 10: Code.
+    if m.code_body.len() > 0 {
+        let body: list[int] = []
+        hw_uleb_b(body, m.code_body.len())
+        let mut i: int = 0
+        while i < m.code_body.len() {
+            let fbody: list[int] = []
+            let lc: list[int] = m.code_lc.get(i)
+            let lt: list[int] = m.code_lt.get(i)
+            hw_uleb_b(fbody, lc.len())
+            let mut j: int = 0
+            while j < lc.len() {
+                hw_uleb_b(fbody, lc.get(j))
+                fbody.push(lt.get(j))
+                j = j + 1
+            }
+            hw_cat_b(fbody, m.code_body.get(i))
+            fbody.push(11)
+            hw_uleb_b(body, fbody.len())
+            hw_cat_b(body, hw_bytes_str(fbody))
+            i = i + 1
+        }
+        hw_cat_b(out, hw_section(10, hw_bytes_str(body)))
+    }
+    # Section 11: Data.
+    if m.data_off.len() > 0 {
+        let body: list[int] = []
+        hw_uleb_b(body, m.data_off.len())
+        let mut i: int = 0
+        while i < m.data_off.len() {
+            body.push(0)
+            body.push(65)
+            hw_sleb_b(body, m.data_off.get(i))
+            body.push(11)
+            let d: str = m.data_bytes.get(i)
+            hw_uleb_b(body, d.len())
+            hw_cat_b(body, d)
+            i = i + 1
+        }
+        hw_cat_b(out, hw_section(11, hw_bytes_str(body)))
+    }
+    return hw_bytes_str(out)
+}
+
+# ----------------------------------------------------------------------------
+# main — the CLI (argparse surface of the .py, hand-rolled: same flags,
+# same --flag value / --flag=value forms, same exits: 0 ok, 1 compile
+# error, 2 usage).
+# ----------------------------------------------------------------------------
+
+fn hw_usage_text() -> str {
+    return "usage: hlwasm [-h] [--target TARGET] [--no-wasm] [--no-js]\n"
+    + "              [--no-html] [--run] [--list-targets]\n"
+    + "              [--wasm-opt {auto,on,off}] [--opt-level {O1,O2,O3,Os}]\n"
+    + "              [--glue {compact,verbose}] [--serve PORT]\n"
+    + "              [input] [output_base]\n"
+    + "\n"
+    + "Stage 24 WebAssembly backend: HLS -> .wasm + wasm-opt + emscripten\n"
+    + "bridge."
+}
+
+# ----------------------------------------------------------------------------
+# The wasm emitter (the .py's WasmEmitterCore + WasmEmitterLower +
+# WasmEmitterRuntime, one struct, method-for-method).
+# ----------------------------------------------------------------------------
+
+# hw_taint_inner — strip tainted[...].
+fn hw_taint_inner(t: str) -> str {
+    if t.starts_with("tainted[") && t.ends_with("]") && t.len() > 9 {
+        return t.slice(8, t.len() - 1)
+    }
+    return t
+}
+
+# hw_valtype — the .py's hls_to_wasm_valtype (I32=127, I64=126, F64=124).
+fn hw_valtype(t: str) -> int {
+    let u: str = hw_taint_inner(t)
+    if u == "int" {
+        return 126
+    }
+    if u == "float" {
+        return 124
+    }
+    if u == "bool" {
+        return 127
+    }
+    if u == "str" {
+        return 127
+    }
+    if u.starts_with("list[") || u.starts_with("map[") {
+        return 127
+    }
+    if u == "void" {
+        panic("void has no value type")
+    }
+    # struct / enum / generic instantiated -> pointer
+    return 127
+}
+
+# hw_result_types — the .py's hls_to_wasm_result.
+fn hw_result_types(t: str) -> list[int] {
+    if t == "void" {
+        return []
+    }
+    let out: list[int] = []
+    out.push(hw_valtype(t))
+    return out
+}
+
+# hw_refuse — the .py's HLError channel: panic with the "(line N)"
+# suffix the interpreter's HLError.__str__ appended (col 0 on every
+# emitter raise); the parent maps it to "compile error: ...".
+fn hw_refuse(msg: str, line: int) -> void {
+    panic(msg + " (line " + line.to_str() + ")")
+}
+
+# HwEmitter — the emitter state (the .py's self.*).
+struct HwEmitter {
+    ctx: Ctx,
+    mod: HwModule,
+    func_index: map[str, int],
+    helper_emitted: map[str, bool],
+    str_pool: map[str, int],
+    str_list: list[str],
+    str_offs: list[int],
+    str_pool_end: int,
+    locals: map[str, int],
+    local_count: int,
+    cur_ret_type: str,
+    loop_break: list[int],
+    loop_cont: list[int],
+    frames: int,
+    js_externs: map[str, bool],
+    js_extern_order: list[str],
+    # The entry file's own path: hlfront's loaded_files lists the
+    # IMPORTS (load_file_into pushes those); the entry itself never
+    # joins the list, so the extern scan walks it first, by hand.
+    entry_path: str,
+    binding_pool: map[str, int]
+}
+
+fn hw_emit_new(ctx: Ctx, entry_path: str) -> HwEmitter {
+    return HwEmitter {
+        ctx: ctx,
+        mod: hw_mod_new(),
+        func_index: map_new(),
+        helper_emitted: map_new(),
+        str_pool: map_new(),
+        str_list: [],
+        str_offs: [],
+        str_pool_end: 16,
+        locals: map_new(),
+        local_count: 0,
+        cur_ret_type: "void",
+        loop_break: [],
+        loop_cont: [],
+        frames: 0,
+        js_externs: map_new(),
+        js_extern_order: [],
+        entry_path: entry_path,
+        binding_pool: map_new()
+    }
+}
+
+# hw_intern_str — the string pool: {i32 len, i8 data[len]} records laid
+# out contiguously from STR_BASE (16), 4-byte aligned.
+fn hw_intern_str(mut e: HwEmitter, s: str) -> int {
+    if e.str_pool.has(s) {
+        return e.str_pool.get_or(s, 0)
+    }
+    let offset: int = e.str_pool_end
+    let rec_len: int = 4 + s.len()
+    let padded: int = int_and(rec_len + 3, -4)
+    e.str_pool.set(s, offset)
+    e.str_list.push(s)
+    e.str_offs.push(offset)
+    e.str_pool_end = e.str_pool_end + padded
+    return offset
+}
+
+# ---------- extern "js" / extern "C" discovery ----------
+#
+# The native front-end stores extern decls as is_extern fns without the
+# ABI, so the emitter re-reads every loaded file's text for the
+# `extern "js"` / `extern "C"` blocks (the checker already proved the
+# files parse; the scan is a name harvest, not a parse). extern "C" is
+# refused with the .py's byte-exact message.
+
+# hw_find_from(s, needle, from) — first index >= from (-1 miss; Halis
+# str.find has no start argument).
+fn hw_find_from(s: str, needle: str, from: int) -> int {
+    let n: int = s.len()
+    let m: int = needle.len()
+    if m == 0 {
+        if from <= n {
+            return from
+        }
+        return -1
+    }
+    let mut i: int = from
+    if i < 0 {
+        i = 0
+    }
+    while i + m <= n {
+        let mut k: int = 0
+        let mut same: bool = true
+        while k < m {
+            if s.byte_at(i + k) != needle.byte_at(k) {
+                same = false
+            }
+            k = k + 1
+        }
+        if same {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# hw_line_at(src, pos) — 1-based line number of a byte offset.
+fn hw_line_at(src: str, pos: int) -> int {
+    let mut line: int = 1
+    let mut i: int = 0
+    while i < pos && i < src.len() {
+        if src.byte_at(i) == 10 {
+            line = line + 1
+        }
+        i = i + 1
+    }
+    return line
+}
+
+# hw_ident_at(src, i) — the identifier starting at i ("" when none).
+fn hw_ident_at(src: str, i: int) -> str {
+    let n: int = src.len()
+    if i >= n {
+        return ""
+    }
+    let c: int = src.byte_at(i)
+    let is_start: bool = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+    if !is_start {
+        return ""
+    }
+    let mut j: int = i
+    while j < n {
+        let d: int = src.byte_at(j)
+        let ok: bool = (d >= 65 && d <= 90) || (d >= 97 && d <= 122)
+        || d == 95 || (d >= 48 && d <= 57)
+        if !ok {
+            break
+        }
+        j = j + 1
+    }
+    return src.slice(i, j)
+}
+
+# hw_scan_externs — collect extern "js" fn names (declaration order) and
+# refuse extern "C" (the wasm32-unknown-unknown target has no libc).
+fn hw_scan_externs(mut e: HwEmitter) -> void uses IO {
+    let files: list[str] = []
+    if e.entry_path != "" {
+        files.push(e.entry_path)
+    }
+    let mut dfi: int = 0
+    while dfi < e.ctx.loaded_files.len() {
+        if e.ctx.loaded_files.get(dfi) != e.entry_path {
+            files.push(e.ctx.loaded_files.get(dfi))
+        }
+        dfi = dfi + 1
+    }
+    let mut fi: int = 0
+    while fi < files.len() {
+        let path: str = files.get(fi)
+        let src: str = read_file(path)
+        let mut i: int = 0
+        while true {
+            let at: int = hw_find_from(src, "extern", i)
+            if at < 0 {
+                break
+            }
+            i = at + 6
+            # Word boundary: not part of a longer identifier.
+            let mut before_ok: bool = at == 0
+            if at > 0 {
+                let pc: int = src.byte_at(at - 1)
+                before_ok = !((pc >= 65 && pc <= 90) || (pc >= 97 && pc <= 122)
+                || pc == 95 || (pc >= 48 && pc <= 57))
+            }
+            let word: str = hw_ident_at(src, at)
+            if !before_ok || word != "extern" {
+                continue
+            }
+            # Skip whitespace to the ABI string.
+            let mut j: int = at + 6
+            while j < src.len() && (src.byte_at(j) == 32
+            || src.byte_at(j) == 9 || src.byte_at(j) == 10
+            || src.byte_at(j) == 13) {
+                j = j + 1
+            }
+            if j >= src.len() || src.byte_at(j) != 34 {
+                continue
+            }
+            let close: int = hw_find_from(src, "\"", j + 1)
+            if close < 0 {
+                continue
+            }
+            let abi: str = src.slice(j + 1, close)
+            # Skip whitespace to the block '{'.
+            let mut k: int = close + 1
+            while k < src.len() && (src.byte_at(k) == 32
+            || src.byte_at(k) == 9 || src.byte_at(k) == 10
+            || src.byte_at(k) == 13) {
+                k = k + 1
+            }
+            if k >= src.len() || src.byte_at(k) != 123 {
+                i = close
+                continue
+            }
+            if abi != "js" && abi != "C" {
+                # The parser already rejected other ABIs; unreachable.
+                i = close
+                continue
+            }
+            # Scan the block body for `fn NAME(` declarations. Comments
+            # ('#' to EOL unless '#[') and attribute brackets are cut.
+            let mut p: int = k + 1
+            while p < src.len() {
+                let ch: int = src.byte_at(p)
+                if ch == 125 {
+                    break
+                }
+                if ch == 35 {
+                    # '#' attribute or comment: skip to ']' or EOL.
+                    if p + 1 < src.len() && src.byte_at(p + 1) == 91 {
+                        let ab: int = hw_find_from(src, "]", p)
+                        if ab < 0 {
+                            break
+                        }
+                        p = ab + 1
+                        continue
+                    }
+                    let nl: int = hw_find_from(src, "\n", p)
+                    if nl < 0 {
+                        break
+                    }
+                    p = nl + 1
+                    continue
+                }
+                if ch == 102 {
+                    # candidate 'fn' keyword at a word boundary
+                    let w: str = hw_ident_at(src, p)
+                    if w == "fn" {
+                        let pb: int = p
+                        let mut q: int = p + 2
+                        while q < src.len() && (src.byte_at(q) == 32
+                        || src.byte_at(q) == 9) {
+                            q = q + 1
+                        }
+                        let nm: str = hw_ident_at(src, q)
+                        if nm != "" {
+                            # must be followed by '('
+                            let r: int = q + nm.len()
+                            if r < src.len() && src.byte_at(r) == 40 {
+                                if abi == "C" {
+                                    hw_refuse("extern \"C\" is not supported "
+                                    + "on the wasm32-unknown-unknown target "
+                                    + "(no libc; use --target x86_64-linux-gnu "
+                                    + "for the C backend, or declare the "
+                                    + "import as extern \"js\")",
+                                    hw_line_at(src, pb))
+                                }
+                                if !e.js_externs.has(nm) {
+                                    e.js_externs.set(nm, true)
+                                    e.js_extern_order.push(nm)
+                                }
+                                p = r
+                                continue
+                            }
+                        }
+                    }
+                }
+                p = p + 1
+            }
+            i = p
+        }
+        fi = fi + 1
+    }
+}
+
+# hw_called_fn_names — every call/method NAME in the program (the .py's
+# deep-scan-23 _called_fn_names: an extern "js" import is declared iff
+# some emitted call may reference it; sound by construction).
+fn hw_walk_expr_names(e: HwEmitter, ei: int, acc: map[str, bool]) -> void {
+    if ei < 0 || ei >= e.ctx.exprs.len() {
+        return
+    }
+    let k: str = e.ctx.exprs.get(ei).kind
+    if k == "call" || k == "method" {
+        let nm: str = e.ctx.exprs.get(ei).name
+        if nm != "" {
+            acc.set(nm, true)
+        }
+    }
+    if k == "match" {
+        # args are match-ARM indices, not expressions.
+        hw_walk_expr_names(e, e.ctx.exprs.get(ei).left, acc)
+        let mut a: int = 0
+        let args: list[int] = e.ctx.exprs.get(ei).args
+        while a < args.len() {
+            let arm: MatchArm = e.ctx.match_arms.get(args.get(a))
+            hw_walk_expr_names(e, arm.body, acc)
+            a = a + 1
+        }
+        return
+    }
+    hw_walk_expr_names(e, e.ctx.exprs.get(ei).left, acc)
+    hw_walk_expr_names(e, e.ctx.exprs.get(ei).right, acc)
+    let mut i: int = 0
+    let args2: list[int] = e.ctx.exprs.get(ei).args
+    while i < args2.len() {
+        hw_walk_expr_names(e, args2.get(i), acc)
+        i = i + 1
+    }
+}
+
+fn hw_walk_stmt_names(e: HwEmitter, si: int, acc: map[str, bool]) -> void {
+    if si < 0 || si >= e.ctx.stmts.len() {
+        return
+    }
+    let s: StmtN = e.ctx.stmts.get(si)
+    hw_walk_expr_names(e, s.value, acc)
+    hw_walk_expr_names(e, s.target, acc)
+    hw_walk_expr_names(e, s.cond, acc)
+    hw_walk_expr_names(e, s.iter, acc)
+    hw_walk_expr_names(e, s.e, acc)
+    let mut i: int = 0
+    while i < s.body.len() {
+        hw_walk_stmt_names(e, s.body.get(i), acc)
+        i = i + 1
+    }
+    let mut j: int = 0
+    while j < s.else_body.len() {
+        hw_walk_stmt_names(e, s.else_body.get(j), acc)
+        j = j + 1
+    }
+}
+
+fn hw_called_fn_names(e: HwEmitter) -> map[str, bool] {
+    let acc: map[str, bool] = map_new()
+    # Every non-extern fn body...
+    let mut fi: int = 0
+    while fi < e.ctx.fn_order.len() {
+        let key: str = e.ctx.fn_order.get(fi)
+        let f: FnInfo = e.ctx.fns.get_or(key, dummy_fn())
+        let mut bi: int = 0
+        while bi < f.body.len() {
+            hw_walk_stmt_names(e, f.body.get(bi), acc)
+            bi = bi + 1
+        }
+        fi = fi + 1
+    }
+    # ...and every struct default-value expr (the .py walked the whole
+    # program dict; the defaults are the other value-holding spot).
+    let keys: list[str] = e.ctx.structs.keys()
+    let mut ki: int = 0
+    while ki < keys.len() {
+        let st: StructInfo = e.ctx.structs.get_or(keys.get(ki), dummy_struct())
+        let mut di: int = 0
+        while di < st.fdefaults.len() {
+            if st.fdefaults.get(di) >= 0 {
+                hw_walk_expr_names(e, st.fdefaults.get(di), acc)
+            }
+            di = di + 1
+        }
+        ki = ki + 1
+    }
+    return acc
+}
+
+# ---------- imports ----------
+
+# hw_declare_js_imports — the standard env imports (always first), then
+# the user's extern "js" decls that the program actually calls.
+fn hw_declare_js_imports(mut e: HwEmitter) -> void {
+    # (str ptr) -> void
+    let t_println: int = hw_add_type(e.mod, [127], [])
+    let idx1: int = hw_add_import(e.mod, "env", "hl_js_println", 0, t_println)
+    e.func_index.set("hl_js_println", idx1)
+    let t_print: int = hw_add_type(e.mod, [127], [])
+    let idx2: int = hw_add_import(e.mod, "env", "hl_js_print", 0, t_print)
+    e.func_index.set("hl_js_print", idx2)
+    # (f64) -> str ptr
+    let t_f2s: int = hw_add_type(e.mod, [124], [127])
+    let idx3: int = hw_add_import(e.mod, "env", "hl_js_f64_to_str", 0, t_f2s)
+    e.func_index.set("hl_js_f64_to_str", idx3)
+    # User-declared extern "js" functions, declaration order, tree-shaken
+    # to the ones the program calls (deep-scan-23).
+    let called: map[str, bool] = hw_called_fn_names(e)
+    let mut i: int = 0
+    while i < e.js_extern_order.len() {
+        let nm: str = e.js_extern_order.get(i)
+        if called.has(nm) {
+            let f: FnInfo = e.ctx.fns.get_or(nm, dummy_fn())
+            let pv: list[int] = []
+            let mut pi: int = 0
+            while pi < f.ptypes.len() {
+                pv.push(hw_valtype(f.ptypes.get(pi)))
+                pi = pi + 1
+            }
+            let rv: list[int] = hw_result_types(f.ret)
+            let ty: int = hw_add_type(e.mod, pv, rv)
+            let idx: int = hw_add_import(e.mod, "env", nm, 0, ty)
+            e.func_index.set(nm, idx)
+        }
+        i = i + 1
+    }
+}
+
+# ---------- runtime helpers ----------
+
+# hw_add_helper — declare a wasm-defined helper (idempotent).
+fn hw_add_helper(mut e: HwEmitter, name: str, params: list[int],
+results: list[int]) -> int {
+    if e.helper_emitted.has(name) {
+        return e.func_index.get_or(name, 0)
+    }
+    let ty: int = hw_add_type(e.mod, params, results)
+    let idx: int = hw_add_function(e.mod, ty)
+    e.helper_emitted.set(name, true)
+    e.func_index.set(name, idx)
+    return idx
+}
+
+# hw_call_idx — the func_index of a name (helpers are forward-declared
+# before any body runs, so a miss is an internal error).
+fn hw_call_idx(e: HwEmitter, name: str, line: int) -> int {
+    if !e.func_index.has(name) {
+        hw_refuse("internal: helper '" + name + "' not emitted", line)
+    }
+    return e.func_index.get_or(name, 0)
+}
+
+# ---- hl_alloc(n: i32) -> ptr: bump allocator on HEAP_PTR_ADDR (0). ----
+fn hw_emit_hl_alloc(mut e: HwEmitter) -> void {
+    let body: list[int] = []
+    # i32.const 0; i32.load (align 2, off 0)
+    hw_b(body, 65)
+    hw_sleb_b(body, 0)
+    hw_b(body, 40)
+    hw_b(body, 2)
+    hw_sleb_b(body, 0)
+    hw_b(body, 33)
+    hw_uleb_b(body, 1)
+    hw_b(body, 65)
+    hw_sleb_b(body, 0)
+    hw_b(body, 32)
+    hw_uleb_b(body, 1)
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 106)
+    hw_b(body, 54)
+    hw_b(body, 2)
+    hw_sleb_b(body, 0)
+    hw_b(body, 32)
+    hw_uleb_b(body, 1)
+    hw_add_code(e.mod, [1], [127], hw_bytes_str(body))
+}
+
+# ---- hl_str_concat(a, b) -> c (memory.copy, bulk-memory 1.0). ----
+fn hw_emit_hl_str_concat(mut e: HwEmitter, idx_alloc: int) -> void {
+    let body: list[int] = []
+    # a_len = i32.load(a); b_len = i32.load(b)
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 40)
+    hw_b(body, 2)
+    hw_sleb_b(body, 0)
+    hw_b(body, 33)
+    hw_uleb_b(body, 2)
+    hw_b(body, 32)
+    hw_uleb_b(body, 1)
+    hw_b(body, 40)
+    hw_b(body, 2)
+    hw_sleb_b(body, 0)
+    hw_b(body, 33)
+    hw_uleb_b(body, 3)
+    # total = a_len + b_len
+    hw_b(body, 32)
+    hw_uleb_b(body, 2)
+    hw_b(body, 32)
+    hw_uleb_b(body, 3)
+    hw_b(body, 106)
+    hw_b(body, 33)
+    hw_uleb_b(body, 4)
+    # result_ptr = hl_alloc(4 + total)
+    hw_b(body, 65)
+    hw_sleb_b(body, 4)
+    hw_b(body, 32)
+    hw_uleb_b(body, 4)
+    hw_b(body, 106)
+    hw_b(body, 16)
+    hw_uleb_b(body, idx_alloc)
+    hw_b(body, 33)
+    hw_uleb_b(body, 5)
+    # store total at result_ptr[0]
+    hw_b(body, 32)
+    hw_uleb_b(body, 5)
+    hw_b(body, 32)
+    hw_uleb_b(body, 4)
+    hw_b(body, 54)
+    hw_b(body, 2)
+    hw_sleb_b(body, 0)
+    # memory.copy a.data -> result+4, n = a_len
+    hw_b(body, 32)
+    hw_uleb_b(body, 5)
+    hw_b(body, 65)
+    hw_sleb_b(body, 4)
+    hw_b(body, 106)
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 65)
+    hw_sleb_b(body, 4)
+    hw_b(body, 106)
+    hw_b(body, 32)
+    hw_uleb_b(body, 2)
+    hw_b(body, 252)
+    hw_uleb_b(body, 10)
+    hw_b(body, 0)
+    hw_b(body, 0)
+    # memory.copy b.data -> result+4+a_len, n = b_len
+    hw_b(body, 32)
+    hw_uleb_b(body, 5)
+    hw_b(body, 65)
+    hw_sleb_b(body, 4)
+    hw_b(body, 106)
+    hw_b(body, 32)
+    hw_uleb_b(body, 2)
+    hw_b(body, 106)
+    hw_b(body, 32)
+    hw_uleb_b(body, 1)
+    hw_b(body, 65)
+    hw_sleb_b(body, 4)
+    hw_b(body, 106)
+    hw_b(body, 32)
+    hw_uleb_b(body, 3)
+    hw_b(body, 252)
+    hw_uleb_b(body, 10)
+    hw_b(body, 0)
+    hw_b(body, 0)
+    # return result_ptr
+    hw_b(body, 32)
+    hw_uleb_b(body, 5)
+    hw_add_code(e.mod, [1, 1, 1, 1], [127, 127, 127, 127],
+    hw_bytes_str(body))
+}
+
+# ---- hl_int_to_str(n: i64) -> str (unsigned div/rem — deep-scan-15). ----
+fn hw_emit_hl_int_to_str(mut e: HwEmitter, idx_alloc: int) -> void {
+    let body: list[int] = []
+    # buf_ptr = hl_alloc(24)
+    hw_b(body, 65)
+    hw_sleb_b(body, 24)
+    hw_b(body, 16)
+    hw_uleb_b(body, idx_alloc)
+    hw_b(body, 33)
+    hw_uleb_b(body, 1)
+    # pos = 24
+    hw_b(body, 65)
+    hw_sleb_b(body, 24)
+    hw_b(body, 33)
+    hw_uleb_b(body, 2)
+    # negative = (n < 0)
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 66)
+    hw_sleb_b(body, 0)
+    hw_b(body, 83)
+    hw_b(body, 33)
+    hw_uleb_b(body, 3)
+    # if negative: n = 0 - n
+    hw_b(body, 32)
+    hw_uleb_b(body, 3)
+    hw_b(body, 4)
+    hw_b(body, 64)
+    hw_b(body, 66)
+    hw_sleb_b(body, 0)
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 125)
+    hw_b(body, 33)
+    hw_uleb_b(body, 0)
+    hw_b(body, 11)
+    # if n == 0: pos = 23; buf[23] = '0'
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 80)
+    hw_b(body, 4)
+    hw_b(body, 64)
+    hw_b(body, 65)
+    hw_sleb_b(body, 23)
+    hw_b(body, 33)
+    hw_uleb_b(body, 2)
+    hw_b(body, 32)
+    hw_uleb_b(body, 1)
+    hw_b(body, 65)
+    hw_sleb_b(body, 23)
+    hw_b(body, 106)
+    hw_b(body, 65)
+    hw_sleb_b(body, 48)
+    hw_b(body, 58)
+    hw_b(body, 0)
+    hw_sleb_b(body, 0)
+    hw_b(body, 11)
+    # loop: while n != 0: digit extraction (UNSIGNED div/rem)
+    hw_b(body, 2)
+    hw_b(body, 64)
+    hw_b(body, 3)
+    hw_b(body, 64)
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 80)
+    hw_b(body, 13)
+    hw_uleb_b(body, 1)
+    # tmp = n % 10 (unsigned)
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 66)
+    hw_sleb_b(body, 10)
+    hw_b(body, 130)
+    hw_b(body, 33)
+    hw_uleb_b(body, 4)
+    # n = n / 10 (unsigned)
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 66)
+    hw_sleb_b(body, 10)
+    hw_b(body, 128)
+    hw_b(body, 33)
+    hw_uleb_b(body, 0)
+    # pos--
+    hw_b(body, 32)
+    hw_uleb_b(body, 2)
+    hw_b(body, 65)
+    hw_sleb_b(body, -1)
+    hw_b(body, 106)
+    hw_b(body, 33)
+    hw_uleb_b(body, 2)
+    # buf[pos] = digit + '0'
+    hw_b(body, 32)
+    hw_uleb_b(body, 1)
+    hw_b(body, 32)
+    hw_uleb_b(body, 2)
+    hw_b(body, 106)
+    hw_b(body, 32)
+    hw_uleb_b(body, 4)
+    hw_b(body, 66)
+    hw_sleb_b(body, 48)
+    hw_b(body, 124)
+    hw_b(body, 167)
+    hw_b(body, 58)
+    hw_b(body, 0)
+    hw_sleb_b(body, 0)
+    hw_b(body, 12)
+    hw_uleb_b(body, 0)
+    hw_b(body, 11)
+    hw_b(body, 11)
+    # if negative: pos--; buf[pos] = '-'
+    hw_b(body, 32)
+    hw_uleb_b(body, 3)
+    hw_b(body, 4)
+    hw_b(body, 64)
+    hw_b(body, 32)
+    hw_uleb_b(body, 2)
+    hw_b(body, 65)
+    hw_sleb_b(body, -1)
+    hw_b(body, 106)
+    hw_b(body, 33)
+    hw_uleb_b(body, 2)
+    hw_b(body, 32)
+    hw_uleb_b(body, 1)
+    hw_b(body, 32)
+    hw_uleb_b(body, 2)
+    hw_b(body, 106)
+    hw_b(body, 65)
+    hw_sleb_b(body, 45)
+    hw_b(body, 58)
+    hw_b(body, 0)
+    hw_sleb_b(body, 0)
+    hw_b(body, 11)
+    # len = 24 - pos
+    hw_b(body, 65)
+    hw_sleb_b(body, 24)
+    hw_b(body, 32)
+    hw_uleb_b(body, 2)
+    hw_b(body, 107)
+    hw_b(body, 33)
+    hw_uleb_b(body, 6)
+    # result_ptr = hl_alloc(4 + len); store len
+    hw_b(body, 65)
+    hw_sleb_b(body, 4)
+    hw_b(body, 32)
+    hw_uleb_b(body, 6)
+    hw_b(body, 106)
+    hw_b(body, 16)
+    hw_uleb_b(body, idx_alloc)
+    hw_b(body, 33)
+    hw_uleb_b(body, 5)
+    hw_b(body, 32)
+    hw_uleb_b(body, 5)
+    hw_b(body, 32)
+    hw_uleb_b(body, 6)
+    hw_b(body, 54)
+    hw_b(body, 2)
+    hw_sleb_b(body, 0)
+    # memory.copy buf[pos..pos+len) -> result[4..4+len)
+    hw_b(body, 32)
+    hw_uleb_b(body, 5)
+    hw_b(body, 65)
+    hw_sleb_b(body, 4)
+    hw_b(body, 106)
+    hw_b(body, 32)
+    hw_uleb_b(body, 1)
+    hw_b(body, 32)
+    hw_uleb_b(body, 2)
+    hw_b(body, 106)
+    hw_b(body, 32)
+    hw_uleb_b(body, 6)
+    hw_b(body, 252)
+    hw_uleb_b(body, 10)
+    hw_b(body, 0)
+    hw_b(body, 0)
+    # return result_ptr
+    hw_b(body, 32)
+    hw_uleb_b(body, 5)
+    hw_add_code(e.mod, [1, 1, 1, 1, 1, 1], [127, 127, 127, 126, 127, 127],
+    hw_bytes_str(body))
+}
+
+# ---- hl_bool_to_str(b) -> "true"/"false" literal pointer. ----
+fn hw_emit_hl_bool_to_str(mut e: HwEmitter) -> void {
+    let true_off: int = hw_intern_str(e, "true")
+    let false_off: int = hw_intern_str(e, "false")
+    let body: list[int] = []
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 4)
+    hw_b(body, 127)
+    hw_b(body, 65)
+    hw_sleb_b(body, true_off)
+    hw_b(body, 5)
+    hw_b(body, 65)
+    hw_sleb_b(body, false_off)
+    hw_b(body, 11)
+    hw_add_code(e.mod, [], [], hw_bytes_str(body))
+}
+
+# ---- hl_float_to_str(f) -> str: the JS helper owns the formatting. ----
+fn hw_emit_hl_float_to_str(mut e: HwEmitter) -> void {
+    let js_idx: int = hw_call_idx(e, "hl_js_f64_to_str", 0)
+    let body: list[int] = []
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 16)
+    hw_uleb_b(body, js_idx)
+    hw_add_code(e.mod, [], [], hw_bytes_str(body))
+}
+
+# ---- hl_str_eq(a, b) -> i32 (early-return byte compare). ----
+fn hw_emit_hl_str_eq(mut e: HwEmitter) -> void {
+    let body: list[int] = []
+    # a_len, b_len
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 40)
+    hw_b(body, 2)
+    hw_sleb_b(body, 0)
+    hw_b(body, 33)
+    hw_uleb_b(body, 2)
+    hw_b(body, 32)
+    hw_uleb_b(body, 1)
+    hw_b(body, 40)
+    hw_b(body, 2)
+    hw_sleb_b(body, 0)
+    hw_b(body, 33)
+    hw_uleb_b(body, 3)
+    # if a_len != b_len: return 0
+    hw_b(body, 32)
+    hw_uleb_b(body, 2)
+    hw_b(body, 32)
+    hw_uleb_b(body, 3)
+    hw_b(body, 71)
+    hw_b(body, 4)
+    hw_b(body, 64)
+    hw_b(body, 65)
+    hw_sleb_b(body, 0)
+    hw_b(body, 15)
+    hw_b(body, 11)
+    # i = 0
+    hw_b(body, 65)
+    hw_sleb_b(body, 0)
+    hw_b(body, 33)
+    hw_uleb_b(body, 4)
+    # loop: if i >= a_len return 1; if a[4+i] != b[4+i] return 0; i++
+    hw_b(body, 2)
+    hw_b(body, 64)
+    hw_b(body, 3)
+    hw_b(body, 64)
+    hw_b(body, 32)
+    hw_uleb_b(body, 4)
+    hw_b(body, 32)
+    hw_uleb_b(body, 2)
+    hw_b(body, 78)
+    hw_b(body, 4)
+    hw_b(body, 64)
+    hw_b(body, 65)
+    hw_sleb_b(body, 1)
+    hw_b(body, 15)
+    hw_b(body, 11)
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 32)
+    hw_uleb_b(body, 4)
+    hw_b(body, 106)
+    hw_b(body, 45)
+    hw_b(body, 0)
+    hw_sleb_b(body, 4)
+    hw_b(body, 32)
+    hw_uleb_b(body, 1)
+    hw_b(body, 32)
+    hw_uleb_b(body, 4)
+    hw_b(body, 106)
+    hw_b(body, 45)
+    hw_b(body, 0)
+    hw_sleb_b(body, 4)
+    hw_b(body, 71)
+    hw_b(body, 4)
+    hw_b(body, 64)
+    hw_b(body, 65)
+    hw_sleb_b(body, 0)
+    hw_b(body, 15)
+    hw_b(body, 11)
+    hw_b(body, 32)
+    hw_uleb_b(body, 4)
+    hw_b(body, 65)
+    hw_sleb_b(body, 1)
+    hw_b(body, 106)
+    hw_b(body, 33)
+    hw_uleb_b(body, 4)
+    hw_b(body, 12)
+    hw_uleb_b(body, 0)
+    hw_b(body, 11)
+    hw_b(body, 11)
+    # wasm needs a value for the return type (unreachable in practice)
+    hw_b(body, 65)
+    hw_sleb_b(body, 1)
+    hw_add_code(e.mod, [1, 1, 1], [127, 127, 127], hw_bytes_str(body))
+}
+
+# ---- hl_str_len(s) -> i64. ----
+fn hw_emit_hl_str_len(mut e: HwEmitter) -> void {
+    let body: list[int] = []
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 40)
+    hw_b(body, 2)
+    hw_sleb_b(body, 0)
+    hw_b(body, 172)
+    hw_add_code(e.mod, [], [], hw_bytes_str(body))
+}
+
+# ---- hl_str_byte_at(s, i) -> i64. ----
+fn hw_emit_hl_str_byte_at(mut e: HwEmitter) -> void {
+    let body: list[int] = []
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 32)
+    hw_uleb_b(body, 1)
+    hw_b(body, 167)
+    hw_b(body, 65)
+    hw_sleb_b(body, 4)
+    hw_b(body, 106)
+    hw_b(body, 106)
+    hw_b(body, 45)
+    hw_b(body, 0)
+    hw_sleb_b(body, 0)
+    hw_b(body, 172)
+    hw_add_code(e.mod, [], [], hw_bytes_str(body))
+}
+
+# ---- hl_chr_to_str(n: i64) -> 1-byte string. ----
+fn hw_emit_hl_chr_to_str(mut e: HwEmitter, idx_alloc: int) -> void {
+    let body: list[int] = []
+    hw_b(body, 65)
+    hw_sleb_b(body, 8)
+    hw_b(body, 16)
+    hw_uleb_b(body, idx_alloc)
+    hw_b(body, 34)
+    hw_uleb_b(body, 1)
+    hw_b(body, 65)
+    hw_sleb_b(body, 1)
+    hw_b(body, 54)
+    hw_b(body, 2)
+    hw_sleb_b(body, 0)
+    hw_b(body, 32)
+    hw_uleb_b(body, 1)
+    hw_b(body, 65)
+    hw_sleb_b(body, 4)
+    hw_b(body, 106)
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 167)
+    hw_b(body, 58)
+    hw_b(body, 0)
+    hw_sleb_b(body, 0)
+    hw_b(body, 32)
+    hw_uleb_b(body, 1)
+    hw_add_code(e.mod, [1], [127], hw_bytes_str(body))
+}
+
+# ---- hl_int_abs(n) -> i64 (traps on INT64_MIN, deep-scan-15). ----
+fn hw_emit_hl_int_abs(mut e: HwEmitter) -> void {
+    let body: list[int] = []
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 66)
+    hw_sleb_b(body, -9223372036854775808)
+    hw_b(body, 81)
+    hw_b(body, 4)
+    hw_b(body, 64)
+    hw_b(body, 0)
+    hw_b(body, 11)
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 66)
+    hw_sleb_b(body, 0)
+    hw_b(body, 83)
+    hw_b(body, 4)
+    hw_b(body, 126)
+    hw_b(body, 66)
+    hw_sleb_b(body, 0)
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 125)
+    hw_b(body, 5)
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 11)
+    hw_add_code(e.mod, [], [], hw_bytes_str(body))
+}
+
+# ---- hl_str_to_int(s) -> i64 (deep-scan-15/20/30 fixes). ----
+fn hw_emit_hl_str_to_int(mut e: HwEmitter) -> void {
+    let body: list[int] = []
+    # len = i32.load(s)
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 40)
+    hw_b(body, 2)
+    hw_sleb_b(body, 0)
+    hw_b(body, 33)
+    hw_uleb_b(body, 1)
+    # i = 0, result = 0, negative = 0, digit = 0
+    hw_b(body, 65)
+    hw_sleb_b(body, 0)
+    hw_b(body, 33)
+    hw_uleb_b(body, 2)
+    hw_b(body, 66)
+    hw_sleb_b(body, 0)
+    hw_b(body, 33)
+    hw_uleb_b(body, 3)
+    hw_b(body, 65)
+    hw_sleb_b(body, 0)
+    hw_b(body, 33)
+    hw_uleb_b(body, 4)
+    hw_b(body, 65)
+    hw_sleb_b(body, 0)
+    hw_b(body, 33)
+    hw_uleb_b(body, 5)
+    # if i < len and s.data[4] == '-': negative = 1; i++
+    hw_b(body, 32)
+    hw_uleb_b(body, 2)
+    hw_b(body, 32)
+    hw_uleb_b(body, 1)
+    hw_b(body, 72)
+    hw_b(body, 4)
+    hw_b(body, 64)
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 65)
+    hw_sleb_b(body, 4)
+    hw_b(body, 106)
+    hw_b(body, 45)
+    hw_b(body, 0)
+    hw_sleb_b(body, 0)
+    hw_b(body, 65)
+    hw_sleb_b(body, 45)
+    hw_b(body, 70)
+    hw_b(body, 4)
+    hw_b(body, 64)
+    hw_b(body, 65)
+    hw_sleb_b(body, 1)
+    hw_b(body, 33)
+    hw_uleb_b(body, 4)
+    hw_b(body, 32)
+    hw_uleb_b(body, 2)
+    hw_b(body, 65)
+    hw_sleb_b(body, 1)
+    hw_b(body, 106)
+    hw_b(body, 33)
+    hw_uleb_b(body, 2)
+    hw_b(body, 11)
+    hw_b(body, 11)
+    # loop: while i < len and digit(s.data[4+i]): result*10 + digit
+    hw_b(body, 2)
+    hw_b(body, 64)
+    hw_b(body, 3)
+    hw_b(body, 64)
+    hw_b(body, 32)
+    hw_uleb_b(body, 2)
+    hw_b(body, 32)
+    hw_uleb_b(body, 1)
+    hw_b(body, 78)
+    hw_b(body, 13)
+    hw_uleb_b(body, 1)
+    # byte = s.data[4+i] -> local 5 (dedicated digit scratch, deep-scan-15)
+    hw_b(body, 32)
+    hw_uleb_b(body, 2)
+    hw_b(body, 65)
+    hw_sleb_b(body, 4)
+    hw_b(body, 106)
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 106)
+    hw_b(body, 45)
+    hw_b(body, 0)
+    hw_sleb_b(body, 0)
+    hw_b(body, 34)
+    hw_uleb_b(body, 5)
+    # (byte >= '0') and (byte <= '9') else unreachable (deep-scan-30)
+    hw_b(body, 65)
+    hw_sleb_b(body, 48)
+    hw_b(body, 78)
+    hw_b(body, 32)
+    hw_uleb_b(body, 5)
+    hw_b(body, 65)
+    hw_sleb_b(body, 57)
+    hw_b(body, 76)
+    hw_b(body, 113)
+    hw_b(body, 4)
+    hw_b(body, 64)
+    hw_b(body, 32)
+    hw_uleb_b(body, 5)
+    hw_b(body, 65)
+    hw_sleb_b(body, 48)
+    hw_b(body, 107)
+    hw_b(body, 172)
+    hw_b(body, 32)
+    hw_uleb_b(body, 3)
+    hw_b(body, 66)
+    hw_sleb_b(body, 10)
+    hw_b(body, 126)
+    hw_b(body, 124)
+    hw_b(body, 33)
+    hw_uleb_b(body, 3)
+    hw_b(body, 5)
+    hw_b(body, 0)
+    hw_b(body, 11)
+    hw_b(body, 32)
+    hw_uleb_b(body, 2)
+    hw_b(body, 65)
+    hw_sleb_b(body, 1)
+    hw_b(body, 106)
+    hw_b(body, 33)
+    hw_uleb_b(body, 2)
+    hw_b(body, 12)
+    hw_uleb_b(body, 0)
+    hw_b(body, 11)
+    hw_b(body, 11)
+    # if negative: result = -result
+    hw_b(body, 32)
+    hw_uleb_b(body, 4)
+    hw_b(body, 4)
+    hw_b(body, 64)
+    hw_b(body, 66)
+    hw_sleb_b(body, 0)
+    hw_b(body, 32)
+    hw_uleb_b(body, 3)
+    hw_b(body, 125)
+    hw_b(body, 33)
+    hw_uleb_b(body, 3)
+    hw_b(body, 11)
+    hw_b(body, 32)
+    hw_uleb_b(body, 3)
+    hw_add_code(e.mod, [1, 1, 1, 1, 1], [127, 127, 126, 127, 127],
+    hw_bytes_str(body))
+}
+
+# ---- hl_str_to_float: unreachable (no JS import; the .py's alpha law). ----
+fn hw_emit_hl_str_to_float(mut e: HwEmitter) -> void {
+    let body: list[int] = []
+    hw_b(body, 0)
+    hw_add_code(e.mod, [], [], hw_bytes_str(body))
+}
+
+# ---- hl_float_to_int / hl_int_to_float (Stage 24 conversions). ----
+fn hw_emit_hl_float_to_int(mut e: HwEmitter) -> void {
+    let body: list[int] = []
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 176)
+    hw_add_code(e.mod, [], [], hw_bytes_str(body))
+}
+
+fn hw_emit_hl_int_to_float(mut e: HwEmitter) -> void {
+    let body: list[int] = []
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 185)
+    hw_add_code(e.mod, [], [], hw_bytes_str(body))
+}
+
+# ---- hl_panic / hl_abort / hl_exit: trap (the alpha's halt convention). ----
+fn hw_emit_hl_panic(mut e: HwEmitter) -> void {
+    let body: list[int] = []
+    hw_b(body, 0)
+    hw_add_code(e.mod, [], [], hw_bytes_str(body))
+}
+
+fn hw_emit_hl_abort(mut e: HwEmitter) -> void {
+    let body: list[int] = []
+    hw_b(body, 0)
+    hw_add_code(e.mod, [], [], hw_bytes_str(body))
+}
+
+fn hw_emit_hl_exit(mut e: HwEmitter) -> void {
+    let body: list[int] = []
+    hw_b(body, 0)
+    hw_add_code(e.mod, [], [], hw_bytes_str(body))
+}
+
+# ---- checked i64 arithmetic (deep-scan-25: SPEC §7, traps not wraps). ----
+fn hw_emit_hl_checked_add(mut e: HwEmitter) -> void {
+    let body: list[int] = []
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 32)
+    hw_uleb_b(body, 1)
+    hw_b(body, 124)
+    hw_b(body, 33)
+    hw_uleb_b(body, 2)
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 32)
+    hw_uleb_b(body, 2)
+    hw_b(body, 133)
+    hw_b(body, 32)
+    hw_uleb_b(body, 1)
+    hw_b(body, 32)
+    hw_uleb_b(body, 2)
+    hw_b(body, 133)
+    hw_b(body, 131)
+    hw_b(body, 33)
+    hw_uleb_b(body, 3)
+    hw_b(body, 32)
+    hw_uleb_b(body, 3)
+    hw_b(body, 66)
+    hw_sleb_b(body, 0)
+    hw_b(body, 83)
+    hw_b(body, 4)
+    hw_b(body, 64)
+    hw_b(body, 0)
+    hw_b(body, 11)
+    hw_b(body, 32)
+    hw_uleb_b(body, 2)
+    hw_add_code(e.mod, [2], [126], hw_bytes_str(body))
+}
+
+fn hw_emit_hl_checked_sub(mut e: HwEmitter) -> void {
+    let body: list[int] = []
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 32)
+    hw_uleb_b(body, 1)
+    hw_b(body, 125)
+    hw_b(body, 33)
+    hw_uleb_b(body, 2)
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 32)
+    hw_uleb_b(body, 1)
+    hw_b(body, 133)
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 32)
+    hw_uleb_b(body, 2)
+    hw_b(body, 133)
+    hw_b(body, 131)
+    hw_b(body, 33)
+    hw_uleb_b(body, 3)
+    hw_b(body, 32)
+    hw_uleb_b(body, 3)
+    hw_b(body, 66)
+    hw_sleb_b(body, 0)
+    hw_b(body, 83)
+    hw_b(body, 4)
+    hw_b(body, 64)
+    hw_b(body, 0)
+    hw_b(body, 11)
+    hw_b(body, 32)
+    hw_uleb_b(body, 2)
+    hw_add_code(e.mod, [2], [126], hw_bytes_str(body))
+}
+
+fn hw_emit_hl_checked_mul(mut e: HwEmitter) -> void {
+    let body: list[int] = []
+    # if b == 0: return 0
+    hw_b(body, 32)
+    hw_uleb_b(body, 1)
+    hw_b(body, 80)
+    hw_b(body, 4)
+    hw_b(body, 64)
+    hw_b(body, 66)
+    hw_sleb_b(body, 0)
+    hw_b(body, 15)
+    hw_b(body, 11)
+    # if b == -1: a == INT64_MIN -> trap; else return 0 - a
+    hw_b(body, 32)
+    hw_uleb_b(body, 1)
+    hw_b(body, 66)
+    hw_sleb_b(body, -1)
+    hw_b(body, 81)
+    hw_b(body, 4)
+    hw_b(body, 64)
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 66)
+    hw_sleb_b(body, -9223372036854775808)
+    hw_b(body, 81)
+    hw_b(body, 4)
+    hw_b(body, 64)
+    hw_b(body, 0)
+    hw_b(body, 11)
+    hw_b(body, 66)
+    hw_sleb_b(body, 0)
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 125)
+    hw_b(body, 15)
+    hw_b(body, 11)
+    # r = a * b; if r / b != a: trap
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 32)
+    hw_uleb_b(body, 1)
+    hw_b(body, 126)
+    hw_b(body, 33)
+    hw_uleb_b(body, 2)
+    hw_b(body, 32)
+    hw_uleb_b(body, 2)
+    hw_b(body, 32)
+    hw_uleb_b(body, 1)
+    hw_b(body, 127)
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 82)
+    hw_b(body, 4)
+    hw_b(body, 64)
+    hw_b(body, 0)
+    hw_b(body, 11)
+    hw_b(body, 32)
+    hw_uleb_b(body, 2)
+    hw_add_code(e.mod, [2], [126], hw_bytes_str(body))
+}
+
+fn hw_emit_hl_checked_rem(mut e: HwEmitter) -> void {
+    let body: list[int] = []
+    # if a == INT64_MIN and b == -1: trap (HLS panics; wasm defines 0)
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 66)
+    hw_sleb_b(body, -9223372036854775808)
+    hw_b(body, 81)
+    hw_b(body, 4)
+    hw_b(body, 64)
+    hw_b(body, 32)
+    hw_uleb_b(body, 1)
+    hw_b(body, 66)
+    hw_sleb_b(body, -1)
+    hw_b(body, 81)
+    hw_b(body, 4)
+    hw_b(body, 64)
+    hw_b(body, 0)
+    hw_b(body, 11)
+    hw_b(body, 11)
+    # a % b (rem_s traps on b == 0, matching the HLS panic convention)
+    hw_b(body, 32)
+    hw_uleb_b(body, 0)
+    hw_b(body, 32)
+    hw_uleb_b(body, 1)
+    hw_b(body, 129)
+    hw_add_code(e.mod, [], [], hw_bytes_str(body))
+}
+
+# hw_emit_runtime_helpers — forward-declare every helper (import-space
+# ordering), then emit the bodies in the SAME order.
+fn hw_emit_runtime_helpers(mut e: HwEmitter) -> void {
+    let idx_alloc: int = hw_add_helper(e, "hl_alloc", [127], [127])
+    let idx_concat: int = hw_add_helper(e, "hl_str_concat", [127, 127], [127])
+    let idx_int_to_str: int = hw_add_helper(e, "hl_int_to_str", [126], [127])
+    let idx_bool_to_str: int = hw_add_helper(e, "hl_bool_to_str", [127], [127])
+    let idx_float_to_str: int = hw_add_helper(e, "hl_float_to_str", [124], [127])
+    let idx_str_eq: int = hw_add_helper(e, "hl_str_eq", [127, 127], [127])
+    let idx_str_len: int = hw_add_helper(e, "hl_str_len", [127], [126])
+    let idx_str_byte_at: int = hw_add_helper(e, "hl_str_byte_at", [127, 126], [126])
+    let idx_chr_to_str: int = hw_add_helper(e, "hl_chr_to_str", [126], [127])
+    let idx_int_abs: int = hw_add_helper(e, "hl_int_abs", [126], [126])
+    let idx_str_to_int: int = hw_add_helper(e, "hl_str_to_int", [127], [126])
+    let idx_str_to_float: int = hw_add_helper(e, "hl_str_to_float", [127], [124])
+    let idx_float_to_int: int = hw_add_helper(e, "hl_float_to_int", [124], [126])
+    let idx_int_to_float: int = hw_add_helper(e, "hl_int_to_float", [126], [124])
+    let idx_panic: int = hw_add_helper(e, "hl_panic", [127], [])
+    let idx_abort: int = hw_add_helper(e, "hl_abort", [126], [])
+    let idx_exit: int = hw_add_helper(e, "hl_exit", [126], [])
+    let idx_add: int = hw_add_helper(e, "hl_checked_add", [126, 126], [126])
+    let idx_sub: int = hw_add_helper(e, "hl_checked_sub", [126, 126], [126])
+    let idx_mul: int = hw_add_helper(e, "hl_checked_mul", [126, 126], [126])
+    let idx_rem: int = hw_add_helper(e, "hl_checked_rem", [126, 126], [126])
+    hw_emit_hl_alloc(e)
+    hw_emit_hl_str_concat(e, idx_alloc)
+    hw_emit_hl_int_to_str(e, idx_alloc)
+    hw_emit_hl_bool_to_str(e)
+    hw_emit_hl_float_to_str(e)
+    hw_emit_hl_str_eq(e)
+    hw_emit_hl_str_len(e)
+    hw_emit_hl_str_byte_at(e)
+    hw_emit_hl_chr_to_str(e, idx_alloc)
+    hw_emit_hl_int_abs(e)
+    hw_emit_hl_str_to_int(e)
+    hw_emit_hl_str_to_float(e)
+    hw_emit_hl_float_to_int(e)
+    hw_emit_hl_int_to_float(e)
+    hw_emit_hl_panic(e)
+    hw_emit_hl_abort(e)
+    hw_emit_hl_exit(e)
+    hw_emit_hl_checked_add(e)
+    hw_emit_hl_checked_sub(e)
+    hw_emit_hl_checked_mul(e)
+    hw_emit_hl_checked_rem(e)
+    if idx_concat + idx_int_to_str + idx_bool_to_str + idx_float_to_str
+    + idx_str_eq + idx_str_len + idx_str_byte_at + idx_chr_to_str
+    + idx_int_abs + idx_str_to_int + idx_str_to_float + idx_float_to_int
+    + idx_int_to_float + idx_panic + idx_abort + idx_exit + idx_add
+    + idx_sub + idx_mul + idx_rem < 0 {
+        panic("internal: helper indices")
+    }
+}
+
+# ---------- Stage 73: struct layouts + JS interop exports ----------
+
+# hw_struct_field_wty — the layout rule (int i64/8, float f64/8,
+# bool 4, str ptr 4, other ptr 4); returns (wty, size, align) packed.
+fn hw_struct_field_wty(ft: str) -> list[int] {
+    # [wty_code, size]: code 0=i64, 1=f64, 2=bool, 3=str, 4=ptr
+    let out: list[int] = []
+    if ft == "int" {
+        out.push(0)
+        out.push(8)
+    } else if ft == "float" {
+        out.push(1)
+        out.push(8)
+    } else if ft == "bool" {
+        out.push(2)
+        out.push(4)
+    } else if ft == "str" {
+        out.push(3)
+        out.push(4)
+    } else {
+        out.push(4)
+        out.push(4)
+    }
+    return out
+}
+
+fn hw_wty_name(code: int) -> str {
+    if code == 0 {
+        return "i64"
+    }
+    if code == 1 {
+        return "f64"
+    }
+    if code == 2 {
+        return "bool"
+    }
+    if code == 3 {
+        return "str"
+    }
+    return "ptr"
+}
+
+# hw_struct_descriptors_json — the compact-JSON layout table (structs
+# sorted by name, fields in declaration order; json.dumps separators).
+fn hw_struct_descriptors_json(e: HwEmitter) -> str {
+    let names: list[str] = sort_strs(e.ctx.structs.keys())
+    let mut out: str = "["
+    let mut wrote: int = 0
+    let mut si: int = 0
+    while si < names.len() {
+        let st: StructInfo = e.ctx.structs.get_or(names.get(si), dummy_struct())
+        si = si + 1
+        if st.typeparams.len() > 0 {
+            continue
+        }
+        # Compute the layout (offsets, sizes, alignment).
+        let mut off: int = 0
+        let mut max_align: int = 4
+        let offsets: list[int] = []
+        let wtys: list[int] = []
+        let mut fi: int = 0
+        while fi < st.fields.len() {
+            let parts: list[int] = hw_struct_field_wty(st.ftypes.get(fi))
+            let size: int = parts.get(1)
+            let align: int = size
+            off = int_and(off + align - 1, -align)
+            offsets.push(off)
+            wtys.push(parts.get(0))
+            off = off + size
+            if align > max_align {
+                max_align = align
+            }
+            fi = fi + 1
+        }
+        let size: int = int_and(off + max_align - 1, -max_align)
+        if wrote > 0 {
+            out = out + ","
+        }
+        out = out + "{\"name\":\"" + st.name + "\",\"size\":" + size.to_str()
+        + ",\"fields\":["
+        let mut fj: int = 0
+        while fj < st.fields.len() {
+            if fj > 0 {
+                out = out + ","
+            }
+            out = out + "{\"name\":\"" + st.fields.get(fj) + "\",\"type\":\""
+            + hw_wty_name(wtys.get(fj)) + "\",\"offset\":"
+            + offsets.get(fj).to_str() + "}"
+            fj = fj + 1
+        }
+        out = out + "]}"
+        wrote = wrote + 1
+    }
+    out = out + "]"
+    return out
+}
+
+# hw_struct_layout_count — how many non-generic structs exist (the .py's
+# `if self._struct_layouts:` gate).
+fn hw_struct_layout_count(e: HwEmitter) -> int {
+    let names: list[str] = e.ctx.structs.keys()
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < names.len() {
+        let st: StructInfo = e.ctx.structs.get_or(names.get(i), dummy_struct())
+        if st.typeparams.len() == 0 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+# hw_emit_stage73_helpers — hl_struct_descriptors + hl_call_halis.
+fn hw_emit_stage73_helpers(mut e: HwEmitter) -> void {
+    # --- hl_struct_descriptors ---
+    if hw_struct_layout_count(e) > 0 {
+        let json: str = hw_struct_descriptors_json(e)
+        let off: int = hw_intern_str(e, json)
+        let idx: int = hw_add_helper(e, "hl_struct_descriptors", [], [127])
+        let body: list[int] = []
+        hw_b(body, 65)
+        hw_sleb_b(body, off)
+        # final_bytes appends the closing OP_END itself.
+        hw_add_code(e.mod, [], [], hw_bytes_str(body))
+        hw_add_export(e.mod, "hl_struct_descriptors", 0, idx)
+    }
+    # --- hl_call_halis ---
+    if e.ctx.fns.has("jsffi_on_callback") {
+        let cb: FnInfo = e.ctx.fns.get_or("jsffi_on_callback", dummy_fn())
+        if !cb.is_extern {
+            let ok_sig: bool = cb.params.len() == 2
+            && cb.ptypes.get(0) == "int" && cb.ptypes.get(1) == "str"
+            && cb.ret == "str"
+            if !ok_sig {
+                hw_refuse("jsffi_on_callback must have the exact signature "
+                + "fn jsffi_on_callback(cb_id: int, arg: str) -> str "
+                + "(found a different shape)", cb.line)
+            }
+            let idx_cb: int = hw_call_idx(e, "jsffi_on_callback", cb.line)
+            let idx: int = hw_add_helper(e, "hl_call_halis", [127, 127], [127])
+            let body: list[int] = []
+            # cb_id arrives as i32; the HLS fn takes int (i64) — sign-extend.
+            hw_b(body, 32)
+            hw_uleb_b(body, 0)
+            hw_b(body, 172)
+            hw_b(body, 32)
+            hw_uleb_b(body, 1)
+            hw_b(body, 16)
+            hw_uleb_b(body, idx_cb)
+            hw_add_code(e.mod, [], [], hw_bytes_str(body))
+            hw_add_export(e.mod, "hl_call_halis", 0, idx)
+        }
+    }
+}
+
+# ---------- the _start entry point ----------
+
+fn hw_emit_start(mut e: HwEmitter) -> void {
+    let has_main: bool = e.ctx.fns.has("main")
+    && !e.ctx.fns.get_or("main", dummy_fn()).is_extern
+    let ty_idx: int = hw_add_type(e.mod, [], [])
+    let func_idx: int = hw_add_function(e.mod, ty_idx)
+    e.func_index.set("__hl_start", func_idx)
+    let body: list[int] = []
+    if has_main {
+        let main_idx: int = hw_call_idx(e, "main",
+        e.ctx.fns.get_or("main", dummy_fn()).line)
+        hw_b(body, 16)
+        hw_uleb_b(body, main_idx)
+        # Only drop when main actually returns int (deep-scan-20).
+        if e.ctx.fns.get_or("main", dummy_fn()).ret != "void" {
+            hw_b(body, 26)
+        }
+    }
+    hw_add_code(e.mod, [], [], hw_bytes_str(body))
+}
+
+# ---------- user function emission ----------
+
+# hw_collect_bindings — pre-collect every let/for binding (wasm locals
+# are declared in the function header, not inline). Parallel lists.
+fn hw_collect_bindings(e: HwEmitter, stmts: list[int], acc_n: list[str],
+acc_t: list[str]) -> void {
+    let mut i: int = 0
+    while i < stmts.len() {
+        let s: StmtN = e.ctx.stmts.get(stmts.get(i))
+        if s.kind == "let" {
+            acc_n.push(s.name)
+            acc_t.push(s.vtype)
+        } else if s.kind == "if" {
+            hw_collect_bindings(e, s.body, acc_n, acc_t)
+            if s.else_body.len() > 0 {
+                hw_collect_bindings(e, s.else_body, acc_n, acc_t)
+            }
+        } else if s.kind == "while" {
+            hw_collect_bindings(e, s.body, acc_n, acc_t)
+        } else if s.kind == "for" {
+            acc_n.push(s.name)
+            acc_t.push(s.vtype)
+            # The for-range loop's synthetic end-bound local.
+            acc_n.push(s.name + "#end")
+            acc_t.push("int")
+            hw_collect_bindings(e, s.body, acc_n, acc_t)
+        }
+        i = i + 1
+    }
+}
+
+# hw_emit_function — lower one user function (the .py's _emit_function).
+fn hw_emit_function(mut e: HwEmitter, fname: str, f: FnInfo) -> void {
+    e.cur_ret_type = f.ret
+    # Reset per-function state.
+    e.locals = map_new()
+    e.local_count = 0
+    e.loop_break = []
+    e.loop_cont = []
+    e.frames = 0
+    e.binding_pool = map_new()
+    # The signature.
+    let param_valtypes: list[int] = []
+    let mut pi: int = 0
+    while pi < f.ptypes.len() {
+        param_valtypes.push(hw_valtype(f.ptypes.get(pi)))
+        pi = pi + 1
+    }
+    let result_valtypes: list[int] = hw_result_types(f.ret)
+    let ty_idx: int = hw_add_type(e.mod, param_valtypes, result_valtypes)
+    let func_idx: int = hw_add_function(e.mod, ty_idx)
+    e.func_index.set(fname, func_idx)
+    # Bind parameters to locals 0..n-1.
+    let mut bi: int = 0
+    while bi < f.params.len() {
+        e.locals.set(f.params.get(bi), bi)
+        bi = bi + 1
+    }
+    e.local_count = f.params.len()
+    # Pre-collect let/for bindings; dedupe by (name, hls type) — the
+    # deep-scan-20 sibling-scope binding fix (same name, different type
+    # in sibling scopes must not share a local).
+    let collected_n: list[str] = []
+    let collected_t: list[str] = []
+    hw_collect_bindings(e, f.body, collected_n, collected_t)
+    let seen: map[str, bool] = map_new()
+    let lc: list[int] = []
+    let lt: list[int] = []
+    let mut ci: int = 0
+    while ci < collected_n.len() {
+        let bname: str = collected_n.get(ci)
+        let btype: str = collected_t.get(ci)
+        ci = ci + 1
+        let key: str = bname + "|" + btype
+        if seen.has(key) {
+            continue
+        }
+        seen.set(key, true)
+        let idx: int = e.local_count
+        e.local_count = e.local_count + 1
+        let vty: int = hw_valtype(btype)
+        e.binding_pool.set(key, idx)
+        lc.push(1)
+        lt.push(vty)
+        # First sighting of this NAME becomes the default mapping; the
+        # let statements re-point it as they are lowered.
+        if !e.locals.has(bname) {
+            e.locals.set(bname, idx)
+        }
+    }
+    # Lower the body.
+    let body: list[int] = []
+    let mut si: int = 0
+    while si < f.body.len() {
+        hw_lower_stmt(e, f.body.get(si), body)
+        si = si + 1
+    }
+    # Coalesce adjacent same-type locals.
+    let cc: list[int] = []
+    let ct: list[int] = []
+    let mut di: int = 0
+    while di < lc.len() {
+        if cc.len() > 0 && ct.get(ct.len() - 1) == lt.get(di) {
+            cc.set(cc.len() - 1, cc.get(cc.len() - 1) + 1)
+        } else {
+            cc.push(lc.get(di))
+            ct.push(lt.get(di))
+        }
+        di = di + 1
+    }
+    hw_add_code(e.mod, cc, ct, hw_bytes_str(body))
+}
+
+# ---------- statement lowering ----------
+
+fn hw_lower_stmt(mut e: HwEmitter, si: int, out: list[int]) -> void {
+    let s: StmtN = e.ctx.stmts.get(si)
+    if s.kind == "let" {
+        hw_lower_expr(e, s.value, out)
+        # Re-point the name mapping at THIS binding's (name, type) entry
+        # (deep-scan-20 sibling-scope fix).
+        let bkey: str = s.name + "|" + s.vtype
+        if e.binding_pool.has(bkey) {
+            e.locals.set(s.name, e.binding_pool.get_or(bkey, 0))
+        }
+        if !e.locals.has(s.name) {
+            hw_refuse("internal: unbound local '" + s.name + "'", s.line)
+        }
+        let idx: int = e.locals.get_or(s.name, 0)
+        hw_b(out, 33)
+        hw_uleb_b(out, idx)
+    } else if s.kind == "assign" {
+        hw_lower_assign(e, si, out)
+    } else if s.kind == "if" {
+        hw_lower_if(e, si, out)
+    } else if s.kind == "while" {
+        hw_lower_while(e, si, out)
+    } else if s.kind == "for" {
+        hw_lower_for(e, si, out)
+    } else if s.kind == "return" {
+        if s.value >= 0 {
+            hw_lower_expr(e, s.value, out)
+        }
+        hw_b(out, 15)
+    } else if s.kind == "break" {
+        if e.loop_break.len() == 0 {
+            hw_refuse("break outside loop", s.line)
+        }
+        # Deep-scan-20: br depth computed at the branch site from
+        # ABSOLUTE frame indices (an intervening if no longer breaks
+        # the arithmetic).
+        let break_frame: int = e.loop_break.get(e.loop_break.len() - 1)
+        hw_b(out, 12)
+        hw_uleb_b(out, e.frames - 1 - break_frame)
+    } else if s.kind == "continue" {
+        if e.loop_cont.len() == 0 {
+            hw_refuse("continue outside loop", s.line)
+        }
+        let cont_frame: int = e.loop_cont.get(e.loop_cont.len() - 1)
+        hw_b(out, 12)
+        hw_uleb_b(out, e.frames - 1 - cont_frame)
+    } else if s.kind == "expr" {
+        hw_lower_expr(e, s.e, out)
+        # Drop the produced value unless void/never (deep-scan-20: a
+        # never-typed statement leaves nothing on the stack).
+        let t: str = e.ctx.exprs.get(s.e).t
+        if t != "void" && t != "never" {
+            hw_b(out, 26)
+        }
+    } else {
+        hw_refuse("statement '" + s.kind + "' is not yet supported by "
+        + "--emit wasm (Stage 23-alpha subset)", s.line)
+    }
+}
+
+fn hw_lower_assign(mut e: HwEmitter, si: int, out: list[int]) -> void {
+    let s: StmtN = e.ctx.stmts.get(si)
+    let tk: str = e.ctx.exprs.get(s.target).kind
+    if tk == "ident" {
+        hw_lower_expr(e, s.value, out)
+        let nm: str = e.ctx.exprs.get(s.target).name
+        if !e.locals.has(nm) {
+            hw_refuse("internal: unbound local '" + nm + "'", s.line)
+        }
+        let idx: int = e.locals.get_or(nm, 0)
+        hw_b(out, 33)
+        hw_uleb_b(out, idx)
+    } else {
+        hw_refuse("assignment to '" + tk + "' is not yet supported by "
+        + "--emit wasm (Stage 23-alpha subset)", s.line)
+    }
+}
+
+fn hw_lower_if(mut e: HwEmitter, si: int, out: list[int]) -> void {
+    let s: StmtN = e.ctx.stmts.get(si)
+    hw_lower_expr(e, s.cond, out)
+    hw_b(out, 4)
+    hw_b(out, 64)
+    e.frames = e.frames + 1
+    let mut i: int = 0
+    while i < s.body.len() {
+        hw_lower_stmt(e, s.body.get(i), out)
+        i = i + 1
+    }
+    if s.else_body.len() > 0 {
+        hw_b(out, 5)
+        let mut j: int = 0
+        while j < s.else_body.len() {
+            hw_lower_stmt(e, s.else_body.get(j), out)
+            j = j + 1
+        }
+    }
+    hw_b(out, 11)
+    e.frames = e.frames - 1
+}
+
+fn hw_lower_while(mut e: HwEmitter, si: int, out: list[int]) -> void {
+    let s: StmtN = e.ctx.stmts.get(si)
+    # block { loop { cond i32.eqz br_if 1; body; br 0 } }
+    hw_b(out, 2)
+    hw_b(out, 64)
+    hw_b(out, 3)
+    hw_b(out, 64)
+    e.frames = e.frames + 2
+    let block_frame: int = e.frames - 2
+    let loop_frame: int = e.frames - 1
+    hw_lower_expr(e, s.cond, out)
+    hw_b(out, 69)
+    hw_b(out, 13)
+    hw_uleb_b(out, 1)
+    e.loop_break.push(block_frame)
+    e.loop_cont.push(loop_frame)
+    let mut i: int = 0
+    while i < s.body.len() {
+        hw_lower_stmt(e, s.body.get(i), out)
+        i = i + 1
+    }
+    e.loop_break.pop()
+    e.loop_cont.pop()
+    hw_b(out, 12)
+    hw_uleb_b(out, 0)
+    hw_b(out, 11)
+    hw_b(out, 11)
+    e.frames = e.frames - 2
+}
+
+fn hw_lower_for(mut e: HwEmitter, si: int, out: list[int]) -> void {
+    let s: StmtN = e.ctx.stmts.get(si)
+    # Only `for x: int in range(a, b)` (the Stage 23-alpha subset).
+    let iter: int = s.iter
+    let ik: str = e.ctx.exprs.get(iter).kind
+    let call_name: str = e.ctx.exprs.get(iter).name
+    let is_range: bool = ik == "call" && call_name == "range"
+    && e.ctx.exprs.get(iter).args.len() == 2
+    if !is_range {
+        let mut what: str = ik
+        if ik == "call" {
+            what = call_name
+        }
+        hw_refuse("for-over-" + what + " is not yet supported by --emit wasm "
+        + "(only `for x in range(a, b)` is supported in Stage 23-alpha; "
+        + "list/struct iteration lands with the HLIR-based emitter in "
+        + "Stage 24)", s.line)
+    }
+    let var_name: str = s.name
+    if !e.locals.has(var_name) {
+        hw_refuse("internal: for-loop variable '" + var_name
+        + "' was not pre-collected", s.line)
+    }
+    let var_idx: int = e.locals.get_or(var_name, 0)
+    let end_name: str = var_name + "#end"
+    if !e.locals.has(end_name) {
+        hw_refuse("internal: for-loop end-bound local '" + end_name
+        + "' was not pre-collected", s.line)
+    }
+    let end_idx: int = e.locals.get_or(end_name, 0)
+    # var = start; end = end_expr
+    hw_lower_expr(e, e.ctx.exprs.get(iter).args.get(0), out)
+    hw_b(out, 33)
+    hw_uleb_b(out, var_idx)
+    hw_lower_expr(e, e.ctx.exprs.get(iter).args.get(1), out)
+    hw_b(out, 33)
+    hw_uleb_b(out, end_idx)
+    # block { loop { (var >= end) br_if 1; block { body }; var++; br 0 } }
+    # (the inner block makes continue hit the increment — deep-scan-20)
+    hw_b(out, 2)
+    hw_b(out, 64)
+    hw_b(out, 3)
+    hw_b(out, 64)
+    e.frames = e.frames + 2
+    let block_frame: int = e.frames - 2
+    hw_b(out, 32)
+    hw_uleb_b(out, var_idx)
+    hw_b(out, 32)
+    hw_uleb_b(out, end_idx)
+    hw_b(out, 89)
+    hw_b(out, 13)
+    hw_uleb_b(out, 1)
+    hw_b(out, 2)
+    hw_b(out, 64)
+    e.frames = e.frames + 1
+    let cont_frame: int = e.frames - 1
+    e.loop_break.push(block_frame)
+    e.loop_cont.push(cont_frame)
+    let mut i: int = 0
+    while i < s.body.len() {
+        hw_lower_stmt(e, s.body.get(i), out)
+        i = i + 1
+    }
+    e.loop_break.pop()
+    e.loop_cont.pop()
+    hw_b(out, 11)
+    e.frames = e.frames - 1
+    hw_b(out, 32)
+    hw_uleb_b(out, var_idx)
+    hw_b(out, 66)
+    hw_sleb_b(out, 1)
+    hw_b(out, 124)
+    hw_b(out, 33)
+    hw_uleb_b(out, var_idx)
+    hw_b(out, 12)
+    hw_uleb_b(out, 0)
+    hw_b(out, 11)
+    hw_b(out, 11)
+    e.frames = e.frames - 2
+}
+
+# ---------- expression lowering ----------
+
+fn hw_lower_expr(mut e: HwEmitter, ei: int, out: list[int]) -> void {
+    let x: ExprN = e.ctx.exprs.get(ei)
+    if x.kind == "int" {
+        hw_b(out, 66)
+        hw_sleb_b(out, x.ival)
+    } else if x.kind == "float" {
+        hw_b(out, 68)
+        hw_f64_b(out, x.fval)
+    } else if x.kind == "bool" {
+        hw_b(out, 65)
+        if x.bval {
+            hw_sleb_b(out, 1)
+        } else {
+            hw_sleb_b(out, 0)
+        }
+    } else if x.kind == "str" {
+        let offset: int = hw_intern_str(e, x.sval)
+        hw_b(out, 65)
+        hw_sleb_b(out, offset)
+    } else if x.kind == "ident" {
+        if !e.locals.has(x.name) {
+            hw_refuse("internal: unbound local '" + x.name + "'", x.line)
+        }
+        let idx: int = e.locals.get_or(x.name, 0)
+        hw_b(out, 32)
+        hw_uleb_b(out, idx)
+    } else if x.kind == "bin" {
+        hw_lower_bin(e, ei, out)
+    } else if x.kind == "un" {
+        hw_lower_un(e, ei, out)
+    } else if x.kind == "call" {
+        hw_lower_call(e, ei, out)
+    } else if x.kind == "method" {
+        hw_lower_method(e, ei, out)
+    } else {
+        hw_refuse("expression '" + x.kind + "' is not yet supported by "
+        + "--emit wasm (Stage 23-alpha subset)", x.line)
+    }
+}
+
+fn hw_lower_bin(mut e: HwEmitter, ei: int, out: list[int]) -> void {
+    let x: ExprN = e.ctx.exprs.get(ei)
+    let op: str = x.op
+    # Short-circuit && / ||.
+    if op == "&&" {
+        hw_lower_expr(e, x.left, out)
+        hw_b(out, 4)
+        hw_b(out, 127)
+        e.frames = e.frames + 1
+        hw_lower_expr(e, x.right, out)
+        hw_b(out, 5)
+        hw_b(out, 65)
+        hw_sleb_b(out, 0)
+        hw_b(out, 11)
+        e.frames = e.frames - 1
+        return
+    }
+    if op == "||" {
+        hw_lower_expr(e, x.left, out)
+        hw_b(out, 4)
+        hw_b(out, 127)
+        e.frames = e.frames + 1
+        hw_b(out, 65)
+        hw_sleb_b(out, 1)
+        hw_b(out, 5)
+        hw_lower_expr(e, x.right, out)
+        hw_b(out, 11)
+        e.frames = e.frames - 1
+        return
+    }
+    let lt: str = hw_taint_inner(e.ctx.exprs.get(x.left).t)
+    let rt: str = hw_taint_inner(e.ctx.exprs.get(x.right).t)
+    # str + str -> hl_str_concat.
+    if op == "+" && lt == "str" && rt == "str" {
+        hw_lower_expr(e, x.left, out)
+        hw_lower_expr(e, x.right, out)
+        hw_b(out, 16)
+        hw_uleb_b(out, hw_call_idx(e, "hl_str_concat", x.line))
+        return
+    }
+    hw_lower_expr(e, x.left, out)
+    hw_lower_expr(e, x.right, out)
+    if op == "+" {
+        if lt == "int" {
+            hw_b(out, 16)
+            hw_uleb_b(out, hw_call_idx(e, "hl_checked_add", x.line))
+        } else if lt == "float" {
+            hw_b(out, 160)
+        } else {
+            hw_refuse("'+' on " + lt + " not supported by --emit wasm", x.line)
+        }
+    } else if op == "-" {
+        if lt == "int" {
+            hw_b(out, 16)
+            hw_uleb_b(out, hw_call_idx(e, "hl_checked_sub", x.line))
+        } else if lt == "float" {
+            hw_b(out, 161)
+        } else {
+            hw_refuse("'-' on " + lt + " not supported", x.line)
+        }
+    } else if op == "*" {
+        if lt == "int" {
+            hw_b(out, 16)
+            hw_uleb_b(out, hw_call_idx(e, "hl_checked_mul", x.line))
+        } else if lt == "float" {
+            hw_b(out, 162)
+        } else {
+            hw_refure_placeholder()
+        }
+    } else if op == "/" {
+        if lt == "int" {
+            hw_b(out, 127)
+        } else if lt == "float" {
+            hw_b(out, 163)
+        } else {
+            hw_refuse("'/' on " + lt + " not supported", x.line)
+        }
+    } else if op == "%" {
+        if lt == "int" {
+            hw_b(out, 16)
+            hw_uleb_b(out, hw_call_idx(e, "hl_checked_rem", x.line))
+        } else {
+            hw_refuse("'%' on " + lt + " not supported", x.line)
+        }
+    } else if op == "==" {
+        if lt == "int" {
+            hw_b(out, 81)
+        } else if lt == "float" {
+            hw_b(out, 97)
+        } else if lt == "bool" {
+            hw_b(out, 70)
+        } else if lt == "str" {
+            hw_b(out, 16)
+            hw_uleb_b(out, hw_call_idx(e, "hl_str_eq", x.line))
+        } else {
+            hw_refuse("'==' on " + lt + " not supported", x.line)
+        }
+    } else if op == "!=" {
+        if lt == "int" {
+            hw_b(out, 82)
+        } else if lt == "float" {
+            hw_b(out, 98)
+        } else if lt == "bool" {
+            hw_b(out, 71)
+        } else if lt == "str" {
+            hw_b(out, 16)
+            hw_uleb_b(out, hw_call_idx(e, "hl_str_eq", x.line))
+            hw_b(out, 69)
+        } else {
+            hw_refuse("'!=' on " + lt + " not supported", x.line)
+        }
+    } else if op == "<" {
+        if lt == "int" {
+            hw_b(out, 83)
+        } else if lt == "float" {
+            hw_b(out, 99)
+        } else {
+            hw_refuse("'<' on " + lt + " not supported", x.line)
+        }
+    } else if op == "<=" {
+        if lt == "int" {
+            hw_b(out, 87)
+        } else if lt == "float" {
+            hw_b(out, 100)
+        } else {
+            hw_refuse("'<=' on " + lt + " not supported", x.line)
+        }
+    } else if op == ">" {
+        if lt == "int" {
+            hw_b(out, 85)
+        } else if lt == "float" {
+            hw_b(out, 101)
+        } else {
+            hw_refuse("'>' on " + lt + " not supported", x.line)
+        }
+    } else if op == ">=" {
+        if lt == "int" {
+            hw_b(out, 89)
+        } else if lt == "float" {
+            hw_b(out, 102)
+        } else {
+            hw_refuse("'>=' on " + lt + " not supported", x.line)
+        }
+    } else {
+        hw_refuse("binary op '" + op + "' not supported by --emit wasm",
+        x.line)
+    }
+}
+
+# hw_refure_placeholder — sentinel left by the generator; never reached.
+fn hw_refure_placeholder() -> void {
+    panic("internal: '*' lowering")
+}
+
+fn hw_lower_un(mut e: HwEmitter, ei: int, out: list[int]) -> void {
+    let x: ExprN = e.ctx.exprs.get(ei)
+    let t: str = hw_taint_inner(e.ctx.exprs.get(x.left).t)
+    if x.op == "-" {
+        if t == "int" {
+            # 0 - x via the CHECKED sub (0 - INT64_MIN must halt).
+            hw_b(out, 66)
+            hw_sleb_b(out, 0)
+            hw_lower_expr(e, x.left, out)
+            hw_b(out, 16)
+            hw_uleb_b(out, hw_call_idx(e, "hl_checked_sub", x.line))
+        } else if t == "float" {
+            hw_b(out, 68)
+            hw_f64_b(out, 0.0)
+            hw_lower_expr(e, x.left, out)
+            hw_b(out, 161)
+        } else {
+            hw_refuse("unary '-' on " + t + " not supported", x.line)
+        }
+    } else if x.op == "!" {
+        hw_lower_expr(e, x.left, out)
+        hw_b(out, 69)
+    } else {
+        hw_refuse("unary op '" + x.op + "' not supported by --emit wasm",
+        x.line)
+    }
+}
+
+# hw_helper_for_builtin — the .py's _HELPER_TABLE / _JS_IMPORT_TABLE
+# entries (the wasm-defined helpers reachable as BUILTIN calls; the
+# method-call forms ride _BUILTIN_METHODS below).
+fn hw_helper_for_builtin(name: str) -> str {
+    if name == "int_to_str" {
+        return "hl_int_to_str"
+    }
+    if name == "float_to_str" {
+        return "hl_float_to_str"
+    }
+    if name == "bool_to_str" {
+        return "hl_bool_to_str"
+    }
+    if name == "str_len" {
+        return "hl_str_len"
+    }
+    if name == "str_concat" {
+        return "hl_str_concat"
+    }
+    if name == "str_eq" {
+        return "hl_str_eq"
+    }
+    if name == "str_char_at" {
+        return "hl_str_byte_at"
+    }
+    if name == "chr" {
+        return "hl_chr_to_str"
+    }
+    if name == "panic" {
+        return "hl_panic"
+    }
+    if name == "abort" {
+        return "hl_abort"
+    }
+    if name == "exit" {
+        return "hl_exit"
+    }
+    return ""
+}
+
+fn hw_lower_call(mut e: HwEmitter, ei: int, out: list[int]) -> void {
+    let x: ExprN = e.ctx.exprs.get(ei)
+    let line: int = x.line
+    if x.muser {
+        # 1. extern "js" import (extern fns are free functions; the key
+        #    is the plain name).
+        let key: str = x.mkey
+        if e.js_externs.has(key) {
+            let mut i: int = 0
+            while i < x.args.len() {
+                hw_lower_expr(e, x.args.get(i), out)
+                i = i + 1
+            }
+            hw_b(out, 16)
+            hw_uleb_b(out, hw_call_idx(e, key, line))
+            return
+        }
+        # 6. User-defined function (defined before the caller — the
+        #    .py's forward-reference refusal).
+        if !e.func_index.has(key) {
+            if !e.ctx.fns.has(key) {
+                hw_refuse("undefined function: " + x.name, line)
+            }
+            hw_refuse("forward function reference '" + x.name
+            + "' not yet supported by --emit wasm (reorder so the callee "
+            + "is defined before the caller)", line)
+        }
+        let mut j: int = 0
+        while j < x.args.len() {
+            hw_lower_expr(e, x.args.get(j), out)
+            j = j + 1
+        }
+        hw_b(out, 16)
+        hw_uleb_b(out, e.func_index.get_or(key, 0))
+        return
+    }
+    # Builtins: mkey carries the builtin name.
+    let name: str = x.mkey
+    # 2. println / print -> the JS imports.
+    if name == "println" {
+        hw_lower_expr(e, x.args.get(0), out)
+        hw_b(out, 16)
+        hw_uleb_b(out, hw_call_idx(e, "hl_js_println", line))
+        return
+    }
+    if name == "print" {
+        hw_lower_expr(e, x.args.get(0), out)
+        hw_b(out, 16)
+        hw_uleb_b(out, hw_call_idx(e, "hl_js_print", line))
+        return
+    }
+    # 4. print_int / print_float / print_bool (+ println_*) — sugar that
+    #    converts the arg to a str then prints it.
+    if name == "print_int" || name == "print_float" || name == "print_bool"
+    || name == "println_int" || name == "println_float"
+    || name == "println_bool" {
+        let arg: int = x.args.get(0)
+        let arg_t: str = hw_taint_inner(e.ctx.exprs.get(arg).t)
+        let mut helper: str = ""
+        if arg_t == "int" {
+            helper = "hl_int_to_str"
+        } else if arg_t == "float" {
+            helper = "hl_float_to_str"
+        } else if arg_t == "bool" {
+            helper = "hl_bool_to_str"
+        }
+        if helper == "" {
+            hw_refuse(name + " expects int/float/bool, got " + arg_t, line)
+        }
+        hw_lower_expr(e, arg, out)
+        hw_b(out, 16)
+        hw_uleb_b(out, hw_call_idx(e, helper, line))
+        if name.starts_with("println") {
+            hw_b(out, 16)
+            hw_uleb_b(out, hw_call_idx(e, "hl_js_println", line))
+        } else {
+            hw_b(out, 16)
+            hw_uleb_b(out, hw_call_idx(e, "hl_js_print", line))
+        }
+        return
+    }
+    # 5. range(a, b) — only valid as a for-iter expression.
+    if name == "range" {
+        hw_refuse("range() can only be used as the iter expression of a "
+        + "`for` loop in Stage 23-alpha (use `for i in range(a, b)`)", line)
+    }
+    # 3. Built-in that maps to a wasm helper.
+    let helper: str = hw_helper_for_builtin(name)
+    if helper != "" {
+        let mut i: int = 0
+        while i < x.args.len() {
+            hw_lower_expr(e, x.args.get(i), out)
+            i = i + 1
+        }
+        hw_b(out, 16)
+        hw_uleb_b(out, hw_call_idx(e, helper, line))
+        return
+    }
+    # Unknown builtin.
+    hw_refuse("builtin '" + name + "' is not yet supported by --emit wasm "
+    + "(Stage 23-alpha subset)", line)
+}
+
+# hw_method_helper — the .py's _BUILTIN_METHODS table.
+fn hw_method_helper(method_key: str) -> str {
+    if method_key == "int.to_str" {
+        return "hl_int_to_str"
+    }
+    if method_key == "int.abs" {
+        return "hl_int_abs"
+    }
+    if method_key == "int.to_float" {
+        return "hl_int_to_float"
+    }
+    if method_key == "float.to_str" {
+        return "hl_float_to_str"
+    }
+    if method_key == "float.to_int" {
+        return "hl_float_to_int"
+    }
+    if method_key == "bool.to_str" {
+        return "hl_bool_to_str"
+    }
+    if method_key == "str.len" {
+        return "hl_str_len"
+    }
+    if method_key == "str.to_int" {
+        return "hl_str_to_int"
+    }
+    if method_key == "str.to_float" {
+        return "hl_str_to_float"
+    }
+    if method_key == "str.byte_at" {
+        return "hl_str_byte_at"
+    }
+    return ""
+}
+
+fn hw_lower_method(mut e: HwEmitter, ei: int, out: list[int]) -> void {
+    let x: ExprN = e.ctx.exprs.get(ei)
+    if x.muser {
+        hw_refuse("user-defined method '" + x.name + "' is not yet supported "
+        + "by --emit wasm (Stage 23-alpha subset; only builtin methods like "
+        + ".to_str() and .len() are supported)", x.line)
+    }
+    let method_key: str = x.mop
+    let helper: str = hw_method_helper(method_key)
+    if helper == "" {
+        hw_refuse("builtin method '" + method_key + "' is not yet supported "
+        + "by --emit wasm (Stage 23-alpha subset)", x.line)
+    }
+    # The receiver, then any extra args (s.byte_at(i) — Stage 24 fix).
+    hw_lower_expr(e, x.left, out)
+    let mut i: int = 0
+    while i < x.args.len() {
+        hw_lower_expr(e, x.args.get(i), out)
+        i = i + 1
+    }
+    hw_b(out, 16)
+    hw_uleb_b(out, hw_call_idx(e, helper, x.line))
+}
+
+# ---------- emit — the module assembly (the .py's emit()) ----------
+
+fn hw_emit(mut e: HwEmitter) -> str uses Fs {
+    # Step 1: collect extern "js" decls (refuses extern "C").
+    hw_scan_externs(e)
+    # Step 2: declare the JS imports FIRST (their indices precede every
+    # defined function).
+    hw_declare_js_imports(e)
+    # Step 3: emit the runtime helpers.
+    hw_emit_runtime_helpers(e)
+    # Step 4: emit user functions in declaration order (externs are
+    # imports, not defined funcs).
+    let mut fi: int = 0
+    while fi < e.ctx.fn_order.len() {
+        let key: str = e.ctx.fn_order.get(fi)
+        let f: FnInfo = e.ctx.fns.get_or(key, dummy_fn())
+        if f.is_extern {
+            fi = fi + 1
+            continue
+        }
+        hw_emit_function(e, key, f)
+        fi = fi + 1
+    }
+    # Step 4b: the Stage 73 JS interop exports.
+    hw_emit_stage73_helpers(e)
+    # Step 5: the _start entry point.
+    hw_emit_start(e)
+    # Step 6: memory + exports.
+    hw_add_memory(e.mod, 1)
+    hw_add_export(e.mod, "memory", 2, 0)
+    hw_add_export(e.mod, "_start", 0, e.func_index.get_or("__hl_start", 0))
+    if e.func_index.has("hl_alloc") {
+        hw_add_export(e.mod, "hl_alloc", 0, e.func_index.get_or("hl_alloc", 0))
+    }
+    if e.ctx.fns.has("main")
+    && !e.ctx.fns.get_or("main", dummy_fn()).is_extern {
+        hw_add_export(e.mod, "hl_main", 0, e.func_index.get_or("main", 0))
+    }
+    # Step 7: lay out the string pool + the data section (the heap
+    # pointer at 0, initialised to the end of the pool).
+    hw_add_data(e.mod, 0, hw_i32le(e.str_pool_end))
+    let mut i: int = 0
+    while i < e.str_list.len() {
+        let s: str = e.str_list.get(i)
+        let off: int = e.str_offs.get(i)
+        let rec: str = hw_i32le(s.len()) + s
+        let padded_len: int = int_and(rec.len() + 3, -4)
+        let pad: list[int] = []
+        let mut z: int = rec.len()
+        while z < padded_len {
+            pad.push(0)
+            z = z + 1
+        }
+        hw_add_data(e.mod, off, rec + hw_bytes_str(pad))
+        i = i + 1
+    }
+    return hw_final_bytes(e.mod)
+}
+
+
+# merge_strs / sort_strs — byte-lexicographic merge sort (ported from
+# tools/hls-sign.hls: map keys() are insertion order, anything the .py
+# sorted must be sorted by the twin).
+fn merge_strs(a: list[str], b: list[str]) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    let mut j: int = 0
+    while i < a.len() && j < b.len() {
+        if !(b.get(j) < a.get(i)) {
+            out.push(a.get(i))
+            i = i + 1
+        } else {
+            out.push(b.get(j))
+            j = j + 1
+        }
+    }
+    while i < a.len() {
+        out.push(a.get(i))
+        i = i + 1
+    }
+    while j < b.len() {
+        out.push(b.get(j))
+        j = j + 1
+    }
+    return out
+}
+
+fn sort_strs(xs: list[str]) -> list[str] {
+    if xs.len() <= 1 {
+        let one: list[str] = []
+        let mut i0: int = 0
+        while i0 < xs.len() {
+            one.push(xs.get(i0))
+            i0 = i0 + 1
+        }
+        return one
+    }
+    let mid: int = xs.len() / 2
+    let left_in: list[str] = []
+    let right_in: list[str] = []
+    let mut i: int = 0
+    while i < mid {
+        left_in.push(xs.get(i))
+        i = i + 1
+    }
+    while i < xs.len() {
+        right_in.push(xs.get(i))
+        i = i + 1
+    }
+    return merge_strs(sort_strs(left_in), sort_strs(right_in))
+}
+
+# ----------------------------------------------------------------------------
+# The JS glue + HTML runner templates (the .py's JS_GLUE / JS_GLUE_COMPACT /
+# JS_GLUE_COMPACT_STUBS / HTML_RUNNER / NODE_RUNNER_TEMPLATE, byte for byte;
+# generated from the retired parts, escaped into Halis literals).
+# ----------------------------------------------------------------------------
+
+fn hw_js_glue_verbose() -> str {
+    return "// Halis wasm32-unknown-unknown glue (Stage 23, v0.42.0-alpha)\n"
+    + "// Auto-generated by tools/hlwasm.py. Do not edit by hand.\n"
+    + "//\n"
+    + "// Provides the JS imports the wasm module expects:\n"
+    + "//   env.hl_js_println(ptr)   — read {i32 len, i8 data[len]} from memory,\n"
+    + "//                               decode UTF-8, console.log it.\n"
+    + "//   env.hl_js_print(ptr)     — same, no trailing newline.\n"
+    + "//   env.hl_js_f64_to_str(f)  — convert f to a JS string, allocate space\n"
+    + "//                               in wasm memory via the exported hl_alloc,\n"
+    + "//                               write the bytes, return the pointer.\n"
+    + "//\n"
+    + "// Exports (from the wasm module):\n"
+    + "//   _start()                  — call this to run the program.\n"
+    + "//   hl_main()                 — calls main(), returns the exit code (i64).\n"
+    + "//   hl_alloc(n)               — bump-allocate n bytes in linear memory.\n"
+    + "//   memory                    — the linear memory.\n"
+    + "(function (global) {\n"
+    + "  const HALIS = global.Halis = global.Halis || {};\n"
+    + "\n"
+    + "  // Decode a UTF-8 byte sequence. `bytes` is a Uint8Array.\n"
+    + "  function utf8Decode(bytes) {\n"
+    + "    return new TextDecoder(\"utf-8\").decode(bytes);\n"
+    + "  }\n"
+    + "\n"
+    + "  // Read an HLS string from memory at `ptr`. Layout: {i32 len, i8 data[len]}.\n"
+    + "  function readHlStr(mem, ptr) {\n"
+    + "    const dv = new DataView(mem.buffer);\n"
+    + "    const len = dv.getInt32(ptr, true);  // little-endian\n"
+    + "    const bytes = new Uint8Array(mem.buffer, ptr + 4, len);\n"
+    + "    return utf8Decode(bytes);\n"
+    + "  }\n"
+    + "\n"
+    + "  // Write a JS string into wasm memory as an HLS string. Returns the pointer.\n"
+    + "  function writeHlStr(mem, allocFn, s) {\n"
+    + "    const bytes = new TextEncoder(\"utf-8\").encode(s);\n"
+    + "    const ptr = allocFn(4 + bytes.length + 3);  // +3 for alignment padding\n"
+    + "    const dv = new DataView(mem.buffer);\n"
+    + "    dv.setInt32(ptr, bytes.length, true);\n"
+    + "    const dst = new Uint8Array(mem.buffer, ptr + 4, bytes.length);\n"
+    + "    dst.set(bytes);\n"
+    + "    return ptr;\n"
+    + "  }\n"
+    + "\n"
+    + "  // Instantiate the wasm module from bytes with the Halis import set.\n"
+    + "  // Returns a Promise<{instance, module}>.\n"
+    + "  HALIS.instantiate = async function (wasmBytesOrUrl, importOverrides) {\n"
+    + "    const env = {\n"
+    + "      hl_js_println: function (ptr) {\n"
+    + "        const s = readHlStr(instance.exports.memory, ptr);\n"
+    + "        console.log(s);\n"
+    + "      },\n"
+    + "      hl_js_print: function (ptr) {\n"
+    + "        const s = readHlStr(instance.exports.memory, ptr);\n"
+    + "        // Write without a trailing newline (best effort in browsers).\n"
+    + "        if (typeof process !== \"undefined\" && process.stdout) {\n"
+    + "          process.stdout.write(s);\n"
+    + "        } else {\n"
+    + "          // Browser fallback: append to a DOM element if #halis-out exists,\n"
+    + "          // else console.log without newline (browsers don't distinguish).\n"
+    + "          const out = document.getElementById(\"halis-out\");\n"
+    + "          if (out) {\n"
+    + "            out.appendChild(document.createTextNode(s));\n"
+    + "          } else {\n"
+    + "            console.log(s);\n"
+    + "          }\n"
+    + "        }\n"
+    + "      },\n"
+    + "      hl_js_f64_to_str: function (f) {\n"
+    + "        // Format like the C runtime: %g-ish (trim trailing zeros, keep\n"
+    + "        // at least one decimal). For the alpha, use JS's default which\n"
+    + "        // matches %g closely enough for demo purposes.\n"
+    + "        let s;\n"
+    + "        if (Number.isInteger(f)) {\n"
+    + "          // Halis floats always have a fractional part in the C runtime\n"
+    + "          // (e.g. 3.0 prints as \"3\"), but for the alpha we use the JS\n"
+    + "          // default which is \"3\". For exact parity, append \".0\" when the\n"
+    + "          // value is integer-valued.\n"
+    + "          s = f.toString();\n"
+    + "          if (s.indexOf(\".\") < 0 && s.indexOf(\"e\") < 0 && s.indexOf(\"inf\") < 0\n"
+    + "              && s.indexOf(\"NaN\") < 0) {\n"
+    + "            s = s + \".0\";\n"
+    + "          }\n"
+    + "        } else {\n"
+    + "          s = f.toString();\n"
+    + "        }\n"
+    + "        return writeHlStr(instance.exports.memory, instance.exports.hl_alloc, s);\n"
+    + "      }\n"
+    + "    };\n"
+    + "    // Allow user overrides (for extern \"js\" functions declared by the program).\n"
+    + "    if (importOverrides) {\n"
+    + "      for (const k in importOverrides) env[k] = importOverrides[k];\n"
+    + "    }\n"
+    + "    let module;\n"
+    + "    if (wasmBytesOrUrl instanceof WebAssembly.Module) {\n"
+    + "      module = wasmBytesOrUrl;\n"
+    + "    } else if (typeof wasmBytesOrUrl === \"string\") {\n"
+    + "      // URL: fetch then compile.\n"
+    + "      const resp = await fetch(wasmBytesOrUrl);\n"
+    + "      const buf = await resp.arrayBuffer();\n"
+    + "      module = await WebAssembly.compile(buf);\n"
+    + "    } else if (wasmBytesOrUrl instanceof ArrayBuffer\n"
+    + "               || wasmBytesOrUrl instanceof Uint8Array) {\n"
+    + "      module = await WebAssembly.compile(wasmBytesOrUrl);\n"
+    + "    } else {\n"
+    + "      throw new Error(\"Halis.instantiate: expected bytes, ArrayBuffer, or URL\");\n"
+    + "    }\n"
+    + "    // We need the instance to be visible to the env callbacks (for memory\n"
+    + "    // access). Use a `let` and assign after instantiation.\n"
+    + "    let instance;\n"
+    + "    instance = await WebAssembly.instantiate(module, { env: env });\n"
+    + "    return { instance: instance, module: module };\n"
+    + "  };\n"
+    + "\n"
+    + "  // Convenience: load + run a .wasm file. Returns the exit code (i64).\n"
+    + "  // Pass `importOverrides` to provide extern \"js\" functions.\n"
+    + "  HALIS.run = async function (wasmBytesOrUrl, importOverrides) {\n"
+    + "    const { instance } = await HALIS.instantiate(wasmBytesOrUrl, importOverrides);\n"
+    + "    // Call hl_main() (which calls main() and returns the exit code).\n"
+    + "    // We do NOT also call _start() — that would run main() twice.\n"
+    + "    if (typeof instance.exports.hl_main === \"function\") {\n"
+    + "      return instance.exports.hl_main();\n"
+    + "    }\n"
+    + "    if (typeof instance.exports._start === \"function\") {\n"
+    + "      instance.exports._start();\n"
+    + "    }\n"
+    + "    return 0;\n"
+    + "  };\n"
+    + "})(typeof globalThis !== \"undefined\" ? globalThis : (typeof window !== \"undefined\" ? window : global));\n"
+}
+
+fn hw_js_glue_compact_base() -> str {
+    return "/* Halis wasm32 glue (Stage 73, v0.92.0-alpha) -- compact build. */\n"
+    + "(function(G){var H=G.Halis=G.Halis||{};\n"
+    + "var TD=new TextDecoder(\"utf-8\"),TE=new TextEncoder();\n"
+    + "function rs(m,p){var dv=new DataView(m.buffer);var l=dv.getInt32(p,true);\n"
+    + "return TD.decode(new Uint8Array(m.buffer,p+4,l));}\n"
+    + "function ws(m,a,s){var b=TE.encode(s);var p=a(b.length+7);var dv=new DataView(m.buffer);\n"
+    + "dv.setInt32(p,b.length,true);new Uint8Array(m.buffer,p+4,b.length).set(b);return p;}\n"
+    + "function sz(t){return t===\"i64\"||t===\"f64\"?8:t===\"i32\"||t===\"bool\"||t===\"str\"||t===\"ptr\"?4:0;}\n"
+    + "H.readStruct=function(p,n){var d=H.structs[n];if(!d)throw new Error(\"unknown struct: \"+n);\n"
+    + "var m=H._mem;if(!m)throw new Error(\"memory not ready\");var dv=new DataView(m.buffer);var o={};\n"
+    + "for(var i=0;i<d.length;i++){var f=d[i];var v=p+f.offset;\n"
+    + "if(f.type===\"i64\"){o[f.name]=dv.getBigInt64(v,true);}\n"
+    + "else if(f.type===\"i32\"){o[f.name]=dv.getInt32(v,true);}\n"
+    + "else if(f.type===\"f64\"){o[f.name]=dv.getFloat64(v,true);}\n"
+    + "else if(f.type===\"bool\"){o[f.name]=dv.getInt32(v,true)!==0;}\n"
+    + "else if(f.type===\"str\"){/* Stage 73 fix: the field holds a POINTER\n"
+    + "to {i32 len, bytes} — dereference it before reading the string\n"
+    + "(the Stage 24 version read the string AT the field address). */\n"
+    + "var fp=dv.getInt32(v,true);o[f.name]=rs(m,fp);}\n"
+    + "else if(f.type===\"ptr\"){o[f.name]=dv.getInt32(v,true);}}\n"
+    + "return o;};\n"
+    + "H.writeStruct=function(a,obj,n){var d=H.structs[n];if(!d)throw new Error(\"unknown struct: \"+n);\n"
+    + "var m=H._mem;if(!m)throw new Error(\"memory not ready\");\n"
+    + "var ms=0;for(var i=0;i<d.length;i++){ms=Math.max(ms,d[i].offset+sz(d[i].type));}\n"
+    + "var p=a(ms+7);var dv=new DataView(m.buffer);\n"
+    + "for(var i=0;i<d.length;i++){var f=d[i];var v=p+f.offset;var val=obj[f.name];\n"
+    + "if(f.type===\"i64\"){dv.setBigInt64(v,BigInt(val),true);}\n"
+    + "else if(f.type===\"i32\"){dv.setInt32(v,val|0,true);}\n"
+    + "else if(f.type===\"f64\"){dv.setFloat64(v,+val,true);}\n"
+    + "else if(f.type===\"bool\"){dv.setInt32(v,val?1:0,true);}\n"
+    + "else if(f.type===\"str\"){var sp=ws(m,a,String(val));dv.setInt32(v,sp,true);}\n"
+    + "else if(f.type===\"ptr\"){dv.setInt32(v,val|0,true);}}\n"
+    + "return p;};\n"
+    + "H.registerStruct=function(n,d){H.structs=H.structs||{};H.structs[n]=d;};\n"
+    + "H.instantiate=async function(wb,ov){var inst;var env={hl_js_println:function(p){console.log(rs(inst.exports.memory,p));},\n"
+    + "hl_js_print:function(p){var s=rs(inst.exports.memory,p);\n"
+    + "if(typeof process!==\"undefined\"&&process.stdout)process.stdout.write(s);\n"
+    + "else if(typeof document!==\"undefined\"){var o=document.getElementById(\"halis-out\");\n"
+    + "if(o)o.appendChild(document.createTextNode(s));}else console.log(s);},\n"
+    + "hl_js_f64_to_str:function(f){var s=String(f);\n"
+    + "if(s.indexOf(\".\")<0&&s.indexOf(\"e\")<0&&s.indexOf(\"i\")<0&&s.indexOf(\"N\")<0)s+=\".0\";\n"
+    + "return ws(inst.exports.memory,inst.exports.hl_alloc,s);},\n"
+    + "/* std.jsffi defaults — injected per-import by generate_js_glue(). */\n"
+    + "__EXTRA_ENV_STUBS__};\n"
+    + "if(ov)for(var k in ov)env[k]=ov[k];\n"
+    + "var mod;if(wb instanceof WebAssembly.Module)mod=wb;\n"
+    + "else if(typeof wb===\"string\"){var r=await fetch(wb);var b=await r.arrayBuffer();\n"
+    + "mod=await WebAssembly.compile(b);}\n"
+    + "else if(wb instanceof ArrayBuffer||wb instanceof Uint8Array)mod=await WebAssembly.compile(wb);\n"
+    + "else throw new Error(\"Halis.instantiate: expected bytes/URL\");\n"
+    + "inst=await WebAssembly.instantiate(mod,{env:env});H._mem=inst.exports.memory;H._inst=inst;\n"
+    + "/* Stage 73: AUTO-REGISTER struct descriptors. If the module exports\n"
+    + "hl_struct_descriptors(), every struct in the Halis program is\n"
+    + "registered for marshalling with zero manual setup — \"a Halis struct\n"
+    + "becomes a JS object\". */\n"
+    + "if(typeof inst.exports.hl_struct_descriptors===\"function\"){\n"
+    + "try{var d=JSON.parse(rs(inst.exports.memory,inst.exports.hl_struct_descriptors()));\n"
+    + "for(var di=0;di<d.length;di++)H.registerStruct(d[di].name,d[di].fields);}catch(e){}}\n"
+    + "return{instance:inst,module:mod};};\n"
+    + "H.callHalis=async function(cbId,argJson){\n"
+    + "if(!H._inst||typeof H._inst.exports.hl_call_halis!==\"function\")\n"
+    + "throw new Error(\"hl_call_halis export missing: define fn jsffi_on_callback(cb_id: int, arg: str) -> str in the Halis program\");\n"
+    + "var m=H._inst.exports.memory;\n"
+    + "var ap=ws(m,H._inst.exports.hl_alloc,String(argJson));\n"
+    + "return rs(m,H._inst.exports.hl_call_halis(cbId,ap));};\n"
+    + "H.run=async function(wb,ov){var r=await H.instantiate(wb,ov);\n"
+    + "if(typeof r.instance.exports.hl_main===\"function\")return r.instance.exports.hl_main();\n"
+    + "if(typeof r.instance.exports._start===\"function\")r.instance.exports._start();return 0;};\n"
+    + "})(typeof globalThis!==\"undefined\"?globalThis:(typeof window!==\"undefined\"?window:global));\n"
+}
+
+# hw_glue_stub_names / hw_glue_stub_bodies — the per-import default stubs
+# in the .py dict insertion order (generate_js_glue joins in THIS order).
+fn hw_glue_stub_names() -> list[str] {
+    return ["js_console_log", "js_console_warn", "js_console_error", "js_dom_set_text", "js_dom_append", "js_random", "js_random_int", "js_fetch", "js_localstorage_get", "js_localstorage_set", "js_now_ms", "js_set_timeout", "js_struct_to_json", "js_json_to_struct", "js_call_with_struct", "js_console_table", "js_console_clear", "js_console_count", "js_console_count_reset", "js_console_group", "js_console_group_end", "js_console_time", "js_console_time_end", "js_dom_set_attr", "js_dom_get_attr", "js_dom_remove", "js_dom_add_class", "js_dom_remove_class", "js_dom_toggle_class", "js_dom_set_style", "js_dom_get_value", "js_dom_set_value", "js_dom_document_title", "js_dom_set_title", "js_json_canonical", "js_json_valid", "js_url_encode", "js_url_decode", "js_fetch_with_options", "js_localstorage_remove", "js_localstorage_clear", "js_localstorage_key_count", "js_platform_name", "js_language", "js_online", "js_user_agent", "js_screen_width", "js_screen_height", "js_alert", "js_performance_now", "js_date_now_iso"]
+}
+
+fn hw_glue_stub_bodies() -> list[str] {
+    return ["function(p){console.log(rs(inst.exports.memory,p));}",
+    "function(p){console.warn(rs(inst.exports.memory,p));}",
+    "function(p){console.error(rs(inst.exports.memory,p));}",
+    "function(i,t){if(typeof document===\"undefined\")return;\nvar m=inst.exports.memory;var e=document.getElementById(rs(m,i));if(e)e.textContent=rs(m,t);}",
+    "function(i,h){if(typeof document===\"undefined\")return;\nvar m=inst.exports.memory;var e=document.getElementById(rs(m,i));if(e)e.insertAdjacentHTML(\"beforeend\",rs(m,h));}",
+    "function(){return Math.random();}",
+    "function(mx){return BigInt(Math.floor(Math.random()*Number(mx)));}",
+    "function(u){throw new Error(\"js_fetch: override via importOverrides\");}",
+    "function(k){if(typeof localStorage===\"undefined\")return 0;\nvar m=inst.exports.memory;return ws(m,inst.exports.hl_alloc,localStorage.getItem(rs(m,k))||\"\");}",
+    "function(k,v){if(typeof localStorage===\"undefined\")return;\nvar m=inst.exports.memory;localStorage.setItem(rs(m,k),rs(m,v));}",
+    "function(){return BigInt(Date.now());}",
+    "function(ms){return BigInt(0);}",
+    "function(p,n){var m=inst.exports.memory;var nm=rs(m,n);\nif(H.structs&&H.structs[nm])return ws(m,inst.exports.hl_alloc,JSON.stringify(H.readStruct(p,nm)));\nreturn ws(m,inst.exports.hl_alloc,\"{}\");}",
+    "function(j,n){var m=inst.exports.memory;var nm=rs(m,n);\nif(H.structs&&H.structs[nm])try{return H.writeStruct(inst.exports.hl_alloc,JSON.parse(rs(m,j)),nm);}catch(e){}\nreturn 0;}",
+    "function(f,p,n){return 0;}",
+    "function(m){console.table(rs(inst.exports.memory,m));}",
+    "function(){console.clear();}",
+    "function(l){var k=rs(inst.exports.memory,l);\nH._counts=H._counts||{};H._counts[k]=(H._counts[k]||0)+1;\nconsole.log(k+\": \"+H._counts[k]);return BigInt(H._counts[k]);}",
+    "function(l){var k=rs(inst.exports.memory,l);\nif(H._counts)delete H._counts[k];}",
+    "function(l){console.group(rs(inst.exports.memory,l));}",
+    "function(){console.groupEnd();}",
+    "function(l){H._timers=H._timers||{};\nH._timers[rs(inst.exports.memory,l)]=Date.now();}",
+    "function(l){var k=rs(inst.exports.memory,l);\nH._timers=H._timers||{};var t0=H._timers[k]||Date.now();delete H._timers[k];\nvar ms=Date.now()-t0;console.log(k+\": \"+ms+\"ms\");return BigInt(ms);}",
+    "function(i,n,v){if(typeof document===\"undefined\")return;\nvar m=inst.exports.memory;var e=document.getElementById(rs(m,i));\nif(e)e.setAttribute(rs(m,n),rs(m,v));}",
+    "function(i,n){var m=inst.exports.memory;\nif(typeof document===\"undefined\")return ws(m,inst.exports.hl_alloc,\"\");\nvar e=document.getElementById(rs(m,i));\nreturn ws(m,inst.exports.hl_alloc,e?String(e.getAttribute(rs(m,n))||\"\"):\"\");}",
+    "function(i){if(typeof document===\"undefined\")return;\nvar m=inst.exports.memory;var e=document.getElementById(rs(m,i));\nif(e)e.remove();}",
+    "function(i,c){if(typeof document===\"undefined\")return;\nvar m=inst.exports.memory;var e=document.getElementById(rs(m,i));\nif(e)e.classList.add(rs(m,c));}",
+    "function(i,c){if(typeof document===\"undefined\")return;\nvar m=inst.exports.memory;var e=document.getElementById(rs(m,i));\nif(e)e.classList.remove(rs(m,c));}",
+    "function(i,c){if(typeof document===\"undefined\")return false;\nvar m=inst.exports.memory;var e=document.getElementById(rs(m,i));\nif(!e)return false;return e.classList.toggle(rs(m,c));}",
+    "function(i,p,v){if(typeof document===\"undefined\")return;\nvar m=inst.exports.memory;var e=document.getElementById(rs(m,i));\nif(e)e.style.setProperty(rs(m,p),rs(m,v));}",
+    "function(i){var m=inst.exports.memory;\nif(typeof document===\"undefined\")return ws(m,inst.exports.hl_alloc,\"\");\nvar e=document.getElementById(rs(m,i));\nreturn ws(m,inst.exports.hl_alloc,e?String(e.value||\"\"):\"\");}",
+    "function(i,v){if(typeof document===\"undefined\")return;\nvar m=inst.exports.memory;var e=document.getElementById(rs(m,i));\nif(e)e.value=rs(m,v);}",
+    "function(){var m=inst.exports.memory;\nreturn ws(m,inst.exports.hl_alloc,typeof document===\"undefined\"?\"\":String(document.title||\"\"));}",
+    "function(t){if(typeof document===\"undefined\")return;\nvar m=inst.exports.memory;document.title=rs(m,t);}",
+    "function(s){var m=inst.exports.memory;\ntry{return ws(m,inst.exports.hl_alloc,JSON.stringify(JSON.parse(rs(m,s))));}\ncatch(e){return ws(m,inst.exports.hl_alloc,\"null\");}}",
+    "function(s){var m=inst.exports.memory;\ntry{JSON.parse(rs(m,s));return true;}catch(e){return false;}}",
+    "function(s){var m=inst.exports.memory;\nreturn ws(m,inst.exports.hl_alloc,encodeURIComponent(rs(m,s)));}",
+    "function(s){var m=inst.exports.memory;\ntry{return ws(m,inst.exports.hl_alloc,decodeURIComponent(rs(m,s)));}\ncatch(e){return ws(m,inst.exports.hl_alloc,\"\");}}",
+    "function(u,o){throw new Error(\"js_fetch_with_options: override via importOverrides\");}",
+    "function(k){if(typeof localStorage===\"undefined\")return;\nvar m=inst.exports.memory;localStorage.removeItem(rs(m,k));}",
+    "function(){if(typeof localStorage!==\"undefined\")localStorage.clear();}",
+    "function(){if(typeof localStorage===\"undefined\")return BigInt(0);\nreturn BigInt(localStorage.length);}",
+    "function(){var m=inst.exports.memory;\nvar n=typeof navigator!==\"undefined\"?String(navigator.platform||\"node\"):\"unknown\";\nreturn ws(m,inst.exports.hl_alloc,n);}",
+    "function(){var m=inst.exports.memory;\nvar n=typeof navigator!==\"undefined\"?String(navigator.language||\"en\"):\"en\";\nreturn ws(m,inst.exports.hl_alloc,n);}",
+    "function(){return typeof navigator!==\"undefined\"?navigator.onLine!==false:true;}",
+    "function(){var m=inst.exports.memory;\nvar n=typeof navigator!==\"undefined\"?String(navigator.userAgent||\"\"):\"node\";\nreturn ws(m,inst.exports.hl_alloc,n);}",
+    "function(){if(typeof screen===\"undefined\")return BigInt(0);\nreturn BigInt(screen.width|0);}",
+    "function(){if(typeof screen===\"undefined\")return BigInt(0);\nreturn BigInt(screen.height|0);}",
+    "function(m){if(typeof alert!==\"undefined\")alert(rs(inst.exports.memory,m));}",
+    "function(){return (typeof performance!==\"undefined\"?performance.now():Date.now());}",
+    "function(){var m=inst.exports.memory;\nreturn ws(m,inst.exports.hl_alloc,new Date().toISOString());}"]
+}
+
+
+# hw_html_runner(title, wasm_name, js_name, wasm_size) — the .py's
+# HTML_RUNNER.format(...) output (the {{ }} pairs collapse to { }, the
+# four placeholders ride @@-sentinels here).
+fn hw_html_runner(title: str, wasm_name: str, js_name: str, wasm_size: int) -> str {
+    let t: str = hw_html_runner_template()
+        let r: str = str_replace(t, "@@TITLE@@", title)
+    let r2: str = str_replace(r, "@@WASM_NAME@@", wasm_name)
+    let r3: str = str_replace(r2, "@@JS_NAME@@", js_name)
+    return str_replace(r3, "@@WASM_SIZE@@", wasm_size.to_str())
+}
+
+fn hw_html_runner_template() -> str {
+    return "<!DOCTYPE html>\n"
+    + "<html lang=\"en\">\n"
+    + "<head>\n"
+    + "<meta charset=\"utf-8\">\n"
+    + "<title>@@TITLE@@</title>\n"
+    + "<style>\n"
+    + "  body { font-family: -apple-system, system-ui, sans-serif; margin: 2rem; background: #fafafa; }\n"
+    + "  h1 { font-size: 1.2rem; font-weight: 600; }\n"
+    + "  pre { background: #1e1e1e; color: #d4d4d4; padding: 1rem; border-radius: 4px;\n"
+    + "         overflow-x: auto; font-family: \"SF Mono\", \"Menlo\", monospace; font-size: 13px;\n"
+    + "         min-height: 100px; }\n"
+    + "  .meta { color: #666; font-size: 0.85rem; margin-top: 1rem; }\n"
+    + "  button { font-size: 0.9rem; padding: 0.3rem 0.8rem; cursor: pointer; }\n"
+    + "</style>\n"
+    + "</head>\n"
+    + "<body>\n"
+    + "<h1>@@TITLE@@</h1>\n"
+    + "<p>Output of the Halis program compiled to WebAssembly (Stage 23):</p>\n"
+    + "<pre id=\"halis-out\"></pre>\n"
+    + "<div class=\"meta\">Wasm size: @@WASM_SIZE@@ bytes · <button onclick=\"location.reload()\">Reload</button></div>\n"
+    + "<script src=\"@@JS_NAME@@\"></script>\n"
+    + "<script>\n"
+    + "(async function () {\n"
+    + "  // Capture stdout into the <pre> element.\n"
+    + "  const out = document.getElementById(\"halis-out\");\n"
+    + "  const origLog = console.log;\n"
+    + "  console.log = function (...args) {\n"
+    + "    out.appendChild(document.createTextNode(args.join(\" \") + \"\\n"
+    + "\"));\n"
+    + "    origLog.apply(console, args);\n"
+    + "  };\n"
+    + "  // Deep-scan-30 fix: capture the module memory BEFORE running. The\n"
+    + "  // instantiate hook used to be installed after `await Halis.run`,\n"
+    + "  // so every print override below dereferenced `_mem` while it was\n"
+    + "  // still in its temporal dead zone (ReferenceError) — or, after the\n"
+    + "  // declaration executed, read `undefined` and rendered nothing.\n"
+    + "  // Hooking first means `_mem` is set the moment the instance exists,\n"
+    + "  // before any wasm code can call the print imports.\n"
+    + "  let _mem;\n"
+    + "  const _origInst = Halis.instantiate;\n"
+    + "  Halis.instantiate = async function (...args) {\n"
+    + "    const r = await _origInst.apply(Halis, args);\n"
+    + "    _mem = r.instance.exports.memory;\n"
+    + "    return r;\n"
+    + "  };\n"
+    + "  function readHlStrFromInstance(ptr) {\n"
+    + "    if (!_mem) return \"\";\n"
+    + "    const dv = new DataView(_mem.buffer);\n"
+    + "    const len = dv.getInt32(ptr, true);\n"
+    + "    const bytes = new Uint8Array(_mem.buffer, ptr + 4, len);\n"
+    + "    return new TextDecoder(\"utf-8\").decode(bytes);\n"
+    + "  }\n"
+    + "  // Run the program with print imports that write into the <pre>.\n"
+    + "  try {\n"
+    + "    const wasmUrl = \"@@WASM_NAME@@\";\n"
+    + "    await Halis.run(wasmUrl, {\n"
+    + "      // Override the print imports so output goes into the <pre>.\n"
+    + "      hl_js_println: function (ptr) {\n"
+    + "        const s = readHlStrFromInstance(ptr);\n"
+    + "        out.appendChild(document.createTextNode(s + \"\\n"
+    + "\"));\n"
+    + "      },\n"
+    + "      hl_js_print: function (ptr) {\n"
+    + "        const s = readHlStrFromInstance(ptr);\n"
+    + "        out.appendChild(document.createTextNode(s));\n"
+    + "      }\n"
+    + "    });\n"
+    + "  } catch (e) {\n"
+    + "    out.appendChild(document.createTextNode(\"Error: \" + e.message + \"\\n"
+    + "\"));\n"
+    + "    console.error(e);\n"
+    + "  }\n"
+    + "})();\n"
+    + "</script>\n"
+    + "</body>\n"
+    + "</html>\n"
+}
+
+# hw_node_runner(wasm_path) — the .py's NODE_RUNNER_TEMPLATE (a .cjs
+# runner: never at the mercy of a package.json module type).
+fn hw_node_runner(wasm_path: str) -> str {
+    return str_replace(hw_node_runner_template(), "@@WASM_PATH@@", wasm_path)
+}
+
+fn hw_node_runner_template() -> str {
+    return "\n"
+    + "const fs = require(\"fs\");\n"
+    + "const path = require(\"path\");\n"
+    + "const wasmBytes = fs.readFileSync(\"@@WASM_PATH@@\");\n"
+    + "// Inline the glue (the .js file is alongside the .wasm).\n"
+    + "const gluePath = \"@@WASM_PATH@@\".replace(/\\.wasm$/, \".js\");\n"
+    + "if (fs.existsSync(gluePath)) {\n"
+    + "  // Load the glue into this scope.\n"
+    + "  const src = fs.readFileSync(gluePath, \"utf-8\");\n"
+    + "  eval(src);\n"
+    + "} else {\n"
+    + "  console.error(\"glue file not found: \" + gluePath);\n"
+    + "  process.exit(1);\n"
+    + "}\n"
+    + "Halis.run(new Uint8Array(wasmBytes)).then(function (code) {\n"
+    + "  // exit code (i64) — Node's process.exit takes int32, clamp.\n"
+    + "  process.exit(Number(code) & 0x7fffffff);\n"
+    + "}).catch(function (e) {\n"
+    + "  console.error(\"Halis run failed: \" + e.message);\n"
+    + "  process.exit(1);\n"
+    + "});\n"
+}
+
+# ----------------------------------------------------------------------------
+# generate_js_glue — the compact glue with ONLY the stubs the module
+# imports (deep-scan-23 tree-shaking); imports="" keeps every stub (the
+# emscripten bridge's import section is not ours).
+# ----------------------------------------------------------------------------
+
+fn hw_generate_js_glue(verbose: bool, imports: str) -> str {
+    if verbose {
+        return hw_js_glue_verbose()
+    }
+    let names: list[str] = hw_glue_stub_names()
+    let bodies: list[str] = hw_glue_stub_bodies()
+    let parts: list[str] = []
+    let mut i: int = 0
+    while i < names.len() {
+        let nm: str = names.get(i)
+        if imports == "" || imports.find("|" + nm + "|") >= 0 {
+            parts.push(nm + ":" + bodies.get(i))
+        }
+        i = i + 1
+    }
+    let mut extra: str = join(parts, ",\n")
+    if parts.len() > 0 {
+        extra = extra + ","
+    }
+    return str_replace(hw_js_glue_compact_base(), "__EXTRA_ENV_STUBS__", extra)
+}
+
+# ----------------------------------------------------------------------------
+# The orchestrator (the .py's compile_program + _run_wasm_opt +
+# run_wasm_in_node + _start_dev_server + compile_via_emscripten).
+# ----------------------------------------------------------------------------
+
+# hw_canonical_target — the .py's canonical_target ("" = unknown).
+fn hw_canonical_target(name: str) -> str {
+    if name == "wasm32-unknown-unknown" {
+        return name
+    }
+    if name == "wasm32-unknown-emscripten" {
+        return name
+    }
+    if name == "wasm32" || name == "wasm" || name == "wasi" {
+        return "wasm32-unknown-unknown"
+    }
+    if name == "emscripten" {
+        return "wasm32-unknown-emscripten"
+    }
+    return ""
+}
+
+# hw_self_dir — the directory of this binary (sibling lookup root).
+fn hw_self_dir() -> str uses Args {
+    let argv: list[str] = args()
+    if argv.len() == 0 {
+        return ""
+    }
+    return dir_of(argv.get(0))
+}
+
+# hw_sibling(name) — a sibling binary next to this one ("" when absent).
+fn hw_sibling(name: str) -> str uses Args, Fs {
+    let d: str = hw_self_dir()
+    if d == "" {
+        return ""
+    }
+    let p: str = join_path(d, name)
+    if file_exists(p) {
+        return p
+    }
+    return ""
+}
+
+# hw_run_wasm_opt — spawn the sibling hlwasm-opt on the bytes (the .py
+# imported the module in-process; a tool ships one main, so the twin
+# spawns the binary). Prints the .py's "wasm-opt: N -> M bytes" line.
+fn hw_run_wasm_opt(wasm: str, level: str) -> str uses IO, Fs, Proc, Args, Clock {
+    let opt: str = hw_sibling("hlwasm-opt")
+    if opt == "" {
+        eprintln("warning: hlwasm_opt not found; skipping optimization")
+        return wasm
+    }
+    let mut dir: str = env_get("TMPDIR")
+    if dir == "" {
+        dir = "/tmp"
+    }
+    let base: str = dir + "/hlwasm-opt-" + clock_ms().to_str()
+    let in_path: str = base + ".in.wasm"
+    let out_path: str = in_path + ".opt.wasm"
+    write_file(in_path, wasm)
+    let argv: list[str] = [in_path, out_path, "--level", level]
+    let pid: int = proc_spawn(opt, argv, 2, 1, 1)
+    if pid < 1 {
+        eprintln("warning: hlwasm_opt not found; skipping optimization")
+        return wasm
+    }
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    # Read BEFORE the clean-up: the scratch goes away either way, the
+    # optimized bytes only when they exist (a failed opt run keeps the
+    # input — the .py's silent-skip law).
+    if !file_exists(out_path) {
+        proc_exec("rm -f '" + in_path + "'")
+        return wasm
+    }
+    let optimized: str = read_file(out_path)
+    proc_exec("rm -f '" + in_path + "' '" + out_path + "'")
+    let saved: int = wasm.len() - optimized.len()
+    if saved > 0 {
+        # "%.1f%%" — one decimal, integer math.
+        let pct10: int = saved * 1000 / wasm.len()
+        let whole: int = pct10 / 10
+        let frac: int = pct10 % 10
+        eprintln("wasm-opt: " + wasm.len().to_str() + " -> "
+        + optimized.len().to_str() + " bytes (-" + saved.to_str() + ", "
+        + whole.to_str() + "." + frac.to_str() + "%)")
+    }
+    return optimized
+}
+
+# hw_run_wasm_in_node — run the compiled wasm in Node.js (the .py's
+# runner .cjs, byte for byte). Returns the exit code.
+fn hw_run_wasm_in_node(wasm_path: str) -> int uses IO, Fs, Proc {
+    let node: str = hw_which("node")
+    if node == "" {
+        eprintln("note: --run requested but node.js is not installed; "
+        + "skipping execution.")
+        return 0
+    }
+    let runner: str = wasm_path + ".run.cjs"
+    write_file(runner, hw_node_runner(wasm_path))
+    let argv: list[str] = [runner]
+    let pid: int = proc_spawn(node, argv, 2, 1, 1)
+    if pid < 1 {
+        proc_exec("rm -f '" + runner + "'")
+        return 1
+    }
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    let code: int = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    if out != "" {
+        print(out)
+    }
+    if err != "" {
+        eprint(err)
+    }
+    proc_exec("rm -f '" + runner + "'")
+    return code
+}
+
+# hw_start_dev_server — hand the bundle to the sibling hlserve (the .py
+# execv'd tools/hlserve.py; the twin spawns the native binary with
+# inherited stdio and waits — documented divergence).
+fn hw_start_dev_server(output_base: str, port: int) -> int uses IO, Proc, Args, Fs {
+    let hlserve: str = hw_sibling("hlserve")
+    if hlserve == "" {
+        eprintln("warning: hlserve not found; cannot start dev server")
+        return 0
+    }
+    eprintln("starting dev server on port " + port.to_str() + "...")
+    let argv: list[str] = ["--port", port.to_str(),
+    "--bundle", output_base]
+    let pid: int = proc_spawn(hlserve, argv, 0, 0, 0)
+    if pid < 1 {
+        eprintln("warning: hlserve not found; cannot start dev server")
+        return 0
+    }
+    return proc_wait(pid)
+}
+
+# hw_compile_via_emscripten — the Stage 24 emcc bridge (hlc -> C ->
+# emcc -> wasm + js). Returns the compile_program rc, or -1 to fall
+# back to the freestanding backend.
+fn hw_compile_via_emscripten(input_hls: str, output_base: str,
+opt_level: str, emit_wasm: bool, emit_js: bool, run: bool,
+serve_port: int) -> int uses IO, Fs, Proc, Args {
+    let emcc: str = hw_which("emcc")
+    if emcc == "" {
+        return -1
+    }
+    let hlc: str = hw_sibling("hlc")
+    if hlc == "" {
+        return -1
+    }
+    let tmp_c: str = output_base + ".c"
+    # Step 1: HLS -> C.
+    let argv1: list[str] = [input_hls, tmp_c]
+    let pid1: int = proc_spawn(hlc, argv1, 2, 1, 1)
+    if pid1 < 1 {
+        return -1
+    }
+    let mut err1: str = ""
+    let mut chunk: str = proc_child_read(pid1, 2, 65536)
+    while chunk != "" {
+        err1 = err1 + chunk
+        chunk = proc_child_read(pid1, 2, 65536)
+    }
+    let rc1: int = proc_wait(pid1)
+    proc_child_close(pid1, 1)
+    proc_child_close(pid1, 2)
+    if rc1 != 0 {
+        eprintln("error: hlc failed (Stage 24 emscripten bridge)")
+        if err1 != "" {
+            eprint(err1)
+        }
+        return 1
+    }
+    if !file_exists(tmp_c) {
+        eprintln("error: hlc did not produce " + tmp_c)
+        return 1
+    }
+    # Step 2: emcc -> wasm + js.
+    let mut o_flag: str = "-O2"
+    if opt_level == "O1" || opt_level == "O2" || opt_level == "O3"
+    || opt_level == "Os" {
+        o_flag = "-" + opt_level
+    }
+    let js_out: str = output_base + ".js"
+    let argv2: list[str] = [o_flag, "-s", "WASM=1",
+    "-s", "ENVIRONMENT=web,node",
+    "-s", "EXPORTED_FUNCTIONS=[_main]",
+    "-s", "EXPORTED_RUNTIME_METHODS=[ccall,cwrap,UTF8ToString,stringToUTF8]",
+    "-o", js_out, tmp_c, "-lm"]
+    let pid2: int = proc_spawn(emcc, argv2, 2, 1, 1)
+    if pid2 < 1 {
+        return -1
+    }
+    let mut err2: str = ""
+    let mut chunk2: str = proc_child_read(pid2, 2, 65536)
+    while chunk2 != "" {
+        err2 = err2 + chunk2
+        chunk2 = proc_child_read(pid2, 2, 65536)
+    }
+    let rc2: int = proc_wait(pid2)
+    proc_child_close(pid2, 1)
+    proc_child_close(pid2, 2)
+    if rc2 != 0 {
+        eprintln("error: emcc failed (Stage 24 emscripten bridge)")
+        let shown: str = err2
+        if shown.len() > 500 {
+            eprint(shown.slice(0, 500))
+        } else {
+            eprint(shown)
+        }
+        return 1
+    }
+    let wasm_path: str = output_base + ".wasm"
+    if !file_exists(wasm_path) {
+        # emcc may emit a differently-named .wasm alongside the js.
+        # (directory listing through a captured ls child; proc_exec
+        # returns only the exit code)
+        let dir: str = dir_of(js_out)
+        let lpid: int = proc_spawn("ls", [dir], 2, 1, 1)
+        let mut listing: str = ""
+        if lpid >= 1 {
+            let mut lchunk: str = proc_child_read(lpid, 1, 65536)
+            while lchunk != "" {
+                listing = listing + lchunk
+                lchunk = proc_child_read(lpid, 1, 65536)
+            }
+            proc_wait(lpid)
+            proc_child_close(lpid, 1)
+            proc_child_close(lpid, 2)
+        }
+        let lines: list[str] = listing.split("\n")
+        let mut li: int = 0
+        while li < lines.len() {
+            if lines.get(li).ends_with(".wasm") {
+                proc_exec("cp '" + join_path(dir, lines.get(li)) + "' '"
+                + wasm_path + "'")
+            }
+            li = li + 1
+        }
+    }
+    let wasm_bytes: str = read_file(wasm_path)
+    eprintln("Stage 24 emscripten bridge: emcc produced " + js_out + " ("
+    + wasm_bytes.len().to_str() + " bytes)")
+    if emit_wasm {
+        write_file(output_base + ".wasm", wasm_bytes)
+    }
+    if emit_js {
+        write_file(output_base + ".halis-glue.js", hw_generate_js_glue(false, ""))
+    }
+    if run {
+        let rc: int = hw_run_wasm_in_node(output_base + ".wasm")
+        if rc != 0 {
+            return rc
+        }
+    }
+    if serve_port > 0 {
+        return hw_start_dev_server(output_base, serve_port)
+    }
+    return 0
+}
+
+# hw_basename / hw_base_of — the .py's os.path.basename.
+fn hw_basename(p: str) -> str {
+    let mut i: int = p.len() - 1
+    while i >= 0 {
+        if p.byte_at(i) == 47 {
+            return p.slice(i + 1, p.len())
+        }
+        i = i - 1
+    }
+    return p
+}
+
+# hw_compile_program — the .py's compile_program: load + check + emit +
+# wasm-opt + write .wasm/.js/.html + optional run/serve. Runs INSIDE the
+# probe child (refusals panic; the parent maps them to clean errors).
+fn hw_compile_program(input_hls: str, output_base: str, target: str,
+emit_wasm: bool, emit_js: bool, emit_html: bool, run: bool,
+wasm_opt: str, opt_level: str, glue_style: str,
+serve_port: int) -> int uses IO, Fs, Proc, Args, Exit, Clock {
+    let canon: str = hw_canonical_target(target)
+    if canon == "" {
+        eprintln("error: unknown target '" + target + "'. Use --list-targets.")
+        return 2
+    }
+    if canon == "wasm32-unknown-emscripten" {
+        let bridged: int = hw_compile_via_emscripten(input_hls, output_base,
+        opt_level, emit_wasm, emit_js, run, serve_port)
+        if bridged >= 0 {
+            return bridged
+        }
+        eprintln("note: emcc not found; wasm32-unknown-emscripten falls back "
+        + "to the freestanding backend (install emscripten for full libc "
+        + "access).")
+    }
+    # Load + check the program on the REAL front-end, then emit.
+    let ctx: Ctx = hl_load_crate(input_hls)
+    hl_check(ctx)
+    let em: HwEmitter = hw_emit_new(ctx, input_hls)
+    let mut wasm: str = hw_emit(em)
+    # Stage 24: run wasm-opt if requested.
+    if wasm_opt != "off" {
+        wasm = hw_run_wasm_opt(wasm, opt_level)
+    }
+    # Write outputs (the parent dir may not exist yet).
+    let outdir: str = dir_of(output_base)
+    if outdir != "" && outdir != "." {
+        proc_exec("mkdir -p '" + outdir + "'")
+    }
+    if emit_wasm {
+        let wasm_path: str = output_base + ".wasm"
+        write_file(wasm_path, wasm)
+        eprintln("wrote " + wasm_path + " (" + wasm.len().to_str()
+        + " bytes)")
+    }
+    if emit_js {
+        let js_path: str = output_base + ".js"
+        # The compact glue re-injects only the stubs the module imports
+        # (deep-scan-23 tree-shaking); |name| framing avoids substring
+        # collisions between stub names.
+        let imp_names: list[str] = em.mod.imp_name
+        let mut wanted: str = "|"
+        let mut ii: int = 0
+        while ii < imp_names.len() {
+            wanted = wanted + imp_names.get(ii) + "|"
+            ii = ii + 1
+        }
+        write_file(js_path, hw_generate_js_glue(glue_style == "verbose",
+        wanted))
+        eprintln("wrote " + js_path + " ("
+        + hw_file_size(js_path).to_str() + " bytes)")
+    }
+    if emit_html {
+        let html_path: str = output_base + ".html"
+        write_file(html_path, hw_html_runner("Halis: "
+        + hw_basename(input_hls), hw_basename(output_base) + ".wasm",
+        hw_basename(output_base) + ".js", wasm.len()))
+        eprintln("wrote " + html_path)
+    }
+    # Optionally run.
+    if run {
+        let rc: int = hw_run_wasm_in_node(output_base + ".wasm")
+        if rc != 0 {
+            return rc
+        }
+    }
+    if serve_port > 0 {
+        return hw_start_dev_server(output_base, serve_port)
+    }
+    return 0
+}
+
+# hw_file_size — the size of a file (0 when absent; the fs_size builtin
+# rounds through the Fs effect).
+fn hw_file_size(path: str) -> int uses Fs {
+    if !file_exists(path) {
+        return 0
+    }
+    return fs_size(path)
+}
+
+# HwCfg — the parsed command line (argparse's Namespace).
+struct HwCfg {
+    input: str,
+    output_base: str,
+    target: str,
+    emit_wasm: bool,
+    emit_js: bool,
+    emit_html: bool,
+    run: bool,
+    list_targets: bool,
+    wasm_opt: str,
+    opt_level: str,
+    glue_style: str,
+    serve_port: int
+}
+
+fn hw_cfg_new() -> HwCfg {
+    return HwCfg {
+        input: "", output_base: "",
+        target: "wasm32-unknown-unknown",
+        emit_wasm: true, emit_js: true, emit_html: true,
+        run: false, list_targets: false,
+        wasm_opt: "auto", opt_level: "O3", glue_style: "compact",
+        serve_port: -1
+    }
+}
+
+# hw_parse(argv) — the .py's argparse surface: [input] [output_base]
+# positionals, --flag value AND --flag=value forms, choices enforced.
+# Returns (mode, detail): "cfg" ok; "help"; "unknown FLAG"; "noval FLAG";
+# "badchoice FLAG VAL"; "nofile" (input/output_base missing).
+fn hw_parse(argv: list[str], mut cfg: HwCfg) -> list[str] {
+    let mut i: int = 1
+    while i < argv.len() {
+        let a: str = argv.get(i)
+        if a == "-h" || a == "--help" {
+            return["help", ""]
+        }
+        if a == "--list-targets" {
+            cfg.list_targets = true
+            i = i + 1
+            continue
+        }
+        if a == "--no-wasm" {
+            cfg.emit_wasm = false
+            i = i + 1
+            continue
+        }
+        if a == "--no-js" {
+            cfg.emit_js = false
+            i = i + 1
+            continue
+        }
+        if a == "--no-html" {
+            cfg.emit_html = false
+            i = i + 1
+            continue
+        }
+        if a == "--run" {
+            cfg.run = true
+            i = i + 1
+            continue
+        }
+        # Value options: --opt VALUE or --opt=VALUE.
+        let mut val: str = ""
+        let mut have_val: bool = false
+        let mut opt: str = a
+        let eq: int = a.find("=")
+        if eq >= 0 && a.starts_with("--") {
+            opt = a.slice(0, eq)
+            val = a.slice(eq + 1, a.len())
+            have_val = true
+        }
+        if opt == "--target" || opt == "--wasm-opt" || opt == "--opt-level"
+        || opt == "--glue" || opt == "--serve" {
+            if !have_val {
+                if i + 1 >= argv.len() {
+                    return["noval", opt]
+                }
+                val = argv.get(i + 1)
+                i = i + 1
+            }
+            if opt == "--target" {
+                cfg.target = val
+            } else if opt == "--wasm-opt" {
+                if val != "auto" && val != "on" && val != "off" {
+                    return["badchoice", "--wasm-opt '" + val + "'"]
+                }
+                cfg.wasm_opt = val
+            } else if opt == "--opt-level" {
+                if val != "O1" && val != "O2" && val != "O3" && val != "Os" {
+                    return["badchoice", "--opt-level '" + val + "'"]
+                }
+                cfg.opt_level = val
+            } else if opt == "--glue" {
+                if val != "compact" && val != "verbose" {
+                    return["badchoice", "--glue '" + val + "'"]
+                }
+                cfg.glue_style = val
+            } else {
+                let port: int = val.to_int()
+                if port <= 0 {
+                    return["badchoice", "--serve '" + val + "'"]
+                }
+                cfg.serve_port = port
+            }
+            i = i + 1
+            continue
+        }
+        if a.starts_with("--") {
+            return["unknown", a]
+        }
+        if cfg.input == "" {
+            cfg.input = a
+        } else if cfg.output_base == "" {
+            cfg.output_base = a
+        } else {
+            return["unknown", a]
+        }
+        i = i + 1
+    }
+    if cfg.input == "" || cfg.output_base == "" {
+        if !cfg.list_targets {
+            return["nofile", ""]
+        }
+    }
+    return["cfg", ""]
+}
+
+# hw_cli(argv) — the parent: usage gates, --list-targets, and the compile
+# in a probe child (a program that does not parse/check/lower surfaces as
+# the .py's clean "compile error: ..." line, exit 1, never a raw panic).
+fn hw_cli(argv: list[str]) -> int uses IO, Fs, Proc, Args, Exit, Clock {
+    let cfg: HwCfg = hw_cfg_new()
+    let pa: list[str] = hw_parse(argv, cfg)
+    let mode: str = pa.get(0)
+    if mode == "help" {
+        println(hw_usage_text())
+        return 0
+    }
+    if mode == "unknown" {
+        eprintln("hlwasm: error: unrecognized arguments: " + pa.get(1))
+        return 2
+    }
+    if mode == "noval" {
+        eprintln("hlwasm: error: argument " + pa.get(1)
+        + ": expected one argument")
+        return 2
+    }
+    if mode == "badchoice" {
+        eprintln("hlwasm: error: argument " + pa.get(1)
+        + ": invalid choice (see --help)")
+        return 2
+    }
+    if mode == "nofile" {
+        eprintln(hw_usage_text())
+        eprintln("hlwasm: error: input and output_base are required "
+        + "(or use --list-targets)")
+        return 2
+    }
+    if cfg.list_targets {
+        return hw_cmd_list_targets()
+    }
+    let mut selfp: str = ""
+    if argv.len() > 0 {
+        selfp = argv.get(0)
+    }
+    if selfp == "" {
+        eprintln("error: cannot re-exec the tool for the compile")
+        return 1
+    }
+    let child_argv: list[str] = ["--hw-child", cfg.input,
+    cfg.output_base, "--target", cfg.target, "--wasm-opt", cfg.wasm_opt,
+    "--opt-level", cfg.opt_level, "--glue", cfg.glue_style]
+    if !cfg.emit_wasm {
+        child_argv.push("--no-wasm")
+    }
+    if !cfg.emit_js {
+        child_argv.push("--no-js")
+    }
+    if !cfg.emit_html {
+        child_argv.push("--no-html")
+    }
+    if cfg.run {
+        child_argv.push("--run")
+    }
+    if cfg.serve_port > 0 {
+        child_argv.push("--serve")
+        child_argv.push(cfg.serve_port.to_str())
+    }
+    let pid: int = proc_spawn(selfp, child_argv, 2, 1, 1)
+    if pid < 1 {
+        eprintln("error: cannot re-exec the tool for the compile")
+        return 1
+    }
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    let code: int = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    if out != "" {
+        print(out)
+    }
+    if err != "" {
+        eprint(err)
+    }
+    if code == 0 {
+        return 0
+    }
+    if code == 101 {
+        # A refusal / front-end diagnostic: the .py's HLError channel
+        # ("compile error: <msg> (line N)", exit 1).
+        let mut why: str = err.trim()
+        if why.starts_with("panic: ") {
+            why = why.slice(7, why.len())
+        }
+        let nl: int = why.find("\n")
+        if nl > 0 {
+            why = why.slice(0, nl)
+        }
+        eprintln("compile error: " + why)
+        return 1
+    }
+    return code
+}
+
+# hw_cli_child(argv) — the probe child: the real compile (the .py's
+# compile_program, panics allowed — the parent maps 101 to a clean error).
+fn hw_cli_child(argv: list[str]) -> int uses IO, Fs, Proc, Args, Exit, Clock {
+    let cfg: HwCfg = hw_cfg_new()
+    let pa: list[str] = hw_parse(argv, cfg)
+    if pa.get(0) != "cfg" {
+        eprintln("error: bad probe child invocation")
+        return 2
+    }
+    return hw_compile_program(cfg.input, cfg.output_base, cfg.target,
+    cfg.emit_wasm, cfg.emit_js, cfg.emit_html, cfg.run, cfg.wasm_opt,
+    cfg.opt_level, cfg.glue_style, cfg.serve_port)
+}
+
+# hw_cmd_list_targets — the .py's cmd_list_targets, bytes verbatim
+# (the emcc line reflects the binary probe).
+fn hw_cmd_list_targets() -> int uses IO, Proc {
+    println("Supported WebAssembly targets (Stage 24):")
+    println("")
+    println("  wasm32-unknown-unknown")
+    println("      Freestanding wasm32 (no libc; JS imports)")
+    println("  wasm32-unknown-emscripten")
+    println("      Emscripten libc (uses emcc if available; falls back to freestanding)")
+    println("")
+    println("Aliases (accepted by --target):")
+    println("  wasm32          -> wasm32-unknown-unknown")
+    println("  wasm            -> wasm32-unknown-unknown")
+    println("  wasi            -> wasm32-unknown-unknown")
+    println("  emscripten      -> wasm32-unknown-emscripten")
+    println("")
+    if hw_which("emcc") != "" {
+        println("emcc found at: " + hw_which("emcc"))
+        println("  (full emscripten libc access is available for "
+        + "wasm32-unknown-emscripten)")
+    } else {
+        println("emcc: not found (wasm32-unknown-emscripten falls back to "
+        + "the freestanding backend)")
+    }
+    return 0
+}
+
+# hw_capture(program, args) — spawn with stdout piped, drain, wait;
+# the one-shot stdout as a string ("" when the spawn fails). proc_exec
+# returns only the exit code, so every output read goes through a child.
+fn hw_capture(program: str, args: list[str]) -> str uses Proc {
+    let pid: int = proc_spawn(program, args, 2, 1, 2)
+    if pid < 1 {
+        return ""
+    }
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    proc_wait(pid)
+    proc_child_close(pid, 1)
+    return out
+}
+
+# hw_shell_quote(s) — neutralise single quotes for sh -c one-liners.
+fn hw_shell_quote(s: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < s.len() {
+        if s.byte_at(i) == 39 {
+            out = out + "'\\''"
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# hw_which(name) — the first PATH hit ("" when absent). `command -v`
+# is a shell builtin, so the probe rides sh -c (the harness's own
+# which() law) with the name neutralised for quotes.
+fn hw_which(name: str) -> str uses Proc {
+    let safe: str = hw_shell_quote(name)
+    let t: str = hw_capture("sh", ["-c", "command -v '" + safe + "'"]).trim()
+    if t == "" || t.find("/") < 0 {
+        return ""
+    }
+    return t
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit, Clock {
+    let argv: list[str] = args()
+    # The probe child re-exec: everything after --hw-child is the real
+    # compile (panics allowed — the parent maps them to clean errors).
+    if argv.len() > 1 && argv.get(1) == "--hw-child" {
+        let rest: list[str] = [argv.get(0)]
+        let mut i: int = 2
+        while i < argv.len() {
+            rest.push(argv.get(i))
+            i = i + 1
+        }
+        return hw_cli_child(rest)
+    }
+    return hw_cli(argv)
+}
