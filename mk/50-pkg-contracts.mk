@@ -560,7 +560,7 @@ sandbox-selftest:
 # definition, the assembler, the policy, the derivation, the
 # enforcement — the kernel half, Linux + seccomp + cc, the shim,
 # the statement + ledger, the demos, the tools).
-sandbox-acceptance: $(BIN)/acc-sandbox
+sandbox-acceptance: $(BIN)/acc-sandbox $(BIN)/hls-sandbox $(BIN)/hls-pkg $(BIN)/hlc
 	@echo "[Stage 110 acceptance] running tests/acc/sandbox_acceptance.hls..."
 	@$(BIN)/acc-sandbox
 
@@ -607,6 +607,6 @@ auditlog-selftest:
 # refusals, the launcher, the checkpoint verdicts, the ledgers, the
 # demos, the tools). Tool-only — no solver, no kernel half needed;
 # the native half of the demo parity runs when bin/hlc exists.
-auditlog-acceptance: $(BIN)/acc-auditlog $(BIN)/hls-pkg $(BIN)/hls-sign
+auditlog-acceptance: $(BIN)/acc-auditlog $(BIN)/hls-pkg $(BIN)/hls-sign $(BIN)/hls-sandbox
 	@echo "[Stage 112 acceptance] running tests/acc/auditlog_acceptance.hls..."
 	@$(BIN)/acc-auditlog
