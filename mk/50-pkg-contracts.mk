@@ -607,6 +607,6 @@ auditlog-selftest:
 # refusals, the launcher, the checkpoint verdicts, the ledgers, the
 # demos, the tools). Tool-only — no solver, no kernel half needed;
 # the native half of the demo parity runs when bin/hlc exists.
-auditlog-acceptance: $(BIN)/acc-auditlog $(BIN)/hls-pkg $(BIN)/hls-sign $(BIN)/hls-sandbox
+auditlog-acceptance: $(BIN)/acc-auditlog $(BIN)/hls-auditlog $(BIN)/hls-pkg $(BIN)/hls-sign $(BIN)/hls-sandbox
 	@echo "[Stage 112 acceptance] running tests/acc/auditlog_acceptance.hls..."
 	@$(BIN)/acc-auditlog
