@@ -179,10 +179,11 @@ $(BIN)/ll_validate: tools/ll_validate.hls $(wildcard std/*.hls) $(wildcard core/
 # provisions its whole fleet -- rc=127 legs are missing deps, and a
 # gate must never depend on what an earlier job happened to leave in
 # bin/.
-$(BIN)/acc-suite_02_differential: $(BIN)/ll_validate $(BIN)/hls-sbom $(BIN)/hls-repro $(BIN)/hlboot
+$(BIN)/acc-suite_02_differential: $(BIN)/ll_validate $(BIN)/hls-sbom $(BIN)/hls-repro $(BIN)/hlboot $(BIN)/hls-audit $(BIN)/hls-sign $(BIN)/hls-bench-stdlib
 $(BIN)/acc-suite_03_selfhost: $(BIN)/hlpgo $(BIN)/hlcov $(BIN)/hltest $(BIN)/hlboot $(BIN)/hls-fuzz
-$(BIN)/acc-suite_05_backends: $(BIN)/hlaarch64
-$(BIN)/acc-suite_06_advanced: $(BIN)/hlriscv
+$(BIN)/acc-suite_05_backends: $(BIN)/hlaarch64 $(BIN)/hlcross
+$(BIN)/acc-suite_06_advanced: $(BIN)/hlriscv $(BIN)/hlcross
+$(BIN)/acc-suite_08_osdev: $(BIN)/hlcross
 
 # hltest -- the in-language test runner, in Halis (the native twin of
 # the Python hltest that retired; same CLI, same report, same snapshot
