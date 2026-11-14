@@ -9794,7 +9794,9 @@ Roadmap Stage 140 is one phrase: "Independent security audit
 (third-party, paid)". A promise about the future is prose, and
 prose rots — so Phase IX closes by turning the promise into a
 LEDGER, exactly as Stage 135 turned the guarantees into one. The
-new `tools/hls-auditkit.py` runs the whole engagement as a
+kit — `tools/hls-auditkit.hls`, built as `bin/hls-auditkit`, the
+native twin of the Python tool that retired — runs the whole
+engagement as a
 hash-chained, append-only record (`.hlaudit/engagement.jsonl`,
 machine-local like every ledger in this tree) where every fact of
 the audit is an entry somebody signed, and the lifecycle is seven

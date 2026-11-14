@@ -285,6 +285,19 @@ $(BIN)/hls-pkg: tools/hls-pkg.hls tools/hlfront.hls src/hlc.hls $(wildcard src/h
 
 # hls-freeze -- in Halis (the native twin of the Python hls-freeze.py that
 # retired; same CLI, same wire, same exits).
+# hls-auditkit -- in Halis (the native twin of the Python hls-auditkit.py that
+# retired: same seven commands, same chain arithmetic, same refusals, same
+# renders). The scope rides the tree's own tools/hls-guarantee.hls through
+# bin/hlboot -- the way the .py era imported the module. Same prerequisites
+# discipline as the other tools: the tool's sources + the compiler it links
+# + std + core, never $(SNAP).
+$(BIN)/hls-auditkit: tools/hls-auditkit.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hls-auditkit] hlc compiles the tool (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hls-auditkit.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
 $(BIN)/hls-freeze: tools/hls-freeze.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
 	@mkdir -p $(BIN)
 	@echo "[hls-freeze] hlc compiles the tool (self-hosted, no python)..."
@@ -1470,16 +1483,16 @@ size-acceptance: $(BIN)/acc-size bin/hlc
 # the negative space (off-roster filings, no-reproducer findings,
 # reasons-less triages, broken chains, tampered ledgers, the dirty
 # window, the scope that moved).
-auditkit-brief:
-	@$(PYTHON) tools/hls-auditkit.py brief --out AUDITBRIEF.md
+auditkit-brief: $(BIN)/hls-auditkit
+	@$(BIN)/hls-auditkit brief --out AUDITBRIEF.md
 
-auditkit-evidence:
-	@$(PYTHON) tools/hls-auditkit.py evidence
+auditkit-evidence: $(BIN)/hls-auditkit
+	@$(BIN)/hls-auditkit evidence
 
-auditkit-report:
-	@$(PYTHON) tools/hls-auditkit.py report --out AUDITREPORT.md
+auditkit-report: $(BIN)/hls-auditkit
+	@$(BIN)/hls-auditkit report --out AUDITREPORT.md
 
-auditkit-acceptance: $(BIN)/acc-auditkit bin/hlc
+auditkit-acceptance: $(BIN)/acc-auditkit $(BIN)/hls-auditkit $(BIN)/hls-guarantee bin/hlc bin/hlboot
 	@echo "[Stage 140 acceptance] running tests/acc/auditkit_acceptance.hls..."
 	@$(BIN)/acc-auditkit
 	@echo "ACCEPTANCE OK: Stage 140 -- independent security audit (third-party, paid)"

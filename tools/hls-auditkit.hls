@@ -11,9 +11,12 @@
 # enforced at write time:
 #
 #   1. the SCOPE is derived LIVE from the Stage 135 guarantee ledger
-#      (bin/hls-guarantee verify --json / list --json, spawned — the
-#      .py imported the module; the spawn reads the same engine at
-#      run time, never copied, never re-derived);
+#      (the tree's own tools/hls-guarantee.hls, evaluated by the
+#      bootstrap's evaluator: `bin/hlboot <tree>/tools/
+#      hls-guarantee.hls dump` / `... verify --json --root <tree>` —
+#      the .py imported the module; the spawn reads the same source at
+#      run time, never copied, never re-derived, a foreign tree's own
+#      ledger the way the import once loaded it);
 #   2. the CHAIN is the family's one arithmetic (sha256 over prev +
 #      canonical-json(record minus chain_hash)), folded here verbatim
 #      from hltlog's law — every reader verifies the whole chain
@@ -33,6 +36,9 @@ import "std.result"
 import "std.sha256"
 import "std.fs"
 import "std.process"
+import "std.env"
+import "std.option"
+import "std.time"
 
 # ----------------------------------------------------------------------------
 # Constants.
@@ -66,13 +72,135 @@ fn ak_finding_width() -> int {
     return 3
 }
 
-# ----------------------------------------------------------------------------
-# Small helpers (json value building, paths, shell).
-# ----------------------------------------------------------------------------
-
-fn sh(cmd: str) -> int uses Proc {
-    return proc_exec(cmd)
+# The closed vocabularies. The audit severity vocabulary is wider than
+# the bounty's three (Stage 135 ranks critical/high/medium for what a
+# VIOLATION means): auditors also file low and info rows — hardening
+# notes that carry no bounty but belong in a paid report.
+fn ak_severities() -> list[str] {
+    let xs: list[str] = []
+    xs.push("critical")
+    xs.push("high")
+    xs.push("medium")
+    xs.push("low")
+    xs.push("info")
+    return xs
 }
+
+fn ak_severity_rank(s: str) -> int {
+    if s == "critical" {
+        return 0
+    }
+    if s == "high" {
+        return 1
+    }
+    if s == "medium" {
+        return 2
+    }
+    if s == "low" {
+        return 3
+    }
+    return 4
+}
+
+fn ak_severity_meaning(s: str) -> str {
+    if s == "critical" {
+        return "a soundness boundary is bypassable in practice, or the "
+        + "two implementations diverge on an accepted program"
+    }
+    if s == "high" {
+        return "a security boundary (matching, capability, sandbox, "
+        + "constant-time, taint, FFI honesty) is bypassed with a "
+        + "reproducer the toolchain accepts"
+    }
+    if s == "medium" {
+        return "a documented guarantee does not hold as written, but no "
+        + "exploit path is demonstrated"
+    }
+    if s == "low" {
+        return "hardening: the guarantee holds, the margin around it is "
+        + "thinner than the ledger claims"
+    }
+    return "an observation the auditors want on record that maps onto "
+    + "no guarantee row"
+}
+
+fn ak_triage_verdicts() -> list[str] {
+    let xs: list[str] = []
+    xs.push("accepted")
+    xs.push("disputed")
+    xs.push("out-of-scope")
+    return xs
+}
+
+fn ak_verdict_meaning(v: str) -> str {
+    if v == "accepted" {
+        return "the finding stands; the remediation commit is recorded "
+        + "on the triage itself"
+    }
+    if v == "disputed" {
+        return "the finding stands as filed but the project contests "
+        + "it — with a written reason"
+    }
+    return "the finding falls outside the contract it was filed "
+    + "against — with a written reason"
+}
+
+# The lifecycle, ordered. Derived from the census on every render;
+# never stored, never asserted by a writer.
+fn ak_state_meaning(s: str) -> str {
+    if s == "vacant" {
+        return "no ledger at all — nothing has happened"
+    }
+    if s == "open" {
+        return "the contract is on record; no evidence pass has run"
+    }
+    if s == "underway" {
+        return "at least one evidence pass is on record; no finding filed"
+    }
+    if s == "reported" {
+        return "the auditors have spoken — at least one finding is on "
+        + "record, not yet fully triaged"
+    }
+    if s == "responded" {
+        return "every finding carries its one triage"
+    }
+    return "every finding is triaged and every acceptance carries its "
+    + "remediation commit"
+}
+
+fn ak_roles() -> list[str] {
+    let xs: list[str] = []
+    xs.push("auditor")
+    xs.push("project")
+    return xs
+}
+
+fn ak_kinds() -> list[str] {
+    let xs: list[str] = []
+    xs.push("engagement")
+    xs.push("evidence")
+    xs.push("finding")
+    xs.push("triage")
+    return xs
+}
+
+fn ak_repro_modes() -> list[str] {
+    let xs: list[str] = []
+    xs.push("path")
+    xs.push("text")
+    return xs
+}
+
+fn ak_pass_outcomes() -> list[str] {
+    let xs: list[str] = []
+    xs.push("ok")
+    xs.push("failed")
+    return xs
+}
+
+# ----------------------------------------------------------------------------
+# Small helpers (paths, strings, shell).
+# ----------------------------------------------------------------------------
 
 fn ak_dirname(path: str) -> str {
     let mut i: int = path.len() - 1
@@ -98,6 +226,23 @@ fn ak_join(dir: str, name: str) -> str {
     return dir + "/" + name
 }
 
+# ak_relpath(path, root) — the path under root as root-relative, the
+# path outside root verbatim (os.path.relpath for the only shapes the
+# kit's documents name).
+fn ak_relpath(path: str, root: str) -> str {
+    if root == "" || root == "." {
+        if path.starts_with("./") {
+            return path.slice(2, path.len())
+        }
+        return path
+    }
+    let pref: str = root + "/"
+    if path.starts_with(pref) {
+        return path.slice(pref.len(), path.len())
+    }
+    return path
+}
+
 fn ak_is_hex(s: str, n: int) -> bool {
     if s.len() != n {
         return false
@@ -121,6 +266,20 @@ fn ak_is_hex40(s: str) -> bool {
     return ak_is_hex(s, 40)
 }
 
+fn ak_is_digits(s: str) -> bool {
+    if s.len() == 0 {
+        return false
+    }
+    let mut i: int = 0
+    while i < s.len() {
+        if s.byte_at(i) < 48 || s.byte_at(i) > 57 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
 fn ak_is_finding_id(s: str) -> bool {
     if !s.starts_with(ak_finding_prefix()) {
         return false
@@ -129,20 +288,69 @@ fn ak_is_finding_id(s: str) -> bool {
     if tail.len() != ak_finding_width() {
         return false
     }
+    return ak_is_digits(tail)
+}
+
+# ak_in_strs — membership in a closed vocabulary.
+fn ak_in_strs(xs: list[str], s: str) -> bool {
     let mut i: int = 0
-    while i < tail.len() {
-        if tail.byte_at(i) < 48 || tail.byte_at(i) > 57 {
-            return false
+    while i < xs.len() {
+        if xs.get(i) == s {
+            return true
         }
         i = i + 1
     }
-    return true
+    return false
+}
+
+# ak_pad2 — two-digit zero padding (AF- ids, clock renders).
+fn ak_pad2(n: int) -> str {
+    let digits: str = "0123456789"
+    if n < 10 {
+        return "0" + digits.slice(n, n + 1)
+    }
+    return digits.slice(n / 10, n / 10 + 1) + digits.slice(n % 10, n % 10 + 1)
+}
+
+# py_repr — Python's repr() for the simple strings the kit records:
+# single-quoted, backslash and quote escaped, controls as \xNN.
+fn py_repr(s: str) -> str {
+    let mut out: str = "'"
+    let mut i: int = 0
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        if b == 39 {
+            out = out + "\\'"
+        } else if b == 92 {
+            out = out + "\\\\"
+        } else if b == 10 {
+            out = out + "\\n"
+        } else if b == 9 {
+            out = out + "\\t"
+        } else if b == 13 {
+            out = out + "\\r"
+        } else if b < 32 {
+            out = out + "\\x" + ak_hex2(b)
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out + "'"
+}
+
+fn ak_hex2(b: int) -> str {
+    let digits: str = "0123456789abcdef"
+    let hi: int = int_and(int_shr(b, 4), 15)
+    let lo: int = int_and(b, 15)
+    return digits.slice(hi, hi + 1) + digits.slice(lo, lo + 1)
 }
 
 # ----------------------------------------------------------------------------
 # The json builder — a tiny ordered-object writer producing EXACTLY
 # the canonical forms the chain law needs (sorted keys for the chain,
-# sorted keys for the record lines).
+# sorted keys for the record lines), plus the indent-2 renderer the
+# --json modes print (json.dumps(indent=2, sort_keys=True)).
 # ----------------------------------------------------------------------------
 
 struct JField {
@@ -150,9 +358,11 @@ struct JField {
     val: str # a pre-rendered json value (literal, quoted, or nested)
 }
 
-# j_quote — a JSON string literal.
+# j_quote — a JSON string literal, ensure_ascii: every byte >= 0x80
+# renders as \uXXXX (surrogate pair above BMP), exactly the escaping
+# json.dumps default and the family's canon agree on.
 fn j_quote(s: str) -> str {
-    let out: str = "\""
+    let mut out: str = "\""
     let mut i: int = 0
     while i < s.len() {
         let b: int = s.byte_at(i)
@@ -168,30 +378,61 @@ fn j_quote(s: str) -> str {
             out = out + "\\r"
         } else if b < 32 {
             out = out + "\\u00" + ak_hex2(b)
+        } else if b < 128 {
+            out = out + s.slice(i, i + 1)
         } else {
-            out = out + chr(b)
+            let mut cp: int = 0
+            let mut adv: int = 1
+            if b >= 240 && i + 3 < s.len() {
+                cp = (b - 240) * 262144
+                + (s.byte_at(i + 1) - 128) * 4096
+                + (s.byte_at(i + 2) - 128) * 64
+                + (s.byte_at(i + 3) - 128)
+                adv = 4
+            } else if b >= 224 && i + 2 < s.len() {
+                cp = (b - 224) * 4096
+                + (s.byte_at(i + 1) - 128) * 64
+                + (s.byte_at(i + 2) - 128)
+                adv = 3
+            } else if b >= 192 && i + 1 < s.len() {
+                cp = (b - 192) * 64 + (s.byte_at(i + 1) - 128)
+                adv = 2
+            } else {
+                cp = b
+                adv = 1
+            }
+            if cp > 65535 {
+                out = out + j_hex4_surro(cp)
+            } else {
+                out = out + j_hex4(cp)
+            }
+            i = i + adv
+            continue
         }
         i = i + 1
     }
     return out + "\""
 }
 
-fn ak_hex2(b: int) -> str {
+fn j_hex4(cp: int) -> str {
     let digits: str = "0123456789abcdef"
-    let hi: int = int_and(int_shr(b, 4), 15)
-    let lo: int = int_and(b, 15)
-    return digits.slice(hi, hi + 1) + digits.slice(lo, lo + 1)
+    let a: int = (cp / 4096) % 16
+    let b: int = (cp / 256) % 16
+    let c: int = (cp / 16) % 16
+    let d: int = cp % 16
+    return "\\u" + digits.slice(a, a + 1) + digits.slice(b, b + 1)
+    + digits.slice(c, c + 1) + digits.slice(d, d + 1)
 }
 
-# j_canon_sorted(fields) — json.dumps(obj, sort_keys=True,
-# separators=(",", ":")): keys sorted, no whitespace.
-fn j_canon_sorted(fields: list[JField]) -> str {
-    let keys: list[str] = []
-    let mut i: int = 0
-    while i < fields.len() {
-        keys.push(fields.get(i).key)
-        i = i + 1
-    }
+fn j_hex4_surro(cp: int) -> str {
+    let v: int = cp - 65536
+    let hi: int = 55296 + v / 1024
+    let lo: int = 56320 + v % 1024
+    return j_hex4(hi) + j_hex4(lo)
+}
+
+# j_sort_keys — insertion sort over the keys (the family's idiom).
+fn j_sort_keys(keys: list[str]) -> list[str] {
     let mut a: int = 1
     while a < keys.len() {
         let v: str = keys.get(a)
@@ -203,29 +444,90 @@ fn j_canon_sorted(fields: list[JField]) -> str {
         keys.set(b + 1, v)
         a = a + 1
     }
-    let out: str = "{"
-    i = 0
-    while i < keys.len() {
-        if i > 0 {
-            out = out + ","
+    return keys
+}
+
+# j_canon — json.dumps(obj, sort_keys=True, separators=(",", ":")) over
+# a parsed value: keys sorted, no whitespace, ensure_ascii strings.
+fn j_canon(v: JsonValue) -> str {
+    if json_is_null(v) {
+        return "null"
+    }
+    if json_is_bool(v) {
+        if json_bool_value(v) {
+            return "true"
         }
-        let k: str = keys.get(i)
-        let mut j: int = 0
-        while j < fields.len() {
-            if fields.get(j).key == k {
-                out = out + j_quote(k) + ":" + fields.get(j).val
-                j = fields.len()
+        return "false"
+    }
+    if json_is_int(v) {
+        return json_int_value(v).to_str()
+    }
+    if json_is_float(v) {
+        return json_float_value(v).to_str()
+    }
+    if json_is_str(v) {
+        return j_quote(json_str_value(v))
+    }
+    if json_is_array(v) {
+        let mut out: str = "["
+        let mut i: int = 0
+        while i < v.arr.len() {
+            if i > 0 {
+                out = out + ","
             }
-            j = j + 1
+            out = out + j_canon(v.arr.get(i))
+            i = i + 1
+        }
+        return out + "]"
+    }
+    let keys: list[str] = []
+    let mut ci: int = 0
+    while ci < v.obj_keys.len() {
+        keys.push(v.obj_keys.get(ci))
+        ci = ci + 1
+    }
+    j_sort_keys(keys)
+    let mut out2: str = "{"
+    let mut i2: int = 0
+    while i2 < keys.len() {
+        if i2 > 0 {
+            out2 = out2 + ","
+        }
+        let k: str = keys.get(i2)
+        out2 = out2 + j_quote(k) + ":" + j_canon(json_object_get(v, k))
+        i2 = i2 + 1
+    }
+    return out2 + "}"
+}
+
+# j_canon_without — the canon of an object minus one key (the chain
+# law's record-minus-chain_hash).
+fn j_canon_without(v: JsonValue, key: str) -> str {
+    let keys: list[str] = []
+    let mut i: int = 0
+    while i < v.obj_keys.len() {
+        if v.obj_keys.get(i) != key {
+            keys.push(v.obj_keys.get(i))
         }
         i = i + 1
+    }
+    let sorted: list[str] = j_sort_keys(keys)
+    let mut out: str = "{"
+    let mut j: int = 0
+    while j < sorted.len() {
+        if j > 0 {
+            out = out + ","
+        }
+        let k: str = sorted.get(j)
+        out = out + j_quote(k) + ":" + j_canon(json_object_get(v, k))
+        j = j + 1
     }
     return out + "}"
 }
 
 # j_str_arr — a json array of string literals.
 fn j_str_arr(xs: list[str]) -> str {
-    let out: str = "["
+    let mut out: str = "["
     let mut i: int = 0
     while i < xs.len() {
         if i > 0 {
@@ -237,21 +539,199 @@ fn j_str_arr(xs: list[str]) -> str {
     return out + "]"
 }
 
+# j_spaces — indent padding.
+fn j_spaces(n: int) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < n {
+        out = out + " "
+        i = i + 1
+    }
+    return out
+}
+
+# j_dump_at — json.dumps(v, indent=2, sort_keys=True): the --json
+# renders. Empty containers stay compact, exactly like Python's.
+fn j_dump_at(v: JsonValue, indent: int) -> str {
+    let pad: str = j_spaces(indent * 2)
+    let pad2: str = j_spaces((indent + 1) * 2)
+    if json_is_null(v) {
+        return "null"
+    }
+    if json_is_bool(v) {
+        if json_bool_value(v) {
+            return "true"
+        }
+        return "false"
+    }
+    if json_is_int(v) {
+        return json_int_value(v).to_str()
+    }
+    if json_is_float(v) {
+        return json_float_value(v).to_str()
+    }
+    if json_is_str(v) {
+        return j_quote(json_str_value(v))
+    }
+    if json_is_array(v) {
+        if v.arr.len() == 0 {
+            return "[]"
+        }
+        let mut out: str = "[\n"
+        let mut i: int = 0
+        while i < v.arr.len() {
+            out = out + pad2 + j_dump_at(v.arr.get(i), indent + 1)
+            if i + 1 < v.arr.len() {
+                out = out + ","
+            }
+            out = out + "\n"
+            i = i + 1
+        }
+        return out + pad + "]"
+    }
+    let keys: list[str] = []
+    let mut ci: int = 0
+    while ci < v.obj_keys.len() {
+        keys.push(v.obj_keys.get(ci))
+        ci = ci + 1
+    }
+    j_sort_keys(keys)
+    if keys.len() == 0 {
+        return "{}"
+    }
+    let mut out2: str = "{\n"
+    let mut n: int = 0
+    while n < keys.len() {
+        let k: str = keys.get(n)
+        out2 = out2 + pad2 + j_quote(k) + ": "
+        + j_dump_at(json_object_get(v, k), indent + 1)
+        if n + 1 < keys.len() {
+            out2 = out2 + ","
+        }
+        out2 = out2 + "\n"
+        n = n + 1
+    }
+    return out2 + pad + "}"
+}
+
+# jv_strs — a json array of plain strings (a record's roster).
+fn jv_strs(xs: list[str]) -> JsonValue {
+    let vals: list[JsonValue] = []
+    let mut i: int = 0
+    while i < xs.len() {
+        vals.push(json_str(xs.get(i)))
+        i = i + 1
+    }
+    return json_array(vals)
+}
+
 # ----------------------------------------------------------------------------
 # The chain law — hltlog's arithmetic, folded verbatim: sha256 over
 # prev + canonical-json(record minus chain_hash).
 # ----------------------------------------------------------------------------
 
-fn ak_chain_of(prev: str, record: str) -> str {
-    # record arrives as canonical json WITHOUT the chain_hash field;
-    # the callers strip it when re-deriving (j_canon without the field).
-    return sha256_hex(prev + record)
+fn ak_chain_of(prev: str, record: JsonValue) -> str {
+    return sha256_hex(prev + j_canon_without(record, "chain_hash"))
 }
 
 # ----------------------------------------------------------------------------
-# The scope — the Stage 135 guarantee ledger, read live from
-# bin/hls-guarantee (spawned; the .py imported the module, the spawn
-# single-sources the same engine).
+# Spawning — the kit's run_capture (stdout+stderr piped, drained, the
+# encoded exit kept). Every child the kit drives is git, or the
+# bootstrap's evaluator over a tree's own guarantee source.
+# ----------------------------------------------------------------------------
+
+struct AkRun {
+    code: int, # -1 when the spawn itself failed
+    out: str,
+    err: str
+}
+
+fn ak_run(program: str, args: list[str]) -> AkRun uses Proc {
+    let r: AkRun = AkRun {
+        code: -1, out: "", err: ""
+    }
+    let pid: int = proc_spawn(program, args, 2, 1, 1)
+    if pid < 1 {
+        return r
+    }
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    r.code = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    r.out = out
+    r.err = err
+    return r
+}
+
+# ----------------------------------------------------------------------------
+# Identity. --by is recorded verbatim on every entry; the default is
+# the tree's own git identity (the maintainer's name), so the normal
+# `make auditkit-evidence` run is honestly labelled SELF-ASSESSED
+# unless the auditors run it themselves.
+# ----------------------------------------------------------------------------
+
+fn ak_default_actor(tree: str) -> str uses Proc {
+    let r: AkRun = ak_run("git", ["config", "user.name"])
+    if r.code == 0 && r.out.trim() != "" {
+        return r.out.trim()
+    }
+    let u: Option[tainted[str]] = env_var("USER")
+    if option_is_some(u) {
+        let name: str = taint_unwrap(option_unwrap(u))
+        if name.trim() != "" {
+            return name.trim()
+        }
+    }
+    return "<unknown>"
+}
+
+fn ak_git_sha(tree: str) -> str uses Proc {
+    let r: AkRun = ak_run("git", ["rev-parse", "HEAD"])
+    if r.code == 0 {
+        return r.out.trim()
+    }
+    return "unknown (not a git tree)"
+}
+
+# ak_commit_exists — True when the sha names a commit in the tree;
+# None (the triage prints a note) when the tree is not git at all.
+# Halis has no tri-state: 1 exists / 0 absent / -1 not a git tree.
+fn ak_commit_exists(tree: str, sha: str) -> int uses Proc {
+    let args: list[str] = []
+    args.push("cat-file")
+    args.push("-e")
+    args.push(sha + "^{commit}")
+    let r: AkRun = ak_run("git", args)
+    if r.code == 0 {
+        return 1
+    }
+    let probe: list[str] = []
+    probe.push("rev-parse")
+    probe.push("--git-dir")
+    let r2: AkRun = ak_run("git", probe)
+    if r2.code == 0 {
+        return 0
+    }
+    return -1
+}
+
+# ----------------------------------------------------------------------------
+# The scope — the Stage 135 guarantee ledger, read live from the
+# TREE'S OWN source: `bin/hlboot <tree>/tools/hls-guarantee.hls dump`
+# (the kit's own evaluator interprets the tree's tool the way the .py
+# era imported the module — a foreign tree's own ledger, live at run
+# time, never copied, never re-derived).
 # ----------------------------------------------------------------------------
 
 struct GgCensus {
@@ -265,91 +745,172 @@ struct GgCensus {
     probe_counts: list[int],
     digest: str,
     policy: str,
+    anchors_files: list[str],
+    anchors_patterns: list[str],
+    n_rows: int,
     ok: bool,
     err: str
 }
 
-# ak_scope(root) — the census + digest from the guarantee binary.
-fn ak_scope(root: str) -> GgCensus uses IO, Fs, Proc {
-    let out: GgCensus = GgCensus { ids: [], families: [], severities: [],
+# ak_boot_path — the evaluator the scope rides: the repo the kit
+# binary lives in (argv0/../..), the same tree bin/hlc built it from.
+fn ak_boot_path() -> str uses Args, Fs {
+    let a: list[str] = args()
+    if a.len() == 0 {
+        return "bin/hlboot"
+    }
+    let argv0: str = a.get(0)
+    if !argv0.contains("/") {
+        return "bin/hlboot"
+    }
+    let root: str = ak_dirname(ak_dirname(argv0))
+    let boot: str = ak_join(root, "bin/hlboot")
+    if !file_exists(boot) {
+        return "bin/hlboot"
+    }
+    return boot
+}
+
+fn ak_scope(root: str) -> GgCensus uses Args, Fs, Proc {
+    let out: GgCensus = GgCensus {
+        ids: [], families: [], severities: [],
         claims: [], violations: [], repros: [], anchor_counts: [],
-        probe_counts: [], digest: "", policy: "", ok: false, err: "" }
-    let gtool: str = ak_join(root, "bin/hls-guarantee")
-    if !file_exists(gtool) {
-        out.err = "no guarantee engine at " + gtool
-        + " — run `make bin/hls-guarantee` (the audit scope is the "
-        + "Stage 135 ledger, and this tree does not carry one)"
+        probe_counts: [], digest: "", policy: "", anchors_files: [],
+        anchors_patterns: [], n_rows: 0, ok: false, err: ""
+    }
+    let gsrc: str = ak_join(root, "tools/hls-guarantee.hls")
+    if !file_exists(gsrc) {
+        out.err = "no guarantee ledger at " + ak_relpath(gsrc, root)
+        + " — the audit scope is the Stage 135 ledger, and this tree "
+        + "does not carry one"
         return out
     }
-    # the census rows: list --json
-    let pid: int = proc_spawn(gtool, ["list", "--json"], 0, 1, 1)
-    if pid < 1 {
-        out.err = "cannot spawn " + gtool
+    let boot: str = ak_boot_path()
+    let args: list[str] = []
+    args.push(gsrc)
+    args.push("dump")
+    let r: AkRun = ak_run(boot, args)
+    if r.code != 0 {
+        out.err = "the guarantee ledger at " + ak_relpath(gsrc, root)
+        + " does not load: " + ak_first_line(r.err)
         return out
     }
-    let mut text: str = ""
-    let mut chunk: str = proc_child_read(pid, 1, 65536)
-    while chunk != "" {
-        text = text + chunk
-        chunk = proc_child_read(pid, 1, 65536)
-    }
-    proc_wait(pid)
-    let rr: Result[JsonValue, str] = json_parse_result(text)
+    let rr: Result[JsonValue, str] = json_parse_result(r.out)
     if result_is_err(rr) {
-        out.err = "the guarantee ledger does not load: "
-        + result_err_or(rr, "not json")
+        out.err = "the guarantee ledger at " + ak_relpath(gsrc, root)
+        + " does not load: " + result_err_or(rr, "not json")
         return out
     }
     let doc: JsonValue = result_unwrap(rr)
-    let rows: list[JsonValue] = json_object_get(doc, "guarantees").arr
+    out.digest = ak_jstr(doc, "ledger_sha256")
+    out.policy = ak_jstr(doc, "policy")
+    let rows: list[JsonValue] = ak_jarr(doc, "guarantees")
     let mut i: int = 0
     while i < rows.len() {
-        let r: JsonValue = rows.get(i)
+        let g: JsonValue = rows.get(i)
         i = i + 1
-        out.ids.push(json_str_value(json_object_get(r, "id")))
-        out.families.push(json_str_value(json_object_get(r, "family")))
-        out.severities.push(json_str_value(json_object_get(r, "severity")))
-        out.claims.push(json_str_value(json_object_get(r, "claim")))
-        out.anchor_counts.push(
-            json_int_value(json_object_get(r, "anchors")))
-        out.probe_counts.push(
-            json_int_value(json_object_get(r, "probes")))
-        out.violations.push("")
-        out.repros.push("")
+        out.ids.push(ak_jstr(g, "id"))
+        out.families.push(ak_jstr(g, "family"))
+        out.severities.push(ak_jstr(g, "severity"))
+        out.claims.push(ak_jstr(g, "claim"))
+        out.violations.push(ak_jstr(g, "violation"))
+        out.repros.push(ak_jstr(g, "repro"))
+        out.anchor_counts.push(ak_jarr(g, "anchors").len())
+        out.probe_counts.push(ak_jarr(g, "probes").len())
     }
-    # the digest + policy: verify --json (also proves the ledger loads).
-    let pid2: int = proc_spawn(gtool, ["verify", "--json"], 0, 1, 1)
-    if pid2 < 1 {
-        out.err = "cannot spawn " + gtool
-        return out
+    let pas: list[JsonValue] = ak_jarr(doc, "policy_anchors")
+    i = 0
+    while i < pas.len() {
+        let pa: JsonValue = pas.get(i)
+        i = i + 1
+        out.anchors_files.push(ak_jstr(pa, "file"))
+        out.anchors_patterns.push(ak_jstr(pa, "pattern"))
     }
-    let mut text2: str = ""
-    let mut chunk2: str = proc_child_read(pid2, 1, 65536)
-    while chunk2 != "" {
-        text2 = text2 + chunk2
-        chunk2 = proc_child_read(pid2, 1, 65536)
-    }
-    proc_wait(pid2)
-    let rr2: Result[JsonValue, str] = json_parse_result(text2)
-    if result_is_err(rr2) {
-        out.err = "the guarantee ledger does not verify: "
-        + result_err_or(rr2, "not json")
-        return out
-    }
-    let vdoc: JsonValue = result_unwrap(rr2)
-    out.digest = json_str_value(json_object_get(vdoc, "ledger_sha256"))
-    out.policy = json_str_value(json_object_get(vdoc, "policy"))
-    if out.ids.len() == 0 || out.digest == "" {
-        out.err = "the guarantee ledger at " + gtool + " is empty"
+    out.n_rows = out.ids.len()
+    if out.n_rows == 0 || out.digest == "" {
+        out.err = "the guarantee ledger at " + ak_relpath(gsrc, root)
+        + " is empty"
         return out
     }
     out.ok = true
     return out
 }
 
+# ak_first_line — the first non-empty line, trimmed; "" for empty text.
+fn ak_first_line(text: str) -> str {
+    let lines: list[str] = text.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let t: str = lines.get(i).trim()
+        if t != "" {
+            return t
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# ak_jstr / ak_jint / ak_jbool / ak_jarr — null-safe accessors, so a
+# malformed ledger row reads as empty instead of a panic.
+fn ak_jstr(v: JsonValue, key: str) -> str {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_str(x) {
+        return json_str_value(x)
+    }
+    return ""
+}
+
+fn ak_jint(v: JsonValue, key: str) -> int {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_int(x) {
+        return json_int_value(x)
+    }
+    return -1
+}
+
+fn ak_jbool(v: JsonValue, key: str) -> bool {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_bool(x) {
+        return json_bool_value(x)
+    }
+    return false
+}
+
+fn ak_jarr(v: JsonValue, key: str) -> list[JsonValue] {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_array(x) {
+        return x.arr
+    }
+    let empty: list[JsonValue] = []
+    return empty
+}
+
+# ak_policy_anchor_ok — the live-quote law: the reporting channel
+# anchored in SECURITY.md must still be there, or the brief refuses.
+fn ak_policy_anchor_ok(root: str, scope: GgCensus) -> list[str] uses Fs {
+    let problems: list[str] = []
+    let mut i: int = 0
+    while i < scope.anchors_files.len() {
+        let rel: str = scope.anchors_files.get(i)
+        let pat: str = scope.anchors_patterns.get(i)
+        let full: str = ak_join(root, rel)
+        if !file_exists(full) {
+            problems.push("the reporting channel anchor is gone ("
+            + rel + ": missing " + pat + ")")
+        } else if !read_file(full).contains(pat) {
+            problems.push("the reporting channel anchor is gone ("
+            + rel + ": '" + pat + "' not found)")
+        }
+        i = i + 1
+    }
+    return problems
+}
+
 # ----------------------------------------------------------------------------
-# The evidence pass — bin/hls-guarantee verify --json, re-parsed for
-# the counts the transcript records.
+# The evidence pass — the tree's own checker run live:
+# `bin/hlboot <tree>/tools/hls-guarantee.hls verify --json --root
+# <tree>`. The counts and refusals the transcript records are the
+# engine's own.
 # ----------------------------------------------------------------------------
 
 struct EvidenceOut {
@@ -362,68 +923,2035 @@ struct EvidenceOut {
     err: str
 }
 
-fn ak_evidence(root: str) -> EvidenceOut uses IO, Proc {
-    let out: EvidenceOut = EvidenceOut { ok: false, verified: 0,
-        total: 0, anchors: 0, probes: 0, refusals: [], err: "" }
-    let gtool: str = ak_join(root, "bin/hls-guarantee")
-    let pid: int = proc_spawn(gtool, ["verify", "--json"], 0, 1, 1)
-    if pid < 1 {
-        out.err = "cannot spawn " + gtool
+fn ak_evidence(root: str) -> EvidenceOut uses Args, Fs, Proc {
+    let out: EvidenceOut = EvidenceOut {
+        ok: false, verified: 0,
+        total: 0, anchors: 0, probes: 0, refusals: [], err: ""
+    }
+    let gsrc: str = ak_join(root, "tools/hls-guarantee.hls")
+    if !file_exists(gsrc) {
+        out.err = "no guarantee ledger at " + ak_relpath(gsrc, root)
+        + " — the audit scope is the Stage 135 ledger, and this tree "
+        + "does not carry one"
         return out
     }
-    let mut text: str = ""
-    let mut chunk: str = proc_child_read(pid, 1, 65536)
-    while chunk != "" {
-        text = text + chunk
-        chunk = proc_child_read(pid, 1, 65536)
+    let boot: str = ak_boot_path()
+    let args: list[str] = []
+    args.push(gsrc)
+    args.push("verify")
+    args.push("--json")
+    args.push("--root")
+    args.push(root)
+    let r: AkRun = ak_run(boot, args)
+    if r.out.trim() == "" {
+        out.err = "verify did not answer json: " + ak_first_line(r.err)
+        return out
     }
-    let code: int = proc_wait(pid)
-    let rr: Result[JsonValue, str] = json_parse_result(text)
+    let rr: Result[JsonValue, str] = json_parse_result(r.out)
     if result_is_err(rr) {
         out.err = "verify did not answer json: "
         + result_err_or(rr, "not json")
         return out
     }
     let doc: JsonValue = result_unwrap(rr)
-    out.ok = code == 0
-    let gs: list[JsonValue] = json_object_get(doc, "guarantees").arr
+    out.ok = r.code == 0
+    let gs: list[JsonValue] = ak_jarr(doc, "guarantees")
     let mut i: int = 0
     while i < gs.len() {
         let g: JsonValue = gs.get(i)
         i = i + 1
         out.total = out.total + 1
-        if json_str_value(json_object_get(g, "status")) == "verified" {
+        if ak_jstr(g, "status") == "verified" {
             out.verified = out.verified + 1
         }
-        let ancs: list[JsonValue] = json_object_get(g, "anchors").arr
+        let ancs: list[JsonValue] = ak_jarr(g, "anchors")
         let mut a: int = 0
         while a < ancs.len() {
-            if json_bool_value(json_object_get(ancs.get(a), "ok")) {
+            if ak_jbool(ancs.get(a), "ok") {
                 out.anchors = out.anchors + 1
             }
             a = a + 1
         }
-        let prbs: list[JsonValue] = json_object_get(g, "probes").arr
+        let prbs: list[JsonValue] = ak_jarr(g, "probes")
         let mut p: int = 0
         while p < prbs.len() {
-            if json_str_value(json_object_get(prbs.get(p), "verdict"))
-            == "ok" {
+            if ak_jstr(prbs.get(p), "verdict") == "ok" {
                 out.probes = out.probes + 1
             }
             p = p + 1
         }
     }
-    let refs: list[JsonValue] = json_object_get(doc, "refusals").arr
+    let refs: list[JsonValue] = ak_jarr(doc, "refusals")
     i = 0
     while i < refs.len() {
-        let r: JsonValue = refs.get(i)
+        let rf: JsonValue = refs.get(i)
         i = i + 1
-        if json_is_str(r) {
-            out.refusals.push(json_str_value(r))
+        if json_is_str(rf) {
+            out.refusals.push(json_str_value(rf))
         } else {
-            out.refusals.push(json_str_value(
-                json_object_get(r, "detail")))
+            out.refusals.push(ak_jstr(rf, "detail"))
         }
     }
     return out
+}
+
+# ----------------------------------------------------------------------------
+# The window. Two ISO dates joined by a slash; a window that ends
+# before it starts is refused at write time. ISO is validated by hand
+# (month 1-12, the day inside the month, February's leap rule).
+# ----------------------------------------------------------------------------
+
+fn ak_days_in_month(y: int, m: int) -> int {
+    if m == 1 || m == 3 || m == 5 || m == 7 || m == 8 || m == 10
+    || m == 12 {
+        return 31
+    }
+    if m == 4 || m == 6 || m == 9 || m == 11 {
+        return 30
+    }
+    if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+        return 29
+    }
+    return 28
+}
+
+# ak_to_int — the digits of a validated digit string as a number (the
+# callers check ak_is_digits first; anything else reads as 0).
+fn ak_to_int(s: str) -> int {
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < s.len() {
+        v = v * 10 + (s.byte_at(i) - 48)
+        i = i + 1
+    }
+    return v
+}
+
+# ak_valid_iso — YYYY-MM-DD, real calendar dates only.
+fn ak_valid_iso(s: str) -> bool {
+    if s.len() != 10 {
+        return false
+    }
+    if s.byte_at(4) != 45 || s.byte_at(7) != 45 {
+        return false
+    }
+    let y: str = s.slice(0, 4)
+    let m: str = s.slice(5, 7)
+    let d: str = s.slice(8, 10)
+    if !ak_is_digits(y) || !ak_is_digits(m) || !ak_is_digits(d) {
+        return false
+    }
+    let yi: int = ak_to_int(y)
+    let mi: int = ak_to_int(m)
+    let di: int = ak_to_int(d)
+    if mi < 1 || mi > 12 {
+        return false
+    }
+    if di < 1 || di > ak_days_in_month(yi, mi) {
+        return false
+    }
+    return true
+}
+
+# ak_parse_window — "" when the window is well formed, the refusal
+# wording when it is not. Valid ISO dates compare as strings.
+fn ak_parse_window(window: str) -> str {
+    let parts: list[str] = window.split("/")
+    if parts.len() != 2 {
+        return "not two ISO dates joined by /"
+    }
+    if !ak_valid_iso(parts.get(0)) || !ak_valid_iso(parts.get(1)) {
+        return "a date is not ISO (YYYY-MM-DD)"
+    }
+    if parts.get(1) < parts.get(0) {
+        return "the window ends before it starts"
+    }
+    return ""
+}
+
+# ----------------------------------------------------------------------------
+# The ledger. One JSON object per line, the family's mandatory chain
+# fields (seq, timestamp, prev_hash, chain_hash) on every entry, one
+# of four kinds: engagement / evidence / finding / triage. The chain
+# arithmetic is the family's one law; every reader verifies the whole
+# chain first and names the broken line — nothing renders from a
+# ledger it could not verify.
+# ----------------------------------------------------------------------------
+
+struct LedgerRead {
+    ok: bool,
+    err: str,
+    entries: list[JsonValue],
+    head: str,
+    log_sha: str
+}
+
+# ak_entry_shape — the per-kind shape, checked on every read. Shape
+# only — the reader never re-derives live facts (the scope may have
+# moved; that is the drift law's business, not the parser's).
+fn ak_entry_shape(entry: JsonValue, line_no: int) -> str {
+    let kind: str = ak_jstr(entry, "kind")
+    if !ak_in_strs(ak_kinds(), kind) {
+        return "unknown entry kind: line " + line_no.to_str()
+        + ": the kind is not one of engagement/evidence/finding/triage"
+    }
+    let what: str = kind + " entry"
+    if ak_jint(entry, "seq") < 1 {
+        return what + ": line " + line_no.to_str()
+        + ": seq must be an int >= 1"
+    }
+    if ak_jint(entry, "timestamp") < 0 {
+        return what + ": line " + line_no.to_str()
+        + ": timestamp must be an int >= 0"
+    }
+    if !ak_is_hex64(ak_jstr(entry, "prev_hash")) {
+        return what + ": line " + line_no.to_str()
+        + ": prev_hash is not 64 hex"
+    }
+    if !ak_is_hex64(ak_jstr(entry, "chain_hash")) {
+        return what + ": line " + line_no.to_str()
+        + ": chain_hash is not 64 hex"
+    }
+
+    if kind == "engagement" {
+        if ak_jstr(entry, "by") == "" {
+            return ak_need_fail(what, line_no, "by")
+        }
+        if ak_jstr(entry, "firm") == "" {
+            return ak_need_fail(what, line_no, "firm")
+        }
+        let roster: list[JsonValue] = ak_jarr(entry, "roster")
+        if roster.len() == 0 {
+            return what + ": line " + line_no.to_str()
+            + ": roster must be a non-empty list of unique names"
+        }
+        let mut i: int = 0
+        while i < roster.len() {
+            let r: JsonValue = roster.get(i)
+            if !json_is_str(r) || json_str_value(r) == "" {
+                return what + ": line " + line_no.to_str()
+                + ": roster must be a non-empty list of unique names"
+            }
+            let mut j: int = 0
+            while j < i {
+                if json_str_value(roster.get(j)) == json_str_value(r) {
+                    return what + ": line " + line_no.to_str()
+                    + ": roster must be a non-empty list of unique names"
+                }
+                j = j + 1
+            }
+            i = i + 1
+        }
+        let window: str = ak_jstr(entry, "window")
+        if window == "" && !json_object_has(entry, "window") {
+            return what + ": line " + line_no.to_str()
+            + ": window must be a string"
+        }
+        let why: str = ak_parse_window(window)
+        if why != "" {
+            return what + ": line " + line_no.to_str() + ": bad window "
+            + py_repr(window) + " (" + why + ")"
+        }
+        if ak_jstr(entry, "basis") == "" {
+            return ak_need_fail(what, line_no, "basis")
+        }
+        if !ak_is_hex64(ak_jstr(entry, "scope_sha256")) {
+            return what + ": line " + line_no.to_str()
+            + ": scope_sha256 is not 64 hex"
+        }
+    }
+
+    if kind == "evidence" {
+        if ak_jstr(entry, "by") == "" {
+            return ak_need_fail(what, line_no, "by")
+        }
+        if !ak_in_strs(ak_roles(), ak_jstr(entry, "role")) {
+            return what + ": line " + line_no.to_str() + ": role "
+            + py_repr(ak_jstr(entry, "role"))
+            + " is not one of auditor/project"
+        }
+        let iv: JsonValue = json_object_get(entry, "independent")
+        if !json_is_bool(iv) {
+            return what + ": line " + line_no.to_str()
+            + ": independent must be a boolean"
+        }
+        if ak_jstr(entry, "tree") == "" {
+            return ak_need_fail(what, line_no, "tree")
+        }
+        if !ak_is_hex64(ak_jstr(entry, "scope_sha256")) {
+            return what + ": line " + line_no.to_str()
+            + ": scope_sha256 is not 64 hex"
+        }
+        if !ak_in_strs(ak_pass_outcomes(), ak_jstr(entry, "outcome")) {
+            return what + ": line " + line_no.to_str() + ": outcome "
+            + py_repr(ak_jstr(entry, "outcome"))
+            + " is not one of ok/failed"
+        }
+        let keys: list[str] = []
+        keys.push("verified_guarantees")
+        keys.push("total_guarantees")
+        keys.push("anchors")
+        keys.push("probes")
+        let mut k: int = 0
+        while k < keys.len() {
+            let key: str = keys.get(k)
+            let x: JsonValue = json_object_get(entry, key)
+            if !json_is_int(x) || json_int_value(x) < 0 {
+                return what + ": line " + line_no.to_str() + ": " + key
+                + " must be an int >= 0"
+            }
+            k = k + 1
+        }
+        if ak_jint(entry, "verified_guarantees")
+        > ak_jint(entry, "total_guarantees") {
+            return what + ": line " + line_no.to_str()
+            + ": more verified guarantees than the scope has"
+        }
+        let refs: list[JsonValue] = ak_jarr(entry, "refusals")
+        let mut r: int = 0
+        while r < refs.len() {
+            if !json_is_str(refs.get(r)) {
+                return what + ": line " + line_no.to_str()
+                + ": refusals must be a list of strings"
+            }
+            r = r + 1
+        }
+        if ak_jstr(entry, "outcome") == "failed" && refs.len() == 0 {
+            return what + ": line " + line_no.to_str()
+            + ": a failed pass with no refusals names nothing"
+        }
+        if ak_jstr(entry, "outcome") == "ok" && refs.len() > 0 {
+            return what + ": line " + line_no.to_str()
+            + ": a green pass carrying refusals is a contradiction"
+        }
+    }
+
+    if kind == "finding" {
+        if !ak_is_finding_id(ak_jstr(entry, "id")) {
+            return what + ": line " + line_no.to_str()
+            + ": id must be AF-NNN"
+        }
+        if ak_jstr(entry, "by") == "" {
+            return ak_need_fail(what, line_no, "by")
+        }
+        if ak_jstr(entry, "against") == "" {
+            return ak_need_fail(what, line_no, "against")
+        }
+        if !ak_in_strs(ak_severities(), ak_jstr(entry, "severity")) {
+            return what + ": line " + line_no.to_str() + ": severity "
+            + py_repr(ak_jstr(entry, "severity"))
+            + " is not one of critical/high/medium/low/info"
+        }
+        if ak_jstr(entry, "title") == "" {
+            return ak_need_fail(what, line_no, "title")
+        }
+        if !ak_in_strs(ak_repro_modes(), ak_jstr(entry, "repro_mode")) {
+            return what + ": line " + line_no.to_str() + ": repro_mode "
+            + py_repr(ak_jstr(entry, "repro_mode"))
+            + " is not one of path/text"
+        }
+        if ak_jstr(entry, "repro_value") == "" {
+            return ak_need_fail(what, line_no, "repro_value")
+        }
+    }
+
+    if kind == "triage" {
+        if ak_jstr(entry, "by") == "" {
+            return ak_need_fail(what, line_no, "by")
+        }
+        if !ak_is_finding_id(ak_jstr(entry, "for")) {
+            return what + ": line " + line_no.to_str()
+            + ": for must be AF-NNN"
+        }
+        if !ak_in_strs(ak_triage_verdicts(), ak_jstr(entry, "verdict")) {
+            return what + ": line " + line_no.to_str() + ": verdict "
+            + py_repr(ak_jstr(entry, "verdict"))
+            + " is not one of accepted/disputed/out-of-scope"
+        }
+        if ak_jstr(entry, "reason") == "" {
+            return ak_need_fail(what, line_no, "reason")
+        }
+        if json_object_has(entry, "fix")
+        && !ak_is_hex40(ak_jstr(entry, "fix")) {
+            return what + ": line " + line_no.to_str()
+            + ": fix must be 40 hex"
+        }
+        if ak_jstr(entry, "verdict") != "accepted"
+        && json_object_has(entry, "fix") {
+            return what + ": line " + line_no.to_str()
+            + ": only an acceptance carries a fix"
+        }
+    }
+    return ""
+}
+
+fn ak_need_fail(what: str, line_no: int, key: str) -> str {
+    return what + ": line " + line_no.to_str() + ": " + key
+    + " must be a non-empty string"
+}
+
+# ak_read_ledger — verifies the whole chain first: a tampered ledger
+# is named at its broken line, never rendered.
+fn ak_read_ledger(path: str, must_exist: bool) -> LedgerRead uses Fs {
+    let out: LedgerRead = LedgerRead {
+        ok: false, err: "", entries: [],
+        head: ak_genesis(), log_sha: ""
+    }
+    if !file_exists(path) {
+        if must_exist {
+            out.err = "no engagement ledger at " + path
+            + " — nothing to read"
+            return out
+        }
+        out.ok = true
+        return out
+    }
+    let raw: str = read_file(path)
+    out.log_sha = sha256_hex(raw)
+    let lines: list[str] = raw.split("\n")
+    let mut n: int = lines.len()
+    if n > 0 && lines.get(n - 1) == "" {
+        n = n - 1
+    }
+    let mut prev: str = ak_genesis()
+    let mut i: int = 0
+    while i < n {
+        let line_no: int = i + 1
+        let line: str = lines.get(i).trim()
+        if line == "" {
+            out.err = "blank line " + line_no.to_str()
+            + ": the ledger is a JSONL chain, not a notepad"
+            return out
+        }
+        let rr: Result[JsonValue, str] = json_parse_result(line)
+        if result_is_err(rr) {
+            out.err = "line " + line_no.to_str() + " is not JSON: "
+            + result_err_or(rr, "not json")
+            return out
+        }
+        let entry: JsonValue = result_unwrap(rr)
+        if !json_is_object(entry) {
+            out.err = "line " + line_no.to_str() + " is not an object"
+            return out
+        }
+        let shape: str = ak_entry_shape(entry, line_no)
+        if shape != "" {
+            out.err = shape
+            return out
+        }
+        if ak_jint(entry, "seq") != line_no {
+            out.err = "line " + line_no.to_str() + ": seq is "
+            + ak_jint(entry, "seq").to_str() + ", expected "
+            + line_no.to_str()
+            + " — the chain has a hole or a lie"
+            return out
+        }
+        if ak_jstr(entry, "prev_hash") != prev {
+            out.err = "line " + line_no.to_str() + ": prev_hash "
+            + ak_jstr(entry, "prev_hash").slice(0, 12)
+            + "... does not chain onto " + prev.slice(0, 12)
+            + "... — the chain is BROKEN here: the ledger was "
+            + "rewritten, reordered or truncated"
+            return out
+        }
+        let want: str = ak_chain_of(prev, entry)
+        if ak_jstr(entry, "chain_hash") != want {
+            out.err = "line " + line_no.to_str() + ": chain_hash "
+            + ak_jstr(entry, "chain_hash").slice(0, 12)
+            + "... does not hash onto its predecessor (expected "
+            + want.slice(0, 12) + "... ) — the entry was edited "
+            + "after it was written"
+            return out
+        }
+        out.entries.push(entry)
+        prev = ak_jstr(entry, "chain_hash")
+        i = i + 1
+    }
+    out.head = prev
+    out.ok = true
+    return out
+}
+
+# ak_append_chained — append one entry with the family's arithmetic;
+# the chain is re-verified BEFORE the write (a tool that appends onto
+# a chain it never read is a tool that trusts a file it has never
+# seen).
+fn ak_append_chained(path: str, body: JsonValue) -> LedgerRead
+uses Fs, Proc, Clock {
+    let prev_read: LedgerRead = ak_read_ledger(path, false)
+    if !prev_read.ok {
+        return prev_read
+    }
+    let seq: int = prev_read.entries.len() + 1
+    let now: int = system_time_unix_secs(system_time_now())
+    let fields: list[str] = []
+    let vals: list[JsonValue] = []
+    let mut i: int = 0
+    while i < body.obj_keys.len() {
+        fields.push(body.obj_keys.get(i))
+        vals.push(body.obj_vals.get(i))
+        i = i + 1
+    }
+    fields.push("seq")
+    vals.push(json_int(seq))
+    fields.push("timestamp")
+    vals.push(json_int(now))
+    fields.push("prev_hash")
+    vals.push(json_str(prev_read.head))
+    let staged: JsonValue = json_object(fields, vals)
+    let chain: str = ak_chain_of(prev_read.head, staged)
+    let fields2: list[str] = []
+    let vals2: list[JsonValue] = []
+    i = 0
+    while i < staged.obj_keys.len() {
+        fields2.push(staged.obj_keys.get(i))
+        vals2.push(staged.obj_vals.get(i))
+        i = i + 1
+    }
+    fields2.push("chain_hash")
+    vals2.push(json_str(chain))
+    let entry: JsonValue = json_object(fields2, vals2)
+    let d: str = ak_dirname(path)
+    if d != "" && d != "." {
+        proc_exec("mkdir -p '" + ak_shell_quote(d) + "'")
+    }
+    let mut body_txt: str = ""
+    if file_exists(path) {
+        body_txt = read_file(path)
+    }
+    write_file(path, body_txt + j_canon(entry) + "\n")
+    let out: LedgerRead = LedgerRead {
+        ok: true, err: "", entries: [],
+        head: chain, log_sha: ""
+    }
+    out.entries.push(entry)
+    return out
+}
+
+# ak_shell_quote — neutralise single quotes for the one-liners.
+fn ak_shell_quote(s: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < s.len() {
+        if s.byte_at(i) == 39 {
+            out = out + "'\\''"
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# The census. The state and every aggregate are DERIVED from the
+# entries on each render — never stored, never asserted.
+# ----------------------------------------------------------------------------
+
+# ak_engagement_of — the engagement is the first entry or none.
+fn ak_engagement_of(entries: list[JsonValue]) -> JsonValue {
+    if entries.len() > 0
+    && ak_jstr(entries.get(0), "kind") == "engagement" {
+        return entries.get(0)
+    }
+    return json_null()
+}
+
+# ak_findings_of — {AF-NNN: finding}, ledger order.
+fn ak_findings_of(entries: list[JsonValue]) -> list[JsonValue] {
+    let out: list[JsonValue] = []
+    let mut i: int = 0
+    while i < entries.len() {
+        let e: JsonValue = entries.get(i)
+        if ak_jstr(e, "kind") == "finding" {
+            out.push(e)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ak_triages_of — one triage per finding; the census takes the first
+# it sees.
+fn ak_triages_of(entries: list[JsonValue]) -> list[JsonValue] {
+    let out: list[JsonValue] = []
+    let mut i: int = 0
+    while i < entries.len() {
+        let e: JsonValue = entries.get(i)
+        if ak_jstr(e, "kind") == "triage" {
+            let fid: str = ak_jstr(e, "for")
+            let mut seen: bool = false
+            let mut j: int = 0
+            while j < out.len() {
+                if ak_jstr(out.get(j), "for") == fid {
+                    seen = true
+                }
+                j = j + 1
+            }
+            if !seen {
+                out.push(e)
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn ak_passes_of(entries: list[JsonValue]) -> list[JsonValue] {
+    let out: list[JsonValue] = []
+    let mut i: int = 0
+    while i < entries.len() {
+        let e: JsonValue = entries.get(i)
+        if ak_jstr(e, "kind") == "evidence" {
+            out.push(e)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ak_derive_state — the lifecycle word, from the census alone. A
+# finding-free audit honestly stays underway — see the report's
+# honesty note.
+fn ak_derive_state(entries: list[JsonValue]) -> str {
+    if entries.len() == 0 {
+        return "vacant"
+    }
+    if json_is_null(ak_engagement_of(entries)) {
+        return "open"
+    }
+    let findings: list[JsonValue] = ak_findings_of(entries)
+    let triages: list[JsonValue] = ak_triages_of(entries)
+    if ak_passes_of(entries).len() == 0 {
+        return "open"
+    }
+    if findings.len() == 0 {
+        return "underway"
+    }
+    if triages.len() < findings.len() {
+        return "reported"
+    }
+    let mut i: int = 0
+    while i < triages.len() {
+        let t: JsonValue = triages.get(i)
+        if ak_jstr(t, "verdict") == "accepted"
+        && !json_object_has(t, "fix") {
+            return "responded"
+        }
+        i = i + 1
+    }
+    return "remediated"
+}
+
+# ak_fmt_ts — the entry's timestamp as a UTC second, the family's
+# tradition: entries carry facts; renders carry them verbatim.
+# Civil-from-days, then the clock.
+fn ak_fmt_ts(ts: int) -> str {
+    let days: int = ts / 86400
+    let secs: int = ts % 86400
+    let hh: int = secs / 3600
+    let mi: int = (secs % 3600) / 60
+    let ss: int = secs % 60
+    let ymd: str = ak_civil_date(days)
+    return ymd + "T" + ak_pad2(hh) + ":" + ak_pad2(mi) + ":"
+    + ak_pad2(ss) + "Z"
+}
+
+# ak_civil_date — days since 1970-01-01 as YYYY-MM-DD (the era
+# algorithm, one division chain, no loops over years).
+fn ak_civil_date(z: int) -> str {
+    let z2: int = z + 719468
+    let era: int = z2 / 146097
+    let doe: int = z2 - era * 146097
+    let yoe: int = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let y: int = yoe + era * 400
+    let doy: int = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp: int = (5 * doy + 2) / 153
+    let d: int = doy - (153 * mp + 2) / 5 + 1
+    let mut m: int = mp + 3
+    if mp >= 10 {
+        m = mp - 9
+    }
+    let mut yy: int = y
+    if m <= 2 {
+        yy = y + 1
+    }
+    return yy.to_str() + "-" + ak_pad2(m) + "-" + ak_pad2(d)
+}
+
+# ak_stamp_now — the --stamp clock, the same UTC second render the
+# entries use.
+fn ak_stamp_now() -> str uses Clock {
+    return ak_fmt_ts(system_time_unix_secs(system_time_now()))
+}
+
+# ----------------------------------------------------------------------------
+# Renders. Both documents are deterministic per input (the tree for
+# the brief, the ledger bytes for the report): sorted walks, no
+# wall-clock unless --stamp, two renders byte-identical — so a
+# hand-edited document is visible as a diff.
+# ----------------------------------------------------------------------------
+
+# render_brief — the RFP, a deterministic render of the live scope.
+fn ak_render_brief(root: str, scope: GgCensus, engagement: JsonValue,
+stamp: str) -> str uses Proc {
+    let tree: str = ak_git_sha(root)
+    let mut firm_line: str = "OPEN SOLICITATION — no contract on record; "
+    + "the terms below are the standing proposal, to be recorded "
+    + "verbatim at engage time"
+    if !json_is_null(engagement) {
+        firm_line = ak_jstr(engagement, "firm") + " — window "
+        + ak_jstr(engagement, "window") + ", basis on record: "
+        + py_repr(ak_jstr(engagement, "basis")) + " (signed by "
+        + ak_jstr(engagement, "by") + ")"
+    }
+    let mut L: list[str] = []
+    L.push("# Halis — third-party security audit brief (RFP)")
+    L.push("")
+    L.push("Regenerated from the live tree by `" + ak_tool() + "`.")
+    L.push("This document is generated, not maintained: the scope")
+    L.push("below is what the CURRENT tree still demonstrates,")
+    L.push("quoted live from the Stage 135 guarantee ledger. Do")
+    L.push("not hand-edit; regenerate with")
+    L.push("`bin/hls-auditkit brief --out AUDITBRIEF.md`.")
+    L.push("")
+    L.push("- Policy: " + ak_policy())
+    L.push("- Toolchain: " + ak_version())
+    L.push("- Tree: `" + tree + "`")
+    L.push("- Scope: the Stage 135 guarantee ledger, LIVE — "
+    + scope.n_rows.to_str() + " guarantees")
+    L.push("- Scope digest: `sha256:" + scope.digest + "`")
+    L.push("- Engagement: " + firm_line)
+    if stamp != "" {
+        L.push("- Generated: " + stamp)
+    }
+    L.push("")
+    L.push("## Why this brief is generated, not written")
+    L.push("")
+    L.push("An audit scoped by a document is scoped by prose, and")
+    L.push("prose rots: nothing fails when the code it describes")
+    L.push("changes. This brief is derived at render time from the")
+    L.push("guarantee ledger the toolchain itself is held to, so a")
+    L.push("guarantee removed from the ledger is removed from the")
+    L.push("audit the same day, and a guarantee the tree no longer")
+    L.push("demonstrates takes the brief with it — the render")
+    L.push("refuses. The scope digest above pins the ledger this")
+    L.push("brief was scoped from; the engagement records it")
+    L.push("again at signature time, and every evidence pass")
+    L.push("records the digest it actually ran, so a scope that")
+    L.push("moved under the auditors is a named fact, never a")
+    L.push("silence.")
+    L.push("")
+    L.push("## What the auditors are asked to do")
+    L.push("")
+    L.push("1. RE-DERIVE every anchor: each guarantee rests on named")
+    L.push("   enforcement points in the tree; find them, read them,")
+    L.push("   and say whether the mechanism is what the row claims.")
+    L.push("2. RE-RUN every probe through the real checker: the")
+    L.push("   fixtures are pinned refusals and panics; confirm the")
+    L.push("   toolchain still refuses and still panics as written.")
+    L.push("3. ATTEMPT the violation contracts, bounty-style: write")
+    L.push("   programs that should be refused and are not; the")
+    L.push("   contract of each row below is the boundary to attack.")
+    L.push("4. FILE findings per the protocol below — and nothing")
+    L.push("   else: an observation that maps onto no row and carries")
+    L.push("   no reproducer is out of the protocol by definition.")
+    L.push("")
+    L.push("## The findings protocol")
+    L.push("")
+    L.push("- The severity vocabulary is closed, five words, ranked:")
+    L.push("")
+    L.push("  | severity | rank | meaning |")
+    L.push("  |----------|-----:|---------|")
+    let sevs: list[str] = ak_severities()
+    let mut i: int = 0
+    while i < sevs.len() {
+        let sev: str = sevs.get(i)
+        L.push("  | " + sev + " | " + ak_severity_rank(sev).to_str()
+        + " | " + ak_severity_meaning(sev) + " |")
+        i = i + 1
+    }
+    L.push("")
+    L.push("- A finding names ONE guarantee id from the scope (the")
+    L.push("  `against` law); a finding against nothing in the scope")
+    L.push("  is refused naming the known rows.")
+    L.push("- A finding carries a REPRODUCER: a path that exists in")
+    L.push("  the tree, or inline text — never both, never neither.")
+    L.push("  A finding that cannot be reproduced is an opinion, and")
+    L.push("  opinions are not findings.")
+    L.push("- THE INDEPENDENCE LAW: findings are the AUDITORS' to")
+    L.push("  file — the project cannot author one, and an auditor")
+    L.push("  cannot triage one. The response is the project's to")
+    L.push("  give, with a written reason; an acceptance carries its")
+    L.push("  remediation commit, 40 hex naming a commit that exists.")
+    L.push("  An acceptance without its remediation is a wish, not a")
+    L.push("  fix.")
+    L.push("- Every evidence pass is run by SOMEONE, and the label")
+    L.push("  follows the roster, never the runner's mood: a pass by")
+    L.push("  a roster member is INDEPENDENT, anyone else's is")
+    L.push("  SELF-ASSESSED, and the report refuses to call a")
+    L.push("  self-run pass independent. Independence is a fact the")
+    L.push("  ledger names, not a fact it manufactures.")
+    L.push("")
+    L.push("## The commercial terms (the paid part)")
+    L.push("")
+    L.push("- The engagement is PAID. The fee basis is a term of the")
+    L.push("  contract, recorded verbatim at `engage` time, and the")
+    L.push("  kit refuses an engagement without one: a gratis review")
+    L.push("  is not an independent audit — it has no deliverable")
+    L.push("  schedule, no remedy when the deliverable is late, and")
+    L.push("  no obligation to file what it found.")
+    L.push("- The standing proposal, until the engagement records its")
+    L.push("  own basis: fixed fee against the scope census (the "
+    + scope.n_rows.to_str())
+    L.push("  rows below), half payable at engagement, half on")
+    L.push("  delivery of the report; expenses within the window")
+    L.push("  borne by the engaging party.")
+    L.push("- The deliverable schedule: findings filed within the")
+    L.push("  window; the project triages within 14 days of each")
+    L.push("  finding; remediation commits recorded at triage time.")
+    L.push("- The window is recorded at signature time as two ISO")
+    L.push("  dates; a window that ends before it starts is refused")
+    L.push("  at the signature, not discovered at the invoice.")
+    L.push("")
+    L.push("## The acceptance criteria for the engagement")
+    L.push("")
+    L.push("- every guarantee re-derived by the auditor's OWN pass —")
+    L.push("  an INDEPENDENT transcript on record by a roster member;")
+    L.push("- every finding carries a reproducer and names a row in")
+    L.push("  the scope;")
+    L.push("- every triage carries a written reason; every acceptance")
+    L.push("  carries its remediation commit;")
+    L.push("- the report renders from the chained ledger, and the")
+    L.push("  chain verifies — a tampered ledger is evidence, not a")
+    L.push("  document.")
+    L.push("")
+    L.push("## The scope census")
+    L.push("")
+    L.push("| id | family | severity | anchors | probes |")
+    L.push("|----|--------|----------|---------:|-------:|")
+    i = 0
+    while i < scope.n_rows {
+        L.push("| " + scope.ids.get(i) + " | " + scope.families.get(i)
+        + " | " + scope.severities.get(i) + " | "
+        + scope.anchor_counts.get(i).to_str() + " | "
+        + scope.probe_counts.get(i).to_str() + " |")
+        i = i + 1
+    }
+    L.push("")
+    L.push("### The rows in full — the boundary of each claim")
+    L.push("")
+    i = 0
+    while i < scope.n_rows {
+        L.push("#### " + scope.ids.get(i) + " — " + scope.families.get(i)
+        + " — " + scope.severities.get(i))
+        L.push("")
+        L.push("**Claim.** " + scope.claims.get(i))
+        L.push("")
+        L.push("**Violation contract.** " + scope.violations.get(i))
+        L.push("")
+        L.push("**Reproduction.** " + scope.repros.get(i))
+        L.push("")
+        i = i + 1
+    }
+    L.push("## Reporting channel (anchored live)")
+    L.push("")
+    L.push("The channel is anchored in SECURITY.md and checked at")
+    L.push("render time — if it moves, this brief refuses until it")
+    L.push("is re-anchored: open a private GitHub Security Advisory")
+    L.push("at")
+    L.push("<https://github.com/mhieuhonda/halis-lang/security/advisories/new>.")
+    L.push("The project follows a 90-day coordinated-disclosure")
+    L.push("window and aims to acknowledge within 48 hours. Please")
+    L.push("do NOT open a public issue for security reports.")
+    L.push("")
+    L.push("## Reproducing this brief")
+    L.push("")
+    L.push("`bin/hls-auditkit brief --out AUDITBRIEF.md` — two")
+    L.push("renders of one tree are byte-identical; `--stamp` adds a")
+    L.push("Generated line and nothing else. The scope digest above")
+    L.push("pins the ledger this brief was scoped from.")
+    L.push("")
+    return str_join(L, "\n") + "\n"
+}
+
+# render_report — the deliverable, deterministic per ledger.
+fn ak_render_report(path: str, kit_root: str, entries: list[JsonValue],
+log_sha: str, stamp: str) -> str {
+    let state: str = ak_derive_state(entries)
+    let engagement: JsonValue = ak_engagement_of(entries)
+    let passes: list[JsonValue] = ak_passes_of(entries)
+    let findings: list[JsonValue] = ak_findings_of(entries)
+    let triages: list[JsonValue] = ak_triages_of(entries)
+    let mut L: list[str] = []
+    L.push("# Halis security audit — engagement report")
+    L.push("")
+    L.push("Regenerated from the chained ledger by `" + ak_tool() + "`.")
+    L.push("Deterministic per ledger: two renders of one ledger are")
+    L.push("byte-identical. Do not hand-edit; regenerate with")
+    L.push("`bin/hls-auditkit report --out AUDITREPORT.md`.")
+    L.push("")
+    L.push("- Ledger: " + ak_relpath(path, kit_root) + " — "
+    + entries.len().to_str() + " entries, digest `sha256:"
+    + log_sha + "`")
+    L.push("- State: **" + state + "** — " + ak_state_meaning(state))
+    if !json_is_null(engagement) {
+        L.push("- Engagement: " + ak_jstr(engagement, "firm")
+        + " — roster: " + str_join(ak_jstrs(engagement, "roster"), ", "))
+        L.push("- Window: " + ak_jstr(engagement, "window"))
+        L.push("- Basis on record: " + py_repr(ak_jstr(engagement, "basis"))
+        + " (signed by " + ak_jstr(engagement, "by") + ")")
+        L.push("- Scope at engagement: `sha256:"
+        + ak_jstr(engagement, "scope_sha256") + "`")
+        let mut moved: JsonValue = json_null()
+        let mut i: int = 0
+        while i < passes.len() {
+            if ak_jstr(passes.get(i), "scope_sha256")
+            != ak_jstr(engagement, "scope_sha256") {
+                moved = passes.get(i)
+            }
+            i = i + 1
+        }
+        if !json_is_null(moved) {
+            L.push("- Scope drift: **MOVED** — engaged at `sha256:"
+            + ak_jstr(engagement, "scope_sha256").slice(0, 24)
+            + "`, and the last pass that ran a different scope "
+            + "did so at `sha256:"
+            + ak_jstr(moved, "scope_sha256").slice(0, 24) + "`:")
+            L.push("  the scope moved under the auditors; every")
+            L.push("  pass above names the scope it actually ran.")
+        } else {
+            L.push("- Scope drift: none on record")
+        }
+    } else {
+        L.push("- Engagement: none on record — this ledger predates")
+        L.push("  its own contract, which no writer in this kit")
+        L.push("  produces; the chain refused to guess.")
+    }
+    if stamp != "" {
+        L.push("- Generated: " + stamp)
+    }
+    L.push("")
+    L.push("## The evidence passes")
+    L.push("")
+    if passes.len() == 0 {
+        L.push("No evidence pass on record. The engagement has no")
+        L.push("transcript yet; nothing below is demonstrated by")
+        L.push("anyone, by anyone, in any role.")
+    } else {
+        L.push("| # | by | role | independence | scope | outcome |"
+        + " guarantees |")
+        L.push("|---|----|------|--------------|-------|---------|"
+        + "------------|")
+        let mut i2: int = 0
+        while i2 < passes.len() {
+            let e: JsonValue = passes.get(i2)
+            let mut label: str = "SELF-ASSESSED"
+            if ak_jbool(e, "independent") {
+                label = "INDEPENDENT"
+            }
+            L.push("| " + ak_jint(e, "seq").to_str() + " | "
+            + ak_jstr(e, "by") + " | " + ak_jstr(e, "role") + " | "
+            + label + " | " + ak_jstr(e, "scope_sha256").slice(0, 12)
+            + " | " + ak_jstr(e, "outcome") + " | "
+            + ak_jint(e, "verified_guarantees").to_str() + "/"
+            + ak_jint(e, "total_guarantees").to_str() + " |")
+            i2 = i2 + 1
+        }
+        L.push("")
+        let newest: JsonValue = passes.get(passes.len() - 1)
+        let mut newest_i: JsonValue = json_null()
+        let mut i3: int = 0
+        while i3 < passes.len() {
+            if ak_jbool(passes.get(i3), "independent") {
+                newest_i = passes.get(i3)
+            }
+            i3 = i3 + 1
+        }
+        if !json_is_null(newest_i) {
+            L.push("**Independent pass on record:** "
+            + ak_jstr(newest_i, "by") + ", " + ak_fmt_ts(
+            ak_jint(newest_i, "timestamp")) + " — the")
+            L.push("latest such pass, by the auditors' own roster.")
+            if !ak_jbool(newest, "independent") {
+                L.push("The latest pass overall was run by the")
+                L.push("project itself (SELF-ASSESSED); both records")
+                L.push("stand, and each is labelled by who ran it.")
+            }
+        } else {
+            L.push("**No independent pass on record.** The latest")
+            L.push("pass was run by the project itself and is")
+            L.push("labelled SELF-ASSESSED; this report refuses to")
+            L.push("call it independent — independence is a fact the")
+            L.push("ledger names, not a fact it manufactures.")
+        }
+        if ak_jstr(newest, "outcome") == "failed" {
+            L.push("")
+            L.push("**The latest pass FAILED** — the refusals it")
+            L.push("recorded, verbatim:")
+            let refs: list[JsonValue] = ak_jarr(newest, "refusals")
+            let mut r: int = 0
+            while r < refs.len() {
+                L.push("- " + json_str_value(refs.get(r)))
+                r = r + 1
+            }
+        }
+    }
+    L.push("")
+    L.push("## The findings")
+    L.push("")
+    if findings.len() == 0 {
+        L.push("No findings on record. A clean pass so far — the")
+        L.push("state line honestly stays underway, because the")
+        L.push("ledger cannot know the auditors rested; this report")
+        L.push("is the deliverable either way.")
+    } else {
+        L.push("| id | severity | against | title | filed by |"
+        + " reproducer |")
+        L.push("|----|----------|---------|-------|-----------|"
+        + "------------|")
+        let ordered: list[JsonValue] = ak_sorted_by_id(findings)
+        let mut i4: int = 0
+        while i4 < ordered.len() {
+            let f: JsonValue = ordered.get(i4)
+            let mut repro: str = ak_jstr(f, "repro_mode") + ": "
+            + ak_jstr(f, "repro_value")
+            if ak_jstr(f, "repro_mode") == "text" && repro.len() > 64 {
+                repro = repro.slice(0, 61) + "..."
+            }
+            L.push("| " + ak_jstr(f, "id") + " | "
+            + ak_jstr(f, "severity") + " | " + ak_jstr(f, "against")
+            + " | " + ak_jstr(f, "title") + " | " + ak_jstr(f, "by")
+            + " | " + repro + " |")
+            i4 = i4 + 1
+        }
+    }
+    L.push("")
+    L.push("## The triage and remediation")
+    L.push("")
+    if triages.len() == 0 {
+        L.push("No triage on record yet — every finding above is")
+        L.push("still awaiting the project's response, with a")
+        L.push("written reason and, for acceptances, the remediation")
+        L.push("commit itself.")
+    } else {
+        L.push("| finding | verdict | by | reason | remediation |")
+        L.push("|---------|---------|----|--------|-------------|")
+        let ordered2: list[JsonValue] = ak_sorted_by_for(triages)
+        let mut i5: int = 0
+        while i5 < ordered2.len() {
+            let t: JsonValue = ordered2.get(i5)
+            let mut fix: str = "—"
+            if json_object_has(t, "fix") {
+                fix = ak_jstr(t, "fix")
+            }
+            L.push("| " + ak_jstr(t, "for") + " | "
+            + ak_jstr(t, "verdict") + " | " + ak_jstr(t, "by")
+            + " | " + ak_jstr(t, "reason") + " | " + fix + " |")
+            i5 = i5 + 1
+        }
+    }
+    L.push("")
+    L.push("## The state, honestly")
+    L.push("")
+    L.push("**" + str_to_upper_ascii(state) + ".** "
+    + ak_state_meaning(state))
+    L.push("The word is derived from the census on every render,")
+    L.push("never stored: responded requires every finding triaged;")
+    L.push("remediated requires every acceptance to carry its")
+    L.push("remediation commit. A finding-free audit stays underway")
+    L.push("— the ledger cannot know the auditors rested; the report")
+    L.push("is the deliverable either way.")
+    L.push("")
+    L.push("## The render contract")
+    L.push("")
+    L.push("No wall-clock unless `--stamp` (and then only the")
+    L.push("Generated line). The ledger digest above is the sha256")
+    L.push("of the raw ledger bytes: tamper with one byte of it and")
+    L.push("the chain names the line — a tampered ledger is")
+    L.push("evidence, not a document, and nothing renders from it.")
+    L.push("")
+    return str_join(L, "\n") + "\n"
+}
+
+# ak_jstrs — a json string array as plain strs.
+fn ak_jstrs(v: JsonValue, key: str) -> list[str] {
+    let out: list[str] = []
+    let xs: list[JsonValue] = ak_jarr(v, key)
+    let mut i: int = 0
+    while i < xs.len() {
+        if json_is_str(xs.get(i)) {
+            out.push(json_str_value(xs.get(i)))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ak_sorted_by_id — findings in AF-NNN order (sorted(fid), the
+# report's table order).
+fn ak_sorted_by_id(items: list[JsonValue]) -> list[JsonValue] {
+    let out: list[JsonValue] = []
+    let mut i: int = 0
+    while i < items.len() {
+        out.push(items.get(i))
+        i = i + 1
+    }
+    let mut a: int = 1
+    while a < out.len() {
+        let v: JsonValue = out.get(a)
+        let mut b: int = a - 1
+        while b >= 0 && ak_jstr(out.get(b), "id") > ak_jstr(v, "id") {
+            out.set(b + 1, out.get(b))
+            b = b - 1
+        }
+        out.set(b + 1, v)
+        a = a + 1
+    }
+    return out
+}
+
+# ak_sorted_by_for — triages in AF-NNN order.
+fn ak_sorted_by_for(items: list[JsonValue]) -> list[JsonValue] {
+    let out: list[JsonValue] = []
+    let mut i: int = 0
+    while i < items.len() {
+        out.push(items.get(i))
+        i = i + 1
+    }
+    let mut a: int = 1
+    while a < out.len() {
+        let v: JsonValue = out.get(a)
+        let mut b: int = a - 1
+        while b >= 0 && ak_jstr(out.get(b), "for") > ak_jstr(v, "for") {
+            out.set(b + 1, out.get(b))
+            b = b - 1
+        }
+        out.set(b + 1, v)
+        a = a + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# Shared plumbing.
+# ----------------------------------------------------------------------------
+
+struct AkArgs {
+    cmd: str,
+    ledger: str, # "" = the default ledger under the kit's repo
+    root: str, # "" = the kit's repo
+    firm: str,
+    auditors: list[str],
+    window: str,
+    basis: str,
+    by: str,
+    out: str,
+    stamp: bool,
+    json: bool,
+    against: str,
+    severity: str,
+    title: str,
+    repro_path: str,
+    repro_text: str,
+    finding: str,
+    verdict: str,
+    reason: str,
+    fix: str
+}
+
+# ak_usage — the argparse refusal: exit 2, the grammar on stderr.
+fn ak_usage(line: str) -> int uses IO {
+    eprint("usage: hls-auditkit engage --firm F --auditor N "
+    + "[--auditor N ...] --window YYYY-MM-DD/YYYY-MM-DD --basis B "
+    + "[--by NAME] [--root PATH] [--ledger PATH]\n")
+    eprint("       hls-auditkit brief [--out FILE.md] [--stamp] "
+    + "[--root PATH] [--ledger PATH]\n")
+    eprint("       hls-auditkit evidence [--by NAME] [--json] "
+    + "[--root PATH] [--ledger PATH]\n")
+    eprint("       hls-auditkit file --against G-XXX-NN "
+    + "--severity critical|high|medium|low|info --title T "
+    + "(--repro-path P | --repro-text T) [--by NAME] "
+    + "[--root PATH] [--ledger PATH]\n")
+    eprint("       hls-auditkit triage AF-NNN "
+    + "--verdict accepted|disputed|out-of-scope --reason R "
+    + "[--fix <40-hex>] [--by NAME] [--root PATH] [--ledger PATH]\n")
+    eprint("       hls-auditkit report --out FILE.md [--stamp] "
+    + "[--root PATH] [--ledger PATH]\n")
+    eprint("       hls-auditkit status [--json] [--root PATH] "
+    + "[--ledger PATH]\n")
+    if line != "" {
+        eprint("error: " + line + "\n")
+    }
+    return 2
+}
+
+# ak_fail — a named refusal: the rule on stderr, exit 1.
+fn ak_fail(msg: str) -> int uses IO {
+    eprint("error: " + msg + "\n")
+    return 1
+}
+
+# ----------------------------------------------------------------------------
+# engage — the contract. One engagement per ledger, ever: a second is
+# a new ledger (the chain arithmetic makes history immutable anyway).
+# ----------------------------------------------------------------------------
+fn ak_cmd_engage(a: AkArgs, kit_root: str) -> int uses IO, Fs, Proc, Clock {
+    let root: str = a.root
+    let path: str = a.ledger
+    let read: LedgerRead = ak_read_ledger(path, false)
+    if !read.ok {
+        return ak_fail(read.err)
+    }
+    if !json_is_null(ak_engagement_of(read.entries)) {
+        return ak_fail("an engagement is already on record (seq 1, "
+        + ak_jstr(read.entries.get(0), "firm") + ") — a contract "
+        + "is not a draft; start a new ledger for a new engagement")
+    }
+    let mut by: str = a.by
+    if by == "" {
+        by = ak_default_actor(root)
+    }
+    let roster: list[str] = []
+    let mut i: int = 0
+    while i < a.auditors.len() {
+        if a.auditors.get(i) != "" {
+            roster.push(a.auditors.get(i))
+        }
+        i = i + 1
+    }
+    if roster.len() == 0 {
+        return ak_fail("the roster is empty — an audit with no "
+        + "auditors is a monologue")
+    }
+    if ak_in_strs(roster, by) {
+        return ak_fail("the signer (" + py_repr(by)
+        + ") cannot be on their own roster — independence starts "
+        + "at the signature")
+    }
+    let why: str = ak_parse_window(a.window)
+    if why != "" {
+        return ak_fail("the window " + py_repr(a.window)
+        + " is refused: " + why)
+    }
+    let scope: GgCensus = ak_scope(root)
+    if !scope.ok {
+        return ak_fail(scope.err)
+    }
+    let fields: list[str] = []
+    let vals: list[JsonValue] = []
+    fields.push("kind")
+    vals.push(json_str("engagement"))
+    fields.push("tool")
+    vals.push(json_str(ak_tool()))
+    fields.push("version")
+    vals.push(json_str(ak_version()))
+    fields.push("by")
+    vals.push(json_str(by))
+    fields.push("firm")
+    vals.push(json_str(a.firm))
+    fields.push("roster")
+    vals.push(jv_strs(roster))
+    fields.push("window")
+    vals.push(json_str(a.window))
+    fields.push("basis")
+    vals.push(json_str(a.basis))
+    fields.push("scope_sha256")
+    vals.push(json_str(scope.digest))
+    let w: LedgerRead = ak_append_chained(path, json_object(fields, vals))
+    if !w.ok {
+        return ak_fail(w.err)
+    }
+    let entry: JsonValue = w.entries.get(0)
+    println("engaged: " + a.firm + " — " + a.window)
+    println("  roster   : " + str_join(roster, ", "))
+    println("  basis    : " + py_repr(a.basis))
+    println("  signed by: " + by + " (the project side)")
+    println("  scope    : " + scope.n_rows.to_str() + " guarantees, sha256:"
+    + ak_jstr(entry, "scope_sha256").slice(0, 16))
+    println("  chain    : seq " + ak_jint(entry, "seq").to_str()
+    + ", prev " + ak_jstr(entry, "prev_hash").slice(0, 12) + "...")
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# brief — the RFP. The only command that may run before a ledger
+# exists: solicitation precedes contract.
+# ----------------------------------------------------------------------------
+fn ak_cmd_brief(a: AkArgs, kit_root: str) -> int uses IO, Fs, Proc {
+    let root: str = a.root
+    let path: str = a.ledger
+    let read: LedgerRead = ak_read_ledger(path, false)
+    if !read.ok {
+        return ak_fail(read.err)
+    }
+    let scope: GgCensus = ak_scope(root)
+    if !scope.ok {
+        return ak_fail(scope.err)
+    }
+    let problems: list[str] = ak_policy_anchor_ok(root, scope)
+    if problems.len() > 0 {
+        let mut i: int = 0
+        while i < problems.len() {
+            eprint("error: " + problems.get(i) + "\n")
+            i = i + 1
+        }
+        return 1
+    }
+    let mut stamp: str = ""
+    if a.stamp {
+        stamp = ak_stamp_now()
+    }
+    let doc: str = ak_render_brief(root, scope,
+    ak_engagement_of(read.entries), stamp)
+    if a.out != "" {
+        let out_path: str = ak_abs_out(a.out)
+        let d: str = ak_dirname(out_path)
+        if d != "" && d != "." {
+            proc_exec("mkdir -p '" + ak_shell_quote(d) + "'")
+        }
+        write_file(out_path, doc)
+        println("brief: " + ak_relpath(out_path, kit_root) + " ("
+        + scope.n_rows.to_str() + " guarantees, tree "
+        + ak_git_sha(root).slice(0, 12) + ")")
+    } else {
+        print(doc)
+    }
+    return 0
+}
+
+# ak_abs_out — --out anchored where the caller stands (the .py
+# os.path.abspath: relative to the cwd, however the path reads).
+fn ak_abs_out(p: str) -> str uses Fs, Proc {
+    if p.starts_with("/") {
+        return p
+    }
+    return ak_join(cwd_get(), p)
+}
+
+# ----------------------------------------------------------------------------
+# evidence — the pass. Re-runs the whole scope through the real
+# checker (the tree's own guarantee ledger, interpreted by the
+# bootstrap's evaluator), appends ONE chained transcript naming who
+# ran it. Fail-closed AND fail-recorded: a failed pass is a record,
+# not a shame.
+# ----------------------------------------------------------------------------
+fn ak_cmd_evidence(a: AkArgs, kit_root: str) -> int
+uses IO, Fs, Proc, Clock {
+    let root: str = a.root
+    let path: str = a.ledger
+    let read: LedgerRead = ak_read_ledger(path, true)
+    if !read.ok {
+        return ak_fail(read.err)
+    }
+    let eng: JsonValue = ak_engagement_of(read.entries)
+    if json_is_null(eng) {
+        return ak_fail("no engagement on record — engage first: the "
+        + "audit kit writes nothing before the contract does")
+    }
+    let mut by: str = a.by
+    if by == "" {
+        by = ak_default_actor(root)
+    }
+    let scope: GgCensus = ak_scope(root)
+    if !scope.ok {
+        return ak_fail(scope.err)
+    }
+    let pass: EvidenceOut = ak_evidence(root)
+    if pass.err != "" {
+        return ak_fail(pass.err)
+    }
+    let roster: list[str] = ak_jstrs(eng, "roster")
+    let mut fields: list[str] = []
+    let mut vals: list[JsonValue] = []
+    fields.push("kind")
+    vals.push(json_str("evidence"))
+    fields.push("tool")
+    vals.push(json_str(ak_tool()))
+    fields.push("version")
+    vals.push(json_str(ak_version()))
+    fields.push("by")
+    vals.push(json_str(by))
+    fields.push("role")
+    if ak_in_strs(roster, by) {
+        vals.push(json_str("auditor"))
+    } else {
+        vals.push(json_str("project"))
+    }
+    fields.push("independent")
+    vals.push(json_bool(ak_in_strs(roster, by)))
+    fields.push("tree")
+    vals.push(json_str(ak_git_sha(root)))
+    fields.push("scope_sha256")
+    vals.push(json_str(scope.digest))
+    fields.push("outcome")
+    if pass.ok {
+        vals.push(json_str("ok"))
+    } else {
+        vals.push(json_str("failed"))
+    }
+    fields.push("verified_guarantees")
+    vals.push(json_int(pass.verified))
+    fields.push("total_guarantees")
+    vals.push(json_int(scope.n_rows))
+    fields.push("anchors")
+    vals.push(json_int(pass.anchors))
+    fields.push("probes")
+    vals.push(json_int(pass.probes))
+    if !pass.ok {
+        fields.push("refusals")
+        vals.push(jv_strs(pass.refusals))
+    }
+    let w: LedgerRead = ak_append_chained(path,
+    json_object(fields, vals))
+    if !w.ok {
+        return ak_fail(w.err)
+    }
+    let entry: JsonValue = w.entries.get(0)
+    if a.json {
+        print(j_dump_at(entry, 0) + "\n")
+    } else {
+        let mut label: str = "SELF-ASSESSED"
+        if ak_jbool(entry, "independent") {
+            label = "INDEPENDENT"
+        }
+        println("transcript: seq " + ak_jint(entry, "seq").to_str()
+        + " by " + by + " — " + label)
+        println("  scope    : " + pass.verified.to_str() + "/"
+        + scope.n_rows.to_str() + " guarantees, "
+        + pass.anchors.to_str() + " anchors, "
+        + pass.probes.to_str() + " probes")
+        if pass.ok {
+            println("  outcome  : ok")
+        } else {
+            println("  outcome  : FAILED")
+        }
+    }
+    if !pass.ok {
+        eprint("EVIDENCE FAILED — " + pass.refusals.len().to_str()
+        + " refusal(s), recorded verbatim:\n")
+        let mut i: int = 0
+        while i < pass.refusals.len() {
+            eprint("  - " + pass.refusals.get(i) + "\n")
+            i = i + 1
+        }
+        return 1
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# file — the auditor's instrument.
+# ----------------------------------------------------------------------------
+fn ak_cmd_file(a: AkArgs, kit_root: str) -> int uses IO, Fs, Proc {
+    let root: str = a.root
+    let path: str = a.ledger
+    let read: LedgerRead = ak_read_ledger(path, true)
+    if !read.ok {
+        return ak_fail(read.err)
+    }
+    let eng: JsonValue = ak_engagement_of(read.entries)
+    if json_is_null(eng) {
+        return ak_fail("no engagement on record — engage first: the "
+        + "audit kit writes nothing before the contract does")
+    }
+    let mut by: str = a.by
+    if by == "" {
+        by = ak_default_actor(root)
+    }
+    let roster: list[str] = ak_jstrs(eng, "roster")
+    if !ak_in_strs(roster, by) {
+        return ak_fail(py_repr(by) + " is not on the auditor roster ("
+        + str_join(roster, ", ") + ") — findings are the auditors' "
+        + "to file. The roster is recorded at engage time and the "
+        + "ledger does not negotiate it afterwards")
+    }
+    let scope: GgCensus = ak_scope(root)
+    if !scope.ok {
+        return ak_fail(scope.err)
+    }
+    if !ak_in_strs(scope.ids, a.against) {
+        return ak_fail("finding against " + py_repr(a.against)
+        + " is refused — not one of the scope's rows (known: "
+        + str_join(scope.ids, ", ") + "); a finding against "
+        + "nothing in the scope is out of the protocol by definition")
+    }
+    if !ak_in_strs(ak_severities(), a.severity) {
+        return ak_fail("severity " + py_repr(a.severity)
+        + " is not one of critical/high/medium/low/info")
+    }
+    if a.title == "" {
+        return ak_fail("a finding without a title names nothing")
+    }
+    let have_path: bool = a.repro_path != ""
+    let have_text: bool = a.repro_text != ""
+    if have_path && have_text {
+        return ak_fail("a finding carries ONE reproducer, not two: "
+        + "--repro-path or --repro-text")
+    }
+    if !have_path && !have_text {
+        return ak_fail("a finding that cannot be reproduced is an "
+        + "opinion, and opinions are not findings — pass "
+        + "--repro-path or --repro-text")
+    }
+    let mut mode: str = "text"
+    let mut value: str = a.repro_text
+    if have_path {
+        if !file_exists(ak_join(root, a.repro_path)) {
+            return ak_fail("repro path " + py_repr(a.repro_path)
+            + " does not exist in the tree — a reproducer that "
+            + "points at nothing is a rumor")
+        }
+        mode = "path"
+        value = a.repro_path
+    }
+    let existing: list[JsonValue] = ak_findings_of(read.entries)
+    let mut next_n: int = 1
+    let mut i: int = 0
+    while i < existing.len() {
+        let id: str = ak_jstr(existing.get(i), "id")
+        let n: int = ak_to_int(id.slice(ak_finding_prefix().len(),
+        id.len()))
+        if n >= next_n {
+            next_n = n + 1
+        }
+        i = i + 1
+    }
+    let mut fid: str = ak_finding_prefix()
+    if next_n < 10 {
+        fid = fid + "00" + next_n.to_str()
+    } else if next_n < 100 {
+        fid = fid + "0" + next_n.to_str()
+    } else {
+        fid = fid + next_n.to_str()
+    }
+    let fields: list[str] = []
+    let vals: list[JsonValue] = []
+    fields.push("kind")
+    vals.push(json_str("finding"))
+    fields.push("tool")
+    vals.push(json_str(ak_tool()))
+    fields.push("version")
+    vals.push(json_str(ak_version()))
+    fields.push("id")
+    vals.push(json_str(fid))
+    fields.push("by")
+    vals.push(json_str(by))
+    fields.push("against")
+    vals.push(json_str(a.against))
+    fields.push("severity")
+    vals.push(json_str(a.severity))
+    fields.push("title")
+    vals.push(json_str(a.title))
+    fields.push("repro_mode")
+    vals.push(json_str(mode))
+    fields.push("repro_value")
+    vals.push(json_str(value))
+    let w: LedgerRead = ak_append_chained(path, json_object(fields, vals))
+    if !w.ok {
+        return ak_fail(w.err)
+    }
+    let entry: JsonValue = w.entries.get(0)
+    let mut shown: str = value
+    if shown.len() > 64 {
+        shown = shown.slice(0, 61) + "..."
+    }
+    println("filed " + fid + " (" + a.severity + ", against "
+    + a.against + ") by " + by + " — seq "
+    + ak_jint(entry, "seq").to_str())
+    println("  reproducer: " + mode + ": " + shown)
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# triage — the project's response.
+# ----------------------------------------------------------------------------
+fn ak_cmd_triage(a: AkArgs, kit_root: str) -> int uses IO, Fs, Proc {
+    let root: str = a.root
+    let path: str = a.ledger
+    let read: LedgerRead = ak_read_ledger(path, true)
+    if !read.ok {
+        return ak_fail(read.err)
+    }
+    let eng: JsonValue = ak_engagement_of(read.entries)
+    if json_is_null(eng) {
+        return ak_fail("no engagement on record — engage first: the "
+        + "audit kit writes nothing before the contract does")
+    }
+    let mut by: str = a.by
+    if by == "" {
+        by = ak_default_actor(root)
+    }
+    let roster: list[str] = ak_jstrs(eng, "roster")
+    if ak_in_strs(roster, by) {
+        return ak_fail(py_repr(by) + " is on the auditor roster — the "
+        + "response is the project's to give, and an auditor "
+        + "cannot triage their own finding")
+    }
+    let findings: list[JsonValue] = ak_findings_of(read.entries)
+    let triages: list[JsonValue] = ak_triages_of(read.entries)
+    let fid: str = a.finding
+    if !ak_is_finding_id(fid) {
+        return ak_fail("a finding id is AF-NNN, not " + py_repr(fid))
+    }
+    let mut on_record: bool = false
+    let mut filed: list[str] = []
+    let mut i: int = 0
+    while i < findings.len() {
+        if ak_jstr(findings.get(i), "id") == fid {
+            on_record = true
+        }
+        filed.push(ak_jstr(findings.get(i), "id"))
+        i = i + 1
+    }
+    if !on_record {
+        let names: str = str_join(ak_sort_strs(filed), ", ")
+        let mut shown: str = names
+        if names == "" {
+            shown = "none"
+        }
+        return ak_fail("no finding " + fid + " on record (filed: "
+        + shown + ")")
+    }
+    let mut prior: JsonValue = json_null()
+    i = 0
+    while i < triages.len() {
+        if ak_jstr(triages.get(i), "for") == fid {
+            prior = triages.get(i)
+        }
+        i = i + 1
+    }
+    if !json_is_null(prior) {
+        return ak_fail(fid + " already carries its triage (seq "
+        + ak_jint(prior, "seq").to_str() + ") — one finding, one "
+        + "response; the record is the response, not a negotiation")
+    }
+    if !ak_in_strs(ak_triage_verdicts(), a.verdict) {
+        return ak_fail("verdict " + py_repr(a.verdict)
+        + " is not one of accepted/disputed/out-of-scope")
+    }
+    if a.reason == "" {
+        return ak_fail("a triage without a reason is refused — the "
+        + "sanction law, on the other side of the table")
+    }
+    let fields: list[str] = []
+    let vals: list[JsonValue] = []
+    fields.push("kind")
+    vals.push(json_str("triage"))
+    fields.push("tool")
+    vals.push(json_str(ak_tool()))
+    fields.push("version")
+    vals.push(json_str(ak_version()))
+    fields.push("by")
+    vals.push(json_str(by))
+    fields.push("for")
+    vals.push(json_str(fid))
+    fields.push("verdict")
+    vals.push(json_str(a.verdict))
+    fields.push("reason")
+    vals.push(json_str(a.reason))
+    if a.verdict == "accepted" {
+        if a.fix == "" {
+            return ak_fail("an acceptance without its remediation is a "
+            + "wish, not a fix — pass --fix <40-hex commit>")
+        }
+        if !ak_is_hex40(a.fix) {
+            return ak_fail("the fix must be 40 hex, not "
+            + py_repr(a.fix))
+        }
+        let known: int = ak_commit_exists(root, a.fix)
+        if known == 0 {
+            return ak_fail("fix " + a.fix.slice(0, 12)
+            + " names no commit in this tree — a remediation that "
+            + "exists nowhere is a promise, not a commit")
+        }
+        if known < 0 {
+            println("  note: not a git tree — the fix is validated by "
+            + "shape only")
+        }
+        fields.push("fix")
+        vals.push(json_str(a.fix))
+    } else {
+        if a.fix != "" {
+            return ak_fail("only an acceptance carries a fix: a "
+            + a.verdict + " finding with a remediation is a "
+            + "contradiction — fix it first, then re-file")
+        }
+    }
+    let w: LedgerRead = ak_append_chained(path, json_object(fields, vals))
+    if !w.ok {
+        return ak_fail(w.err)
+    }
+    let entry: JsonValue = w.entries.get(0)
+    println("triaged " + fid + ": " + a.verdict + " by " + by
+    + " — seq " + ak_jint(entry, "seq").to_str())
+    println("  reason: " + py_repr(a.reason))
+    if json_object_has(entry, "fix") {
+        println("  fix    : " + ak_jstr(entry, "fix"))
+    }
+    return 0
+}
+
+# ak_sort_strs — insertion sort, the family's idiom.
+fn ak_sort_strs(xs: list[str]) -> list[str] {
+    let mut a: int = 1
+    while a < xs.len() {
+        let v: str = xs.get(a)
+        let mut b: int = a - 1
+        while b >= 0 && xs.get(b) > v {
+            xs.set(b + 1, xs.get(b))
+            b = b - 1
+        }
+        xs.set(b + 1, v)
+        a = a + 1
+    }
+    return xs
+}
+
+# ----------------------------------------------------------------------------
+# report — the deliverable.
+# ----------------------------------------------------------------------------
+fn ak_cmd_report(a: AkArgs, kit_root: str) -> int uses IO, Fs, Proc, Clock {
+    if a.out == "" {
+        eprint("error: report needs --out FILE.md\n")
+        return 2
+    }
+    let path: str = a.ledger
+    let read: LedgerRead = ak_read_ledger(path, true)
+    if !read.ok {
+        return ak_fail(read.err)
+    }
+    let mut stamp: str = ""
+    if a.stamp {
+        stamp = ak_stamp_now()
+    }
+    let doc: str = ak_render_report(path, kit_root, read.entries,
+    read.log_sha, stamp)
+    let out_path: str = ak_abs_out(a.out)
+    let d: str = ak_dirname(out_path)
+    if d != "" && d != "." {
+        proc_exec("mkdir -p '" + ak_shell_quote(d) + "'")
+    }
+    write_file(out_path, doc)
+    println("report: " + ak_relpath(out_path, kit_root) + " ("
+    + read.entries.len().to_str() + " entries, state "
+    + ak_derive_state(read.entries) + ")")
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# status — the census, one look.
+# ----------------------------------------------------------------------------
+fn ak_cmd_status(a: AkArgs, kit_root: str) -> int uses IO, Fs {
+    let path: str = a.ledger
+    let read: LedgerRead = ak_read_ledger(path, true)
+    if !read.ok {
+        return ak_fail(read.err)
+    }
+    let entries: list[JsonValue] = read.entries
+    let state: str = ak_derive_state(entries)
+    let eng: JsonValue = ak_engagement_of(entries)
+    let passes: list[JsonValue] = ak_passes_of(entries)
+    let findings: list[JsonValue] = ak_findings_of(entries)
+    let triages: list[JsonValue] = ak_triages_of(entries)
+    let mut n_ind: int = 0
+    let mut i: int = 0
+    while i < passes.len() {
+        if ak_jbool(passes.get(i), "independent") {
+            n_ind = n_ind + 1
+        }
+        i = i + 1
+    }
+    let sev_critical: int = ak_count_sev(findings, "critical")
+    let sev_high: int = ak_count_sev(findings, "high")
+    let sev_medium: int = ak_count_sev(findings, "medium")
+    let sev_low: int = ak_count_sev(findings, "low")
+    let sev_info: int = ak_count_sev(findings, "info")
+    let n_acc: int = ak_count_verdict(triages, "accepted")
+    let n_dis: int = ak_count_verdict(triages, "disputed")
+    let n_oos: int = ak_count_verdict(triages, "out-of-scope")
+    let mut n_fix: int = 0
+    i = 0
+    while i < triages.len() {
+        if json_object_has(triages.get(i), "fix") {
+            n_fix = n_fix + 1
+        }
+        i = i + 1
+    }
+    if a.json {
+        let fields: list[str] = []
+        let vals: list[JsonValue] = []
+        fields.push("tool")
+        vals.push(json_str(ak_tool()))
+        fields.push("version")
+        vals.push(json_str(ak_version()))
+        fields.push("policy")
+        vals.push(json_str(ak_policy()))
+        fields.push("ledger")
+        vals.push(json_str(path))
+        fields.push("state")
+        vals.push(json_str(state))
+        fields.push("state_meaning")
+        vals.push(json_str(ak_state_meaning(state)))
+        fields.push("entries")
+        vals.push(json_int(entries.len()))
+        if json_is_null(eng) {
+            fields.push("engagement")
+            vals.push(json_null())
+        } else {
+            let ef: list[str] = []
+            let ev: list[JsonValue] = []
+            ef.push("firm")
+            ev.push(json_str(ak_jstr(eng, "firm")))
+            ef.push("roster")
+            ev.push(jv_strs(ak_jstrs(eng, "roster")))
+            ef.push("window")
+            ev.push(json_str(ak_jstr(eng, "window")))
+            ef.push("basis")
+            ev.push(json_str(ak_jstr(eng, "basis")))
+            ef.push("by")
+            ev.push(json_str(ak_jstr(eng, "by")))
+            ef.push("scope_sha256")
+            ev.push(json_str(ak_jstr(eng, "scope_sha256")))
+            fields.push("engagement")
+            vals.push(json_object(ef, ev))
+        }
+        let evf: list[str] = []
+        let evv: list[JsonValue] = []
+        evf.push("passes")
+        evv.push(json_int(passes.len()))
+        evf.push("independent")
+        evv.push(json_int(n_ind))
+        evf.push("self_assessed")
+        evv.push(json_int(passes.len() - n_ind))
+        evf.push("latest_outcome")
+        if passes.len() > 0 {
+            evv.push(json_str(ak_jstr(passes.get(passes.len() - 1),
+            "outcome")))
+        } else {
+            evv.push(json_null())
+        }
+        fields.push("evidence")
+        vals.push(json_object(evf, evv))
+        let ff: list[str] = []
+        let fv: list[JsonValue] = []
+        ff.push("total")
+        fv.push(json_int(findings.len()))
+        ff.push("critical")
+        fv.push(json_int(sev_critical))
+        ff.push("high")
+        fv.push(json_int(sev_high))
+        ff.push("medium")
+        fv.push(json_int(sev_medium))
+        ff.push("low")
+        fv.push(json_int(sev_low))
+        ff.push("info")
+        fv.push(json_int(sev_info))
+        fields.push("findings")
+        vals.push(json_object(ff, fv))
+        let tf: list[str] = []
+        let tv: list[JsonValue] = []
+        tf.push("total")
+        tv.push(json_int(triages.len()))
+        tf.push("accepted")
+        tv.push(json_int(n_acc))
+        tf.push("disputed")
+        tv.push(json_int(n_dis))
+        tf.push("out_of_scope")
+        tv.push(json_int(n_oos))
+        fields.push("triage")
+        vals.push(json_object(tf, tv))
+        fields.push("fixes")
+        vals.push(json_int(n_fix))
+        print(j_dump_at(json_object(fields, vals), 0) + "\n")
+        return 0
+    }
+    println(ak_tool() + " " + ak_version() + " — "
+    + ak_relpath(path, kit_root))
+    println("  state     : " + state + " — " + ak_state_meaning(state))
+    if !json_is_null(eng) {
+        println("  engagement: " + ak_jstr(eng, "firm") + " — window "
+        + ak_jstr(eng, "window"))
+        println("              basis " + py_repr(ak_jstr(eng, "basis"))
+        + " (signed by " + ak_jstr(eng, "by") + ")")
+        println("              roster: "
+        + str_join(ak_jstrs(eng, "roster"), ", "))
+    } else {
+        println("  engagement: none on record")
+    }
+    if passes.len() > 0 {
+        println("  evidence  : " + passes.len().to_str()
+        + " pass(es) — " + n_ind.to_str() + " independent, "
+        + (passes.len() - n_ind).to_str()
+        + " self-assessed; latest outcome " + ak_jstr(
+        passes.get(passes.len() - 1), "outcome"))
+    } else {
+        println("  evidence  : no pass on record")
+    }
+    println("  findings  : " + findings.len().to_str()
+    + " on record — critical " + sev_critical.to_str() + ", high "
+    + sev_high.to_str() + ", medium " + sev_medium.to_str()
+    + ", low " + sev_low.to_str() + ", info " + sev_info.to_str())
+    println("  triage    : " + triages.len().to_str()
+    + " on record — accepted " + n_acc.to_str() + ", disputed "
+    + n_dis.to_str() + ", out-of-scope " + n_oos.to_str())
+    println("  fixes     : " + n_fix.to_str()
+    + " remediation commit(s) recorded")
+    return 0
+}
+
+fn ak_count_sev(findings: list[JsonValue], sev: str) -> int {
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < findings.len() {
+        if ak_jstr(findings.get(i), "severity") == sev {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn ak_count_verdict(triages: list[JsonValue], v: str) -> int {
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < triages.len() {
+        if ak_jstr(triages.get(i), "verdict") == v {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+# ----------------------------------------------------------------------------
+# main — the CLI. Flags in any order, --k v pairs, boolean flags, the
+# repeatable --auditor, triage's one positional; a grammar refusal is
+# exit 2, a ledger refusal names the rule on stderr (exit 1), the
+# command's contract holding is exit 0.
+# ----------------------------------------------------------------------------
+fn main() -> int uses IO, Fs, Proc, Args, Exit, Clock {
+    let argv: list[str] = args()
+    if argv.len() < 2 {
+        return ak_usage("")
+    }
+    # The kit's repo: argv0/../.., where bin/ and the default ledger
+    # live (the .py's dirname(dirname(__file__))).
+    let argv0: str = argv.get(0)
+    let mut kit_root: str = cwd_get()
+    if argv0.contains("/") {
+        kit_root = ak_dirname(ak_dirname(argv0))
+    }
+    let a: AkArgs = AkArgs {
+        cmd: argv.get(1), ledger: "", root: "",
+        firm: "", auditors: [], window: "", basis: "", by: "", out: "",
+        stamp: false, json: false, against: "", severity: "",
+        title: "", repro_path: "", repro_text: "", finding: "",
+        verdict: "", reason: "", fix: ""
+    }
+    let positionals: list[str] = []
+    let mut i: int = 2
+    while i < argv.len() {
+        let arg: str = argv.get(i)
+        if arg == "--auditor" {
+            if i + 1 >= argv.len() {
+                return ak_usage("--auditor needs a name")
+            }
+            i = i + 1
+            a.auditors.push(argv.get(i))
+        } else if arg == "--ledger" || arg == "--root" || arg == "--firm"
+        || arg == "--window" || arg == "--basis" || arg == "--by"
+        || arg == "--out" || arg == "--against" || arg == "--severity"
+        || arg == "--title" || arg == "--repro-path"
+        || arg == "--repro-text" || arg == "--verdict"
+        || arg == "--reason" || arg == "--fix" {
+            if i + 1 >= argv.len() {
+                return ak_usage(arg + " needs a value")
+            }
+            i = i + 1
+            let v: str = argv.get(i)
+            if arg == "--ledger" {
+                a.ledger = v
+            } else if arg == "--root" {
+                a.root = v
+            } else if arg == "--firm" {
+                a.firm = v
+            } else if arg == "--window" {
+                a.window = v
+            } else if arg == "--basis" {
+                a.basis = v
+            } else if arg == "--by" {
+                a.by = v
+            } else if arg == "--out" {
+                a.out = v
+            } else if arg == "--against" {
+                a.against = v
+            } else if arg == "--severity" {
+                a.severity = v
+            } else if arg == "--title" {
+                a.title = v
+            } else if arg == "--repro-path" {
+                a.repro_path = v
+            } else if arg == "--repro-text" {
+                a.repro_text = v
+            } else if arg == "--verdict" {
+                a.verdict = v
+            } else if arg == "--reason" {
+                a.reason = v
+            } else if arg == "--fix" {
+                a.fix = v
+            }
+        } else if arg == "--stamp" {
+            a.stamp = true
+        } else if arg == "--json" {
+            a.json = true
+        } else if arg.starts_with("--") {
+            return ak_usage("unknown option: " + arg)
+        } else {
+            positionals.push(arg)
+        }
+        i = i + 1
+    }
+    if a.ledger == "" {
+        a.ledger = ak_join(kit_root, ak_ledger_rel())
+    }
+    if a.root == "" {
+        a.root = kit_root
+    }
+    if a.cmd == "engage" {
+        if a.firm == "" || a.window == "" || a.basis == "" {
+            return ak_usage("engage needs --firm, --window and --basis")
+        }
+        return ak_cmd_engage(a, kit_root)
+    }
+    if a.cmd == "brief" {
+        return ak_cmd_brief(a, kit_root)
+    }
+    if a.cmd == "evidence" {
+        return ak_cmd_evidence(a, kit_root)
+    }
+    if a.cmd == "file" {
+        if a.against == "" || a.severity == "" || a.title == "" {
+            return ak_usage("file needs --against, --severity, --title "
+            + "and one reproducer")
+        }
+        return ak_cmd_file(a, kit_root)
+    }
+    if a.cmd == "triage" {
+        if positionals.len() != 1 {
+            return ak_usage("triage takes one finding id (AF-NNN)")
+        }
+        a.finding = positionals.get(0)
+        if a.verdict == "" {
+            return ak_usage("triage needs --verdict and --reason")
+        }
+        return ak_cmd_triage(a, kit_root)
+    }
+    if a.cmd == "report" {
+        return ak_cmd_report(a, kit_root)
+    }
+    if a.cmd == "status" {
+        return ak_cmd_status(a, kit_root)
+    }
+    return ak_usage("unknown command: " + a.cmd)
 }
