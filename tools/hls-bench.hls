@@ -1,0 +1,2908 @@
+# ============================================================================
+# tools/hls-bench.hls — the Stage 124 criterion-style micro-benchmark
+# runner, in Halis (the native twin of the Python hls-bench.py that
+# retired; same CLI, same wire protocol, same report layout, same
+# exits — compiled by the bootstrap's own hlc).
+# ----------------------------------------------------------------------------
+# The convention (unchanged from the .py years):
+#
+#   * a benchmark SUITE is a .hls file that defines NO `main`;
+#   * a BENCHMARK is a top-level `fn bench_<name>()` taking no
+#     parameters (the runner times the CALL, not the result; the
+#     synthesized loop binds the result into a type-shaped sink);
+#   * a THROUGHPUT UNIT is an optional companion `fn units_<name>()
+#     -> int` (one per iteration's work units);
+#   * `std.bench.mark_skip(reason)` skips the bench.
+#
+# The measurement rides ONE driver source, TWO backends:
+#
+#   interpreter -> a `bin/hlboot <driver>` child (the Stage-0
+#                  evaluator, the .py's fresh-Interp law behind a
+#                  process boundary — hltest's execution model);
+#   native      -> bin/hlc + cc compile the driver, the binary runs.
+#
+# The driver's plan constants are baked in as literals, so
+# `--fixed-iters` makes both backends emit the SAME (bench, iters)
+# plan — only the clock readings differ, which is exactly what must
+# differ.
+#
+# The wire protocol (reserved prefixes on stdout):
+#
+#   __HLBENCH_UNITS__ <bench> <units>
+#   __HLBENCH__ <bench> <iters> <elapsed_ns>
+#   __HLBENCH_HARNESS__ <iters> <elapsed_ns>
+#
+# Effects come from the REAL checker: the runner synthesizes a probe
+# (the suite + an empty main declaring the full effect universe),
+# compiles it through hlfront (the compiler linked as a library), and
+# reads ctx.computed_effects. Halis has no exceptions and hlfront's
+# checker dies on a bad program, so the probe runs in a CHILD of this
+# very binary (`--probe-check <file>`) whose 101 is the .py's
+# `except HLError` — the probe-child discipline every lab tool here
+# carries.
+#
+# Exit codes: 0 every selected bench measured (skips allowed) · 1 at
+# least one bench or file failed · 2 usage / IO error.
+# ============================================================================
+
+import "./hlfront.hls"
+import "std.str"
+import "std.json"
+import "std.result"
+import "std.math"
+import "std.fs"
+import "std.env"
+
+# ----------------------------------------------------------------------------
+# Constants — the .py's own numbers, unchanged.
+# ----------------------------------------------------------------------------
+
+fn TOOL_VERSION() -> str {
+    return "0.142.0-alpha"
+}
+
+fn PROTO_UNITS() -> str {
+    return "__HLBENCH_UNITS__ "
+}
+
+fn PROTO_HARNESS() -> str {
+    return "__HLBENCH_HARNESS__ "
+}
+
+fn PROTO_SAMPLE() -> str {
+    return "__HLBENCH__ "
+}
+
+fn PROTO_STEM() -> str {
+    return "__HLBENCH_"
+}
+
+fn SKIP_PREFIX() -> str {
+    return "__HLBENCH_SKIP__:"
+}
+
+fn BASELINE_DIR() -> str {
+    return ".hlbench"
+}
+
+fn DEFAULT_SAMPLES() -> int {
+    return 30
+}
+
+fn DEFAULT_MIN_ITERS() -> int {
+    return 1
+}
+
+fn DEFAULT_MAX_ITERS() -> int {
+    return 1073741824
+}
+
+# Bootstrap resamples for the confidence intervals (seeded from the
+# bench name through crc32 — the .py's own seeding, ported below — so
+# the same data yields the same report).
+fn BOOTSTRAP_B() -> int {
+    return 2000
+}
+
+fn ALPHA_PCT() -> float {
+    return 5.0
+}
+
+# int64 min / 2 — unreachable by the sink (the escape branch).
+fn SINK_ESCAPE() -> int {
+    return -4611686018427387904
+}
+
+# The full effect universe the probe driver declares on its main.
+fn PROBE_EFFECTS() -> str {
+    return "IO, Fs, Clock, Args, Exit, Net, Rand, Proc, Conc"
+}
+
+# ----------------------------------------------------------------------------
+# Small path helpers (the .py's os.path family, static).
+# ----------------------------------------------------------------------------
+
+fn hb_dirname(path: str) -> str {
+    let mut i: int = path.len() - 1
+    while i >= 0 {
+        if path.byte_at(i) == 47 {
+            if i == 0 {
+                return "/"
+            }
+            return path.slice(0, i)
+        }
+        i = i - 1
+    }
+    return "."
+}
+
+fn hb_basename(path: str) -> str {
+    let mut i: int = path.len() - 1
+    while i >= 0 {
+        if path.byte_at(i) == 47 {
+            return path.slice(i + 1, path.len())
+        }
+        i = i - 1
+    }
+    return path
+}
+
+fn hb_join(dir: str, name: str) -> str {
+    if dir == "" || dir == "." {
+        return name
+    }
+    if dir.byte_at(dir.len() - 1) == 47 {
+        return dir + name
+    }
+    return dir + "/" + name
+}
+
+fn hb_stem(name: str) -> str {
+    if name.ends_with(".hls") {
+        return name.slice(0, name.len() - 4)
+    }
+    return name
+}
+
+# ----------------------------------------------------------------------------
+# The statistics — the criterion-style numbers, ported 1:1 from the
+# .py (floats are IEEE doubles here too; Halis float IS binary64).
+# ----------------------------------------------------------------------------
+
+fn stat_mean(xs: list[float]) -> float {
+    let mut s: float = 0.0
+    let mut i: int = 0
+    while i < xs.len() {
+        s = s + xs.get(i)
+        i = i + 1
+    }
+    return s / xs.len().to_float()
+}
+
+fn stat_var_sample(xs: list[float]) -> float {
+    let mut n: int = xs.len()
+    if n < 2 {
+        return 0.0
+    }
+    let mut m: float = stat_mean(xs)
+    let mut s: float = 0.0
+    let mut i: int = 0
+    while i < n {
+        let mut d: float = xs.get(i) - m
+        s = s + d * d
+        i = i + 1
+    }
+    return s / (n - 1).to_float()
+}
+
+fn float_sort(xs: list[float]) -> list[float] {
+    let mut out: list[float] = []
+    let mut i: int = 0
+    while i < xs.len() {
+        out.push(xs.get(i))
+        i = i + 1
+    }
+    let mut a: int = 1
+    while a < out.len() {
+        let mut v: float = out.get(a)
+        let mut b: int = a - 1
+        while b >= 0 && out.get(b) > v {
+            out.set(b + 1, out.get(b))
+            b = b - 1
+        }
+        out.set(b + 1, v)
+        a = a + 1
+    }
+    return out
+}
+
+# quantile(sorted_xs, q) — linear-interpolation (numpy's 'linear').
+fn stat_quantile(sx: list[float], q: float) -> float {
+    let mut n: int = sx.len()
+    if n == 0 {
+        panic("quantile of empty data")
+    }
+    if n == 1 {
+        return sx.get(0)
+    }
+    let mut pos: float = q * (n - 1).to_float()
+    let mut lo: int = math_floor(pos).to_int()
+    let mut hi: int = math_ceil(pos).to_int()
+    if lo == hi {
+        return sx.get(lo)
+    }
+    let mut frac: float = pos - lo.to_float()
+    return sx.get(lo) * (1.0 - frac) + sx.get(hi) * frac
+}
+
+fn stat_median(xs: list[float]) -> float {
+    return stat_quantile(float_sort(xs), 0.5)
+}
+
+fn stat_mad(xs: list[float]) -> float {
+    let mut m: float = stat_median(xs)
+    let mut devs: list[float] = []
+    let mut i: int = 0
+    while i < xs.len() {
+        let mut d: float = xs.get(i) - m
+        if d < 0.0 {
+            devs.push(0.0 - d)
+        } else {
+            devs.push(d)
+        }
+        i = i + 1
+    }
+    return stat_median(devs)
+}
+
+struct Outliers {
+    low_severe: int,
+    low_mild: int,
+    high_mild: int,
+    high_severe: int
+}
+
+fn stat_classify_outliers(xs: list[float]) -> Outliers {
+    let mut s: list[float] = float_sort(xs)
+    let mut q1: float = stat_quantile(s, 0.25)
+    let mut q3: float = stat_quantile(s, 0.75)
+    let mut iqr: float = q3 - q1
+    let mut lo_mild: float = q1 - 1.5 * iqr
+    let mut hi_mild: float = q3 + 1.5 * iqr
+    let mut lo_sev: float = q1 - 3.0 * iqr
+    let mut hi_sev: float = q3 + 3.0 * iqr
+    let mut out: Outliers = Outliers {
+        low_severe: 0, low_mild: 0, high_mild: 0, high_severe: 0
+    }
+    let mut i: int = 0
+    while i < xs.len() {
+        let mut x: float = xs.get(i)
+        if x < lo_sev {
+            out.low_severe = out.low_severe + 1
+        } else if x < lo_mild {
+            out.low_mild = out.low_mild + 1
+        } else if x > hi_sev {
+            out.high_severe = out.high_severe + 1
+        } else if x > hi_mild {
+            out.high_mild = out.high_mild + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# crc32 of a str (the .py's zlib.crc32 over the utf-8 bytes; the
+# standard reflected poly 0xEDB88320, one round per byte).
+fn hb_crc32(s: str) -> int {
+    let mut crc: int = -1
+    let mut i: int = 0
+    while i < s.len() {
+        let mut b: int = s.byte_at(i)
+        let mut k: int = 0
+        while k < 8 {
+            let mut lsb: int = int_and(crc, 1)
+            crc = int_shr(crc, 1)
+            let mut bit: int = int_xor(lsb, int_and(b, 1))
+            if bit == 1 {
+                crc = int_xor(crc, -306674912)
+            }
+            b = int_shr(b, 1)
+            k = k + 1
+        }
+        i = i + 1
+    }
+    # the complement, read as unsigned 32-bit
+    return int_and(int_xor(crc, -1), 4294967295)
+}
+
+# The xorshift* PRNG the family uses (deterministic across runs;
+# rand_int's stream belongs to the runtime, not the tool).
+fn hb_seed_of(name: str) -> int {
+    return hb_crc32(name)
+}
+
+struct Rng {
+    s: int
+}
+
+fn rng_new(seed: int) -> Rng {
+    let mut r: Rng = Rng {
+        s: seed
+    }
+    if r.s == 0 {
+        r.s = 134
+    }
+    return r
+}
+
+# 31-bit xorshift (the fuzzer's own mixer — Halis arithmetic is
+# checked, so the state stays inside the positive int32 band).
+fn rng_next(r: Rng) -> int {
+    let mut x: int = r.s
+    x = int_xor(x, int_shl(x, 13))
+    x = int_xor(x, int_shr(x, 17))
+    x = int_xor(x, int_shl(x, 5))
+    r.s = int_and(x, 2147483647)
+    return r.s
+}
+
+fn rng_below(r: Rng, n: int) -> int {
+    if n <= 1 {
+        return 0
+    }
+    let mut v: int = rng_next(r)
+    if v < 0 {
+        v = 0 - v
+    }
+    return v % n
+}
+
+# bootstrap_ci(xs, stat_is_median, b, seed) — the percentile CI
+# (2.5, 97.5). stat is either median or mean (the two the .py uses).
+fn stat_bootstrap_ci(xs: list[float], stat_is_median: bool, b: int, seed: int) -> list[float] {
+    let mut out: list[float] = [0.0, 0.0]
+    let mut n: int = xs.len()
+    if n == 0 {
+        panic("bootstrap of empty data")
+    }
+    if n == 1 {
+        out.set(0, xs.get(0))
+        out.set(1, xs.get(0))
+        return out
+    }
+    let mut rng: Rng = rng_new(seed)
+    let mut stats: list[float] = []
+    let mut k: int = 0
+    while k < b {
+        let mut j: int = 0
+        while j < n {
+            let mut rs: list[float] = []
+            let mut q: int = 0
+            while q < n {
+                rs.push(xs.get(rng_below(rng, n)))
+                q = q + 1
+            }
+            if stat_is_median {
+                stats.push(stat_median(rs))
+            } else {
+                stats.push(stat_mean(rs))
+            }
+            j = j + 1
+        }
+        k = k + 1
+    }
+    let mut ss: list[float] = float_sort(stats)
+    out.set(0, stat_quantile(ss, 0.025))
+    out.set(1, stat_quantile(ss, 0.975))
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# Welch's t-test (the change-detection p-value) — the .py's betacf /
+# betainc pair, ported line for line.
+# ----------------------------------------------------------------------------
+
+fn welch_betacf(a: float, b: float, x: float) -> float {
+    let mut maxit: int = 300
+    let mut eps: float = 0.0000000000000003
+    let mut fpmin: float = 1e-300
+    let mut qab: float = a + b
+    let mut qap: float = a + 1.0
+    let mut qam: float = a - 1.0
+    let mut c: float = 1.0
+    let mut d: float = 1.0 - qab * x / qap
+    if d < fpmin && d > 0.0 - fpmin {
+        d = fpmin
+    }
+    if d == 0.0 {
+        d = fpmin
+    }
+    d = 1.0 / d
+    let mut h: float = d
+    let mut m: int = 1
+    while m <= maxit {
+        let mut m2: int = 2 * m
+        let mut aa: float = m.to_float() * (b - m.to_float()) * x
+        aa = aa / ((qam + m2.to_float()) * (a + m2.to_float()))
+        d = 1.0 + aa * d
+        if d == 0.0 {
+            d = fpmin
+        }
+        c = 1.0 + aa / c
+        if c == 0.0 {
+            c = fpmin
+        }
+        d = 1.0 / d
+        h = h * d * c
+        let mut aa2: float = 0.0 - (a + m.to_float()) * (qab + m.to_float()) * x
+        aa2 = aa2 / ((a + m2.to_float()) * (qap + m2.to_float()))
+        d = 1.0 + aa2 * d
+        if d == 0.0 {
+            d = fpmin
+        }
+        c = 1.0 + aa2 / c
+        if c == 0.0 {
+            c = fpmin
+        }
+        d = 1.0 / d
+        let mut dele: float = d * c
+        h = h * dele
+        if dele > 1.0 + eps || dele < 1.0 - eps {
+            # keep iterating
+        } else {
+            return h
+        }
+        m = m + 1
+    }
+    return h
+}
+
+fn welch_betainc(a: float, b: float, x: float) -> float {
+    if x <= 0.0 {
+        return 0.0
+    }
+    if x >= 1.0 {
+        return 1.0
+    }
+    let mut ln_bt: float = math_lgamma(a + b) - math_lgamma(a) - math_lgamma(b)
+    + a * math_log(x) + b * math_log(1.0 - x)
+    let mut bt: float = math_exp(ln_bt)
+    if x < (a + 1.0) / (a + b + 2.0) {
+        return bt * welch_betacf(a, b, x) / a
+    }
+    return 1.0 - bt * welch_betacf(b, a, 1.0 - x) / b
+}
+
+fn welch_p(a: list[float], b: list[float]) -> float {
+    let mut na: int = a.len()
+    let mut nb: int = b.len()
+    if na < 2 || nb < 2 {
+        return 1.0
+    }
+    let mut va: float = stat_var_sample(a)
+    let mut vb: float = stat_var_sample(b)
+    let mut denom: float = va / na.to_float() + vb / nb.to_float()
+    if denom <= 0.0 {
+        return 1.0
+    }
+    let mut t: float = (stat_mean(a) - stat_mean(b)) / math_sqrt(denom)
+    let mut num: float = denom * denom
+    let mut va2: float = (va / na.to_float()) * (va / na.to_float())
+    let mut vb2: float = (vb / nb.to_float()) * (vb / nb.to_float())
+    let mut den: float = va2 / (na - 1).to_float() + vb2 / (nb - 1).to_float()
+    if den <= 0.0 {
+        return 1.0
+    }
+    let mut df: float = num / den
+    return welch_betainc(df / 2.0, 0.5, df / (df + t * t))
+}
+
+# ----------------------------------------------------------------------------
+# Formatting — criterion's units and significant digits (%.4g, µs).
+# ----------------------------------------------------------------------------
+
+# fmt_sig_dec(x, dec) — x rendered with `dec` decimals, trailing
+# zeros and a trailing dot stripped (the %g tail law).
+fn fmt_sig_dec(x: float, dec: int) -> str {
+    let mut neg: bool = x < 0.0
+    let mut a: float = x
+    if neg {
+        a = 0.0 - x
+    }
+    let mut ip: int = math_floor(a).to_int()
+    let mut frac: float = a - math_floor(a)
+    let mut scale: float = math_power_float(10.0, dec)
+    let mut scaled_f: float = frac * scale
+    let mut scaled: int = math_floor(scaled_f + 0.5).to_int()
+    if scaled.to_str() == "1000000000000000000" {
+        # the rounding carried into the integer part
+        ip = ip + 1
+        scaled = 0
+    }
+    let mut pad: str = scaled.to_str()
+    while pad.len() < dec {
+        pad = "0" + pad
+    }
+    let mut out: str = ip.to_str()
+    if dec > 0 {
+        out = out + "." + pad
+    }
+    while out.len() > 0 && out.slice(out.len() - 1, out.len()) == "0" {
+        out = out.slice(0, out.len() - 1)
+    }
+    if out.len() > 0 && out.slice(out.len() - 1, out.len()) == "." {
+        out = out.slice(0, out.len() - 1)
+    }
+    if neg {
+        return "-" + out
+    }
+    return out
+}
+
+fn fmt_exp_str(e: int) -> str {
+    if e < 0 {
+        if - e < 10 {
+            return "-0" + (0 - e).to_str()
+        }
+        return "-" + (0 - e).to_str()
+    }
+    if e < 10 {
+        return "+0" + e.to_str()
+    }
+    return "+" + e.to_str()
+}
+
+# sig4(v) — Python's "%.4g": 4 significant digits, %g's fixed-vs-
+# scientific cut (exponent < -4 or >= 6 goes scientific).
+fn sig4(v: float) -> str {
+    if v == 0.0 {
+        return "0"
+    }
+    let mut neg: bool = v < 0.0
+    let mut a: float = v
+    if neg {
+        a = 0.0 - v
+    }
+    let mut e: int = math_floor(math_log10(a)).to_int()
+    if e < -4 || e > 5 {
+        let mut mant: float = a / math_power_float(10.0, e)
+        let mut body: str = fmt_sig_dec(mant, 3)
+        if neg {
+            return "-" + body + "e" + fmt_exp_str(e)
+        }
+        return body + "e" + fmt_exp_str(e)
+    }
+    let mut dec: int = 3 - e
+    if dec < 0 {
+        dec = 0
+    }
+    let mut out: str = fmt_sig_dec(a, dec)
+    if neg {
+        return "-" + out
+    }
+    return out
+}
+
+# fmt_dec2(x) — Python's "%.2f".
+fn fmt_dec2(x: float) -> str {
+    let mut neg: bool = x < 0.0
+    let mut a: float = x
+    if neg {
+        a = 0.0 - a
+    }
+    let mut scaled: int = math_floor(a * 100.0 + 0.5).to_int()
+    let mut whole: int = scaled / 100
+    let mut frac: int = scaled % 100
+    let mut fs: str = frac.to_str()
+    let mut pad: str = fs
+    while pad.len() < 2 {
+        pad = "0" + pad
+    }
+    let mut out: str = whole.to_str() + "." + pad
+    if neg {
+        return "-" + out
+    }
+    return out
+}
+
+# fmt_dec1(x) — Python's "%.1f" (the summary seconds).
+fn fmt_dec1(x: float) -> str {
+    let mut neg: bool = x < 0.0
+    let mut a: float = x
+    if neg {
+        a = 0.0 - a
+    }
+    let mut scaled: int = math_floor(a * 10.0 + 0.5).to_int()
+    let mut whole: int = scaled / 10
+    let mut frac: int = scaled % 10
+    let mut out: str = whole.to_str() + "." + frac.to_str()
+    if neg {
+        return "-" + out
+    }
+    return out
+}
+
+fn fmt_unit_disp(name: str) -> str {
+    # 'us' renders as the micro sign (µ = UTF-8 C2 B5).
+    if name == "us" {
+        return chr(194) + chr(181) + "s"
+    }
+    return name
+}
+
+# fmt_time(ns) — the largest unit that keeps the value >= 1, 4
+# significant digits (criterion's choice).
+fn fmt_time(ns: float) -> str {
+    let mut a: float = ns
+    if a < 0.0 {
+        a = 0.0 - a
+    }
+    if a >= 1e9 {
+        return sig4(ns / 1e9) + " " + fmt_unit_disp("s")
+    }
+    if a >= 1e6 {
+        return sig4(ns / 1e6) + " " + fmt_unit_disp("ms")
+    }
+    if a >= 1e3 {
+        return sig4(ns / 1e3) + " " + fmt_unit_disp("us")
+    }
+    return sig4(ns) + " " + fmt_unit_disp("ns")
+}
+
+fn fmt_pct(x: float, signed: bool) -> str {
+    if signed && x >= 0.0 {
+        return "+" + fmt_dec2(x) + "%"
+    }
+    return fmt_dec2(x) + "%"
+}
+
+fn fmt_rate(ups: float) -> str {
+    return sig4(ups) + " units/s"
+}
+
+fn bracket(lo: float, mid: float, hi: float) -> str {
+    return "[" + fmt_time(lo) + " " + fmt_time(mid) + " " + fmt_time(hi) + "]"
+}
+
+# ----------------------------------------------------------------------------
+# The protocol parser — line-oriented, reserved-prefix discipline.
+# ----------------------------------------------------------------------------
+
+struct ProtoRec {
+    kind: str, # "units" | "sample" | "harness"
+    bench: str,
+    a: int,
+    b: int
+}
+
+struct ProtoOut {
+    recs: list[ProtoRec],
+    err: str
+}
+
+fn is_uint(s: str) -> bool {
+    if s.len() == 0 {
+        return false
+    }
+    let mut i: int = 0
+    while i < s.len() {
+        let mut b: int = s.byte_at(i)
+        if b < 48 || b > 57 {
+            return false
+        }
+        i = i + 1
+    }
+    if s.len() > 1 && s.byte_at(0) == 48 {
+        return false
+    }
+    return true
+}
+
+fn clip64(s: str) -> str {
+    if s.len() <= 64 {
+        return s
+    }
+    return s.slice(0, 64)
+}
+
+# parse_protocol(stdout) — the records in emission order, or the
+# protocol error. A line STARTING with a record prefix must parse
+# exactly; a line CONTAINING the reserved stem that is not a record
+# is an error; everything else is skipped (benches may print).
+fn parse_protocol(text: str) -> ProtoOut {
+    let mut out: ProtoOut = ProtoOut {
+        recs: [], err: ""
+    }
+    let mut lines: list[str] = text.split("\n")
+    let mut li: int = 0
+    while li < lines.len() {
+        let mut line: str = lines.get(li)
+        li = li + 1
+        if line.len() == 0 {
+            continue
+        }
+        if line.starts_with(PROTO_UNITS()) {
+            let mut rest: str = line.slice(PROTO_UNITS().len(), line.len())
+            let mut parts: list[str] = rest.split(" ")
+            if parts.len() != 2 {
+                out.err = "protocol error: '" + clip64(line)
+                + "' is not '__HLBENCH_UNITS__ <bench> <units>'"
+                return out
+            }
+            let mut ub: str = parts.get(1)
+            if !is_uint(ub) {
+                out.err = "protocol error: malformed units count '"
+                + ub + "'"
+                return out
+            }
+            out.recs.push(ProtoRec {
+                kind: "units", bench: parts.get(0),
+                a: ub.to_int(), b: 0
+            })
+        } else if line.starts_with(PROTO_HARNESS()) {
+            let mut rest: str = line.slice(PROTO_HARNESS().len(), line.len())
+            let mut parts: list[str] = rest.split(" ")
+            if parts.len() != 2 {
+                out.err = "protocol error: '" + clip64(line)
+                + "' is not '__HLBENCH_HARNESS__ <iters> <elapsed>'"
+                return out
+            }
+            if !is_uint(parts.get(0)) || !is_uint(parts.get(1)) {
+                out.err = "protocol error: malformed harness record '"
+                + clip64(line) + "'"
+                return out
+            }
+            out.recs.push(ProtoRec {
+                kind: "harness", bench: "",
+                a: parts.get(0).to_int(), b: parts.get(1).to_int()
+            })
+        } else if line.starts_with(PROTO_SAMPLE()) {
+            let mut rest: str = line.slice(PROTO_SAMPLE().len(), line.len())
+            let mut parts: list[str] = rest.split(" ")
+            if parts.len() != 3 {
+                out.err = "protocol error: '" + clip64(line)
+                + "' is not '__HLBENCH__ <bench> <iters> <elapsed>'"
+                return out
+            }
+            if !is_uint(parts.get(1)) || !is_uint(parts.get(2)) {
+                out.err = "protocol error: malformed sample record for '"
+                + clip64(parts.get(0)) + "'"
+                return out
+            }
+            out.recs.push(ProtoRec {
+                kind: "sample", bench: parts.get(0),
+                a: parts.get(1).to_int(), b: parts.get(2).to_int()
+            })
+        } else if line.contains(PROTO_STEM()) {
+            out.err = "protocol error: output contains the reserved "
+            + "prefix '__HLBENCH_' outside a record: '" + clip64(line) + "'"
+            return out
+        }
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# Driver synthesis — one small Halis program per benchmark.
+# ----------------------------------------------------------------------------
+
+fn eff_sorted_clause(effects: list[str]) -> str {
+    let mut uniq: list[str] = []
+    let mut i: int = 0
+    while i < effects.len() {
+        let mut e: str = effects.get(i)
+        let mut has: bool = false
+        let mut j: int = 0
+        while j < uniq.len() {
+            if uniq.get(j) == e {
+                has = true
+            }
+            j = j + 1
+        }
+        if !has {
+            uniq.push(e)
+        }
+        i = i + 1
+    }
+    let mut a: int = 1
+    while a < uniq.len() {
+        let mut v: str = uniq.get(a)
+        let mut b: int = a - 1
+        while b >= 0 && uniq.get(b) > v {
+            uniq.set(b + 1, uniq.get(b))
+            b = b - 1
+        }
+        uniq.set(b + 1, v)
+        a = a + 1
+    }
+    if uniq.len() == 0 {
+        return ""
+    }
+    let mut out: str = " uses " + uniq.get(0)
+    let mut k: int = 1
+    while k < uniq.len() {
+        out = out + ", " + uniq.get(k)
+        k = k + 1
+    }
+    return out
+}
+
+fn list_has_str(xs: list[str], x: str) -> bool {
+    let mut i: int = 0
+    while i < xs.len() {
+        if xs.get(i) == x {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# call_and_sink(call, ret) — the two statement lines that call the
+# bench inside the measured loop and keep its work observable.
+fn call_and_sink(call: str, ret: str) -> list[str] {
+    let mut r: str = ret
+    let mut expr: str = call + "()"
+    let mut out: list[str] = []
+    if r == "" || r == "void" {
+        out.push("        " + call + "()")
+        out.push("        sink = sink + 1")
+        return out
+    }
+    if r == "int" {
+        out.push("        let mut v: int = " + expr)
+        out.push("        sink = sink + (v - (v / 100) * 100)")
+        return out
+    }
+    if r == "bool" {
+        out.push("        let mut v: bool = " + expr)
+        out.push("        if v { sink = sink + 1 }")
+        return out
+    }
+    if r == "str" {
+        out.push("        let mut v: str = " + expr)
+        out.push("        sink = sink + v.len()")
+        return out
+    }
+    if r == "float" {
+        out.push("        let mut v: float = " + expr)
+        out.push("        if v > 0.0 { sink = sink + 1 }")
+        return out
+    }
+    out.push("        let mut v: " + r + " = " + expr)
+    out.push("        sink = sink + 1")
+    return out
+}
+
+# The plan — the .py's dict, made a struct.
+struct Plan {
+    mode: str, # "adaptive" | "fixed"
+    samples: int,
+    iters: int,
+    warmup_ns: int,
+    sample_time_ns: int,
+    min_iters: int,
+    max_iters: int
+}
+
+# synthesize_driver — the measurement driver for one bench, as a
+# single string (the .py's lines list joined by \n).
+fn synthesize_driver(bench_name: str, suite_basename: str, plan: Plan,
+bench_ret: str, bench_effects: list[str],
+units_name: str, units_effects: list[str]) -> str {
+    let mut run_set: list[str] = []
+    run_set.push(bench_name)
+    let mut run_effs: list[str] = []
+    let mut i: int = 0
+    while i < bench_effects.len() {
+        run_effs.push(bench_effects.get(i))
+        i = i + 1
+    }
+    if !list_has_str(run_effs, "IO") {
+        run_effs.push("IO")
+    }
+    let mut main_effs: list[str] = []
+    i = 0
+    while i < bench_effects.len() {
+        main_effs.push(bench_effects.get(i))
+        i = i + 1
+    }
+    if units_name != "" {
+        i = 0
+        while i < units_effects.len() {
+            if !list_has_str(main_effs, units_effects.get(i)) {
+                main_effs.push(units_effects.get(i))
+            }
+            i = i + 1
+        }
+    }
+    if !list_has_str(main_effs, "IO") {
+        main_effs.push("IO")
+    }
+    if !list_has_str(main_effs, "Clock") {
+        main_effs.push("Clock")
+    }
+    let mut ret: str = bench_ret
+    if ret == "" {
+        ret = "void"
+    }
+
+    let mut L: list[str] = []
+    L.push("# generated by hls-bench (Stage 124, " + TOOL_VERSION()
+    + ") - do not edit")
+    L.push("# suite: " + suite_basename)
+    L.push("# bench: " + bench_name)
+    L.push("import \"" + suite_basename + "\"")
+    L.push("")
+    L.push("fn __hlb_run(n: int)" + eff_sorted_clause(run_effs) + " {")
+    L.push("    let mut sink: int = 0")
+    L.push("    let mut i: int = 0")
+    L.push("    while i < n {")
+    let mut stmts: list[str] = call_and_sink(bench_name, ret)
+    i = 0
+    while i < stmts.len() {
+        L.push(stmts.get(i))
+        i = i + 1
+    }
+    L.push("        i = i + 1")
+    L.push("    }")
+    L.push("    if sink < " + SINK_ESCAPE().to_str() + " {")
+    L.push("        println(\"__HLBENCH_SINK__\")")
+    L.push("    }")
+    L.push("}")
+    L.push("")
+    L.push("fn __hlb_harness(n: int) {")
+    L.push("    let mut i: int = 0")
+    L.push("    while i < n {")
+    L.push("        i = i + 1")
+    L.push("    }")
+    L.push("}")
+    L.push("")
+    L.push("fn main()" + eff_sorted_clause(main_effs) + " {")
+    if units_name != "" {
+        L.push("    let u: int = " + units_name + "()")
+        L.push("    println(\"" + PROTO_UNITS().trim()
+        + " " + bench_name + " \" + u.to_str())")
+    }
+    if plan.mode == "fixed" {
+        L.push("    let iters: int = " + plan.iters.to_str())
+    } else {
+        L.push("    # warmup: doubling batches until the warmup budget is")
+        L.push("    # spent; the last (largest) batch estimates the cost of")
+        L.push("    # one iteration and sizes the measurement samples.")
+        L.push("    let mut n: int = 1")
+        L.push("    let mut dt: int = 0")
+        L.push("    let mut warming: bool = true")
+        L.push("    while warming {")
+        L.push("        let t0: int = instant_now_ns()")
+        L.push("        __hlb_run(n)")
+        L.push("        dt = instant_now_ns() - t0")
+        L.push("        if dt >= " + plan.warmup_ns.to_str() + " {")
+        L.push("            warming = false")
+        L.push("        } else if n >= " + plan.max_iters.to_str() + " {")
+        L.push("            warming = false")
+        L.push("        } else {")
+        L.push("            n = n * 2")
+        L.push("        }")
+        L.push("    }")
+        L.push("    let mut per_iter: int = dt / n")
+        L.push("    if per_iter < 1 {")
+        L.push("        per_iter = 1")
+        L.push("    }")
+        L.push("    let mut iters: int = " + plan.sample_time_ns.to_str()
+        + " / per_iter")
+        L.push("        if iters < " + plan.min_iters.to_str() + " {")
+        L.push("            iters = " + plan.min_iters.to_str())
+        L.push("        }")
+        L.push("        if iters > " + plan.max_iters.to_str() + " {")
+        L.push("            iters = " + plan.max_iters.to_str())
+        L.push("        }")
+    }
+    L.push("    let mut s: int = 0")
+    L.push("    while s < " + plan.samples.to_str() + " {")
+    L.push("        let t0: int = instant_now_ns()")
+    L.push("        __hlb_run(iters)")
+    L.push("        let d: int = instant_now_ns() - t0")
+    L.push("        println(\"" + PROTO_SAMPLE().trim() + " " + bench_name
+    + " \" + iters.to_str() + \" \" + d.to_str())")
+    L.push("        s = s + 1")
+    L.push("    }")
+    L.push("    # harness calibration: one batch of the empty loop at the")
+    L.push("    # same size - the loop cost every sample includes.")
+    L.push("    let th: int = instant_now_ns()")
+    L.push("    __hlb_harness(iters)")
+    L.push("    let dh: int = instant_now_ns() - th")
+    L.push("    println(\"" + PROTO_HARNESS().trim()
+    + " \" + iters.to_str() + \" \" + dh.to_str())")
+    L.push("}")
+    let mut out: str = ""
+    i = 0
+    while i < L.len() {
+        if i > 0 {
+            out = out + "\n"
+        }
+        out = out + L.get(i)
+        i = i + 1
+    }
+    return out + "\n"
+}
+
+# synthesize_probe — the suite + an empty main declaring the full
+# effect universe (the checker needs a program; the runner reads the
+# computed effects it writes).
+fn synthesize_probe(suite_basename: str) -> str {
+    return "# generated by hls-bench (Stage 124, " + TOOL_VERSION()
+    + ") - do not edit\n"
+    + "# probe: " + suite_basename + "\n"
+    + "import \"" + suite_basename + "\"\n"
+    + "\n"
+    + "fn main() uses " + PROBE_EFFECTS() + " {\n"
+    + "}\n"
+}
+
+# ----------------------------------------------------------------------------
+# Discovery + the suite convention.
+# ----------------------------------------------------------------------------
+
+# discover_files(paths, recurse) — expand files/dirs into a
+# deduplicated, sorted .hls list (dot-files skipped: the runner's own
+# temp drivers are dot-prefixed).
+fn discover_files(paths: list[str], recurse: bool) -> list[str] uses Fs, IO {
+    let mut out: list[str] = []
+    let mut i: int = 0
+    while i < paths.len() {
+        let mut p: str = paths.get(i)
+        i = i + 1
+        if p == "" {
+            continue
+        }
+        if fs_is_dir(p) {
+            let mut found: list[str] = []
+            hb_walk_dir(p, recurse, found)
+            let mut a: int = 0
+            while a < found.len() {
+                let mut f: str = found.get(a)
+                let mut base: str = hb_basename(f)
+                if base.ends_with(".hls")
+                && base.byte_at(0) != 46 {
+                    if !list_has_str(out, f) {
+                        out.push(f)
+                    }
+                }
+                a = a + 1
+            }
+        } else {
+            let mut base: str = hb_basename(p)
+            if base.ends_with(".hls") && file_exists(p) {
+                if !list_has_str(out, p) {
+                    out.push(p)
+                }
+            } else {
+                eprintln("hls-bench: skip (not .hls or not found): " + p)
+            }
+        }
+    }
+    return out
+}
+
+# hb_walk_dir(dir, recurse, out) — depth-first, entries sorted per
+# directory (os.listdir's sorted() + os.walk order).
+fn hb_walk_dir(dir: str, recurse: bool, out: list[str]) -> void uses Fs {
+    let mut names: list[str] = fs_read_dir(dir)
+    let mut i: int = 0
+    while i < names.len() {
+        let mut n: str = names.get(i)
+        let mut full: str = hb_join(dir, n)
+        if fs_is_dir(full) {
+            if recurse {
+                hb_walk_dir(full, recurse, out)
+            }
+        } else {
+            out.push(full)
+        }
+        i = i + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Suite parsing — the entry file alone, through the real lexer/parser
+# (hl_parse_file: single-file view, imports NOT followed).
+# ----------------------------------------------------------------------------
+
+struct FnEntry {
+    name: str,
+    params: int,
+    ret: str,
+    is_extern: bool,
+    is_method: bool,
+    line: int
+}
+
+# parse_suite(path) — the entry file's top-level fns in source order
+# (ctx.fn_order), the .py's _parse_entry. err != "" on a parse error.
+struct SuiteParse {
+    fns: list[FnEntry],
+    err: str
+}
+
+fn hb_dummy_fn() -> FnInfo {
+    return FnInfo {
+        name: "", params: [], ptypes: [], pmuts: [], ret: "",
+        effects: [], is_pure: false, body: [], is_method: false,
+        struct_of: "", typeparams: [], line: 0, is_extern: false,
+        requires_e: -1, ensures_e: -1, attr_stack_size: -1,
+        attr_no_red_zone: false, attr_irq_handler: false,
+        attr_irq_vector: -1, attr_inline: "", attr_hot: false,
+        attr_cold: false, attr_tail_call: false,
+        attr_panic_handler: false, attr_section: "", attr_align: -1,
+        src_file: "", param_preds: map_new(), ret_pred: "",
+        has_refinements: false, attr_secrets: "", attr_ct: false,
+        attr_deprecated: false, attr_deprecated_msg: "",
+        attr_taint_source: false, attr_taint_sinks: ""
+    }
+}
+
+fn parse_suite(path: str) -> SuiteParse uses IO, Fs {
+    let mut out: SuiteParse = SuiteParse {
+        fns: [], err: ""
+    }
+    let mut ctx: Ctx = hl_parse_file(path)
+    let mut i: int = 0
+    while i < ctx.fn_order.len() {
+        let mut name: str = ctx.fn_order.get(i)
+        let mut info: FnInfo = ctx.fns.get_or(name, hb_dummy_fn())
+        out.fns.push(FnEntry {
+            name: name,
+            params: info.params.len(),
+            ret: info.ret,
+            is_extern: info.is_extern,
+            is_method: info.is_method,
+            line: info.line
+        })
+        i = i + 1
+    }
+    return out
+}
+
+fn suite_fn(sp: SuiteParse, name: str) -> FnEntry {
+    let mut i: int = 0
+    while i < sp.fns.len() {
+        if sp.fns.get(i).name == name {
+            return sp.fns.get(i)
+        }
+        i = i + 1
+    }
+    return FnEntry {
+        name: "", params: 0, ret: "", is_extern: false,
+        is_method: false, line: 0
+    }
+}
+
+# ----------------------------------------------------------------------------
+# The probe child — the checker's computed effects, collected behind a
+# process boundary (the .py ran load+check in process; Halis has no
+# exceptions, so the parent re-execs itself with --probe-check and
+# reads the TSV the child prints on success).
+# ----------------------------------------------------------------------------
+
+struct ProbeOut {
+    ok: bool, # the child checked the program
+    detail: str, # the child's refusal (compile error) or TSV
+}
+
+# hb_probe_check(self_path, suite_path, probe_path) — run the probe
+# child: it loads probe_path through hlfront, checks it, and prints
+# one "fn<TAB>effect" TSV line per computed effect (the .py's
+# checker.computed_effects dict). The child's stderr carries the
+# compile error on refusal.
+fn hb_probe_check(self_path: str, probe_path: str) -> ProbeOut uses IO, Proc {
+    let mut out: ProbeOut = ProbeOut {
+        ok: false, detail: ""
+    }
+    let mut cargs: list[str] = ["--probe-check", probe_path]
+    let mut r: CapRes = hb_spawn_tool(self_path, cargs)
+    if r.code == 0 {
+        out.ok = true
+        out.detail = r.out
+        return out
+    }
+    out.detail = r.err.trim()
+    return out
+}
+
+# hb_spawn_tool — the family's child runner (stdio_pipe both ends,
+# alternate reads; hlboot_eval's law, local copy).
+struct CapRes {
+    code: int,
+    out: str,
+    err: str
+}
+
+fn hb_spawn_tool(prog: str, cargs: list[str]) -> CapRes uses Proc {
+    let mut pid: int = proc_spawn(prog, cargs, 0, 1, 1)
+    if pid < 1 {
+        return CapRes {
+            code: -1, out: "", err: "spawn failed: " + prog
+        }
+    }
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    let mut code: int = proc_wait(pid)
+    return CapRes {
+        code: code, out: out, err: err
+    }
+}
+
+# hb_run_probe_child(probe_path) — the child side of --probe-check:
+# load + check through hlfront, print the computed-effects TSV. Any
+# failure dies (the parent reads the exit code — the probe discipline).
+fn hb_run_probe_child(probe_path: str) -> int uses IO, Fs, Proc {
+    let mut ctx: Ctx = hl_load_crate(probe_path)
+    hl_check(ctx)
+    let mut keys: list[str] = ctx.computed_effects.keys()
+    let mut i: int = 0
+    while i < keys.len() {
+        let mut k: str = keys.get(i)
+        let mut effs: list[str] = ctx.computed_effects.get_or(k, empty_effs())
+        let mut j: int = 0
+        while j < effs.len() {
+            println(k + "\t" + effs.get(j))
+            j = j + 1
+        }
+        if effs.len() == 0 {
+            println(k + "\t")
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+# hb_computed_from_tsv(tsv) — "fn\teff" lines to the lookup helper.
+struct Computed {
+    keys: list[str],
+    effs: map[str, list[str]]
+}
+
+fn empty_effs() -> list[str] {
+    return[]
+}
+
+fn hb_computed_new() -> Computed {
+    return Computed {
+        keys: [], effs: map_new()
+    }
+}
+
+fn hb_computed_add(c: Computed, line: str) -> void {
+    let mut parts: list[str] = line.split("\t")
+    if parts.len() < 1 {
+        return
+    }
+    let mut k: str = parts.get(0)
+    let mut eff: str = ""
+    if parts.len() > 1 {
+        eff = parts.get(1)
+    }
+    if !c.effs.has(k) {
+        c.effs.set(k, [])
+        c.keys.push(k)
+    }
+    let mut lst: list[str] = c.effs.get_or(k, empty_effs())
+    if eff != "" {
+        lst.push(eff)
+    }
+}
+
+fn hb_computed_of(c: Computed, k: str) -> list[str] {
+    if c.effs.has(k) {
+        return c.effs.get_or(k, empty_effs())
+    }
+    let mut empty: list[str] = []
+    return empty
+}
+
+# ----------------------------------------------------------------------------
+# Baselines — .hlbench/<suite-stem>/<bench>.<name>.json beside the
+# suite file. Byte-stable records: sorted keys, fixed floats, no
+# timestamps.
+# ----------------------------------------------------------------------------
+
+fn baseline_path_for(filepath: str, bench_name: str, baseline_name: str) -> str {
+    let mut d: str = hb_dirname(filepath)
+    let mut stem: str = hb_stem(hb_basename(filepath))
+    return hb_join(d, BASELINE_DIR() + "/" + stem + "/" + bench_name
+    + "." + baseline_name + ".json")
+}
+
+# hb_json_float(x) — a json float literal, repr-shortest is approximated
+# by the %.17g round-trip law (the same double always writes the same
+# bytes; Python's repr picks the shortest that round-trips — the gate
+# only requires the record byte-stable under rewrite, which a fixed
+# format satisfies).
+
+fn hb_json_float(x: float) -> str {
+    let mut s: str = json_sig17(x)
+    if s.contains(".") || s.contains("e") || s.contains("inf") {
+        return s
+    }
+    return s + ".0"
+}
+
+fn json_sig17(x: float) -> str {
+    if x == 0.0 {
+        return "0.0"
+    }
+    if x != x {
+        return "NaN"
+    }
+    if x > 1.7976931348623157e308 {
+        return "Infinity"
+    }
+    if x < 0.0 - 1.7976931348623157e308 {
+        return "-Infinity"
+    }
+    let mut neg: bool = x < 0.0
+    let mut a: float = x
+    if neg {
+        a = 0.0 - x
+    }
+    let mut e: int = math_floor(math_log10(a)).to_int()
+    # try 15..17 significant digits; the first whose parse-back
+    # round-trips is the shortest stable form (Python's repr law).
+    let mut sig: int = 15
+    let mut body: str = ""
+    while sig <= 17 {
+        body = fmt_sig_dec_exp(a, e, sig)
+        if parse_float(body) * math_power_float(10.0, e) == a {
+            sig = 18
+        } else {
+            sig = sig + 1
+        }
+    }
+    let mut out: str = body + "e" + e.to_str()
+    if neg {
+        return "-" + out
+    }
+    return out
+}
+
+# fmt_sig_dec_exp(mant, e, sig) — mantissa with sig significant
+# digits, followed by "e<exp>" (scientific; the exponent's sign kept
+# so the round-trip multiply is exact).
+fn fmt_sig_dec_exp(mant: float, e: int, sig: int) -> str {
+    let mut dec: int = sig - 1
+    return fmt_sig_dec(mant, dec)
+}
+
+# parse_float(s) — a plain decimal float literal parser for the
+# round-trip check (digits, dot, optional e-exponent handled by the
+# caller's multiply).
+fn parse_float(s: str) -> float {
+    let mut parts: list[str] = s.split(".")
+    let mut whole: str = parts.get(0)
+    let mut frac: str = ""
+    if parts.len() > 1 {
+        frac = parts.get(1)
+    }
+    let mut v: float = whole.to_float()
+    let mut i: int = 0
+    let mut scale: float = 0.1
+    while i < frac.len() {
+        let mut d: int = frac.byte_at(frac.len() - 1 - i) - 48
+        v = v + d.to_float() * scale
+        scale = scale / 10.0
+        i = i + 1
+    }
+    return v
+}
+
+struct BaseRec {
+    backend: str,
+    bench: str,
+    estimates: list[float],
+    iters_total: int,
+    elapsed_total_ns: int,
+    samples: list[ProtoRec],
+    units: int, # 0 = none recorded
+    ok: bool,
+    err: str
+}
+
+# save_baseline — one record, byte-stable by construction.
+fn save_baseline(path: str, backend: str, bench_name: str,
+units: int, samples: list[ProtoRec],
+estimates: list[float]) -> void uses Fs, Proc {
+    let mut d: str = hb_dirname(path)
+    if d != "" && !file_exists(d) {
+        sh("mkdir -p '" + d + "'")
+    }
+    let mut it_total: int = 0
+    let mut el_total: int = 0
+    let mut i: int = 0
+    while i < samples.len() {
+        it_total = it_total + samples.get(i).a
+        el_total = el_total + samples.get(i).b
+        i = i + 1
+    }
+    let mut L: list[str] = []
+    L.push("{")
+    L.push(" \"backend\": \"" + backend + "\",")
+    L.push(" \"bench\": \"" + bench_name + "\",")
+    let mut es: str = " \"estimates_ns\": ["
+    i = 0
+    while i < estimates.len() {
+        if i > 0 {
+            es = es + ", "
+        }
+        es = es + hb_json_float(estimates.get(i))
+        i = i + 1
+    }
+    L.push(es + "],")
+    L.push(" \"elapsed_total_ns\": " + el_total.to_str() + ",")
+    L.push(" \"iters_total\": " + it_total.to_str() + ",")
+    let mut ss: str = " \"samples\": ["
+    i = 0
+    while i < samples.len() {
+        if i > 0 {
+            ss = ss + ", "
+        }
+        ss = ss + "[" + samples.get(i).a.to_str() + ", "
+        + samples.get(i).b.to_str() + "]"
+        i = i + 1
+    }
+    L.push(ss + "],")
+    L.push(" \"tool\": \"hls-bench\",")
+    if units > 0 {
+        L.push(" \"units\": " + units.to_str() + ",")
+    } else {
+        L.push(" \"units\": null,")
+    }
+    L.push(" \"version\": \"" + TOOL_VERSION() + "\"")
+    L.push("}")
+    let mut text: str = ""
+    i = 0
+    while i < L.len() {
+        if i > 0 {
+            text = text + "\n"
+        }
+        text = text + L.get(i)
+        i = i + 1
+    }
+    write_file(path + ".tmp", text + "\n")
+    sh("mv '" + path + ".tmp' '" + path + "'")
+}
+
+# load_baseline — a missing file is a usage error; anything that is
+# not exactly what save_baseline writes is corruption, reported.
+fn load_baseline(path: str) -> BaseRec uses Fs {
+    let mut out: BaseRec = BaseRec {
+        backend: "", bench: "",
+        estimates: [], iters_total: 0, elapsed_total_ns: 0,
+        samples: [], units: 0, ok: false, err: ""
+    }
+    if !file_exists(path) {
+        out.err = "baseline file not found: " + path
+        + " (record one first: hls-bench --save ...)"
+        return out
+    }
+    let mut raw: str = read_file(path)
+    let mut doc: Result[JsonValue, str] = json_parse_result(raw)
+    if result_is_err(doc) {
+        out.err = "baseline " + path + " is corrupt (not JSON: "
+        + result_err_or(doc, "parse error") + ")"
+        return out
+    }
+    let mut obj: JsonValue = result_unwrap(doc)
+    if !json_is_object(obj) {
+        out.err = "baseline " + path + " is corrupt (not an object)"
+        return out
+    }
+    if !json_object_has(obj, "backend") || !json_object_has(obj, "bench")
+    || !json_object_has(obj, "estimates_ns")
+    || !json_object_has(obj, "samples") {
+        out.err = "baseline " + path + " is corrupt (missing a core key)"
+        return out
+    }
+    out.backend = json_str_value(json_object_get(obj, "backend"))
+    out.bench = json_str_value(json_object_get(obj, "bench"))
+    let mut est: JsonValue = json_object_get(obj, "estimates_ns")
+    if !json_is_array(est) || est.arr.len() == 0 {
+        out.err = "baseline " + path + " is corrupt ('estimates_ns' must "
+        + "be a non-empty list of positive numbers)"
+        return out
+    }
+    let mut i: int = 0
+    while i < est.arr.len() {
+        let mut v: JsonValue = est.arr.get(i)
+        let mut f: float = 0.0
+        if json_is_int(v) {
+            f = json_int_value(v).to_float()
+        } else {
+            f = json_float_value(v)
+        }
+        if f <= 0.0 {
+            out.err = "baseline " + path + " is corrupt ('estimates_ns' "
+            + "must be a non-empty list of positive numbers)"
+            return out
+        }
+        out.estimates.push(f)
+        i = i + 1
+    }
+    let mut smp: JsonValue = json_object_get(obj, "samples")
+    i = 0
+    while i < smp.arr.len() {
+        let mut pair: JsonValue = smp.arr.get(i)
+        let mut it: int = 0
+        if json_is_int(pair.arr.get(0)) {
+            it = json_int_value(pair.arr.get(0))
+        } else {
+            it = json_float_value(pair.arr.get(0)).to_int()
+        }
+        let mut el: int = 0
+        if json_is_int(pair.arr.get(1)) {
+            el = json_int_value(pair.arr.get(1))
+        } else {
+            el = json_float_value(pair.arr.get(1)).to_int()
+        }
+        out.samples.push(ProtoRec {
+            kind: "sample", bench: "", a: it,
+            b: el
+        })
+        i = i + 1
+    }
+    if json_object_has(obj, "units") {
+        let mut u: JsonValue = json_object_get(obj, "units")
+        if json_is_int(u) {
+            out.units = json_int_value(u)
+        }
+    }
+    out.ok = true
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# The change block — criterion's classification over a loaded record.
+# ----------------------------------------------------------------------------
+
+struct Change {
+    baseline: str,
+    classification: str,
+    note: str,
+    p: float,
+    point_pct: float,
+    ci_lo_pct: float,
+    ci_hi_pct: float,
+    present: bool
+}
+
+# compare_to_baseline — relative change of the median with a
+# bootstrap CI, Welch p, and the classification line.
+fn compare_to_baseline(bench_name: str, cur_est: list[float],
+base: BaseRec, noise_pct: float, seed: int) -> Change {
+    let mut out: Change = Change {
+        baseline: base.bench,
+        classification: "", note: "", p: 1.0, point_pct: 0.0,
+        ci_lo_pct: 0.0, ci_hi_pct: 0.0, present: false
+    }
+    let mut cur_med: float = stat_median(cur_est)
+    let mut base_med: float = stat_median(base.estimates)
+    if base_med <= 0.0 {
+        return out
+    }
+    out.present = true
+    out.point_pct = (cur_med - base_med) / base_med * 100.0
+    # bootstrap the difference of medians (independent resamples),
+    # relative to the baseline median.
+    let mut rng: Rng = rng_new(seed)
+    let mut nb: int = base.estimates.len()
+    let mut diffs: list[float] = []
+    let mut k: int = 0
+    while k < BOOTSTRAP_B() {
+        let mut cs: list[float] = []
+        let mut j: int = 0
+        while j < cur_est.len() {
+            cs.push(cur_est.get(rng_below(rng, cur_est.len())))
+            j = j + 1
+        }
+        let mut bs: list[float] = []
+        j = 0
+        while j < nb {
+            bs.push(base.estimates.get(rng_below(rng, nb)))
+            j = j + 1
+        }
+        diffs.push((stat_median(cs) - stat_median(bs)) / base_med * 100.0)
+        k = k + 1
+    }
+    let mut sd: list[float] = float_sort(diffs)
+    out.ci_lo_pct = stat_quantile(sd, 0.025)
+    out.ci_hi_pct = stat_quantile(sd, 0.975)
+    out.p = welch_p(cur_est, base.estimates)
+    let mut significant: bool = out.p * 100.0 < ALPHA_PCT()
+    if !significant {
+        out.classification = "no-change"
+        out.note = "No change in performance detected."
+    } else if out.ci_lo_pct > noise_pct {
+        out.classification = "regressed"
+        out.note = "Performance has regressed."
+    } else if out.ci_hi_pct < 0.0 - noise_pct {
+        out.classification = "improved"
+        out.note = "Performance has improved."
+    } else {
+        out.classification = "within-noise"
+        out.note = "Change within noise threshold."
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# Bench results — one bench's outcome (report lines + json payload).
+# ----------------------------------------------------------------------------
+
+struct BenchResult {
+    file: str,
+    name: str,
+    status: str, # "ok" | "skip" | "fail"
+    detail: str,
+    report: list[str],
+    json_lines: list[str], # the per-bench json object body, pre-rendered
+    raw_samples: list[ProtoRec]
+}
+
+fn bench_result(file: str, name: str, status: str, detail: str) -> BenchResult {
+    return BenchResult {
+        file: file, name: name, status: status,
+        detail: detail, report: [], json_lines: [], raw_samples: []
+    }
+}
+
+# ----------------------------------------------------------------------------
+# The backends — one driver, two instruments.
+# ----------------------------------------------------------------------------
+
+struct RunOut {
+    rc: int,
+    out: str,
+    err: str,
+    spawn_failed: bool
+}
+
+# run_interpreter — bin/hlboot <driver>: the Stage-0 evaluator, the
+# .py's fresh-Interp law behind a process boundary. stdin closed so
+# read_line-driven benches die at EOF instead of hanging.
+fn run_interpreter(driver_path: str, hlboot: str) -> RunOut uses Proc {
+    let mut cargs: list[str] = [driver_path]
+    let mut pid: int = proc_spawn(hlboot, cargs, 2, 1, 1)
+    if pid < 1 {
+        return RunOut {
+            rc: -1, out: "", err: "cannot spawn " + hlboot
+            + " - run `make bin/hlboot` first", spawn_failed: true
+        }
+    }
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    let mut code: int = proc_wait(pid)
+    return RunOut {
+        rc: code, out: out, err: err, spawn_failed: false
+    }
+}
+
+# run_native — bin/hlc + cc compile the driver, then run the binary.
+# Build artifacts live under bin/.hlbench-tmp-<pid>/ (removed after).
+fn run_native(driver_path: str, hlc: str, cc: str, root: str) -> RunOut uses IO, Fs, Proc {
+    if !file_exists(hlc) {
+        return RunOut {
+            rc: 1, out: "", err: "native backend needs the "
+            + "native compiler at " + hlc + " - run `make bootstrap` first "
+            + "(or run without --native)", spawn_failed: true
+        }
+    }
+    let mut tmp: str = root + "/bin/.hlbench-tmp-" + proc_pid().to_str()
+    sh("rm -rf '" + tmp + "'")
+    sh("mkdir -p '" + tmp + "'")
+    let mut c_path: str = tmp + "/driver.c"
+    let mut bin_path: str = tmp + "/driver.bin"
+    let mut cwd_save: str = cwd_get()
+    env_set_current_dir(root)
+    let mut r1: CapRes = hb_spawn_tool(hlc, [driver_path, c_path])
+    if r1.code != 0 {
+        env_set_current_dir(cwd_save)
+        sh("rm -rf '" + tmp + "'")
+        return RunOut {
+            rc: 1, out: "", err: r1.err, spawn_failed: false
+        }
+    }
+    let mut r2: CapRes = hb_spawn_tool(cc, ["-O2", "-o", bin_path, c_path,
+    "-lm", "-pthread"])
+    if r2.code != 0 {
+        env_set_current_dir(cwd_save)
+        sh("rm -rf '" + tmp + "'")
+        return RunOut {
+            rc: 1, out: "", err: r2.err, spawn_failed: false
+        }
+    }
+    env_set_current_dir(cwd_save)
+    let mut r3: CapRes = hb_spawn_tool(bin_path, [])
+    sh("rm -rf '" + tmp + "'")
+    return RunOut {
+        rc: r3.code, out: r3.out, err: r3.err,
+        spawn_failed: false
+    }
+}
+
+# ----------------------------------------------------------------------------
+# One bench, end to end: synthesize, run, parse, statistics, baseline.
+# ----------------------------------------------------------------------------
+
+struct Cfg {
+    backend: str, # "interpreter" | "native"
+    hlc: str,
+    cc: str,
+    hlboot: str,
+    root: str,
+    grep: str,
+    plan: Plan,
+    save: str,
+    baseline: str,
+    noise_pct: float
+}
+
+fn measure_bench(filepath: str, bench: str, sp: SuiteParse,
+computed: Computed, cfg: Cfg, has_units: bool) -> BenchResult
+uses IO, Fs, Proc {
+    let mut base: str = bench.slice(6, bench.len())
+    let mut units_fn: str = ""
+    if has_units {
+        units_fn = "units_" + base
+    }
+    let mut suite_base: str = hb_basename(filepath)
+    let mut bench_effects: list[str] = hb_computed_of(computed, bench)
+    let mut units_effects: list[str] = hb_computed_of(computed, units_fn)
+    let mut be: FnEntry = suite_fn(sp, bench)
+    let mut ret: str = be.ret
+    if ret == "" {
+        ret = "void"
+    }
+    let mut src: str = synthesize_driver(bench, suite_base, cfg.plan, ret,
+    bench_effects, units_fn, units_effects)
+
+    # the driver sits BESIDE the suite (dot-prefixed), so the suite's
+    # relative imports resolve exactly where they resolve for any
+    # other importer.
+    let mut driver_path: str = hb_join(hb_dirname(filepath),
+    "." + bench + ".hlbench-driver.hls")
+    write_file(driver_path, src)
+    let mut r: RunOut = RunOut {
+        rc: 0, out: "", err: "", spawn_failed: false
+    }
+    if cfg.backend == "native" {
+        r = run_native(driver_path, cfg.hlc, cfg.cc, cfg.root)
+    } else {
+        r = run_interpreter(driver_path, cfg.hlboot)
+    }
+    sh("rm -f '" + driver_path + "'")
+
+    # classify the run itself before touching the records.
+    if r.spawn_failed {
+        return bench_result(filepath, bench, "fail", r.err)
+    }
+    if r.rc != 0 {
+        let mut text: str = r.err.trim()
+        if r.rc == 101 && text.contains(SKIP_PREFIX()) {
+            let mut idx: int = text.find(SKIP_PREFIX())
+            let mut rest: str = text.slice(idx + SKIP_PREFIX().len(),
+            text.len())
+            let mut cut: int = rest.find(" (at line ")
+            let mut reason: str = ""
+            if cut >= 0 {
+                reason = rest.slice(0, cut).trim()
+            } else {
+                reason = rest.trim()
+            }
+            return bench_result(filepath, bench, "skip", reason)
+        }
+        let mut tail: str = last_lines(text, 6)
+        return bench_result(filepath, bench, "fail",
+        "driver exited " + r.rc.to_str() + ":\n" + tail)
+    }
+
+    let mut proto: ProtoOut = parse_protocol(r.out)
+    if proto.err != "" {
+        return bench_result(filepath, bench, "fail", proto.err)
+    }
+
+    # split the records; every kind has an exact expected shape.
+    let mut units_val: int = 0
+    let mut harness: ProtoRec = ProtoRec {
+        kind: "", bench: "", a: 0, b: 0
+    }
+    let mut saw_harness: bool = false
+    let mut samples: list[ProtoRec] = []
+    let mut i: int = 0
+    while i < proto.recs.len() {
+        let mut rec: ProtoRec = proto.recs.get(i)
+        if rec.kind == "units" {
+            if rec.bench != bench {
+                return bench_result(filepath, bench, "fail",
+                "protocol error: units record for '" + rec.bench
+                + "' in the driver of '" + bench + "'")
+            }
+            units_val = rec.a
+        } else if rec.kind == "harness" {
+            harness = rec
+            saw_harness = true
+        } else {
+            if rec.bench != bench {
+                return bench_result(filepath, bench, "fail",
+                "protocol error: sample record for '" + rec.bench
+                + "' in the driver of '" + bench + "'")
+            }
+            samples.push(rec)
+        }
+        i = i + 1
+    }
+    if samples.len() != cfg.plan.samples {
+        return bench_result(filepath, bench, "fail",
+        "protocol error: expected " + cfg.plan.samples.to_str()
+        + " sample record(s), got " + samples.len().to_str()
+        + " - the driver's plan and the parser must agree")
+    }
+    if !saw_harness {
+        return bench_result(filepath, bench, "fail",
+        "protocol error: no __HLBENCH_HARNESS__ record (the driver "
+        + "always emits exactly one)")
+    }
+    i = 0
+    while i < samples.len() {
+        if samples.get(i).a <= 0 || samples.get(i).b <= 0 {
+            return bench_result(filepath, bench, "fail",
+            "protocol error: a sample reports elapsed <= 0 ns - the "
+            + "monotonic clock must advance across a measured batch")
+        }
+        i = i + 1
+    }
+    if has_units {
+        if units_val == 0 {
+            return bench_result(filepath, bench, "fail",
+            "protocol error: no __HLBENCH_UNITS__ record (the driver "
+            + "emits it before sampling)")
+        }
+        if units_val < 0 {
+            return bench_result(filepath, bench, "fail",
+            "units fn '" + units_fn + "' returned "
+            + units_val.to_str() + " - declare at least 1 unit per "
+            + "iteration")
+        }
+    }
+
+    # the statistics.
+    let mut est: list[float] = []
+    i = 0
+    while i < samples.len() {
+        let mut el: float = samples.get(i).b.to_float()
+        est.push(el / samples.get(i).a.to_float())
+        i = i + 1
+    }
+    let mut seed: int = hb_seed_of(bench)
+    let mut med: float = stat_median(est)
+    let mut mean: float = stat_mean(est)
+    let mut std: float = math_sqrt(stat_var_sample(est))
+    let mut m: float = stat_mad(est)
+    let mut med_ci: list[float] = stat_bootstrap_ci(est, true,
+    BOOTSTRAP_B(), seed)
+    let mut mean_ci: list[float] = stat_bootstrap_ci(est, false,
+    BOOTSTRAP_B(), seed + 1)
+    let mut outliers: Outliers = stat_classify_outliers(est)
+    let mut it_total: int = 0
+    let mut el_total: int = 0
+    i = 0
+    while i < samples.len() {
+        it_total = it_total + samples.get(i).a
+        el_total = el_total + samples.get(i).b
+        i = i + 1
+    }
+    let mut slope: float = el_total.to_float() / it_total.to_float()
+    let mut thrpt_pt: float = 0.0
+    let mut have_thrpt: bool = false
+    if units_val > 0 {
+        thrpt_pt = units_val.to_float() * it_total.to_float()
+        / (el_total.to_float() / 1e9)
+        have_thrpt = true
+    }
+    let mut thrpt_ci: list[float] = [0.0, 0.0]
+    if have_thrpt {
+        thrpt_ci = bootstrap_ci_slope(samples, units_val,
+        BOOTSTRAP_B(), seed + 2)
+    }
+    let mut harness_per_iter: float = 0.0
+    if harness.a > 0 {
+        harness_per_iter = harness.b.to_float() / harness.a.to_float()
+    }
+
+    # baseline comparison and recording (compare first, criterion's
+    # order — a name being both read and saved is compared before the
+    # save overwrites it).
+    let mut change: Change = Change {
+        baseline: "", classification: "",
+        note: "", p: 1.0, point_pct: 0.0, ci_lo_pct: 0.0, ci_hi_pct: 0.0,
+        present: false
+    }
+    if cfg.baseline != "" {
+        let mut bpath: str = baseline_path_for(filepath, bench, cfg.baseline)
+        let mut bobj: BaseRec = load_baseline(bpath)
+        if !bobj.ok {
+            return bench_result(filepath, bench, "fail", bobj.err)
+        }
+        if bobj.backend != cfg.backend {
+            return bench_result(filepath, bench, "fail",
+            "baseline '" + cfg.baseline + "' was recorded with "
+            + "backend '" + bobj.backend + "', this run is '"
+            + cfg.backend + "' - interpreter and native timings are "
+            + "different instruments; compare like with like")
+        }
+        change = compare_to_baseline(bench, est, bobj, cfg.noise_pct,
+        seed + 3)
+    }
+    if cfg.save != "" {
+        let mut units_rec: int = 0
+        if has_units {
+            units_rec = units_val
+        }
+        save_baseline(baseline_path_for(filepath, bench, cfg.save),
+        cfg.backend, bench, units_rec, samples, est)
+    }
+
+    # render + carry.
+    let mut res: BenchResult = bench_result(filepath, bench, "ok", "")
+    render_bench(res, med, med_ci, mean, mean_ci, std, m, outliers,
+    est.len(), slope, units_val, have_thrpt, thrpt_pt, thrpt_ci,
+    harness_per_iter, change)
+    res.raw_samples = samples
+    return res
+}
+
+# bootstrap_ci_slope — the THROUGHPUT CI under whole-pair resampling.
+fn bootstrap_ci_slope(samples: list[ProtoRec], units: int, b: int,
+seed: int) -> list[float] {
+    let mut out: list[float] = [0.0, 0.0]
+    let mut n: int = samples.len()
+    if n == 0 {
+        return out
+    }
+    if n == 1 {
+        let mut it: int = samples.get(0).a
+        let mut el: int = samples.get(0).b
+        let mut v: float = 0.0
+        if el > 0 {
+            v = units.to_float() * it.to_float() / el.to_float() * 1e9
+        }
+        out.set(0, v)
+        out.set(1, v)
+        return out
+    }
+    let mut rng: Rng = rng_new(seed)
+    let mut vals: list[float] = []
+    let mut k: int = 0
+    while k < b {
+        let mut its: int = 0
+        let mut els: int = 0
+        let mut j: int = 0
+        while j < n {
+            let mut idx: int = rng_below(rng, n)
+            its = its + samples.get(idx).a
+            els = els + samples.get(idx).b
+            j = j + 1
+        }
+        if els > 0 {
+            vals.push(units.to_float() * its.to_float()
+            / els.to_float() * 1e9)
+        }
+        k = k + 1
+    }
+    if vals.len() == 0 {
+        return out
+    }
+    let mut sv: list[float] = float_sort(vals)
+    out.set(0, stat_quantile(sv, 0.025))
+    out.set(1, stat_quantile(sv, 0.975))
+    return out
+}
+
+# last_lines(text, n) — the trailing n lines (the .py's tail detail).
+fn last_lines(text: str, n: int) -> str {
+    let mut lines: list[str] = text.split("\n")
+    let mut start: int = lines.len() - n
+    if start < 0 {
+        start = 0
+    }
+    let mut out: list[str] = []
+    let mut i: int = start
+    while i < lines.len() {
+        if lines.get(i) != "" {
+            out.push(lines.get(i))
+        }
+        i = i + 1
+    }
+    let mut s: str = ""
+    i = 0
+    while i < out.len() {
+        if i > 0 {
+            s = s + "\n"
+        }
+        s = s + out.get(i)
+        i = i + 1
+    }
+    return s
+}
+
+# ----------------------------------------------------------------------------
+# The report renderer — criterion's layout, the .py's exact wording.
+# ----------------------------------------------------------------------------
+
+fn render_bench(res: BenchResult, med: float, med_ci: list[float],
+mean: float, mean_ci: list[float], std: float, m: float,
+outliers: Outliers, n_samples: int, slope: float,
+units: int, have_thrpt: bool, thrpt_pt: float,
+thrpt_ci: list[float], harness_per_iter: float,
+change: Change) -> void uses IO {
+    res.report.push("time:   " + bracket(med_ci.get(0), med, med_ci.get(1)))
+    res.report.push("mean:   " + fmt_time(mean) + "  std dev: "
+    + fmt_time(std))
+    res.report.push("median: " + fmt_time(med) + "  med abs dev: "
+    + fmt_time(m))
+    if units > 0 {
+        let mut lo: str = fmt_dec2(thrpt_ci.get(0))
+        let mut hi: str = fmt_dec2(thrpt_ci.get(1))
+        res.report.push("thrpt:  [" + lo + " " + sig4(thrpt_pt) + " " + hi
+        + "]  (" + fmt_rate(thrpt_pt) + ")")
+    }
+    if change.present {
+        let mut rel: str = fmt_pct(change.ci_lo_pct, true) + " "
+        + fmt_pct(change.point_pct, true) + " "
+        + fmt_pct(change.ci_hi_pct, true)
+        let mut cmp_op: str = ">"
+        if change.p * 100.0 < ALPHA_PCT() {
+            cmp_op = "<"
+        }
+        res.report.push("change: [" + rel + "] (p = "
+        + fmt_dec2(change.p) + " " + cmp_op + " "
+        + fmt_dec2(ALPHA_PCT()) + "%)")
+        res.report.push(change.note)
+    }
+    let mut total_out: int = outliers.low_severe + outliers.low_mild
+    + outliers.high_mild + outliers.high_severe
+    if total_out > 0 {
+        let mut pct: float = total_out.to_float() / n_samples.to_float() * 100.0
+        res.report.push("Found " + total_out.to_str() + " outliers among "
+        + n_samples.to_str() + " samples (" + fmt_dec2(pct) + "%)")
+        if outliers.low_severe > 0 {
+            res.report.push("  " + outliers.low_severe.to_str() + " ("
+            + fmt_dec2(outliers.low_severe.to_float()
+            / n_samples.to_float() * 100.0) + "%) low severe")
+        }
+        if outliers.low_mild > 0 {
+            res.report.push("  " + outliers.low_mild.to_str() + " ("
+            + fmt_dec2(outliers.low_mild.to_float()
+            / n_samples.to_float() * 100.0) + "%) low mild")
+        }
+        if outliers.high_mild > 0 {
+            res.report.push("  " + outliers.high_mild.to_str() + " ("
+            + fmt_dec2(outliers.high_mild.to_float()
+            / n_samples.to_float() * 100.0) + "%) high mild")
+        }
+        if outliers.high_severe > 0 {
+            res.report.push("  " + outliers.high_severe.to_str() + " ("
+            + fmt_dec2(outliers.high_severe.to_float()
+            / n_samples.to_float() * 100.0) + "%) high severe")
+        }
+    }
+    res.report.push("harness: " + fmt_time(harness_per_iter)
+    + "/iter (the loop every sample includes)")
+
+    # the --json payload body (the caller wraps it in the doc).
+    let mut J: list[str] = res.json_lines
+    J.push("   \"estimates_ns_per_iter\": {")
+    J.push("    \"mad\": " + hb_json_float(m) + ",")
+    J.push("    \"mean\": " + hb_json_float(mean) + ",")
+    J.push("    \"mean_ci\": [" + hb_json_float(mean_ci.get(0)) + ", "
+    + hb_json_float(mean_ci.get(1)) + "],")
+    J.push("    \"median\": " + hb_json_float(med) + ",")
+    J.push("    \"median_ci\": [" + hb_json_float(med_ci.get(0)) + ", "
+    + hb_json_float(med_ci.get(1)) + "],")
+    J.push("    \"slope\": " + hb_json_float(slope) + ",")
+    J.push("    \"stddev\": " + hb_json_float(std))
+    J.push("   },")
+    if change.present {
+        J.push("   \"change\": {")
+        J.push("    \"baseline\": \"" + change.baseline + "\",")
+        J.push("    \"ci_pct\": [" + hb_json_float(change.ci_lo_pct) + ", "
+        + hb_json_float(change.ci_hi_pct) + "],")
+        J.push("    \"classification\": \"" + change.classification + "\",")
+        J.push("    \"note\": \"" + change.note + "\",")
+        J.push("    \"p\": " + hb_json_float(change.p) + ",")
+        J.push("    \"point_pct\": " + hb_json_float(change.point_pct))
+        J.push("   },")
+    }
+    J.push("   \"harness_ns_per_iter\": "
+    + hb_json_float(harness_per_iter) + ",")
+    J.push("   \"name\": \"" + res.name + "\",")
+    if total_out > 0 {
+        J.push("   \"outliers\": {")
+        J.push("    \"high_mild\": " + outliers.high_mild.to_str() + ",")
+        J.push("    \"high_severe\": " + outliers.high_severe.to_str() + ",")
+        J.push("    \"low_mild\": " + outliers.low_mild.to_str() + ",")
+        J.push("    \"low_severe\": " + outliers.low_severe.to_str())
+        J.push("   },")
+    }
+    if res.raw_samples.len() > 0 {
+        let mut ss: str = "   \"samples\": ["
+        let mut i: int = 0
+        while i < res.raw_samples.len() {
+            if i > 0 {
+                ss = ss + ", "
+            }
+            ss = ss + "[" + res.raw_samples.get(i).a.to_str() + ", "
+            + res.raw_samples.get(i).b.to_str() + "]"
+            i = i + 1
+        }
+        J.push(ss + "],")
+    }
+    J.push("   \"samples_count\": " + n_samples.to_str() + ",")
+    J.push("   \"status\": \"ok\",")
+    if have_thrpt && thrpt_ci.len() == 2 {
+        J.push("   \"throughput_ci\": [" + hb_json_float(thrpt_ci.get(0))
+        + ", " + hb_json_float(thrpt_ci.get(1)) + "],")
+    }
+    if have_thrpt {
+        J.push("   \"throughput_units_per_s\": "
+        + hb_json_float(thrpt_pt) + ",")
+    }
+    if units > 0 {
+        J.push("   \"units\": " + units.to_str())
+    } else {
+        J.push("   \"units\": null")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# One suite file, end to end.
+# ----------------------------------------------------------------------------
+
+struct FileOutcome {
+    file: str,
+    results: list[BenchResult],
+    n_ok: int
+}
+
+# run_file — discover, validate, and measure every bench in one suite
+# file. A bench-level problem becomes a failing (or skipping) result.
+fn run_file(filepath: str, cfg: Cfg, self_path: str) -> FileOutcome
+uses IO, Fs, Proc {
+    let mut out: FileOutcome = FileOutcome {
+        file: filepath, results: [],
+        n_ok: 0
+    }
+    let mut sp: SuiteParse = parse_suite(filepath)
+    if sp.err != "" {
+        out.results.push(bench_result(filepath, "<parse>", "fail",
+        "compile error: " + sp.err))
+        return out
+    }
+    let mut fns: list[FnEntry] = sp.fns
+
+    # the convention, enforced statically where it can be.
+    let mut has_main: bool = false
+    let mut bench_names: list[str] = []
+    let mut units_names: list[str] = []
+    let mut i: int = 0
+    while i < fns.len() {
+        let mut n: str = fns.get(i).name
+        if n == "main" {
+            has_main = true
+        }
+        if n.starts_with("bench_") {
+            bench_names.push(n)
+        }
+        if n.starts_with("units_") {
+            units_names.push(n)
+        }
+        i = i + 1
+    }
+    if has_main {
+        out.results.push(bench_result(filepath,
+        "<bench:" + hb_basename(filepath) + ">", "fail",
+        "bench suite defines main - bench files are libraries (the "
+        + "runner is their main; move the demo into examples/ or a "
+        + "test)"))
+        return out
+    }
+    if bench_names.len() == 0 && units_names.len() == 0 {
+        out.results.push(bench_result(filepath, "<no-benches>", "skip",
+        "no bench_* functions in this file"))
+        return out
+    }
+    let mut bench_bases: list[str] = []
+    i = 0
+    while i < bench_names.len() {
+        bench_bases.push(bench_names.get(i).slice(6,
+        bench_names.get(i).len()))
+        i = i + 1
+    }
+    i = 0
+    while i < units_names.len() {
+        let mut u: str = units_names.get(i)
+        if !list_has_str(bench_bases, u.slice(6, u.len())) {
+            out.results.push(bench_result(filepath,
+            "<bench:" + hb_basename(filepath) + ">", "fail",
+            "stray units fn '" + u + "' - no bench_" + u.slice(6,
+            u.len()) + " beside it (the convention is bench_<name> "
+            + "<-> units_<name>, same file)"))
+        }
+        i = i + 1
+    }
+    let mut static_fails: list[str] = []
+    i = 0
+    while i < out.results.len() {
+        if out.results.get(i).status == "fail" {
+            static_fails.push(out.results.get(i).name)
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < bench_names.len() {
+        let mut b: str = bench_names.get(i)
+        let mut d: FnEntry = suite_fn(sp, b)
+        if d.params > 0 {
+            out.results.push(bench_result(filepath, b, "fail",
+            "benchmark '" + b + "' takes " + d.params.to_str()
+            + " parameter(s) - benchmarks take none (the runner calls "
+            + "them with no arguments)"))
+        } else if d.is_extern {
+            out.results.push(bench_result(filepath, b, "fail",
+            "benchmark '" + b + "' is extern - benchmarks are HLS code "
+            + "the runner measures, not a declaration"))
+        } else {
+            let mut u: str = "units_" + b.slice(6, b.len())
+            let mut ud: FnEntry = suite_fn(sp, u)
+            if u != "" && ud.name == u {
+                if ud.params > 0 {
+                    out.results.push(bench_result(filepath, b, "fail",
+                    "units fn '" + u + "' must take no parameters "
+                    + "(the runner calls it with none), got "
+                    + ud.params.to_str()))
+                } else if ud.is_extern {
+                    out.results.push(bench_result(filepath, b, "fail",
+                    "units fn '" + u + "' is extern - the units count "
+                    + "is HLS code the runner executes, not a "
+                    + "declaration"))
+                } else if ud.ret != "int" {
+                    out.results.push(bench_result(filepath, b, "fail",
+                    "units fn '" + u + "' must return int (the work "
+                    + "units of ONE iteration), declares '" + ud.ret
+                    + "'"))
+                }
+            }
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < out.results.len() {
+        if out.results.get(i).status == "fail" {
+            if !list_has_str(static_fails, out.results.get(i).name) {
+                static_fails.push(out.results.get(i).name)
+            }
+        }
+        i = i + 1
+    }
+
+    # selection: --grep is a substring over the fn name.
+    let mut selected: list[str] = []
+    i = 0
+    while i < bench_names.len() {
+        let mut b: str = bench_names.get(i)
+        if cfg.grep == "" || b.contains(cfg.grep) {
+            selected.push(b)
+        }
+        i = i + 1
+    }
+    if selected.len() == 0 {
+        out.results.push(bench_result(filepath, "<no-benches>", "skip",
+        "no bench matches --grep '" + cfg.grep + "'"))
+        return out
+    }
+
+    # the probe: the REAL checker over the suite (through the probe
+    # child), reading the computed effects for the suite's functions.
+    let mut suite_base: str = hb_basename(filepath)
+    let mut probe_src: str = synthesize_probe(suite_base)
+    let mut probe_path: str = hb_join(hb_dirname(filepath),
+    ".probe.hlbench-probe.hls")
+    write_file(probe_path, probe_src)
+    let mut probe: ProbeOut = hb_probe_check(self_path, probe_path)
+    sh("rm -f '" + probe_path + "'")
+    if !probe.ok {
+        out.results.push(bench_result(filepath, "<check>", "fail",
+        "type error: " + probe.detail))
+        return out
+    }
+    let mut computed: Computed = hb_computed_new()
+    let mut plines: list[str] = probe.detail.split("\n")
+    i = 0
+    while i < plines.len() {
+        if plines.get(i).contains("\t") {
+            hb_computed_add(computed, plines.get(i))
+        }
+        i = i + 1
+    }
+
+    # per-bench measurement.
+    i = 0
+    while i < selected.len() {
+        let mut bench: str = selected.get(i)
+        if list_has_str(static_fails, bench) {
+            i = i + 1
+            continue
+        }
+        let mut base2: str = bench.slice(6, bench.len())
+        let mut units_fn2: str = "units_" + base2
+        let mut uentry: FnEntry = suite_fn(sp, units_fn2)
+        let mut has_units: bool = uentry.name == units_fn2
+        && !list_has_str(static_fails, units_fn2)
+        && suite_fn(sp, bench).params == 0
+        && !suite_fn(sp, bench).is_extern
+        let mut res: BenchResult = measure_bench(filepath, bench, sp,
+        computed, cfg, has_units)
+        out.results.push(res)
+        if res.status == "ok" {
+            out.n_ok = out.n_ok + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# sh(cmd) — the harness's shell one-liner (proc_exec's quiet twin).
+# ----------------------------------------------------------------------------
+
+fn sh(cmd: str) -> int uses Proc {
+    return proc_exec(cmd)
+}
+
+# ----------------------------------------------------------------------------
+# The CLI.
+# ----------------------------------------------------------------------------
+
+fn hb_usage_error(msg: str) -> int uses IO, Exit {
+    eprintln("hls-bench: " + msg)
+    eprintln("usage: hls-bench [--native] [--grep SUB] [--samples N]")
+    eprintln("                [--warmup-ms F] [--sample-time-ms F]")
+    eprintln("                [--min-iters N] [--max-iters N]")
+    eprintln("                [--fixed-iters N] [--save NAME]")
+    eprintln("                [--baseline NAME] [--noise PCT]")
+    eprintln("                [--json PATH] [--list] FILES...")
+    return 2
+}
+
+fn hb_self_path() -> str uses Args {
+    let mut a: list[str] = args()
+    if a.len() == 0 {
+        return ""
+    }
+    return a.get(0)
+}
+
+# hb_repo_root — the tree the tool lives in (argv[0]'s grandparent,
+# verified by the Makefile's prerequisite law).
+fn hb_repo_root(self_path: str) -> str uses Fs, IO, Proc {
+    let mut cand: str = hb_dirname(hb_dirname(self_path))
+    if file_exists(hb_join(cand, "src/hlc.hls")) {
+        return cand
+    }
+    return cwd_get()
+}
+
+# print_report — the full human report (hltest's summary shape).
+fn print_report(outcomes: list[FileOutcome], cfg: Cfg, total_s: float) -> list[int] uses IO {
+    let mut counts: list[int] = [0, 0, 0] # ok, skip, fail
+    println("== hls-bench: " + outcomes.len().to_str() + " file(s), backend="
+    + cfg.backend + ", " + cfg.plan.mode + " plan, "
+    + cfg.plan.samples.to_str() + " sample(s) ==")
+    let mut oi: int = 0
+    while oi < outcomes.len() {
+        let mut oc: FileOutcome = outcomes.get(oi)
+        oi = oi + 1
+        if oc.results.len() == 0 {
+            continue
+        }
+        println("")
+        println(oc.file)
+        let mut width: int = 0
+        let mut ri: int = 0
+        while ri < oc.results.len() {
+            let mut w: int = oc.results.get(ri).name.len()
+            if w > width {
+                width = w
+            }
+            ri = ri + 1
+        }
+        width = width + 2
+        ri = 0
+        while ri < oc.results.len() {
+            let mut r: BenchResult = oc.results.get(ri)
+            ri = ri + 1
+            if r.status == "ok" {
+                counts.set(0, counts.get(0) + 1)
+                let mut first: bool = true
+                let mut li: int = 0
+                while li < r.report.len() {
+                    if first {
+                        println("  " + r.name
+                        + str_repeat(" ", width - r.name.len())
+                        + r.report.get(li))
+                        first = false
+                    } else {
+                        println("  " + str_repeat(" ", width + 2)
+                        + r.report.get(li))
+                    }
+                    li = li + 1
+                }
+            } else if r.status == "skip" {
+                counts.set(1, counts.get(1) + 1)
+                println("  " + r.name + str_repeat(" ", width - r.name.len())
+                + "  " + r.detail)
+            } else {
+                counts.set(2, counts.get(2) + 1)
+                println("  " + r.name + str_repeat(" ", width - r.name.len())
+                + "  FAIL")
+                let mut dl: list[str] = r.detail.split("\n")
+                let mut di: int = 0
+                while di < dl.len() {
+                    if dl.get(di) != "" {
+                        println("        " + dl.get(di))
+                    }
+                    di = di + 1
+                }
+            }
+        }
+    }
+    println("")
+    println("== hls-bench: " + counts.get(0).to_str() + " bench measured, "
+    + counts.get(1).to_str() + " skip, " + counts.get(2).to_str()
+    + " fail in " + fmt_dec1(total_s) + " s ==")
+    return counts
+}
+
+# write_json — the machine-readable report.
+fn write_json(outcomes: list[FileOutcome], path: str, cfg: Cfg) -> void uses Fs, IO {
+    let mut L: list[str] = []
+    L.push("{")
+    L.push(" \"backend\": \"" + cfg.backend + "\",")
+    L.push(" \"files\": [")
+    let mut oi: int = 0
+    while oi < outcomes.len() {
+        let mut oc: FileOutcome = outcomes.get(oi)
+        oi = oi + 1
+        L.push("  {\"benches\": [")
+        let mut ri: int = 0
+        while ri < oc.results.len() {
+            let r: BenchResult = oc.results.get(ri)
+            ri = ri + 1
+            let mut comma: str = ""
+            if ri < oc.results.len() {
+                comma = ","
+            }
+            if r.status == "ok" {
+                L.push("   {")
+                let mut ji: int = 0
+                while ji < r.json_lines.len() {
+                    L.push(r.json_lines.get(ji))
+                    ji = ji + 1
+                }
+                L.push("   }" + comma)
+            } else if r.status == "skip" {
+                L.push("   {\"detail\": " + json_quote(r.detail)
+                + ", \"name\": \"" + r.name + "\", \"status\": \"skip\"}"
+                + comma)
+            } else {
+                L.push("   {\"detail\": " + json_quote(r.detail)
+                + ", \"name\": \"" + r.name + "\", \"status\": \"fail\"}"
+                + comma)
+            }
+        }
+        let mut tail4: str = ""
+        if oi < outcomes.len() {
+            tail4 = ","
+        }
+        L.push("  ], \"file\": \"" + oc.file + "\"}" + tail4)
+    }
+    L.push(" ],")
+    L.push(" \"noise_pct\": " + hb_json_float(cfg.noise_pct) + ",")
+    L.push(" \"plan\": {\"iters\": " + cfg.plan.iters.to_str()
+    + ", \"max_iters\": " + cfg.plan.max_iters.to_str()
+    + ", \"min_iters\": " + cfg.plan.min_iters.to_str()
+    + ", \"mode\": \"" + cfg.plan.mode + "\""
+    + ", \"sample_time_ns\": " + cfg.plan.sample_time_ns.to_str()
+    + ", \"samples\": " + cfg.plan.samples.to_str()
+    + ", \"warmup_ns\": " + cfg.plan.warmup_ns.to_str() + "},")
+    L.push(" \"tool\": \"hls-bench\",")
+    L.push(" \"version\": \"" + TOOL_VERSION() + "\"")
+    L.push("}")
+    let mut text: str = ""
+    let mut i: int = 0
+    while i < L.len() {
+        if i > 0 {
+            text = text + "\n"
+        }
+        text = text + L.get(i)
+        i = i + 1
+    }
+    write_file(path, text + "\n")
+    println("== json report written to " + path + " ==")
+}
+
+# json_quote(s) — a JSON string literal (the stdlib's encoder law,
+# local: control escapes + quote + backslash).
+fn json_quote(s: str) -> str {
+    let mut out: str = "\""
+    let mut i: int = 0
+    while i < s.len() {
+        let mut b: int = s.byte_at(i)
+        if b == 34 {
+            out = out + "\\\""
+        } else if b == 92 {
+            out = out + "\\\\"
+        } else if b == 10 {
+            out = out + "\\n"
+        } else if b == 9 {
+            out = out + "\\t"
+        } else if b == 13 {
+            out = out + "\\r"
+        } else if b < 32 {
+            out = out + "\\u" + hex4(b)
+        } else {
+            out = out + chr(b)
+        }
+        i = i + 1
+    }
+    return out + "\""
+}
+
+fn hex4(b: int) -> str {
+    let mut digits: str = "0123456789abcdef"
+    let mut hi: int = int_and(int_shr(b, 4), 15)
+    let mut lo: int = int_and(b, 15)
+    return digits.slice(hi, hi + 1) + digits.slice(lo, lo + 1)
+}
+
+fn hb_main_inner(argv: list[str]) -> int uses IO, Fs, Proc, Args, Exit, Clock {
+    let mut self_path: str = hb_self_path()
+    let mut root: str = hb_repo_root(self_path)
+
+    # the probe child: --probe-check <file> (checked by the parent).
+    if argv.len() > 1 && argv.get(1) == "--probe-check" {
+        if argv.len() < 3 {
+            eprintln("error: --probe-check needs a file")
+            return 2
+        }
+        return hb_run_probe_child(argv.get(2))
+    }
+
+    let mut files_arg: list[str] = []
+    let mut grep: str = ""
+    let mut native: bool = false
+    let mut hlc: str = hb_join(root, "bin/hlc")
+    let mut cc: str = "gcc"
+    let mut samples: int = DEFAULT_SAMPLES()
+    let mut warmup_ms: float = 30.0
+    let mut sample_time_ms: float = 15.0
+    let mut min_iters: int = DEFAULT_MIN_ITERS()
+    let mut max_iters: int = DEFAULT_MAX_ITERS()
+    let mut fixed_iters: int = 0
+    let mut save: str = ""
+    let mut baseline: str = ""
+    let mut noise_pct: float = 5.0
+    let mut json_path: str = ""
+    let mut list_only: bool = false
+
+    let mut i: int = 1
+    while i < argv.len() {
+        let mut a: str = argv.get(i)
+        if a == "--dir" || a == "-r" || a == "--recursive"
+        || a == "-j" || a == "--jobs" {
+            # --dir DIR, -j N: consumed with their value
+            if i + 1 >= argv.len() {
+                return hb_usage_error(a + " expects a value")
+            }
+            if a == "--dir" {
+                files_arg.push(argv.get(i + 1))
+            }
+            i = i + 2
+        } else if a == "-r" || a == "--recursive" {
+            i = i + 1
+        } else if a == "--grep" {
+            if i + 1 >= argv.len() {
+                return hb_usage_error("--grep expects a value")
+            }
+            grep = argv.get(i + 1)
+            i = i + 2
+        } else if a == "--native" {
+            native = true
+            i = i + 1
+        } else if a == "--hlc" {
+            if i + 1 >= argv.len() {
+                return hb_usage_error("--hlc expects a value")
+            }
+            hlc = argv.get(i + 1)
+            i = i + 2
+        } else if a == "--cc" {
+            if i + 1 >= argv.len() {
+                return hb_usage_error("--cc expects a value")
+            }
+            cc = argv.get(i + 1)
+            i = i + 2
+        } else if a == "--samples" {
+            if i + 1 >= argv.len() {
+                return hb_usage_error("--samples expects a value")
+            }
+            samples = argv.get(i + 1).to_int()
+            i = i + 2
+        } else if a == "--warmup-ms" {
+            if i + 1 >= argv.len() {
+                return hb_usage_error("--warmup-ms expects a value")
+            }
+            warmup_ms = argv.get(i + 1).to_float()
+            i = i + 2
+        } else if a == "--sample-time-ms" {
+            if i + 1 >= argv.len() {
+                return hb_usage_error("--sample-time-ms expects a value")
+            }
+            sample_time_ms = argv.get(i + 1).to_float()
+            i = i + 2
+        } else if a == "--min-iters" {
+            if i + 1 >= argv.len() {
+                return hb_usage_error("--min-iters expects a value")
+            }
+            min_iters = argv.get(i + 1).to_int()
+            i = i + 2
+        } else if a == "--max-iters" {
+            if i + 1 >= argv.len() {
+                return hb_usage_error("--max-iters expects a value")
+            }
+            max_iters = argv.get(i + 1).to_int()
+            i = i + 2
+        } else if a == "--fixed-iters" {
+            if i + 1 >= argv.len() {
+                return hb_usage_error("--fixed-iters expects a value")
+            }
+            fixed_iters = argv.get(i + 1).to_int()
+            i = i + 2
+        } else if a == "--save" {
+            if i + 1 >= argv.len() {
+                return hb_usage_error("--save expects a value")
+            }
+            save = argv.get(i + 1)
+            i = i + 2
+        } else if a == "--baseline" {
+            if i + 1 >= argv.len() {
+                return hb_usage_error("--baseline expects a value")
+            }
+            baseline = argv.get(i + 1)
+            i = i + 2
+        } else if a == "--noise" {
+            if i + 1 >= argv.len() {
+                return hb_usage_error("--noise expects a value")
+            }
+            noise_pct = argv.get(i + 1).to_float()
+            i = i + 2
+        } else if a == "--json" {
+            if i + 1 >= argv.len() {
+                return hb_usage_error("--json expects a value")
+            }
+            json_path = argv.get(i + 1)
+            i = i + 2
+        } else if a == "--list" {
+            list_only = true
+            i = i + 1
+        } else if a == "--version" {
+            println(TOOL_VERSION())
+            return 0
+        } else if a == "-h" || a == "--help" {
+            println("hls-bench — Halis benchmark runner (Stage 124)")
+            return 0
+        } else if a.starts_with("--") {
+            return hb_usage_error("unrecognized argument: " + a)
+        } else {
+            files_arg.push(a)
+            i = i + 1
+        }
+    }
+
+    if files_arg.len() == 0 {
+        let mut cwd: str = cwd_get()
+        if fs_is_dir(hb_join(cwd, "benches")) {
+            files_arg.push(hb_join(cwd, "benches"))
+        } else {
+            return hb_usage_error("no input files (pass .hls suite paths, "
+            + "or use --dir DIR; the default location is benches/)")
+        }
+    }
+    let mut files: list[str] = discover_files(files_arg, false)
+    if files.len() == 0 {
+        eprintln("hls-bench: no .hls suite files found")
+        return 2
+    }
+    if samples < 1 {
+        eprintln("hls-bench: --samples must be >= 1")
+        return 2
+    }
+    if fixed_iters != 0 && fixed_iters < 1 {
+        eprintln("hls-bench: --fixed-iters must be >= 1")
+        return 2
+    }
+
+    # --list: what would run, without measuring.
+    if list_only {
+        let mut fi: int = 0
+        while fi < files.len() {
+            let mut f: str = files.get(fi)
+            fi = fi + 1
+            let mut sp: SuiteParse = parse_suite(f)
+            if sp.err != "" {
+                println(f + ": error: " + sp.err)
+                continue
+            }
+            let mut marks: list[str] = []
+            let mut bi: int = 0
+            while bi < sp.fns.len() {
+                let mut n: str = sp.fns.get(bi).name
+                if n.starts_with("bench_") {
+                    let mut u: str = "units_" + n.slice(6, n.len())
+                    if suite_fn(sp, u).name == u {
+                        marks.push(n + "*")
+                    } else {
+                        marks.push(n)
+                    }
+                }
+                bi = bi + 1
+            }
+            let mut line: str = "(no bench_* functions)"
+            if marks.len() > 0 {
+                line = ""
+                let mut mi: int = 0
+                while mi < marks.len() {
+                    if mi > 0 {
+                        line = line + ", "
+                    }
+                    line = line + marks.get(mi)
+                    mi = mi + 1
+                }
+            }
+            println(f + ": " + line)
+        }
+        println("")
+        println("(* = units_<name> declared — the bench reports throughput)")
+        return 0
+    }
+
+    let mut plan: Plan = Plan {
+        mode: "adaptive",
+        samples: samples,
+        iters: 0,
+        warmup_ns: (warmup_ms * 1000000.0).to_int(),
+        sample_time_ns: (sample_time_ms * 1000000.0).to_int(),
+        min_iters: min_iters,
+        max_iters: max_iters
+    }
+    if fixed_iters != 0 {
+        plan.mode = "fixed"
+        plan.iters = fixed_iters
+    }
+
+    let mut cfg: Cfg = Cfg {
+        backend: "interpreter",
+        hlc: hlc,
+        cc: cc,
+        hlboot: hb_join(root, "bin/hlboot"),
+        root: root,
+        grep: grep,
+        plan: plan,
+        save: save,
+        baseline: baseline,
+        noise_pct: noise_pct
+    }
+    if native {
+        cfg.backend = "native"
+    }
+
+    if baseline != "" && save == baseline {
+        eprintln("hls-bench: note: comparing against and overwriting the "
+        + "same baseline '" + baseline + "' in one run (compare happens "
+        + "first)")
+    }
+
+    # pre-flight the baseline NAME before burning minutes of
+    # measurement: a baseline that does not exist is a usage error
+    # (exit 2, before the first bench runs).
+    let mut fi: int = 0
+    if baseline != "" {
+        while fi < files.len() {
+            let mut f: str = files.get(fi)
+            fi = fi + 1
+            let mut sp: SuiteParse = parse_suite(f)
+            if sp.err != "" {
+                continue
+            }
+            let mut bi: int = 0
+            while bi < sp.fns.len() {
+                let mut n: str = sp.fns.get(bi).name
+                bi = bi + 1
+                if !n.starts_with("bench_") {
+                    continue
+                }
+                if grep != "" && !n.contains(grep) {
+                    continue
+                }
+                let mut bpath: str = baseline_path_for(f, n, baseline)
+                if !file_exists(bpath) {
+                    eprintln("hls-bench: baseline '" + baseline
+                    + "' does not exist (e.g. expected " + bpath
+                    + ") - record one first: hls-bench --save " + baseline
+                    + " ...")
+                    return 2
+                }
+            }
+        }
+    }
+
+    eprintln("== hls-bench: " + files.len().to_str() + " suite file(s) ==")
+    let mut t0: int = instant_now_ns()
+    let mut outcomes: list[FileOutcome] = []
+    let mut mi: int = 0
+    while mi < files.len() {
+        let mut f: str = files.get(mi)
+        mi = mi + 1
+        outcomes.push(run_file(f, cfg, self_path))
+        eprintln("  [" + mi.to_str() + "/" + files.len().to_str()
+        + "] suites measured")
+    }
+    let mut total_s: float = (instant_now_ns() - t0).to_float() / 1e9
+
+    println("")
+    let mut counts: list[int] = print_report(outcomes, cfg, total_s)
+    if json_path != "" {
+        write_json(outcomes, json_path, cfg)
+    }
+    if counts.get(2) == 0 {
+        return 0
+    }
+    return 1
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let mut argv: list[str] = args()
+    return hb_main_inner(argv)
+}
+
+# ----------------------------------------------------------------------------
+# End of tools/hls-bench.hls
+# ============================================================================
