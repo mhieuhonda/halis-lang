@@ -1,0 +1,4041 @@
+# ============================================================================
+# tools/hls-finalaudit.hls — the Stage 144 final independent third-party
+# security audit, in Halis (the native twin of the Python
+# hls-finalaudit.py that retired; same nine commands, same three
+# anchors, same closure laws, same renders — compiled by the
+# bootstrap's own hlc).
+# ----------------------------------------------------------------------------
+# Roadmap Stage 144 is one phrase: "Independent third-party security
+# audit (final)". Stage 140 built the ENGAGEMENT kit; FINAL is a
+# property of the artifact, not of the paperwork. One ledger
+# (.hlfa/final.jsonl, machine-local like every ledger in this tree),
+# nine commands, and the laws that make an audit final:
+#
+#   1. the PINNED-ARTIFACT LAW — the signature pins THREE anchors at
+#      once (the Stage 135 guarantee scope, read live from the tree's
+#      own tools/hls-guarantee.hls through bin/hlboot; the Stage 141
+#      API freeze digest plus the head of its amendment chain; the
+#      Stage 142/143 snapshot manifest's closure and snapshot
+#      digests). Every pass re-derives all three; the signoff and the
+#      gate refuse any anchor that moved — a moved surface is a new
+#      engagement, not an amendment;
+#   2. the CLOSURE-REQUIRES-INDEPENDENCE LAW — the seal refuses
+#      without an INDEPENDENT pass on record and a green latest pass;
+#   3. the FIX-LANDING LAW — a remediation must EXIST, LANDED (an
+#      ancestor of the tree's HEAD) and POSTDATE the finding it
+#      fixes, at triage time, again at the seal, and again at the gate;
+#   4. the SEAL LAW — signoff is the project's closing act; after it
+#      nothing appends, because what comes after the seal is the next
+#      audit, not an amendment;
+#   5. the GATE LAW — exit 0 only when the sealed audit holds on THIS
+#      tree: the sealed tree an ancestor of HEAD, the anchors still
+#      pinned, the fixes still landed.
+#
+# Commands: engage, brief, evidence, file, triage, signoff, gate,
+# report, status.
+# Exits: 0 ok · 1 ledger refusal (named on stderr) · 2 usage.
+# ============================================================================
+
+import "std.str"
+import "std.json"
+import "std.result"
+import "std.sha256"
+import "std.fs"
+import "std.process"
+import "std.env"
+import "std.option"
+import "std.time"
+
+# ----------------------------------------------------------------------------
+# Constants.
+# ----------------------------------------------------------------------------
+
+fn fa_tool() -> str {
+    return "hls-finalaudit"
+}
+
+fn fa_version() -> str {
+    return "0.165.0-alpha"
+}
+
+fn fa_policy() -> str {
+    return "halis-finalaudit-1"
+}
+
+fn fa_ledger_rel() -> str {
+    return ".hlfa/final.jsonl"
+}
+
+fn fa_genesis() -> str {
+    return "0000000000000000000000000000000000000000000000000000000000000000"
+}
+
+fn fa_finding_prefix() -> str {
+    return "AF-"
+}
+
+fn fa_finding_width() -> int {
+    return 3
+}
+
+# The three Phase X anchors. A Stage 140 engagement pinned ONE
+# digest and watched it drift; the final audit pins the FROZEN
+# ARTIFACT whole: what the toolchain guarantees (Stage 135), what
+# the surface is (Stage 141), and what the shipped compiler bytes
+# are (Stage 142/143). An audit is final when the thing it audited
+# is the thing that ships.
+fn fa_anchor_names() -> list[str] {
+    let xs: list[str] = []
+    xs.push("guarantee-scope")
+    xs.push("api-freeze")
+    xs.push("bootstrap-snapshot")
+    return xs
+}
+
+fn fa_anchor_meaning(n: str) -> str {
+    if n == "guarantee-scope" {
+        return "the Stage 135 soundness guarantee ledger, imported "
+        + "live — the scope the evidence passes re-run through the "
+        + "real checker"
+    }
+    if n == "api-freeze" {
+        return "the Stage 141 frozen API document: the surface digest "
+        + "plus the head of its amendment chain — the contract every "
+        + "program ever written against this language rests on"
+    }
+    return "the Stage 142/143 snapshot manifest: the compiler bytes "
+    + "and their import closure — the artifact every release build "
+    + "starts from, byte for byte"
+}
+
+# The closed vocabularies. The audit severity vocabulary is wider than
+# the bounty's three (Stage 135 ranks critical/high/medium for what a
+# VIOLATION means): auditors also file low and info rows — hardening
+# notes that carry no bounty but belong in a paid report.
+fn fa_severities() -> list[str] {
+    let xs: list[str] = []
+    xs.push("critical")
+    xs.push("high")
+    xs.push("medium")
+    xs.push("low")
+    xs.push("info")
+    return xs
+}
+
+fn fa_severity_rank(s: str) -> int {
+    if s == "critical" {
+        return 0
+    }
+    if s == "high" {
+        return 1
+    }
+    if s == "medium" {
+        return 2
+    }
+    if s == "low" {
+        return 3
+    }
+    return 4
+}
+
+fn fa_severity_meaning(s: str) -> str {
+    if s == "critical" {
+        return "a soundness boundary is bypassable in practice, or the "
+        + "two implementations diverge on an accepted program"
+    }
+    if s == "high" {
+        return "a security boundary (matching, capability, sandbox, "
+        + "constant-time, taint, FFI honesty) is bypassed with a "
+        + "reproducer the toolchain accepts"
+    }
+    if s == "medium" {
+        return "a documented guarantee does not hold as written, but no "
+        + "exploit path is demonstrated"
+    }
+    if s == "low" {
+        return "hardening: the guarantee holds, the margin around it is "
+        + "thinner than the ledger claims"
+    }
+    return "an observation the auditors want on record that maps onto "
+    + "no guarantee row"
+}
+
+fn fa_triage_verdicts() -> list[str] {
+    let xs: list[str] = []
+    xs.push("accepted")
+    xs.push("disputed")
+    xs.push("out-of-scope")
+    return xs
+}
+
+fn fa_verdict_meaning(v: str) -> str {
+    if v == "accepted" {
+        return "the finding stands; the remediation commit is recorded "
+        + "on the triage itself"
+    }
+    if v == "disputed" {
+        return "the finding stands as filed but the project contests "
+        + "it — with a written reason"
+    }
+    return "the finding falls outside the contract it was filed "
+    + "against — with a written reason"
+}
+
+# The lifecycle, ordered. Derived from the census on every render;
+# never stored, never asserted by a writer.
+fn fa_state_meaning(s: str) -> str {
+    if s == "vacant" {
+        return "no ledger at all — nothing has happened"
+    }
+    if s == "open" {
+        return "the contract is on record; no evidence pass has run"
+    }
+    if s == "underway" {
+        return "at least one evidence pass is on record; no finding filed"
+    }
+    if s == "reported" {
+        return "the auditors have spoken — at least one finding is on "
+        + "record, not yet fully triaged"
+    }
+    if s == "responded" {
+        return "every finding carries its one triage"
+    }
+    if s == "remediated" {
+        return "every finding is triaged and every acceptance carries "
+        + "its remediation commit"
+    }
+    return "the project signed the closure — the three anchors "
+    + "pinned, the independent pass on record, every fix landed — "
+    + "and the ledger is closed; what comes after the seal is the "
+    + "next audit, not an amendment"
+}
+
+fn fa_roles() -> list[str] {
+    let xs: list[str] = []
+    xs.push("auditor")
+    xs.push("project")
+    return xs
+}
+
+fn fa_kinds() -> list[str] {
+    let xs: list[str] = []
+    xs.push("engagement")
+    xs.push("evidence")
+    xs.push("finding")
+    xs.push("triage")
+    xs.push("signoff")
+    return xs
+}
+
+fn fa_repro_modes() -> list[str] {
+    let xs: list[str] = []
+    xs.push("path")
+    xs.push("text")
+    return xs
+}
+
+fn fa_pass_outcomes() -> list[str] {
+    let xs: list[str] = []
+    xs.push("ok")
+    xs.push("failed")
+    return xs
+}
+
+# ----------------------------------------------------------------------------
+# Small helpers (paths, strings, shell).
+# ----------------------------------------------------------------------------
+
+fn fa_dirname(path: str) -> str {
+    let mut i: int = path.len() - 1
+    while i >= 0 {
+        if path.byte_at(i) == 47 {
+            if i == 0 {
+                return "/"
+            }
+            return path.slice(0, i)
+        }
+        i = i - 1
+    }
+    return "."
+}
+
+fn fa_join(dir: str, name: str) -> str {
+    if dir == "" || dir == "." {
+        return name
+    }
+    if dir.byte_at(dir.len() - 1) == 47 {
+        return dir + name
+    }
+    return dir + "/" + name
+}
+
+# fa_relpath(path, root) — the path under root as root-relative, the
+# path outside root verbatim (os.path.relpath for the only shapes the
+# kit's documents name).
+fn fa_relpath(path: str, root: str) -> str {
+    if root == "" || root == "." {
+        if path.starts_with("./") {
+            return path.slice(2, path.len())
+        }
+        return path
+    }
+    let pref: str = root + "/"
+    if path.starts_with(pref) {
+        return path.slice(pref.len(), path.len())
+    }
+    return path
+}
+
+fn fa_is_hex(s: str, n: int) -> bool {
+    if s.len() != n {
+        return false
+    }
+    let mut i: int = 0
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        if !((b >= 48 && b <= 57) || (b >= 97 && b <= 102)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn fa_is_hex64(s: str) -> bool {
+    return fa_is_hex(s, 64)
+}
+
+fn fa_is_hex40(s: str) -> bool {
+    return fa_is_hex(s, 40)
+}
+
+fn fa_is_digits(s: str) -> bool {
+    if s.len() == 0 {
+        return false
+    }
+    let mut i: int = 0
+    while i < s.len() {
+        if s.byte_at(i) < 48 || s.byte_at(i) > 57 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn fa_is_finding_id(s: str) -> bool {
+    if !s.starts_with(fa_finding_prefix()) {
+        return false
+    }
+    let tail: str = s.slice(fa_finding_prefix().len(), s.len())
+    if tail.len() != fa_finding_width() {
+        return false
+    }
+    return fa_is_digits(tail)
+}
+
+# fa_in_strs — membership in a closed vocabulary.
+fn fa_in_strs(xs: list[str], s: str) -> bool {
+    let mut i: int = 0
+    while i < xs.len() {
+        if xs.get(i) == s {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# fa_pad2 — two-digit zero padding (AF- ids, clock renders).
+fn fa_pad2(n: int) -> str {
+    let digits: str = "0123456789"
+    if n < 10 {
+        return "0" + digits.slice(n, n + 1)
+    }
+    return digits.slice(n / 10, n / 10 + 1) + digits.slice(n % 10, n % 10 + 1)
+}
+
+# py_repr — Python's repr() for the simple strings the kit records:
+# single-quoted, backslash and quote escaped, controls as \xNN.
+fn py_repr(s: str) -> str {
+    let mut out: str = "'"
+    let mut i: int = 0
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        if b == 39 {
+            out = out + "\\'"
+        } else if b == 92 {
+            out = out + "\\\\"
+        } else if b == 10 {
+            out = out + "\\n"
+        } else if b == 9 {
+            out = out + "\\t"
+        } else if b == 13 {
+            out = out + "\\r"
+        } else if b < 32 {
+            out = out + "\\x" + fa_hex2(b)
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out + "'"
+}
+
+fn fa_hex2(b: int) -> str {
+    let digits: str = "0123456789abcdef"
+    let hi: int = int_and(int_shr(b, 4), 15)
+    let lo: int = int_and(b, 15)
+    return digits.slice(hi, hi + 1) + digits.slice(lo, lo + 1)
+}
+
+# ----------------------------------------------------------------------------
+# The json builder — a tiny ordered-object writer producing EXACTLY
+# the canonical forms the chain law needs (sorted keys for the chain,
+# sorted keys for the record lines), plus the indent-2 renderer the
+# --json modes print (json.dumps(indent=2, sort_keys=True)).
+# ----------------------------------------------------------------------------
+
+struct JField {
+    key: str,
+    val: str # a pre-rendered json value (literal, quoted, or nested)
+}
+
+# j_quote — a JSON string literal, ensure_ascii: every byte >= 0x80
+# renders as \uXXXX (surrogate pair above BMP), exactly the escaping
+# json.dumps default and the family's canon agree on.
+fn j_quote(s: str) -> str {
+    let mut out: str = "\""
+    let mut i: int = 0
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        if b == 34 {
+            out = out + "\\\""
+        } else if b == 92 {
+            out = out + "\\\\"
+        } else if b == 10 {
+            out = out + "\\n"
+        } else if b == 9 {
+            out = out + "\\t"
+        } else if b == 13 {
+            out = out + "\\r"
+        } else if b < 32 {
+            out = out + "\\u00" + fa_hex2(b)
+        } else if b < 128 {
+            out = out + s.slice(i, i + 1)
+        } else {
+            let mut cp: int = 0
+            let mut adv: int = 1
+            if b >= 240 && i + 3 < s.len() {
+                cp = (b - 240) * 262144
+                + (s.byte_at(i + 1) - 128) * 4096
+                + (s.byte_at(i + 2) - 128) * 64
+                + (s.byte_at(i + 3) - 128)
+                adv = 4
+            } else if b >= 224 && i + 2 < s.len() {
+                cp = (b - 224) * 4096
+                + (s.byte_at(i + 1) - 128) * 64
+                + (s.byte_at(i + 2) - 128)
+                adv = 3
+            } else if b >= 192 && i + 1 < s.len() {
+                cp = (b - 192) * 64 + (s.byte_at(i + 1) - 128)
+                adv = 2
+            } else {
+                cp = b
+                adv = 1
+            }
+            if cp > 65535 {
+                out = out + j_hex4_surro(cp)
+            } else {
+                out = out + j_hex4(cp)
+            }
+            i = i + adv
+            continue
+        }
+        i = i + 1
+    }
+    return out + "\""
+}
+
+fn j_hex4(cp: int) -> str {
+    let digits: str = "0123456789abcdef"
+    let a: int = (cp / 4096) % 16
+    let b: int = (cp / 256) % 16
+    let c: int = (cp / 16) % 16
+    let d: int = cp % 16
+    return "\\u" + digits.slice(a, a + 1) + digits.slice(b, b + 1)
+    + digits.slice(c, c + 1) + digits.slice(d, d + 1)
+}
+
+fn j_hex4_surro(cp: int) -> str {
+    let v: int = cp - 65536
+    let hi: int = 55296 + v / 1024
+    let lo: int = 56320 + v % 1024
+    return j_hex4(hi) + j_hex4(lo)
+}
+
+# j_sort_keys — insertion sort over the keys (the family's idiom).
+fn j_sort_keys(keys: list[str]) -> list[str] {
+    let mut a: int = 1
+    while a < keys.len() {
+        let v: str = keys.get(a)
+        let mut b: int = a - 1
+        while b >= 0 && keys.get(b) > v {
+            keys.set(b + 1, keys.get(b))
+            b = b - 1
+        }
+        keys.set(b + 1, v)
+        a = a + 1
+    }
+    return keys
+}
+
+# j_canon — json.dumps(obj, sort_keys=True, separators=(",", ":")) over
+# a parsed value: keys sorted, no whitespace, ensure_ascii strings.
+fn j_canon(v: JsonValue) -> str {
+    if json_is_null(v) {
+        return "null"
+    }
+    if json_is_bool(v) {
+        if json_bool_value(v) {
+            return "true"
+        }
+        return "false"
+    }
+    if json_is_int(v) {
+        return json_int_value(v).to_str()
+    }
+    if json_is_float(v) {
+        return json_float_value(v).to_str()
+    }
+    if json_is_str(v) {
+        return j_quote(json_str_value(v))
+    }
+    if json_is_array(v) {
+        let mut out: str = "["
+        let mut i: int = 0
+        while i < v.arr.len() {
+            if i > 0 {
+                out = out + ","
+            }
+            out = out + j_canon(v.arr.get(i))
+            i = i + 1
+        }
+        return out + "]"
+    }
+    let keys: list[str] = []
+    let mut ci: int = 0
+    while ci < v.obj_keys.len() {
+        keys.push(v.obj_keys.get(ci))
+        ci = ci + 1
+    }
+    j_sort_keys(keys)
+    let mut out2: str = "{"
+    let mut i2: int = 0
+    while i2 < keys.len() {
+        if i2 > 0 {
+            out2 = out2 + ","
+        }
+        let k: str = keys.get(i2)
+        out2 = out2 + j_quote(k) + ":" + j_canon(json_object_get(v, k))
+        i2 = i2 + 1
+    }
+    return out2 + "}"
+}
+
+# j_canon_without — the canon of an object minus one key (the chain
+# law's record-minus-chain_hash).
+fn j_canon_without(v: JsonValue, key: str) -> str {
+    let keys: list[str] = []
+    let mut i: int = 0
+    while i < v.obj_keys.len() {
+        if v.obj_keys.get(i) != key {
+            keys.push(v.obj_keys.get(i))
+        }
+        i = i + 1
+    }
+    let sorted: list[str] = j_sort_keys(keys)
+    let mut out: str = "{"
+    let mut j: int = 0
+    while j < sorted.len() {
+        if j > 0 {
+            out = out + ","
+        }
+        let k: str = sorted.get(j)
+        out = out + j_quote(k) + ":" + j_canon(json_object_get(v, k))
+        j = j + 1
+    }
+    return out + "}"
+}
+
+# j_str_arr — a json array of string literals.
+fn j_str_arr(xs: list[str]) -> str {
+    let mut out: str = "["
+    let mut i: int = 0
+    while i < xs.len() {
+        if i > 0 {
+            out = out + ","
+        }
+        out = out + j_quote(xs.get(i))
+        i = i + 1
+    }
+    return out + "]"
+}
+
+# j_spaces — indent padding.
+fn j_spaces(n: int) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < n {
+        out = out + " "
+        i = i + 1
+    }
+    return out
+}
+
+# j_dump_at — json.dumps(v, indent=2, sort_keys=True): the --json
+# renders. Empty containers stay compact, exactly like Python's.
+fn j_dump_at(v: JsonValue, indent: int) -> str {
+    let pad: str = j_spaces(indent * 2)
+    let pad2: str = j_spaces((indent + 1) * 2)
+    if json_is_null(v) {
+        return "null"
+    }
+    if json_is_bool(v) {
+        if json_bool_value(v) {
+            return "true"
+        }
+        return "false"
+    }
+    if json_is_int(v) {
+        return json_int_value(v).to_str()
+    }
+    if json_is_float(v) {
+        return json_float_value(v).to_str()
+    }
+    if json_is_str(v) {
+        return j_quote(json_str_value(v))
+    }
+    if json_is_array(v) {
+        if v.arr.len() == 0 {
+            return "[]"
+        }
+        let mut out: str = "[\n"
+        let mut i: int = 0
+        while i < v.arr.len() {
+            out = out + pad2 + j_dump_at(v.arr.get(i), indent + 1)
+            if i + 1 < v.arr.len() {
+                out = out + ","
+            }
+            out = out + "\n"
+            i = i + 1
+        }
+        return out + pad + "]"
+    }
+    let keys: list[str] = []
+    let mut ci: int = 0
+    while ci < v.obj_keys.len() {
+        keys.push(v.obj_keys.get(ci))
+        ci = ci + 1
+    }
+    j_sort_keys(keys)
+    if keys.len() == 0 {
+        return "{}"
+    }
+    let mut out2: str = "{\n"
+    let mut n: int = 0
+    while n < keys.len() {
+        let k: str = keys.get(n)
+        out2 = out2 + pad2 + j_quote(k) + ": "
+        + j_dump_at(json_object_get(v, k), indent + 1)
+        if n + 1 < keys.len() {
+            out2 = out2 + ","
+        }
+        out2 = out2 + "\n"
+        n = n + 1
+    }
+    return out2 + pad + "}"
+}
+
+# jv_strs — a json array of plain strings (a record's roster).
+fn jv_strs(xs: list[str]) -> JsonValue {
+    let vals: list[JsonValue] = []
+    let mut i: int = 0
+    while i < xs.len() {
+        vals.push(json_str(xs.get(i)))
+        i = i + 1
+    }
+    return json_array(vals)
+}
+
+# ----------------------------------------------------------------------------
+# The chain law — hltlog's arithmetic, folded verbatim: sha256 over
+# prev + canonical-json(record minus chain_hash).
+# ----------------------------------------------------------------------------
+
+fn fa_chain_of(prev: str, record: JsonValue) -> str {
+    return sha256_hex(prev + j_canon_without(record, "chain_hash"))
+}
+
+# ----------------------------------------------------------------------------
+# Spawning — the kit's run_capture (stdout+stderr piped, drained, the
+# encoded exit kept). Every child the kit drives is git, or the
+# bootstrap's evaluator over a tree's own guarantee source.
+# ----------------------------------------------------------------------------
+
+struct FaRun {
+    code: int, # -1 when the spawn itself failed
+    out: str,
+    err: str
+}
+
+fn fa_run(program: str, args: list[str]) -> FaRun uses Proc {
+    let r: FaRun = FaRun {
+        code: -1, out: "", err: ""
+    }
+    let pid: int = proc_spawn(program, args, 2, 1, 1)
+    if pid < 1 {
+        return r
+    }
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    r.code = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    r.out = out
+    r.err = err
+    return r
+}
+
+# fa_run_at — a spawn in a NAMED tree: sh -c "cd '<tree>' && exec
+# '<prog>' ...", the discipline hls-guarantee's probe driver uses.
+# Every git question the landing law asks is asked of the tree the
+# law names, never of wherever the binary happens to run.
+fn fa_run_at(prog: str, args: list[str], cwd: str) -> FaRun uses Proc {
+    let mut cmd: str = "cd '" + cwd + "' && exec '" + prog + "'"
+    let mut i: int = 0
+    while i < args.len() {
+        cmd = cmd + " '" + args.get(i) + "'"
+        i = i + 1
+    }
+    return fa_run("sh", ["-c", cmd])
+}
+
+# ----------------------------------------------------------------------------
+# Identity. --by is recorded verbatim on every entry; the default is
+# the tree's own git identity (the maintainer's name), so the normal
+# `make auditkit-evidence` run is honestly labelled SELF-ASSESSED
+# unless the auditors run it themselves.
+# ----------------------------------------------------------------------------
+
+fn fa_default_actor(tree: str) -> str uses Proc {
+    let r: FaRun = fa_run_at("git", ["config", "user.name"], tree)
+    if r.code == 0 && r.out.trim() != "" {
+        return r.out.trim()
+    }
+    let u: Option[tainted[str]] = env_var("USER")
+    if option_is_some(u) {
+        let name: str = taint_unwrap(option_unwrap(u))
+        if name.trim() != "" {
+            return name.trim()
+        }
+    }
+    return "<unknown>"
+}
+
+# fa_own_repo — the tree's own repository toplevel, or "": `git
+# rev-parse` walks UP the directory tree, so a tarball unpacked
+# inside somebody else's repo would silently answer questions about
+# the WRONG history — the landing law refuses to read a history the
+# tree does not own.
+fn fa_own_repo(tree: str) -> str uses Fs, Proc {
+    # the tree as an absolute path, so the toplevel comparison reads
+    # the same directory realpath() did in the .py
+    let mut abs: str = tree
+    if !abs.starts_with("/") {
+        abs = cwd_get()
+        if tree != "." {
+            abs = fa_join(abs, tree)
+        }
+    }
+    let r: FaRun = fa_run_at("git", ["rev-parse", "--show-toplevel"],
+    abs)
+    if r.code == 0 && r.out.trim() != "" {
+        let top: str = r.out.trim()
+        if top == abs {
+            return top
+        }
+    }
+    return ""
+}
+
+fn fa_is_git_tree(tree: str) -> bool uses Proc {
+    return fa_own_repo(tree) != ""
+}
+
+fn fa_git_sha(tree: str) -> str uses Proc {
+    if fa_own_repo(tree) == "" {
+        return "unknown (not a git tree)"
+    }
+    let r: FaRun = fa_run_at("git", ["rev-parse", "HEAD"], tree)
+    if r.code == 0 {
+        return r.out.trim()
+    }
+    return "unknown (not a git tree)"
+}
+
+# fa_commit_exists — 1 when the sha names a commit in the tree's own
+# repository; 0 when it names none; -1 when the tree owns no
+# repository (an auditor working from a tarball) — the caller
+# validates shape only and says so.
+fn fa_commit_exists(tree: str, sha: str) -> int uses Proc {
+    if fa_own_repo(tree) == "" {
+        return -1
+    }
+    let args: list[str] = []
+    args.push("cat-file")
+    args.push("-e")
+    args.push(sha + "^{commit}")
+    let r: FaRun = fa_run_at("git", args, tree)
+    if r.code == 0 {
+        return 1
+    }
+    return 0
+}
+
+# fa_commit_landed — 1 when the sha is an ancestor of the tree's HEAD
+# (the fix-landing law); 0 when it exists but never landed; -1 when
+# the tree's history cannot be asked.
+fn fa_commit_landed(tree: str, sha: str) -> int uses Proc {
+    if fa_own_repo(tree) == "" {
+        return -1
+    }
+    let args: list[str] = []
+    args.push("merge-base")
+    args.push("--is-ancestor")
+    args.push(sha)
+    args.push("HEAD")
+    let r: FaRun = fa_run_at("git", args, tree)
+    if r.code == 0 {
+        return 1
+    }
+    return 0
+}
+
+# fa_commit_timestamp — the commit's committer timestamp (unix
+# seconds), or -1 when the tree cannot be asked. The fix-date law
+# compares this against the finding entry's own timestamp.
+fn fa_commit_timestamp(tree: str, sha: str) -> int uses Proc {
+    if fa_own_repo(tree) == "" {
+        return -1
+    }
+    let args: list[str] = []
+    args.push("show")
+    args.push("-s")
+    args.push("--format=%ct")
+    args.push(sha)
+    let r: FaRun = fa_run_at("git", args, tree)
+    if r.code == 0 && fa_is_digits(r.out.trim()) {
+        return fa_to_int(r.out.trim())
+    }
+    return -1
+}
+
+# ----------------------------------------------------------------------------
+# The scope — the Stage 135 guarantee ledger, read live from the
+# TREE'S OWN source: `bin/hlboot <tree>/tools/hls-guarantee.hls dump`
+# (the kit's own evaluator interprets the tree's tool the way the .py
+# era imported the module — a foreign tree's own ledger, live at run
+# time, never copied, never re-derived).
+# ----------------------------------------------------------------------------
+
+struct FaScope {
+    ids: list[str],
+    families: list[str],
+    severities: list[str],
+    claims: list[str],
+    violations: list[str],
+    repros: list[str],
+    anchor_counts: list[int],
+    probe_counts: list[int],
+    digest: str,
+    policy: str,
+    anchors_files: list[str],
+    anchors_patterns: list[str],
+    n_rows: int,
+    ok: bool,
+    err: str
+}
+
+# fa_boot_path — the evaluator the scope rides: the repo the kit
+# binary lives in (argv0/../..), the same tree bin/hlc built it from.
+fn fa_boot_path() -> str uses Args, Fs {
+    let a: list[str] = args()
+    if a.len() == 0 {
+        return "bin/hlboot"
+    }
+    let argv0: str = a.get(0)
+    if !argv0.contains("/") {
+        return "bin/hlboot"
+    }
+    let root: str = fa_dirname(fa_dirname(argv0))
+    let boot: str = fa_join(root, "bin/hlboot")
+    if !file_exists(boot) {
+        return "bin/hlboot"
+    }
+    return boot
+}
+
+fn fa_scope(root: str) -> FaScope uses Args, Fs, Proc {
+    let out: FaScope = FaScope {
+        ids: [], families: [], severities: [],
+        claims: [], violations: [], repros: [], anchor_counts: [],
+        probe_counts: [], digest: "", policy: "", anchors_files: [],
+        anchors_patterns: [], n_rows: 0, ok: false, err: ""
+    }
+    let gsrc: str = fa_join(root, "tools/hls-guarantee.hls")
+    if !file_exists(gsrc) {
+        out.err = "no guarantee ledger at " + fa_relpath(gsrc, root)
+        + " — the audit scope is the Stage 135 ledger, and this tree "
+        + "does not carry one"
+        return out
+    }
+    let boot: str = fa_boot_path()
+    let args: list[str] = []
+    args.push(gsrc)
+    args.push("dump")
+    let r: FaRun = fa_run(boot, args)
+    if r.code != 0 {
+        out.err = "the guarantee ledger at " + fa_relpath(gsrc, root)
+        + " does not load: " + fa_first_line(r.err)
+        return out
+    }
+    let rr: Result[JsonValue, str] = json_parse_result(r.out)
+    if result_is_err(rr) {
+        out.err = "the guarantee ledger at " + fa_relpath(gsrc, root)
+        + " does not load: " + result_err_or(rr, "not json")
+        return out
+    }
+    let doc: JsonValue = result_unwrap(rr)
+    out.digest = fa_jstr(doc, "ledger_sha256")
+    out.policy = fa_jstr(doc, "policy")
+    let rows: list[JsonValue] = fa_jarr(doc, "guarantees")
+    let mut i: int = 0
+    while i < rows.len() {
+        let g: JsonValue = rows.get(i)
+        i = i + 1
+        out.ids.push(fa_jstr(g, "id"))
+        out.families.push(fa_jstr(g, "family"))
+        out.severities.push(fa_jstr(g, "severity"))
+        out.claims.push(fa_jstr(g, "claim"))
+        out.violations.push(fa_jstr(g, "violation"))
+        out.repros.push(fa_jstr(g, "repro"))
+        out.anchor_counts.push(fa_jarr(g, "anchors").len())
+        out.probe_counts.push(fa_jarr(g, "probes").len())
+    }
+    let pas: list[JsonValue] = fa_jarr(doc, "policy_anchors")
+    i = 0
+    while i < pas.len() {
+        let pa: JsonValue = pas.get(i)
+        i = i + 1
+        out.anchors_files.push(fa_jstr(pa, "file"))
+        out.anchors_patterns.push(fa_jstr(pa, "pattern"))
+    }
+    out.n_rows = out.ids.len()
+    if out.n_rows == 0 || out.digest == "" {
+        out.err = "the guarantee ledger at " + fa_relpath(gsrc, root)
+        + " is empty"
+        return out
+    }
+    out.ok = true
+    return out
+}
+
+# fa_first_line — the first non-empty line, trimmed; "" for empty text.
+fn fa_first_line(text: str) -> str {
+    let lines: list[str] = text.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let t: str = lines.get(i).trim()
+        if t != "" {
+            return t
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# fa_jstr / fa_jint / fa_jbool / fa_jarr — null-safe accessors, so a
+# malformed ledger row reads as empty instead of a panic.
+fn fa_jstr(v: JsonValue, key: str) -> str {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_str(x) {
+        return json_str_value(x)
+    }
+    return ""
+}
+
+fn fa_jint(v: JsonValue, key: str) -> int {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_int(x) {
+        return json_int_value(x)
+    }
+    return -1
+}
+
+fn fa_jbool(v: JsonValue, key: str) -> bool {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_bool(x) {
+        return json_bool_value(x)
+    }
+    return false
+}
+
+fn fa_jarr(v: JsonValue, key: str) -> list[JsonValue] {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_array(x) {
+        return x.arr
+    }
+    let empty: list[JsonValue] = []
+    return empty
+}
+
+# fa_policy_anchor_ok — the live-quote law: the reporting channel
+# anchored in SECURITY.md must still be there, or the brief refuses.
+fn fa_policy_anchor_ok(root: str, scope: FaScope) -> list[str] uses Fs {
+    let problems: list[str] = []
+    let mut i: int = 0
+    while i < scope.anchors_files.len() {
+        let rel: str = scope.anchors_files.get(i)
+        let pat: str = scope.anchors_patterns.get(i)
+        let full: str = fa_join(root, rel)
+        if !file_exists(full) {
+            problems.push("the reporting channel anchor is gone ("
+            + rel + ": missing " + pat + ")")
+        } else if !read_file(full).contains(pat) {
+            problems.push("the reporting channel anchor is gone ("
+            + rel + ": '" + pat + "' not found)")
+        }
+        i = i + 1
+    }
+    return problems
+}
+
+# ----------------------------------------------------------------------------
+# The evidence pass — the tree's own checker run live:
+# `bin/hlboot <tree>/tools/hls-guarantee.hls verify --json --root
+# <tree>`. The counts and refusals the transcript records are the
+# engine's own.
+# ----------------------------------------------------------------------------
+
+struct FaPassOut {
+    ok: bool,
+    verified: int,
+    total: int,
+    anchors: int,
+    probes: int,
+    refusals: list[str],
+    err: str
+}
+
+fn fa_evidence(root: str) -> FaPassOut uses Args, Fs, Proc {
+    let out: FaPassOut = FaPassOut {
+        ok: false, verified: 0,
+        total: 0, anchors: 0, probes: 0, refusals: [], err: ""
+    }
+    let gsrc: str = fa_join(root, "tools/hls-guarantee.hls")
+    if !file_exists(gsrc) {
+        out.err = "no guarantee ledger at " + fa_relpath(gsrc, root)
+        + " — the audit scope is the Stage 135 ledger, and this tree "
+        + "does not carry one"
+        return out
+    }
+    let boot: str = fa_boot_path()
+    let args: list[str] = []
+    args.push(gsrc)
+    args.push("verify")
+    args.push("--json")
+    args.push("--root")
+    args.push(root)
+    let r: FaRun = fa_run(boot, args)
+    if r.out.trim() == "" {
+        out.err = "verify did not answer json: " + fa_first_line(r.err)
+        return out
+    }
+    let rr: Result[JsonValue, str] = json_parse_result(r.out)
+    if result_is_err(rr) {
+        out.err = "verify did not answer json: "
+        + result_err_or(rr, "not json")
+        return out
+    }
+    let doc: JsonValue = result_unwrap(rr)
+    out.ok = r.code == 0
+    let gs: list[JsonValue] = fa_jarr(doc, "guarantees")
+    let mut i: int = 0
+    while i < gs.len() {
+        let g: JsonValue = gs.get(i)
+        i = i + 1
+        out.total = out.total + 1
+        if fa_jstr(g, "status") == "verified" {
+            out.verified = out.verified + 1
+        }
+        let ancs: list[JsonValue] = fa_jarr(g, "anchors")
+        let mut a: int = 0
+        while a < ancs.len() {
+            if fa_jbool(ancs.get(a), "ok") {
+                out.anchors = out.anchors + 1
+            }
+            a = a + 1
+        }
+        let prbs: list[JsonValue] = fa_jarr(g, "probes")
+        let mut p: int = 0
+        while p < prbs.len() {
+            if fa_jstr(prbs.get(p), "verdict") == "ok" {
+                out.probes = out.probes + 1
+            }
+            p = p + 1
+        }
+    }
+    let refs: list[JsonValue] = fa_jarr(doc, "refusals")
+    i = 0
+    while i < refs.len() {
+        let rf: JsonValue = refs.get(i)
+        i = i + 1
+        if json_is_str(rf) {
+            out.refusals.push(json_str_value(rf))
+        } else {
+            out.refusals.push(fa_jstr(rf, "detail"))
+        }
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# The three anchors. Each is derived LIVE from the tree --root points
+# at, never copied, never cached across roots; each collapses to one
+# 64-hex digest plus the human detail the renders quote.
+# ----------------------------------------------------------------------------
+
+struct FaAnchorSet {
+    g_digest: str, # the guarantee ledger's own digest
+    g_count: int,
+    a_guarantee: str, # the pinned anchor digests
+    a_freeze: str,
+    a_snapshot: str,
+    d_guarantee: str, # the human detail the renders quote
+    d_freeze: str,
+    d_snapshot: str,
+    ok: bool,
+    err: str
+}
+
+# fa_read_freeze — (surface_digest, amendments_head, count) from the
+# committed Stage 141 document and its amendment chain. The chain is
+# verified with the family's arithmetic — the final audit refuses to
+# pin a broken freeze.
+fn fa_read_freeze(root: str) -> FaAnchorSet uses Fs {
+    let out: FaAnchorSet = FaAnchorSet {
+        g_digest: "", g_count: 0,
+        a_guarantee: "", a_freeze: "", a_snapshot: "", d_guarantee: "",
+        d_freeze: "", d_snapshot: "", ok: false, err: ""
+    }
+    let doc_path: str = fa_join(root, "tests/api_freeze.json")
+    if !file_exists(doc_path) {
+        out.err = "no API freeze at " + fa_relpath(doc_path, root)
+        + " — the final audit audits the frozen artifact, and this "
+        + "tree carries no freeze to audit"
+        return out
+    }
+    let rr: Result[JsonValue, str] = json_parse_result(read_file(doc_path))
+    if result_is_err(rr) {
+        out.err = "the freeze document at tests/api_freeze.json is not "
+        + "JSON: " + result_err_or(rr, "not json")
+        return out
+    }
+    let doc: JsonValue = result_unwrap(rr)
+    let digest: str = fa_jstr(doc, "digest")
+    if !fa_is_hex64(digest) {
+        out.err = "the freeze document at tests/api_freeze.json carries "
+        + "no 64-hex surface digest — a freeze that cannot name itself "
+        + "cannot be pinned"
+        return out
+    }
+    let mut head: str = fa_genesis()
+    let mut count: int = 0
+    let am_path: str = fa_join(root, "tests/api_freeze_amendments.jsonl")
+    if file_exists(am_path) {
+        let lines: list[str] = fa_ledger_lines(read_file(am_path))
+        let mut prev: str = fa_genesis()
+        let mut i: int = 0
+        while i < lines.len() {
+            let line_no: int = i + 1
+            let rr2: Result[JsonValue, str] = json_parse_result(lines.get(i))
+            if result_is_err(rr2) {
+                out.err = "the freeze amendment chain is broken at line "
+                + line_no.to_str() + " (not JSON: "
+                + result_err_or(rr2, "not json")
+                + ") — the final audit refuses to pin a broken freeze"
+                return out
+            }
+            let entry: JsonValue = result_unwrap(rr2)
+            if fa_jint(entry, "seq") != line_no
+            || fa_jstr(entry, "prev_hash") != prev
+            || fa_jstr(entry, "chain_hash") != fa_chain_of(prev, entry) {
+                out.err = "the freeze amendment chain is broken at line "
+                + line_no.to_str()
+                + " — the final audit refuses to pin a broken freeze"
+                return out
+            }
+            prev = fa_jstr(entry, "chain_hash")
+            i = i + 1
+        }
+        head = prev
+        count = lines.len()
+    }
+    out.a_freeze = sha256_hex(j_canon(fa_obj2(
+    "digest", json_str(digest),
+    "amendments_head", json_str(head))))
+    out.d_freeze = "surface sha256:" + digest.slice(0, 16) + ", "
+    + count.to_str() + " amendment(s) on chain"
+    out.ok = true
+    return out
+}
+
+# fa_ledger_lines — the non-blank lines of a JSONL document.
+fn fa_ledger_lines(raw: str) -> list[str] {
+    let out: list[str] = []
+    let lines: list[str] = raw.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let t: str = lines.get(i).trim()
+        if t != "" {
+            out.push(t)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# fa_obj2 / fa_obj3 — small literal objects for the anchor digests.
+fn fa_obj2(k1: str, v1: JsonValue, k2: str, v2: JsonValue) -> JsonValue {
+    let keys: list[str] = []
+    let vals: list[JsonValue] = []
+    keys.push(k1)
+    vals.push(v1)
+    keys.push(k2)
+    vals.push(v2)
+    return json_object(keys, vals)
+}
+
+fn fa_obj3(k1: str, v1: JsonValue, k2: str, v2: JsonValue, k3: str,
+v3: JsonValue) -> JsonValue {
+    let keys: list[str] = []
+    let vals: list[JsonValue] = []
+    keys.push(k1)
+    vals.push(v1)
+    keys.push(k2)
+    vals.push(v2)
+    keys.push(k3)
+    vals.push(v3)
+    return json_object(keys, vals)
+}
+
+# fa_read_snapshot — (closure_digest, hlc_c_sha256, version) from the
+# Stage 142/143 manifest, the only witness of what the shipped
+# compiler bytes are.
+fn fa_read_snapshot(root: str) -> FaAnchorSet uses Fs {
+    let out: FaAnchorSet = FaAnchorSet {
+        g_digest: "", g_count: 0,
+        a_guarantee: "", a_freeze: "", a_snapshot: "", d_guarantee: "",
+        d_freeze: "", d_snapshot: "", ok: false, err: ""
+    }
+    let path: str = fa_join(root, "snapshot/MANIFEST.json")
+    if !file_exists(path) {
+        out.err = "no snapshot manifest at " + fa_relpath(path, root)
+        + " — the final audit audits the artifact every release build "
+        + "starts from, and this tree carries none"
+        return out
+    }
+    let rr: Result[JsonValue, str] = json_parse_result(read_file(path))
+    if result_is_err(rr) {
+        out.err = "the snapshot manifest at snapshot/MANIFEST.json is "
+        + "not JSON: " + result_err_or(rr, "not json")
+        return out
+    }
+    let man: JsonValue = result_unwrap(rr)
+    let closure: str = fa_jstr(man, "closure_digest")
+    let snap: str = fa_jstr(man, "hlc_c_sha256")
+    if !fa_is_hex64(closure) || !fa_is_hex64(snap) {
+        out.err = "the snapshot manifest at snapshot/MANIFEST.json "
+        + "carries no 64-hex closure/snapshot digests — a manifest "
+        + "that cannot name the bytes cannot be pinned"
+        return out
+    }
+    let mut version: str = fa_jstr(man, "version")
+    if version == "" && !json_object_has(man, "version") {
+        version = "?"
+    }
+    out.a_snapshot = sha256_hex(j_canon(fa_obj3(
+    "closure", json_str(closure),
+    "snapshot", json_str(snap),
+    "version", json_str(version))))
+    out.d_snapshot = "snapshot sha256:" + snap.slice(0, 16)
+    + ", closure sha256:" + closure.slice(0, 16) + " (" + version
+    + ")"
+    out.ok = true
+    return out
+}
+
+# fa_anchors_of — all three anchors, derived live. The guarantee leg
+# rides the tree's own ledger source through the evaluator (the .py
+# imported the module); the freeze and snapshot legs read the
+# committed documents and hash the canonical form of their parts.
+fn fa_anchors_of(root: str) -> FaAnchorSet uses Args, Fs, Proc {
+    let scope: FaScope = fa_scope(root)
+    if !scope.ok {
+        let out: FaAnchorSet = FaAnchorSet {
+            g_digest: "", g_count: 0,
+            a_guarantee: "", a_freeze: "", a_snapshot: "",
+            d_guarantee: "", d_freeze: "", d_snapshot: "", ok: false,
+            err: scope.err
+        }
+        return out
+    }
+    let fr: FaAnchorSet = fa_read_freeze(root)
+    if !fr.ok {
+        return fr
+    }
+    let sn: FaAnchorSet = fa_read_snapshot(root)
+    if !sn.ok {
+        return sn
+    }
+    let out: FaAnchorSet = FaAnchorSet {
+        g_digest: scope.digest,
+        g_count: scope.n_rows,
+        a_guarantee: scope.digest,
+        a_freeze: fr.a_freeze,
+        a_snapshot: sn.a_snapshot,
+        d_guarantee: scope.n_rows.to_str()
+        + " guarantees, live from the Stage 135 ledger",
+        d_freeze: fr.d_freeze,
+        d_snapshot: sn.d_snapshot,
+        ok: true, err: ""
+    }
+    return out
+}
+
+# fa_anchor_digest_of — the anchor's pinned digest, by name.
+fn fa_anchor_digest_of(a: FaAnchorSet, n: str) -> str {
+    if n == "guarantee-scope" {
+        return a.a_guarantee
+    }
+    if n == "api-freeze" {
+        return a.a_freeze
+    }
+    return a.a_snapshot
+}
+
+# fa_anchor_drift — [names whose digest differs], in anchor order.
+fn fa_anchor_drift(pinned: JsonValue, live: FaAnchorSet) -> list[str] {
+    let out: list[str] = []
+    let names: list[str] = fa_anchor_names()
+    let mut i: int = 0
+    while i < names.len() {
+        let n: str = names.get(i)
+        if fa_jstr(pinned, n) != fa_anchor_digest_of(live, n) {
+            out.push(n)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# The window. Two ISO dates joined by a slash; a window that ends
+# before it starts is refused at write time. ISO is validated by hand
+# (month 1-12, the day inside the month, February's leap rule).
+# ----------------------------------------------------------------------------
+
+fn fa_days_in_month(y: int, m: int) -> int {
+    if m == 1 || m == 3 || m == 5 || m == 7 || m == 8 || m == 10
+    || m == 12 {
+        return 31
+    }
+    if m == 4 || m == 6 || m == 9 || m == 11 {
+        return 30
+    }
+    if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+        return 29
+    }
+    return 28
+}
+
+# fa_to_int — the digits of a validated digit string as a number (the
+# callers check fa_is_digits first; anything else reads as 0).
+fn fa_to_int(s: str) -> int {
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < s.len() {
+        v = v * 10 + (s.byte_at(i) - 48)
+        i = i + 1
+    }
+    return v
+}
+
+# fa_valid_iso — YYYY-MM-DD, real calendar dates only.
+fn fa_valid_iso(s: str) -> bool {
+    if s.len() != 10 {
+        return false
+    }
+    if s.byte_at(4) != 45 || s.byte_at(7) != 45 {
+        return false
+    }
+    let y: str = s.slice(0, 4)
+    let m: str = s.slice(5, 7)
+    let d: str = s.slice(8, 10)
+    if !fa_is_digits(y) || !fa_is_digits(m) || !fa_is_digits(d) {
+        return false
+    }
+    let yi: int = fa_to_int(y)
+    let mi: int = fa_to_int(m)
+    let di: int = fa_to_int(d)
+    if mi < 1 || mi > 12 {
+        return false
+    }
+    if di < 1 || di > fa_days_in_month(yi, mi) {
+        return false
+    }
+    return true
+}
+
+# fa_parse_window — "" when the window is well formed, the refusal
+# wording when it is not. Valid ISO dates compare as strings.
+fn fa_parse_window(window: str) -> str {
+    let parts: list[str] = window.split("/")
+    if parts.len() != 2 {
+        return "not two ISO dates joined by /"
+    }
+    if !fa_valid_iso(parts.get(0)) || !fa_valid_iso(parts.get(1)) {
+        return "a date is not ISO (YYYY-MM-DD)"
+    }
+    if parts.get(1) < parts.get(0) {
+        return "the window ends before it starts"
+    }
+    return ""
+}
+
+# ----------------------------------------------------------------------------
+# The ledger. One JSON object per line, the family's mandatory chain
+# fields (seq, timestamp, prev_hash, chain_hash) on every entry, one
+# of four kinds: engagement / evidence / finding / triage. The chain
+# arithmetic is the family's one law; every reader verifies the whole
+# chain first and names the broken line — nothing renders from a
+# ledger it could not verify.
+# ----------------------------------------------------------------------------
+
+struct LedgerRead {
+    ok: bool,
+    err: str,
+    entries: list[JsonValue],
+    head: str,
+    log_sha: str
+}
+
+# fa_entry_shape — the per-kind shape, checked on every read. Shape
+# only — the reader never re-derives live facts (the scope may have
+# moved; that is the drift law's business, not the parser's).
+fn fa_entry_shape(entry: JsonValue, line_no: int) -> str {
+    let kind: str = fa_jstr(entry, "kind")
+    if !fa_in_strs(fa_kinds(), kind) {
+        return "unknown entry kind: line " + line_no.to_str()
+        + ": the kind is not one of engagement/evidence/finding/triage"
+    }
+    let what: str = kind + " entry"
+    if fa_jint(entry, "seq") < 1 {
+        return what + ": line " + line_no.to_str()
+        + ": seq must be an int >= 1"
+    }
+    if fa_jint(entry, "timestamp") < 0 {
+        return what + ": line " + line_no.to_str()
+        + ": timestamp must be an int >= 0"
+    }
+    if !fa_is_hex64(fa_jstr(entry, "prev_hash")) {
+        return what + ": line " + line_no.to_str()
+        + ": prev_hash is not 64 hex"
+    }
+    if !fa_is_hex64(fa_jstr(entry, "chain_hash")) {
+        return what + ": line " + line_no.to_str()
+        + ": chain_hash is not 64 hex"
+    }
+
+    if kind == "engagement" {
+        if fa_jstr(entry, "by") == "" {
+            return fa_need_fail(what, line_no, "by")
+        }
+        if fa_jstr(entry, "firm") == "" {
+            return fa_need_fail(what, line_no, "firm")
+        }
+        let roster: list[JsonValue] = fa_jarr(entry, "roster")
+        if roster.len() == 0 {
+            return what + ": line " + line_no.to_str()
+            + ": roster must be a non-empty list of unique names"
+        }
+        let mut i: int = 0
+        while i < roster.len() {
+            let r: JsonValue = roster.get(i)
+            if !json_is_str(r) || json_str_value(r) == "" {
+                return what + ": line " + line_no.to_str()
+                + ": roster must be a non-empty list of unique names"
+            }
+            let mut j: int = 0
+            while j < i {
+                if json_str_value(roster.get(j)) == json_str_value(r) {
+                    return what + ": line " + line_no.to_str()
+                    + ": roster must be a non-empty list of unique names"
+                }
+                j = j + 1
+            }
+            i = i + 1
+        }
+        let window: str = fa_jstr(entry, "window")
+        if window == "" && !json_object_has(entry, "window") {
+            return what + ": line " + line_no.to_str()
+            + ": window must be a string"
+        }
+        let why: str = fa_parse_window(window)
+        if why != "" {
+            return what + ": line " + line_no.to_str() + ": bad window "
+            + py_repr(window) + " (" + why + ")"
+        }
+        if fa_jstr(entry, "basis") == "" {
+            return fa_need_fail(what, line_no, "basis")
+        }
+        if !fa_anchors_ok(entry) {
+            return what + ": line " + line_no.to_str()
+            + ": anchors must carry all three (guarantee-scope/"
+            + "api-freeze/bootstrap-snapshot), each 64 hex"
+        }
+    }
+
+    if kind == "evidence" {
+        if fa_jstr(entry, "by") == "" {
+            return fa_need_fail(what, line_no, "by")
+        }
+        if !fa_in_strs(fa_roles(), fa_jstr(entry, "role")) {
+            return what + ": line " + line_no.to_str() + ": role "
+            + py_repr(fa_jstr(entry, "role"))
+            + " is not one of auditor/project"
+        }
+        let iv: JsonValue = json_object_get(entry, "independent")
+        if !json_is_bool(iv) {
+            return what + ": line " + line_no.to_str()
+            + ": independent must be a boolean"
+        }
+        if fa_jstr(entry, "tree") == "" {
+            return fa_need_fail(what, line_no, "tree")
+        }
+        if !fa_anchors_ok(entry) {
+            return what + ": line " + line_no.to_str()
+            + ": anchors must carry all three (guarantee-scope/"
+            + "api-freeze/bootstrap-snapshot), each 64 hex"
+        }
+        let drift: list[JsonValue] = fa_jarr(entry, "anchor_drift")
+        let mut di: int = 0
+        while di < drift.len() {
+            if !json_is_str(drift.get(di))
+            || !fa_in_strs(fa_anchor_names(),
+            json_str_value(drift.get(di))) {
+                return what + ": line " + line_no.to_str()
+                + ": anchor_drift must be a list of anchor names"
+            }
+            di = di + 1
+        }
+        if !fa_in_strs(fa_pass_outcomes(), fa_jstr(entry, "outcome")) {
+            return what + ": line " + line_no.to_str() + ": outcome "
+            + py_repr(fa_jstr(entry, "outcome"))
+            + " is not one of ok/failed"
+        }
+        let keys: list[str] = []
+        keys.push("verified_guarantees")
+        keys.push("total_guarantees")
+        keys.push("guarantee_anchors")
+        keys.push("guarantee_probes")
+        let mut k: int = 0
+        while k < keys.len() {
+            let key: str = keys.get(k)
+            let x: JsonValue = json_object_get(entry, key)
+            if !json_is_int(x) || json_int_value(x) < 0 {
+                return what + ": line " + line_no.to_str() + ": " + key
+                + " must be an int >= 0"
+            }
+            k = k + 1
+        }
+        if fa_jint(entry, "verified_guarantees")
+        > fa_jint(entry, "total_guarantees") {
+            return what + ": line " + line_no.to_str()
+            + ": more verified guarantees than the scope has"
+        }
+        let refs: list[JsonValue] = fa_jarr(entry, "refusals")
+        let mut r: int = 0
+        while r < refs.len() {
+            if !json_is_str(refs.get(r)) {
+                return what + ": line " + line_no.to_str()
+                + ": refusals must be a list of strings"
+            }
+            r = r + 1
+        }
+        if fa_jstr(entry, "outcome") == "failed" && refs.len() == 0 {
+            return what + ": line " + line_no.to_str()
+            + ": a failed pass with no refusals names nothing"
+        }
+        if fa_jstr(entry, "outcome") == "ok" && refs.len() > 0 {
+            return what + ": line " + line_no.to_str()
+            + ": a green pass carrying refusals is a contradiction"
+        }
+    }
+
+    if kind == "finding" {
+        if !fa_is_finding_id(fa_jstr(entry, "id")) {
+            return what + ": line " + line_no.to_str()
+            + ": id must be AF-NNN"
+        }
+        if fa_jstr(entry, "by") == "" {
+            return fa_need_fail(what, line_no, "by")
+        }
+        if fa_jstr(entry, "against") == "" {
+            return fa_need_fail(what, line_no, "against")
+        }
+        if !fa_in_strs(fa_severities(), fa_jstr(entry, "severity")) {
+            return what + ": line " + line_no.to_str() + ": severity "
+            + py_repr(fa_jstr(entry, "severity"))
+            + " is not one of critical/high/medium/low/info"
+        }
+        if fa_jstr(entry, "title") == "" {
+            return fa_need_fail(what, line_no, "title")
+        }
+        if !fa_in_strs(fa_repro_modes(), fa_jstr(entry, "repro_mode")) {
+            return what + ": line " + line_no.to_str() + ": repro_mode "
+            + py_repr(fa_jstr(entry, "repro_mode"))
+            + " is not one of path/text"
+        }
+        if fa_jstr(entry, "repro_value") == "" {
+            return fa_need_fail(what, line_no, "repro_value")
+        }
+    }
+
+    if kind == "triage" {
+        if fa_jstr(entry, "by") == "" {
+            return fa_need_fail(what, line_no, "by")
+        }
+        if !fa_is_finding_id(fa_jstr(entry, "for")) {
+            return what + ": line " + line_no.to_str()
+            + ": for must be AF-NNN"
+        }
+        if !fa_in_strs(fa_triage_verdicts(), fa_jstr(entry, "verdict")) {
+            return what + ": line " + line_no.to_str() + ": verdict "
+            + py_repr(fa_jstr(entry, "verdict"))
+            + " is not one of accepted/disputed/out-of-scope"
+        }
+        if fa_jstr(entry, "reason") == "" {
+            return fa_need_fail(what, line_no, "reason")
+        }
+        if json_object_has(entry, "fix")
+        && !fa_is_hex40(fa_jstr(entry, "fix")) {
+            return what + ": line " + line_no.to_str()
+            + ": fix must be 40 hex"
+        }
+        if fa_jstr(entry, "verdict") != "accepted"
+        && json_object_has(entry, "fix") {
+            return what + ": line " + line_no.to_str()
+            + ": only an acceptance carries a fix"
+        }
+    }
+
+    if kind == "signoff" {
+        if fa_jstr(entry, "by") == "" {
+            return fa_need_fail(what, line_no, "by")
+        }
+        if fa_jstr(entry, "tree") == "" {
+            return fa_need_fail(what, line_no, "tree")
+        }
+        if !fa_anchors_ok(entry) {
+            return what + ": line " + line_no.to_str()
+            + ": anchors must carry all three (guarantee-scope/"
+            + "api-freeze/bootstrap-snapshot), each 64 hex"
+        }
+        let skeys: list[str] = []
+        skeys.push("passes")
+        skeys.push("independent_passes")
+        skeys.push("findings")
+        skeys.push("triages")
+        skeys.push("fixes")
+        let mut k: int = 0
+        while k < skeys.len() {
+            let key: str = skeys.get(k)
+            let x: JsonValue = json_object_get(entry, key)
+            if !json_is_int(x) || json_int_value(x) < 0 {
+                return what + ": line " + line_no.to_str() + ": " + key
+                + " must be an int >= 0"
+            }
+            k = k + 1
+        }
+    }
+    return ""
+}
+
+# fa_anchors_ok — the entry's anchors object carries all three names,
+# each a 64-hex digest.
+fn fa_anchors_ok(entry: JsonValue) -> bool {
+    let a: JsonValue = json_object_get(entry, "anchors")
+    if !json_is_object(a) {
+        return false
+    }
+    let names: list[str] = fa_anchor_names()
+    let mut i: int = 0
+    while i < names.len() {
+        if !fa_is_hex64(fa_jstr(a, names.get(i))) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn fa_need_fail(what: str, line_no: int, key: str) -> str {
+    return what + ": line " + line_no.to_str() + ": " + key
+    + " must be a non-empty string"
+}
+
+# fa_read_ledger — verifies the whole chain first: a tampered ledger
+# is named at its broken line, never rendered.
+fn fa_read_ledger(path: str, must_exist: bool) -> LedgerRead uses Fs {
+    let out: LedgerRead = LedgerRead {
+        ok: false, err: "", entries: [],
+        head: fa_genesis(), log_sha: ""
+    }
+    if !file_exists(path) {
+        if must_exist {
+            out.err = "no final-audit ledger at " + path
+            + " — nothing to read"
+            return out
+        }
+        out.ok = true
+        return out
+    }
+    let raw: str = read_file(path)
+    out.log_sha = sha256_hex(raw)
+    let lines: list[str] = raw.split("\n")
+    let mut n: int = lines.len()
+    if n > 0 && lines.get(n - 1) == "" {
+        n = n - 1
+    }
+    let mut prev: str = fa_genesis()
+    let mut i: int = 0
+    while i < n {
+        let line_no: int = i + 1
+        let line: str = lines.get(i).trim()
+        if line == "" {
+            out.err = "blank line " + line_no.to_str()
+            + ": the ledger is a JSONL chain, not a notepad"
+            return out
+        }
+        let rr: Result[JsonValue, str] = json_parse_result(line)
+        if result_is_err(rr) {
+            out.err = "line " + line_no.to_str() + " is not JSON: "
+            + result_err_or(rr, "not json")
+            return out
+        }
+        let entry: JsonValue = result_unwrap(rr)
+        if !json_is_object(entry) {
+            out.err = "line " + line_no.to_str() + " is not an object"
+            return out
+        }
+        let shape: str = fa_entry_shape(entry, line_no)
+        if shape != "" {
+            out.err = shape
+            return out
+        }
+        if fa_jint(entry, "seq") != line_no {
+            out.err = "line " + line_no.to_str() + ": seq is "
+            + fa_jint(entry, "seq").to_str() + ", expected "
+            + line_no.to_str()
+            + " — the chain has a hole or a lie"
+            return out
+        }
+        if fa_jstr(entry, "prev_hash") != prev {
+            out.err = "line " + line_no.to_str() + ": prev_hash "
+            + fa_jstr(entry, "prev_hash").slice(0, 12)
+            + "... does not chain onto " + prev.slice(0, 12)
+            + "... — the chain is BROKEN here: the ledger was "
+            + "rewritten, reordered or truncated"
+            return out
+        }
+        let want: str = fa_chain_of(prev, entry)
+        if fa_jstr(entry, "chain_hash") != want {
+            out.err = "line " + line_no.to_str() + ": chain_hash "
+            + fa_jstr(entry, "chain_hash").slice(0, 12)
+            + "... does not hash onto its predecessor (expected "
+            + want.slice(0, 12) + "... ) — the entry was edited "
+            + "after it was written"
+            return out
+        }
+        out.entries.push(entry)
+        prev = fa_jstr(entry, "chain_hash")
+        i = i + 1
+    }
+    out.head = prev
+    out.ok = true
+    return out
+}
+
+# fa_append_chained — append one entry with the family's arithmetic;
+# the chain is re-verified BEFORE the write (a tool that appends onto
+# a chain it never read is a tool that trusts a file it has never
+# seen).
+fn fa_append_chained(path: str, body: JsonValue) -> LedgerRead
+uses Fs, Proc, Clock {
+    let prev_read: LedgerRead = fa_read_ledger(path, false)
+    if !prev_read.ok {
+        return prev_read
+    }
+    let seq: int = prev_read.entries.len() + 1
+    let now: int = system_time_unix_secs(system_time_now())
+    let fields: list[str] = []
+    let vals: list[JsonValue] = []
+    let mut i: int = 0
+    while i < body.obj_keys.len() {
+        fields.push(body.obj_keys.get(i))
+        vals.push(body.obj_vals.get(i))
+        i = i + 1
+    }
+    fields.push("seq")
+    vals.push(json_int(seq))
+    fields.push("timestamp")
+    vals.push(json_int(now))
+    fields.push("prev_hash")
+    vals.push(json_str(prev_read.head))
+    let staged: JsonValue = json_object(fields, vals)
+    let chain: str = fa_chain_of(prev_read.head, staged)
+    let fields2: list[str] = []
+    let vals2: list[JsonValue] = []
+    i = 0
+    while i < staged.obj_keys.len() {
+        fields2.push(staged.obj_keys.get(i))
+        vals2.push(staged.obj_vals.get(i))
+        i = i + 1
+    }
+    fields2.push("chain_hash")
+    vals2.push(json_str(chain))
+    let entry: JsonValue = json_object(fields2, vals2)
+    let d: str = fa_dirname(path)
+    if d != "" && d != "." {
+        proc_exec("mkdir -p '" + fa_shell_quote(d) + "'")
+    }
+    let mut body_txt: str = ""
+    if file_exists(path) {
+        body_txt = read_file(path)
+    }
+    write_file(path, body_txt + j_canon(entry) + "\n")
+    let out: LedgerRead = LedgerRead {
+        ok: true, err: "", entries: [],
+        head: chain, log_sha: ""
+    }
+    out.entries.push(entry)
+    return out
+}
+
+# fa_shell_quote — neutralise single quotes for the one-liners.
+fn fa_shell_quote(s: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < s.len() {
+        if s.byte_at(i) == 39 {
+            out = out + "'\\''"
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# The census. The state and every aggregate are DERIVED from the
+# entries on each render — never stored, never asserted.
+# ----------------------------------------------------------------------------
+
+# fa_engagement_of — the engagement is the first entry or none.
+fn fa_engagement_of(entries: list[JsonValue]) -> JsonValue {
+    if entries.len() > 0
+    && fa_jstr(entries.get(0), "kind") == "engagement" {
+        return entries.get(0)
+    }
+    return json_null()
+}
+
+# fa_findings_of — {AF-NNN: finding}, ledger order.
+fn fa_findings_of(entries: list[JsonValue]) -> list[JsonValue] {
+    let out: list[JsonValue] = []
+    let mut i: int = 0
+    while i < entries.len() {
+        let e: JsonValue = entries.get(i)
+        if fa_jstr(e, "kind") == "finding" {
+            out.push(e)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# fa_triages_of — one triage per finding; the census takes the first
+# it sees.
+fn fa_triages_of(entries: list[JsonValue]) -> list[JsonValue] {
+    let out: list[JsonValue] = []
+    let mut i: int = 0
+    while i < entries.len() {
+        let e: JsonValue = entries.get(i)
+        if fa_jstr(e, "kind") == "triage" {
+            let fid: str = fa_jstr(e, "for")
+            let mut seen: bool = false
+            let mut j: int = 0
+            while j < out.len() {
+                if fa_jstr(out.get(j), "for") == fid {
+                    seen = true
+                }
+                j = j + 1
+            }
+            if !seen {
+                out.push(e)
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn fa_passes_of(entries: list[JsonValue]) -> list[JsonValue] {
+    let out: list[JsonValue] = []
+    let mut i: int = 0
+    while i < entries.len() {
+        let e: JsonValue = entries.get(i)
+        if fa_jstr(e, "kind") == "evidence" {
+            out.push(e)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# fa_signoff_of — the seal, or none. The writer refuses to write a
+# second; the census takes the first it sees, like every derived fact.
+fn fa_signoff_of(entries: list[JsonValue]) -> JsonValue {
+    let mut i: int = 0
+    while i < entries.len() {
+        let e: JsonValue = entries.get(i)
+        if fa_jstr(e, "kind") == "signoff" {
+            return e
+        }
+        i = i + 1
+    }
+    return json_null()
+}
+
+# fa_derive_state — the lifecycle word, from the census alone. The
+# seventh word — sealed — is a signoff entry on record; a
+# finding-free audit honestly stays underway, exactly as Stage 140
+# taught.
+fn fa_derive_state(entries: list[JsonValue]) -> str {
+    if entries.len() == 0 {
+        return "vacant"
+    }
+    if json_is_null(fa_engagement_of(entries)) {
+        return "open"
+    }
+    if !json_is_null(fa_signoff_of(entries)) {
+        return "sealed"
+    }
+    let findings: list[JsonValue] = fa_findings_of(entries)
+    let triages: list[JsonValue] = fa_triages_of(entries)
+    if fa_passes_of(entries).len() == 0 {
+        return "open"
+    }
+    if findings.len() == 0 {
+        return "underway"
+    }
+    if triages.len() < findings.len() {
+        return "reported"
+    }
+    let mut i: int = 0
+    while i < triages.len() {
+        let t: JsonValue = triages.get(i)
+        if fa_jstr(t, "verdict") == "accepted"
+        && !json_object_has(t, "fix") {
+            return "responded"
+        }
+        i = i + 1
+    }
+    return "remediated"
+}
+
+# fa_closure_refusals — the refusals between this ledger and a legal
+# signoff. The closure laws, in order: the census, the independence,
+# the anchors, the landing. Empty list == the seal may be written.
+fn fa_closure_refusals(entries: list[JsonValue], root: str) -> list[str]
+uses Args, Fs, Proc {
+    let out: list[str] = []
+    let eng: JsonValue = fa_engagement_of(entries)
+    if json_is_null(eng) {
+        out.push("no engagement on record — engage first: the final "
+        + "audit writes nothing before the contract does")
+        return out
+    }
+    let findings: list[JsonValue] = fa_findings_of(entries)
+    let triages: list[JsonValue] = fa_triages_of(entries)
+    let passes: list[JsonValue] = fa_passes_of(entries)
+    if passes.len() == 0 {
+        out.push("no evidence pass on record — an audit with no "
+        + "transcript has nothing to close")
+    }
+    let mut unfixed: int = 0
+    let mut i: int = 0
+    while i < triages.len() {
+        let t: JsonValue = triages.get(i)
+        if fa_jstr(t, "verdict") == "accepted"
+        && !json_object_has(t, "fix") {
+            unfixed = unfixed + 1
+        }
+        i = i + 1
+    }
+    let sorted_f: list[JsonValue] = fa_sorted_by_id(findings)
+    i = 0
+    while i < sorted_f.len() {
+        let fid: str = fa_jstr(sorted_f.get(i), "id")
+        let mut answered: bool = false
+        let mut j: int = 0
+        while j < triages.len() {
+            if fa_jstr(triages.get(j), "for") == fid {
+                answered = true
+            }
+            j = j + 1
+        }
+        if !answered {
+            out.push("finding " + fid + " carries no triage — every "
+            + "finding is answered before the audit closes")
+        }
+        i = i + 1
+    }
+    if unfixed > 0 {
+        out.push(unfixed.to_str() + " acceptance(s) without their "
+        + "remediation — an acceptance without its fix is a wish, "
+        + "not a fix")
+    }
+    let mut any_indep: bool = false
+    i = 0
+    while i < passes.len() {
+        if fa_jbool(passes.get(i), "independent") {
+            any_indep = true
+        }
+        i = i + 1
+    }
+    if !any_indep {
+        out.push("no independent pass on record — the final audit "
+        + "does not close on the project's own evidence; an audit "
+        + "that closes on self-assessed passes is a rubber stamp "
+        + "with a paper trail")
+    }
+    if passes.len() > 0
+    && fa_jstr(passes.get(passes.len() - 1), "outcome") != "ok" {
+        out.push("the latest pass failed — the final audit does not "
+        + "close on a failed pass; re-run the evidence and let the "
+        + "refusals be fixed first")
+    }
+    # the pinned-artifact law, at closure time: live == engaged
+    let live: FaAnchorSet = fa_anchors_of(root)
+    if !live.ok {
+        out.push("the live anchors cannot be derived (" + live.err
+        + ") — the final audit closes only on the artifact it was "
+        + "signed against")
+    } else {
+        let moved: list[str] = fa_anchor_drift(
+        json_object_get(eng, "anchors"), live)
+        let mut m: int = 0
+        while m < moved.len() {
+            let n: str = moved.get(m)
+            out.push("the " + n + " anchor moved since the engagement "
+            + "(engaged sha256:" + fa_jstr(
+            json_object_get(eng, "anchors"), n).slice(0, 24)
+            + "..., live sha256:" + fa_anchor_digest_of(live, n)
+            .slice(0, 24) + "...) — the final audit closes only on "
+            + "the artifact it was signed against; a moved surface is "
+            + "a new engagement, not an amendment")
+            m = m + 1
+        }
+    }
+    # the landing law, at closure time
+    if !fa_is_git_tree(root) {
+        out.push("the tree is not a git repository — the landing law "
+        + "cannot be verified, and the final audit does not close on "
+        + "a tree whose history it cannot read")
+    } else {
+        let head: str = fa_git_sha(root)
+        let sorted_t: list[JsonValue] = fa_sorted_by_for(triages)
+        i = 0
+        while i < sorted_t.len() {
+            let t: JsonValue = sorted_t.get(i)
+            if fa_jstr(t, "verdict") != "accepted" {
+                i = i + 1
+                continue
+            }
+            let fid: str = fa_jstr(t, "for")
+            let fix: str = fa_jstr(t, "fix")
+            let landed: int = fa_commit_landed(root, fix)
+            if landed == 0 {
+                out.push("the remediation for " + fid + " (" + fix
+                .slice(0, 12) + ") is not an ancestor of HEAD "
+                + head.slice(0, 12) + " — a fix that has not landed "
+                + "is a promise, not a fix")
+            }
+            let mut finding_ts: int = -1
+            let mut j: int = 0
+            while j < findings.len() {
+                if fa_jstr(findings.get(j), "id") == fid {
+                    finding_ts = fa_jint(findings.get(j), "timestamp")
+                }
+                j = j + 1
+            }
+            let when: int = fa_commit_timestamp(root, fix)
+            if when >= 0 && finding_ts >= 0 && when < finding_ts {
+                out.push("the remediation for " + fid
+                + " predates the finding it fixes (committed "
+                + when.to_str() + ", filed " + finding_ts.to_str()
+                + ") — a fix that predates its finding is a "
+                + "contradiction")
+            }
+            i = i + 1
+        }
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# The clock renders — the family's tradition: entries carry facts;
+# renders carry them verbatim.
+# ----------------------------------------------------------------------------
+fn fa_fmt_ts(ts: int) -> str {
+    let days: int = ts / 86400
+    let secs: int = ts % 86400
+    let hh: int = secs / 3600
+    let mi: int = (secs % 3600) / 60
+    let ss: int = secs % 60
+    let ymd: str = fa_civil_date(days)
+    return ymd + "T" + fa_pad2(hh) + ":" + fa_pad2(mi) + ":"
+    + fa_pad2(ss) + "Z"
+}
+
+# fa_civil_date — days since 1970-01-01 as YYYY-MM-DD (the era
+# algorithm, one division chain, no loops over years).
+fn fa_civil_date(z: int) -> str {
+    let z2: int = z + 719468
+    let era: int = z2 / 146097
+    let doe: int = z2 - era * 146097
+    let yoe: int = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let y: int = yoe + era * 400
+    let doy: int = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp: int = (5 * doy + 2) / 153
+    let d: int = doy - (153 * mp + 2) / 5 + 1
+    let mut m: int = mp + 3
+    if mp >= 10 {
+        m = mp - 9
+    }
+    let mut yy: int = y
+    if m <= 2 {
+        yy = y + 1
+    }
+    return yy.to_str() + "-" + fa_pad2(m) + "-" + fa_pad2(d)
+}
+
+# fa_stamp_now — the --stamp clock, the same UTC second render the
+# entries use.
+fn fa_stamp_now() -> str uses Clock {
+    return fa_fmt_ts(system_time_unix_secs(system_time_now()))
+}
+
+# ----------------------------------------------------------------------------
+# Renders. Both documents are deterministic per input (the tree for
+# the brief, the ledger bytes for the report): sorted walks, no
+# wall-clock unless --stamp — two renders byte-identical, so a
+# hand-edited document is visible as a diff.
+# ----------------------------------------------------------------------------
+
+# fa_render_brief — the RFP, a deterministic render of the live tree
+# and its three anchors.
+fn fa_render_brief(root: str, scope: FaScope, anchors: FaAnchorSet,
+engagement: JsonValue, stamp: str) -> str uses Proc {
+    let tree: str = fa_git_sha(root)
+    let mut firm_line: str = "OPEN SOLICITATION — no contract on record; "
+    + "the terms below are the standing proposal, to be recorded "
+    + "verbatim at engage time"
+    if !json_is_null(engagement) {
+        firm_line = fa_jstr(engagement, "firm") + " — window "
+        + fa_jstr(engagement, "window") + ", basis on record: "
+        + py_repr(fa_jstr(engagement, "basis")) + " (signed by "
+        + fa_jstr(engagement, "by") + ")"
+    }
+    let mut L: list[str] = []
+    L.push("# Halis — FINAL third-party security audit brief (RFP)")
+    L.push("")
+    L.push("Regenerated from the live tree by `" + fa_tool() + "`.")
+    L.push("This document is generated, not maintained. Do not")
+    L.push("hand-edit; regenerate with")
+    L.push("`bin/hls-finalaudit brief --out FINALBRIEF.md`.")
+    L.push("")
+    L.push("This is the engagement the v1.0 release candidates")
+    L.push("wait on: its closure is what `gate` checks before a")
+    L.push("candidate is cut, and a candidate cut while this audit")
+    L.push("is open is a candidate cut from an unaudited tree.")
+    L.push("")
+    L.push("- Policy: " + fa_policy())
+    L.push("- Toolchain: " + fa_version())
+    L.push("- Tree: `" + tree + "`")
+    L.push("- Engagement: " + firm_line)
+    if stamp != "" {
+        L.push("- Generated: " + stamp)
+    }
+    L.push("")
+    L.push("## The pinned artifact — the three anchors")
+    L.push("")
+    L.push("A Stage 140 engagement scoped one digest and watched it")
+    L.push("drift. The final audit is narrower on purpose: it audits")
+    L.push("the FROZEN ARTIFACT, and the signature pins three")
+    L.push("anchors at once — what the toolchain guarantees, what")
+    L.push("the surface is, and what the shipped compiler bytes are.")
+    L.push("The signoff refuses to close on any anchor that moved")
+    L.push("since the engagement, and the gate enforces the same law")
+    L.push("after the seal. An audit is final when the thing it")
+    L.push("audited is the thing that ships.")
+    L.push("")
+    L.push("| anchor | meaning | digest | live detail |")
+    L.push("|--------|---------|--------|-------------|")
+    let names: list[str] = fa_anchor_names()
+    let mut i: int = 0
+    while i < names.len() {
+        let n: str = names.get(i)
+        L.push("| " + n + " | " + fa_anchor_meaning(n) + " | `sha256:"
+        + fa_anchor_digest_of(anchors, n) + "` | "
+        + fa_anchor_detail_of(anchors, n) + " |")
+        i = i + 1
+    }
+    L.push("")
+    L.push("## What the auditors are asked to do")
+    L.push("")
+    L.push("1. RE-DERIVE every guarantee anchor: each row below")
+    L.push("   rests on named enforcement points in the tree; find")
+    L.push("   them, read them, and say whether the mechanism is what")
+    L.push("   the row claims.")
+    L.push("2. RE-RUN every probe through the real checker: the")
+    L.push("   fixtures are pinned refusals and panics; confirm the")
+    L.push("   toolchain still refuses and still panics as written.")
+    L.push("3. ATTEMPT the violation contracts, bounty-style: write")
+    L.push("   programs that should be refused and are not; the")
+    L.push("   contract of each row below is the boundary to attack.")
+    L.push("4. RUN your evidence through this kit, under your own")
+    L.push("   names: the pass is INDEPENDENT only when the roster")
+    L.push("   ran it, and the closure below requires one.")
+    L.push("5. FILE findings per the protocol below — and nothing")
+    L.push("   else: an observation that maps onto no row and carries")
+    L.push("   no reproducer is out of the protocol by definition.")
+    L.push("")
+    L.push("## The findings protocol")
+    L.push("")
+    L.push("- The severity vocabulary is closed, five words, ranked:")
+    L.push("")
+    L.push("  | severity | rank | meaning |")
+    L.push("  |----------|-----:|---------|")
+    let sevs: list[str] = fa_severities()
+    i = 0
+    while i < sevs.len() {
+        let sev: str = sevs.get(i)
+        L.push("  | " + sev + " | " + fa_severity_rank(sev).to_str()
+        + " | " + fa_severity_meaning(sev) + " |")
+        i = i + 1
+    }
+    L.push("")
+    L.push("- A finding names ONE guarantee id from the scope (the")
+    L.push("  `against` law); a finding against nothing in the scope")
+    L.push("  is refused naming the known rows.")
+    L.push("- A finding carries a REPRODUCER: a path that exists in")
+    L.push("  the tree, or inline text — never both, never neither.")
+    L.push("  A finding that cannot be reproduced is an opinion, and")
+    L.push("  opinions are not findings.")
+    L.push("- Findings are the AUDITORS' to file — the project cannot")
+    L.push("  author one, and an auditor cannot triage one. The")
+    L.push("  response is the project's to give, with a written")
+    L.push("  reason; an acceptance carries its remediation commit,")
+    L.push("  40 hex naming a commit that exists.")
+    L.push("")
+    L.push("## The closure criteria — what makes this audit final")
+    L.push("")
+    L.push("This is where the final audit leaves the Stage 140")
+    L.push("machinery behind. An engagement that ends `remediated` is")
+    L.push("a finished audit; only these close a FINAL one:")
+    L.push("")
+    L.push("- an INDEPENDENT evidence pass on record — the audit does")
+    L.push("  not close on the project's own evidence, and the latest")
+    L.push("  pass of any label must have run green;")
+    L.push("- every acceptance's remediation commit LANDED: an")
+    L.push("  ancestor of the tree's HEAD, and not older than the")
+    L.push("  finding it fixes — a fix that predates its finding is")
+    L.push("  a contradiction, refused with both timestamps named;")
+    L.push("- the three anchors unchanged since the signature: the")
+    L.push("  signoff closes only on the artifact engaged; a moved")
+    L.push("  surface is a new engagement, not an amendment;")
+    L.push("- the SIGNOFF: the project's own act, written by the")
+    L.push("  project side, sealing the ledger — after the seal")
+    L.push("  nothing appends, because what comes after the seal is")
+    L.push("  the next audit;")
+    L.push("- the GATE: sealed tree an ancestor of the candidate's")
+    L.push("  HEAD, anchors still pinned, fixes still landed — the")
+    L.push("  release is cut from the audited tree or its")
+    L.push("  descendants, never around the audit.")
+    L.push("")
+    L.push("## The commercial terms (the paid part)")
+    L.push("")
+    L.push("- The engagement is PAID. The fee basis is a term of the")
+    L.push("  contract, recorded verbatim at `engage` time, and the")
+    L.push("  kit refuses an engagement without one: a gratis review")
+    L.push("  is not an independent audit — it has no deliverable")
+    L.push("  schedule, no remedy when the deliverable is late, and")
+    L.push("  no obligation to file what it found.")
+    L.push("- The standing proposal, until the engagement records its")
+    L.push("  own basis: fixed fee against the scope census (the "
+    + scope.n_rows.to_str())
+    L.push("  rows below), half payable at engagement, half on")
+    L.push("  delivery of the sealed report; expenses within the")
+    L.push("  window borne by the engaging party.")
+    L.push("- The deliverable schedule: findings filed within the")
+    L.push("  window; the project triages within 14 days of each")
+    L.push("  finding; remediation commits recorded at triage time;")
+    L.push("  the signoff and the gate follow the closure criteria")
+    L.push("  above.")
+    L.push("- The window is recorded at signature time as two ISO")
+    L.push("  dates; a window that ends before it starts is refused")
+    L.push("  at the signature, not discovered at the invoice.")
+    L.push("")
+    L.push("## The scope census")
+    L.push("")
+    L.push("| id | family | severity | anchors | probes |")
+    L.push("|----|--------|----------|---------:|-------:|")
+    i = 0
+    while i < scope.n_rows {
+        L.push("| " + scope.ids.get(i) + " | " + scope.families.get(i)
+        + " | " + scope.severities.get(i) + " | "
+        + scope.anchor_counts.get(i).to_str() + " | "
+        + scope.probe_counts.get(i).to_str() + " |")
+        i = i + 1
+    }
+    L.push("")
+    L.push("### The rows in full — the boundary of each claim")
+    L.push("")
+    i = 0
+    while i < scope.n_rows {
+        L.push("#### " + scope.ids.get(i) + " — " + scope.families.get(i)
+        + " — " + scope.severities.get(i))
+        L.push("")
+        L.push("**Claim.** " + scope.claims.get(i))
+        L.push("")
+        L.push("**Violation contract.** " + scope.violations.get(i))
+        L.push("")
+        L.push("**Reproduction.** " + scope.repros.get(i))
+        L.push("")
+        i = i + 1
+    }
+    L.push("## Reporting channel (anchored live)")
+    L.push("")
+    L.push("The channel is anchored in SECURITY.md and checked at")
+    L.push("render time — if it moves, this brief refuses until it")
+    L.push("is re-anchored: open a private GitHub Security Advisory")
+    L.push("at")
+    L.push("<https://github.com/mhieuhonda/halis-lang/security/advisories/new>.")
+    L.push("The project follows a 90-day coordinated-disclosure")
+    L.push("window and aims to acknowledge within 48 hours. Please")
+    L.push("do NOT open a public issue for security reports.")
+    L.push("")
+    L.push("## Reproducing this brief")
+    L.push("")
+    L.push("`bin/hls-finalaudit brief --out FINALBRIEF.md` — two")
+    L.push("renders of one tree are byte-identical; `--stamp` adds a")
+    L.push("Generated line and nothing else. The three digests above")
+    L.push("pin the artifact this brief was scoped from.")
+    L.push("")
+    return str_join(L, "\n") + "\n"
+}
+
+# fa_anchor_detail_of — the anchor's human detail, by name.
+fn fa_anchor_detail_of(a: FaAnchorSet, n: str) -> str {
+    if n == "guarantee-scope" {
+        return a.d_guarantee
+    }
+    if n == "api-freeze" {
+        return a.d_freeze
+    }
+    return a.d_snapshot
+}
+
+# fa_render_report — the deliverable, deterministic per ledger.
+fn fa_render_report(path: str, kit_root: str, entries: list[JsonValue],
+log_sha: str, stamp: str) -> str {
+    let state: str = fa_derive_state(entries)
+    let engagement: JsonValue = fa_engagement_of(entries)
+    let passes: list[JsonValue] = fa_passes_of(entries)
+    let findings: list[JsonValue] = fa_findings_of(entries)
+    let triages: list[JsonValue] = fa_triages_of(entries)
+    let seal: JsonValue = fa_signoff_of(entries)
+    let mut L: list[str] = []
+    L.push("# Halis FINAL security audit — engagement report")
+    L.push("")
+    L.push("Regenerated from the chained ledger by `" + fa_tool() + "`.")
+    L.push("Deterministic per ledger: two renders of one ledger are")
+    L.push("byte-identical. Do not hand-edit; regenerate with")
+    L.push("`bin/hls-finalaudit report --out FINALREPORT.md`.")
+    L.push("")
+    L.push("- Ledger: " + fa_relpath(path, kit_root) + " — "
+    + entries.len().to_str() + " entries, digest `sha256:" + log_sha
+    + "`")
+    L.push("- State: **" + state + "** — " + fa_state_meaning(state))
+    if !json_is_null(engagement) {
+        L.push("- Engagement: " + fa_jstr(engagement, "firm")
+        + " — roster: " + str_join(fa_jstrs(engagement, "roster"), ", "))
+        L.push("- Window: " + fa_jstr(engagement, "window"))
+        L.push("- Basis on record: " + py_repr(fa_jstr(engagement, "basis"))
+        + " (signed by " + fa_jstr(engagement, "by") + ")")
+        L.push("- Anchors pinned at the signature:")
+        let names: list[str] = fa_anchor_names()
+        let mut i: int = 0
+        while i < names.len() {
+            L.push("  - " + names.get(i) + ": `sha256:" + fa_jstr(
+            json_object_get(engagement, "anchors"), names.get(i))
+            + "`")
+            i = i + 1
+        }
+    } else {
+        L.push("- Engagement: none on record — this ledger predates")
+        L.push("  its own contract, which no writer in this kit")
+        L.push("  produces; the chain refused to guess.")
+    }
+    if stamp != "" {
+        L.push("- Generated: " + stamp)
+    }
+    L.push("")
+    L.push("## The evidence passes")
+    L.push("")
+    if passes.len() == 0 {
+        L.push("No evidence pass on record. The engagement has no")
+        L.push("transcript yet; nothing below is demonstrated by")
+        L.push("anyone, by anyone, in any role.")
+    } else {
+        L.push("| # | by | role | independence | anchors | outcome |"
+        + " guarantees |")
+        L.push("|---|----|------|--------------|---------|---------|"
+        + "------------|")
+        let mut i2: int = 0
+        while i2 < passes.len() {
+            let e: JsonValue = passes.get(i2)
+            let mut label: str = "SELF-ASSESSED"
+            if fa_jbool(e, "independent") {
+                label = "INDEPENDENT"
+            }
+            let drift: list[str] = fa_jstrs(e, "anchor_drift")
+            let mut amark: str = "pinned"
+            if drift.len() > 0 {
+                amark = "drift: " + str_join(drift, "/")
+            }
+            L.push("| " + fa_jint(e, "seq").to_str() + " | "
+            + fa_jstr(e, "by") + " | " + fa_jstr(e, "role") + " | "
+            + label + " | " + amark + " | " + fa_jstr(e, "outcome")
+            + " | " + fa_jint(e, "verified_guarantees").to_str() + "/"
+            + fa_jint(e, "total_guarantees").to_str() + " |")
+            i2 = i2 + 1
+        }
+        L.push("")
+        let newest: JsonValue = passes.get(passes.len() - 1)
+        let mut newest_i: JsonValue = json_null()
+        let mut i3: int = 0
+        while i3 < passes.len() {
+            if fa_jbool(passes.get(i3), "independent") {
+                newest_i = passes.get(i3)
+            }
+            i3 = i3 + 1
+        }
+        if !json_is_null(newest_i) {
+            L.push("**Independent pass on record:** "
+            + fa_jstr(newest_i, "by") + ", " + fa_fmt_ts(
+            fa_jint(newest_i, "timestamp")) + " — the")
+            L.push("latest such pass, by the auditors' own roster.")
+            if !fa_jbool(newest, "independent") {
+                L.push("The latest pass overall was run by the")
+                L.push("project itself (SELF-ASSESSED); both records")
+                L.push("stand, and each is labelled by who ran it.")
+            }
+        } else {
+            L.push("**No independent pass on record.** The latest")
+            L.push("pass was run by the project itself and is")
+            L.push("labelled SELF-ASSESSED; this report refuses to")
+            L.push("call it independent — independence is a fact the")
+            L.push("ledger names, not a fact it manufactures. The")
+            L.push("signoff will refuse to close on this evidence")
+            L.push("alone.")
+        }
+        let ndrift: list[str] = fa_jstrs(newest, "anchor_drift")
+        if ndrift.len() > 0 {
+            L.push("")
+            L.push("**The latest pass ran DRIFTED anchors** — the")
+            L.push("engagement was signed against one artifact and")
+            L.push("this pass ran another (" + str_join(ndrift, ", ")
+            + "); the drift is a fact")
+            L.push("on record, and the signoff refuses to close")
+            L.push("until the evidence re-runs on the artifact that")
+            L.push("was engaged.")
+        }
+        if fa_jstr(newest, "outcome") == "failed" {
+            L.push("")
+            L.push("**The latest pass FAILED** — the refusals it")
+            L.push("recorded, verbatim:")
+            let refs: list[JsonValue] = fa_jarr(newest, "refusals")
+            let mut r: int = 0
+            while r < refs.len() {
+                L.push("- " + json_str_value(refs.get(r)))
+                r = r + 1
+            }
+        }
+    }
+    L.push("")
+    L.push("## The findings")
+    L.push("")
+    if findings.len() == 0 {
+        L.push("No findings on record. A clean pass so far — the")
+        L.push("state line honestly stays underway, because the")
+        L.push("ledger cannot know the auditors rested; this report")
+        L.push("is the deliverable either way.")
+    } else {
+        L.push("| id | severity | against | title | filed by |"
+        + " reproducer |")
+        L.push("|----|----------|---------|-------|-----------|"
+        + "------------|")
+        let ordered: list[JsonValue] = fa_sorted_by_id(findings)
+        let mut i4: int = 0
+        while i4 < ordered.len() {
+            let f: JsonValue = ordered.get(i4)
+            let mut repro: str = fa_jstr(f, "repro_mode") + ": "
+            + fa_jstr(f, "repro_value")
+            if fa_jstr(f, "repro_mode") == "text" && repro.len() > 64 {
+                repro = repro.slice(0, 61) + "..."
+            }
+            L.push("| " + fa_jstr(f, "id") + " | "
+            + fa_jstr(f, "severity") + " | " + fa_jstr(f, "against")
+            + " | " + fa_jstr(f, "title") + " | " + fa_jstr(f, "by")
+            + " | " + repro + " |")
+            i4 = i4 + 1
+        }
+    }
+    L.push("")
+    L.push("## The triage and remediation")
+    L.push("")
+    if triages.len() == 0 {
+        L.push("No triage on record yet — every finding above is")
+        L.push("still awaiting the project's response, with a")
+        L.push("written reason and, for acceptances, the remediation")
+        L.push("commit itself — landed, and not older than the")
+        L.push("finding it fixes.")
+    } else {
+        L.push("| finding | verdict | by | reason | remediation |")
+        L.push("|---------|---------|----|--------|-------------|")
+        let ordered2: list[JsonValue] = fa_sorted_by_for(triages)
+        let mut i5: int = 0
+        while i5 < ordered2.len() {
+            let t: JsonValue = ordered2.get(i5)
+            let mut fix: str = "—"
+            if json_object_has(t, "fix") {
+                fix = fa_jstr(t, "fix")
+            }
+            L.push("| " + fa_jstr(t, "for") + " | "
+            + fa_jstr(t, "verdict") + " | " + fa_jstr(t, "by") + " | "
+            + fa_jstr(t, "reason") + " | " + fix + " |")
+            i5 = i5 + 1
+        }
+    }
+    L.push("")
+    L.push("## The signoff")
+    L.push("")
+    if json_is_null(seal) {
+        L.push("No signoff on record. The closure laws that must")
+        L.push("hold before the seal is written:")
+        L.push("")
+        L.push("- an independent evidence pass on record, and the")
+        L.push("  latest pass green;")
+        L.push("- every finding triaged, every acceptance carrying")
+        L.push("  its remediation commit — landed, and not older")
+        L.push("  than its finding;")
+        L.push("- the three anchors unchanged since the signature.")
+        L.push("")
+    } else {
+        L.push("**SEALED** by " + fa_jstr(seal, "by") + " at "
+        + fa_fmt_ts(fa_jint(seal, "timestamp")) + ", from the tree `"
+        + fa_jstr(seal, "tree") + "`.")
+        L.push("")
+        L.push("The closure census at seal time: "
+        + fa_jint(seal, "passes").to_str() + " pass(es), "
+        + fa_jint(seal, "independent_passes").to_str()
+        + " independent; " + fa_jint(seal, "findings").to_str()
+        + " finding(s), " + fa_jint(seal, "triages").to_str()
+        + " triaged, " + fa_jint(seal, "fixes").to_str()
+        + " fix(es) recorded.")
+        L.push("")
+        L.push("The anchors pinned at the seal:")
+        L.push("")
+        let names2: list[str] = fa_anchor_names()
+        let mut i6: int = 0
+        while i6 < names2.len() {
+            L.push("- " + names2.get(i6) + ": `sha256:" + fa_jstr(
+            json_object_get(seal, "anchors"), names2.get(i6))
+            + "`")
+            i6 = i6 + 1
+        }
+        L.push("")
+        L.push("The ledger is closed — after the seal nothing")
+        L.push("appends. What comes after the seal is the next")
+        L.push("audit, not an amendment.")
+    }
+    L.push("")
+    L.push("## The state, honestly")
+    L.push("")
+    L.push("**" + str_to_upper_ascii(state) + ".** "
+    + fa_state_meaning(state))
+    L.push("The word is derived from the census on every render,")
+    L.push("never stored: responded requires every finding triaged;")
+    L.push("remediated requires every acceptance to carry its")
+    L.push("remediation commit; sealed requires the signoff — and")
+    L.push("the signoff itself required the independent pass, the")
+    L.push("landed fixes and the unchanged anchors before it could")
+    L.push("be written. A finding-free audit stays underway — the")
+    L.push("ledger cannot know the auditors rested; the report is")
+    L.push("the deliverable either way.")
+    L.push("")
+    L.push("## The render contract")
+    L.push("")
+    L.push("No wall-clock unless `--stamp` (and then only the")
+    L.push("Generated line). The ledger digest above is the sha256")
+    L.push("of the raw ledger bytes: tamper with one byte of it and")
+    L.push("the chain names the line — a tampered ledger is")
+    L.push("evidence, not a document, and nothing renders from it.")
+    L.push("This report is a render of the LEDGER; the live")
+    L.push("verification is the gate's business, not the")
+    L.push("document's.")
+    L.push("")
+    return str_join(L, "\n") + "\n"
+}
+
+# fa_jstrs — a json string array as plain strs.
+fn fa_jstrs(v: JsonValue, key: str) -> list[str] {
+    let out: list[str] = []
+    let xs: list[JsonValue] = fa_jarr(v, key)
+    let mut i: int = 0
+    while i < xs.len() {
+        if json_is_str(xs.get(i)) {
+            out.push(json_str_value(xs.get(i)))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# fa_sorted_by_id — findings in AF-NNN order (sorted(fid), the
+# report's table order).
+fn fa_sorted_by_id(items: list[JsonValue]) -> list[JsonValue] {
+    let out: list[JsonValue] = []
+    let mut i: int = 0
+    while i < items.len() {
+        out.push(items.get(i))
+        i = i + 1
+    }
+    let mut a: int = 1
+    while a < out.len() {
+        let v: JsonValue = out.get(a)
+        let mut b: int = a - 1
+        while b >= 0 && fa_jstr(out.get(b), "id") > fa_jstr(v, "id") {
+            out.set(b + 1, out.get(b))
+            b = b - 1
+        }
+        out.set(b + 1, v)
+        a = a + 1
+    }
+    return out
+}
+
+# fa_sorted_by_for — triages in AF-NNN order.
+fn fa_sorted_by_for(items: list[JsonValue]) -> list[JsonValue] {
+    let out: list[JsonValue] = []
+    let mut i: int = 0
+    while i < items.len() {
+        out.push(items.get(i))
+        i = i + 1
+    }
+    let mut a: int = 1
+    while a < out.len() {
+        let v: JsonValue = out.get(a)
+        let mut b: int = a - 1
+        while b >= 0 && fa_jstr(out.get(b), "for") > fa_jstr(v, "for") {
+            out.set(b + 1, out.get(b))
+            b = b - 1
+        }
+        out.set(b + 1, v)
+        a = a + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# Shared plumbing.
+# ----------------------------------------------------------------------------
+
+struct FaArgs {
+    cmd: str,
+    ledger: str, # "" = the default ledger under the kit's repo
+    root: str, # "" = the kit's repo
+    firm: str,
+    auditors: list[str],
+    window: str,
+    basis: str,
+    by: str,
+    out: str,
+    stamp: bool,
+    json: bool,
+    against: str,
+    severity: str,
+    title: str,
+    repro_path: str,
+    repro_text: str,
+    finding: str,
+    verdict: str,
+    reason: str,
+    fix: str
+}
+
+# fa_usage — the argparse refusal: exit 2, the grammar on stderr.
+fn fa_usage(line: str) -> int uses IO {
+    eprint("usage: hls-finalaudit engage --firm F --auditor N "
+    + "[--auditor N ...] --window YYYY-MM-DD/YYYY-MM-DD --basis B "
+    + "[--by NAME] [--root PATH] [--ledger PATH]\n")
+    eprint("       hls-finalaudit brief [--out FILE.md] [--stamp] "
+    + "[--root PATH] [--ledger PATH]\n")
+    eprint("       hls-finalaudit evidence [--by NAME] [--json] "
+    + "[--root PATH] [--ledger PATH]\n")
+    eprint("       hls-finalaudit file --against G-XXX-NN "
+    + "--severity critical|high|medium|low|info --title T "
+    + "(--repro-path P | --repro-text T) [--by NAME] [--root PATH] "
+    + "[--ledger PATH]\n")
+    eprint("       hls-finalaudit triage AF-NNN "
+    + "--verdict accepted|disputed|out-of-scope --reason R "
+    + "[--fix <40-hex>] [--by NAME] [--root PATH] [--ledger PATH]\n")
+    eprint("       hls-finalaudit signoff [--by NAME] [--root PATH] "
+    + "[--ledger PATH]\n")
+    eprint("       hls-finalaudit gate [--json] [--root PATH] "
+    + "[--ledger PATH]\n")
+    eprint("       hls-finalaudit report --out FILE.md [--stamp] "
+    + "[--root PATH] [--ledger PATH]\n")
+    eprint("       hls-finalaudit status [--json] [--root PATH] "
+    + "[--ledger PATH]\n")
+    if line != "" {
+        eprint("error: " + line + "\n")
+    }
+    return 2
+}
+
+# fa_fail — a named refusal: the rule on stderr, exit 1.
+fn fa_fail(msg: str) -> int uses IO {
+    eprint("error: " + msg + "\n")
+    return 1
+}
+
+# fa_require_engagement — the engagement, or the named refusal.
+fn fa_require_engagement(entries: list[JsonValue]) -> Result[JsonValue, str] {
+    let eng: JsonValue = fa_engagement_of(entries)
+    if json_is_null(eng) {
+        return Result.Err("no engagement on record — engage first: "
+        + "the final audit kit writes nothing before the contract does")
+    }
+    return Result.Ok(eng)
+}
+
+# fa_refuse_if_sealed — after the seal nothing appends: what comes
+# after the seal is the next audit, not an amendment.
+fn fa_refuse_if_sealed(entries: list[JsonValue]) -> str {
+    let seal: JsonValue = fa_signoff_of(entries)
+    if !json_is_null(seal) {
+        return "the final audit is sealed (seq "
+        + fa_jint(seal, "seq").to_str() + ", by " + fa_jstr(seal, "by")
+        + ", tree " + fa_jstr(seal, "tree").slice(0, 12) + ") — what "
+        + "comes after the seal is the next audit, not an amendment"
+    }
+    return ""
+}
+
+# ----------------------------------------------------------------------------
+# engage — the contract. One engagement per ledger, ever; the
+# signature pins the FROZEN ARTIFACT, all three anchors at once.
+# ----------------------------------------------------------------------------
+fn fa_cmd_engage(a: FaArgs, kit_root: str) -> int
+uses IO, Args, Fs, Proc, Clock {
+    let root: str = a.root
+    let path: str = a.ledger
+    let read: LedgerRead = fa_read_ledger(path, false)
+    if !read.ok {
+        return fa_fail(read.err)
+    }
+    if !json_is_null(fa_engagement_of(read.entries)) {
+        return fa_fail("an engagement is already on record (seq 1, "
+        + fa_jstr(read.entries.get(0), "firm") + ") — a contract is "
+        + "not a draft; start a new ledger for a new engagement")
+    }
+    let mut by: str = a.by
+    if by == "" {
+        by = fa_default_actor(root)
+    }
+    let roster: list[str] = []
+    let mut i: int = 0
+    while i < a.auditors.len() {
+        if a.auditors.get(i) != "" {
+            roster.push(a.auditors.get(i))
+        }
+        i = i + 1
+    }
+    if roster.len() == 0 {
+        return fa_fail("the roster is empty — an audit with no "
+        + "auditors is a monologue")
+    }
+    if fa_in_strs(roster, by) {
+        return fa_fail("the signer (" + py_repr(by)
+        + ") cannot be on their own roster — independence starts at "
+        + "the signature")
+    }
+    let why: str = fa_parse_window(a.window)
+    if why != "" {
+        return fa_fail("the window " + py_repr(a.window)
+        + " is refused: " + why)
+    }
+    let anchors: FaAnchorSet = fa_anchors_of(root)
+    if !anchors.ok {
+        return fa_fail(anchors.err)
+    }
+    let anchor_obj: JsonValue = fa_anchor_obj_of(anchors)
+    let fields: list[str] = []
+    let vals: list[JsonValue] = []
+    fields.push("kind")
+    vals.push(json_str("engagement"))
+    fields.push("tool")
+    vals.push(json_str(fa_tool()))
+    fields.push("version")
+    vals.push(json_str(fa_version()))
+    fields.push("by")
+    vals.push(json_str(by))
+    fields.push("firm")
+    vals.push(json_str(a.firm))
+    fields.push("roster")
+    vals.push(fa_jv_strs(roster))
+    fields.push("window")
+    vals.push(json_str(a.window))
+    fields.push("basis")
+    vals.push(json_str(a.basis))
+    fields.push("anchors")
+    vals.push(anchor_obj)
+    let w: LedgerRead = fa_append_chained(path, json_object(fields, vals))
+    if !w.ok {
+        return fa_fail(w.err)
+    }
+    let entry: JsonValue = w.entries.get(0)
+    println("engaged: " + a.firm + " — " + a.window)
+    println("  roster   : " + str_join(roster, ", "))
+    println("  basis    : " + py_repr(a.basis))
+    println("  signed by: " + by + " (the project side)")
+    println("  scope    : " + anchors.g_count.to_str()
+    + " guarantees, sha256:" + anchors.a_guarantee.slice(0, 16))
+    println("  anchor   : api-freeze = " + anchors.a_freeze.slice(0, 16)
+    + " (" + anchors.d_freeze + ")")
+    println("  anchor   : bootstrap-snapshot = "
+    + anchors.a_snapshot.slice(0, 16) + " (" + anchors.d_snapshot + ")")
+    println("  chain    : seq " + fa_jint(entry, "seq").to_str()
+    + ", prev " + fa_jstr(entry, "prev_hash").slice(0, 12) + "...")
+    return 0
+}
+
+# fa_anchor_obj_of — the three pinned digests as one json object.
+fn fa_anchor_obj_of(a: FaAnchorSet) -> JsonValue {
+    let keys: list[str] = []
+    let vals: list[JsonValue] = []
+    let names: list[str] = fa_anchor_names()
+    let mut i: int = 0
+    while i < names.len() {
+        keys.push(names.get(i))
+        vals.push(json_str(fa_anchor_digest_of(a, names.get(i))))
+        i = i + 1
+    }
+    return json_object(keys, vals)
+}
+
+# fa_jv_strs — a json array of plain strings.
+fn fa_jv_strs(xs: list[str]) -> JsonValue {
+    let vals: list[JsonValue] = []
+    let mut i: int = 0
+    while i < xs.len() {
+        vals.push(json_str(xs.get(i)))
+        i = i + 1
+    }
+    return json_array(vals)
+}
+
+# ----------------------------------------------------------------------------
+# brief — the RFP. The only command that may run before a ledger
+# exists: solicitation precedes contract.
+# ----------------------------------------------------------------------------
+fn fa_cmd_brief(a: FaArgs, kit_root: str) -> int
+uses IO, Args, Fs, Proc, Clock {
+    let root: str = a.root
+    let path: str = a.ledger
+    let read: LedgerRead = fa_read_ledger(path, false)
+    if !read.ok {
+        return fa_fail(read.err)
+    }
+    let scope: FaScope = fa_scope(root)
+    if !scope.ok {
+        return fa_fail(scope.err)
+    }
+    let problems: list[str] = fa_policy_anchor_ok(root, scope)
+    if problems.len() > 0 {
+        let mut i: int = 0
+        while i < problems.len() {
+            eprint("error: " + problems.get(i) + "\n")
+            i = i + 1
+        }
+        return 1
+    }
+    let anchors: FaAnchorSet = fa_anchors_of(root)
+    if !anchors.ok {
+        return fa_fail(anchors.err)
+    }
+    let mut stamp: str = ""
+    if a.stamp {
+        stamp = fa_stamp_now()
+    }
+    let doc: str = fa_render_brief(root, scope, anchors,
+    fa_engagement_of(read.entries), stamp)
+    if a.out != "" {
+        let out_path: str = fa_abs_out(a.out)
+        let d: str = fa_dirname(out_path)
+        if d != "" && d != "." {
+            proc_exec("mkdir -p '" + fa_shell_quote(d) + "'")
+        }
+        write_file(out_path, doc)
+        println("brief: " + fa_relpath(out_path, kit_root) + " ("
+        + scope.n_rows.to_str() + " guarantees, tree "
+        + fa_git_sha(root).slice(0, 12) + ")")
+    } else {
+        print(doc)
+    }
+    return 0
+}
+
+# fa_abs_out — --out anchored where the caller stands (the .py
+# os.path.abspath: relative to the cwd, however the path reads).
+fn fa_abs_out(p: str) -> str uses Fs, Proc {
+    if p.starts_with("/") {
+        return p
+    }
+    return fa_join(cwd_get(), p)
+}
+
+# ----------------------------------------------------------------------------
+# evidence — the pass. Re-runs the whole scope through the real
+# checker, re-derives the three anchors live, records what it ran and
+# any drift as a fact. The seal is refused later on drift that was
+# never re-pinned; the pass itself is honest about both outcomes —
+# fail-closed AND fail-recorded.
+# ----------------------------------------------------------------------------
+fn fa_cmd_evidence(a: FaArgs, kit_root: str) -> int
+uses IO, Args, Fs, Proc, Clock {
+    let root: str = a.root
+    let path: str = a.ledger
+    let read: LedgerRead = fa_read_ledger(path, true)
+    if !read.ok {
+        return fa_fail(read.err)
+    }
+    let req: Result[JsonValue, str] = fa_require_engagement(read.entries)
+    if result_is_err(req) {
+        return fa_fail(result_err_or(req, "refused"))
+    }
+    let eng: JsonValue = result_unwrap(req)
+    let sealed: str = fa_refuse_if_sealed(read.entries)
+    if sealed != "" {
+        return fa_fail(sealed)
+    }
+    let mut by: str = a.by
+    if by == "" {
+        by = fa_default_actor(root)
+    }
+    let scope: FaScope = fa_scope(root)
+    if !scope.ok {
+        return fa_fail(scope.err)
+    }
+    let anchors: FaAnchorSet = fa_anchors_of(root)
+    if !anchors.ok {
+        return fa_fail(anchors.err)
+    }
+    let pass: FaPassOut = fa_evidence(root)
+    if pass.err != "" {
+        return fa_fail(pass.err)
+    }
+    let drift: list[str] = fa_anchor_drift(
+    json_object_get(eng, "anchors"), anchors)
+    let roster: list[str] = fa_jstrs(eng, "roster")
+    let mut fields: list[str] = []
+    let mut vals: list[JsonValue] = []
+    fields.push("kind")
+    vals.push(json_str("evidence"))
+    fields.push("tool")
+    vals.push(json_str(fa_tool()))
+    fields.push("version")
+    vals.push(json_str(fa_version()))
+    fields.push("by")
+    vals.push(json_str(by))
+    fields.push("role")
+    if fa_in_strs(roster, by) {
+        vals.push(json_str("auditor"))
+    } else {
+        vals.push(json_str("project"))
+    }
+    fields.push("independent")
+    vals.push(json_bool(fa_in_strs(roster, by)))
+    fields.push("tree")
+    vals.push(json_str(fa_git_sha(root)))
+    fields.push("anchors")
+    vals.push(fa_anchor_obj_of(anchors))
+    fields.push("anchor_drift")
+    vals.push(fa_jv_strs(drift))
+    fields.push("outcome")
+    if pass.ok {
+        vals.push(json_str("ok"))
+    } else {
+        vals.push(json_str("failed"))
+    }
+    fields.push("verified_guarantees")
+    vals.push(json_int(pass.verified))
+    fields.push("total_guarantees")
+    vals.push(json_int(scope.n_rows))
+    fields.push("guarantee_anchors")
+    vals.push(json_int(pass.anchors))
+    fields.push("guarantee_probes")
+    vals.push(json_int(pass.probes))
+    if !pass.ok {
+        fields.push("refusals")
+        vals.push(fa_jv_strs(pass.refusals))
+    }
+    let w: LedgerRead = fa_append_chained(path,
+    json_object(fields, vals))
+    if !w.ok {
+        return fa_fail(w.err)
+    }
+    let entry: JsonValue = w.entries.get(0)
+    if a.json {
+        print(j_dump_at(entry, 0) + "\n")
+    } else {
+        let mut label: str = "SELF-ASSESSED"
+        if fa_jbool(entry, "independent") {
+            label = "INDEPENDENT"
+        }
+        println("transcript: seq " + fa_jint(entry, "seq").to_str()
+        + " by " + by + " — " + label)
+        println("  scope    : " + pass.verified.to_str() + "/"
+        + scope.n_rows.to_str() + " guarantees, "
+        + pass.anchors.to_str() + " anchors, " + pass.probes.to_str()
+        + " probes")
+        let mut amark: str = "pinned"
+        if drift.len() > 0 {
+            amark = "drift: " + str_join(drift, ", ")
+        }
+        println("  anchors  : " + amark)
+        if pass.ok {
+            println("  outcome  : ok")
+        } else {
+            println("  outcome  : FAILED")
+        }
+    }
+    if !pass.ok {
+        eprint("EVIDENCE FAILED — " + pass.refusals.len().to_str()
+        + " refusal(s), recorded verbatim:\n")
+        let mut i: int = 0
+        while i < pass.refusals.len() {
+            eprint("  - " + pass.refusals.get(i) + "\n")
+            i = i + 1
+        }
+        return 1
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# file — the auditor's instrument.
+# ----------------------------------------------------------------------------
+fn fa_cmd_file(a: FaArgs, kit_root: str) -> int
+uses IO, Args, Fs, Proc, Clock {
+    let root: str = a.root
+    let path: str = a.ledger
+    let read: LedgerRead = fa_read_ledger(path, true)
+    if !read.ok {
+        return fa_fail(read.err)
+    }
+    let req: Result[JsonValue, str] = fa_require_engagement(read.entries)
+    if result_is_err(req) {
+        return fa_fail(result_err_or(req, "refused"))
+    }
+    let eng: JsonValue = result_unwrap(req)
+    let sealed: str = fa_refuse_if_sealed(read.entries)
+    if sealed != "" {
+        return fa_fail(sealed)
+    }
+    let mut by: str = a.by
+    if by == "" {
+        by = fa_default_actor(root)
+    }
+    let roster: list[str] = fa_jstrs(eng, "roster")
+    if !fa_in_strs(roster, by) {
+        return fa_fail(py_repr(by) + " is not on the auditor roster ("
+        + str_join(roster, ", ") + ") — findings are the auditors' to "
+        + "file. The roster is recorded at engage time and the ledger "
+        + "does not negotiate it afterwards")
+    }
+    let scope: FaScope = fa_scope(root)
+    if !scope.ok {
+        return fa_fail(scope.err)
+    }
+    if !fa_in_strs(scope.ids, a.against) {
+        return fa_fail("finding against " + py_repr(a.against)
+        + " is refused — not one of the scope's rows (known: "
+        + str_join(scope.ids, ", ") + "); a finding against nothing "
+        + "in the scope is out of the protocol by definition")
+    }
+    if !fa_in_strs(fa_severities(), a.severity) {
+        return fa_fail("severity " + py_repr(a.severity)
+        + " is not one of critical/high/medium/low/info")
+    }
+    if a.title == "" {
+        return fa_fail("a finding without a title names nothing")
+    }
+    let have_path: bool = a.repro_path != ""
+    let have_text: bool = a.repro_text != ""
+    if have_path && have_text {
+        return fa_fail("a finding carries ONE reproducer, not two: "
+        + "--repro-path or --repro-text")
+    }
+    if !have_path && !have_text {
+        return fa_fail("a finding that cannot be reproduced is an "
+        + "opinion, and opinions are not findings — pass "
+        + "--repro-path or --repro-text")
+    }
+    let mut mode: str = "text"
+    let mut value: str = a.repro_text
+    if have_path {
+        if !file_exists(fa_join(root, a.repro_path)) {
+            return fa_fail("repro path " + py_repr(a.repro_path)
+            + " does not exist in the tree — a reproducer that points "
+            + "at nothing is a rumor")
+        }
+        mode = "path"
+        value = a.repro_path
+    }
+    let existing: list[JsonValue] = fa_findings_of(read.entries)
+    let mut next_n: int = 1
+    let mut i: int = 0
+    while i < existing.len() {
+        let id: str = fa_jstr(existing.get(i), "id")
+        let n: int = fa_to_int(id.slice(fa_finding_prefix().len(),
+        id.len()))
+        if n >= next_n {
+            next_n = n + 1
+        }
+        i = i + 1
+    }
+    let mut fid: str = fa_finding_prefix()
+    if next_n < 10 {
+        fid = fid + "00" + next_n.to_str()
+    } else if next_n < 100 {
+        fid = fid + "0" + next_n.to_str()
+    } else {
+        fid = fid + next_n.to_str()
+    }
+    let fields: list[str] = []
+    let vals: list[JsonValue] = []
+    fields.push("kind")
+    vals.push(json_str("finding"))
+    fields.push("tool")
+    vals.push(json_str(fa_tool()))
+    fields.push("version")
+    vals.push(json_str(fa_version()))
+    fields.push("id")
+    vals.push(json_str(fid))
+    fields.push("by")
+    vals.push(json_str(by))
+    fields.push("against")
+    vals.push(json_str(a.against))
+    fields.push("severity")
+    vals.push(json_str(a.severity))
+    fields.push("title")
+    vals.push(json_str(a.title))
+    fields.push("repro_mode")
+    vals.push(json_str(mode))
+    fields.push("repro_value")
+    vals.push(json_str(value))
+    let w: LedgerRead = fa_append_chained(path,
+    json_object(fields, vals))
+    if !w.ok {
+        return fa_fail(w.err)
+    }
+    let entry: JsonValue = w.entries.get(0)
+    let mut shown: str = value
+    if shown.len() > 64 {
+        shown = shown.slice(0, 61) + "..."
+    }
+    println("filed " + fid + " (" + a.severity + ", against "
+    + a.against + ") by " + by + " — seq "
+    + fa_jint(entry, "seq").to_str())
+    println("  reproducer: " + mode + ": " + shown)
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# triage — the project's response. The fix-landing law lives here:
+# exist, postdate the finding, land in the tree being released.
+# ----------------------------------------------------------------------------
+fn fa_cmd_triage(a: FaArgs, kit_root: str) -> int
+uses IO, Args, Fs, Proc, Clock {
+    let root: str = a.root
+    let path: str = a.ledger
+    let read: LedgerRead = fa_read_ledger(path, true)
+    if !read.ok {
+        return fa_fail(read.err)
+    }
+    let req: Result[JsonValue, str] = fa_require_engagement(read.entries)
+    if result_is_err(req) {
+        return fa_fail(result_err_or(req, "refused"))
+    }
+    let eng: JsonValue = result_unwrap(req)
+    let sealed: str = fa_refuse_if_sealed(read.entries)
+    if sealed != "" {
+        return fa_fail(sealed)
+    }
+    let mut by: str = a.by
+    if by == "" {
+        by = fa_default_actor(root)
+    }
+    let roster: list[str] = fa_jstrs(eng, "roster")
+    if fa_in_strs(roster, by) {
+        return fa_fail(py_repr(by) + " is on the auditor roster — the "
+        + "response is the project's to give, and an auditor cannot "
+        + "triage their own finding")
+    }
+    let findings: list[JsonValue] = fa_findings_of(read.entries)
+    let triages: list[JsonValue] = fa_triages_of(read.entries)
+    let fid: str = a.finding
+    if !fa_is_finding_id(fid) {
+        return fa_fail("a finding id is AF-NNN, not " + py_repr(fid))
+    }
+    let mut on_record: bool = false
+    let mut filed: list[str] = []
+    let mut finding_ts: int = -1
+    let mut i: int = 0
+    while i < findings.len() {
+        if fa_jstr(findings.get(i), "id") == fid {
+            on_record = true
+            finding_ts = fa_jint(findings.get(i), "timestamp")
+        }
+        filed.push(fa_jstr(findings.get(i), "id"))
+        i = i + 1
+    }
+    if !on_record {
+        let names: str = str_join(fa_sort_strs(filed), ", ")
+        let mut shown: str = names
+        if names == "" {
+            shown = "none"
+        }
+        return fa_fail("no finding " + fid + " on record (filed: "
+        + shown + ")")
+    }
+    let mut prior: JsonValue = json_null()
+    i = 0
+    while i < triages.len() {
+        if fa_jstr(triages.get(i), "for") == fid {
+            prior = triages.get(i)
+        }
+        i = i + 1
+    }
+    if !json_is_null(prior) {
+        return fa_fail(fid + " already carries its triage (seq "
+        + fa_jint(prior, "seq").to_str() + ") — one finding, one "
+        + "response; the record is the response, not a negotiation")
+    }
+    if !fa_in_strs(fa_triage_verdicts(), a.verdict) {
+        return fa_fail("verdict " + py_repr(a.verdict)
+        + " is not one of accepted/disputed/out-of-scope")
+    }
+    if a.reason == "" {
+        return fa_fail("a triage without a reason is refused — the "
+        + "sanction law, on the other side of the table")
+    }
+    let fields: list[str] = []
+    let vals: list[JsonValue] = []
+    fields.push("kind")
+    vals.push(json_str("triage"))
+    fields.push("tool")
+    vals.push(json_str(fa_tool()))
+    fields.push("version")
+    vals.push(json_str(fa_version()))
+    fields.push("by")
+    vals.push(json_str(by))
+    fields.push("for")
+    vals.push(json_str(fid))
+    fields.push("verdict")
+    vals.push(json_str(a.verdict))
+    fields.push("reason")
+    vals.push(json_str(a.reason))
+    if a.verdict == "accepted" {
+        if a.fix == "" {
+            return fa_fail("an acceptance without its remediation is "
+            + "a wish, not a fix — pass --fix <40-hex commit>")
+        }
+        if !fa_is_hex40(a.fix) {
+            return fa_fail("the fix must be 40 hex, not "
+            + py_repr(a.fix))
+        }
+        let known: int = fa_commit_exists(root, a.fix)
+        if known == 0 {
+            return fa_fail("fix " + a.fix.slice(0, 12)
+            + " names no commit in this tree — a remediation that "
+            + "exists nowhere is a promise, not a commit")
+        }
+        if known < 0 {
+            println("  note: not a git tree — the fix is validated by "
+            + "shape only")
+        } else {
+            let landed: int = fa_commit_landed(root, a.fix)
+            if landed == 0 {
+                let head: str = fa_git_sha(root)
+                return fa_fail("the fix " + a.fix.slice(0, 12)
+                + " is not in the tree being released (not an ancestor "
+                + "of HEAD " + head.slice(0, 12) + ") — a fix that has "
+                + "not landed is a promise, not a fix")
+            }
+            let when: int = fa_commit_timestamp(root, a.fix)
+            if when >= 0 && finding_ts >= 0 && when < finding_ts {
+                return fa_fail("the fix " + a.fix.slice(0, 12)
+                + " predates the finding it fixes (committed "
+                + when.to_str() + ", filed " + finding_ts.to_str()
+                + ") — a fix that predates its finding is a "
+                + "contradiction")
+            }
+        }
+        fields.push("fix")
+        vals.push(json_str(a.fix))
+    } else {
+        if a.fix != "" {
+            return fa_fail("only an acceptance carries a fix: a "
+            + a.verdict + " finding with a remediation is a "
+            + "contradiction — fix it first, then re-file")
+        }
+    }
+    let w: LedgerRead = fa_append_chained(path,
+    json_object(fields, vals))
+    if !w.ok {
+        return fa_fail(w.err)
+    }
+    let entry: JsonValue = w.entries.get(0)
+    println("triaged " + fid + ": " + a.verdict + " by " + by
+    + " — seq " + fa_jint(entry, "seq").to_str())
+    println("  reason: " + py_repr(a.reason))
+    if json_object_has(entry, "fix") {
+        println("  fix    : " + fa_jstr(entry, "fix"))
+    }
+    return 0
+}
+
+# fa_sort_strs — insertion sort, the family's idiom.
+fn fa_sort_strs(xs: list[str]) -> list[str] {
+    let mut a: int = 1
+    while a < xs.len() {
+        let v: str = xs.get(a)
+        let mut b: int = a - 1
+        while b >= 0 && xs.get(b) > v {
+            xs.set(b + 1, xs.get(b))
+            b = b - 1
+        }
+        xs.set(b + 1, v)
+        a = a + 1
+    }
+    return xs
+}
+
+# ----------------------------------------------------------------------------
+# signoff — the project's closing act. Writes the seal, and closes
+# the ledger: after the seal nothing appends.
+# ----------------------------------------------------------------------------
+fn fa_cmd_signoff(a: FaArgs, kit_root: str) -> int
+uses IO, Args, Fs, Proc, Clock {
+    let root: str = a.root
+    let path: str = a.ledger
+    let read: LedgerRead = fa_read_ledger(path, true)
+    if !read.ok {
+        return fa_fail(read.err)
+    }
+    let req: Result[JsonValue, str] = fa_require_engagement(read.entries)
+    if result_is_err(req) {
+        return fa_fail(result_err_or(req, "refused"))
+    }
+    let eng: JsonValue = result_unwrap(req)
+    let sealed: str = fa_refuse_if_sealed(read.entries)
+    if sealed != "" {
+        return fa_fail(sealed)
+    }
+    let mut by: str = a.by
+    if by == "" {
+        by = fa_default_actor(root)
+    }
+    let roster: list[str] = fa_jstrs(eng, "roster")
+    if fa_in_strs(roster, by) {
+        return fa_fail(py_repr(by) + " is on the auditor roster — the "
+        + "signoff is the project's act; the auditors' deliverable is "
+        + "the findings, not the closure")
+    }
+    let refusals: list[str] = fa_closure_refusals(read.entries, root)
+    if refusals.len() > 0 {
+        eprint("SIGNOFF REFUSED — the closure laws that did not hold:\n")
+        let mut i: int = 0
+        while i < refusals.len() {
+            eprint("  - " + refusals.get(i) + "\n")
+            i = i + 1
+        }
+        return 1
+    }
+    let anchors: FaAnchorSet = fa_anchors_of(root)
+    if !anchors.ok {
+        return fa_fail(anchors.err)
+    }
+    let passes: list[JsonValue] = fa_passes_of(read.entries)
+    let findings: list[JsonValue] = fa_findings_of(read.entries)
+    let triages: list[JsonValue] = fa_triages_of(read.entries)
+    let mut n_ind: int = 0
+    let mut n_fix: int = 0
+    let mut i: int = 0
+    while i < passes.len() {
+        if fa_jbool(passes.get(i), "independent") {
+            n_ind = n_ind + 1
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < triages.len() {
+        if json_object_has(triages.get(i), "fix") {
+            n_fix = n_fix + 1
+        }
+        i = i + 1
+    }
+    let fields: list[str] = []
+    let vals: list[JsonValue] = []
+    fields.push("kind")
+    vals.push(json_str("signoff"))
+    fields.push("tool")
+    vals.push(json_str(fa_tool()))
+    fields.push("version")
+    vals.push(json_str(fa_version()))
+    fields.push("by")
+    vals.push(json_str(by))
+    fields.push("tree")
+    vals.push(json_str(fa_git_sha(root)))
+    fields.push("anchors")
+    vals.push(fa_anchor_obj_of(anchors))
+    fields.push("passes")
+    vals.push(json_int(passes.len()))
+    fields.push("independent_passes")
+    vals.push(json_int(n_ind))
+    fields.push("findings")
+    vals.push(json_int(findings.len()))
+    fields.push("triages")
+    vals.push(json_int(triages.len()))
+    fields.push("fixes")
+    vals.push(json_int(n_fix))
+    let w: LedgerRead = fa_append_chained(path,
+    json_object(fields, vals))
+    if !w.ok {
+        return fa_fail(w.err)
+    }
+    let entry: JsonValue = w.entries.get(0)
+    println("sealed: seq " + fa_jint(entry, "seq").to_str() + " by "
+    + by + " — the final audit is closed")
+    println("  tree    : " + fa_jstr(entry, "tree").slice(0, 24))
+    let names: list[str] = fa_anchor_names()
+    i = 0
+    while i < names.len() {
+        println("  anchor  : " + names.get(i) + " = " + fa_jstr(
+        json_object_get(entry, "anchors"), names.get(i))
+        .slice(0, 16))
+        i = i + 1
+    }
+    println("  census  : " + fa_jint(entry, "passes").to_str()
+    + " pass(es), " + fa_jint(entry, "independent_passes").to_str()
+    + " independent; " + fa_jint(entry, "findings").to_str()
+    + " finding(s), " + fa_jint(entry, "triages").to_str()
+    + " triaged, " + fa_jint(entry, "fixes").to_str() + " fix(es)")
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# gate — the RC gate. What the release process runs before cutting a
+# candidate; exit 0 only when the final audit holds on THIS tree.
+# ----------------------------------------------------------------------------
+fn fa_cmd_gate(a: FaArgs, kit_root: str) -> int
+uses IO, Args, Fs, Proc {
+    let root: str = a.root
+    let path: str = a.ledger
+    if !file_exists(path) {
+        return fa_gate_refuse(a, "no final audit on record ("
+        + fa_relpath(path, kit_root) + ") — a release candidate is "
+        + "not cut from an unaudited tree")
+    }
+    let read: LedgerRead = fa_read_ledger(path, true)
+    if !read.ok {
+        return fa_fail(read.err)
+    }
+    let entries: list[JsonValue] = read.entries
+    let seal: JsonValue = fa_signoff_of(entries)
+    let state: str = fa_derive_state(entries)
+    if json_is_null(seal) {
+        let refusals: list[str] = fa_closure_refusals(entries, root)
+        let mut lines: str = ""
+        let mut i: int = 0
+        while i < refusals.len() {
+            lines = lines + "  - " + refusals.get(i) + "\n"
+            i = i + 1
+        }
+        return fa_gate_refuse(a, "the final audit is " + state
+        + ", not sealed — the gate opens only on a sealed audit; the "
+        + "closure laws that did not hold:\n" + lines)
+    }
+    if !fa_is_git_tree(root) {
+        return fa_gate_refuse(a, "the tree is not a git repository — "
+        + "the gate cannot verify that the candidate is cut from the "
+        + "audited tree")
+    }
+    let head: str = fa_git_sha(root)
+    if fa_commit_landed(root, fa_jstr(seal, "tree")) != 1 {
+        return fa_gate_refuse(a, "the sealed tree "
+        + fa_jstr(seal, "tree").slice(0, 24) + " is not an ancestor of "
+        + "the current HEAD " + head.slice(0, 24) + " — the candidate "
+        + "is cut around the audit")
+    }
+    let live: FaAnchorSet = fa_anchors_of(root)
+    if !live.ok {
+        return fa_gate_refuse(a, "the live anchors cannot be derived ("
+        + live.err + ") — the sealed artifact cannot be confirmed")
+    }
+    let moved: list[str] = fa_anchor_drift(
+    json_object_get(seal, "anchors"), live)
+    if moved.len() > 0 {
+        return fa_gate_refuse(a, "the " + moved.get(0)
+        + " anchor moved after the seal (sealed " + fa_jstr(
+        json_object_get(seal, "anchors"), moved.get(0))
+        .slice(0, 24) + "..., live " + fa_anchor_digest_of(live,
+        moved.get(0)).slice(0, 24) + "...) — the candidate is not "
+        + "the artifact that was audited")
+    }
+    let triages: list[JsonValue] = fa_triages_of(entries)
+    let sorted_t: list[JsonValue] = fa_sorted_by_for(triages)
+    let mut i: int = 0
+    while i < sorted_t.len() {
+        let t: JsonValue = sorted_t.get(i)
+        if fa_jstr(t, "verdict") == "accepted"
+        && fa_commit_landed(root, fa_jstr(t, "fix")) != 1 {
+            return fa_gate_refuse(a, "the remediation for "
+            + fa_jstr(t, "for") + " no longer lands in this tree — a "
+            + "fix that is not in the tree being released is a "
+            + "promise, not a fix")
+        }
+        i = i + 1
+    }
+    if a.json {
+        print(j_canon(fa_obj8(seal, live, head, state)) + "\n")
+    } else {
+        println("GATE GREEN — the final audit holds; the candidate "
+        + "may be cut")
+        println("  sealed tree : " + fa_jstr(seal, "tree")
+        .slice(0, 24) + " (an ancestor of HEAD " + head.slice(0, 12)
+        + ")")
+        let eng: JsonValue = fa_engagement_of(entries)
+        println("  engagement  : " + fa_jstr(eng, "firm") + ", "
+        + fa_jint(seal, "findings").to_str() + " finding(s), "
+        + fa_jint(seal, "fixes").to_str() + " fix(es) landed")
+        let names: list[str] = fa_anchor_names()
+        i = 0
+        while i < names.len() {
+            println("  anchor      : " + names.get(i) + " = "
+            + fa_anchor_digest_of(live, names.get(i)).slice(0, 16)
+            + " (" + fa_anchor_detail_of(live, names.get(i)) + ")")
+            i = i + 1
+        }
+    }
+    return 0
+}
+
+# fa_gate_refuse — the gate's red answer: --json gets the one-line
+# object, text gets GATE RED with the rule.
+fn fa_gate_refuse(a: FaArgs, msg: str) -> int uses IO {
+    if a.json {
+        let keys: list[str] = []
+        let vals: list[JsonValue] = []
+        keys.push("tool")
+        vals.push(json_str(fa_tool()))
+        keys.push("version")
+        vals.push(json_str(fa_version()))
+        keys.push("policy")
+        vals.push(json_str(fa_policy()))
+        keys.push("gate")
+        vals.push(json_str("red"))
+        keys.push("refusal")
+        vals.push(json_str(msg))
+        print(j_canon(json_object(keys, vals)) + "\n")
+    } else {
+        eprint("GATE RED — " + msg + "\n")
+    }
+    return 1
+}
+
+# fa_obj8 — the gate --json object.
+fn fa_obj8(seal: JsonValue, live: FaAnchorSet, head: str,
+state: str) -> JsonValue {
+    let keys: list[str] = []
+    let vals: list[JsonValue] = []
+    keys.push("tool")
+    vals.push(json_str(fa_tool()))
+    keys.push("version")
+    vals.push(json_str(fa_version()))
+    keys.push("policy")
+    vals.push(json_str(fa_policy()))
+    keys.push("gate")
+    vals.push(json_str("green"))
+    keys.push("state")
+    vals.push(json_str(state))
+    keys.push("sealed_tree")
+    vals.push(json_str(fa_jstr(seal, "tree")))
+    keys.push("head")
+    vals.push(json_str(head))
+    keys.push("anchors")
+    vals.push(fa_anchor_obj_of(live))
+    keys.push("findings")
+    vals.push(json_int(fa_jint(seal, "findings")))
+    keys.push("fixes")
+    vals.push(json_int(fa_jint(seal, "fixes")))
+    return json_object(keys, vals)
+}
+
+# ----------------------------------------------------------------------------
+# report — the deliverable.
+# ----------------------------------------------------------------------------
+fn fa_cmd_report(a: FaArgs, kit_root: str) -> int
+uses IO, Args, Fs, Proc, Clock {
+    if a.out == "" {
+        eprint("error: report needs --out FILE.md\n")
+        return 2
+    }
+    let path: str = a.ledger
+    let read: LedgerRead = fa_read_ledger(path, true)
+    if !read.ok {
+        return fa_fail(read.err)
+    }
+    let mut stamp: str = ""
+    if a.stamp {
+        stamp = fa_stamp_now()
+    }
+    let doc: str = fa_render_report(path, kit_root, read.entries,
+    read.log_sha, stamp)
+    let out_path: str = fa_abs_out(a.out)
+    let d: str = fa_dirname(out_path)
+    if d != "" && d != "." {
+        proc_exec("mkdir -p '" + fa_shell_quote(d) + "'")
+    }
+    write_file(out_path, doc)
+    println("report: " + fa_relpath(out_path, kit_root) + " ("
+    + read.entries.len().to_str() + " entries, state "
+    + fa_derive_state(read.entries) + ")")
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# status — the census, one look.
+# ----------------------------------------------------------------------------
+fn fa_cmd_status(a: FaArgs, kit_root: str) -> int uses IO, Fs {
+    let path: str = a.ledger
+    let read: LedgerRead = fa_read_ledger(path, true)
+    if !read.ok {
+        return fa_fail(read.err)
+    }
+    let entries: list[JsonValue] = read.entries
+    let state: str = fa_derive_state(entries)
+    let eng: JsonValue = fa_engagement_of(entries)
+    let passes: list[JsonValue] = fa_passes_of(entries)
+    let findings: list[JsonValue] = fa_findings_of(entries)
+    let triages: list[JsonValue] = fa_triages_of(entries)
+    let seal: JsonValue = fa_signoff_of(entries)
+    let mut n_ind: int = 0
+    let mut i: int = 0
+    while i < passes.len() {
+        if fa_jbool(passes.get(i), "independent") {
+            n_ind = n_ind + 1
+        }
+        i = i + 1
+    }
+    let sev_critical: int = fa_count_sev(findings, "critical")
+    let sev_high: int = fa_count_sev(findings, "high")
+    let sev_medium: int = fa_count_sev(findings, "medium")
+    let sev_low: int = fa_count_sev(findings, "low")
+    let sev_info: int = fa_count_sev(findings, "info")
+    let n_acc: int = fa_count_verdict(triages, "accepted")
+    let n_dis: int = fa_count_verdict(triages, "disputed")
+    let n_oos: int = fa_count_verdict(triages, "out-of-scope")
+    let mut n_fix: int = 0
+    i = 0
+    while i < triages.len() {
+        if json_object_has(triages.get(i), "fix") {
+            n_fix = n_fix + 1
+        }
+        i = i + 1
+    }
+    if a.json {
+        let fields: list[str] = []
+        let vals: list[JsonValue] = []
+        fields.push("tool")
+        vals.push(json_str(fa_tool()))
+        fields.push("version")
+        vals.push(json_str(fa_version()))
+        fields.push("policy")
+        vals.push(json_str(fa_policy()))
+        fields.push("ledger")
+        vals.push(json_str(path))
+        fields.push("state")
+        vals.push(json_str(state))
+        fields.push("state_meaning")
+        vals.push(json_str(fa_state_meaning(state)))
+        fields.push("entries")
+        vals.push(json_int(entries.len()))
+        if json_is_null(eng) {
+            fields.push("engagement")
+            vals.push(json_null())
+        } else {
+            let ef: list[str] = []
+            let ev: list[JsonValue] = []
+            ef.push("firm")
+            ev.push(json_str(fa_jstr(eng, "firm")))
+            ef.push("roster")
+            ev.push(fa_jv_strs(fa_jstrs(eng, "roster")))
+            ef.push("window")
+            ev.push(json_str(fa_jstr(eng, "window")))
+            ef.push("basis")
+            ev.push(json_str(fa_jstr(eng, "basis")))
+            ef.push("by")
+            ev.push(json_str(fa_jstr(eng, "by")))
+            ef.push("anchors")
+            ev.push(json_object_get(eng, "anchors"))
+            fields.push("engagement")
+            vals.push(json_object(ef, ev))
+        }
+        let evf: list[str] = []
+        let evv: list[JsonValue] = []
+        evf.push("passes")
+        evv.push(json_int(passes.len()))
+        evf.push("independent")
+        evv.push(json_int(n_ind))
+        evf.push("self_assessed")
+        evv.push(json_int(passes.len() - n_ind))
+        evf.push("latest_outcome")
+        if passes.len() > 0 {
+            evv.push(json_str(fa_jstr(passes.get(passes.len() - 1),
+            "outcome")))
+        } else {
+            evv.push(json_null())
+        }
+        fields.push("evidence")
+        vals.push(json_object(evf, evv))
+        let ff: list[str] = []
+        let fv: list[JsonValue] = []
+        ff.push("total")
+        fv.push(json_int(findings.len()))
+        ff.push("critical")
+        fv.push(json_int(sev_critical))
+        ff.push("high")
+        fv.push(json_int(sev_high))
+        ff.push("medium")
+        fv.push(json_int(sev_medium))
+        ff.push("low")
+        fv.push(json_int(sev_low))
+        ff.push("info")
+        fv.push(json_int(sev_info))
+        fields.push("findings")
+        vals.push(json_object(ff, fv))
+        let tf: list[str] = []
+        let tv: list[JsonValue] = []
+        tf.push("total")
+        tv.push(json_int(triages.len()))
+        tf.push("accepted")
+        tv.push(json_int(n_acc))
+        tf.push("disputed")
+        tv.push(json_int(n_dis))
+        tf.push("out_of_scope")
+        tv.push(json_int(n_oos))
+        fields.push("triage")
+        vals.push(json_object(tf, tv))
+        fields.push("fixes")
+        vals.push(json_int(n_fix))
+        if json_is_null(seal) {
+            fields.push("signoff")
+            vals.push(json_null())
+        } else {
+            let sf: list[str] = []
+            let sv: list[JsonValue] = []
+            sf.push("by")
+            sv.push(json_str(fa_jstr(seal, "by")))
+            sf.push("tree")
+            sv.push(json_str(fa_jstr(seal, "tree")))
+            sf.push("anchors")
+            sv.push(json_object_get(seal, "anchors"))
+            fields.push("signoff")
+            vals.push(json_object(sf, sv))
+        }
+        print(j_dump_at(json_object(fields, vals), 0) + "\n")
+        return 0
+    }
+    println(fa_tool() + " " + fa_version() + " — "
+    + fa_relpath(path, kit_root))
+    println("  state     : " + state + " — " + fa_state_meaning(state))
+    if !json_is_null(eng) {
+        println("  engagement: " + fa_jstr(eng, "firm") + " — window "
+        + fa_jstr(eng, "window"))
+        println("              basis " + py_repr(fa_jstr(eng, "basis"))
+        + " (signed by " + fa_jstr(eng, "by") + ")")
+        println("              roster: "
+        + str_join(fa_jstrs(eng, "roster"), ", "))
+        let names: list[str] = fa_anchor_names()
+        let mut k: int = 0
+        while k < names.len() {
+            println("              anchor " + names.get(k) + ": "
+            + fa_jstr(json_object_get(eng, "anchors"), names.get(k))
+            .slice(0, 16))
+            k = k + 1
+        }
+    } else {
+        println("  engagement: none on record")
+    }
+    if passes.len() > 0 {
+        let latest: JsonValue = passes.get(passes.len() - 1)
+        let mut drifted: str = ""
+        if fa_jstrs(latest, "anchor_drift").len() > 0 {
+            drifted = ", drifted anchors"
+        }
+        println("  evidence  : " + passes.len().to_str()
+        + " pass(es) — " + n_ind.to_str() + " independent, "
+        + (passes.len() - n_ind).to_str() + " self-assessed; latest "
+        + "outcome " + fa_jstr(latest, "outcome") + drifted)
+    } else {
+        println("  evidence  : no pass on record")
+    }
+    println("  findings  : " + findings.len().to_str()
+    + " on record — critical " + sev_critical.to_str() + ", high "
+    + sev_high.to_str() + ", medium " + sev_medium.to_str() + ", low "
+    + sev_low.to_str() + ", info " + sev_info.to_str())
+    println("  triage    : " + triages.len().to_str()
+    + " on record — accepted " + n_acc.to_str() + ", disputed "
+    + n_dis.to_str() + ", out-of-scope " + n_oos.to_str())
+    println("  fixes     : " + n_fix.to_str()
+    + " remediation commit(s) recorded")
+    if !json_is_null(seal) {
+        println("  signoff   : sealed by " + fa_jstr(seal, "by")
+        + " from tree " + fa_jstr(seal, "tree").slice(0, 24))
+    } else {
+        println("  signoff   : not sealed — the gate is red")
+    }
+    return 0
+}
+
+fn fa_count_sev(findings: list[JsonValue], sev: str) -> int {
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < findings.len() {
+        if fa_jstr(findings.get(i), "severity") == sev {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn fa_count_verdict(triages: list[JsonValue], v: str) -> int {
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < triages.len() {
+        if fa_jstr(triages.get(i), "verdict") == v {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+# ----------------------------------------------------------------------------
+# main — the CLI. Flags in any order, --k v pairs, boolean flags, the
+# repeatable --auditor, triage's one positional; a grammar refusal is
+# exit 2, a ledger refusal names the rule on stderr (exit 1), the
+# command's contract holding is exit 0.
+# ----------------------------------------------------------------------------
+fn main() -> int uses IO, Fs, Proc, Args, Exit, Clock {
+    let argv: list[str] = args()
+    if argv.len() < 2 {
+        return fa_usage("")
+    }
+    # The kit's repo: argv0/../.., where bin/ and the default ledger
+    # live (the .py's dirname(dirname(__file__))).
+    let argv0: str = argv.get(0)
+    let mut kit_root: str = cwd_get()
+    if argv0.contains("/") {
+        kit_root = fa_dirname(fa_dirname(argv0))
+    }
+    let a: FaArgs = FaArgs {
+        cmd: argv.get(1), ledger: "", root: "",
+        firm: "", auditors: [], window: "", basis: "", by: "", out: "",
+        stamp: false, json: false, against: "", severity: "", title: "",
+        repro_path: "", repro_text: "", finding: "", verdict: "",
+        reason: "", fix: ""
+    }
+    let positionals: list[str] = []
+    let mut i: int = 2
+    while i < argv.len() {
+        let arg: str = argv.get(i)
+        if arg == "--auditor" {
+            if i + 1 >= argv.len() {
+                return fa_usage("--auditor needs a name")
+            }
+            i = i + 1
+            a.auditors.push(argv.get(i))
+        } else if arg == "--ledger" || arg == "--root" || arg == "--firm"
+        || arg == "--window" || arg == "--basis" || arg == "--by"
+        || arg == "--out" || arg == "--against" || arg == "--severity"
+        || arg == "--title" || arg == "--repro-path"
+        || arg == "--repro-text" || arg == "--verdict"
+        || arg == "--reason" || arg == "--fix" {
+            if i + 1 >= argv.len() {
+                return fa_usage(arg + " needs a value")
+            }
+            i = i + 1
+            let v: str = argv.get(i)
+            if arg == "--ledger" {
+                a.ledger = v
+            } else if arg == "--root" {
+                a.root = v
+            } else if arg == "--firm" {
+                a.firm = v
+            } else if arg == "--window" {
+                a.window = v
+            } else if arg == "--basis" {
+                a.basis = v
+            } else if arg == "--by" {
+                a.by = v
+            } else if arg == "--out" {
+                a.out = v
+            } else if arg == "--against" {
+                a.against = v
+            } else if arg == "--severity" {
+                a.severity = v
+            } else if arg == "--title" {
+                a.title = v
+            } else if arg == "--repro-path" {
+                a.repro_path = v
+            } else if arg == "--repro-text" {
+                a.repro_text = v
+            } else if arg == "--verdict" {
+                a.verdict = v
+            } else if arg == "--reason" {
+                a.reason = v
+            } else if arg == "--fix" {
+                a.fix = v
+            }
+        } else if arg == "--stamp" {
+            a.stamp = true
+        } else if arg == "--json" {
+            a.json = true
+        } else if arg.starts_with("--") {
+            return fa_usage("unknown option: " + arg)
+        } else {
+            positionals.push(arg)
+        }
+        i = i + 1
+    }
+    if a.ledger == "" {
+        a.ledger = fa_join(kit_root, fa_ledger_rel())
+    }
+    if a.root == "" {
+        a.root = kit_root
+    }
+    if a.cmd == "engage" {
+        if a.firm == "" || a.window == "" || a.basis == "" {
+            return fa_usage("engage needs --firm, --window and --basis")
+        }
+        return fa_cmd_engage(a, kit_root)
+    }
+    if a.cmd == "brief" {
+        return fa_cmd_brief(a, kit_root)
+    }
+    if a.cmd == "evidence" {
+        return fa_cmd_evidence(a, kit_root)
+    }
+    if a.cmd == "file" {
+        if a.against == "" || a.severity == "" || a.title == "" {
+            return fa_usage("file needs --against, --severity, --title "
+            + "and one reproducer")
+        }
+        return fa_cmd_file(a, kit_root)
+    }
+    if a.cmd == "triage" {
+        if positionals.len() != 1 {
+            return fa_usage("triage takes one finding id (AF-NNN)")
+        }
+        a.finding = positionals.get(0)
+        if a.verdict == "" {
+            return fa_usage("triage needs --verdict and --reason")
+        }
+        return fa_cmd_triage(a, kit_root)
+    }
+    if a.cmd == "signoff" {
+        return fa_cmd_signoff(a, kit_root)
+    }
+    if a.cmd == "gate" {
+        return fa_cmd_gate(a, kit_root)
+    }
+    if a.cmd == "report" {
+        return fa_cmd_report(a, kit_root)
+    }
+    if a.cmd == "status" {
+        return fa_cmd_status(a, kit_root)
+    }
+    return fa_usage("unknown command: " + a.cmd)
+}

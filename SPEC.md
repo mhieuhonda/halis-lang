@@ -10289,7 +10289,9 @@ stage's parentheses. FINAL is a property of the artifact, not
 of the paperwork: an audit is final when it was run against
 the thing that will ship, when its closure is demonstrated
 rather than declared, and when nothing can be released while
-it is open. The new `tools/hls-finalaudit.py` turns the word
+it is open. The final audit — `tools/hls-finalaudit.hls`, built
+as `bin/hls-finalaudit`, the native twin of the Python tool that
+retired — turns the word
 into nine commands and one ledger (`.hlfa/final.jsonl`,
 machine-local like every ledger in this tree, chained with the
 family's one arithmetic): `engage`, `brief`, `evidence`,

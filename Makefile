@@ -298,6 +298,18 @@ $(BIN)/hls-auditkit: tools/hls-auditkit.hls tools/hlfront.hls src/hlc.hls $(wild
 	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
 	@rm -f $@.c
 
+# hls-finalaudit -- in Halis (the native twin of the Python hls-finalaudit.py
+# that retired: same nine commands, same three anchors, same closure laws,
+# same renders). The scope rides the tree's own tools/hls-guarantee.hls
+# through bin/hlboot; the freeze and snapshot anchors read the committed
+# documents. Same prerequisites discipline as the other tools.
+$(BIN)/hls-finalaudit: tools/hls-finalaudit.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+	@mkdir -p $(BIN)
+	@echo "[hls-finalaudit] hlc compiles the tool (self-hosted, no python)..."
+	@$(BIN)/hlc tools/hls-finalaudit.hls $@.c
+	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
+	@rm -f $@.c
+
 $(BIN)/hls-freeze: tools/hls-freeze.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
 	@mkdir -p $(BIN)
 	@echo "[hls-freeze] hlc compiles the tool (self-hosted, no python)..."
@@ -1570,19 +1582,19 @@ purebootstrap-acceptance: $(BIN)/acc-purebootstrap
 # candidate is cut from the audited tree or its descendants, never
 # around the audit), anchors still pinned, fixes still landed —
 # anything else exits 1 with the named refusal.
-finalaudit-brief:
-	@$(PYTHON) tools/hls-finalaudit.py brief --out FINALBRIEF.md
+finalaudit-brief: $(BIN)/hls-finalaudit
+	@$(BIN)/hls-finalaudit brief --out FINALBRIEF.md
 
-finalaudit-evidence:
-	@$(PYTHON) tools/hls-finalaudit.py evidence
+finalaudit-evidence: $(BIN)/hls-finalaudit
+	@$(BIN)/hls-finalaudit evidence
 
-finalaudit-report:
-	@$(PYTHON) tools/hls-finalaudit.py report --out FINALREPORT.md
+finalaudit-report: $(BIN)/hls-finalaudit
+	@$(BIN)/hls-finalaudit report --out FINALREPORT.md
 
-finalaudit-gate:
-	@$(PYTHON) tools/hls-finalaudit.py gate
+finalaudit-gate: $(BIN)/hls-finalaudit
+	@$(BIN)/hls-finalaudit gate
 
-finalaudit-acceptance: $(BIN)/acc-finalaudit bin/hlc
+finalaudit-acceptance: $(BIN)/acc-finalaudit $(BIN)/hls-finalaudit $(BIN)/hls-guarantee bin/hlc bin/hlboot
 	@echo "[Stage 144 acceptance] running tests/acc/finalaudit_acceptance.hls..."
 	@$(BIN)/acc-finalaudit
 	@echo "ACCEPTANCE OK: Stage 144 -- independent third-party security audit (final)"
