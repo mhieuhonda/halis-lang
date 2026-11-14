@@ -1829,24 +1829,29 @@ session; the adapter exits with the session.
 ### 23.7. `hls-repl` — the interactive REPL
 
 The prompt stops reading the program and starts growing it.
-`tools/hls-repl.py` is an interactive REPL where the session IS a
-Halis program: definitions (`fn` / `struct` / `enum` / `impl` /
-`import` / `extern`) extend the program at the top level, statements
-(`let` / assignment / `if` / `while` / `for`) join the session block,
-and bare expressions evaluate immediately and print `= <value>`. It
-runs on the Stage-0 interpreter — the same reference implementation
-boot.py runs — with the real loader and the real checker on every
-single input.
+`tools/hls-repl.hls` (built as `bin/hls-repl`) is an interactive
+REPL where the session IS a Halis program: definitions (`fn` /
+`struct` / `enum` / `impl` / `import` / `extern`) extend the program
+at the top level, statements (`let` / assignment / `if` / `while` /
+`for`) join the session block, and bare expressions evaluate
+immediately and print `= <value>`. It runs on the Stage-0 evaluator
+linked as a library (`tools/hlboot_eval.hls` — the same tree-walker
+`bin/hlboot` runs programs with; one evaluator, two front doors)
+with the real loader and the real checker on every single input.
 
 - **Every input is compiled before anything runs.** The session
   source is synthesized (your definitions, then the session block as
   `fn main()`), loaded by the same loader boot.py uses — so
   `import "std.str"` at the prompt resolves exactly where it resolves
-  for a file — and checked by the real checker. An input the checker
-  rejects never touches the session: no half-typed definitions, no
+  for a file — and checked by the real checker. The compile runs in
+  a probe child of the REPL binary itself (Halis has no exceptions,
+  and the front-end reports a bad program by dying; a probe's death
+  is the Python years' caught `HLError`), then is re-derived in
+  process once the probe has passed it. An input the checker rejects
+  never touches the session: no half-typed definitions, no
   half-bound variables, and the diagnostic's line number is
   relocated to the input that caused it.
-- **Nothing is ever re-run behind your back.** One live interpreter
+- **Nothing is ever re-run behind your back.** One live evaluator
   follows the session: each committed input extends its program
   tables and executes only the new statements. A `println` you typed
   once is not repeated by the next input, a `write_file` runs once,
@@ -1869,9 +1874,9 @@ single input.
   what the session already holds: `(none - pure)`, a set with
   `(new: ...)` naming what the expression adds, or `none beyond the
   session's (...)` when the expression needs nothing the session has
-  not already declared. `:audit` prints the very same table
-  `boot.py --audit` prints for the session program — same code, same
-  bytes.
+  not already declared. `:audit` prints the very table `hlboot
+  --audit` prints for the session program — four columns, the status
+  verdict, the summary — same code, same bytes.
 - **The session block is the REPL's own `main`.** Its `uses` clause
   grows by itself, from the checker's own missing-effect diagnostic,
   and ONLY for the session block: a definition of yours that lacks a

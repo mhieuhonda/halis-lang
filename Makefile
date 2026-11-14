@@ -117,8 +117,9 @@ $(BIN)/hllint: tools/hllint.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc
 # Python interpreter under tools/hlinterp/ that is retiring; same CLI,
 # same batch wire, same verdicts — the differential oracle every suite
 # leg spawns, built by the bootstrap's own compiler on the shared
-# front-end tools/hlfront.hls links).
-$(BIN)/hlboot: tools/hlboot.hls tools/hlfront.hls tools/hlemit.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+# front-end tools/hlfront.hls links). The evaluator lives in
+# tools/hlboot_eval.hls; this entry owns only the CLI main.
+$(BIN)/hlboot: tools/hlboot.hls tools/hlboot_eval.hls tools/hlfront.hls tools/hlemit.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
 	@mkdir -p $(BIN)
 	@echo "[hlboot] hlc compiles the Stage-0 evaluator (self-hosted, no python)..."
 	@$(BIN)/hlc tools/hlboot.hls $@.c
@@ -382,8 +383,12 @@ $(BIN)/hls-migrate: tools/hls-migrate.hls tools/hlfront.hls src/hlc.hls $(wildca
 	@rm -f $@.c
 
 # hls-repl -- in Halis (the native twin of the Python hls-repl.py that
-# retired; same CLI, same wire, same exits).
-$(BIN)/hls-repl: tools/hls-repl.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+# retired; same commands, same transcript grammar, same refusals). The
+# session rides the Stage-0 evaluator as a library
+# (tools/hlboot_eval.hls) — one evaluator, two front doors — and every
+# compile goes through probe children, the way every lab tool here
+# survives a bad program.
+$(BIN)/hls-repl: tools/hls-repl.hls tools/hlboot_eval.hls tools/hlfront.hls tools/hlemit.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
 	@mkdir -p $(BIN)
 	@echo "[hls-repl] hlc compiles the tool (self-hosted, no python)..."
 	@$(BIN)/hlc tools/hls-repl.hls $@.c
@@ -982,7 +987,7 @@ dap-acceptance: $(BIN)/hlfmt
 # :reset), panics and refusals, and the corpus + transcript parity
 # (the canonical session's `=` lines are the fixture program's output,
 # natively byte-identical when bin/hlc + gcc exist).
-repl-acceptance: $(BIN)/acc-repl
+repl-acceptance: $(BIN)/acc-repl $(BIN)/hls-repl
 	@echo "[Stage 123 acceptance] running tests/acc/repl_acceptance.hls..."
 	@$(BIN)/acc-repl
 

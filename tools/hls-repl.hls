@@ -1,0 +1,2101 @@
+# ============================================================================
+# tools/hls-repl.hls — the interactive REPL, in Halis (the native twin of
+# the Python hls-repl.py that retired; same commands, same transcript
+# grammar, same refusals — driven through bin/hls-repl, built by the
+# bootstrap's own compiler).
+# ----------------------------------------------------------------------------
+# The REPL holds ONE live session. The session is a Halis program that
+# grows as you type: definitions (fn / struct / enum / impl / import /
+# extern) join it at the top level, statements (let / assign / if /
+# while / for) join the session block, and bare expressions are
+# evaluated immediately and printed. The discipline that shaped the
+# Python years carries over unchanged — never guess:
+#
+#   * Every input is compiled by the REAL toolchain before anything
+#     runs. The session source is synthesized into a scratch file
+#     under bin/ (named by the REPL's own pid, wiped on exit), loaded
+#     by the same loader bin/hlboot uses — the front-end linked
+#     through tools/hlfront.hls — and checked by the real checker.
+#     An input the checker rejects never touches the session.
+#   * Evaluation rides the Stage-0 evaluator itself, linked as a
+#     library (tools/hlboot_eval.hls): one live Boot per session, the
+#     same tree-walker bin/hlboot runs programs with. Each committed
+#     input swaps the evaluator's tables and executes only the new
+#     statements, so nothing is ever re-run behind your back: a
+#     write_file you typed once is not replayed by the next input.
+#     Call-shaped expressions (calls, methods, fieldcalls, match, `?`)
+#     join the session block after they run — their effects are real
+#     and the session's audit must see them; value expressions
+#     (`1 + 1`, `a3`) are queries and never join the state.
+#   * Types and effects come from the checker, not from a re-
+#     implementation. `:type` reads the annotation the checker wrote on
+#     the expression's ExprN; `:effects` reads the effect fixpoint's
+#     computed set for the session block; `:audit` prints boot.py's
+#     own table — the four columns, the status verdict, the summary.
+#
+# Halis has no exceptions, and the real front-end reports a bad
+# program by dying. The REPL survives bad input the way every lab
+# tool here does — the probe-child discipline: compilation happens in
+# a child of this very binary (`--probe-session`, `--probe-classify`,
+# `--probe-tryexpr`, `--probe-trystmts`, `--probe-loadmod`), whose
+# death is a diagnostic, not a crash. A probe's 101 is the Python
+# years' `except HLError`. Once the probe says the program checks,
+# the parent re-derives the same load+check in process — the checker
+# is a pure function of its input, so what a probe passed cannot kill
+# the parent — and only then does the evaluator touch the session.
+#
+# The piped transcript (the gates' run_feed world): all of stdin is
+# read up front and walked by index, so incomplete inputs fold their
+# continuation lines without a prompt. Interactive sessions read line
+# by line; a tty EOF is recognised the honest way the runtime allows
+# — two consecutive zero-millisecond empty reads (a human cannot
+# produce a blank line that fast; the kernel produces nothing else at
+# EOF) — and :quit always leaves cleanly. Prompts ride stderr (the
+# unbuffered stream), so a prompt never lags behind its input; the
+# transcript itself rides stdout, exactly where the evaluator writes.
+#
+# Usage:
+#   bin/hls-repl            (interactive when stdin is a tty)
+#   ... | bin/hls-repl      (piped: no banner, no prompts)
+#
+# Exit codes: 0 always (a REPL that ran its inputs has no verdict to
+# give; broken pipes die with the runtime's own signal).
+# ============================================================================
+
+import "./hlboot_eval.hls"
+import "std.str"
+
+# ----------------------------------------------------------------------------
+# Constants — the Python years' own numbers, unchanged.
+# ----------------------------------------------------------------------------
+
+fn REPL_VERSION() -> str {
+    return "0.141.0-alpha"
+}
+
+# Keywords whose input is a top-level definition of the session program.
+fn REPL_ITEM_IS(kw: str) -> bool {
+    return kw == "fn" || kw == "struct" || kw == "enum" || kw == "impl"
+    || kw == "import" || kw == "extern"
+}
+
+# Keywords that can only start a statement (parse_expr would refuse
+# them; the classifier routes them straight to the statement parse).
+fn REPL_STMT_KW_IS(kw: str) -> bool {
+    return kw == "let" || kw == "if" || kw == "while" || kw == "for"
+    || kw == "return" || kw == "break" || kw == "continue"
+    || kw == "asm"
+}
+
+# The probe binding name is reserved so an expression's value can never
+# collide with session state (the REPL never binds it today, but the
+# reservation keeps that true if the implementation ever changes).
+fn REPL_PROBE_PREFIX() -> str {
+    return "__repl_"
+}
+
+fn REPL_MAX_EFFECT_ROUNDS() -> int {
+    return 16
+}
+
+fn REPL_MAX_RENDER() -> int {
+    return 240
+}
+
+fn REPL_MAX_ITEMS() -> int {
+    return 6
+}
+
+# ----------------------------------------------------------------------------
+# Small list/set helpers (effects and computed sets are list[str];
+# Python's sorted/join/set-ops, made static).
+# ----------------------------------------------------------------------------
+
+fn repl_list_has(xs: list[str], x: str) -> bool {
+    let mut i: int = 0
+    while i < xs.len() {
+        if xs.get(i) == x {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn repl_list_union(xs: list[str], ys: list[str]) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < xs.len() {
+        out.push(xs.get(i))
+        i = i + 1
+    }
+    let mut j: int = 0
+    while j < ys.len() {
+        if !repl_list_has(out, ys.get(j)) {
+            out.push(ys.get(j))
+        }
+        j = j + 1
+    }
+    return out
+}
+
+fn repl_list_diff(xs: list[str], ys: list[str]) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < xs.len() {
+        if !repl_list_has(ys, xs.get(i)) {
+            out.push(xs.get(i))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn repl_sorted(xs: list[str]) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < xs.len() {
+        out.push(xs.get(i))
+        i = i + 1
+    }
+    let mut j: int = 1
+    while j < out.len() {
+        let v: str = out.get(j)
+        let mut k: int = j - 1
+        while k >= 0 && out.get(k) > v {
+            out.set(k + 1, out.get(k))
+            k = k - 1
+        }
+        out.set(k + 1, v)
+        j = j + 1
+    }
+    return out
+}
+
+fn repl_join(xs: list[str], sep: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < xs.len() {
+        if i > 0 {
+            out = out + sep
+        }
+        out = out + xs.get(i)
+        i = i + 1
+    }
+    return out
+}
+
+fn repl_count_lines(part: str) -> int {
+    let mut n: int = 1
+    let mut i: int = 0
+    while i < part.len() {
+        if part.byte_at(i) == 10 {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+# ----------------------------------------------------------------------------
+# Self path and the session's scratch files (one per process, under
+# bin/ so std./core. imports resolve through the walk-up exactly the
+# way they resolve for a file in the repo; wiped on exit).
+# ----------------------------------------------------------------------------
+
+fn repl_self_path() -> str uses Args {
+    let a: list[str] = args()
+    if a.len() == 0 {
+        return ""
+    }
+    return a.get(0)
+}
+
+fn repl_scratch_paths() -> list[str] uses Proc {
+    let pid: int = proc_pid()
+    let base: str = "bin/.hls-repl-" + pid.to_str()
+    let ps: list[str] = [base + "-cls.hls", base + "-expr.hls",
+    base + "-sess.hls"]
+    return ps
+}
+
+# panic_body(err) — the interpreter-era error text of a probe's death:
+# the first stderr line, minus the "panic: " prefix. The checker's
+# "type error: " / lexer's "lex error: " / parser's "syntax error: "
+# lead stays (the Python years' messages carried it too, through
+# str(ex)).
+fn repl_panic_body(err: str) -> str {
+    let mut msg: str = err
+    let nl: int = msg.find("\n")
+    if nl >= 0 {
+        msg = msg.slice(0, nl)
+    }
+    if msg.starts_with("panic: ") {
+        msg = msg.slice(7, msg.len())
+    }
+    return msg
+}
+
+# ----------------------------------------------------------------------------
+# The probe children. One dispatcher, five private modes; every mode is
+# a pure front-end run whose death is a diagnostic. main() routes here
+# before any REPL behavior, so a probe child never reads stdin.
+# ----------------------------------------------------------------------------
+
+fn repl_probe_main(argv: list[str]) -> int uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let mode: str = argv.get(1)
+
+    # --probe-classify <file> — the input's coarse shape: which parse
+    # path owns it. Never parses (so it cannot die past the lex); the
+    # parent picks the next probe from the answer.
+    if mode == "--probe-classify" {
+        if argv.len() < 3 {
+            eprint("error: --probe-classify needs a file\n")
+            return 2
+        }
+        let path: str = argv.get(2)
+        let src: str = read_file(path)
+        let ctx: Ctx = new_ctx(src)
+        lex(ctx)
+        let t0: Tok = ctx.toks.get(0)
+        if t0.kind == "eof" {
+            print("KIND EMPTY\n")
+            return 0
+        }
+        if t0.kind == "kw" && REPL_ITEM_IS(t0.value) {
+            print("KIND ITEM\n")
+            return 0
+        }
+        if t0.kind == "kw" && REPL_STMT_KW_IS(t0.value) {
+            print("KIND STMTSKW\n")
+            return 0
+        }
+        print("KIND TRY\n")
+        return 0
+    }
+
+    # --probe-tryexpr <file> — parse the input as ONE expression; 3 =
+    # it is one (the shape and every ident token ride along), 4 = it
+    # parsed but more follows (a statement, then).
+    if mode == "--probe-tryexpr" {
+        if argv.len() < 3 {
+            eprint("error: --probe-tryexpr needs a file\n")
+            return 2
+        }
+        let path: str = argv.get(2)
+        let src: str = read_file(path)
+        let ctx: Ctx = new_ctx(src)
+        lex(ctx)
+        let root: int = parse_expr(ctx, true)
+        let mut at_end: bool = ctx.pos >= ctx.toks.len()
+        if !at_end {
+            at_end = ctx.toks.get(ctx.pos).kind == "eof"
+        }
+        if at_end {
+            print("SHAPE " + ctx.exprs[root].kind + "\n")
+            let mut i: int = 0
+            while i < ctx.toks.len() {
+                let tk: Tok = ctx.toks.get(i)
+                if tk.kind == "ident" {
+                    print("IDENT " + tk.value + "\n")
+                }
+                i = i + 1
+            }
+            exit(3)
+        }
+        exit(4)
+    }
+
+    # --probe-trystmts <file> — parse the input as a statement
+    # sequence to EOF; the count and every bound name ride along.
+    if mode == "--probe-trystmts" {
+        if argv.len() < 3 {
+            eprint("error: --probe-trystmts needs a file\n")
+            return 2
+        }
+        let path: str = argv.get(2)
+        let src: str = read_file(path)
+        let ctx: Ctx = new_ctx(src)
+        lex(ctx)
+        let mut count: int = 0
+        let mut more: bool = ctx.pos < ctx.toks.len()
+        if more {
+            more = ctx.toks.get(ctx.pos).kind != "eof"
+        }
+        while more {
+            let si: int = parse_stmt(ctx)
+            count = count + 1
+            let nm: str = ctx.stmts[si].name
+            if nm != "" {
+                print("NAME " + nm + "\n")
+            }
+            more = ctx.pos < ctx.toks.len()
+            if more {
+                more = ctx.toks.get(ctx.pos).kind != "eof"
+            }
+        }
+        print("COUNT " + count.to_str() + "\n")
+        return 0
+    }
+
+    # --probe-session <file> [exprfile] [base] — load the synthesized
+    # session (imports followed), splice the probe expression into
+    # main's body when one is given, and check the whole program.
+    # Death = the diagnostic the parent reports or repairs.
+    if mode == "--probe-session" {
+        if argv.len() < 3 {
+            eprint("error: --probe-session needs a file\n")
+            return 2
+        }
+        let path: str = argv.get(2)
+        let ctx: Ctx = hl_load_crate(path)
+        if argv.len() > 3 && argv.get(3) != "" {
+            let epath: str = argv.get(3)
+            let esrc: str = read_file(epath)
+            let mut base: int = 0
+            if argv.len() > 4 {
+                base = int(argv.get(4))
+            }
+            repl_splice_expr(ctx, esrc, base)
+        }
+        hl_check(ctx)
+        return 0
+    }
+
+    # --probe-loadmod <file> — :load's parse-only probe: 0 = a
+    # module-style file (item count rides along), 3 = it defines main
+    # (refused), death = the parse error verbatim.
+    if mode == "--probe-loadmod" {
+        if argv.len() < 3 {
+            eprint("error: --probe-loadmod needs a file\n")
+            return 2
+        }
+        let path: str = argv.get(2)
+        let ctx: Ctx = hl_parse_file(path)
+        if ctx.fns.has("main") {
+            exit(3)
+        }
+        let n: int = ctx.fns.len() + ctx.structs.len() + ctx.enums.len()
+        print("ITEMS " + n.to_str() + "\n")
+        return 0
+    }
+
+    eprint("error: unknown probe mode " + mode + "\n")
+    return 2
+}
+
+# ----------------------------------------------------------------------------
+# The expression splice — the one liberty the Python years took at the
+# AST level, made static. A prompt expression is parsed from its own
+# source into a private pool, then grafted onto the session's main
+# body as a final expression statement (the checker's expr-stmt path
+# checks any expression; only the PARSER restricts statements to
+# calls). Indices are remapped by the pool offset — the subtree is the
+# whole private pool, so the graft is one linear pass — and lines are
+# shifted into the session source's space so runtime panics land in
+# ONE frame of reference the formatter understands.
+# ----------------------------------------------------------------------------
+
+fn repl_splice_expr(ctx: Ctx, esrc: str, line_offset: int) -> int {
+    let ectx: Ctx = new_ctx(esrc)
+    lex(ectx)
+    let root_local: int = parse_expr(ectx, true)
+    let eoff: int = ctx.exprs.len()
+    let aoff: int = ctx.match_arms.len()
+
+    # Graft the arms first (their bodies are expr indices).
+    let mut ai: int = 0
+    while ai < ectx.match_arms.len() {
+        let arm: MatchArm = ectx.match_arms.get(ai)
+        arm.body = arm.body + eoff
+        arm.line = arm.line + line_offset
+        ctx.match_arms.push(arm)
+        ai = ai + 1
+    }
+
+    # Graft the expression nodes: child indices shift by the offsets,
+    # match args shift by the arm offset, lines by the line offset.
+    let mut ei: int = 0
+    while ei < ectx.exprs.len() {
+        let n: ExprN = ectx.exprs.get(ei)
+        if n.left >= 0 {
+            n.left = n.left + eoff
+        }
+        if n.right >= 0 {
+            n.right = n.right + eoff
+        }
+        let mut k: int = 0
+        while k < n.args.len() {
+            let av: int = n.args.get(k)
+            if n.kind == "match" {
+                n.args.set(k, av + aoff)
+            } else {
+                n.args.set(k, av + eoff)
+            }
+            k = k + 1
+        }
+        if n.line > 0 {
+            n.line = n.line + line_offset
+        }
+        ctx.exprs.push(n)
+        ei = ei + 1
+    }
+
+    let root: int = root_local + eoff
+
+    # The statement node: an "expr" statement closing main's body.
+    let line: int = ctx.exprs[root].line
+    let si: int = nx_stmt(ctx, "expr", line)
+    ctx.stmts[si].e = root
+    let f: FnInfo = ctx.fns.get_or("main", dummy_fn())
+    f.body.push(si)
+    return root
+}
+
+# ----------------------------------------------------------------------------
+# The session.
+# ----------------------------------------------------------------------------
+
+struct ReplS {
+    items: list[str], # top-level definition sources (in order)
+    stmts: list[str], # committed session-block statement sources
+    n_stmts: int, # how many AST statements that amounts to
+    effects: list[str], # declared effects of the session block
+    computed: list[str], # computed effects of the committed session
+    boot: Boot, # the ONE live evaluator
+    committed_ctx: Ctx, # last committed tables (rollback target)
+    have_ctx: bool, # false until the first successful commit
+    frame: Fr, # the session scope (live bindings)
+    path_cls: str,
+    path_expr: str,
+    path_sess: str,
+    probe_root: int, # last splice's root expr index (-1 = none)
+    last_eff: list[str] # the compile loop's final declared set
+}
+
+fn repl_session_new() -> ReplS uses Conc, Proc {
+    let ps: list[str] = repl_scratch_paths()
+    let empty_ctx: Ctx = new_ctx("")
+    let boot: Boot = Boot {
+        ctx: empty_ctx,
+        tasks: [],
+        rng: 1,
+        argv: v_list([]),
+        det: false,
+        trace: false,
+        contracts: false,
+        target_feature: "",
+        sandbox: "",
+        cov_on: false,
+        cov_hits: map_new()
+    }
+    return ReplS {
+        items: [],
+        stmts: [],
+        n_stmts: 0,
+        effects: [],
+        computed: [],
+        boot: boot,
+        committed_ctx: empty_ctx,
+        have_ctx: false,
+        frame: fr_new(),
+        path_cls: ps.get(0),
+        path_expr: ps.get(1),
+        path_sess: ps.get(2),
+        probe_root: -1,
+        last_eff: []
+    }
+}
+
+# repl_source(s, extra_items, extra_stmts, eff) — build the whole
+# session program's source with the given declared-effects set.
+# Returns [src, stmts_base, items_base]: the line counts to SUBTRACT
+# from a raw diagnostic's line so the number shown is relative to the
+# input that caused it (a fragment starting on synthesized line S is
+# input line 1, so the subtractable base is S - 1). Pending
+# definitions append after main's closing brace — top-level order is
+# free, and forward references are allowed.
+fn repl_source(s: ReplS, extra_items: list[str], extra_stmts: list[str],
+eff: list[str]) -> list[str] {
+    let parts: list[str] = []
+
+    let mut i: int = 0
+    while i < s.items.len() {
+        parts.push(s.items.get(i))
+        i = i + 1
+    }
+
+    let mut h: str = "fn main()"
+    if eff.len() > 0 {
+        h = h + " uses " + repl_join(repl_sorted(eff), ", ")
+    }
+    parts.push(h + " {")
+
+    let mut stmts_base: int = 0
+    let mut pi: int = 0
+    while pi < parts.len() {
+        stmts_base = stmts_base + repl_count_lines(parts.get(pi))
+        pi = pi + 1
+    }
+
+    let mut j: int = 0
+    while j < s.stmts.len() {
+        parts.push(s.stmts.get(j))
+        j = j + 1
+    }
+    let mut k: int = 0
+    while k < extra_stmts.len() {
+        parts.push(extra_stmts.get(k))
+        k = k + 1
+    }
+    parts.push("}")
+
+    let mut items_base: int = 0
+    let mut pj: int = 0
+    while pj < parts.len() {
+        items_base = items_base + repl_count_lines(parts.get(pj))
+        pj = pj + 1
+    }
+
+    let mut m: int = 0
+    while m < extra_items.len() {
+        parts.push(extra_items.get(m))
+        m = m + 1
+    }
+
+    let out: list[str] = [repl_join(parts, "\n"), stmts_base.to_str(),
+    items_base.to_str()]
+    return out
+}
+
+# repl_pending_base — where a pending fragment sits: the statements
+# region's start plus the committed statements' own length (the probe
+# expression logically follows them).
+fn repl_pending_base(s: ReplS, src_parts: list[str]) -> int {
+    let sb: int = int(src_parts.get(1))
+    let mut committed: int = 0
+    let mut i: int = 0
+    while i < s.stmts.len() {
+        committed = committed + repl_count_lines(s.stmts.get(i))
+        i = i + 1
+    }
+    return sb + committed
+}
+
+# repl_locate_line(s, line) — map a line in the synthesized source back
+# to the material the user can see: a definition fragment (the
+# fragment-relative line), a committed statement input (the
+# input-relative line), or -1 when the line belongs to something with
+# honest numbers of its own (an imported std/core module keeps its real
+# file lines).
+fn repl_locate_line(s: ReplS, line: int) -> int {
+    let mut start: int = 1
+    let mut i: int = 0
+    while i < s.items.len() {
+        let frag: str = s.items.get(i)
+        let span: int = repl_count_lines(frag)
+        if start <= line && line < start + span {
+            return line - start + 1
+        }
+        start = start + span
+        i = i + 1
+    }
+    start = start + 1 # the session block's own header line
+    let mut j: int = 0
+    while j < s.stmts.len() {
+        let src: str = s.stmts.get(j)
+        let span2: int = repl_count_lines(src)
+        if start <= line && line < start + span2 {
+            return line - start + 1
+        }
+        start = start + span2
+        j = j + 1
+    }
+    return -1
+}
+
+# repl_fmt_panic(s, msg, line, pending_base, pending_span) — the most
+# honest line number available: input-relative when the panic fell
+# inside the input that is running, definition- or statement-relative
+# when it fell inside committed material, and the module's own line
+# when it came from an import.
+fn repl_fmt_panic(s: ReplS, msg: str, line: int, pending_base: int,
+pending_span: int) -> str {
+    let mut shown: int = -1
+    if pending_base > 0 && pending_base < line
+    && line <= pending_base + pending_span {
+        shown = line - pending_base
+    } else {
+        shown = repl_locate_line(s, line)
+    }
+    if shown < 0 {
+        return "panic: " + msg + " (at line " + line.to_str() + ")"
+    }
+    return "panic: " + msg + " (at line " + shown.to_str() + ")"
+}
+
+# repl_err_remap(msg, base) — a compile error's text with input-
+# relative line numbers: the trailing "(line N)" shifts down by the
+# base when it names a line inside the pending input; line 0 (whole-
+# program errors) and lines at or below the base stay as they are.
+fn repl_err_remap(msg: str, base: int) -> str {
+    if base <= 0 {
+        return msg
+    }
+    let needle: str = "(line "
+    let mut found: int = -1
+    let mut pos: int = msg.len() - needle.len()
+    while pos >= 0 {
+        if msg.slice(pos, msg.len()).starts_with(needle) {
+            found = pos
+        }
+        pos = pos - 1
+    }
+    if found < 0 {
+        return msg
+    }
+    let digits: str = msg.slice(found + needle.len(), msg.len() - 1)
+    if digits.len() == 0 {
+        return msg
+    }
+    # the line number runs to the end or to a ":C" column suffix
+    let mut end: int = 0
+    while end < digits.len() {
+        let b: int = digits.byte_at(end)
+        if b < 48 || b > 57 {
+            break
+        }
+        end = end + 1
+    }
+    if end == 0 {
+        return msg
+    }
+    let mut tail: str = ")"
+    if end < digits.len() {
+        if digits.byte_at(end) != 58 {
+            return msg
+        }
+        tail = digits.slice(end, digits.len()) + ")"
+    }
+    let n: int = int(digits.slice(0, end))
+    if n <= base {
+        return msg
+    }
+    return msg.slice(0, found) + "(line " + (n - base).to_str() + tail
+}
+
+# repl_missing_effects(msg) — the checker's missing-effect diagnostic
+# for main, as a list ("function 'main' calls '...' which requires
+# effect '...' not declared (declared: ...; missing: A, B)"). Empty
+# list = the message is not that diagnostic.
+fn repl_missing_effects(msg: str) -> list[str] {
+    if !msg.starts_with("type error: function 'main' calls ") {
+        return[]
+    }
+    let mark: str = "; missing: "
+    let at: int = msg.find(mark)
+    if at < 0 {
+        return[]
+    }
+    let rest: str = msg.slice(at + mark.len(), msg.len())
+    let close: int = rest.find(")")
+    if close < 0 {
+        return[]
+    }
+    let body: str = rest.slice(0, close)
+    let parts: list[str] = body.split(",")
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < parts.len() {
+        let p: str = parts.get(i).trim()
+        if p != "" {
+            out.push(p)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# repl_compile — synthesize, probe-check and adopt the session program.
+# The declared-effects loop is the Python years' own: a missing effect
+# on main (and only main — the REPL's own block) is auto-declared from
+# the checker's diagnostic and the round repeats; a user fn's missing
+# effect is an error, never a repair. On success the parent re-derives
+# the identical load+splice+check in process — the probe proved it
+# passes, and the checker is a pure function of its input — so the
+# evaluator's tables come back annotated in this process, where the
+# session's state lives.
+#
+# Returns "" on success (s.boot.ctx holds the checked program,
+# s.probe_root the spliced expression when probe_text was given,
+# s.last_eff the loop's final declared set) or the error text,
+# line-remapped for the input that caused it.
+# ----------------------------------------------------------------------------
+
+fn repl_compile(s: ReplS, extra_items: list[str], extra_stmts: list[str],
+probe_text: str, relocate_stmts: int, relocate_items: int)
+-> str uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let mut eff: list[str] = []
+    let mut ei: int = 0
+    while ei < s.effects.len() {
+        eff.push(s.effects.get(ei))
+        ei = ei + 1
+    }
+
+    let self_path: str = repl_self_path()
+    let mut round: int = 0
+    while round < REPL_MAX_EFFECT_ROUNDS() {
+        let src_parts: list[str] = repl_source(s, extra_items, extra_stmts, eff)
+        let src: str = src_parts.get(0)
+        write_file(s.path_sess, src)
+
+        let cargs: list[str] = ["--probe-session", s.path_sess]
+        if probe_text != "" {
+            write_file(s.path_expr, probe_text)
+            let pending_base: int = repl_pending_base(s, src_parts)
+            cargs.push(s.path_expr)
+            cargs.push(pending_base.to_str())
+        } else {
+            cargs.push("")
+        }
+
+        let res: CapRes = hb_spawn_child(self_path, cargs)
+        if res.code != 0 {
+            let msg: str = repl_panic_body(res.err)
+            let miss: list[str] = repl_missing_effects(msg)
+            if miss.len() > 0 {
+                eff = repl_list_union(eff, miss)
+                round = round + 1
+                continue
+            }
+            let mut base: int = 0
+            if relocate_stmts > 0 {
+                base = relocate_stmts
+            } else {
+                base = relocate_items
+            }
+            return "error: " + repl_err_remap(msg, base)
+        }
+
+        # The probe passed: re-derive the same program in process.
+        let ctx: Ctx = hl_load_crate(s.path_sess)
+        s.probe_root = -1
+        if probe_text != "" {
+            let pending_base2: int = repl_pending_base(s, src_parts)
+            s.probe_root = repl_splice_expr(ctx, probe_text, pending_base2)
+        }
+        hl_check(ctx)
+        s.boot.ctx = ctx
+        s.last_eff = eff
+        return ""
+    }
+    return "error: effect inference did not converge after "
+    + REPL_MAX_EFFECT_ROUNDS().to_str() + " rounds"
+}
+
+# ----------------------------------------------------------------------------
+# Value display — the Python years' one formatter, over the
+# evaluator's own values: bools as the HLS literals, strings decoded
+# and quoted the way json.dumps quoted them, structs in field order
+# from their declared type, enums as Variant(payload), taint visible.
+# ----------------------------------------------------------------------------
+
+fn repl_shorten(text: str) -> str {
+    if text.len() <= REPL_MAX_RENDER() {
+        return text
+    }
+    return text.slice(0, REPL_MAX_RENDER()) + "..."
+}
+
+# repl_json_quote — json.dumps' ASCII law for one string: ", \ and
+# control bytes escape, everything above 127 becomes \uXXXX (decoded
+# from the UTF-8 the value carries; an invalid sequence replaces, and
+# an astral codepoint becomes its surrogate pair).
+fn repl_json_quote(s: str) -> str {
+    let mut out: str = "\""
+    let mut i: int = 0
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        if b == 34 {
+            out = out + "\\\""
+        } else if b == 92 {
+            out = out + "\\\\"
+        } else if b == 10 {
+            out = out + "\\n"
+        } else if b == 9 {
+            out = out + "\\t"
+        } else if b == 13 {
+            out = out + "\\r"
+        } else if b == 8 {
+            out = out + "\\b"
+        } else if b == 12 {
+            out = out + "\\f"
+        } else if b < 32 {
+            out = out + "\\u" + repl_hex4(b)
+        } else if b < 127 {
+            out = out + s.slice(i, i + 1)
+        } else {
+            let dec: list[int] = repl_utf8_dec(s, i)
+            let cp: int = dec.get(0)
+            let width: int = dec.get(1)
+            if cp > 65535 {
+                let hi: int = 55296 + (cp - 65536) / 1024
+                let lo: int = 56320 + (cp - 65536) % 1024
+                out = out + "\\u" + repl_hex4(hi) + "\\u" + repl_hex4(lo)
+            } else {
+                out = out + "\\u" + repl_hex4(cp)
+            }
+            i = i + width - 1
+        }
+        i = i + 1
+    }
+    return out + "\""
+}
+
+# repl_utf8_dec — decode the codepoint at i. Returns [cp, width]; an
+# invalid lead byte or truncated sequence reads as U+FFFD over its own
+# bytes (the Python years' errors="replace").
+fn repl_utf8_dec(s: str, i: int) -> list[int] {
+    let b0: int = s.byte_at(i)
+    if b0 >= 240 && b0 <= 247 {
+        if i + 3 >= s.len() {
+            return[65533, 1]
+        }
+        let b1: int = s.byte_at(i + 1)
+        let b2: int = s.byte_at(i + 2)
+        let b3: int = s.byte_at(i + 3)
+        if !repl_is_cont(b1) || !repl_is_cont(b2) || !repl_is_cont(b3) {
+            return[65533, 1]
+        }
+        let cp: int = (b0 - 240) * 262144 + (b1 - 128) * 4096
+        + (b2 - 128) * 64 + (b3 - 128)
+        if cp > 1114111 {
+            return[65533, 1]
+        }
+        return[cp, 4]
+    }
+    if b0 >= 224 && b0 <= 239 {
+        if i + 2 >= s.len() {
+            return[65533, 1]
+        }
+        let c1: int = s.byte_at(i + 1)
+        let c2: int = s.byte_at(i + 2)
+        if !repl_is_cont(c1) || !repl_is_cont(c2) {
+            return[65533, 1]
+        }
+        return[(b0 - 224) * 4096 + (c1 - 128) * 64 + (c2 - 128), 3]
+    }
+    if b0 >= 192 && b0 <= 223 {
+        if i + 1 >= s.len() {
+            return[65533, 1]
+        }
+        let d1: int = s.byte_at(i + 1)
+        if !repl_is_cont(d1) {
+            return[65533, 1]
+        }
+        return[(b0 - 192) * 64 + (d1 - 128), 2]
+    }
+    return[65533, 1]
+}
+
+fn repl_is_cont(b: int) -> bool {
+    return b >= 128 && b <= 191
+}
+
+fn repl_hex4(v: int) -> str {
+    let hex: str = "0123456789abcdef"
+    let mut n: int = v
+    if n < 0 {
+        n = 0
+    }
+    if n > 65535 {
+        n = 65535
+    }
+    let d3: int = n % 16
+    let d2: int = (n / 16) % 16
+    let d1: int = (n / 256) % 16
+    let d0: int = (n / 4096) % 16
+    return hex.slice(d0, d0 + 1) + hex.slice(d1, d1 + 1)
+    + hex.slice(d2, d2 + 1) + hex.slice(d3, d3 + 1)
+}
+
+# repl_base_type — `Box[int]` -> `Box`; `int` -> `int`.
+fn repl_base_type(ty: str) -> str {
+    let at: int = ty.find("[")
+    if at < 0 {
+        return ty
+    }
+    return ty.slice(0, at)
+}
+
+fn repl_field_type(sdef: StructInfo, name: str) -> str {
+    let mut i: int = 0
+    while i < sdef.fields.len() {
+        if sdef.fields.get(i) == name {
+            return sdef.ftypes.get(i)
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# repl_repr_float — the Python years' repr() for the common range:
+# the shortest decimal that parses back to the same double ("10.0",
+# "0.5", "0.30000000000000004"). The digit loop stops at the first
+# candidate that round-trips through to_float; the exponent forms
+# repr() uses past 1e16 fall back to the fixed form (no corpus float
+# lives out there, and the honest fallback still round-trips).
+fn repl_repr_float(x: float) -> str {
+    if x != x {
+        return "nan"
+    }
+    let pos_inf: float = 1.0 / 0.0
+    if x == pos_inf {
+        return "inf"
+    }
+    if x == 0.0 - pos_inf {
+        return "-inf"
+    }
+    if x < 0.0 {
+        return "-" + repl_repr_float(0.0 - x)
+    }
+    if x == 0.0 {
+        return "0.0"
+    }
+    if x >= 10000000000000000.0 {
+        return x.to_str()
+    }
+    let ipart: int = x.to_int()
+    let s: str = ipart.to_str()
+    let mut frac: float = x - ipart.to_float()
+    if frac == 0.0 {
+        return s + ".0"
+    }
+    let mut digits: str = ""
+    let mut i: int = 0
+    while i < 17 {
+        frac = frac * 10.0
+        let d: int = frac.to_int()
+        digits = digits + repl_digit_ch(d)
+        frac = frac - d.to_float()
+        let cand: str = s + "." + digits
+        if cand.to_float() == x {
+            return cand
+        }
+        i = i + 1
+    }
+    return s + "." + digits
+}
+
+# repl_digit_ch — '0'..'9' for 0..9.
+fn repl_digit_ch(d: int) -> str {
+    if d <= 0 {
+        return "0"
+    }
+    if d > 9 {
+        return "9"
+    }
+    return chr(48 + d)
+}
+
+# repl_display — render a runtime value the way Halis means it.
+fn repl_display(ctx: Ctx, v: V, ty: str) -> str {
+    if v.k == VK_UNIT() {
+        return "void"
+    }
+    if v.k == VK_BOOL() {
+        if v.i == 1 {
+            return "true"
+        }
+        return "false"
+    }
+    if v.k == VK_INT() {
+        return v.i.to_str()
+    }
+    if v.k == VK_FLOAT() {
+        return repl_shorten(repl_repr_float(v.f))
+    }
+    if v.k == VK_STR() {
+        return repl_shorten(repl_json_quote(v.s))
+    }
+    if v.k == VK_LIST() {
+        let mut head: str = ""
+        let mut i: int = 0
+        while i < v.vals.len() && i < REPL_MAX_ITEMS() {
+            if i > 0 {
+                head = head + ", "
+            }
+            head = head + repl_display(ctx, v.vals.get(i), "")
+            i = i + 1
+        }
+        if v.vals.len() > REPL_MAX_ITEMS() {
+            head = head + ", ..."
+        }
+        return repl_shorten("[" + head + "] (len=" + v.vals.len().to_str() + ")")
+    }
+    if v.k == VK_MAP() {
+        if v.keys.len() == 0 {
+            return "{}"
+        }
+        let mut items: str = ""
+        let mut j: int = 0
+        while j < v.keys.len() && j < REPL_MAX_ITEMS() {
+            if j > 0 {
+                items = items + ", "
+            }
+            items = items + v.keys.get(j) + ": "
+            + repl_display(ctx, v.vals.get(j), "")
+            j = j + 1
+        }
+        if v.keys.len() > REPL_MAX_ITEMS() {
+            items = items + ", ..."
+        }
+        return "{ " + items + " }"
+    }
+    if v.k == VK_ENUM() {
+        let name: str = v.s + "." + v.var
+        if v.vals.len() == 0 {
+            return repl_shorten(name)
+        }
+        let mut inner: str = ""
+        let mut k: int = 0
+        while k < v.vals.len() {
+            if k > 0 {
+                inner = inner + ", "
+            }
+            inner = inner + repl_display(ctx, v.vals.get(k), "")
+            k = k + 1
+        }
+        return repl_shorten(name + "(" + inner + ")")
+    }
+    if v.k == VK_TAINTED() {
+        return repl_shorten("tainted[" + repl_display(ctx, v.vals.get(0), "") + "]")
+    }
+    if v.k == VK_STRUCT() {
+        let base: str = repl_base_type(ty)
+        if base != "" && ctx.structs.has(base) {
+            let sdef: StructInfo = ctx.structs.get_or(base, repl_dummy_struct())
+            let mut items: str = ""
+            let mut n: int = 0
+            let mut fi: int = 0
+            while fi < v.keys.len() && n < REPL_MAX_ITEMS() {
+                if n > 0 {
+                    items = items + ", "
+                }
+                let fty: str = repl_field_type(sdef, v.keys.get(fi))
+                items = items + v.keys.get(fi) + ": "
+                + repl_display(ctx, v.vals.get(fi), fty)
+                n = n + 1
+                fi = fi + 1
+            }
+            if v.keys.len() > REPL_MAX_ITEMS() {
+                items = items + ", ..."
+            }
+            return repl_shorten(base + " { " + items + " }")
+        }
+        if v.keys.len() == 0 {
+            return "{}"
+        }
+        let mut items2: str = ""
+        let mut fj: int = 0
+        while fj < v.keys.len() && fj < REPL_MAX_ITEMS() {
+            if fj > 0 {
+                items2 = items2 + ", "
+            }
+            items2 = items2 + v.keys.get(fj) + ": "
+            + repl_display(ctx, v.vals.get(fj), "")
+            fj = fj + 1
+        }
+        if v.keys.len() > REPL_MAX_ITEMS() {
+            items2 = items2 + ", ..."
+        }
+        return "{ " + items2 + " }"
+    }
+    if v.k == VK_TASK() {
+        return "task"
+    }
+    if v.k == VK_CAP() {
+        return "cap:" + v.s
+    }
+    return "chan"
+}
+
+fn repl_dummy_struct() -> StructInfo {
+    return StructInfo {
+        name: "",
+        fields: [],
+        ftypes: [],
+        fdefaults: [],
+        typeparams: [],
+        line: 0,
+        field_preds: map_new()
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Computed effects of the session block, from the checked tables.
+# ----------------------------------------------------------------------------
+
+fn repl_computed_of(ctx: Ctx) -> list[str] {
+    return ctx.computed_effects.get_or("main", [])
+}
+
+# ----------------------------------------------------------------------------
+# The commit paths.
+# ----------------------------------------------------------------------------
+
+# repl_commit_item — a top-level definition, verbatim.
+fn repl_commit_item(s: ReplS, fragment: str) -> str uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let extra_items: list[str] = [fragment]
+    let probe_parts: list[str] = repl_source(s, extra_items, [], s.effects)
+    let ib: int = int(probe_parts.get(2))
+    let err: str = repl_compile(s, extra_items, [], "", 0, ib)
+    if err != "" {
+        return err
+    }
+    s.items.push(fragment)
+    s.effects = s.last_eff
+    s.committed_ctx = s.boot.ctx
+    s.have_ctx = true
+    return ""
+}
+
+# repl_commit_stmts — compile the input against the session, run it in
+# a scratch scope, and only then commit. A runtime panic mid-input
+# reports and commits nothing: bindings the input made are discarded
+# with its scratch scope (mutations of OLDER values are real effects
+# that already happened — the panic message says where). Returns
+# ("", false) on success, (err, true) when the input ran and halted.
+fn repl_commit_stmts(s: ReplS, text: str, count: int) -> list[str] uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let extra_stmts: list[str] = [text]
+    let probe_parts: list[str] = repl_source(s, [], extra_stmts, s.effects)
+    let stmt_base: int = repl_pending_base(s, probe_parts)
+    let err: str = repl_compile(s, [], extra_stmts, "", stmt_base, 0)
+    if err != "" {
+        return["", "false", err]
+    }
+
+    let old_n: int = s.n_stmts
+    let ctx: Ctx = s.boot.ctx
+    let f: FnInfo = ctx.fns.get_or("main", dummy_fn())
+    let scratch: Fr = fr_new()
+    let env: list[Fr] = [s.frame, scratch]
+
+    let mut halted: str = ""
+    let mut i: int = old_n
+    while i < f.body.len() {
+        let r: R = exec_stmt(s.boot, env, f.body.get(i), "main")
+        if r.flow == FL_PANIC() {
+            let span: int = repl_count_lines(text)
+            halted = repl_fmt_panic(s, r.msg, r.line, stmt_base, span)
+            break
+        }
+        if r.flow == FL_RETURN() {
+            halted = "error: return is refused at the prompt "
+            + "(the session block is not callable)"
+            break
+        }
+        if r.flow == FL_BREAK() || r.flow == FL_CONT() {
+            halted = "error: break/continue escaped the session "
+            + "block (the checker should have caught this)"
+            break
+        }
+        if r.flow == FL_EXIT() {
+            halted = "error: exit(" + r.code.to_str() + ") is refused at "
+            + "the prompt (the session is not a process; use :quit)"
+            break
+        }
+        i = i + 1
+    }
+
+    if halted != "" {
+        # Rollback: the live tables stay at the committed state.
+        if s.have_ctx {
+            s.boot.ctx = s.committed_ctx
+        }
+        return["", "true", halted]
+    }
+
+    # Merge the scratch scope into the session scope.
+    let merge_env: list[Fr] = [s.frame]
+    let mut bi: int = 0
+    while bi < scratch.names.len() {
+        env_bind(merge_env, scratch.names.get(bi), scratch.cells.get(bi))
+        bi = bi + 1
+    }
+
+    s.stmts.push(text)
+    s.n_stmts = old_n + count
+    s.effects = s.last_eff
+    s.computed = repl_computed_of(ctx)
+    s.committed_ctx = ctx
+    s.have_ctx = true
+    return["", "false", ""]
+}
+
+# repl_eval_expr — a bare expression in session context: evaluate it,
+# print its value, and commit it when its shape is call-like (the
+# effects are real and the session's audit must see them).
+fn repl_eval_expr(s: ReplS, text: str, shape: str) -> str uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let err: str = repl_compile(s, [], [], text, 0, 0)
+    if err != "" {
+        return err
+    }
+    let ctx: Ctx = s.boot.ctx
+    let root: int = s.probe_root
+
+    let env: list[Fr] = [s.frame]
+    let r: R = eval_expr(s.boot, env, root, "main")
+    if r.flow == FL_PANIC() {
+        let probe_parts: list[str] = repl_source(s, [], [], s.effects)
+        let pending_base: int = repl_pending_base(s, probe_parts)
+        let span: int = repl_count_lines(text)
+        return repl_fmt_panic(s, r.msg, r.line, pending_base, span)
+    }
+    if r.flow == FL_EXIT() {
+        return "error: exit(" + r.code.to_str() + ") is refused at "
+        + "the prompt (the session is not a process; use :quit)"
+    }
+    if r.flow == FL_RETURN() || r.flow == FL_BREAK() || r.flow == FL_CONT() {
+        return "error: control flow escaped the expression"
+    }
+
+    let t: str = ctx.exprs[root].t
+    if t != "" && t != "void" && t != "never" {
+        println("= " + repl_display(ctx, r.v, t))
+    }
+
+    if shape == "call" || shape == "method" || shape == "fieldcall"
+    || shape == "match" || shape == "qmark" {
+        # the expression ran once, against the live environment;
+        # committing its source keeps the checker's session view in
+        # sync with what actually happened (nothing re-runs)
+        s.stmts.push(text)
+        s.n_stmts = s.n_stmts + 1
+        s.effects = s.last_eff
+        s.computed = repl_computed_of(ctx)
+        s.committed_ctx = ctx
+        s.have_ctx = true
+    }
+    return ""
+}
+
+# ----------------------------------------------------------------------------
+# The commands.
+# ----------------------------------------------------------------------------
+
+# repl_cmd_type — the checker's own annotation.
+fn repl_cmd_type(s: ReplS, text: str) -> str uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let err: str = repl_compile(s, [], [], text, 0, 0)
+    if err != "" {
+        return err
+    }
+    let ctx: Ctx = s.boot.ctx
+    let t: str = ctx.exprs[s.probe_root].t
+    if t == "" {
+        println(": unknown")
+        return ""
+    }
+    println(": " + t)
+    return ""
+}
+
+# repl_cmd_effects — the fixpoint's set, relative to the session.
+fn repl_cmd_effects(s: ReplS, text: str) -> str uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let err: str = repl_compile(s, [], [], text, 0, 0)
+    if err != "" {
+        return err
+    }
+    let computed: list[str] = repl_computed_of(s.boot.ctx)
+    let delta: list[str] = repl_list_diff(computed, s.computed)
+    if computed.len() == 0 {
+        println("effects: (none - pure)")
+        return ""
+    }
+    if s.computed.len() == 0 {
+        # a fresh session has nothing to be new relative to
+        println("effects: " + repl_join(repl_sorted(computed), ", "))
+        return ""
+    }
+    if delta.len() > 0 {
+        println("effects: " + repl_join(repl_sorted(computed), ", ")
+        + " (new: " + repl_join(repl_sorted(delta), ", ") + ")")
+        return ""
+    }
+    # the expression needs nothing the session has not already
+    # declared — the honest answer names the session's set
+    println("effects: none beyond the session's ("
+    + repl_join(repl_sorted(s.computed), ", ") + ")")
+    return ""
+}
+
+# repl_cmd_audit — boot.py's own table: four columns, the status
+# verdict, the summary. The capability-granted effects are not missing
+# (Stage 111 law, kept): the status column agrees with the checker's
+# enforcement.
+fn repl_cmd_audit(s: ReplS) -> str uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let err: str = repl_compile(s, [], [], "", 0, 0)
+    if err != "" {
+        return err
+    }
+    repl_print_audit(s.boot.ctx)
+    return ""
+}
+
+fn repl_print_audit(ctx: Ctx) -> void uses IO {
+    let keys: list[str] = ctx.fn_order
+    let names: list[str] = []
+    let decls: list[str] = []
+    let comps: list[str] = []
+    let stats: list[str] = []
+    let mut n_pure: int = 0
+    let mut n_eff: int = 0
+
+    let mut i: int = 0
+    while i < keys.len() {
+        let key: str = keys.get(i)
+        let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        let declared: list[str] = f.effects
+        let computed: list[str] = ctx.computed_effects.get_or(key, [])
+        let grants: list[str] = cap_grants(ctx, key)
+
+        let mut decl_out: str = "(none - pure)"
+        if f.is_pure {
+            if declared.len() == 0 {
+                decl_out = "pure"
+            } else {
+                decl_out = "pure + " + repl_join(repl_sorted(declared), ", ")
+            }
+        } else {
+            if declared.len() > 0 {
+                decl_out = repl_join(repl_sorted(declared), ", ")
+            }
+        }
+        let mut comp_out: str = "(none)"
+        if computed.len() > 0 {
+            comp_out = repl_join(repl_sorted(computed), ", ")
+        }
+        let missing: list[str] = repl_list_diff(
+        repl_list_diff(computed, declared), grants)
+        let mut status: str = "OK"
+        if missing.len() > 0 {
+            status = "VIOLATION: missing " + repl_join(repl_sorted(missing), ", ")
+        } else {
+            if f.is_pure && computed.len() > 0 {
+                status = "VIOLATION: pure but uses effects"
+            }
+        }
+        if f.is_pure {
+            n_pure = n_pure + 1
+        }
+        if declared.len() > 0 {
+            n_eff = n_eff + 1
+        }
+        names.push(key)
+        decls.push(decl_out)
+        comps.push(comp_out)
+        stats.push(status)
+        i = i + 1
+    }
+
+    # Column widths from the content (min: the header's own words).
+    let mut nw: int = 8
+    let mut dw: int = 9
+    let mut cw: int = 8
+    let mut j: int = 0
+    while j < names.len() {
+        if names.get(j).len() > nw {
+            nw = names.get(j).len()
+        }
+        if decls.get(j).len() > dw {
+            dw = decls.get(j).len()
+        }
+        if comps.get(j).len() > cw {
+            cw = comps.get(j).len()
+        }
+        j = j + 1
+    }
+
+    let bar: str = repl_eq_bar(nw + dw + cw + 22)
+    println(bar)
+    println("  " + pad_right("function", nw) + "  " + pad_right("declared", dw)
+    + "  " + pad_right("computed", cw) + "  status")
+    println(bar)
+    let mut k: int = 0
+    while k < names.len() {
+        println("  " + pad_right(names.get(k), nw) + "  "
+        + pad_right(decls.get(k), dw) + "  " + pad_right(comps.get(k), cw)
+        + "  " + stats.get(k))
+        k = k + 1
+    }
+    println(bar)
+    println("  " + names.len().to_str() + " functions: " + n_pure.to_str()
+    + " declared pure, " + n_eff.to_str() + " declared with effects")
+    if ctx.crate_freestanding {
+        println("  Crate mode: #![freestanding] (no libc, no OS calls, std disabled, entry _start)")
+    } else {
+        if ctx.crate_no_std {
+            println("  Crate mode: #![no_std] (std disabled, hosted libc kept)")
+        } else {
+            println("  Crate mode: std (default hosted crate)")
+        }
+    }
+}
+
+fn repl_eq_bar(n: int) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < n {
+        out = out + "="
+        i = i + 1
+    }
+    return out
+}
+
+# repl_cmd_env — the session's bindings, from the committed lets and
+# the live frame.
+fn repl_cmd_env(s: ReplS) -> void uses IO {
+    let rows: list[str] = []
+    if s.have_ctx {
+        let ctx: Ctx = s.committed_ctx
+        let f: FnInfo = ctx.fns.get_or("main", dummy_fn())
+        let mut i: int = 0
+        while i < f.body.len() && i < s.n_stmts {
+            let st: StmtN = ctx.stmts[f.body.get(i)]
+            if st.kind == "let" {
+                let mut ty: str = st.vtype
+                if ty == "" {
+                    ty = "?"
+                }
+                if st.is_mut {
+                    ty = "mut " + ty
+                }
+                let cell: int = repl_frame_find(s.frame, st.name)
+                if cell < 0 {
+                    rows.push("  " + st.name + ": " + ty)
+                } else {
+                    rows.push("  " + st.name + ": " + ty + " = "
+                    + repl_display(ctx, s.frame.cells.get(cell), st.vtype))
+                }
+            }
+            i = i + 1
+        }
+    }
+    if rows.len() > 0 {
+        println("session bindings:")
+        let mut j: int = 0
+        while j < rows.len() {
+            println(rows.get(j))
+            j = j + 1
+        }
+        return
+    }
+    println("session bindings: (none)")
+}
+
+fn repl_frame_find(f: Fr, name: str) -> int {
+    let mut i: int = 0
+    while i < f.names.len() {
+        if f.names.get(i) == name {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# repl_cmd_load — a module-style file (no main) joins the session.
+fn repl_cmd_load(s: ReplS, raw_path: str) -> str uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let p: str = repl_unquote(raw_path.trim())
+    if p == "" {
+        return "error: :load expects a file path"
+    }
+    if !file_exists(p) {
+        return "error: cannot read " + p + ": No such file or directory"
+    }
+    let self_path: str = repl_self_path()
+    let cargs: list[str] = ["--probe-loadmod", p]
+    let res: CapRes = hb_spawn_child(self_path, cargs)
+    if res.code == 3 {
+        return "error: :load refuses files that define main (the "
+        + "session block is the REPL's own main; factor the "
+        + "reusable code into named fns and load those)"
+    }
+    if res.code != 0 {
+        return "error: " + repl_panic_body(res.err)
+    }
+    let n: int = repl_parse_items(res.out)
+
+    let text: str = repl_rstrip_newlines(read_file(p))
+    let err: str = repl_commit_item(s, text)
+    if err != "" {
+        return err
+    }
+    println("loaded " + p + ": " + n.to_str() + " item(s)")
+    return ""
+}
+
+# repl_parse_items — the loadmod probe's "ITEMS n" line, as an int.
+fn repl_parse_items(out: str) -> int {
+    let at: int = out.find("ITEMS ")
+    if at < 0 {
+        return 0
+    }
+    let rest: str = out.slice(at + 6, out.len())
+    let mut end: int = 0
+    while end < rest.len() {
+        let b: int = rest.byte_at(end)
+        if b < 48 || b > 57 {
+            break
+        }
+        end = end + 1
+    }
+    if end == 0 {
+        return 0
+    }
+    return int(rest.slice(0, end))
+}
+
+# repl_unquote — Python's strip('"').
+fn repl_unquote(s: str) -> str {
+    let mut a: int = 0
+    let mut b: int = s.len()
+    while a < b && s.byte_at(a) == 34 {
+        a = a + 1
+    }
+    while b > a && s.byte_at(b - 1) == 34 {
+        b = b - 1
+    }
+    return s.slice(a, b)
+}
+
+fn repl_rstrip_newlines(s: str) -> str {
+    let mut b: int = s.len()
+    while b > 0 && s.byte_at(b - 1) == 10 {
+        b = b - 1
+    }
+    return s.slice(0, b)
+}
+
+# ----------------------------------------------------------------------------
+# Classification — which parse path owns an input. The parent's byte
+# scan only decides blankness; every real decision is a probe's (the
+# lexer and parser die on bad input, and a REPL must survive it).
+# ----------------------------------------------------------------------------
+
+fn CK_EMPTY() -> int {
+    return 0
+}
+
+fn CK_ITEM() -> int {
+    return 1
+}
+
+fn CK_EXPR() -> int {
+    return 2
+}
+
+fn CK_STMTS() -> int {
+    return 3
+}
+
+fn CK_ERR() -> int {
+    return 4
+}
+
+struct ReplClass {
+    kind: int,
+    shape: str,
+    count: int,
+    idents: list[str],
+    err: str
+}
+
+fn repl_classify(s: ReplS, text: str) -> ReplClass uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let out: ReplClass = ReplClass {
+        kind: CK_ERR(), shape: "", count: 0, idents: [], err: ""
+    }
+    let self_path: str = repl_self_path()
+    write_file(s.path_cls, text)
+
+    let res: CapRes = hb_spawn_child(self_path, ["--probe-classify", s.path_cls])
+    if res.code != 0 {
+        out.err = "error: " + repl_panic_body(res.err)
+        return out
+    }
+    if res.out.starts_with("KIND EMPTY") {
+        out.kind = CK_EMPTY()
+        return out
+    }
+    if res.out.starts_with("KIND ITEM") {
+        out.kind = CK_ITEM()
+        return out
+    }
+    if res.out.starts_with("KIND STMTSKW") {
+        return repl_classify_stmts(self_path, s, out)
+    }
+
+    # TRY: an expression first (foo(1) is a value at the prompt,
+    # x = 5 is a statement, and the two are told apart by what
+    # survives an EOF check after the expression parse).
+    let er: CapRes = hb_spawn_child(self_path, ["--probe-tryexpr", s.path_cls])
+    if er.code == 3 {
+        out.kind = CK_EXPR()
+        let lines: list[str] = er.out.split("\n")
+        let mut i: int = 0
+        while i < lines.len() {
+            let l: str = lines.get(i)
+            if l.starts_with("SHAPE ") {
+                out.shape = l.slice(6, l.len())
+            }
+            if l.starts_with("IDENT ") {
+                out.idents.push(l.slice(6, l.len()))
+            }
+            i = i + 1
+        }
+        return out
+    }
+    return repl_classify_stmts(self_path, s, out)
+}
+
+fn repl_classify_stmts(self_path: str, s: ReplS, out: ReplClass) -> ReplClass uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let sr: CapRes = hb_spawn_child(self_path, ["--probe-trystmts", s.path_cls])
+    if sr.code != 0 {
+        out.kind = CK_ERR()
+        out.err = "error: " + repl_panic_body(sr.err)
+        return out
+    }
+    out.kind = CK_STMTS()
+    let lines: list[str] = sr.out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let l: str = lines.get(i)
+        if l.starts_with("COUNT ") {
+            out.count = int(l.slice(6, l.len()))
+        }
+        if l.starts_with("NAME ") {
+            out.idents.push(l.slice(5, l.len()))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# repl_incomplete — true when the input cannot be complete yet: a
+# bracket still open, or an unterminated string literal. A byte-level
+# scan (strings and comments are skipped the way the lexer would skip
+# them — "#[" is an attribute, any other "#" a comment); anything else
+# is a complete input even if it will fail to parse — the error is the
+# user's answer, not an invitation to keep reading.
+# ----------------------------------------------------------------------------
+
+fn repl_incomplete(text: str) -> bool {
+    let mut depth_curly: int = 0
+    let mut depth_paren: int = 0
+    let mut depth_square: int = 0
+    let mut in_str: bool = false
+    let mut in_comment: bool = false
+    let mut i: int = 0
+    while i < text.len() {
+        let c: int = text.byte_at(i)
+        if in_comment {
+            if c == 10 {
+                in_comment = false
+            }
+            i = i + 1
+            continue
+        }
+        if in_str {
+            if c == 92 {
+                i = i + 2
+                continue
+            }
+            if c == 34 {
+                in_str = false
+            }
+            i = i + 1
+            continue
+        }
+        if c == 35 {
+            if i + 1 < text.len() && text.byte_at(i + 1) == 91 {
+                # an attribute list: scan to its closing "]"
+                let mut j: int = i + 2
+                while j < text.len() && text.byte_at(j) != 93 {
+                    j = j + 1
+                }
+                i = j + 1
+                continue
+            }
+            in_comment = true
+            i = i + 1
+            continue
+        }
+        if c == 34 {
+            in_str = true
+            i = i + 1
+            continue
+        }
+        if c == 123 {
+            depth_curly = depth_curly + 1
+        }
+        if c == 125 {
+            depth_curly = depth_curly - 1
+        }
+        if c == 40 {
+            depth_paren = depth_paren + 1
+        }
+        if c == 41 {
+            depth_paren = depth_paren - 1
+        }
+        if c == 91 {
+            depth_square = depth_square + 1
+        }
+        if c == 93 {
+            depth_square = depth_square - 1
+        }
+        i = i + 1
+    }
+    if in_str {
+        return true
+    }
+    return depth_curly > 0 || depth_paren > 0 || depth_square > 0
+}
+
+# ----------------------------------------------------------------------------
+# The process loop.
+# ----------------------------------------------------------------------------
+
+fn REPL_BANNER() -> str {
+    return "Halis REPL v" + REPL_VERSION()
+    + " — Stage-0 evaluator live (types + effects checked)\n"
+    + "Definitions extend the session; statements change it; expressions print.\n"
+    + "Type :help for commands.\n"
+}
+
+fn REPL_HELP() -> str {
+    return "commands:\n"
+    + "  :type <expr>      the checker's inferred type of an expression\n"
+    + "  :effects <expr>   the effects evaluating it requires, in this session\n"
+    + "  :audit            effect tree of the session (same table as hlboot --audit)\n"
+    + "  :env              session bindings (name: type = value)\n"
+    + "  :load <file.hls>  load a module-style file (no main) into the session\n"
+    + "  :reset            clear the session (bindings, definitions, effects)\n"
+    + "  :help             this list\n"
+    + "  :quit             leave the REPL (also :q)\n"
+    + "\n"
+    + "expressions evaluate and print `= <value>` (calls also join the\n"
+    + "session); let/assign/if/while/for join the session block;\n"
+    + "fn/struct/enum/impl/import/extern extend the program.\n"
+    + "The session block is the REPL's own main — its `uses` clause grows by\n"
+    + "itself, your definitions' effects do not. Nothing is ever re-run behind\n"
+    + "your back, so bind a risky call before you retry it."
+}
+
+# repl_main_hint — a duplicate `main` at the prompt deserves its
+# one-line fix.
+fn repl_main_hint(err: str) -> str {
+    if err.contains("duplicate function name: main") {
+        return err + " (the session block is the REPL's own main; "
+        + "name your function something else, or :reset)"
+    }
+    return err
+}
+
+# repl_process — run one complete input through commands -> classify ->
+# compile -> run. Returns true when the REPL should quit.
+fn repl_process(s: ReplS, text: str) -> bool uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    if text.starts_with(":") {
+        return repl_run_command(s, text)
+    }
+    let cls: ReplClass = repl_classify(s, text)
+    if cls.kind == CK_ERR() {
+        println(cls.err)
+        return false
+    }
+    if cls.kind == CK_EMPTY() {
+        return false
+    }
+    if cls.kind == CK_ITEM() {
+        let err: str = repl_commit_item(s, text)
+        if err != "" {
+            println(repl_main_hint(err))
+        }
+        return false
+    }
+    if cls.kind == CK_EXPR() {
+        let mut i: int = 0
+        while i < cls.idents.len() {
+            if cls.idents.get(i).starts_with(REPL_PROBE_PREFIX()) {
+                println("error: '" + cls.idents.get(i)
+                + "' is reserved by the REPL")
+                return false
+            }
+            i = i + 1
+        }
+        let err2: str = repl_eval_expr(s, text, cls.shape)
+        if err2 != "" {
+            println(err2)
+        }
+        return false
+    }
+
+    # statements
+    let mut j: int = 0
+    while j < cls.idents.len() {
+        if cls.idents.get(j).starts_with(REPL_PROBE_PREFIX()) {
+            println("error: '" + cls.idents.get(j)
+            + "' is reserved by the REPL")
+            return false
+        }
+        j = j + 1
+    }
+    let res: list[str] = repl_commit_stmts(s, text, cls.count)
+    if res.get(2) != "" {
+        println(repl_main_hint(res.get(2)))
+    }
+    return false
+}
+
+# repl_run_command — dispatch a `:command` input; unknown commands are
+# refused by name, never silently ignored. Returns true on :quit.
+fn repl_run_command(s: ReplS, text: str) -> bool uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let body: str = text.slice(1, text.len())
+    let parts: list[str] = repl_split_ws2(body)
+    let name: str = parts.get(0)
+    let rest: str = parts.get(1).trim()
+
+    if name == "quit" || name == "q" || name == "exit" {
+        return true
+    }
+    if name == "help" || name == "h" {
+        println(REPL_HELP() + "\n")
+        return false
+    }
+    if name == "reset" {
+        repl_cmd_reset(s)
+        return false
+    }
+    if name == "env" {
+        repl_cmd_env(s)
+        return false
+    }
+    if name == "audit" {
+        let err: str = repl_cmd_audit(s)
+        if err != "" {
+            println(err)
+        }
+        return false
+    }
+    if name == "load" {
+        let err2: str = repl_cmd_load(s, rest)
+        if err2 != "" {
+            println(err2)
+        }
+        return false
+    }
+    if name == "type" || name == "effects" {
+        if rest == "" {
+            println("error: :" + name + " expects an expression")
+            return false
+        }
+        let cls: ReplClass = repl_classify(s, rest)
+        if cls.kind == CK_ERR() {
+            println(cls.err)
+            return false
+        }
+        if cls.kind != CK_EXPR() {
+            println("error: :" + name + " expects an expression")
+            return false
+        }
+        let mut i: int = 0
+        while i < cls.idents.len() {
+            if cls.idents.get(i).starts_with(REPL_PROBE_PREFIX()) {
+                println("error: '" + cls.idents.get(i)
+                + "' is reserved by the REPL")
+                return false
+            }
+            i = i + 1
+        }
+        let err3: str = repl_cmd_type_or_effects(s, rest, name)
+        if err3 != "" {
+            println(err3)
+        }
+        return false
+    }
+    println("error: unknown command ':" + name + "' (try :help)")
+    return false
+}
+
+fn repl_cmd_type_or_effects(s: ReplS, text: str, name: str) -> str uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    if name == "type" {
+        return repl_cmd_type(s, text)
+    }
+    return repl_cmd_effects(s, text)
+}
+
+# repl_split_ws2 — Python's str.split(None, 1): leading whitespace
+# skipped, the first word, then the remainder ("" when absent).
+fn repl_split_ws2(s: str) -> list[str] {
+    let mut i: int = 0
+    while i < s.len() && s.byte_at(i) <= 32 {
+        i = i + 1
+    }
+    let start: int = i
+    while i < s.len() && s.byte_at(i) > 32 {
+        i = i + 1
+    }
+    let word: str = s.slice(start, i)
+    let mut j: int = i
+    while j < s.len() && s.byte_at(j) <= 32 {
+        j = j + 1
+    }
+    return[word, s.slice(j, s.len())]
+}
+
+fn repl_cmd_reset(s: ReplS) -> void uses IO, Conc, Proc {
+    s.items = []
+    s.stmts = []
+    s.n_stmts = 0
+    s.effects = []
+    s.computed = []
+    s.have_ctx = false
+    let empty_ctx: Ctx = new_ctx("")
+    s.boot.ctx = empty_ctx
+    s.committed_ctx = empty_ctx
+    s.frame = fr_new()
+    println("session cleared")
+}
+
+# ----------------------------------------------------------------------------
+# main — the loop. Piped sessions walk stdin's lines by index (the
+# whole stream is read up front, so an incomplete input folds its
+# continuation lines without a prompt and EOF is exact); interactive
+# sessions read line by line with the two-read EOF rule.
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let argv: list[str] = args()
+    if argv.len() > 1 {
+        let a1: str = argv.get(1)
+        if a1 == "--probe-classify" || a1 == "--probe-tryexpr"
+        || a1 == "--probe-trystmts" || a1 == "--probe-session"
+        || a1 == "--probe-loadmod" {
+            return repl_probe_main(argv)
+        }
+        if a1 == "--help" || a1 == "-h" {
+            print("usage: hls-repl [--help]\n"
+            + "  an interactive session when stdin is a tty, a piped\n"
+            + "  transcript otherwise (commands: :help)\n")
+            return 0
+        }
+        eprint("error: unknown flag " + a1 + "\n")
+        return 2
+    }
+
+    proc_exec("mkdir -p bin")
+    let s: ReplS = repl_session_new()
+    let interactive: bool = isatty(0)
+    if interactive {
+        print(REPL_BANNER())
+    }
+
+    let rc: int = repl_loop(s, interactive)
+    proc_exec("rm -f " + s.path_cls + " " + s.path_expr + " " + s.path_sess)
+    return rc
+}
+
+# repl_loop — the input loop itself; returns the exit code (always 0 —
+# a REPL has no verdict to give).
+fn repl_loop(s: ReplS, interactive: bool) -> int uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let lines: list[str] = []
+    if !interactive {
+        let all: str = read_file("/dev/stdin")
+        let parts: list[str] = all.split("\n")
+        let mut pi: int = 0
+        while pi < parts.len() {
+            lines.push(parts.get(pi))
+            pi = pi + 1
+        }
+    }
+
+    let mut idx: int = 0
+    let mut quit: bool = false
+    while !quit {
+        let mut text: str = ""
+        if !interactive {
+            if idx >= lines.len() {
+                break
+            }
+            text = lines.get(idx)
+            idx = idx + 1
+        } else {
+            eprint("hls> ")
+            let r: ReplLine = repl_read_tty()
+            if r.eof {
+                eprint("\n")
+                break
+            }
+            text = r.text
+        }
+
+        if text.trim() == "" {
+            continue
+        }
+
+        # fold continuation lines while the input cannot be complete
+        while repl_incomplete(text) {
+            if !interactive {
+                if idx >= lines.len() {
+                    println("error: unexpected end of input")
+                    return 0
+                }
+                text = text + "\n" + lines.get(idx)
+                idx = idx + 1
+            } else {
+                eprint("...> ")
+                let r2: ReplLine = repl_read_tty()
+                if r2.eof {
+                    println("error: unexpected end of input")
+                    return 0
+                }
+                text = text + "\n" + r2.text
+            }
+        }
+
+        quit = repl_process(s, text)
+    }
+    return 0
+}
+
+struct ReplLine {
+    text: str,
+    eof: bool
+}
+
+# repl_read_tty — one line from the terminal, with the honest EOF rule
+# the runtime allows: an empty read that returned in zero milliseconds
+# twice in a row is EOF (a human cannot produce a blank line that
+# fast; the kernel produces nothing else at EOF).
+fn repl_read_tty() -> ReplLine uses IO, Clock {
+    let out: ReplLine = ReplLine {
+        text: "", eof: false
+    }
+    let t0: int = clock_ms()
+    let line: str = taint_unwrap(read_line())
+    let dt: int = clock_ms() - t0
+    if line == "" && dt == 0 {
+        let t1: int = clock_ms()
+        let line2: str = taint_unwrap(read_line())
+        let dt2: int = clock_ms() - t1
+        if line2 == "" && dt2 == 0 {
+            out.eof = true
+            return out
+        }
+        out.text = line2
+        return out
+    }
+    out.text = line
+    return out
+}
