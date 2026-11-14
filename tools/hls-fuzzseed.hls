@@ -1,0 +1,3445 @@
+# ============================================================================
+# tools/hls-fuzzseed.hls — the Stage 134 fuzz corpus seeder, in Halis
+# (the native twin of the Python hls-fuzzseed.py that retired; same
+# CLI, same harvest/closure/harness/census/mutation laws, same exits —
+# compiled by the bootstrap's own hlc).
+# ----------------------------------------------------------------------------
+# Real code seeds the fuzzer, not a hand-written grammar: every .hls
+# under the package roots (--pkg-cache, repeatable) plus — unless
+# --no-in-tree — the project's own std/, core/, examples/, tests/ok/
+# and benchmarks/. Every file parses through the REAL front-end
+# (hlfront, the compiler linked); a file that does not parse is a
+# named skip, never a crash. What is harvested is FUNCTIONS: each
+# non-extern, non-method, non-main entry becomes a type-correct,
+# runnable, deterministic harness.
+#
+# The closure law (the .py's, unchanged): the CALL closure (every fn
+# and method the body transitively calls) and the TYPE closure (every
+# struct and enum the signatures and bodies mention) are sliced as
+# raw source (brace-matched, string- and comment-aware), and a main()
+# is synthesized that declares every parameter with a type-correct
+# corner value and prints a deterministic PROJECTION of the result.
+# The REAL checker judges the harness — in a probe child of this very
+# binary (Halis has no exceptions; --probe-check's death is the .py's
+# `except HLError`). Generic entries instantiate T to int at the CALL.
+#
+# The gate (unchanged): purity (the Stage 133 deny table over the
+# harness text — crate modes, world-effect imports, nondeterministic
+# and machine-dependent builtins), closure honesty (extern, asm!,
+# module-qualified calls excluded BY NAME), smoke (bin/hlboot runs
+# the seed; ok and panic both fine, timeout excluded unless
+# --keep-timeouts), identity (SHA-256 over the NORMALIZED source).
+#
+# The mutator: eight lexical ops applied OUTSIDE strings and comments
+# (int_corner, op_swap, str_mut, bool_flip, list_mut, line_dup,
+# line_drop, param_corner), every mutant re-checked and re-smoked
+# before it enters the corpus.
+#
+# Exit codes: 0 green (seeds emitted) · 1 empty corpus · 2 usage.
+# ============================================================================
+
+import "./hlfront.hls"
+import "std.str"
+import "std.json"
+import "std.result"
+import "std.fs"
+import "std.sha256"
+import "std.math"
+
+# ----------------------------------------------------------------------------
+# Constants — the .py's own tables, unchanged.
+# ----------------------------------------------------------------------------
+
+fn TOOL_VERSION() -> str {
+    return "hls-fuzzseed 0.152.0-alpha (Stage 134)"
+}
+
+fn MAX_FIXPOINT() -> int {
+    return 32
+}
+
+fn REFINE_ATTEMPTS() -> int {
+    return 8
+}
+
+# The in-tree real-world corpus (the .py's IN_TREE_DIRS).
+fn in_tree_dirs() -> list[str] {
+    return["std", "core", "examples", "tests/ok", "benchmarks"]
+}
+
+# The deny-import table (Stage 133's, verbatim): a harness importing
+# any of these std modules is world-bound by import.
+fn deny_import(mod: str) -> bool {
+    let mut table: list[str] = ["time", "env", "process", "net", "fs",
+    "thread", "sync", "http", "http2", "websocket", "sse",
+    "session", "cookie", "csrf", "archive", "config", "cli",
+    "complete", "man", "hlscli", "hlsdoc", "tui", "color",
+    "progress", "log", "template", "graphql", "openapi", "jsffi",
+    "dom", "taint", "sanitize", "uuid", "simd", "repl", "bench"]
+    return list_has_str(table, mod)
+}
+
+# The shared deny-builtin table (xdiff's law): nondeterministic or
+# environment-bound builtins.
+fn deny_builtin(w: str) -> bool {
+    let mut table: list[str] = ["rand_seed", "rand_int", "clock_ms",
+    "clock_ns", "monotonic_ns", "sleep", "proc_exec", "proc_spawn",
+    "proc_kill", "proc_wait", "spawn", "read_file", "write_file",
+    "append_file", "read_dir", "remove_file", "net_lookup",
+    "net_tcp_", "net_udp_", "hostname", "env_get", "env_set",
+    "args_get", "read_line", "chan_new", "chan_send", "chan_recv",
+    "mutex_", "taint_unwrap"]
+    return list_has_str(table, w)
+}
+
+# The seed-specific rows (the fuzzer's honest additions): machine- and
+# build-dependent probes the differential oracle cannot compare.
+fn seed_deny_builtin(w: str) -> bool {
+    let mut table: list[str] = ["isatty", "cwd_get", "cwd_set",
+    "has_feature", "simd_cpu_supports", "thread_current_id",
+    "instant_now_ns", "system_time_now_ms", "proc_pid"]
+    return list_has_str(table, w)
+}
+
+# The language's own builtins — a plain call to one of these is NOT a
+# closure hole (the impure ones die at the purity gate, the effect law,
+# or both). The list is the checker's own dispatch surface.
+fn builtin_call(name: str) -> bool {
+    let mut table: list[str] = ["abs", "args", "args_os", "async_spawn",
+    "await", "byte_at", "cap_effect_name", "cap_take", "chan_new",
+    "chan_new_bounded", "chr", "clock_ms", "clone", "contains",
+    "cwd_get", "cwd_set", "drop", "ends_with", "env_get", "env_has",
+    "env_set", "env_unset", "eprint", "eprintln", "exit",
+    "file_exists", "find", "float", "fs_is_dir", "fs_read_dir",
+    "fs_set_perms", "fs_size", "future_poll", "future_ready",
+    "future_select", "gen_spawn", "get", "get_or", "has",
+    "has_feature", "instant_now_ns", "int", "int_and", "int_clz",
+    "int_ctz", "int_not", "int_or", "int_popcount", "int_sar",
+    "int_shl", "int_shr", "int_xor", "isatty", "join", "keys",
+    "len", "map_new", "math_acos", "math_asin", "math_atan",
+    "math_atan2", "math_cbrt", "math_copysign", "math_cos",
+    "math_cosh", "math_erf", "math_erfc", "math_exp", "math_fmod",
+    "math_hypot", "math_isfinite", "math_isinf", "math_isnan",
+    "math_lgamma", "math_log", "math_log10", "math_log2",
+    "math_pow", "math_signbit", "math_sin", "math_sinh",
+    "math_sqrt", "math_tan", "math_tanh", "math_tgamma",
+    "net_close", "net_lookup", "net_read", "net_tcp_accept",
+    "net_tcp_connect", "net_tcp_listen", "net_tls_get",
+    "net_udp_open", "net_udp_recv_from", "net_udp_send_to",
+    "panic", "print", "println", "proc_child_close",
+    "proc_child_read", "proc_child_write", "proc_exec",
+    "proc_kill", "proc_pid", "proc_spawn", "proc_wait", "rand_float",
+    "rand_int", "rand_seed", "range", "read_file",
+    "read_file_tainted", "read_line", "sys_hostname",
+    "system_time_now_ms", "taint_mark", "taint_unwrap",
+    "tainted_args", "take", "thread_current_id",
+    "thread_sleep_ms", "thread_yield", "write_file"]
+    return list_has_str(table, name)
+}
+
+# Corner pools (small for seeds; the BIG corners are the mutator's).
+fn seed_int_corners() -> list[int] {
+    return[0, 1, 2, 3, 5, 10, -1, -2]
+}
+
+fn mut_int_corners() -> list[str] {
+    return["0", "1", "-1", "2", "10", "100",
+    "9223372036854775807", "-9223372036854775808", "65536",
+    "1000000007"]
+}
+
+fn seed_str_corners() -> list[str] {
+    return["", "a", "hello", "hello world",
+    "h" + chr(195) + chr(169) + "llo" + chr(194) + chr(165)]
+}
+
+fn mut_str_corners() -> list[str] {
+    return["", "a", "xyz",
+    "h" + chr(195) + chr(169) + "llo" + chr(194) + chr(165),
+    "hello world", "aaaaaaaaaa"]
+}
+
+fn seed_float_corners() -> list[str] {
+    return["0.0", "1.5", "-2.25", "3.14159"]
+}
+
+fn is_primitive(t: str) -> bool {
+    return t == "int" || t == "float" || t == "bool" || t == "str"
+    || t == "void"
+}
+
+fn is_family_keyword(w: str) -> bool {
+    return w == "list" || w == "map" || w == "set" || w == "chan"
+    || w == "T"
+}
+
+# The eight mutation ops, in the vocabulary's fixed order.
+fn mutation_ops() -> list[str] {
+    return["int_corner", "op_swap", "str_mut", "bool_flip",
+    "list_mut", "line_dup", "line_drop", "param_corner"]
+}
+
+# ----------------------------------------------------------------------------
+# Small helpers (path, list, string).
+# ----------------------------------------------------------------------------
+
+fn list_has_str(xs: list[str], x: str) -> bool {
+    let mut i: int = 0
+    while i < xs.len() {
+        if xs.get(i) == x {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn list_add_unique(xs: list[str], x: str) -> void {
+    if !list_has_str(xs, x) {
+        xs.push(x)
+    }
+}
+
+fn fs_dirname(path: str) -> str {
+    let mut i: int = path.len() - 1
+    while i >= 0 {
+        if path.byte_at(i) == 47 {
+            if i == 0 {
+                return "/"
+            }
+            return path.slice(0, i)
+        }
+        i = i - 1
+    }
+    return "."
+}
+
+fn fs_basename(path: str) -> str {
+    let mut i: int = path.len() - 1
+    while i >= 0 {
+        if path.byte_at(i) == 47 {
+            return path.slice(i + 1, path.len())
+        }
+        i = i - 1
+    }
+    return path
+}
+
+fn fs_join(dir: str, name: str) -> str {
+    if dir == "" || dir == "." {
+        return name
+    }
+    if dir.byte_at(dir.len() - 1) == 47 {
+        return dir + name
+    }
+    return dir + "/" + name
+}
+
+fn str_find_from(s: str, sub: str, from: int) -> int {
+    let mut i: int = from
+    while i + sub.len() <= s.len() {
+        if s.slice(i, i + sub.len()) == sub {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn sh(cmd: str) -> int uses Proc {
+    return proc_exec(cmd)
+}
+
+# is_space(c) — the byte is an ASCII whitespace.
+fn is_space(b: int) -> bool {
+    return b == 32 || b == 9 || b == 10 || b == 13 || b == 11
+    || b == 12
+}
+
+# is_ident_byte / is_ident_start / is_digit come with the front-end
+# (src/hlc/types.hls); is_space is local.
+
+# ----------------------------------------------------------------------------
+# The PRNG — the fuzzer's own 31-bit xorshift, --seed pins the stream.
+# ----------------------------------------------------------------------------
+
+struct Rng {
+    state: int
+}
+
+fn rng_next(r: Rng) -> int {
+    let mut x: int = int_and(r.state, 2147483647)
+    x = int_and(int_xor(x, int_and(x * 8192, 2147483647)), 2147483647)
+    x = int_and(int_xor(x, int_shr(x, 17)), 2147483647)
+    x = int_and(int_xor(x, int_and(x * 32, 2147483647)), 2147483647)
+    r.state = x
+    return x
+}
+
+fn rng_below(r: Rng, n: int) -> int {
+    if n <= 0 {
+        return 0
+    }
+    return rng_next(r) % n
+}
+
+fn rng_pick(r: Rng, items: list[str]) -> str {
+    if items.len() == 0 {
+        return ""
+    }
+    return items.get(rng_below(r, items.len()))
+}
+
+fn rng_unit(r: Rng) -> int {
+    return rng_below(r, 10000)
+}
+
+# crc32 (the stable name hash — NEVER a randomized hash; the corpus
+# determinism law depends on it).
+fn fs_crc32(s: str) -> int {
+    let mut crc: int = -1
+    let mut i: int = 0
+    while i < s.len() {
+        let mut b: int = s.byte_at(i)
+        let mut k: int = 0
+        while k < 8 {
+            let mut lsb: int = int_and(crc, 1)
+            crc = int_shr(crc, 1)
+            let mut bit: int = int_xor(lsb, int_and(b, 1))
+            if bit == 1 {
+                crc = int_xor(crc, -306674912)
+            }
+            b = int_shr(b, 1)
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return int_and(int_xor(crc, -1), 4294967295)
+}
+
+# ----------------------------------------------------------------------------
+# Normalization + identity — the law: two functions that differ only
+# in comments and layout are the SAME seed. Strings preserved verbatim.
+# ----------------------------------------------------------------------------
+
+fn normalize_source(src: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    let mut n: int = src.len()
+    let mut in_str: bool = false
+    while i < n {
+        let mut c: int = src.byte_at(i)
+        if in_str {
+            out = out + chr(c)
+            if c == 92 && i + 1 < n {
+                out = out + chr(src.byte_at(i + 1))
+                i = i + 2
+                continue
+            }
+            if c == 34 {
+                in_str = false
+            }
+            i = i + 1
+            continue
+        }
+        if c == 34 {
+            in_str = true
+            out = out + chr(c)
+            i = i + 1
+            continue
+        }
+        if c == 35 {
+            while i < n && src.byte_at(i) != 10 {
+                i = i + 1
+            }
+            continue
+        }
+        if is_space(c) {
+            out = out + " "
+            while i < n && is_space(src.byte_at(i)) {
+                i = i + 1
+            }
+            continue
+        }
+        out = out + chr(c)
+        i = i + 1
+    }
+    return out
+}
+
+fn digest_of(src: str) -> str {
+    return sha256_hex(normalize_source(src))
+}
+
+fn stable_name_hash(name: str) -> int {
+    return fs_crc32(name)
+}
+
+# ----------------------------------------------------------------------------
+# Raw-source slicing — brace matching, string- and comment-aware. The
+# seeder slices ORIGINAL text; it never pretty-prints the AST.
+# ----------------------------------------------------------------------------
+
+# find_def_end(src, start_line) — 1-based line of the '}' closing the
+# definition whose first '{' opens at start_line; 0 when unbalanced.
+fn find_def_end(src: str, start_line: int) -> int {
+    let mut lines: list[str] = src.split("\n")
+    let mut depth: int = 0
+    let mut opened: bool = false
+    let mut idx: int = start_line - 1
+    while idx < lines.len() {
+        let mut line: str = lines.get(idx)
+        let mut i: int = 0
+        let mut n: int = line.len()
+        let mut in_str: bool = false
+        while i < n {
+            let mut c: int = line.byte_at(i)
+            if in_str {
+                if c == 92 {
+                    i = i + 2
+                    continue
+                }
+                if c == 34 {
+                    in_str = false
+                }
+                i = i + 1
+                continue
+            }
+            if c == 34 {
+                in_str = true
+                i = i + 1
+                continue
+            }
+            if c == 35 {
+                break
+            }
+            if c == 123 {
+                depth = depth + 1
+                opened = true
+            } else if c == 125 {
+                depth = depth - 1
+                if opened && depth == 0 {
+                    return idx + 1
+                }
+            }
+            i = i + 1
+        }
+        idx = idx + 1
+    }
+    return 0
+}
+
+# slice_def(src, start_line) — the verbatim lines of a definition, or
+# "" when the braces do not balance.
+fn slice_def(src: str, start_line: int) -> str {
+    let mut end: int = find_def_end(src, start_line)
+    if end == 0 {
+        return ""
+    }
+    let mut lines: list[str] = src.split("\n")
+    let mut out: str = ""
+    let mut i: int = start_line - 1
+    while i < end {
+        if i > start_line - 1 {
+            out = out + "\n"
+        }
+        out = out + lines.get(i)
+        i = i + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# AST facts — what a body calls, mentions, and constructs. The walker
+# mirrors the .py's walk_stmts/walk_exprs over the real AST indices.
+# ----------------------------------------------------------------------------
+
+struct Facts {
+    calls: list[str], # plain fn calls
+    method_calls: list[str], # receiver.method names
+    module_calls: list[str], # module.fn — the named boundary
+    struct_lits: list[str],
+    type_mentions: list[str],
+    has_asm: bool,
+    effects: list[str],
+    local_names: list[str]
+}
+
+fn facts_new() -> Facts {
+    return Facts {
+        calls: [], method_calls: [], module_calls: [],
+        struct_lits: [], type_mentions: [], has_asm: false,
+        effects: [], local_names: []
+    }
+}
+
+# type_names_in(ty) — identifiers inside a type string, minus
+# primitives and the family keywords.
+fn type_names_in(ty: str, out: list[str]) -> void {
+    let mut i: int = 0
+    let mut n: int = ty.len()
+    while i < n {
+        if is_ident_start(ty.byte_at(i)) {
+            let mut j: int = i
+            while j < n && is_ident_char(ty.byte_at(j)) {
+                j = j + 1
+            }
+            let mut w: str = ty.slice(i, j)
+            if !is_primitive(w) && !is_family_keyword(w) {
+                list_add_unique(out, w)
+            }
+            i = j
+        } else {
+            i = i + 1
+        }
+    }
+}
+
+# walk_expr(ctx, idx, out_idxs) — every expr index reachable from
+# idx (the expr tree and its argument/callee subtrees).
+fn walk_expr(ctx: Ctx, idx: int, out: list[int]) -> void {
+    if idx < 0 || idx >= ctx.exprs.len() {
+        return
+    }
+    out.push(idx)
+    let mut e: ExprN = ctx.exprs.get(idx)
+    if e.left >= 0 {
+        walk_expr(ctx, e.left, out)
+    }
+    if e.right >= 0 {
+        walk_expr(ctx, e.right, out)
+    }
+    let mut i: int = 0
+    while i < e.args.len() {
+        walk_expr(ctx, e.args.get(i), out)
+        i = i + 1
+    }
+}
+
+# walk_stmt(ctx, idx, out) — every stmt index reachable (blocks,
+# branches, loop bodies), and their exprs into eout.
+fn walk_stmt(ctx: Ctx, idx: int, out: list[int], eout: list[int]) -> void {
+    if idx < 0 || idx >= ctx.stmts.len() {
+        return
+    }
+    out.push(idx)
+    let mut s: StmtN = ctx.stmts.get(idx)
+    if s.value >= 0 {
+        walk_expr(ctx, s.value, eout)
+    }
+    if s.target >= 0 {
+        walk_expr(ctx, s.target, eout)
+    }
+    if s.cond >= 0 {
+        walk_expr(ctx, s.cond, eout)
+    }
+    if s.iter >= 0 {
+        walk_expr(ctx, s.iter, eout)
+    }
+    if s.e >= 0 {
+        walk_expr(ctx, s.e, eout)
+    }
+    let mut i: int = 0
+    while i < s.body.len() {
+        walk_stmt(ctx, s.body.get(i), out, eout)
+        i = i + 1
+    }
+    i = 0
+    while i < s.else_body.len() {
+        walk_stmt(ctx, s.else_body.get(i), out, eout)
+        i = i + 1
+    }
+    # match arms: the scrutinee rides e.left; args are arm indices.
+    if s.kind == "match" || (s.value >= 0
+    && ctx.exprs.get(s.value).kind == "match") {
+        if s.value >= 0 {
+            let mut m: ExprN = ctx.exprs.get(s.value)
+            let mut a: int = 0
+            while a < m.args.len() {
+                let mut arm: MatchArm = ctx.match_arms.get(m.args.get(a))
+                if arm.body >= 0 {
+                    walk_expr(ctx, arm.body, eout)
+                }
+                a = a + 1
+            }
+        }
+    }
+}
+
+# body_facts(ctx, fname) — everything closure-building needs to know
+# about one fn body, computed over the REAL AST.
+fn body_facts(ctx: Ctx, fname: str, known_types: list[str]) -> Facts {
+    let mut f: Facts = facts_new()
+    let mut fi: FnInfo = ctx.fns.get_or(fname, fz_dummy_fn())
+    let mut i: int = 0
+    while i < fi.effects.len() {
+        list_add_unique(f.effects, fi.effects.get(i))
+        i = i + 1
+    }
+    # the fn's LOCAL names — params first.
+    i = 0
+    while i < fi.params.len() {
+        list_add_unique(f.local_names, fi.params.get(i))
+        i = i + 1
+    }
+    let mut stmt_idxs: list[int] = []
+    let mut expr_idxs: list[int] = []
+    i = 0
+    while i < fi.body.len() {
+        walk_stmt(ctx, fi.body.get(i), stmt_idxs, expr_idxs)
+        i = i + 1
+    }
+    # lets, for-vars, assign roots join the locals.
+    i = 0
+    while i < stmt_idxs.len() {
+        let mut s: StmtN = ctx.stmts.get(stmt_idxs.get(i))
+        if s.kind == "let" {
+            list_add_unique(f.local_names, s.name)
+            if s.vtype != "" {
+                type_names_in(s.vtype, f.type_mentions)
+            }
+        } else if s.kind == "for" {
+            list_add_unique(f.local_names, s.name)
+            if s.vtype != "" {
+                type_names_in(s.vtype, f.type_mentions)
+            }
+        } else if s.kind == "assign" && s.target >= 0 {
+            let mut t: ExprN = ctx.exprs.get(s.target)
+            if t.kind == "ident" {
+                list_add_unique(f.local_names, t.name)
+            }
+        } else if s.kind == "asm" {
+            f.has_asm = true
+        }
+        i = i + 1
+    }
+    # exprs: calls, fieldcalls, structlits; match-arm variant mentions.
+    i = 0
+    while i < expr_idxs.len() {
+        let mut e: ExprN = ctx.exprs.get(expr_idxs.get(i))
+        if e.kind == "call" {
+            if e.muser || true {
+                list_add_unique(f.calls, e.name)
+            }
+        } else if e.kind == "fieldcall" {
+            if e.left >= 0 {
+                let mut t: ExprN = ctx.exprs.get(e.left)
+                if t.kind == "ident" {
+                    let mut root: str = t.name
+                    if list_has_str(known_types, root) {
+                        list_add_unique(f.type_mentions, root)
+                    } else if list_has_str(f.local_names, root) {
+                        list_add_unique(f.method_calls, e.name)
+                    } else {
+                        list_add_unique(f.module_calls, root + "." + e.name)
+                    }
+                } else {
+                    list_add_unique(f.method_calls, e.name)
+                }
+            } else {
+                list_add_unique(f.method_calls, e.name)
+            }
+        } else if e.kind == "structlit" {
+            list_add_unique(f.struct_lits, e.name)
+            list_add_unique(f.type_mentions, e.name)
+        } else if e.kind == "match" {
+            let mut a: int = 0
+            while a < e.args.len() {
+                let mut arm: MatchArm = ctx.match_arms.get(e.args.get(a))
+                if arm.pat_kind == "variant" && arm.enum_name != "" {
+                    list_add_unique(f.type_mentions, arm.enum_name)
+                }
+                # pattern payload bindings are locals of the arm.
+                let mut b: int = 0
+                while b < arm.bindings.len() {
+                    if arm.bindings.get(b) != "_" {
+                        list_add_unique(f.local_names, arm.bindings.get(b))
+                    }
+                    b = b + 1
+                }
+                a = a + 1
+            }
+        }
+        i = i + 1
+    }
+    # signature types.
+    i = 0
+    while i < fi.ptypes.len() {
+        type_names_in(fi.ptypes.get(i), f.type_mentions)
+        i = i + 1
+    }
+    type_names_in(fi.ret, f.type_mentions)
+    return f
+}
+
+fn fz_dummy_fn() -> FnInfo {
+    return FnInfo {
+        name: "", params: [], ptypes: [], pmuts: [], ret: "",
+        effects: [], is_pure: false, body: [], is_method: false,
+        struct_of: "", typeparams: [], line: 0, is_extern: false,
+        requires_e: -1, ensures_e: -1, attr_stack_size: -1,
+        attr_no_red_zone: false, attr_irq_handler: false,
+        attr_irq_vector: -1, attr_inline: "", attr_hot: false,
+        attr_cold: false, attr_tail_call: false,
+        attr_panic_handler: false, attr_section: "", attr_align: -1,
+        src_file: "", param_preds: map_new(), ret_pred: "",
+        has_refinements: false, attr_secrets: "", attr_ct: false,
+        attr_deprecated: false, attr_deprecated_msg: "",
+        attr_taint_source: false, attr_taint_sinks: ""
+    }
+}
+
+# ----------------------------------------------------------------------------
+# The purity gate — Stage 133's law over the harness text (the same
+# deny tables xdiff applies, applied here to one seed).
+# ----------------------------------------------------------------------------
+
+struct Purity {
+    eligible: bool,
+    reason: str
+}
+
+# scan_deny_builtin(src) — the first identifier-shaped word (outside
+# strings and comments) the shared deny table matches. The .py's
+# \b-anchored regexes saw whole words; the table's prefix rows
+# (net_tcp_, mutex_) match by prefix on the whole word.
+fn scan_deny_builtin(src: str) -> str {
+    let mut i: int = 0
+    let mut n: int = src.len()
+    let mut in_str: bool = false
+    while i < n {
+        let mut c: int = src.byte_at(i)
+        if in_str {
+            if c == 92 {
+                i = i + 2
+                continue
+            }
+            if c == 34 {
+                in_str = false
+            }
+            i = i + 1
+            continue
+        }
+        if c == 34 {
+            in_str = true
+            i = i + 1
+            continue
+        }
+        if c == 35 {
+            while i < n && src.byte_at(i) != 10 {
+                i = i + 1
+            }
+            continue
+        }
+        if is_ident_start(c) {
+            let mut j: int = i
+            while j < n && is_ident_char(src.byte_at(j)) {
+                j = j + 1
+            }
+            let mut w: str = src.slice(i, j)
+            if deny_builtin(w) {
+                return w
+            }
+            i = j
+            continue
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# scan_seed_deny(src) — the same walk over the seed-specific table.
+fn scan_seed_deny(src: str) -> str {
+    let mut i: int = 0
+    let mut n: int = src.len()
+    let mut in_str: bool = false
+    while i < n {
+        let mut c: int = src.byte_at(i)
+        if in_str {
+            if c == 92 {
+                i = i + 2
+                continue
+            }
+            if c == 34 {
+                in_str = false
+            }
+            i = i + 1
+            continue
+        }
+        if c == 34 {
+            in_str = true
+            i = i + 1
+            continue
+        }
+        if c == 35 {
+            while i < n && src.byte_at(i) != 10 {
+                i = i + 1
+            }
+            continue
+        }
+        if is_ident_start(c) {
+            let mut j: int = i
+            while j < n && is_ident_char(src.byte_at(j)) {
+                j = j + 1
+            }
+            let mut w: str = src.slice(i, j)
+            if seed_deny_builtin(w) {
+                return w
+            }
+            i = j
+            continue
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# purity_verdict(source) — (eligible, reason). The crate-mode and
+# import rows are scanned line-wise (anchored patterns); the builtin
+# rows are word scans.
+fn purity_verdict(source: str) -> Purity {
+    # crate mode: #![word] at a line start.
+    let mut lines: list[str] = source.split("\n")
+    let mut li: int = 0
+    while li < lines.len() {
+        let mut line: str = lines.get(li).trim()
+        li = li + 1
+        if line.starts_with("#![") {
+            let mut rest: str = line.slice(3, line.len())
+            let mut j: int = 0
+            while j < rest.len() && is_ident_char(rest.byte_at(j)) {
+                j = j + 1
+            }
+            if j > 0 {
+                return Purity {
+                    eligible: false,
+                    reason: "crate mode #![" + rest.slice(0, j)
+                    + "] — not a hosted program"
+                }
+            }
+        }
+        # import "std.<mod>" / "core.<mod>".
+        if line.starts_with("import") {
+            let mut q: int = line.find("\"")
+            if q >= 0 {
+                let mut qe: int = str_find_from(line, "\"", q + 1) # second quote
+                if qe > q {
+                    let mut path: str = line.slice(q + 1, qe)
+                    let mut modpart: str = ""
+                    if path.starts_with("std.") {
+                        modpart = path.slice(4, path.len())
+                    } else if path.starts_with("core.") {
+                        modpart = path.slice(5, path.len())
+                    }
+                    if modpart != "" {
+                        # first dotted segment
+                        let mut k: int = 0
+                        while k < modpart.len()
+                        && modpart.byte_at(k) != 46 {
+                            k = k + 1
+                        }
+                        let mut modname: str = modpart.slice(0, k)
+                        if deny_import(modname) {
+                            return Purity {
+                                eligible: false,
+                                reason: "import std." + modname
+                                + " — output depends on the world, not "
+                                + "the implementation"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    # the shared builtin table (prefix rows included: net_tcp_...).
+    let mut hit: str = scan_deny_builtin(source)
+    if hit != "" {
+        return Purity {
+            eligible: false, reason: "builtin '" + hit
+            + "' — nondeterministic or environment-bound"
+        }
+    }
+    let mut hit2: str = scan_seed_deny(source)
+    if hit2 != "" {
+        return Purity {
+            eligible: false, reason: "builtin '" + hit2
+            + "' — machine- or build-dependent; the differential "
+            + "oracle cannot compare it"
+        }
+    }
+    return Purity {
+        eligible: true, reason: ""
+    }
+}
+
+# ----------------------------------------------------------------------------
+# The closure builder — the call closure and the type closure, sliced.
+# ----------------------------------------------------------------------------
+
+struct Refusal {
+    reason: str,
+    refused: bool
+}
+
+fn refusal(reason: str) -> Refusal {
+    return Refusal {
+        reason: reason, refused: true
+    }
+}
+
+struct ClosureOut {
+    body: str,
+    facts: Facts,
+    ref: Refusal
+}
+
+# build_closure(ctx, src, entry_name, max_lines) — the raw-source
+# closure for one entry fn. Every law is named at the point of
+# refusal, exactly as the .py named them.
+fn build_closure(ctx: Ctx, src: str, entry_name: str, max_lines: int) -> ClosureOut {
+    let mut out: ClosureOut = ClosureOut {
+        body: "", facts: facts_new(),
+        ref: Refusal {
+            reason: "", refused: false
+        }
+    }
+    let mut known_types: list[str] = []
+    let mut ti: int = 0
+    let mut skeys: list[str] = ctx.structs.keys()
+    while ti < skeys.len() {
+        list_add_unique(known_types, skeys.get(ti))
+        ti = ti + 1
+    }
+    ti = 0
+    let mut ekeys: list[str] = ctx.enums.keys()
+    while ti < ekeys.len() {
+        list_add_unique(known_types, ekeys.get(ti))
+        ti = ti + 1
+    }
+
+    let mut entry: FnInfo = ctx.fns.get_or(entry_name, fz_dummy_fn())
+    if entry.is_extern {
+        out.ref = refusal("entry is an extern declaration")
+        return out
+    }
+    let mut included: list[str] = [entry_name]
+    let mut method_included: list[str] = []
+
+    # facts_of with the local name cache (a plain function; the .py
+    # memoized, the closure walk is small enough without).
+    let mut round: int = 0
+    let mut grew: bool = true
+    while grew && round < MAX_FIXPOINT() {
+        round = round + 1
+        grew = false
+        # extend the fn closure through every included body.
+        let mut ii: int = 0
+        let mut scan: list[str] = []
+        let mut z: int = 0
+        while z < included.len() {
+            scan.push(included.get(z))
+            z = z + 1
+        }
+        z = 0
+        while z < method_included.len() {
+            scan.push(method_included.get(z))
+            z = z + 1
+        }
+        while ii < scan.len() {
+            let mut key: str = scan.get(ii)
+            ii = ii + 1
+            let mut cf: FnInfo = ctx.fns.get_or(key, fz_dummy_fn())
+            if cf.is_extern {
+                out.ref = refusal("reaches extern fn '" + key
+                + "' — FFI is not differentiable standalone")
+                return out
+            }
+            let mut facts: Facts = body_facts(ctx, key, known_types)
+            let mut ci: int = 0
+            while ci < facts.calls.len() {
+                let mut callee: str = facts.calls.get(ci)
+                ci = ci + 1
+                if list_has_str(included, callee)
+                || list_has_str(method_included, callee) {
+                    continue
+                }
+                if builtin_call(callee) {
+                    continue
+                }
+                if !ctx.fns.has(callee) {
+                    # name the module when the prefix agrees with an
+                    # import — the census reads like a map.
+                    let mut mi: int = 0
+                    while mi < ctx.imports.len() {
+                        let mut imp: str = ctx.imports.get(mi)
+                        mi = mi + 1
+                        let mut base: str = imp
+                        let mut k2: int = imp.len() - 1
+                        while k2 >= 0 && imp.byte_at(k2) != 46 {
+                            k2 = k2 - 1
+                        }
+                        if k2 >= 0 {
+                            base = imp.slice(k2 + 1, imp.len())
+                        }
+                        if base != "" && callee.starts_with(base + "_") {
+                            out.ref = refusal("calls '" + callee
+                            + "' from import '" + imp
+                            + "' — cross-module seeding is the "
+                            + "honest Stage 134 boundary")
+                            return out
+                        }
+                    }
+                    out.ref = refusal("calls unknown function '" + callee + "'")
+                    return out
+                }
+                let mut dfn: FnInfo = ctx.fns.get_or(callee, fz_dummy_fn())
+                if dfn.is_extern {
+                    out.ref = refusal("reaches extern fn '" + callee
+                    + "' — FFI is not differentiable standalone")
+                    return out
+                }
+                if dfn.is_method {
+                    method_included.push(callee)
+                } else {
+                    included.push(callee)
+                }
+                grew = true
+            }
+        }
+    }
+
+    # the type closure over everything included (signatures, mentions,
+    # struct lits), plus the shapes of the types already closed.
+    let mut type_closure: list[str] = []
+    let mut tround: int = 0
+    let mut tchanged: bool = true
+    while tchanged && tround < MAX_FIXPOINT() {
+        tround = tround + 1
+        tchanged = false
+        let mut scan2: list[str] = []
+        let mut z: int = 0
+        while z < included.len() {
+            scan2.push(included.get(z))
+            z = z + 1
+        }
+        z = 0
+        while z < method_included.len() {
+            scan2.push(method_included.get(z))
+            z = z + 1
+        }
+        let mut new_types: list[str] = []
+        let mut si: int = 0
+        while si < scan2.len() {
+            let mut key: str = scan2.get(si)
+            si = si + 1
+            let mut cf: FnInfo = ctx.fns.get_or(key, fz_dummy_fn())
+            let mut facts: Facts = body_facts(ctx, key, known_types)
+            let mut pi: int = 0
+            while pi < cf.ptypes.len() {
+                type_names_in(cf.ptypes.get(pi), new_types)
+                pi = pi + 1
+            }
+            type_names_in(cf.ret, new_types)
+            pi = 0
+            while pi < facts.type_mentions.len() {
+                list_add_unique(new_types, facts.type_mentions.get(pi))
+                pi = pi + 1
+            }
+            pi = 0
+            while pi < facts.struct_lits.len() {
+                list_add_unique(new_types, facts.struct_lits.get(pi))
+                pi = pi + 1
+            }
+        }
+        # the shapes of the types already closed drag their own types
+        # in (a struct field typed Rgb drags Rgb).
+        let mut tc: int = 0
+        while tc < type_closure.len() {
+            let mut tname: str = type_closure.get(tc)
+            tc = tc + 1
+            if ctx.structs.has(tname) {
+                let mut st: StructInfo = ctx.structs.get_or(tname, fz_dummy_struct())
+                let mut fi2: int = 0
+                while fi2 < st.ftypes.len() {
+                    type_names_in(st.ftypes.get(fi2), new_types)
+                    fi2 = fi2 + 1
+                }
+            } else if ctx.enums.has(tname) {
+                let mut en: EnumInfo = ctx.enums.get_or(tname, fz_dummy_enum())
+                let mut vi: int = 0
+                while vi < en.payloads.len() {
+                    let mut pl: list[str] = en.payloads.get(vi)
+                    let mut pk: int = 0
+                    while pk < pl.len() {
+                        type_names_in(pl.get(pk), new_types)
+                        pk = pk + 1
+                    }
+                    vi = vi + 1
+                }
+            }
+        }
+        # keep only known types; a change restarts the round.
+        let mut ni: int = 0
+        while ni < new_types.len() {
+            let mut cand: str = new_types.get(ni)
+            ni = ni + 1
+            if list_has_str(known_types, cand)
+            && !list_has_str(type_closure, cand) {
+                type_closure.push(cand)
+                tchanged = true
+            }
+        }
+        # pull in methods some receiver call demands.
+        let mut wanted: list[str] = []
+        let mut wi: int = 0
+        while wi < scan2.len() {
+            let mut facts: Facts = body_facts(ctx, scan2.get(wi), known_types)
+            wi = wi + 1
+            let mut mc: int = 0
+            while mc < facts.method_calls.len() {
+                list_add_unique(wanted, facts.method_calls.get(mc))
+                mc = mc + 1
+            }
+        }
+        let mut fkeys: list[str] = ctx.fns.keys()
+        let mut fk: int = 0
+        while fk < fkeys.len() {
+            let mut key: str = fkeys.get(fk)
+            fk = fk + 1
+            let mut dfn: FnInfo = ctx.fns.get_or(key, fz_dummy_fn())
+            if dfn.is_extern || !dfn.is_method {
+                continue
+            }
+            if list_has_str(method_included, key) {
+                continue
+            }
+            if list_has_str(type_closure, dfn.struct_of)
+            && list_has_str(wanted, dfn.name) {
+                method_included.push(key)
+                tchanged = true
+            }
+        }
+    }
+
+    # the named boundary laws.
+    let mut all_included: list[str] = []
+    let mut az: int = 0
+    while az < included.len() {
+        all_included.push(included.get(az))
+        az = az + 1
+    }
+    az = 0
+    while az < method_included.len() {
+        all_included.push(method_included.get(az))
+        az = az + 1
+    }
+    let mut bl: int = 0
+    while bl < all_included.len() {
+        let mut key: str = all_included.get(bl)
+        bl = bl + 1
+        let mut facts: Facts = body_facts(ctx, key, known_types)
+        let mut ei: int = 0
+        while ei < facts.effects.len() {
+            let mut eff: str = facts.effects.get(ei)
+            ei = ei + 1
+            if eff != "IO" {
+                out.ref = refusal("closure fn '" + key + "' declares "
+                + "effect '" + eff + "' — world-bound by declaration")
+                return out
+            }
+        }
+        if facts.has_asm {
+            out.ref = refusal("closure contains an asm! body ('" + key
+            + "') — the interpreter cannot execute it")
+            return out
+        }
+        if facts.module_calls.len() > 0 {
+            out.ref = refusal("'" + key + "' calls module function '"
+            + facts.module_calls.get(0)
+            + "' — cross-module seeding is the honest Stage 134 "
+            + "boundary")
+            return out
+        }
+    }
+
+    # the import-only type law (bare single-capital names exempt).
+    let mut il: int = 0
+    while il < all_included.len() {
+        let mut key: str = all_included.get(il)
+        il = il + 1
+        let mut cf: FnInfo = ctx.fns.get_or(key, fz_dummy_fn())
+        let mut facts: Facts = body_facts(ctx, key, known_types)
+        let mut mentions: list[str] = []
+        let mut pi: int = 0
+        while pi < cf.ptypes.len() {
+            type_names_in(cf.ptypes.get(pi), mentions)
+            pi = pi + 1
+        }
+        type_names_in(cf.ret, mentions)
+        pi = 0
+        while pi < facts.type_mentions.len() {
+            list_add_unique(mentions, facts.type_mentions.get(pi))
+            pi = pi + 1
+        }
+        let mut mi2: int = 0
+        while mi2 < mentions.len() {
+            let mut t: str = mentions.get(mi2)
+            mi2 = mi2 + 1
+            if t.len() == 1 && t.byte_at(0) >= 65 && t.byte_at(0) <= 90 {
+                continue
+            }
+            if !list_has_str(known_types, t) {
+                out.ref = refusal("type '" + t + "' in '" + key
+                + "' resolves only through an import — "
+                + "self-contained harness impossible")
+                return out
+            }
+        }
+    }
+
+    # slicing: types first, then fns, then methods in impl blocks.
+    let mut pieces: list[str] = []
+    let mut tc2: int = 0
+    while tc2 < type_closure.len() {
+        let mut tname: str = type_closure.get(tc2)
+        tc2 = tc2 + 1
+        let mut line: int = 0
+        if ctx.structs.has(tname) {
+            line = ctx.structs.get_or(tname, fz_dummy_struct()).line
+        } else if ctx.enums.has(tname) {
+            line = ctx.enums.get_or(tname, fz_dummy_enum()).line
+        }
+        let mut text: str = ""
+        if line > 0 {
+            text = slice_def(src, line)
+        }
+        if text == "" {
+            out.ref = refusal("type '" + tname + "' cannot be sliced "
+            + "(unbalanced braces)")
+            return out
+        }
+        pieces.push(text)
+    }
+    let mut sorted_included: list[str] = str_sort(included)
+    let mut si2: int = 0
+    while si2 < sorted_included.len() {
+        let mut key: str = sorted_included.get(si2)
+        si2 = si2 + 1
+        let mut text: str = slice_def(src,
+        ctx.fns.get_or(key, fz_dummy_fn()).line)
+        if text == "" {
+            out.ref = refusal("fn '" + key + "' cannot be sliced "
+            + "(unbalanced braces)")
+            return out
+        }
+        pieces.push(text)
+    }
+    let mut sorted_methods: list[str] = str_sort(method_included)
+    let mut sm: int = 0
+    while sm < sorted_methods.len() {
+        let mut key: str = sorted_methods.get(sm)
+        sm = sm + 1
+        let mut dfn: FnInfo = ctx.fns.get_or(key, fz_dummy_fn())
+        let mut text: str = slice_def(src, dfn.line)
+        if text == "" {
+            out.ref = refusal("method '" + key + "' cannot be sliced")
+            return out
+        }
+        # a method sliced bare would be a PLAIN fn — the impl block is
+        # what makes the checker resolve the receiver call.
+        pieces.push("impl " + dfn.struct_of + " {\n" + text + "\n}")
+    }
+    let mut body: str = ""
+    let mut bi2: int = 0
+    while bi2 < pieces.len() {
+        if bi2 > 0 {
+            body = body + "\n\n"
+        }
+        body = body + pieces.get(bi2)
+        bi2 = bi2 + 1
+    }
+    let mut n_lines: int = str_count_chr(body, 10) + 1
+    if n_lines > max_lines {
+        out.ref = refusal("closure is " + n_lines.to_str()
+        + " lines — over the " + max_lines.to_str()
+        + "-line harness budget")
+        return out
+    }
+    out.body = body
+    out.facts = body_facts(ctx, entry_name, known_types)
+    return out
+}
+
+fn str_sort(xs: list[str]) -> list[str] {
+    let mut out: list[str] = []
+    let mut i: int = 0
+    while i < xs.len() {
+        out.push(xs.get(i))
+        i = i + 1
+    }
+    let mut a: int = 1
+    while a < out.len() {
+        let mut v: str = out.get(a)
+        let mut b: int = a - 1
+        while b >= 0 && out.get(b) > v {
+            out.set(b + 1, out.get(b))
+            b = b - 1
+        }
+        out.set(b + 1, v)
+        a = a + 1
+    }
+    return out
+}
+
+fn str_count_chr(s: str, c: int) -> int {
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < s.len() {
+        if s.byte_at(i) == c {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn fz_dummy_struct() -> StructInfo {
+    return StructInfo {
+        name: "", fields: [], ftypes: [], fdefaults: [],
+        typeparams: [], line: 0, field_preds: map_new()
+    }
+}
+
+fn fz_dummy_enum() -> EnumInfo {
+    return EnumInfo {
+        name: "", variants: [], payloads: [], typeparams: [], line: 0
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Type instantiation + corner synthesis + projection.
+# ----------------------------------------------------------------------------
+
+# inst_type(ty) — the harness-side spelling of a generic type: bare T
+# becomes int in every let annotation (only bare T; Tree stays Tree).
+fn inst_type(ty: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    let mut n: int = ty.len()
+    while i < n {
+        if is_ident_start(ty.byte_at(i)) {
+            let mut j: int = i
+            while j < n && is_ident_char(ty.byte_at(j)) {
+                j = j + 1
+            }
+            let mut w: str = ty.slice(i, j)
+            if w == "T" {
+                out = out + "int"
+            } else {
+                out = out + w
+            }
+            i = j
+        } else {
+            out = out + chr(ty.byte_at(i))
+            i = i + 1
+        }
+    }
+    return out
+}
+
+struct SynthOut {
+    expr: str,
+    ok: bool
+}
+
+# synth_value(ty, rng, depth) — a type-correct literal for a parameter
+# type. Generic parameters instantiate to int; custom struct and enum
+# parameters have no synthesizable literal (the caller names the
+# refusal).
+fn synth_value(ty: str, r: Rng, depth: int) -> SynthOut {
+    let mut t: str = ty.trim()
+    let mut base: str = t
+    let mut bi: int = t.find("[")
+    if bi > 0 {
+        base = t.slice(0, bi).trim()
+    }
+    # bare single capitals other than T: generic parameters the call
+    # cannot instantiate here.
+    if base == "T" {
+        let mut pool: list[str] = []
+        let mut corners: list[int] = seed_int_corners()
+        let mut i: int = 0
+        while i < corners.len() {
+            if corners.get(i) >= 0 {
+                pool.push(corners.get(i).to_str())
+            }
+            i = i + 1
+        }
+        return SynthOut {
+            expr: rng_pick(r, pool), ok: true
+        }
+    }
+    if base.len() == 1 && base.byte_at(0) >= 65 && base.byte_at(0) <= 90 {
+        return SynthOut {
+            expr: "", ok: false
+        }
+    }
+    if t == "int" {
+        let mut pool: list[str] = []
+        let mut corners: list[int] = seed_int_corners()
+        let mut i: int = 0
+        while i < corners.len() {
+            pool.push(corners.get(i).to_str())
+            i = i + 1
+        }
+        return SynthOut {
+            expr: rng_pick(r, pool), ok: true
+        }
+    }
+    if t == "float" {
+        return SynthOut {
+            expr: rng_pick(r, seed_float_corners()), ok: true
+        }
+    }
+    if t == "bool" {
+        let mut pool: list[str] = ["true", "false"]
+        return SynthOut {
+            expr: rng_pick(r, pool), ok: true
+        }
+    }
+    if t == "str" {
+        let mut corners: list[str] = seed_str_corners()
+        return SynthOut {
+            expr: "\"" + rng_pick(r, corners) + "\"", ok: true
+        }
+    }
+    if t.starts_with("list[") && t.ends_with("]") {
+        let mut elem: str = t.slice(5, t.len() - 1)
+        let mut v: SynthOut = synth_value(elem, r, depth + 1)
+        if !v.ok || depth >= 1 {
+            # an empty list is type-correct for ANY element type.
+            return SynthOut {
+                expr: "[]", ok: true
+            }
+        }
+        let mut counts: list[int] = [0, 1, 2, 3]
+        let mut n: int = counts.get(rng_below(r, counts.len()))
+        let mut inner: str = ""
+        let mut i: int = 0
+        while i < n {
+            if i > 0 {
+                inner = inner + ", "
+            }
+            inner = inner + v.expr
+            i = i + 1
+        }
+        return SynthOut {
+            expr: "[" + inner + "]", ok: true
+        }
+    }
+    return SynthOut {
+        expr: "", ok: false
+    }
+}
+
+# projection_lines(var, ty, ctx) — HLS statements (unindented) that
+# print a deterministic projection of var: ty.
+fn projection_lines(v: str, ty: str, ctx: Ctx) -> list[str] {
+    let mut out: list[str] = []
+    let mut t: str = ty.trim()
+    if t == "int" || t == "float" || t == "bool" {
+        out.push("print(" + v + ".to_str())")
+        return out
+    }
+    if t == "str" {
+        out.push("print(" + v + ")")
+        return out
+    }
+    if t.starts_with("list[") && t.ends_with("]") {
+        let mut elem: str = t.slice(5, t.len() - 1)
+        if is_primitive(elem) && elem != "void" {
+            let mut cast: str = ""
+            if elem != "str" {
+                cast = ".to_str()"
+            }
+            out.push("print(\"[\")")
+            out.push("let mut _si: int = 0")
+            out.push("while _si < " + v + ".len() {")
+            out.push("if _si > 0 { print(\",\") }")
+            out.push("print(" + v + ".get(_si)" + cast + ")")
+            out.push("_si = _si + 1")
+            out.push("}")
+            out.push("print(\"]\")")
+            return out
+        }
+        out.push("print(\"<" + t + ">\")")
+        return out
+    }
+    let mut base: str = t
+    let mut bi: int = t.find("[")
+    if bi > 0 {
+        base = t.slice(0, bi).trim()
+    }
+    if ctx.structs.has(base) {
+        let mut st: StructInfo = ctx.structs.get_or(base, fz_dummy_struct())
+        if st.typeparams.len() == 0 {
+            out.push("print(\"<" + base + "\")")
+            let mut i: int = 0
+            while i < st.fields.len() && i < 4 {
+                let mut fname: str = st.fields.get(i)
+                let mut ftype: str = st.ftypes.get(i)
+                i = i + 1
+                if ftype == "int" || ftype == "float" || ftype == "bool" {
+                    out.push("print(\" " + fname + "=\")")
+                    out.push("print(" + v + "." + fname + ".to_str())")
+                } else if ftype == "str" {
+                    out.push("print(\" " + fname + "=\")")
+                    out.push("print(" + v + "." + fname + ")")
+                }
+            }
+            out.push("print(\">\")")
+            return out
+        }
+    }
+    out.push("print(\"<" + t + ">\")")
+    return out
+}
+
+# build_harness — the fixed harness shape: header, closure, main with
+# corner-valued lets, the call, the projection, return 0.
+struct HarnessOut {
+    text: str,
+    param_summary: list[str],
+    refusal: str
+}
+
+fn build_harness(entry_name: str, closure_body: str, r: Rng,
+source_rel: str, ctx: Ctx) -> HarnessOut {
+    let mut out: HarnessOut = HarnessOut {
+        text: "", param_summary: [],
+        refusal: ""
+    }
+    let mut fi: FnInfo = ctx.fns.get_or(entry_name, fz_dummy_fn())
+    let mut lets: list[str] = []
+    let mut call_args: list[str] = []
+    let mut i: int = 0
+    while i < fi.params.len() {
+        let mut pname: str = fi.params.get(i)
+        let mut ptype: str = fi.ptypes.get(i)
+        i = i + 1
+        let mut v: SynthOut = synth_value(ptype, r, 0)
+        if !v.ok {
+            out.refusal = "parameter '" + pname + "' has type '" + ptype
+            + "' — no synthesizable literal"
+            return out
+        }
+        lets.push("    let " + pname + ": " + inst_type(ptype) + " = "
+        + v.expr)
+        call_args.push(pname)
+        out.param_summary.push(pname + ": " + inst_type(ptype))
+    }
+    let mut call: str = entry_name + "()"
+    if call_args.len() > 0 {
+        call = entry_name + "(" + str_join_comma(call_args) + ")"
+    }
+    let mut body_stmts: list[str] = []
+    i = 0
+    while i < lets.len() {
+        body_stmts.push(lets.get(i))
+        i = i + 1
+    }
+    if fi.ret == "void" || fi.ret == "" {
+        body_stmts.push("    " + call)
+        body_stmts.push("    println(\"\")")
+    } else {
+        let mut iret: str = inst_type(fi.ret)
+        body_stmts.push("    let _r: " + iret + " = " + call)
+        let mut plines: list[str] = projection_lines("_r", fi.ret, ctx)
+        i = 0
+        while i < plines.len() {
+            body_stmts.push("    " + plines.get(i))
+            i = i + 1
+        }
+        body_stmts.push("    println(\"\")")
+    }
+    let mut main_body: str = ""
+    i = 0
+    while i < body_stmts.len() {
+        if i > 0 {
+            main_body = main_body + "\n"
+        }
+        main_body = main_body + body_stmts.get(i)
+        i = i + 1
+    }
+    let mut header: str = "# seed: " + entry_name + " @ " + source_rel + ":"
+    + fi.line.to_str() + " (hls-fuzzseed, Stage 134)\n"
+    + "# provenance: " + source_rel + "\n"
+    + "# harness: corner-valued params, the call, the projection\n"
+    out.text = header + closure_body + "\n\n"
+    + "fn main() -> int uses IO {\n" + main_body
+    + "\n    return 0\n}\n"
+    return out
+}
+
+fn str_join_comma(xs: list[str]) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < xs.len() {
+        if i > 0 {
+            out = out + ", "
+        }
+        out = out + xs.get(i)
+        i = i + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# The feature census — static weights, auditable ranks.
+# ----------------------------------------------------------------------------
+
+struct Census {
+    hits_names: list[str],
+    hits_counts: list[int],
+    score: int
+}
+
+# census_breakdown(src, recursive) — the weighted feature count over
+# the normalized source (the ranking heuristic, never a soundness
+# gate).
+fn census_breakdown(src: str, recursive: bool) -> Census {
+    let mut norm: str = normalize_source(src)
+    let mut c: Census = Census {
+        hits_names: [], hits_counts: [], score: 0
+    }
+    census_feature(c, "struct_lit", 3, norm, "\\b[A-Z][A-Za-z0-9_]*\\s*\\{")
+    census_word(c, "enum_match", 3, norm, "match")
+    census_feature(c, "generic_fn", 3, norm, "\\bfn\\s+\\w+\\s*\\[")
+    census_feature(c, "method_call", 2, norm, "\\.\\w+\\s*\\(")
+    census_feature(c, "list_op", 1, norm,
+    "\\.(push|pop|get|set|insert|remove)\\s*\\(")
+    census_feature(c, "str_op", 1, norm,
+    "\\.(len|sub|split|trim|contains|upper|lower)\\s*\\(")
+    census_word(c, "while_loop", 1, norm, "while")
+    census_word(c, "for_loop", 1, norm, "for")
+    census_word(c, "if_chain", 1, norm, "if")
+    census_feature(c, "float_lit", 1, norm, "\\b\\d+\\.\\d+")
+    census_feature(c, "qmark", 2, norm, "\\?(\\s|$|[.\\[])")
+    census_feature(c, "cast_op", 1, norm,
+    "\\b(to_int|to_str|to_float)\\s*\\(")
+    if recursive {
+        c.hits_names.push("recursion")
+        c.hits_counts.push(1)
+        c.score = c.score + 2
+    }
+    return c
+}
+
+# census_word — whole-word hits of a keyword (the \b-word regexes).
+fn census_word(c: Census, name: str, weight: int, text: str, word: str) -> void {
+    let mut n: int = 0
+    let mut i: int = 0
+    let mut tlen: int = text.len()
+    let mut wlen: int = word.len()
+    while i + wlen <= tlen {
+        if text.slice(i, i + wlen) == word {
+            let mut before_ok: bool = i == 0
+            || !is_ident_char(text.byte_at(i - 1))
+            let mut after_ok: bool = i + wlen == tlen
+            || !is_ident_char(text.byte_at(i + wlen))
+            if before_ok && after_ok {
+                n = n + 1
+            }
+        }
+        i = i + 1
+    }
+    if n > 0 {
+        c.hits_names.push(name)
+        c.hits_counts.push(n)
+        c.score = c.score + weight * census_cap(n, 8)
+    }
+}
+
+# census_feature — a small regex-vocabulary feature. The patterns the
+# .py used decompose into literal word/char sequences; the entries
+# below implement exactly those shapes (prefix word + tail).
+fn census_feature(c: Census, name: str, weight: int, text: str, pat: str) -> void {
+    let mut n: int = census_count_pattern(text, pat)
+    if n > 0 {
+        c.hits_names.push(name)
+        c.hits_counts.push(n)
+        c.score = c.score + weight * census_cap(n, 8)
+    }
+}
+
+fn census_cap(n: int, cap: int) -> int {
+    if n > cap {
+        return cap
+    }
+    return n
+}
+
+# census_count_pattern — the tiny pattern language the census needs:
+#   \b?W...  word-boundary start + literal
+#   \w       [A-Za-z0-9_]
+#   \s       whitespace
+#   \S       non-space
+#   \d       digit
+#   \?,\.,\(,\[,\|  literals
+# The census only ranks; a missed shape reshuffles priority, never
+# correctness — this is the same honesty the .py's table carried.
+fn census_count_pattern(text: str, pat: str) -> int {
+    let mut count: int = 0
+    let mut tlen: int = text.len()
+    let mut start: int = 0
+    while start <= tlen {
+        if census_match_at(text, start, pat) {
+            count = count + 1
+            start = start + 1
+        } else {
+            start = start + 1
+        }
+    }
+    return count
+}
+
+fn census_match_at(text: str, pos: int, pat: str) -> bool {
+    let mut tlen: int = text.len()
+    let mut i: int = pos
+    let mut p: int = 0
+    let mut plen: int = pat.len()
+    while p < plen {
+        let mut pc: int = pat.byte_at(p)
+        # \\b at the head of the pattern
+        if pc == 92 && p + 1 < plen && pat.byte_at(p + 1) == 98 {
+            if i > 0 && is_ident_char(text.byte_at(i - 1)) {
+                return false
+            }
+            p = p + 2
+            continue
+        }
+        if pc == 92 && p + 1 < plen {
+            let mut cls: int = pat.byte_at(p + 1)
+            if i >= tlen {
+                return false
+            }
+            let mut tc: int = text.byte_at(i)
+            if cls == 119 && !is_ident_char(tc) {
+                return false
+            }
+            if cls == 115 && !is_space(tc) {
+                return false
+            }
+            if cls == 83 && is_space(tc) {
+                return false
+            }
+            if cls == 100 && !is_digit(tc) {
+                return false
+            }
+            if cls == 98 {
+                # \b mid-pattern: boundary before this position
+                if i > 0 && is_ident_char(text.byte_at(i - 1)) {
+                    return false
+                }
+                i = i + 0
+                p = p + 2
+                continue
+            }
+            if cls == 63 || cls == 46 || cls == 40 || cls == 91
+            || cls == 41 || cls == 124 {
+                if tc != cls {
+                    return false
+                }
+            }
+            i = i + 1
+            p = p + 2
+            continue
+        }
+        # alternation is only used by the two (a|b|...) patterns; the
+        # census entries with alternation decompose to a first-alt
+        # match here — an undercount that only reshuffles ranks.
+        if i >= tlen || text.byte_at(i) != pc {
+            return false
+        }
+        i = i + 1
+        p = p + 1
+    }
+    return true
+}
+
+# ----------------------------------------------------------------------------
+# The mutator — eight lexical ops, applied OUTSIDE strings and
+# comments. Every mutant is re-checked and re-smoked before it enters
+# the corpus.
+# ----------------------------------------------------------------------------
+
+struct MutateOut {
+    src: str,
+    op: str,
+    ok: bool
+}
+
+# mask(src) — a copy with string contents and comments blanked
+# (positions preserved), so mutations never touch them.
+fn mut_mask(src: str) -> str {
+    let mut out: str = src
+    let mut i: int = 0
+    let mut n: int = src.len()
+    while i < n {
+        let mut c: int = src.byte_at(i)
+        if c == 34 {
+            i = i + 1
+            while i < n && src.byte_at(i) != 34 {
+                out = str_set_byte(out, i, 32)
+                if src.byte_at(i) == 92 && i + 1 < n {
+                    out = str_set_byte(out, i + 1, 32)
+                    i = i + 1
+                }
+                i = i + 1
+            }
+            i = i + 1
+            continue
+        }
+        if c == 35 {
+            while i < n && src.byte_at(i) != 10 {
+                out = str_set_byte(out, i, 32)
+                i = i + 1
+            }
+            continue
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn str_set_byte(s: str, i: int, b: int) -> str {
+    return s.slice(0, i) + chr(b) + s.slice(i + 1, s.len())
+}
+
+# op_swap_pairs — (from, to) both directions.
+fn op_swap_target(o: str) -> str {
+    let mut froms: list[str] = ["==", "!=", "<", ">", "<=", ">=", "&&",
+    "||", "+", "-", "*", "/"]
+    let mut tos: list[str] = ["!=", "==", ">", "<", ">=", "<=", "||",
+    "&&", "-", "+", "/", "*"]
+    let mut i: int = 0
+    while i < froms.len() {
+        if froms.get(i) == o {
+            return tos.get(i)
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn is_op_byte(b: int) -> bool {
+    return b == 61 || b == 33 || b == 60 || b == 62 || b == 38
+    || b == 124 || b == 43 || b == 45 || b == 42 || b == 47
+    || b == 37
+}
+
+# mutate_source(src, rng) — one random op, applied. The op order is
+# shuffled by the rng (the .py's rng.shuffle law, Fisher-Yates).
+fn mutate_source(src: str, r: Rng) -> MutateOut {
+    let mut ops: list[str] = []
+    let mut all: list[str] = mutation_ops()
+    let mut zi: int = 0
+    while zi < all.len() {
+        ops.push(all.get(zi))
+        zi = zi + 1
+    }
+    # Fisher-Yates over the op list.
+    let mut fi: int = ops.len() - 1
+    while fi > 0 {
+        let mut j: int = rng_below(r, fi + 1)
+        let mut tmp: str = ops.get(fi)
+        ops.set(fi, ops.get(j))
+        ops.set(j, tmp)
+        fi = fi - 1
+    }
+    let mut masked: str = mut_mask(src)
+    let mut lines: list[str] = src.split("\n")
+    let mut oi: int = 0
+    while oi < ops.len() {
+        let mut op: str = ops.get(oi)
+        oi = oi + 1
+        if op == "int_corner" {
+            let mut mi: list[int] = mut_int_spans(masked)
+            if mi.len() == 0 {
+                continue
+            }
+            let mut pick: int = mi.get(rng_below(r, mi.len()))
+            let mut corner: str = rng_pick(r, mut_int_corners())
+            return MutateOut {
+                src: src.slice(0, pick)
+                + corner + src.slice(pick + int_span_len(masked, pick),
+                src.len()), op: op, ok: true
+            }
+        }
+        if op == "op_swap" {
+            let mut cand: list[int] = mut_op_spans(masked)
+            if cand.len() == 0 {
+                continue
+            }
+            let mut pick: int = cand.get(rng_below(r, cand.len()))
+            let mut olen: int = 1
+            if pick + 1 < masked.len()
+            && is_op_byte(masked.byte_at(pick + 1)) {
+                olen = 2
+            }
+            let mut o: str = masked.slice(pick, pick + olen)
+            let mut to: str = op_swap_target(o)
+            if to == "" {
+                continue
+            }
+            return MutateOut {
+                src: src.slice(0, pick) + to
+                + src.slice(pick + olen, src.len()), op: op, ok: true
+            }
+        }
+        if op == "str_mut" {
+            let mut cand: list[int] = mut_str_spans(src)
+            if cand.len() == 0 {
+                continue
+            }
+            # the spans are flattened [start, end] PAIRS: pick a pair
+            # (even count), then read its two slots.
+            let mut pick: int = rng_below(r, cand.len() / 2) * 2
+            let mut s: int = cand.get(pick)
+            let mut e: int = cand.get(pick + 1)
+            return MutateOut {
+                src: src.slice(0, s)
+                + rng_pick(r, mut_str_corners())
+                + src.slice(e, src.len()), op: op, ok: true
+            }
+        }
+        if op == "bool_flip" {
+            let mut cand: list[int] = mut_bool_spans(masked)
+            if cand.len() == 0 {
+                continue
+            }
+            let mut pick: int = cand.get(rng_below(r, cand.len()))
+            let mut cur: str = masked.slice(pick, pick + 4)
+            let mut flip: str = "true"
+            if cur == "true" {
+                flip = "false"
+            }
+            return MutateOut {
+                src: src.slice(0, pick) + flip
+                + src.slice(pick + cur.len(), src.len()), op: op,
+                ok: true
+            }
+        }
+        if op == "list_mut" {
+            let mut m: MutateOut = mut_list(src, r)
+            if m.ok {
+                m.op = op
+                return m
+            }
+            continue
+        }
+        if op == "line_dup" || op == "line_drop" {
+            let mut mi: int = mut_main_block(lines)
+            if mi < 0 {
+                continue
+            }
+            let mut body: list[int] = []
+            let mut bi: int = mi + 1
+            while bi < lines.len() {
+                let mut ln: str = lines.get(bi).trim()
+                if ln != "" && ln != "return 0" && ln != "}"
+                && !ln.contains("{") && !ln.contains("}")
+                && !mut_is_param_let(lines.get(bi)) {
+                    body.push(bi)
+                }
+                bi = bi + 1
+            }
+            if body.len() == 0 {
+                continue
+            }
+            let mut pick: int = body.get(rng_below(r, body.len()))
+            let mut out_lines: list[str] = []
+            let mut li: int = 0
+            while li < lines.len() {
+                out_lines.push(lines.get(li))
+                if op == "line_dup" && li == pick {
+                    out_lines.push(lines.get(li))
+                }
+                if op == "line_drop" && li == pick {
+                    out_lines.pop()
+                }
+                li = li + 1
+            }
+            return MutateOut {
+                src: str_join_nl(out_lines), op: op,
+                ok: true
+            }
+        }
+        if op == "param_corner" {
+            let mut mi: int = mut_main_block(lines)
+            if mi < 0 {
+                continue
+            }
+            let mut cand: list[int] = []
+            let mut bi: int = mi + 1
+            while bi < lines.len() {
+                if mut_is_param_let(lines.get(bi)) {
+                    cand.push(bi)
+                }
+                bi = bi + 1
+            }
+            if cand.len() == 0 {
+                continue
+            }
+            let mut pick: int = cand.get(rng_below(r, cand.len()))
+            let mut parsed: ParamLet = mut_parse_param_let(lines.get(pick))
+            if !parsed.ok {
+                continue
+            }
+            let mut pool: list[str] = []
+            if parsed.ty == "int" {
+                let mut corners: list[str] = mut_int_corners()
+                let mut ci: int = 0
+                while ci < corners.len() {
+                    if corners.get(ci) != parsed.value {
+                        pool.push(corners.get(ci))
+                    }
+                    ci = ci + 1
+                }
+            } else if parsed.ty == "str" {
+                let mut corners: list[str] = mut_str_corners()
+                let mut ci: int = 0
+                while ci < corners.len() {
+                    let mut quoted: str = "\"" + corners.get(ci) + "\""
+                    if quoted != parsed.value {
+                        pool.push(quoted)
+                    }
+                    ci = ci + 1
+                }
+            } else {
+                if parsed.value == "false" {
+                    pool.push("true")
+                } else {
+                    pool.push("false")
+                }
+            }
+            if pool.len() == 0 {
+                continue
+            }
+            lines.set(pick, parsed.indent + "let " + parsed.name + ": "
+            + parsed.ty + " = " + rng_pick(r, pool))
+            return MutateOut {
+                src: str_join_nl(lines), op: op,
+                ok: true
+            }
+        }
+    }
+    return MutateOut {
+        src: "", op: "none", ok: false
+    }
+}
+
+# --- the op candidate scanners (masked = strings/comments blanked) ---
+
+fn mut_int_spans(masked: str) -> list[int] {
+    let mut out: list[int] = []
+    let mut i: int = 0
+    let mut n: int = masked.len()
+    while i < n {
+        if is_digit(masked.byte_at(i))
+        && (i == 0 || !is_ident_char(masked.byte_at(i - 1))) {
+            out.push(i)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn int_span_len(masked: str, start: int) -> int {
+    let mut j: int = start
+    while j < masked.len() && is_digit(masked.byte_at(j)) {
+        j = j + 1
+    }
+    return j - start
+}
+
+fn mut_op_spans(masked: str) -> list[int] {
+    # (?<=[\w\)\]])\s*(op)\s*(?=[\w\(\"\[]) — an operator between a
+    # value end and a value start.
+    let mut out: list[int] = []
+    let mut i: int = 1
+    let mut n: int = masked.len()
+    while i < n {
+        let mut prev: int = masked.byte_at(i - 1)
+        let mut is_val_end: bool = is_ident_char(prev) || prev == 41
+        || prev == 93
+        if !is_val_end {
+            i = i + 1
+            continue
+        }
+        let mut j: int = i
+        while j < n && is_space(masked.byte_at(j)) {
+            j = j + 1
+        }
+        if j >= n || !is_op_byte(masked.byte_at(j)) {
+            i = i + 1
+            continue
+        }
+        # the op must be one of the swap pairs (single or double).
+        let mut olen: int = 1
+        if j + 1 < n && is_op_byte(masked.byte_at(j + 1)) {
+            olen = 2
+        }
+        let mut o: str = masked.slice(j, j + olen)
+        if op_swap_target(o) != "" {
+            let mut k: int = j + olen
+            while k < n && is_space(masked.byte_at(k)) {
+                k = k + 1
+            }
+            if k < n {
+                let mut nc: int = masked.byte_at(k)
+                if is_ident_start(nc) || nc == 40 || nc == 34
+                || nc == 91 {
+                    out.push(j)
+                }
+            }
+        }
+        i = j + 1
+        continue
+    }
+    return out
+}
+
+fn mut_str_spans(src: str) -> list[int] {
+    # [start, end] flattened pairs (span EXCLUDES the quotes).
+    let mut out: list[int] = []
+    let mut i: int = 0
+    let mut n: int = src.len()
+    while i < n {
+        if src.byte_at(i) == 34 {
+            let mut j: int = i + 1
+            while j < n && src.byte_at(j) != 34 {
+                if src.byte_at(j) == 92 {
+                    j = j + 1
+                }
+                j = j + 1
+            }
+            out.push(i + 1)
+            out.push(j)
+            i = j + 1
+        } else {
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn mut_bool_spans(masked: str) -> list[int] {
+    let mut out: list[int] = []
+    let mut i: int = 0
+    let mut n: int = masked.len()
+    while i + 4 <= n {
+        let mut w: str = masked.slice(i, i + 4)
+        if(w == "true" || w == "fals")
+        && (i == 0 || !is_ident_char(masked.byte_at(i - 1))) {
+            let mut wlen: int = 4
+            if w == "fals" {
+                wlen = 5
+            }
+            if i + wlen == n
+            || !is_ident_char(masked.byte_at(i + wlen)) {
+                out.push(i)
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn mut_list(src: str, r: Rng) -> MutateOut {
+    # a flat [...] span with no inner bracket or brace: drop one
+    # element (40%) or append one corner.
+    let mut i: int = 0
+    let mut n: int = src.len()
+    while i < n {
+        let mut c: int = src.byte_at(i)
+        if c == 34 {
+            i = i + 1
+            while i < n && src.byte_at(i) != 34 {
+                if src.byte_at(i) == 92 {
+                    i = i + 1
+                }
+                i = i + 1
+            }
+            i = i + 1
+            continue
+        }
+        if c == 35 {
+            while i < n && src.byte_at(i) != 10 {
+                i = i + 1
+            }
+            continue
+        }
+        if c == 91 {
+            let mut depth: int = 0
+            let mut j: int = i
+            while j < n {
+                let mut cj: int = src.byte_at(j)
+                if cj == 34 {
+                    j = j + 1
+                    while j < n && src.byte_at(j) != 34 {
+                        if src.byte_at(j) == 92 {
+                            j = j + 1
+                        }
+                        j = j + 1
+                    }
+                    j = j + 1
+                    continue
+                }
+                if cj == 91 {
+                    depth = depth + 1
+                } else if cj == 93 {
+                    depth = depth - 1
+                    if depth == 0 {
+                        break
+                    }
+                }
+                j = j + 1
+            }
+            if j >= n {
+                i = i + 1
+                continue
+            }
+            let mut inner: str = src.slice(i + 1, j)
+            if !inner.contains("[") && !inner.contains("{") {
+                let mut elems: list[str] = []
+                let mut raw: list[str] = inner.split(",")
+                let mut k: int = 0
+                while k < raw.len() {
+                    if raw.get(k).trim() != "" {
+                        elems.push(raw.get(k).trim())
+                    }
+                    k = k + 1
+                }
+                let mut out_elems: list[str] = []
+                let mut drop: bool = rng_unit(r) < 4000 && elems.len() > 0
+                if drop {
+                    let mut victim: int = rng_below(r, elems.len())
+                    let mut e2: int = 0
+                    while e2 < elems.len() {
+                        if e2 != victim {
+                            out_elems.push(elems.get(e2))
+                        }
+                        e2 = e2 + 1
+                    }
+                } else {
+                    let mut corners: list[str] = ["0", "1", "-1", "10",
+                    "\"a\"", "true"]
+                    let mut e2: int = 0
+                    while e2 < elems.len() {
+                        out_elems.push(elems.get(e2))
+                        e2 = e2 + 1
+                    }
+                    out_elems.push(rng_pick(r, corners))
+                }
+                return MutateOut {
+                    src: src.slice(0, i) + "["
+                    + str_join_comma(out_elems) + "]"
+                    + src.slice(j + 1, src.len()), op: "", ok: true
+                }
+            }
+            i = j + 1
+            continue
+        }
+        i = i + 1
+    }
+    return MutateOut {
+        src: "", op: "", ok: false
+    }
+}
+
+fn mut_main_block(lines: list[str]) -> int {
+    let mut mi: int = -1
+    let mut i: int = lines.len() - 1
+    while i >= 0 {
+        if lines.get(i).starts_with("fn main") {
+            mi = i
+            i = -1
+        } else {
+            i = i - 1
+        }
+    }
+    return mi
+}
+
+fn mut_is_param_let(line: str) -> bool {
+    # \s*let \w+: (int|str|bool) = ...
+    let mut t: str = line.trim()
+    if !t.starts_with("let ") {
+        return false
+    }
+    let mut rest: str = t.slice(4, t.len())
+    let mut i: int = 0
+    while i < rest.len() && is_ident_char(rest.byte_at(i)) {
+        i = i + 1
+    }
+    if i == 0 || i + 1 >= rest.len() {
+        return false
+    }
+    if rest.byte_at(i) != 58 {
+        return false
+    }
+    let mut after: str = rest.slice(i + 1, rest.len()).trim()
+    return after.starts_with("int ") || after.starts_with("str ")
+    || after.starts_with("bool ")
+}
+
+struct ParamLet {
+    indent: str,
+    name: str,
+    ty: str,
+    value: str,
+    ok: bool
+}
+
+fn mut_parse_param_let(line: str) -> ParamLet {
+    let mut out: ParamLet = ParamLet {
+        indent: "", name: "", ty: "",
+        value: "", ok: false
+    }
+    let mut ind: int = 0
+    while ind < line.len() && line.byte_at(ind) == 32 {
+        ind = ind + 1
+    }
+    out.indent = line.slice(0, ind)
+    let mut t: str = line.trim()
+    if !t.starts_with("let ") {
+        return out
+    }
+    let mut rest: str = t.slice(4, t.len())
+    let mut i: int = 0
+    while i < rest.len() && is_ident_char(rest.byte_at(i)) {
+        i = i + 1
+    }
+    if i == 0 {
+        return out
+    }
+    out.name = rest.slice(0, i)
+    if i >= rest.len() || rest.byte_at(i) != 58 {
+        return out
+    }
+    let mut after: str = rest.slice(i + 1, rest.len()).trim()
+    let mut j: int = 0
+    while j < after.len() && is_ident_char(after.byte_at(j)) {
+        j = j + 1
+    }
+    out.ty = after.slice(0, j)
+    if out.ty != "int" && out.ty != "str" && out.ty != "bool" {
+        return out
+    }
+    let mut eq: int = after.find("=")
+    if eq < 0 {
+        return out
+    }
+    out.value = after.slice(eq + 1, after.len()).trim()
+    out.ok = true
+    return out
+}
+
+fn str_join_nl(xs: list[str]) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < xs.len() {
+        if i > 0 {
+            out = out + "\n"
+        }
+        out = out + xs.get(i)
+        i = i + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# Harvest — the file walk over the roots.
+# ----------------------------------------------------------------------------
+
+struct FileRef {
+    path: str,
+    rel: str
+}
+
+# harvest_files(roots) — [(path, label/rel)], sorted per directory,
+# deduped by path.
+fn harvest_files(roots: list[str], labels: list[str]) -> list[FileRef] uses Fs {
+    let mut out: list[FileRef] = []
+    let mut ri: int = 0
+    while ri < roots.len() {
+        let mut base: str = roots.get(ri)
+        let mut label: str = labels.get(ri)
+        ri = ri + 1
+        if !fs_is_dir(base) {
+            continue
+        }
+        let mut found: list[str] = []
+        fz_walk(base, found)
+        let mut sorted: list[str] = str_sort(found)
+        let mut fi: int = 0
+        while fi < sorted.len() {
+            let mut p: str = sorted.get(fi)
+            fi = fi + 1
+            let mut bn: str = fs_basename(p)
+            if !bn.ends_with(".hls") {
+                continue
+            }
+            let mut dupe: bool = false
+            let mut oi: int = 0
+            while oi < out.len() {
+                if out.get(oi).path == p {
+                    dupe = true
+                }
+                oi = oi + 1
+            }
+            if !dupe {
+                out.push(FileRef {
+                    path: p,
+                    rel: label + "/" + rel_within(base, p)
+                })
+            }
+        }
+    }
+    return out
+}
+
+fn fz_walk(dir: str, out: list[str]) -> void uses Fs {
+    let mut names: list[str] = fs_read_dir(dir)
+    let mut i: int = 0
+    while i < names.len() {
+        let mut full: str = fs_join(dir, names.get(i))
+        if fs_is_dir(full) {
+            fz_walk(full, out)
+        } else {
+            out.push(full)
+        }
+        i = i + 1
+    }
+}
+
+fn rel_within(base: str, path: str) -> str {
+    if path.starts_with(base + "/") {
+        return path.slice(base.len() + 1, path.len())
+    }
+    return path
+}
+
+# ----------------------------------------------------------------------------
+# The probe child — parse + check through hlfront, behind the process
+# boundary (the .py's `except HLError`). One flag: --probe-check
+# <file>; exit 0 = checks, 101 = the refusal on stderr.
+# ----------------------------------------------------------------------------
+
+# fz_probe(self_path, path) -> (ok, detail).
+struct ProbeOut {
+    ok: bool,
+    detail: str
+}
+
+fn fz_spawn(prog: str, cargs: list[str]) -> ProbeOut uses Proc {
+    let mut pid: int = proc_spawn(prog, cargs, 0, 1, 1)
+    if pid < 1 {
+        return ProbeOut {
+            ok: false, detail: "spawn failed: " + prog
+        }
+    }
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    let mut code: int = proc_wait(pid)
+    return ProbeOut {
+        ok: code == 0, detail: err.trim()
+    }
+}
+
+fn fz_self_path() -> str uses Args {
+    let mut a: list[str] = args()
+    if a.len() == 0 {
+        return ""
+    }
+    return a.get(0)
+}
+
+fn fz_repo_root(self_path: str) -> str uses Fs, IO, Proc {
+    let mut cand: str = fs_dirname(fs_dirname(self_path))
+    if file_exists(fs_join(cand, "src/hlc.hls")) {
+        return cand
+    }
+    return cwd_get()
+}
+
+# ----------------------------------------------------------------------------
+# Smoke — bin/hlboot runs the seed; ok and panic are both fine.
+# ----------------------------------------------------------------------------
+
+struct SmokeOut {
+    verdict: str, # ok | panic:... | timeout | error:...
+    ok: bool
+}
+
+# smoke_run — bin/hlboot runs the seed under the OS `timeout`
+# wrapper (SIGTERM at the budget, then KILL): the .py's
+# subprocess.run(timeout) law, delegated to the one tool POSIX
+# already ships for exactly this. setsid groups hlboot's re-exec
+# relay so the signal reaches the inner --probe-run too; the shell
+# waits the group and reports 124 on timeout (GNU timeout's own
+# code, passed through).
+fn smoke_run(path: str, hlboot: str, timeout_ms: int) -> SmokeOut uses Proc {
+    let mut secs: int = timeout_ms / 1000
+    if secs < 1 {
+        secs = 1
+    }
+    let shcmd: str = "exec '" + hlboot + "' '" + path + "'"
+    let pid: int = proc_spawn("timeout", ["-k", "1", secs.to_str(),
+    "sh", "-c", shcmd], 2, 1, 1)
+    if pid < 1 {
+        return SmokeOut {
+            verdict: "error:cannot spawn " + hlboot,
+            ok: false
+        }
+    }
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    let code: int = proc_wait(pid)
+    if code == 0 {
+        return SmokeOut {
+            verdict: "ok", ok: true
+        }
+    }
+    # 124 = timeout's own exit; -15/143 = the SIGTERM path.
+    if code == 124 || code == -15 || code == 143 {
+        return SmokeOut {
+            verdict: "timeout", ok: false
+        }
+    }
+    let mut fl: str = err
+    if fl == "" {
+        fl = out
+    }
+    fl = fl.trim()
+    let cut: int = fl.find("\n")
+    if cut > 0 {
+        fl = fl.slice(0, cut)
+    }
+    if fl.len() > 120 {
+        fl = fl.slice(0, 120)
+    }
+    if fl == "" {
+        return SmokeOut {
+            verdict: "error:rc=" + code.to_str(),
+            ok: false
+        }
+    }
+    if fl.contains("panic") {
+        return SmokeOut {
+            verdict: "panic:" + fl, ok: true
+        }
+    }
+    return SmokeOut {
+        verdict: "error:" + fl, ok: false
+    }
+}
+
+# ----------------------------------------------------------------------------
+# The seeder's data model.
+# ----------------------------------------------------------------------------
+
+struct Seed {
+    name: str,
+    digest: str,
+    sources: list[str],
+    params: list[str],
+    recursive: bool,
+    text: str,
+    smoke: str,
+    score: int,
+    census_names: list[str],
+    census_counts: list[int],
+    file: str,
+    mutants_made: int
+}
+
+struct Skip {
+    source: str,
+    fn_name: str,
+    reason: str
+}
+
+struct Stats {
+    files_seen: int,
+    files_unparsed: int,
+    fns_seen: int,
+    entries_considered: int,
+    harness_checked: int,
+    harness_refined: int,
+    rank_pruned: int,
+    smoke_ok: int,
+    smoke_panic: int,
+    smoke_timeout: int,
+    smoke_error: int,
+    mutants_attempted: int,
+    mutants_born: int,
+    mutants_dropped: int
+}
+
+# ----------------------------------------------------------------------------
+# seed_all — the pipeline in five phases (the .py's law).
+# ----------------------------------------------------------------------------
+
+struct SeedAllCfg {
+    out_dir: str,
+    pkg_cache: list[str],
+    no_in_tree: bool,
+    limit: int,
+    mutate: int,
+    max_lines: int,
+    seed: int,
+    keep_timeouts: bool,
+    smoke_timeout_ms: int
+}
+
+# seed_all returns the accepted seeds in rank order plus the skips.
+struct SeedAllOut {
+    seeds: list[Seed],
+    skips: list[Skip],
+    stats: Stats
+}
+
+fn seed_all(cfg: SeedAllCfg, self_path: str, root: str) -> SeedAllOut uses IO, Fs, Proc, Conc {
+    let mut out: SeedAllOut = SeedAllOut {
+        seeds: [], skips: [],
+        stats: Stats {
+            files_seen: 0, files_unparsed: 0, fns_seen: 0,
+            entries_considered: 0, harness_checked: 0,
+            harness_refined: 0, rank_pruned: 0, smoke_ok: 0,
+            smoke_panic: 0, smoke_timeout: 0, smoke_error: 0,
+            mutants_attempted: 0, mutants_born: 0, mutants_dropped: 0
+        }
+    }
+    let mut rng: Rng = Rng {
+        state: cfg.seed
+    }
+    sh("rm -rf '" + cfg.out_dir + "'")
+    sh("mkdir -p '" + cfg.out_dir + "'")
+    sh("mkdir -p '" + cfg.out_dir + "/m'")
+
+    # the roots: packages first (labelled pkg:<name>), then in-tree.
+    let mut roots: list[str] = []
+    let mut labels: list[str] = []
+    let mut pi: int = 0
+    while pi < cfg.pkg_cache.len() {
+        let mut d: str = cfg.pkg_cache.get(pi).trim()
+        pi = pi + 1
+        while d.len() > 1 && d.byte_at(d.len() - 1) == 47 {
+            d = d.slice(0, d.len() - 1)
+        }
+        roots.push(d)
+        labels.push("pkg:" + fs_basename(d))
+    }
+    if !cfg.no_in_tree {
+        let mut it: list[str] = in_tree_dirs()
+        let mut ii: int = 0
+        while ii < it.len() {
+            roots.push(fs_join(root, it.get(ii)))
+            labels.push("tree")
+            ii = ii + 1
+        }
+    }
+    let mut files: list[FileRef] = harvest_files(roots, labels)
+    out.stats.files_seen = files.len()
+
+    # ---- phase 1: parse, close, build, check -----------------------------
+    let mut candidates: list[Seed] = []
+    let mut seen_digests: list[str] = []
+    let mut fi: int = 0
+    while fi < files.len() {
+        let mut fr: FileRef = files.get(fi)
+        fi = fi + 1
+        if !file_exists(fr.path) {
+            continue
+        }
+        let mut src: str = read_file(fr.path)
+        # A file that does not parse is a NAMED skip, never a crash:
+        # hl_parse_file panics in-process (Halis has no exceptions),
+        # so the parse verdict comes from a probe child of this very
+        # binary first — the family's discipline. The child that
+        # passes means the same pure function parses in-process.
+        let mut probe: ProbeOut = fz_spawn(self_path,
+        ["--probe-parse-count", fr.path])
+        if !probe.ok {
+            out.stats.files_unparsed = out.stats.files_unparsed + 1
+            out.skips.push(Skip {
+                source: fr.rel, fn_name: "<file>",
+                reason: "parse: " + clip_str(probe.detail, 100)
+            })
+            continue
+        }
+        # the single-file parse view (imports NOT followed — the .py's
+        # parse(), one file's own declarations).
+        let mut ctx: Ctx = hl_parse_file(fr.path)
+        let mut fkeys: list[str] = ctx.fn_order
+        # the child also printed the fn census (name<TAB>line<TAB>
+        # extern<TAB>method<TAB>params<TAB>ret) — re-parse here from
+        # the real ctx (the child verified it; this walk is the same
+        # pure function over the same file).
+        let mut fk: int = 0
+        while fk < fkeys.len() {
+            let mut fname: str = fkeys.get(fk)
+            fk = fk + 1
+            out.stats.fns_seen = out.stats.fns_seen + 1
+            let mut info: FnInfo = ctx.fns.get_or(fname, fz_dummy_fn())
+            if info.is_extern {
+                continue
+            }
+            if fname == "main" {
+                out.skips.push(Skip {
+                    source: fr.rel, fn_name: fname,
+                    reason: "entry is main — the harness IS a main"
+                })
+                continue
+            }
+            if info.is_method {
+                continue
+            }
+            if info.body.len() == 0 {
+                continue
+            }
+            out.stats.entries_considered = out.stats.entries_considered + 1
+
+            let mut cl: ClosureOut = build_closure(ctx, src, fname,
+            cfg.max_lines)
+            if cl.ref.refused {
+                out.skips.push(Skip {
+                    source: fr.rel, fn_name: fname,
+                    reason: cl.ref.reason
+                })
+                continue
+            }
+
+            # harness attempts (refinement-safe corner vectors).
+            let mut built: str = ""
+            let mut psum: list[str] = []
+            let mut refused: str = ""
+            let mut attempts: int = 0
+            let mut done: bool = false
+            while attempts < REFINE_ATTEMPTS() && !done {
+                attempts = attempts + 1
+                let mut cand_rng: Rng = Rng {
+                    state: cfg.seed * 1000003 + attempts
+                    + stable_name_hash(fname) % 65536
+                }
+                let mut h: HarnessOut = build_harness(fname, cl.body,
+                cand_rng, fr.rel, ctx)
+                if h.refusal != "" {
+                    refused = h.refusal
+                    done = true
+                    continue
+                }
+                # the REAL checker judges the harness — probe child.
+                let mut tmp: str = cfg.out_dir + "/.probe-"
+                + proc_pid().to_str() + ".hls"
+                write_file(tmp, h.text)
+                let mut checkp: ProbeOut = fz_spawn(self_path,
+                ["--probe-check", tmp])
+                sh("rm -f '" + tmp + "'")
+                if !checkp.ok {
+                    # a refinement rejection retries with new corners;
+                    # a synthesis refusal does not (already done above).
+                    refused = checkp.detail
+                    continue
+                }
+                out.stats.harness_checked = out.stats.harness_checked + 1
+                if attempts > 1 {
+                    out.stats.harness_refined = out.stats.harness_refined + 1
+                }
+                built = h.text
+                psum = h.param_summary
+                done = true
+            }
+            if built == "" {
+                out.skips.push(Skip {
+                    source: fr.rel, fn_name: fname,
+                    reason: refused
+                })
+                continue
+            }
+
+            # purity: the Stage 133 law over the harness text.
+            let mut pv: Purity = purity_verdict(built)
+            if !pv.eligible {
+                out.skips.push(Skip {
+                    source: fr.rel, fn_name: fname,
+                    reason: pv.reason
+                })
+                continue
+            }
+
+            # identity: SHA-256 over the normalized source.
+            let mut digest: str = digest_of(built)
+            if list_has_str(seen_digests, digest) {
+                continue
+            }
+            seen_digests.push(digest)
+
+            # recursion: the entry calls itself.
+            let mut recursive: bool = list_has_str(
+            body_facts(ctx, fname, []).calls, fname)
+
+            # the census ranks; over-provision 2x the limit.
+            let mut census: Census = census_breakdown(built, recursive)
+            let mut s: Seed = Seed {
+                name: fname,
+                digest: digest,
+                sources: [fr.rel],
+                params: psum,
+                recursive: recursive,
+                text: built,
+                smoke: "",
+                score: census.score,
+                census_names: census.hits_names,
+                census_counts: census.hits_counts,
+                file: "",
+                mutants_made: 0
+            }
+            candidates.push(s)
+        }
+    }
+
+    # ---- phase 2: rank and cut (overprovision 2x) ------------------------
+    let mut ranked: list[Seed] = seeds_rank_sort(candidates)
+    let mut provision: list[Seed] = []
+    let mut budget: int = cfg.limit * 2
+    let mut ci: int = 0
+    while ci < ranked.len() {
+        if cfg.limit > 0 && provision.len() >= budget {
+            break
+        }
+        provision.push(ranked.get(ci))
+        ci = ci + 1
+    }
+
+    # ---- phase 3: smoke the shortlist --------------------------------------
+    let mut hlboot: str = fs_join(root, "bin/hlboot")
+    let mut si: int = 0
+    while si < provision.len() {
+        let mut s: Seed = provision.get(si)
+        si = si + 1
+        let mut tmp: str = cfg.out_dir + "/.smoke-"
+        + proc_pid().to_str() + "-" + si.to_str() + ".hls"
+        write_file(tmp, s.text)
+        let mut v: SmokeOut = smoke_run(tmp, hlboot, cfg.smoke_timeout_ms)
+        sh("rm -f '" + tmp + "'")
+        s.smoke = v.verdict
+        if v.verdict == "ok" {
+            out.stats.smoke_ok = out.stats.smoke_ok + 1
+        } else if v.verdict == "timeout" {
+            out.stats.smoke_timeout = out.stats.smoke_timeout + 1
+        } else if v.verdict.starts_with("panic:") {
+            out.stats.smoke_panic = out.stats.smoke_panic + 1
+        } else {
+            out.stats.smoke_error = out.stats.smoke_error + 1
+        }
+        if v.verdict == "timeout" && !cfg.keep_timeouts {
+            out.skips.push(Skip {
+                source: s.sources.get(0),
+                fn_name: s.name,
+                reason: "smoke: timeout — a hanging seed is wasted "
+                + "fuzz time (--keep-timeouts lifts this)"
+            })
+            continue
+        }
+        if v.verdict.starts_with("error:") {
+            out.skips.push(Skip {
+                source: s.sources.get(0),
+                fn_name: s.name, reason: "smoke: " + v.verdict
+            })
+            continue
+        }
+        if cfg.limit > 0 && out.seeds.len() >= cfg.limit {
+            out.stats.rank_pruned = out.stats.rank_pruned + 1
+            continue
+        }
+        out.seeds.push(s)
+    }
+
+    # ---- phase 4: write the accepted seeds --------------------------------
+    si = 0
+    while si < out.seeds.len() {
+        let mut s: Seed = out.seeds.get(si)
+        si = si + 1
+        let mut safe: str = safe_name(s.name)
+        s.file = "seed-" + safe + "-" + s.digest.slice(0, 8) + ".hls"
+        write_file(fs_join(cfg.out_dir, s.file), s.text)
+    }
+
+    # ---- phase 5: mutants for the accepted seeds only --------------------
+    if cfg.mutate > 0 && out.seeds.len() > 0 {
+        let mut mi: int = 0
+        while mi < out.seeds.len() {
+            let mut s: Seed = out.seeds.get(mi)
+            mi = mi + 1
+            let mut k: int = 0
+            while k < cfg.mutate {
+                k = k + 1
+                out.stats.mutants_attempted = out.stats.mutants_attempted + 1
+                # the .py's seed ^ int(digest[:12], 16) + k*7919 — a
+                # deterministic per-mutant stream.
+                let mut mrng: Rng = Rng {
+                    state: int_xor(cfg.seed,
+                    hex12(s.digest.slice(0, 12))) + k * 7919
+                }
+                let mut m: MutateOut = mutate_source(s.text, mrng)
+                if !m.ok {
+                    out.stats.mutants_dropped = out.stats.mutants_dropped + 1
+                    continue
+                }
+                # the checker is the bouncer — probe child; the smoke
+                # run follows on the SAME file, and only then is it
+                # removed (smoking a deleted path is an instant error).
+                let mut tmp: str = cfg.out_dir + "/.mprobe-"
+                + proc_pid().to_str() + ".hls"
+                write_file(tmp, m.src)
+                let mut checkp: ProbeOut = fz_spawn(self_path,
+                ["--probe-check", tmp])
+                if !checkp.ok {
+                    sh("rm -f '" + tmp + "'")
+                    out.stats.mutants_dropped = out.stats.mutants_dropped + 1
+                    continue
+                }
+                # smoke the mutant.
+                let mut sv: SmokeOut = smoke_run(tmp, hlboot, cfg.smoke_timeout_ms)
+                sh("rm -f '" + tmp + "'")
+                if sv.verdict == "timeout" && !cfg.keep_timeouts {
+                    out.stats.mutants_dropped = out.stats.mutants_dropped + 1
+                    continue
+                }
+                if sv.verdict.starts_with("error:") {
+                    out.stats.mutants_dropped = out.stats.mutants_dropped + 1
+                    continue
+                }
+                let mut mfile: str = s.file.slice(0, s.file.len() - 5)
+                + "-m" + (k - 1).to_str() + ".hls"
+                write_file(fs_join(fs_join(cfg.out_dir, "m"), mfile),
+                m.src)
+                s.mutants_made = s.mutants_made + 1
+                out.stats.mutants_born = out.stats.mutants_born + 1
+            }
+        }
+    }
+    return out
+}
+
+# hex12(s) — a 12-hex-digit prefix of a digest as int (0 on junk).
+fn hex12(s: str) -> int {
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < s.len() && i < 12 {
+        let mut b: int = s.byte_at(i)
+        let mut d: int = 0
+        if b >= 48 && b <= 57 {
+            d = b - 48
+        } else if b >= 97 && b <= 102 {
+            d = b - 87
+        } else {
+            return 0
+        }
+        v = v * 16 + d
+        i = i + 1
+    }
+    return v
+}
+
+fn safe_name(name: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < name.len() {
+        let mut b: int = name.byte_at(i)
+        if is_ident_char(b) {
+            out = out + chr(b)
+        } else {
+            out = out + "_"
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# seeds_rank_sort — score desc, then name asc (the .py's ranked order).
+fn seeds_rank_sort(xs: list[Seed]) -> list[Seed] {
+    let mut out: list[Seed] = []
+    let mut i: int = 0
+    while i < xs.len() {
+        out.push(xs.get(i))
+        i = i + 1
+    }
+    let mut a: int = 1
+    while a < out.len() {
+        let mut v: Seed = out.get(a)
+        let mut b: int = a - 1
+        while b >= 0 && (out.get(b).score < v.score
+        || (out.get(b).score == v.score && out.get(b).name > v.name)) {
+            out.set(b + 1, out.get(b))
+            b = b - 1
+        }
+        out.set(b + 1, v)
+        a = a + 1
+    }
+    return out
+}
+
+fn clip_str(s: str, n: int) -> str {
+    if s.len() <= n {
+        return s
+    }
+    return s.slice(0, n)
+}
+
+# ----------------------------------------------------------------------------
+# Manifest + report.
+# ----------------------------------------------------------------------------
+
+fn jstr_lit(s: str) -> str {
+    let mut out: str = "\""
+    let mut i: int = 0
+    while i < s.len() {
+        let mut b: int = s.byte_at(i)
+        if b == 34 {
+            out = out + "\\\""
+        } else if b == 92 {
+            out = out + "\\\\"
+        } else if b == 10 {
+            out = out + "\\n"
+        } else if b == 9 {
+            out = out + "\\t"
+        } else if b == 13 {
+            out = out + "\\r"
+        } else if b < 32 {
+            out = out + "\\u00" + hex2(b)
+        } else {
+            out = out + chr(b)
+        }
+        i = i + 1
+    }
+    return out + "\""
+}
+
+fn hex2(b: int) -> str {
+    let mut digits: str = "0123456789abcdef"
+    let mut hi: int = int_and(int_shr(b, 4), 15)
+    let mut lo: int = int_and(b, 15)
+    return digits.slice(hi, hi + 1) + digits.slice(lo, lo + 1)
+}
+
+# write_manifest(out_dir, seeds, skips, stats, cfg, stamp) — the
+# machine-readable corpus record (sorted keys, indent 2).
+fn write_manifest(out_dir: str, res: SeedAllOut, cfg: SeedAllCfg,
+stamp: str) -> void uses Fs, IO {
+    let mut L: list[str] = []
+    L.push("{")
+    L.push("  \"limit\": " + cfg.limit.to_str() + ",")
+    L.push("  \"max_lines\": " + cfg.max_lines.to_str() + ",")
+    L.push("  \"mutate\": " + cfg.mutate.to_str() + ",")
+    L.push("  \"no_in_tree\": " + bool_lit(cfg.no_in_tree) + ",")
+    L.push("  \"pkg_cache\": [" + jstr_list(cfg.pkg_cache) + "],")
+    L.push("  \"seed\": " + cfg.seed.to_str() + ",")
+    L.push("  \"seeds\": [")
+    let mut si: int = 0
+    while si < res.seeds.len() {
+        let mut s: Seed = res.seeds.get(si)
+        si = si + 1
+        let mut comma: str = ","
+        if si == res.seeds.len() {
+            comma = ""
+        }
+        L.push("    {")
+        L.push("      \"census\": {" + census_obj(s) + "},")
+        L.push("      \"digest\": \"" + s.digest + "\",")
+        L.push("      \"file\": \"" + s.file + "\",")
+        L.push("      \"fn\": \"" + s.name + "\",")
+        L.push("      \"mutants\": [],")
+        L.push("      \"mutants_made\": " + s.mutants_made.to_str() + ",")
+        L.push("      \"params\": [" + jstr_list(s.params) + "],")
+        L.push("      \"recursive\": " + bool_lit(s.recursive) + ",")
+        L.push("      \"score\": " + s.score.to_str() + ",")
+        L.push("      \"smoke\": " + jstr_lit(s.smoke) + ",")
+        L.push("      \"sources\": [" + jstr_list(s.sources) + "]")
+        L.push("    }" + comma)
+    }
+    L.push("  ],")
+    L.push("  \"skips\": [")
+    let mut ki: int = 0
+    while ki < res.skips.len() {
+        let mut k: Skip = res.skips.get(ki)
+        ki = ki + 1
+        let mut comma2: str = ","
+        if ki == res.skips.len() {
+            comma2 = ""
+        }
+        L.push("    {\"fn\": " + jstr_lit(k.fn_name)
+        + ", \"reason\": " + jstr_lit(k.reason)
+        + ", \"source\": " + jstr_lit(k.source) + "}" + comma2)
+    }
+    L.push("  ],")
+    L.push("  \"stamp\": " + jstr_or_null(stamp) + ",")
+    L.push("  \"stats\": {")
+    L.push("    \"entries_considered\": "
+    + res.stats.entries_considered.to_str() + ",")
+    L.push("    \"files_seen\": " + res.stats.files_seen.to_str() + ",")
+    L.push("    \"files_unparsed\": " + res.stats.files_unparsed.to_str() + ",")
+    L.push("    \"fns_seen\": " + res.stats.fns_seen.to_str() + ",")
+    L.push("    \"harness_checked\": "
+    + res.stats.harness_checked.to_str() + ",")
+    L.push("    \"harness_refined\": "
+    + res.stats.harness_refined.to_str() + ",")
+    L.push("    \"mutants_attempted\": "
+    + res.stats.mutants_attempted.to_str() + ",")
+    L.push("    \"mutants_born\": "
+    + res.stats.mutants_born.to_str() + ",")
+    L.push("    \"mutants_dropped\": "
+    + res.stats.mutants_dropped.to_str() + ",")
+    L.push("    \"rank_pruned\": " + res.stats.rank_pruned.to_str() + ",")
+    L.push("    \"smoke_error\": " + res.stats.smoke_error.to_str() + ",")
+    L.push("    \"smoke_ok\": " + res.stats.smoke_ok.to_str() + ",")
+    L.push("    \"smoke_panic\": " + res.stats.smoke_panic.to_str() + ",")
+    L.push("    \"smoke_timeout\": "
+    + res.stats.smoke_timeout.to_str())
+    L.push("  },")
+    L.push("  \"tool\": " + jstr_lit(TOOL_VERSION()))
+    L.push("}")
+    let mut text: str = ""
+    let mut i: int = 0
+    while i < L.len() {
+        if i > 0 {
+            text = text + "\n"
+        }
+        text = text + L.get(i)
+        i = i + 1
+    }
+    write_file(fs_join(out_dir, "manifest.json"), text + "\n")
+}
+
+fn census_obj(s: Seed) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < s.census_names.len() {
+        if i > 0 {
+            out = out + ", "
+        }
+        out = out + "\"" + s.census_names.get(i) + "\": "
+        + s.census_counts.get(i).to_str()
+        i = i + 1
+    }
+    return out
+}
+
+fn bool_lit(b: bool) -> str {
+    if b {
+        return "true"
+    }
+    return "false"
+}
+
+fn jstr_list(xs: list[str]) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < xs.len() {
+        if i > 0 {
+            out = out + ", "
+        }
+        out = out + jstr_lit(xs.get(i))
+        i = i + 1
+    }
+    return out
+}
+
+fn jstr_or_null(s: str) -> str {
+    if s == "" {
+        return "null"
+    }
+    return jstr_lit(s)
+}
+
+# print_report — the human summary (the .py's layout).
+fn print_report(res: SeedAllOut, out_dir: str) -> void uses IO {
+    let mut nmut: int = 0
+    let mut si: int = 0
+    while si < res.seeds.len() {
+        nmut = nmut + res.seeds.get(si).mutants_made
+        si = si + 1
+    }
+    println("== " + TOOL_VERSION() + " ==")
+    println("corpus: " + res.seeds.len().to_str() + " seeds (+"
+    + nmut.to_str() + " mutants), " + res.skips.len().to_str()
+    + " named skips")
+    let mut shown: int = 0
+    si = 0
+    while si < res.seeds.len() && shown < 12 {
+        let mut s: Seed = res.seeds.get(si)
+        si = si + 1
+        let mut smoke_head: str = s.smoke
+        let mut cut: int = smoke_head.find(":")
+        if cut > 0 {
+            smoke_head = smoke_head.slice(0, cut)
+        }
+        println("  " + s.file + " score=" + s.score.to_str()
+        + " smoke=" + smoke_head + " src=" + s.sources.get(0))
+        shown = shown + 1
+    }
+    if res.seeds.len() > 12 {
+        println("  ... and " + (res.seeds.len() - 12).to_str()
+        + " more")
+    }
+    println("manifest: " + fs_join(out_dir, "manifest.json"))
+}
+
+# ----------------------------------------------------------------------------
+# The CLI.
+# ----------------------------------------------------------------------------
+
+fn fz_usage_error(msg: str) -> int uses IO, Exit {
+    eprintln("hls-fuzzseed: " + msg)
+    return 2
+}
+
+fn fz_main_inner(argv: list[str]) -> int uses IO, Fs, Proc, Conc, Clock, Args, Exit {
+    let mut self_path: str = fz_self_path()
+    let mut root: str = fz_repo_root(self_path)
+
+    # the probe children.
+    if argv.len() > 1 && argv.get(1) == "--probe-check" {
+        if argv.len() < 3 {
+            eprintln("error: --probe-check needs a file")
+            return 2
+        }
+        # load + check through the real front-end; die on refusal
+        # (the parent reads the code + stderr).
+        let mut ctx: Ctx = hl_load_crate(argv.get(2))
+        hl_check(ctx)
+        return 0
+    }
+    if argv.len() > 1 && argv.get(1) == "--probe-parse-count" {
+        # the parse probe: one file's own declarations, printed as
+        # TSV (name, line, extern, method, nparams, ret) — exit 0
+        # when the file parses, 101 with the lexer/parser error.
+        if argv.len() < 3 {
+            eprintln("error: --probe-parse-count needs a file")
+            return 2
+        }
+        let mut ctx: Ctx = hl_parse_file(argv.get(2))
+        let mut i: int = 0
+        while i < ctx.fn_order.len() {
+            let mut name: str = ctx.fn_order.get(i)
+            let mut fi: FnInfo = ctx.fns.get_or(name, fz_dummy_fn())
+            println(name + "\t" + fi.line.to_str() + "\t"
+            + bool_lit(fi.is_extern) + "\t"
+            + bool_lit(fi.is_method) + "\t"
+            + fi.params.len().to_str() + "\t" + fi.ret)
+            i = i + 1
+        }
+        return 0
+    }
+
+    let mut out_dir: str = fs_join(root, "fuzz-corpus/seed")
+    let mut pkg_cache: list[str] = []
+    let mut no_in_tree: bool = false
+    let mut limit: int = 200
+    let mut mutate: int = 1
+    let mut max_lines: int = 120
+    let mut seed: int = 134
+    let mut keep_timeouts: bool = false
+    let mut stamp: str = ""
+    let mut json_mode: bool = false
+    let mut quiet: bool = false
+    let mut smoke_timeout_ms: int = 5000
+
+    let mut i: int = 1
+    while i < argv.len() {
+        let mut a: str = argv.get(i)
+        if a == "--out" {
+            if i + 1 >= argv.len() {
+                return fz_usage_error("--out expects a value")
+            }
+            out_dir = argv.get(i + 1)
+            i = i + 2
+        } else if a == "--pkg-cache" {
+            if i + 1 >= argv.len() {
+                return fz_usage_error("--pkg-cache expects a value")
+            }
+            pkg_cache.push(argv.get(i + 1))
+            i = i + 2
+        } else if a == "--no-in-tree" {
+            no_in_tree = true
+            i = i + 1
+        } else if a == "--limit" {
+            if i + 1 >= argv.len() {
+                return fz_usage_error("--limit expects a value")
+            }
+            limit = argv.get(i + 1).to_int()
+            i = i + 2
+        } else if a == "--mutate" {
+            if i + 1 >= argv.len() {
+                return fz_usage_error("--mutate expects a value")
+            }
+            mutate = argv.get(i + 1).to_int()
+            i = i + 2
+        } else if a == "--max-lines" {
+            if i + 1 >= argv.len() {
+                return fz_usage_error("--max-lines expects a value")
+            }
+            max_lines = argv.get(i + 1).to_int()
+            i = i + 2
+        } else if a == "--seed" {
+            if i + 1 >= argv.len() {
+                return fz_usage_error("--seed expects a value")
+            }
+            seed = argv.get(i + 1).to_int()
+            i = i + 2
+        } else if a == "--smoke-timeout" {
+            if i + 1 >= argv.len() {
+                return fz_usage_error("--smoke-timeout expects a value")
+            }
+            # seconds -> milliseconds (the watchdog's budget)
+            smoke_timeout_ms = argv.get(i + 1).to_int() * 1000
+            i = i + 2
+        } else if a == "--keep-timeouts" {
+            keep_timeouts = true
+            i = i + 1
+        } else if a == "--stamp" {
+            if i + 1 >= argv.len() {
+                return fz_usage_error("--stamp expects a value")
+            }
+            stamp = argv.get(i + 1)
+            i = i + 2
+        } else if a == "--json" {
+            json_mode = true
+            i = i + 1
+        } else if a == "--quiet" {
+            quiet = true
+            i = i + 1
+        } else if a == "--unit-ops" {
+            # the gate's module probe: the mutation vocabulary.
+            println("ops=" + str_join_comma(mutation_ops()))
+            return 0
+        } else if a == "--unit-purity-text" {
+            if i + 2 >= argv.len() {
+                return fz_usage_error("--unit-purity-text needs a text")
+            }
+            let mut pv: Purity = purity_verdict(argv.get(i + 2))
+            if pv.eligible {
+                println("eligible=1")
+                println("reason=")
+            } else {
+                println("eligible=0")
+                println("reason=" + pv.reason)
+            }
+            return 0
+        } else if a == "--unit-purity-file" {
+            if i + 2 >= argv.len() {
+                return fz_usage_error("--unit-purity-file needs a path")
+            }
+            let mut pv: Purity = purity_verdict(read_file(argv.get(i + 2)))
+            if pv.eligible {
+                println("eligible=1")
+                println("reason=")
+            } else {
+                println("eligible=0")
+                println("reason=" + pv.reason)
+            }
+            return 0
+        } else if a == "-h" || a == "--help" {
+            println("hls-fuzzseed — fuzz corpus seeding from real-world "
+            + "packages (Stage 134)")
+            return 0
+        } else {
+            return fz_usage_error("unrecognized argument: " + a)
+        }
+    }
+
+    if limit < 0 || mutate < 0 || max_lines < 4 {
+        eprintln("hls-fuzzseed: usage error — limit/mutate/max-lines "
+        + "out of range")
+        return 2
+    }
+    let mut pi: int = 0
+    while pi < pkg_cache.len() {
+        if !fs_is_dir(pkg_cache.get(pi)) {
+            eprintln("hls-fuzzseed: --pkg-cache '"
+            + pkg_cache.get(pi) + "' does not exist — a configured "
+            + "source that is not there is a refusal, not a silent "
+            + "empty")
+            return 2
+        }
+        pi = pi + 1
+    }
+
+    let mut cfg: SeedAllCfg = SeedAllCfg {
+        out_dir: out_dir,
+        pkg_cache: pkg_cache,
+        no_in_tree: no_in_tree,
+        limit: limit,
+        mutate: mutate,
+        max_lines: max_lines,
+        seed: seed,
+        keep_timeouts: keep_timeouts,
+        smoke_timeout_ms: smoke_timeout_ms
+    }
+    let mut res: SeedAllOut = seed_all(cfg, self_path, root)
+    write_manifest(out_dir, res, cfg, stamp)
+
+    if json_mode {
+        # the manifest + the result line, as the .py printed.
+        let mut man: str = read_file(fs_join(out_dir, "manifest.json"))
+        let mut doc: str = man
+        if doc.ends_with("\n}") || doc.ends_with("}") {
+            # insert "result" before the closing brace
+            let mut cut: int = doc.len() - 1
+            while cut > 0 && (doc.byte_at(cut) != 125) {
+                cut = cut - 1
+            }
+            let mut head: str = doc.slice(0, cut).trim()
+            let mut result: str = "green"
+            if res.seeds.len() == 0 {
+                result = "empty"
+            }
+            println(head + ",\n  \"result\": \"" + result + "\"\n}")
+        }
+    } else if !quiet {
+        print_report(res, out_dir)
+    }
+    if res.seeds.len() > 0 {
+        return 0
+    }
+    return 1
+}
+
+fn main() -> int uses IO, Fs, Proc, Conc, Clock, Args, Exit {
+    let mut argv: list[str] = args()
+    return fz_main_inner(argv)
+}
