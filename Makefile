@@ -1262,7 +1262,7 @@ xdiff-acceptance: $(BIN)/acc-xdiff $(BIN)/hls-xdiff $(BIN)/ll_validate bin/hlc
 fuzzseed:
 	@$(BIN)/hls-fuzzseed --limit 200 --mutate 1
 
-fuzzseed-acceptance: $(BIN)/acc-fuzzseed bin/hlc
+fuzzseed-acceptance: $(BIN)/acc-fuzzseed $(BIN)/hls-fuzzseed $(BIN)/hlboot bin/hlc
 	@echo "[Stage 134 acceptance] running tests/acc/fuzzseed_acceptance.hls..."
 	@$(BIN)/acc-fuzzseed
 	@echo "ACCEPTANCE OK: Stage 134 -- fuzz corpus seeding from real-world packages"
