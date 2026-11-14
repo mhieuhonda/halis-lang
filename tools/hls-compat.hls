@@ -1,0 +1,2495 @@
+# ============================================================================
+# tools/hls-compat.hls — the Stage 128 backwards-compatibility verifier,
+# in Halis (the native twin of the Python hls-compat.py that retired;
+# same census, same ledger discipline, same witness — driven through
+# bin/hls-compat, built by the bootstrap's own compiler).
+# ----------------------------------------------------------------------------
+# Stage 128's question is the one every growing language eventually has
+# to answer honestly: does a program that compiled and ran green on
+# release vN still compile and run green TODAY? The roadmap phrase is
+# "every prior version's ok/" — the acceptance corpus each release
+# shipped, replayed against the current toolchain. This tool replays it
+# and refuses to believe the answer, it measures it:
+#
+#   1. the CENSUS — every release tag in the repository is discovered
+#      (v<major>.<minor>[.<patch>][-suffix]; non-release tags are
+#      counted and named, never silently dropped) and its tests/ok
+#      corpus is extracted with `git archive` (through tar — no
+#      worktree checkout, no dirty tree). The corpora are
+#      content-addressed: a fixture that never changed between two
+#      releases is verified ONCE (its import closure is part of its
+#      identity, so a fixture whose imported sibling changed is a
+#      different program and re-runs). 170+ releases collapse to a
+#      few hundred unique programs — the whole history replays in
+#      minutes, which is what makes the suite per-commit runnable.
+#
+#   2. the INTERPRETER leg — every unique historical program runs
+#      through TODAY'S Stage-0 evaluator, bin/hlboot: today's checker,
+#      today's effects, today's stdlib (std./core. imports resolve to
+#      the current repo through the cwd fallback; relative imports
+#      resolve inside the extracted historical tree, so a fixture runs
+#      with the siblings it shipped with). The bar is the suite's own
+#      convention: exit 0, or exit 101 for the expected-panic
+#      fixtures. Anything else is a failure, named with its first
+#      error line. The python years spawned tools/hlinterp/boot.py;
+#      the interpreter retired into bin/hlboot and the leg rides it —
+#      the differential suites pin the two to the same verdicts on
+#      the same bytes, so the census keeps its meaning.
+#
+#   3. the LEDGER — failures are diffed against the sanctioned-drift
+#      registry (tests/compat_ledger.json), never waved through. A
+#      failure the ledger names is WAIVED (the sanctioned change is
+#      quoted back at you); a failure the ledger does not name is a
+#      REGRESSION — the alarm this stage exists to sound. The diff is
+#      two-way: a ledgered program that runs green again is
+#      RECONCILED (the waiver is stale and must be trimmed), and a
+#      ledger entry that matches no historical content is STALE.
+#      Entries come in three kinds: "break" (it ran green at its
+#      release; today it fails), "resurrect" (it was red at its
+#      release — a toolchain bug; today it runs green — the drift
+#      must be owned, not accidental), and "drift" (it still exits 0
+#      on both toolchains but its output changed — the entry pins
+#      BOTH stdout digests and the last old-behaviour release, so any
+#      further drift of the same program fails the witness).
+#
+#   4. the NATIVE leg (--native) — every program whose interpreter
+#      leg was green is compiled with the house recipe (bin/hlc +
+#      gcc -O2 -lm -pthread; the freestanding recipe for
+#      #![freestanding] crates) and run; native (exit, stdout) must
+#      equal interpreter (exit, stdout) byte for byte. The
+#      differential suite's discipline extended across time: an old
+#      program must still produce the same result on BOTH of today's
+#      backends.
+#
+#   5. the TIME-TRAVEL leg (--time-travel) — the strongest witness:
+#      for sampled tags the FULL tree at that tag is extracted and the
+#      tag's OWN interpreter runs its own corpus (its world, its
+#      stdlib — what vN actually shipped and tested), beside today's
+#      evaluator on the same programs. Old trees ship their
+#      interpreter as boot/boot.py or tools/hlinterp/boot.py (both
+#      python — spawned with python3, historical content, the world
+#      the release actually ran); trees from the native era ship
+#      tools/hlboot.hls, which is built inside the extracted tree with
+#      TODAY's frozen-surface compiler (the v1.0 law: the compiler
+#      reads the language the same way it did at the release, so the
+#      tag's own evaluator runs with its own sources). Exit code and
+#      stdout must agree byte for byte, with exactly the sanctioned
+#      exceptions the ledger names — and the witnessing runs BOTH
+#      ways: a "break" entry is checked to have really run green at
+#      its release, a "resurrect" entry to have really been red (an
+#      unnamed resurrection — a red-at-release program that runs green
+#      today — is a problem to own, not a pass). A program that fails
+#      under its own release's interpreter is an OLD-BUG, reported
+#      honestly and excluded from the comparison. 'all' sweeps every
+#      release; the default samples the bookends plus one tag per
+#      sanctioned-drift family, so every waiver's history is checked
+#      every time the leg runs. The runs are strictly sequential —
+#      the corpus contains port-binding fixtures and timing-sensitive
+#      handshakes, and a verifier must not have a mode that can
+#      falsify history.
+#
+# The unit surface: the python battery importlib-loaded the tool's
+# private helpers; the gates ask the same questions through this
+# binary's --unit-* modes (vkey / ctx / ctx1 / fp / fp1 / env / rels /
+# ledger), which print the same JSON the shim printed.
+#
+# Exit codes: 0 = COMPATIBLE; 1 = not compatible (a regression, a
+# native divergence, a history divergence, or ledger drift — the
+# reason is named); 2 = usage (not a git repository, unknown tags,
+# missing/corrupt ledger, missing bin/hlboot or gcc, bad option
+# values).
+#
+# Usage:
+#   bin/hls-compat                       # verify the union corpus
+#   bin/hls-compat --tags v0.1.0,v0.70.0-alpha
+#   bin/hls-compat --native              # + the native differential leg
+#   bin/hls-compat --time-travel         # + the sampled history witness
+#   bin/hls-compat --time-travel v0.1.0,v0.34.0-alpha
+#   bin/hls-compat --discover            # the tag census, no runs
+#   bin/hls-compat --json report.json    # machine-readable report
+#   bin/hls-compat --update-ledger       # print the failing set
+# ============================================================================
+
+import "std.str"
+import "std.json"
+import "std.result"
+import "std.sha256"
+import "std.env"
+import "std.fs"
+
+# ----------------------------------------------------------------------------
+# Constants.
+# ----------------------------------------------------------------------------
+
+fn CC_VERSION() -> str {
+    return "0.146.0-alpha"
+}
+
+fn CC_LEDGER_PATH() -> str {
+    return "tests/compat_ledger.json"
+}
+
+fn CC_LEDGER_SCHEMA() -> int {
+    return 1
+}
+
+# The default time-travel sample: the two bookends (the oldest and
+# the latest release — dynamic, so the sample stays honest as the
+# history grows) plus one tag per sanctioned-drift family (the html
+# forward-slash escaping + the Hieu-Louis-to-Halis data rename, the
+# import guard, the asm register widths + the xxHash spec fix, the
+# hex64 word rendering + the config quoted-dot-key bug) — every
+# waiver's history is witnessed every run.
+fn CC_FAMILY_TAGS() -> list[str] {
+    return["v0.7.0-alpha", "v0.34.0-alpha", "v0.70.0-alpha",
+    "v0.103.0-alpha"]
+}
+
+# ----------------------------------------------------------------------------
+# The child runner (the batteries' RunResult shape).
+# ----------------------------------------------------------------------------
+
+struct RunRes {
+    code: int,
+    out: str,
+    err: str,
+    spawned: bool
+}
+
+fn cc_run(prog: str, args: list[str]) -> RunRes uses Proc {
+    let r: RunRes = RunRes {
+        code: -1, out: "", err: "", spawned: false
+    }
+    let pid: int = proc_spawn(prog, args, 2, 1, 1)
+    if pid < 1 {
+        return r
+    }
+    r.spawned = true
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    r.code = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    r.out = out
+    r.err = err
+    return r
+}
+
+# cc_sh_capture — sh -c with stdout+stderr captured (the historical
+# runs need their own tree as cwd, which proc_spawn cannot give).
+fn cc_sh_capture(cmd: str) -> RunRes uses Proc {
+    let r: RunRes = RunRes {
+        code: -1, out: "", err: "", spawned: false
+    }
+    let pid: int = proc_spawn("sh", ["-c", cmd], 2, 1, 1)
+    if pid < 1 {
+        return r
+    }
+    r.spawned = true
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    r.code = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    r.out = out
+    r.err = err
+    return r
+}
+
+fn cc_sh(cmd: str) -> int uses Proc {
+    return proc_exec(cmd)
+}
+
+# ----------------------------------------------------------------------------
+# Version keys — v(major).(minor)[.(patch)][-suffix], tuple-ordered.
+# ----------------------------------------------------------------------------
+
+struct TagKey {
+    tag: str,
+    maj: int,
+    min: int,
+    pat: int,
+    suf: str
+}
+
+# cc_is_release — the release-tag grammar. Anything else (deep-scan-7)
+# is a working tag — counted and named, never a release.
+fn cc_is_release(tag: str) -> bool {
+    if tag.len() < 4 {
+        return false
+    }
+    if tag.byte_at(0) != 118 {
+        return false
+    }
+    let rest: str = tag.slice(1, tag.len())
+    let d1: int = cc_digits_end(rest, 0)
+    if d1 <= 0 || d1 >= rest.len() || rest.byte_at(d1) != 46 {
+        return false
+    }
+    let d2: int = cc_digits_end(rest, d1 + 1)
+    if d2 <= d1 + 1 {
+        return false
+    }
+    let mut pos: int = d2
+    # optional .patch
+    if pos < rest.len() && rest.byte_at(pos) == 46 {
+        let d3: int = cc_digits_end(rest, pos + 1)
+        if d3 > pos + 1 {
+            pos = d3
+        }
+    }
+    if pos >= rest.len() {
+        return true
+    }
+    let c: int = rest.byte_at(pos)
+    if c != 45 && c != 46 {
+        return false
+    }
+    let suf: str = rest.slice(pos + 1, rest.len())
+    if suf.len() == 0 {
+        return false
+    }
+    let mut i: int = 0
+    while i < suf.len() {
+        let b: int = suf.byte_at(i)
+        let ok: bool = (b >= 48 && b <= 57) || (b >= 65 && b <= 90)
+        || (b >= 97 && b <= 122) || b == 45 || b == 46
+        if !ok {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# cc_digits_end(s, from) — the index just past the digit run starting
+# at from (== from when there are none).
+fn cc_digits_end(s: str, from: int) -> int {
+    let mut i: int = from
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        if b < 48 || b > 57 {
+            break
+        }
+        i = i + 1
+    }
+    return i
+}
+
+fn cc_tag_key(tag: str) -> TagKey {
+    let rest: str = tag.slice(1, tag.len())
+    let d1: int = cc_digits_end(rest, 0)
+    let d2: int = cc_digits_end(rest, d1 + 1)
+    let mut pat: int = 0
+    let mut suf: str = ""
+    let mut pos: int = d2
+    if pos < rest.len() && rest.byte_at(pos) == 46 {
+        let d3: int = cc_digits_end(rest, pos + 1)
+        if d3 > pos + 1 {
+            pat = int(rest.slice(pos + 1, d3))
+            pos = d3
+        }
+    }
+    if pos < rest.len() && (rest.byte_at(pos) == 45 || rest.byte_at(pos) == 46) {
+        suf = rest.slice(pos + 1, rest.len())
+    }
+    let maj: int = int(rest.slice(0, d1))
+    let min: int = int(rest.slice(d1 + 1, d2))
+    return TagKey {
+        tag: tag, maj: maj, min: min, pat: pat, suf: suf
+    }
+}
+
+fn cc_str_lt(a: str, b: str) -> bool {
+    let n: int = a.len()
+    let m: int = b.len()
+    let mut i: int = 0
+    while i < n && i < m {
+        let ba: int = a.byte_at(i)
+        let bb: int = b.byte_at(i)
+        if ba != bb {
+            return ba < bb
+        }
+        i = i + 1
+    }
+    return n < m
+}
+
+fn cc_key_lt(a: TagKey, b: TagKey) -> bool {
+    if a.maj != b.maj {
+        return a.maj < b.maj
+    }
+    if a.min != b.min {
+        return a.min < b.min
+    }
+    if a.pat != b.pat {
+        return a.pat < b.pat
+    }
+    return cc_str_lt(a.suf, b.suf)
+}
+
+# cc_key_le — a <= b (tag <= drift_until is the drift window).
+fn cc_key_le(a: TagKey, b: TagKey) -> bool {
+    return !cc_key_lt(b, a)
+}
+
+# cc_sort_tags(tags) — the tuple-ordered sort, stable.
+fn cc_sort_tags(tags: list[str]) -> list[str] {
+    let keys: list[TagKey] = []
+    let mut i: int = 0
+    while i < tags.len() {
+        keys.push(cc_tag_key(tags.get(i)))
+        i = i + 1
+    }
+    let mut j: int = 1
+    while j < keys.len() {
+        let v: TagKey = keys.get(j)
+        let mut k: int = j - 1
+        while k >= 0 && cc_key_lt(v, keys.get(k)) {
+            keys.set(k + 1, keys.get(k))
+            k = k - 1
+        }
+        keys.set(k + 1, v)
+        j = j + 1
+    }
+    let out: list[str] = []
+    let mut m: int = 0
+    while m < keys.len() {
+        out.push(keys.get(m).tag)
+        m = m + 1
+    }
+    return out
+}
+
+fn cc_list_has(xs: list[str], x: str) -> bool {
+    let mut i: int = 0
+    while i < xs.len() {
+        if xs.get(i) == x {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn cc_list_find(xs: list[str], x: str) -> int {
+    let mut i: int = 0
+    while i < xs.len() {
+        if xs.get(i) == x {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# ----------------------------------------------------------------------------
+# Hashing and paths.
+# ----------------------------------------------------------------------------
+
+fn cc_sha16(data: str) -> str {
+    return sha256_hex(data).slice(0, 16)
+}
+
+# cc_chain_add — one round of the incremental digest: sha16 over the
+# running 16-hex accumulator + the next part. The python years fed a
+# streaming SHA-256; the values differ (a chain is not a stream) but
+# the LAW is identical — equal part sequences chain to equal digests,
+# any changed part changes the result — and these digests never leave
+# the tool (context keys, manifests, fingerprints: memo and identity
+# only; the ledger's sha256_16 and the report's stdout digests stay
+# the plain single-input sha16, byte-compatible with the registry).
+fn cc_chain_add(acc: str, part: str) -> str {
+    return sha256_hex(acc + part).slice(0, 16)
+}
+
+# cc_normpath — Python's os.path.normpath for "/"-separated paths
+# (collapse "//", "." and "..", keep a leading "/", drop the trailing).
+fn cc_normpath(p: str) -> str {
+    let abs: bool = p.len() > 0 && p.byte_at(0) == 47
+    let parts: list[str] = p.split("/")
+    let stack: list[str] = []
+    let mut i: int = 0
+    while i < parts.len() {
+        let seg: str = parts.get(i)
+        if seg == "" || seg == "." {
+            i = i + 1
+            continue
+        }
+        if seg == ".." {
+            if stack.len() > 0 && stack.get(stack.len() - 1) != ".." {
+                stack.pop()
+            } else {
+                if !abs {
+                    stack.push("..")
+                }
+            }
+            i = i + 1
+            continue
+        }
+        stack.push(seg)
+        i = i + 1
+    }
+    let mut out: str = ""
+    if abs {
+        out = "/"
+    }
+    let mut j: int = 0
+    while j < stack.len() {
+        if j > 0 {
+            out = out + "/"
+        }
+        out = out + stack.get(j)
+        j = j + 1
+    }
+    if out == "" {
+        return "."
+    }
+    return out
+}
+
+# cc_dirname / cc_join — the shell's dirname and one slash between.
+fn cc_dirname(p: str) -> str {
+    let mut i: int = p.len() - 1
+    while i >= 0 {
+        if p.byte_at(i) == 47 {
+            if i == 0 {
+                return "/"
+            }
+            return p.slice(0, i)
+        }
+        i = i - 1
+    }
+    return "."
+}
+
+fn cc_join(a: str, b: str) -> str {
+    if a == "." {
+        return b
+    }
+    if a.len() == 0 {
+        return b
+    }
+    if a.byte_at(a.len() - 1) == 47 {
+        return a + b
+    }
+    return a + "/" + b
+}
+
+# cc_relpath(path, base) — path made relative to base (the caller
+# guarantees the prefix; anything else passes through unchanged).
+fn cc_relpath(path: str, base: str) -> str {
+    if base == "." || base == "" {
+        return path
+    }
+    let mut pre: str = base
+    if pre.byte_at(pre.len() - 1) != 47 {
+        pre = pre + "/"
+    }
+    if path.len() >= pre.len() && path.slice(0, pre.len()) == pre {
+        return path.slice(pre.len(), path.len())
+    }
+    return path
+}
+
+# cc_basename(p) — everything past the last "/".
+fn cc_basename(p: str) -> str {
+    let mut i: int = p.len() - 1
+    while i >= 0 {
+        if p.byte_at(i) == 47 {
+            return p.slice(i + 1, p.len())
+        }
+        i = i - 1
+    }
+    return p
+}
+
+# cc_tag_dir — the tag as a path component (dots become underscores).
+fn cc_tag_dir(tag: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < tag.len() {
+        if tag.byte_at(i) == 46 {
+            out = out + "_"
+        } else {
+            out = out + tag.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# The environment — children must see the default world: no HL_* mode
+# vars (det/rt/rss arming, package dep dirs) leak into a compat run.
+# The keys come from /proc/self/environ (read once, before anything is
+# unset); the unsetting is std.env's (children inherit the result).
+# ----------------------------------------------------------------------------
+
+fn cc_env_keys() -> list[str] uses Fs {
+    let mut raw: str = ""
+    if file_exists("/proc/self/environ") {
+        raw = read_file("/proc/self/environ")
+    }
+    let entries: list[str] = raw.split(chr(0))
+    let keys: list[str] = []
+    let mut i: int = 0
+    while i < entries.len() {
+        let e: str = entries.get(i)
+        let eq: int = e.find("=")
+        if eq > 0 {
+            keys.push(e.slice(0, eq))
+        }
+        i = i + 1
+    }
+    return keys
+}
+
+# cc_clean_env — the inherited keys minus every HL_* (the python years
+# returned a cleaned dict; the port unsets the vars in its own
+# process, which is exactly what children inherit).
+fn cc_clean_env() -> list[str] uses Fs, Proc {
+    let keys: list[str] = cc_env_keys()
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < keys.len() {
+        let k: str = keys.get(i)
+        if k.starts_with("HL_") {
+            env_unset(k)
+        } else {
+            out.push(k)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# Extraction — git archive through tar (no worktree, no dirty tree).
+# A pathspec of "" extracts the FULL tree (the time-travel leg).
+# ----------------------------------------------------------------------------
+
+fn cc_extract_run(tag: str, dest: str, pathspec: str) -> bool uses Proc {
+    cc_sh("mkdir -p '" + dest + "'")
+    let mut cmd: str = "git archive '" + tag + "'"
+    if pathspec != "" {
+        cmd = cmd + " '" + pathspec + "'"
+    }
+    cmd = cmd + " | tar -x -C '" + dest + "'"
+    return cc_sh(cmd) == 0
+}
+
+# ----------------------------------------------------------------------------
+# Relative imports — the census's context law.
+# ----------------------------------------------------------------------------
+
+# cc_rel_imports — raw relative import paths (non-std./core.) in
+# source order: a line-leading `import "..."`.
+fn cc_rel_imports(src: str) -> list[str] {
+    let lines: list[str] = src.split("\n")
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < lines.len() {
+        let l: str = lines.get(i)
+        let t: str = cc_lstrip(l)
+        if t.starts_with("import ") {
+            let rest: str = cc_lstrip(t.slice(6, t.len()))
+            if rest.starts_with("\"") {
+                let close: int = cc_find_from(rest, "\"", 1)
+                if close > 1 {
+                    let path: str = rest.slice(1, close)
+                    if !path.starts_with("std.") && !path.starts_with("core.") {
+                        out.push(path)
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn cc_lstrip(s: str) -> str {
+    let mut i: int = 0
+    while i < s.len() && s.byte_at(i) <= 32 {
+        i = i + 1
+    }
+    return s.slice(i, s.len())
+}
+
+fn cc_find_from(s: str, sub: str, from: int) -> int {
+    let mut i: int = from
+    while i + sub.len() <= s.len() {
+        if s.slice(i, i + sub.len()) == sub {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# ----------------------------------------------------------------------------
+# The census.
+# ----------------------------------------------------------------------------
+
+struct Entry {
+    file: str,
+    sha: str,
+    key: str
+}
+
+struct Rec {
+    file: str,
+    sha: str,
+    key: str,
+    path: str,
+    rel_imports: bool,
+    tags: list[str],
+    rc: int,
+    out: str,
+    out_sha: str,
+    err: str,
+    verdict: str
+}
+
+struct Census {
+    tmp: str,
+    recs: list[Rec],
+    rec_idx: map[str, int],
+    corpora: map[str, list[Entry]]
+}
+
+fn cc_census_new(tmp: str) -> Census uses Proc {
+    cc_sh("rm -rf '" + tmp + "'")
+    cc_sh("mkdir -p '" + tmp + "'")
+    return Census {
+        tmp: tmp,
+        recs: [],
+        rec_idx: map_new(),
+        corpora: map_new()
+    }
+}
+
+# cc_list_hls(dir) — the sorted top-level .hls files of a directory
+# (the suite_01 convention — modules/ holds imported siblings, not
+# entries).
+fn cc_list_hls(dir: str) -> list[str] uses Fs {
+    let out: list[str] = []
+    let p: Path = path_from_str(dir)
+    if !path_is_dir(p) {
+        return out
+    }
+    let entries: list[Path] = path_read_dir(p)
+    let mut i: int = 0
+    while i < entries.len() {
+        let e: Path = entries.get(i)
+        let full: str = path_to_str(e)
+        if full.ends_with(".hls") && path_is_file(e) {
+            out.push(full)
+        }
+        i = i + 1
+    }
+    let mut j: int = 1
+    while j < out.len() {
+        let v: str = out.get(j)
+        let mut k: int = j - 1
+        while k >= 0 && cc_str_lt(v, out.get(k)) {
+            out.set(k + 1, out.get(k))
+            k = k - 1
+        }
+        out.set(k + 1, v)
+        j = j + 1
+    }
+    return out
+}
+
+# cc_under(p, base) — p == base or p lives under base + "/".
+fn cc_under(p: str, base: str) -> bool {
+    if p == base {
+        return true
+    }
+    if p.len() > base.len() + 1 && p.slice(0, base.len() + 1) == base + "/" {
+        return true
+    }
+    return false
+}
+
+# cc_context_hash — digest of the file + its relative-import closure
+# (the siblings it shipped with). Paths enter the chain RELATIVE to
+# the extracted tree so two releases carrying identical content hash
+# identically (the temp extraction dir's name must not leak into the
+# identity). "" when an import escapes the extracted tree — the caller
+# falls back to the whole-tree manifest (the program is its entire
+# context then).
+fn cc_context_hash(filepath: str, tree_root: str) -> str uses Fs {
+    let mut acc: str = ""
+    let stack: list[str] = [filepath]
+    let seen: list[str] = []
+    let base: str = cc_normpath(cc_dirname(filepath))
+    while stack.len() > 0 {
+        let fp: str = stack.pop()
+        let rp: str = cc_normpath(fp)
+        if cc_list_has(seen, rp) {
+            continue
+        }
+        seen.push(rp)
+        if !file_exists(rp) {
+            return ""
+        }
+        let data: str = read_file(rp)
+        acc = cc_chain_add(acc, cc_relpath(rp, tree_root))
+        acc = cc_chain_add(acc, data)
+        let rels: list[str] = cc_rel_imports(data)
+        let mut i: int = 0
+        while i < rels.len() {
+            let cand: str = cc_normpath(cc_join(cc_dirname(rp), rels.get(i)))
+            if cand != base && !cc_under(cand, base) {
+                return "" # escapes the tree (the old '..' imports)
+            }
+            if !file_exists(cand) {
+                return "" # unresolved inside the tree
+            }
+            stack.push(cand)
+            i = i + 1
+        }
+    }
+    return acc
+}
+
+# cc_manifest_hash — the whole-tree fallback: every file under okdir,
+# sorted by relative path, path + content.
+fn cc_manifest_hash(okdir: str) -> str uses Fs, Proc {
+    let files: list[str] = cc_walk_files(okdir)
+    let mut acc: str = ""
+    let mut i: int = 0
+    while i < files.len() {
+        acc = cc_chain_add(acc, cc_relpath(files.get(i), okdir))
+        acc = cc_chain_add(acc, read_file(files.get(i)))
+        i = i + 1
+    }
+    return acc
+}
+
+# cc_walk_files(dir) — every regular file under dir, recursively,
+# sorted by path (os.walk + sorted, made static).
+fn cc_walk_files(dir: str) -> list[str] uses Fs {
+    let out: list[str] = []
+    let p: Path = path_from_str(dir)
+    if !path_is_dir(p) {
+        return out
+    }
+    let all: list[Path] = path_walk_files(p)
+    let mut i: int = 0
+    while i < all.len() {
+        out.push(path_to_str(all.get(i)))
+        i = i + 1
+    }
+    let mut j: int = 1
+    while j < out.len() {
+        let v: str = out.get(j)
+        let mut k: int = j - 1
+        while k >= 0 && cc_str_lt(v, out.get(k)) {
+            out.set(k + 1, out.get(k))
+            k = k - 1
+        }
+        out.set(k + 1, v)
+        j = j + 1
+    }
+    return out
+}
+
+# cc_scan_tag — extract tests/ok, key every top-level fixture, and
+# attribute the tag to each key. The FIRST tree that produced a key
+# owns the run's concrete path; later tags just attribute themselves.
+fn cc_scan_tag(c: Census, tag: str) -> void uses Fs, Proc {
+    let dest: str = cc_join(c.tmp, "corpus_" + cc_tag_dir(tag))
+    let entries: list[Entry] = []
+    c.corpora.set(tag, entries)
+    if !cc_extract_run(tag, dest, "tests/ok") {
+        return
+    }
+    let okdir: str = cc_join(dest, "tests/ok")
+    let files: list[str] = cc_list_hls(okdir)
+    let mut i: int = 0
+    while i < files.len() {
+        let fp: str = files.get(i)
+        let src: str = read_file(fp)
+        let sha: str = cc_sha16(src)
+        let rels: list[str] = cc_rel_imports(src)
+        let mut key: str = sha
+        if rels.len() > 0 {
+            let ctx: str = cc_context_hash(fp, dest)
+            if ctx != "" {
+                key = sha + ":" + ctx
+            } else {
+                key = sha + ":" + cc_manifest_hash(okdir)
+            }
+        }
+        let e: Entry = Entry {
+            file: cc_basename(fp), sha: sha, key: key
+        }
+        entries.push(e)
+        let idx: int = c.rec_idx.get_or(key, -1)
+        if idx < 0 {
+            let rec: Rec = Rec {
+                file: e.file, sha: sha, key: key, path: fp,
+                rel_imports: rels.len() > 0, tags: [tag],
+                rc: -999, out: "", out_sha: "", err: "",
+                verdict: ""
+            }
+            c.recs.push(rec)
+            c.rec_idx.set(key, c.recs.len() - 1)
+        } else {
+            let rec: Rec = c.recs.get(idx)
+            rec.tags.push(tag)
+        }
+        i = i + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# The interpreter leg — today's evaluator on the historical programs.
+# ----------------------------------------------------------------------------
+
+# cc_run_today(path) — one green-check run through bin/hlboot (it
+# resolves std./core. through the cwd fallback; the tool runs from
+# the repo root — the law the gates already enforce).
+fn cc_run_today(path: str) -> RunRes uses Proc {
+    return cc_run("bin/hlboot", [path])
+}
+
+# cc_first_line(err) — the first non-blank stderr line.
+fn cc_first_line(err: str) -> str {
+    let lines: list[str] = err.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let l: str = lines.get(i).trim()
+        if l != "" {
+            return l
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# ----------------------------------------------------------------------------
+# The native leg — the house recipe (freestanding-aware).
+# ----------------------------------------------------------------------------
+
+# cc_compile_native(src, workdir, name) — compile and run one program.
+# Returns [ok, rc, stdout, msg]: ok "false" carries the failing stage.
+fn cc_compile_native(src: str, workdir: str, name: str) -> list[str] uses Fs, Proc {
+    if !file_exists("bin/hlc") {
+        return["false", "0", "", "no bin/hlc under the repo — run make bootstrap"]
+    }
+    let which_gcc: RunRes = cc_run("which", ["gcc"])
+    if which_gcc.code != 0 {
+        return["false", "0", "", "gcc not found on PATH"]
+    }
+    cc_sh("mkdir -p '" + workdir + "'")
+    let c_path: str = cc_join(workdir, name + ".c")
+    let bin_path: str = cc_join(workdir, name)
+    let comp: RunRes = cc_run("bin/hlc", [src, c_path])
+    if comp.code != 0 {
+        return["false", "0", "", "hlc compile failed on " + cc_basename(src)
+        + " (exit " + comp.code.to_str() + ")"]
+    }
+    let probe: str = cc_head400(read_file(src))
+    let mut gcc: RunRes = RunRes {
+        code: -1, out: "", err: "", spawned: false
+    }
+    if probe.contains("#![freestanding]") {
+        gcc = cc_run("gcc", ["-O2", "-ffreestanding", "-nostdlib",
+        "-ffunction-sections", "-fno-stack-protector",
+        "-Wl,--gc-sections", "-o", bin_path, c_path])
+    } else {
+        gcc = cc_run("gcc", ["-O2", "-o", bin_path, c_path,
+        "-lm", "-pthread"])
+    }
+    if gcc.code != 0 {
+        return["false", "0", "", "gcc failed on " + cc_basename(src)
+        + " (exit " + gcc.code.to_str() + ")"]
+    }
+    let run: RunRes = cc_run(bin_path, [])
+    return["true", run.code.to_str(), run.out, ""]
+}
+
+# cc_head400 — the first 400 bytes of a file (the freestanding probe).
+fn cc_head400(s: str) -> str {
+    if s.len() <= 400 {
+        return s
+    }
+    return s.slice(0, 400)
+}
+
+# ----------------------------------------------------------------------------
+# The ledger — the sanctioned-drift registry: strict schema, loud
+# failures.
+# ----------------------------------------------------------------------------
+
+struct Wav {
+    file: str,
+    sha: str,
+    kind: str, # break | resurrect | drift
+    sanctioned_change: str,
+    reason: str,
+    old_red_from: str, # "" when none
+    old_stdout_16: str, # drift only
+    new_stdout_16: str, # drift only
+    drift_until: str # drift only
+}
+
+fn cc_no_wav() -> Wav {
+    return Wav {
+        file: "", sha: "", kind: "", sanctioned_change: "", reason: "",
+        old_red_from: "", old_stdout_16: "", new_stdout_16: "",
+        drift_until: ""
+    }
+}
+
+# cc_load_ledger(path) — validate and index by file + "@" + sha. Dies
+# with exit 2 on every refusal (the python years' sys.exit(2),
+# verbatim messages).
+fn cc_load_ledger(path: str) -> map[str, Wav] uses IO, Fs, Exit {
+    if !file_exists(path) {
+        eprint("hls-compat: no ledger at " + path + " — the sanctioned-"
+        + "drift registry is part of the stage; run with "
+        + "--update-ledger to draft one\n")
+        exit(2)
+    }
+    let rr: Result[JsonValue, str] = json_parse_result(read_file(path))
+    if result_is_err(rr) {
+        eprint("hls-compat: ledger does not parse ("
+        + result_err_or(rr, "parse failed") + ")\n")
+        exit(2)
+    }
+    let data: JsonValue = result_unwrap(rr)
+    let schema: JsonValue = json_object_get(data, "schema")
+    let waivers_j: JsonValue = json_object_get(data, "waivers")
+    if !json_is_int(schema) || json_int_value(schema) != CC_LEDGER_SCHEMA()
+    || !json_is_array(waivers_j) {
+        eprint("hls-compat: ledger schema mismatch — expected schema "
+        + CC_LEDGER_SCHEMA().to_str() + " with a waivers[] list\n")
+        exit(2)
+    }
+    let by_key: map[str, Wav] = map_new()
+    let mut i: int = 0
+    while i < waivers_j.arr.len() {
+        let w: JsonValue = waivers_j.arr.get(i)
+        let file_j: JsonValue = json_object_get(w, "file")
+        let sha_j: JsonValue = json_object_get(w, "sha256_16")
+        let change_j: JsonValue = json_object_get(w, "sanctioned_change")
+        let reason_j: JsonValue = json_object_get(w, "reason")
+        if !cc_wav_field(file_j) || !cc_wav_field(sha_j)
+        || !cc_wav_field(change_j) || !cc_wav_field(reason_j) {
+            eprint("hls-compat: ledger entry missing 'sanctioned_change': "
+            + cc_json_line(w) + "\n")
+            exit(2)
+        }
+        let file: str = json_str_value(file_j)
+        let sha: str = json_str_value(sha_j)
+        let mut kind: str = "break"
+        let kind_j: JsonValue = json_object_get(w, "kind")
+        if json_is_str(kind_j) {
+            kind = json_str_value(kind_j)
+        }
+        if kind != "break" && kind != "resurrect" && kind != "drift" {
+            eprint("hls-compat: ledger entry for " + file + " has unknown "
+            + "kind '" + kind + "' (break|resurrect|drift)\n")
+            exit(2)
+        }
+        let mut old_red_from: str = ""
+        let gap_j: JsonValue = json_object_get(w, "old_red_from")
+        if json_is_str(gap_j) {
+            let gap: str = json_str_value(gap_j)
+            if !cc_is_release(gap) {
+                eprint("hls-compat: ledger entry for " + file + " has a "
+                + "malformed old_red_from '" + gap + "' (a release "
+                + "tag or null)\n")
+                exit(2)
+            }
+            old_red_from = gap
+        }
+        let mut old_stdout_16: str = ""
+        let mut new_stdout_16: str = ""
+        let mut drift_until: str = ""
+        if kind == "drift" {
+            let old_j: JsonValue = json_object_get(w, "old_stdout_16")
+            let new_j: JsonValue = json_object_get(w, "new_stdout_16")
+            if !json_is_str(old_j) || !cc_is_hex16(json_str_value(old_j)) {
+                eprint("hls-compat: drift entry for " + file + " needs "
+                + "a 16-hex old_stdout_16\n")
+                exit(2)
+            }
+            if !json_is_str(new_j) || !cc_is_hex16(json_str_value(new_j)) {
+                eprint("hls-compat: drift entry for " + file + " needs "
+                + "a 16-hex new_stdout_16\n")
+                exit(2)
+            }
+            old_stdout_16 = json_str_value(old_j)
+            new_stdout_16 = json_str_value(new_j)
+            let until_j: JsonValue = json_object_get(w, "drift_until")
+            if !json_is_str(until_j) || !cc_is_release(json_str_value(until_j)) {
+                eprint("hls-compat: drift entry for " + file + " needs a "
+                + "release tag in drift_until\n")
+                exit(2)
+            }
+            drift_until = json_str_value(until_j)
+        }
+        let wav: Wav = Wav {
+            file: file, sha: sha, kind: kind,
+            sanctioned_change: json_str_value(change_j),
+            reason: json_str_value(reason_j),
+            old_red_from: old_red_from,
+            old_stdout_16: old_stdout_16,
+            new_stdout_16: new_stdout_16,
+            drift_until: drift_until
+        }
+        by_key.set(file + "@" + sha, wav)
+        i = i + 1
+    }
+    return by_key
+}
+
+# cc_wav_field — a non-empty string field.
+fn cc_wav_field(v: JsonValue) -> bool {
+    if !json_is_str(v) {
+        return false
+    }
+    return json_str_value(v).trim() != ""
+}
+
+fn cc_is_hex16(s: str) -> bool {
+    if s.len() != 16 {
+        return false
+    }
+    let mut i: int = 0
+    while i < 16 {
+        let b: int = s.byte_at(i)
+        if !((b >= 48 && b <= 57) || (b >= 97 && b <= 102)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# ----------------------------------------------------------------------------
+# JSON rendering — json.dumps(indent=2, sort_keys=True) over
+# std.json's values (the report and the ledger draft).
+# ----------------------------------------------------------------------------
+
+fn cc_json_escape(s: str) -> str {
+    let mut out: str = "\""
+    let mut i: int = 0
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        if b == 34 {
+            out = out + "\\\""
+        } else if b == 92 {
+            out = out + "\\\\"
+        } else if b == 10 {
+            out = out + "\\n"
+        } else if b == 9 {
+            out = out + "\\t"
+        } else if b == 13 {
+            out = out + "\\r"
+        } else if b < 32 {
+            out = out + "\\u" + cc_hex4(b)
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out + "\""
+}
+
+fn cc_hex4(v: int) -> str {
+    let hex: str = "0123456789abcdef"
+    let mut n: int = v
+    if n < 0 {
+        n = 0
+    }
+    if n > 65535 {
+        n = 65535
+    }
+    let d3: int = n % 16
+    let d2: int = (n / 16) % 16
+    let d1: int = (n / 256) % 16
+    let d0: int = (n / 4096) % 16
+    return hex.slice(d0, d0 + 1) + hex.slice(d1, d1 + 1)
+    + hex.slice(d2, d2 + 1) + hex.slice(d3, d3 + 1)
+}
+
+fn cc_json_dump_at(v: JsonValue, indent: int) -> str {
+    let pad: str = cc_spaces(indent * 2)
+    let pad2: str = cc_spaces((indent + 1) * 2)
+    if json_is_null(v) {
+        return "null"
+    }
+    if json_is_bool(v) {
+        if json_bool_value(v) {
+            return "true"
+        }
+        return "false"
+    }
+    if json_is_int(v) {
+        return json_int_value(v).to_str()
+    }
+    if json_is_float(v) {
+        return json_float_value(v).to_str()
+    }
+    if json_is_str(v) {
+        return cc_json_escape(json_str_value(v))
+    }
+    if json_is_array(v) {
+        if v.arr.len() == 0 {
+            return "[]"
+        }
+        let mut out: str = "[\n"
+        let mut i: int = 0
+        while i < v.arr.len() {
+            out = out + pad2 + cc_json_dump_at(v.arr.get(i), indent + 1)
+            if i + 1 < v.arr.len() {
+                out = out + ","
+            }
+            out = out + "\n"
+            i = i + 1
+        }
+        return out + pad + "]"
+    }
+    if json_is_object(v) {
+        if v.obj_keys.len() == 0 {
+            return "{}"
+        }
+        # sorted keys (sort_keys=True)
+        let order: list[int] = []
+        let mut k: int = 0
+        while k < v.obj_keys.len() {
+            order.push(k)
+            k = k + 1
+        }
+        let mut j: int = 1
+        while j < order.len() {
+            let oi: int = order.get(j)
+            let mut m: int = j - 1
+            while m >= 0
+            && cc_str_lt(v.obj_keys.get(oi), v.obj_keys.get(order.get(m))) {
+                order.set(m + 1, order.get(m))
+                m = m - 1
+            }
+            order.set(m + 1, oi)
+            j = j + 1
+        }
+        let mut out2: str = "{\n"
+        let mut n: int = 0
+        while n < order.len() {
+            let ki: int = order.get(n)
+            out2 = out2 + pad2 + cc_json_escape(v.obj_keys.get(ki)) + ": "
+            + cc_json_dump_at(v.obj_vals.get(ki), indent + 1)
+            if n + 1 < order.len() {
+                out2 = out2 + ","
+            }
+            out2 = out2 + "\n"
+            n = n + 1
+        }
+        return out2 + pad + "}"
+    }
+    return "null"
+}
+
+fn cc_json_dump(v: JsonValue) -> str {
+    return cc_json_dump_at(v, 0)
+}
+
+# cc_json_line — a one-line rendering (the ledger refusal's excerpt).
+fn cc_json_line(v: JsonValue) -> str {
+    let s: str = cc_json_dump_at(v, 0)
+    let nl: int = s.find("\n")
+    if nl >= 0 {
+        return s.slice(0, nl)
+    }
+    if s.len() > 120 {
+        return s.slice(0, 120)
+    }
+    return s
+}
+
+fn cc_spaces(n: int) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < n {
+        out = out + " "
+        i = i + 1
+    }
+    return out
+}
+
+# JSON builders (the report's own shape).
+fn jv_strs(xs: list[str]) -> JsonValue {
+    let vals: list[JsonValue] = []
+    let mut i: int = 0
+    while i < xs.len() {
+        vals.push(json_str(xs.get(i)))
+        i = i + 1
+    }
+    return json_array(vals)
+}
+
+# ----------------------------------------------------------------------------
+# The time-travel leg — the tag's own interpreter over its own corpus.
+# ----------------------------------------------------------------------------
+
+# cc_old_interp(oldtree) — the tag's own Stage-0 interpreter:
+# "python3\t<path>" for the python eras (boot/boot.py, then
+# tools/hlinterp/boot.py), "" when the tree ships neither.
+fn cc_old_interp(oldtree: str) -> str uses Fs {
+    let b1: str = cc_join(oldtree, "boot/boot.py")
+    if file_exists(b1) {
+        return "python3\t" + b1
+    }
+    let b2: str = cc_join(oldtree, "tools/hlinterp/boot.py")
+    if file_exists(b2) {
+        return "python3\t" + b2
+    }
+    return ""
+}
+
+# cc_build_old_hlboot — build the tag's own evaluator inside its tree
+# with today's frozen-surface compiler (the native era's time-travel).
+# Returns the binary path, "" on failure.
+fn cc_build_old_hlboot(oldtree: str) -> str uses Fs, Proc {
+    let src: str = cc_join(oldtree, "tools/hlboot.hls")
+    if !file_exists(src) {
+        return ""
+    }
+    let cpath: str = cc_join(oldtree, "bin/hlboot-tt.c")
+    let bpath: str = cc_join(oldtree, "bin/hlboot-tt")
+    cc_sh("mkdir -p '" + cc_join(oldtree, "bin") + "'")
+    let comp: RunRes = cc_run("bin/hlc", [src, cpath])
+    if comp.code != 0 {
+        return ""
+    }
+    let gcc: RunRes = cc_run("gcc", ["-O1", "-o", bpath, cpath,
+    "-lm", "-pthread"])
+    if gcc.code != 0 {
+        return ""
+    }
+    return bpath
+}
+
+# cc_fingerprint — content fingerprint of a release's own interpreter
+# world (boot/ in old trees, tools/hlinterp/ in the interpreter era,
+# plus std/ and core/ — and the evaluator sources for the native era).
+# Two releases with the same fingerprint run the same file content
+# identically — the sweep memoizes on this.
+fn cc_fingerprint(tree_root: str) -> str uses Fs {
+    let mut acc: str = ""
+    let paths: list[str] = []
+    let subs: list[str] = ["boot", "tools/hlinterp", "std", "core"]
+    let mut si: int = 0
+    while si < subs.len() {
+        let d: str = cc_join(tree_root, subs.get(si))
+        if path_is_dir(path_from_str(d)) {
+            let files: list[str] = cc_walk_files(d)
+            let mut fi: int = 0
+            while fi < files.len() {
+                paths.push(files.get(fi))
+                fi = fi + 1
+            }
+        }
+        si = si + 1
+    }
+    let natives: list[str] = ["tools/hlboot.hls", "tools/hlboot_eval.hls",
+    "tools/hlfront.hls", "tools/hlemit.hls"]
+    let mut ni: int = 0
+    while ni < natives.len() {
+        let f: str = cc_join(tree_root, natives.get(ni))
+        if file_exists(f) {
+            paths.push(f)
+        }
+        ni = ni + 1
+    }
+    let sorted_paths: list[str] = cc_sort_strs(paths)
+    let mut i: int = 0
+    while i < sorted_paths.len() {
+        acc = cc_chain_add(acc, cc_relpath(sorted_paths.get(i), tree_root))
+        acc = cc_chain_add(acc, read_file(sorted_paths.get(i)))
+        i = i + 1
+    }
+    return acc
+}
+
+fn cc_sort_strs(xs: list[str]) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < xs.len() {
+        out.push(xs.get(i))
+        i = i + 1
+    }
+    let mut j: int = 1
+    while j < out.len() {
+        let v: str = out.get(j)
+        let mut k: int = j - 1
+        while k >= 0 && cc_str_lt(v, out.get(k)) {
+            out.set(k + 1, out.get(k))
+            k = k - 1
+        }
+        out.set(k + 1, v)
+        j = j + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# Formatting helpers (the python years' %-format verbs).
+# ----------------------------------------------------------------------------
+
+# cc_pad_left(s, n) — the %-verbs' numeric alignment (%3d).
+fn cc_pad_left(s: str, n: int) -> str {
+    let mut out: str = s
+    while out.len() < n {
+        out = " " + out
+    }
+    return out
+}
+
+fn cc_pad(s: str, n: int) -> str {
+    let mut out: str = s
+    while out.len() < n {
+        out = out + " "
+    }
+    return out
+}
+
+# cc_fixed1(num10) — "%.1f" of num10/10 ("75.4").
+fn cc_fixed1(num10: int) -> str {
+    return(num10 / 10).to_str() + "." + (num10 % 10).to_str()
+}
+
+fn cc_join_strs(xs: list[str], sep: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < xs.len() {
+        if i > 0 {
+            out = out + sep
+        }
+        out = out + xs.get(i)
+        i = i + 1
+    }
+    return out
+}
+
+fn cc_clip(s: str, n: int) -> str {
+    if s.len() <= n {
+        return s
+    }
+    return s.slice(0, n)
+}
+
+fn cc_or(s: str, fallback: str) -> str {
+    if s == "" {
+        return fallback
+    }
+    return s
+}
+
+fn cc_split_commas(s: str) -> list[str] {
+    if s == "" {
+        return[]
+    }
+    return s.split(",")
+}
+
+# cc_dedup_str — "%.1f" of instances/unique (as num10 = x10).
+fn cc_dedup_str(instances: int, unique: int) -> str {
+    if unique == 0 {
+        return "0.0"
+    }
+    return cc_fixed1(instances * 10 / unique)
+}
+
+fn cc_worst(v: str) -> int {
+    if v == "COMPATIBLE" {
+        return 0
+    }
+    if v == "COMPATIBLE-PANIC" {
+        return 1
+    }
+    if v == "RECONCILED" {
+        return 2
+    }
+    if v == "WAIVED" {
+        return 3
+    }
+    return 4
+}
+
+# cc_rec_order — the plan's iteration order: sorted by (file, sha).
+fn cc_rec_order(c: Census) -> list[int] {
+    let order: list[int] = []
+    let mut i: int = 0
+    while i < c.recs.len() {
+        order.push(i)
+        i = i + 1
+    }
+    let mut j: int = 1
+    while j < order.len() {
+        let v: int = order.get(j)
+        let vr: Rec = c.recs.get(v)
+        let mut k: int = j - 1
+        while k >= 0 {
+            let kr: Rec = c.recs.get(order.get(k))
+            let mut lt: bool = cc_str_lt(vr.file, kr.file)
+            if vr.file == kr.file {
+                lt = cc_str_lt(vr.sha, kr.sha)
+            }
+            if !lt {
+                break
+            }
+            order.set(k + 1, order.get(k))
+            k = k - 1
+        }
+        order.set(k + 1, v)
+        j = j + 1
+    }
+    return order
+}
+
+# ----------------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Fs, Proc, Clock, Args, Exit {
+    let argv: list[str] = args()
+
+    # ---- the unit surface (the gates' shim questions) ----
+    if argv.len() > 1 {
+        let a1: str = argv.get(1)
+        if a1 == "--unit-vkey" || a1 == "--unit-ctx" || a1 == "--unit-ctx1"
+        || a1 == "--unit-fp" || a1 == "--unit-fp1"
+        || a1 == "--unit-env" || a1 == "--unit-rels"
+        || a1 == "--unit-ledger" {
+            return cc_unit_main(argv)
+        }
+    }
+
+    # ---- flags ----
+    let mut tags_arg: str = ""
+    let mut timeout_s: int = 60
+    let mut native_on: bool = false
+    let mut travel_arg: str = ""
+    let mut travel_on: bool = false
+    let mut discover: bool = false
+    let mut json_path: str = ""
+    let mut update_ledger: bool = false
+    let mut bad_flag: str = ""
+    let mut i: int = 1
+    while i < argv.len() {
+        let a: str = argv.get(i)
+        if a == "--tags" {
+            if i + 1 >= argv.len() {
+                bad_flag = "--tags needs a list"
+            } else {
+                i = i + 1
+                tags_arg = argv.get(i)
+            }
+        } else if a == "--timeout" {
+            if i + 1 >= argv.len() {
+                bad_flag = "--timeout needs a value"
+            } else {
+                i = i + 1
+                let v: str = argv.get(i)
+                let mut ok: bool = v.len() > 0
+                let mut vi: int = 0
+                while vi < v.len() {
+                    let b: int = v.byte_at(vi)
+                    if b < 48 || b > 57 {
+                        ok = false
+                    }
+                    vi = vi + 1
+                }
+                if ok {
+                    timeout_s = int(v)
+                } else {
+                    bad_flag = "--timeout needs an integer"
+                }
+            }
+        } else if a == "--native" {
+            native_on = true
+        } else if a == "--time-travel" {
+            travel_on = true
+            if i + 1 < argv.len() && !argv.get(i + 1).starts_with("--") {
+                i = i + 1
+                travel_arg = argv.get(i)
+            } else {
+                travel_arg = "default"
+            }
+        } else if a == "--discover" {
+            discover = true
+        } else if a == "--json" {
+            if i + 1 >= argv.len() {
+                bad_flag = "--json needs a file"
+            } else {
+                i = i + 1
+                json_path = argv.get(i)
+            }
+        } else if a == "--update-ledger" {
+            update_ledger = true
+        } else if a == "--help" || a == "-h" {
+            print("usage: hls-compat [--tags T1,T2,...] [--timeout SEC]\n"
+            + "                  [--native] [--time-travel [T1,T2,...|all]]\n"
+            + "                  [--discover] [--json FILE] [--update-ledger]\n")
+            return 0
+        } else {
+            bad_flag = "unknown option " + a
+        }
+        i = i + 1
+    }
+    if bad_flag != "" {
+        eprint("hls-compat: " + bad_flag + "\n")
+        return 2
+    }
+    if timeout_s < 1 {
+        eprint("hls-compat: --timeout must be >= 1 second\n")
+        return 2
+    }
+
+    # ---- the tag census ----
+    let taglist: RunRes = cc_run("git", ["tag"])
+    if taglist.code != 0 {
+        eprint("hls-compat: git tag failed — is this a git repository?\n")
+        return 2
+    }
+    let releases: list[str] = []
+    let others: list[str] = []
+    let tlines: list[str] = taglist.out.split("\n")
+    let mut ti: int = 0
+    while ti < tlines.len() {
+        let t: str = tlines.get(ti).trim()
+        if t == "" {
+            ti = ti + 1
+            continue
+        }
+        if cc_is_release(t) {
+            releases.push(t)
+        } else {
+            others.push(t)
+        }
+        ti = ti + 1
+    }
+    if releases.len() == 0 {
+        eprint("hls-compat: no release tags found — nothing to verify\n")
+        return 2
+    }
+    let mut final_releases: list[str] = cc_sort_tags(releases)
+
+    if tags_arg != "" {
+        let wanted: list[str] = []
+        let parts: list[str] = tags_arg.split(",")
+        let mut pi: int = 0
+        while pi < parts.len() {
+            let p: str = parts.get(pi).trim()
+            if p != "" {
+                wanted.push(p)
+            }
+            pi = pi + 1
+        }
+        let missing: list[str] = []
+        let mut wi: int = 0
+        while wi < wanted.len() {
+            if !cc_list_has(final_releases, wanted.get(wi)) {
+                missing.push(wanted.get(wi))
+            }
+            wi = wi + 1
+        }
+        if missing.len() > 0 {
+            eprint("hls-compat: not a release tag: "
+            + cc_join_strs(missing, ", ") + "\n")
+            return 2
+        }
+        final_releases = cc_sort_tags(wanted)
+    }
+
+    let tmp_root: str = "/tmp/hls-compat-" + proc_pid().to_str()
+    let census: Census = cc_census_new(tmp_root)
+    let mut ri: int = 0
+    while ri < final_releases.len() {
+        cc_scan_tag(census, final_releases.get(ri))
+        ri = ri + 1
+    }
+    let mut instances: int = 0
+    let mut ci: int = 0
+    while ci < final_releases.len() {
+        let es: list[Entry] = census.corpora.get_or(final_releases.get(ci), [])
+        instances = instances + es.len()
+        ci = ci + 1
+    }
+    let unique: int = census.recs.len()
+
+    # ---- --discover: the census, no runs ----
+    if discover {
+        let mut others_note: str = "none"
+        if others.len() > 0 {
+            others_note = cc_join_strs(others, ", ")
+        }
+        println("hls-compat: " + final_releases.len().to_str()
+        + " release tags, " + others.len().to_str()
+        + " non-release tags ignored (" + others_note + ")")
+        let mut di: int = 0
+        while di < final_releases.len() {
+            let tag: str = final_releases.get(di)
+            let es: list[Entry] = census.corpora.get_or(tag, [])
+            println("  " + cc_pad(tag, 24) + " "
+            + cc_pad_left(es.len().to_str(), 3) + " fixtures")
+            di = di + 1
+        }
+        println("hls-compat: " + instances.to_str() + " file-instances -> "
+        + unique.to_str() + " unique programs (dedup "
+        + cc_dedup_str(instances, unique) + "x)")
+        cc_sh("rm -rf '" + tmp_root + "'")
+        return 0
+    }
+
+    # ---- --update-ledger: draft the failing set ----
+    if update_ledger {
+        println("hls-compat: drafting the ledger from the CURRENT failing "
+        + "set (" + unique.to_str() + " unique programs, "
+        + instances.to_str() + " file-instances)...")
+        cc_clean_env()
+        if !file_exists("bin/hlboot") {
+            eprint("hls-compat: no bin/hlboot — run make bin/hlboot\n")
+            cc_sh("rm -rf '" + tmp_root + "'")
+            return 2
+        }
+        let sorted_recs: list[int] = cc_rec_order(census)
+        let draft: list[JsonValue] = []
+        let mut ui: int = 0
+        while ui < sorted_recs.len() {
+            let rec: Rec = census.recs.get(sorted_recs.get(ui))
+            let r: RunRes = cc_run_today(rec.path)
+            if r.code == 0 || r.code == 101 {
+                ui = ui + 1
+                continue
+            }
+            println("  FAIL " + cc_pad(rec.file, 28) + " " + rec.sha)
+            draft.push(json_object(
+            ["file", "sha256_16", "sanctioned_change", "reason",
+            "migrated_in"],
+            [json_str(rec.file), json_str(rec.sha),
+            json_str("UNREVIEWED"),
+            json_str(cc_clip(cc_first_line(r.err), 160)),
+            json_str("UNREVIEWED")]))
+            ui = ui + 1
+        }
+        println("---- ledger draft (tests/compat_ledger.json) ----")
+        print(cc_json_dump(json_object(["schema", "waivers"],
+        [json_int(CC_LEDGER_SCHEMA()), json_array(draft)])) + "\n")
+        println("---- end draft ----")
+        println("hls-compat: review every entry, name the sanctioned change "
+        + "and the release that migrated the fixture, then splice "
+        + "into tests/compat_ledger.json — the tool never writes the "
+        + "ledger itself")
+        cc_sh("rm -rf '" + tmp_root + "'")
+        return 0
+    }
+
+    # ---- the ledger ----
+    let waivers: map[str, Wav] = cc_load_ledger(CC_LEDGER_PATH())
+
+    # ---- the interpreter leg: every unique program, today's world ----
+    cc_clean_env()
+    if !file_exists("bin/hlboot") {
+        eprint("hls-compat: no bin/hlboot — run make bin/hlboot\n")
+        cc_sh("rm -rf '" + tmp_root + "'")
+        return 2
+    }
+    let t0: int = clock_ms()
+    let mut n_compat: int = 0
+    let mut n_panic: int = 0
+    let mut n_waived: int = 0
+    let mut n_reg: int = 0
+    let order: list[int] = cc_rec_order(census)
+    let mut oi: int = 0
+    while oi < order.len() {
+        let rec: Rec = census.recs.get(order.get(oi))
+        let r: RunRes = cc_run_today(rec.path)
+        let wav: Wav = waivers.get_or(rec.file + "@" + rec.sha, cc_no_wav())
+        rec.rc = r.code
+        rec.out = r.out
+        rec.out_sha = cc_sha16(r.out)
+        rec.err = ""
+        if r.code != 0 && r.code != 101 {
+            rec.err = cc_first_line(r.err)
+        }
+        if r.code == 0 {
+            if wav.kind == "break" {
+                # the ledger says today fails this program; it does not —
+                # the break-waiver is stale and must be trimmed
+                rec.verdict = "RECONCILED"
+                n_reg = n_reg + 1
+            } else {
+                rec.verdict = "COMPATIBLE"
+                n_compat = n_compat + 1
+            }
+        } else {
+            if r.code == 101 {
+                # the expected-panic convention's green (the suite's own
+                # since v0.1.0). A behavioural break that manifests as a
+                # panic — a program that ran to completion at its release
+                # and panics today — is invisible to this leg by design;
+                # the time-travel leg is the one that sees it, and the
+                # ledger entry that names it.
+                rec.verdict = "COMPATIBLE-PANIC"
+                n_panic = n_panic + 1
+            } else {
+                if wav.kind == "break" {
+                    rec.verdict = "WAIVED"
+                    n_waived = n_waived + 1
+                } else {
+                    # unledgered — or a resurrect-waiver whose "green
+                    # today" claim just broke. Either way: loud.
+                    rec.verdict = "REGRESSION"
+                    n_reg = n_reg + 1
+                }
+            }
+        }
+        oi = oi + 1
+    }
+    let duration_s: int = (clock_ms() - t0) / 1000
+
+    # Aggregate run-contexts into PROGRAMS (file, sha): one historical
+    # program may appear in many import contexts; the verdict that
+    # matters is the worst context it was ever seen in.
+    let mut ai: int = 0
+    while ai < order.len() {
+        let rec: Rec = census.recs.get(order.get(ai))
+        let mut aj: int = ai + 1
+        while aj < order.len() {
+            let other: Rec = census.recs.get(order.get(aj))
+            if other.file == rec.file && other.sha == rec.sha {
+                if cc_worst(other.verdict) > cc_worst(rec.verdict) {
+                    rec.verdict = other.verdict
+                    rec.rc = other.rc
+                    rec.err = cc_clip(other.err, 200)
+                }
+            }
+            aj = aj + 1
+        }
+        ai = ai + 1
+    }
+
+    # program rows (deduped, in the sorted order)
+    let p_files: list[str] = []
+    let p_shas: list[str] = []
+    let p_ctxs: list[int] = []
+    let p_tags: list[str] = []
+    let p_verdicts: list[str] = []
+    let p_exits: list[int] = []
+    let p_errors: list[str] = []
+    let mut pi2: int = 0
+    while pi2 < order.len() {
+        let rec: Rec = census.recs.get(order.get(pi2))
+        let found: int = cc_find_program(p_files, p_shas, rec.file, rec.sha)
+        if found < 0 {
+            p_files.push(rec.file)
+            p_shas.push(rec.sha)
+            p_ctxs.push(1)
+            p_tags.push(cc_join_strs(rec.tags, ","))
+            p_verdicts.push(rec.verdict)
+            p_exits.push(rec.rc)
+            p_errors.push(cc_clip(rec.err, 200))
+        } else {
+            p_ctxs.set(found, p_ctxs.get(found) + 1)
+            let tags2: list[str] = cc_split_commas(p_tags.get(found))
+            let mut tk2: int = 0
+            while tk2 < rec.tags.len() {
+                if !cc_list_has(tags2, rec.tags.get(tk2)) {
+                    tags2.push(rec.tags.get(tk2))
+                }
+                tk2 = tk2 + 1
+            }
+            p_tags.set(found, cc_join_strs(cc_sort_tags(tags2), ","))
+            if cc_worst(rec.verdict) > cc_worst(p_verdicts.get(found)) {
+                p_verdicts.set(found, rec.verdict)
+                p_exits.set(found, rec.rc)
+                p_errors.set(found, cc_clip(rec.err, 200))
+            }
+        }
+        pi2 = pi2 + 1
+    }
+
+    # program-level counts
+    let mut prog_compat: int = 0
+    let mut prog_panic: int = 0
+    let mut prog_waived: int = 0
+    let mut prog_reg: int = 0
+    let mut prog_rec: int = 0
+    let mut vi: int = 0
+    while vi < p_verdicts.len() {
+        let v: str = p_verdicts.get(vi)
+        if v == "COMPATIBLE" {
+            prog_compat = prog_compat + 1
+        } else if v == "COMPATIBLE-PANIC" {
+            prog_panic = prog_panic + 1
+        } else if v == "WAIVED" {
+            prog_waived = prog_waived + 1
+        } else if v == "REGRESSION" {
+            prog_reg = prog_reg + 1
+        } else {
+            prog_rec = prog_rec + 1
+        }
+        vi = vi + 1
+    }
+    let nprog: int = p_verdicts.len()
+
+    # the problems and the report's contents rows, per verdict
+    let problems: list[str] = []
+    let contents_waived: list[JsonValue] = []
+    let contents_reg: list[JsonValue] = []
+    let contents_rec: list[JsonValue] = []
+    let contents_compat: list[JsonValue] = []
+    let contents_panic: list[JsonValue] = []
+
+    let mut others_note2: str = "none"
+    if others.len() > 0 {
+        others_note2 = cc_join_strs(others, ", ")
+    }
+    println("hls-compat: " + final_releases.len().to_str()
+    + " release tags censused (" + others.len().to_str()
+    + " non-release tags ignored: " + others_note2 + ")")
+    println("hls-compat: union corpus: " + instances.to_str()
+    + " file-instances -> " + unique.to_str() + " unique programs (dedup "
+    + cc_dedup_str(instances, unique) + "x)")
+    println("hls-compat: interpreter leg: " + (n_compat + n_panic).to_str()
+    + " run-contexts green (" + n_compat.to_str() + " exit-0, "
+    + n_panic.to_str() + " expected-panic), "
+    + (n_waived + n_reg).to_str() + " fail; " + nprog.to_str()
+    + " distinct programs [" + final_releases.len().to_str()
+    + " tags/" + duration_s.to_str() + "s]")
+
+    let mut wi2: int = 0
+    while wi2 < nprog {
+        let v: str = p_verdicts.get(wi2)
+        let row: JsonValue = json_object(
+        ["file", "sha", "tags", "contexts", "exit", "error"],
+        [json_str(p_files.get(wi2)), json_str(p_shas.get(wi2)),
+        jv_strs(cc_split_commas(p_tags.get(wi2))),
+        json_int(p_ctxs.get(wi2)), json_int(p_exits.get(wi2)),
+        json_str(p_errors.get(wi2))])
+        if v == "WAIVED" {
+            contents_waived.push(row)
+            let w: Wav = waivers.get_or(p_files.get(wi2) + "@" + p_shas.get(wi2),
+            cc_no_wav())
+            let tl: list[str] = cc_split_commas(p_tags.get(wi2))
+            println("  WAIVED    " + p_files.get(wi2) + "@" + p_shas.get(wi2)
+            + "  " + tl.get(0) + ".." + tl.get(tl.len() - 1) + " ("
+            + tl.len().to_str() + " tags, " + p_ctxs.get(wi2).to_str()
+            + " contexts)")
+            println("            " + w.sanctioned_change)
+        } else {
+            if v == "REGRESSION" {
+                contents_reg.push(row)
+                problems.push("REGRESSION " + p_files.get(wi2) + "@"
+                + p_shas.get(wi2) + " (exit " + p_exits.get(wi2).to_str()
+                + "): " + cc_or(p_errors.get(wi2), "no error output"))
+            } else {
+                if v == "RECONCILED" {
+                    contents_rec.push(row)
+                    problems.push("RECONCILED " + p_files.get(wi2) + "@"
+                    + p_shas.get(wi2) + " runs green — trim the ledger entry")
+                } else {
+                    if v == "COMPATIBLE" {
+                        contents_compat.push(row)
+                    } else {
+                        contents_panic.push(row)
+                    }
+                }
+            }
+        }
+        wi2 = wi2 + 1
+    }
+
+    # ---- stale entries: a ledger entry that matches nothing in the
+    # census. On the FULL census that means history was rewritten or
+    # the entry was invented — loud. On a restricted --tags run the
+    # entry may simply predate or postdate the sampled releases —
+    # said so, not failed: the full run is the certificate, the
+    # restricted run a probe.
+    let seen_keys: list[str] = []
+    let mut ski: int = 0
+    while ski < census.recs.len() {
+        let rec: Rec = census.recs.get(ski)
+        let k: str = rec.file + "@" + rec.sha
+        if !cc_list_has(seen_keys, k) {
+            seen_keys.push(k)
+        }
+        ski = ski + 1
+    }
+    let sorted_lk: list[str] = cc_sort_strs(waivers.keys())
+    let mut li: int = 0
+    while li < sorted_lk.len() {
+        let k: str = sorted_lk.get(li)
+        if !cc_list_has(seen_keys, k) {
+            let w: Wav = waivers.get_or(k, cc_no_wav())
+            if tags_arg == "" {
+                problems.push("STALE ledger entry " + w.file + "@" + w.sha
+                + " matches no historical content")
+            } else {
+                println("  NOTE     " + w.file + "@" + w.sha
+                + " not censused (restricted run)")
+            }
+        }
+        li = li + 1
+    }
+
+    # ---- the native differential leg (--native) ----
+    let mut nat_ran: int = 0
+    let nat_divs: list[str] = []
+    if native_on {
+        let nat_work: str = cc_join(tmp_root, "native")
+        cc_sh("mkdir -p '" + nat_work + "'")
+        let mut ni2: int = 0
+        while ni2 < order.len() {
+            let rec: Rec = census.recs.get(order.get(ni2))
+            if rec.verdict != "COMPATIBLE" && rec.verdict != "COMPATIBLE-PANIC" {
+                ni2 = ni2 + 1
+                continue # waived/regressed programs cannot compile today
+            }
+            nat_ran = nat_ran + 1
+            let res: list[str] = cc_compile_native(rec.path, nat_work,
+            "n_" + rec.sha)
+            if res.get(0) != "true" {
+                nat_divs.push(rec.file + "@" + rec.sha + ": " + res.get(3))
+                ni2 = ni2 + 1
+                continue
+            }
+            let nrc: int = int(res.get(1))
+            let nout: str = res.get(2)
+            if nrc != rec.rc || nout != rec.out {
+                nat_divs.push(rec.file + "@" + rec.sha + ": native exit "
+                + nrc.to_str() + " vs interpreter " + rec.rc.to_str()
+                + "; stdout " + cc_sha16(nout) + " vs " + rec.out_sha)
+            }
+            ni2 = ni2 + 1
+        }
+        println("hls-compat: native leg: " + nat_ran.to_str()
+        + " programs compiled and run; " + nat_divs.len().to_str()
+        + " divergences")
+        let mut di2: int = 0
+        while di2 < nat_divs.len() {
+            problems.push("NATIVE-DIVERGENCE " + nat_divs.get(di2))
+            di2 = di2 + 1
+        }
+    }
+
+    # ---- the time-travel leg (--time-travel) ----
+    let tt_keys: list[str] = []
+    let tt_agree: list[int] = []
+    let tt_break: list[int] = []
+    let tt_res: list[int] = []
+    let tt_drift: list[int] = []
+    let tt_oldbugs_n: list[int] = []
+    let tt_divs_n: list[int] = []
+    let tt_resur_n: list[int] = []
+    if travel_on {
+        let travel_tags: list[str] = []
+        if travel_arg == "default" {
+            travel_tags.push(final_releases.get(0))
+            travel_tags.push(final_releases.get(final_releases.len() - 1))
+            let mut fi: int = 0
+            while fi < CC_FAMILY_TAGS().len() {
+                let t: str = CC_FAMILY_TAGS().get(fi)
+                if cc_list_has(final_releases, t) && !cc_list_has(travel_tags, t) {
+                    travel_tags.push(t)
+                }
+                fi = fi + 1
+            }
+        } else {
+            if travel_arg == "all" {
+                let mut ai2: int = 0
+                while ai2 < final_releases.len() {
+                    travel_tags.push(final_releases.get(ai2))
+                    ai2 = ai2 + 1
+                }
+            } else {
+                let parts: list[str] = travel_arg.split(",")
+                let mut pi3: int = 0
+                while pi3 < parts.len() {
+                    let p: str = parts.get(pi3).trim()
+                    if p != "" {
+                        travel_tags.push(p)
+                    }
+                    pi3 = pi3 + 1
+                }
+                let missing: list[str] = []
+                let mut mi: int = 0
+                while mi < travel_tags.len() {
+                    if !census.corpora.has(travel_tags.get(mi)) {
+                        missing.push(travel_tags.get(mi))
+                    }
+                    mi = mi + 1
+                }
+                if missing.len() > 0 {
+                    eprint("hls-compat: not a release tag: "
+                    + cc_join_strs(missing, ", ") + "\n")
+                    cc_sh("rm -rf '" + tmp_root + "'")
+                    return 2
+                }
+            }
+        }
+        # the old-memo: (run key, fingerprint) -> (rc, stdout). The
+        # runs are strictly sequential — see the header for why this
+        # leg has no parallel mode.
+        let memo_keys: list[str] = []
+        let memo_rc: list[int] = []
+        let memo_out: list[str] = []
+        let mut tag_i: int = 0
+        while tag_i < travel_tags.len() {
+            let tag: str = travel_tags.get(tag_i)
+            let oldtree: str = cc_join(tmp_root, "tt_" + cc_tag_dir(tag))
+            if !cc_extract_run(tag, oldtree, "") {
+                eprint("hls-compat: git archive failed on " + tag + "\n")
+                cc_sh("rm -rf '" + tmp_root + "'")
+                return 2
+            }
+            let interp: str = cc_old_interp(oldtree)
+            let mut use_native: bool = false
+            let mut native_path: str = ""
+            if interp == "" {
+                # the native era: the tag's own evaluator, built with
+                # today's frozen-surface compiler inside its tree
+                native_path = cc_build_old_hlboot(oldtree)
+                if native_path == "" {
+                    eprint("hls-compat: " + tag + " ships no Stage-0 "
+                    + "interpreter — cannot time-travel\n")
+                    cc_sh("rm -rf '" + tmp_root + "'")
+                    return 2
+                }
+                use_native = true
+            }
+            let fingerprint: str = cc_fingerprint(oldtree)
+            let mut agree: int = 0
+            let mut break_waived: int = 0
+            let mut resurrect_waived: int = 0
+            let mut drift_waived: int = 0
+            let oldbugs: list[str] = []
+            let divs: list[str] = []
+            let resurrections: list[str] = []
+            let entries: list[Entry] = census.corpora.get_or(tag, [])
+            let mut ei2: int = 0
+            while ei2 < entries.len() {
+                let e: Entry = entries.get(ei2)
+                let old_path: str = cc_join(cc_join(oldtree, "tests/ok"), e.file)
+                if !file_exists(old_path) {
+                    ei2 = ei2 + 1
+                    continue
+                }
+                let memo_key: str = e.key + "\t" + fingerprint
+                let memo_at: int = cc_list_find(memo_keys, memo_key)
+                let mut got_rc: int = 0
+                let mut got_out: str = ""
+                if memo_at >= 0 {
+                    got_rc = memo_rc.get(memo_at)
+                    got_out = memo_out.get(memo_at)
+                } else {
+                    let rr2: RunRes = cc_run_old_one(interp, use_native,
+                    native_path, old_path, oldtree)
+                    got_rc = rr2.code
+                    got_out = rr2.out
+                    memo_keys.push(memo_key)
+                    memo_rc.push(got_rc)
+                    memo_out.push(got_out)
+                }
+                # Today's verdict for THIS tag's own copy — the census
+                # already ran it in exactly this import context, so the
+                # comparison is like-for-like.
+                let rec: Rec = census.recs.get(
+                census.rec_idx.get_or(e.key, 0))
+                let nrc: int = rec.rc
+                let nout: str = rec.out
+                let w: Wav = waivers.get_or(e.file + "@" + e.sha, cc_no_wav())
+                let in_red_era: bool = w.old_red_from != ""
+                && cc_key_le(cc_tag_key(w.old_red_from), cc_tag_key(tag))
+                if w.kind == "drift"
+                && cc_key_le(cc_tag_key(tag), cc_tag_key(w.drift_until)) {
+                    # The claim, verified against history: both toolchains
+                    # exit 0 and the stdout digests are EXACTLY the two the
+                    # entry pins — any further drift of the same program
+                    # fails here.
+                    if got_rc == 0 && nrc == 0
+                    && cc_sha16(got_out) == w.old_stdout_16
+                    && cc_sha16(nout) == w.new_stdout_16 {
+                        drift_waived = drift_waived + 1
+                    } else {
+                        problems.push("WAIVER-DRIFT " + e.file + "@" + e.sha
+                        + " at " + tag + ": the ledger pinned old stdout "
+                        + w.old_stdout_16 + " / today stdout "
+                        + w.new_stdout_16 + ", but history shows old exit "
+                        + got_rc.to_str() + " stdout " + cc_sha16(got_out)
+                        + " and today exit " + nrc.to_str() + " stdout "
+                        + cc_sha16(nout))
+                    }
+                    ei2 = ei2 + 1
+                    continue
+                }
+                if w.kind == "break" {
+                    # The claim, verified against history: the program ran
+                    # to completion under its own release and does not run
+                    # green today. With a migration gap (old_red_from), the
+                    # gap-era releases are claimed the opposite way: the
+                    # historical interpreter rejected the program too.
+                    let mut verified: bool = false
+                    if in_red_era {
+                        verified = got_rc != 0 && nrc != 0
+                    } else {
+                        verified = got_rc == 0 && nrc != 0
+                    }
+                    if verified {
+                        break_waived = break_waived + 1
+                    } else {
+                        problems.push("WAIVER-DRIFT " + e.file + "@" + e.sha
+                        + " at " + tag + ": the ledger says a sanctioned "
+                        + "break, but history shows old exit "
+                        + got_rc.to_str() + " and today exit "
+                        + nrc.to_str())
+                    }
+                    ei2 = ei2 + 1
+                    continue
+                }
+                if w.kind == "resurrect" {
+                    if !in_red_era {
+                        # Before the bug landed the program was green under
+                        # its own release AND is green today — plain
+                        # agreement; the normal classification takes over.
+                    } else {
+                        # The claim, verified against history: the program
+                        # was red under its own release and is green today.
+                        if got_rc != 0 && nrc == 0 {
+                            resurrect_waived = resurrect_waived + 1
+                        } else {
+                            problems.push("WAIVER-DRIFT " + e.file + "@" + e.sha
+                            + " at " + tag + ": the ledger says a "
+                            + "sanctioned resurrection, but history shows "
+                            + "old exit " + got_rc.to_str() + " and today "
+                            + "exit " + nrc.to_str())
+                        }
+                        ei2 = ei2 + 1
+                        continue
+                    }
+                }
+                if got_rc != 0 && got_rc != 101 {
+                    oldbugs.push(e.file + " (" + got_rc.to_str() + ")")
+                    ei2 = ei2 + 1
+                    continue
+                }
+                if got_rc == 0 && nrc == 0 {
+                    if got_out == nout {
+                        agree = agree + 1
+                    } else {
+                        divs.push(e.file + ": old stdout " + cc_sha16(got_out)
+                        + "; today stdout " + cc_sha16(nout)
+                        + " (both exit 0)")
+                    }
+                } else {
+                    if got_rc == 0 {
+                        divs.push(e.file + ": old exit 0 / stdout "
+                        + cc_sha16(got_out) + "; today exit "
+                        + nrc.to_str() + " / stdout " + cc_sha16(nout)
+                        + " — a working program broke")
+                    } else {
+                        if nrc == 0 {
+                            resurrections.push(e.file
+                            + ": red at its own release (exit "
+                            + got_rc.to_str() + "), green today — name it "
+                            + "in the ledger (kind: resurrect) or investigate")
+                        } else {
+                            if got_out == nout {
+                                agree = agree + 1 # both panic, same stdout
+                            } else {
+                                divs.push(e.file + ": old exit 101 / stdout "
+                                + cc_sha16(got_out) + "; today exit "
+                                + nrc.to_str() + " / stdout "
+                                + cc_sha16(nout))
+                            }
+                        }
+                    }
+                }
+                ei2 = ei2 + 1
+            }
+            tt_keys.push(tag)
+            tt_agree.push(agree)
+            tt_break.push(break_waived)
+            tt_res.push(resurrect_waived)
+            tt_drift.push(drift_waived)
+            tt_oldbugs_n.push(oldbugs.len())
+            tt_divs_n.push(divs.len())
+            tt_resur_n.push(resurrections.len())
+            println("hls-compat: time-travel " + tag + ": " + agree.to_str()
+            + " agree, " + break_waived.to_str() + " break-waived, "
+            + resurrect_waived.to_str() + " resurrect-waived, "
+            + drift_waived.to_str() + " drift-waived (verified against "
+            + "history), " + oldbugs.len().to_str() + " old bugs, "
+            + divs.len().to_str() + " divergences, "
+            + resurrections.len().to_str() + " resurrections")
+            let mut obi: int = 0
+            while obi < oldbugs.len() {
+                println("            OLD-BUG " + oldbugs.get(obi))
+                obi = obi + 1
+            }
+            let mut dvi: int = 0
+            while dvi < divs.len() {
+                problems.push("TRAVEL-DIVERGENCE " + tag + ": " + divs.get(dvi))
+                dvi = dvi + 1
+            }
+            let mut rsi: int = 0
+            while rsi < resurrections.len() {
+                problems.push("RESURRECTED " + tag + ": " + resurrections.get(rsi))
+                rsi = rsi + 1
+            }
+            tag_i = tag_i + 1
+        }
+    }
+
+    # ---- the verdict ----
+    let mut pi4: int = 0
+    while pi4 < problems.len() {
+        println("  PROBLEM  " + problems.get(pi4))
+        pi4 = pi4 + 1
+    }
+    let ngreen: int = prog_compat + prog_panic
+    let mut code: int = 0
+    let mut verdict: str = "COMPATIBLE"
+    if problems.len() == 0 {
+        println("hls-compat: verdict COMPATIBLE — " + ngreen.to_str() + "/"
+        + nprog.to_str() + " distinct programs green, "
+        + prog_waived.to_str() + " waived under "
+        + cc_waiver_count().to_str() + " sanctioned drifts (ledger), 0 "
+        + "regressions" + cc_suffix_native(native_on)
+        + cc_suffix_travel(travel_on))
+    } else {
+        println("hls-compat: verdict NOT COMPATIBLE — " + prog_reg.to_str()
+        + " regression(s) among " + nprog.to_str() + " distinct "
+        + "programs, " + problems.len().to_str() + " problem(s) named above")
+        verdict = "NOT COMPATIBLE"
+        code = 1
+    }
+
+    # ---- the json report ----
+    if json_path != "" {
+        let cfg: JsonValue = json_object(
+        ["tags", "timeout_s", "native", "time_travel"],
+        [jv_strs(final_releases), json_int(timeout_s),
+        json_bool(native_on),
+        json_str(cc_travel_report(travel_on, travel_arg))])
+        let census_j: JsonValue = json_object(
+        ["release_tags", "non_release_tags", "file_instances",
+        "unique_programs"],
+        [json_int(final_releases.len()), jv_strs(others),
+        json_int(instances), json_int(unique)])
+        let contents: JsonValue = json_object(
+        ["COMPATIBLE", "COMPATIBLE-PANIC", "WAIVED", "REGRESSION",
+        "RECONCILED"],
+        [json_array(contents_compat), json_array(contents_panic),
+        json_array(contents_waived), json_array(contents_reg),
+        json_array(contents_rec)])
+        let mut nat_j: JsonValue = json_null()
+        if native_on {
+            let divs_j: list[JsonValue] = []
+            let mut ndi: int = 0
+            while ndi < nat_divs.len() {
+                divs_j.push(json_str(nat_divs.get(ndi)))
+                ndi = ndi + 1
+            }
+            nat_j = json_object(["ran", "divergences"],
+            [json_int(nat_ran), json_array(divs_j)])
+        }
+        let mut tt_j: JsonValue = json_null()
+        if travel_on {
+            let tk: list[str] = []
+            let tv: list[JsonValue] = []
+            let mut tti: int = 0
+            while tti < tt_keys.len() {
+                tk.push(tt_keys.get(tti))
+                tv.push(json_object(
+                ["agree", "break_waived", "resurrect_waived",
+                "drift_waived", "old_bugs", "divergences",
+                "resurrections"],
+                [json_int(tt_agree.get(tti)), json_int(tt_break.get(tti)),
+                json_int(tt_res.get(tti)), json_int(tt_drift.get(tti)),
+                json_array([]), json_array([]), json_array([])]))
+                tti = tti + 1
+            }
+            tt_j = json_object(tk, tv)
+        }
+        let report: JsonValue = json_object(
+        ["tool", "version", "config", "census", "verdict", "reasons",
+        "contents", "native", "time_travel"],
+        [json_str("hls-compat"), json_str(CC_VERSION()), cfg, census_j,
+        json_str(verdict), json_array([]), contents, nat_j, tt_j])
+        write_file(json_path, cc_json_dump(report) + "\n")
+    }
+
+    cc_sh("rm -rf '" + tmp_root + "'")
+    return code
+}
+
+# ----------------------------------------------------------------------------
+# Small helpers used by main.
+# ----------------------------------------------------------------------------
+
+# cc_find_program — the (file, sha) row index, -1 when absent.
+fn cc_find_program(files: list[str], shas: list[str], file: str, sha: str) -> int {
+    let mut i: int = 0
+    while i < files.len() {
+        if files.get(i) == file && shas.get(i) == sha {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# cc_waiver_count — the ledger's entry count (the verdict line quotes
+# it; the registry is the authority).
+fn cc_waiver_count() -> int uses Fs {
+    let rr: Result[JsonValue, str] = json_parse_result(read_file(CC_LEDGER_PATH()))
+    if result_is_err(rr) {
+        return 0
+    }
+    let w: JsonValue = json_object_get(result_unwrap(rr), "waivers")
+    if json_is_array(w) {
+        return w.arr.len()
+    }
+    return 0
+}
+
+fn cc_suffix_native(on: bool) -> str {
+    if on {
+        return "; native agrees"
+    }
+    return ""
+}
+
+fn cc_suffix_travel(on: bool) -> str {
+    if on {
+        return "; history agrees"
+    }
+    return ""
+}
+
+fn cc_travel_report(on: bool, arg: str) -> str {
+    if !on {
+        return ""
+    }
+    return arg
+}
+
+# cc_run_old_one — one historical run: the python eras' interpreter
+# with ITS tree as cwd (its world), or the native era's evaluator
+# (today's frozen-surface compiler built it inside its tree).
+fn cc_run_old_one(interp: str, use_native: bool, native_path: str,
+old_path: str, oldtree: str) -> RunRes uses Proc {
+    if use_native {
+        let sh_cmd: str = "cd '" + oldtree + "' && exec '" + native_path
+        + "' '" + old_path + "'"
+        return cc_sh_capture(sh_cmd)
+    }
+    let tab: int = interp.find("\t")
+    let boot: str = interp.slice(tab + 1, interp.len())
+    let sh_cmd2: str = "cd '" + oldtree + "' && exec python3 '" + boot
+    + "' '" + old_path + "'"
+    return cc_sh_capture(sh_cmd2)
+}
+
+# ----------------------------------------------------------------------------
+# The unit surface — the gates' shim questions, answered by the binary.
+# ----------------------------------------------------------------------------
+
+fn cc_unit_main(argv: list[str]) -> int uses IO, Fs, Proc, Exit {
+    let mode: str = argv.get(1)
+
+    if mode == "--unit-vkey" {
+        let tags: list[str] = ["v0.9.0-alpha", "v0.10.0-alpha",
+        "v0.100.0-alpha", "v0.99.1-alpha"]
+        let rows: list[JsonValue] = []
+        let mut i: int = 0
+        while i < tags.len() {
+            let k: TagKey = cc_tag_key(tags.get(i))
+            rows.push(json_array([json_int(k.maj), json_int(k.min),
+            json_int(k.pat), json_str(k.suf)]))
+            i = i + 1
+        }
+        print(cc_json_dump(json_array(rows)) + "\n")
+        return 0
+    }
+
+    if mode == "--unit-ctx" {
+        let a: str = cc_context_hash(argv.get(2), argv.get(3))
+        let b: str = cc_context_hash(argv.get(4), argv.get(5))
+        print(cc_json_dump(json_array([json_str(a), json_str(b)])) + "\n")
+        return 0
+    }
+
+    if mode == "--unit-ctx1" {
+        let a: str = cc_context_hash(argv.get(2), argv.get(3))
+        print(cc_json_dump(json_array([json_str(a)])) + "\n")
+        return 0
+    }
+
+    if mode == "--unit-fp" {
+        let a: str = cc_fingerprint(argv.get(2))
+        let b: str = cc_fingerprint(argv.get(3))
+        print(cc_json_dump(json_array([json_str(a), json_str(b)])) + "\n")
+        return 0
+    }
+
+    if mode == "--unit-fp1" {
+        let a: str = cc_fingerprint(argv.get(2))
+        print(cc_json_dump(json_array([json_str(a)])) + "\n")
+        return 0
+    }
+
+    if mode == "--unit-env" {
+        let keys: list[str] = cc_clean_env()
+        print(cc_json_dump(jv_strs(cc_sort_strs(keys))) + "\n")
+        return 0
+    }
+
+    if mode == "--unit-rels" {
+        # the argument is the SOURCE TEXT itself (the python shim took
+        # it as a string; the battery passes the fixture inline)
+        let rels: list[str] = cc_rel_imports(argv.get(2))
+        print(cc_json_dump(jv_strs(rels)) + "\n")
+        return 0
+    }
+
+    if mode == "--unit-ledger" {
+        let w: map[str, Wav] = cc_load_ledger(argv.get(2))
+        print(cc_json_dump(json_array([json_int(w.keys().len())])) + "\n")
+        return 0
+    }
+
+    eprint("error: unknown unit mode " + mode + "\n")
+    return 2
+}

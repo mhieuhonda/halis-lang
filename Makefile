@@ -365,8 +365,8 @@ $(BIN)/hls-fuzzseed: tools/hls-fuzzseed.hls tools/hlfront.hls src/hlc.hls $(wild
 	@rm -f $@.c
 
 # hls-compat -- in Halis (the native twin of the Python hls-compat.py that
-# retired; same CLI, same wire, same exits).
-$(BIN)/hls-compat: tools/hls-compat.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+# retired; same census, same ledger discipline, same history witness).
+$(BIN)/hls-compat: tools/hls-compat.hls $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
 	@mkdir -p $(BIN)
 	@echo "[hls-compat] hlc compiles the tool (self-hosted, no python)..."
 	@$(BIN)/hlc tools/hls-compat.hls $@.c
@@ -1093,7 +1093,7 @@ det-acceptance: $(BIN)/acc-det $(BIN)/hls-det bin/hlc $(BIN)/hltest $(BIN)/hlboo
 # historical programs byte-identical across today's backends), and the
 # corpus hygiene (fmt/lint/checker green, no litter). The gate needs
 # bin/hlc + gcc, so the native build is a prerequisite.
-compat-acceptance: $(BIN)/acc-compat bin/hlc
+compat-acceptance: $(BIN)/acc-compat $(BIN)/hls-compat bin/hlc
 	@echo "[Stage 128 acceptance] running tests/acc/compat_acceptance.hls..."
 	@$(BIN)/acc-compat
 	@echo "ACCEPTANCE OK: Stage 128 -- backwards-compatibility test suite (every prior version's ok/)"
