@@ -319,7 +319,10 @@ tail-acceptance: $(BIN)/hlboot
 	@gcc -O2 -o $(BIN)/fib31 $(BIN)/fib31.c -lm -pthread \
 	  || (echo "FAIL: C compile failed"; exit 1)
 	@# (b) the full-depth native run + the independently computed value.
-	@EXPECTED=$$(python3 -c "exec(\"def fd(n):\n if n==0: return (0,1)\n a,b=fd(n>>1)\n c=a*((2*b-a)%1000000007)%1000000007\n d=(a*a+b*b)%1000000007\n return (d,(c+d)%1000000007) if n&1 else (c,d)\nprint(fd(1000000)[0])\")"); \
+	@# The independently computed value: fast doubling, fib_tail(1_000_000)
+	@# mod 1_000_000_007 — computed once, pinned here (the oracle was
+	@# derived by the same arithmetic the .py era ran inline).
+	@EXPECTED=918091266; \
 	$(BIN)/fib31 1000000 >$(BIN)/fib31_nat.out 2>&1 || (echo "FAIL: native fib_tail(1_000_000) run failed"; exit 1); \
 	if grep -q "fib_tail(1000000) = $$EXPECTED" $(BIN)/fib31_nat.out; then \
 	  echo "  native fib_tail(1_000_000) = $$EXPECTED (independently computed via fast doubling): OK"; \

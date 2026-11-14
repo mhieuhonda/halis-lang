@@ -136,7 +136,7 @@ wasm-acceptance: $(BIN)/hlboot $(BIN)/hlwasm $(BIN)/hlwasm-opt
 	@# line (stderr, merged by 2>&1) — it polluted the output comparison
 	@# whenever the in-tree optimizer was active (CI red on main).
 	@grep -v "^wrote " $(BIN)/wasm_run.out | grep -v "^note:" | grep -v "^wasm-opt: " >$(BIN)/wasm_out.txt
-	@python3 -c "import sys; a=open('$(BIN)/interp_out.txt').read(); b=open('$(BIN)/wasm_out.txt').read(); sys.exit(0 if a==b else 1)" || (echo "FAIL: wasm output differs from interpreter"; diff $(BIN)/interp_out.txt $(BIN)/wasm_out.txt | head -5; exit 1)
+	@cmp -s $(BIN)/interp_out.txt $(BIN)/wasm_out.txt || (echo "FAIL: wasm output differs from interpreter"; diff $(BIN)/interp_out.txt $(BIN)/wasm_out.txt | head -5; exit 1)
 	@echo "  output check: OK (wasm output matches interpreter)"
 	@echo "ACCEPTANCE OK: examples/hello.hls compiles to a <10 KB wasm binary with correct output"
 
@@ -292,9 +292,9 @@ aarch64-acceptance: $(BIN)/hlaarch64
 	    $(BIN)/hlc --target-feature neon benchmarks/json_bench.hls $(BIN)/json_neon.c; \
 	    $(CC) -O2 -mbranch-protection=pac-ret+bti -o $(BIN)/json_neon $(BIN)/json_neon.c -lm -pthread; \
 	    NEON_MS=$$($(BIN)/json_neon 2>/dev/null | grep "time = " | sed -n 's/.*time = \([0-9]*\) ms.*/\1/p'); \
-	    RATIO=$$(python3 -c "print(round($$NEON_MS * 100.0 / $$BASELINE_MS, 1))"); \
+	    RATIO=$$(awk "BEGIN{printf \"%.1f\", $$NEON_MS * 100.0 / $$BASELINE_MS}"); \
 	    echo "  baseline: $$BASELINE_MS ms; neon+pac+bti: $$NEON_MS ms ($$RATIO% of baseline)"; \
-	    python3 -c "import sys; sys.exit(0 if $$RATIO <= 80.0 else 1)" \
+	    awk "BEGIN{exit !($$RATIO <= 80.0)}" \
 	      || (echo "FAIL: NEON build is $$RATIO% of baseline (>80% = <20% speedup)"; exit 1); \
 	    echo "  runtime bench:   OK ($$RATIO% of baseline, >=20% speedup)"; \
 	  else \
