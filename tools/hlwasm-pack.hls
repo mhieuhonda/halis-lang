@@ -1,0 +1,4967 @@
+# ============================================================================
+# tools/hlwasm-pack.hls — the Stage 76 wasm-pack kit, in Halis (the
+# native twin of the Python hlwasm_pack.py + hlwasm_pack_parts/ that
+# retired; same subcommands, same flags, same wire bytes, same
+# verdicts — driven through bin/hlwasm-pack, built by the bootstrap's
+# own compiler).
+# ----------------------------------------------------------------------------
+# Usage:
+#   bin/hlwasm-pack new NAME [--scope @org] [--dir DIR] [--template T]
+#   bin/hlwasm-pack build INPUT.hls [--out DIR] [--target T]
+#                          [--name NAME] [--version X.Y.Z] [--scope @org]
+#                          [--description D] [--license L] [--repository R]
+#                          [--authors A ...] [--keywords K ...]
+#                          [--wasm-opt auto|on|off] [--opt-level O1|O2|O3|Os]
+#   bin/hlwasm-pack pack [--pkg DIR] [--tgz FILE]
+#   bin/hlwasm-pack publish TARBALL [--registry URL] [--access public|
+#                          restricted] [--tag TAG] [--no-dry-run]
+#   bin/hlwasm-pack check PKG
+#   bin/hlwasm-pack test PKG
+#   bin/hlwasm-pack --unit-MODE ...   (the gates' shim questions)
+#
+# The .py was a facade over ten part modules (hwp_common .. hwp_cli);
+# the native twin is ONE file with the same ten sections in the same
+# order, so the battery's import-surface questions keep their meaning
+# (section 1 of the gate asks the binary itself, through --unit-surface).
+#
+# Design notes carried over verbatim from the .py's part docstrings:
+#
+#   * hls-wasm-pack is the wasm-pack equivalent for Halis web apps. It
+#     turns a .hls program into a publish-ready npm package (pkg/):
+#     .wasm + target-specific .js glue + .d.ts + package.json +
+#     README.md + .pack-manifest.json — then optionally packs it into
+#     a .tgz and (dry-run by default) publishes it to an npm registry.
+#   * PACK_FORMAT_VERSION is bumped if the on-disk layout of pkg/
+#     changes (a stale pkg/ from v1 must never validate as v2).
+#   * The realpath-based path-containment defence (Stage 27) is kept:
+#     symlinks are resolved on BOTH sides before comparison, so
+#     pkg/foo -> /etc can never exfiltrate or overwrite host files
+#     during pack/unpack. NATIVE DELTA, documented: the Halis runtime
+#     has no readlink loop (the no-libc realpath itself is lexical),
+#     so the native containment check is a lexical realpath (abspath
+#     + dot-dot normalisation, the same defence hls-pkg's confine
+#     runs) PLUS an explicit rejection of every tar member that is a
+#     link (symlink or hardlink) — the exfiltration vector the .py's
+#     realpath closed. Tar members with absolute paths or ".."
+#     segments are rejected before any write, exactly like the .py.
+#   * The tarball layout mirrors npm pack: files live under
+#     package/<fname>, mtime/uid/gid are zeroed and modes pinned to
+#     0644, so the bytes are reproducible (pack twice -> identical
+#     sha256; the gate checks exactly that).
+#   * publish is DRY-RUN BY DEFAULT: it validates the tarball +
+#     registry URL + access level and prints the exact `npm publish`
+#     command WITHOUT touching the network. A real publish requires
+#     the explicit --no-dry-run flag AND an installed npm binary.
+#   * The build compiles through the native hlwasm twin
+#     (bin/hlwasm --glue compact) — the runtime stays single-sourced;
+#     the Stage 73 compact glue's one non-UTF8 comment byte (a cp1252
+#     em-dash upstream mojibake) is normalised to U+FFFD on pack, the
+#     same errors="replace" the .py ran, so the published .js is
+#     decodable everywhere.
+#   * Timestamps in log lines are UTC (the .py stamped localtime; the
+#     native clock is UTC-only — the battery never keyed on the zone).
+#
+# Exit codes: 0 ok / 1 a named refusal / 2 usage. A refusal names the
+# rule, not just the fact.
+# ============================================================================
+
+import "std.str"
+import "std.json"
+import "std.result"
+import "std.sha256"
+import "std.archive"
+
+# hwp_unwrap_err — the error text of a known-Err result (every
+# caller sits inside a result_is_err branch; the .py's str(ex)).
+fn hwp_unwrap_err[T](r: Result[T, str]) -> str {
+    return result_err_or(r, "")
+}
+
+# ============================================================================
+# hwp_common — shared helpers (the .py part 1 of 10).
+# ============================================================================
+
+# On-disk pkg/ layout version (stamped into .pack-manifest.json).
+fn hwp_pack_format_version() -> int {
+    return 1
+}
+
+# Tool banner (--version prints this).
+fn hwp_banner() -> str {
+    return "hls-wasm-pack v0.95.0-alpha (Stage 76)"
+}
+
+# Publish-ready targets (the wasm-pack --target surface, adapted):
+#   bundler    ESM import — webpack / rollup / vite (default).
+#   web        ESM bare — no bundler (<script type=module>).
+#   nodejs     CommonJS require() — Node.js services / tests.
+#   deno       ESM + deno.json hint — deno run / deno publish.
+#   no-modules IIFE global HalisPack — plain <script> tag.
+fn hwp_pack_targets() -> list[str] {
+    return["bundler", "web", "nodejs", "deno", "no-modules"]
+}
+
+fn hwp_default_target() -> str {
+    return "bundler"
+}
+
+fn hwp_default_out_dir() -> str {
+    return "pkg"
+}
+
+fn hwp_default_opt_level() -> str {
+    return "O3"
+}
+
+# Size gates (documented in the acceptance test, not enforced by
+# build: a huge program still packs — check warns, it does not fail).
+fn hwp_warn_wasm_bytes() -> int {
+    return 102400
+}
+
+fn hwp_warn_js_bytes() -> int {
+    return 16384
+}
+
+# ---- the logger (the .py's _Ansi + log_info/warn/error) --------------------
+
+struct HwpLog {
+    color: bool, # forced by --color (true) / --no-color (false);
+    # -1 = auto (isatty(2))
+    auto: int
+}
+
+fn hwp_log_new() -> HwpLog {
+    return HwpLog {
+        color: false, auto: -1
+    }
+}
+
+fn hwp_use_color(l: HwpLog) -> bool uses IO {
+    if l.auto == 0 {
+        return l.color
+    }
+    if l.auto == 1 {
+        return l.color
+    }
+    return isatty(2)
+}
+
+# hwp_ts — "%Y-%m-%dT%H:%M:%S" from the UTC clock (the .py stamped
+# localtime; the native clock is UTC-only — see the header note).
+fn hwp_ts() -> str uses Clock {
+    let secs: int = system_time_now_ms() / 1000
+    let days: int = secs / 86400
+    let rem: int = secs % 86400
+    let ymd: list[int] = hwp_civil_from_days(days)
+    return ymd.get(0).to_str() + "-" + hwp_pad2(ymd.get(1)) + "-"
+    + hwp_pad2(ymd.get(2)) + "T" + hwp_pad2(rem / 3600) + ":"
+    + hwp_pad2((rem % 3600) / 60) + ":" + hwp_pad2(rem % 60)
+}
+
+# hwp_civil_from_days — days-since-epoch -> [y, m, d] (Howard
+# Hinnant's civil_from_calendar, the same arithmetic every native
+# twin in this tree carries).
+fn hwp_civil_from_days(z: int) -> list[int] {
+    let zz: int = z + 719468
+    let era: int = zz / 146097
+    let doe: int = zz - era * 146097
+    let yoe: int = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    let y: int = yoe + era * 400
+    let doy: int = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp: int = (5 * doy + 2) / 153
+    let d: int = doy - (153 * mp + 2) / 5 + 1
+    let mut m: int = mp + 3
+    if mp >= 10 {
+        m = mp - 9
+    }
+    let mut yy: int = y
+    if m <= 2 {
+        yy = y + 1
+    }
+    return[yy, m, d]
+}
+
+fn hwp_pad2(n: int) -> str {
+    let raw: str = n.to_str()
+    if raw.len() < 2 {
+        return "0" + raw
+    }
+    return raw
+}
+
+fn hwp_log_info(l: HwpLog, msg: str) -> void uses IO, Clock {
+    if hwp_use_color(l) {
+        eprint(chr(27) + "[32m" + hwp_ts() + chr(27) + "[0m [INFO] "
+        + msg + "\n")
+    } else {
+        eprint("hls-wasm-pack [" + hwp_ts() + "] INFO: " + msg + "\n")
+    }
+}
+
+fn hwp_log_warn(l: HwpLog, msg: str) -> void uses IO, Clock {
+    if hwp_use_color(l) {
+        eprint(chr(27) + "[33m" + hwp_ts() + chr(27) + "[0m [WARN] "
+        + msg + "\n")
+    } else {
+        eprint("hls-wasm-pack [" + hwp_ts() + "] WARN: " + msg + "\n")
+    }
+}
+
+fn hwp_log_error(l: HwpLog, msg: str) -> void uses IO, Clock {
+    if hwp_use_color(l) {
+        eprint(chr(27) + "[31m" + hwp_ts() + chr(27) + "[0m [ERROR] "
+        + msg + "\n")
+    } else {
+        eprint("hls-wasm-pack [" + hwp_ts() + "] ERROR: " + msg + "\n")
+    }
+}
+
+# ---- path helpers -----------------------------------------------------------
+
+# hwp_path_is_abs — POSIX absolute (leading '/'; the .py's
+# os.path.isatty never saw a drive letter either).
+fn hwp_path_is_abs(p: str) -> bool {
+    return p.len() > 0 && p.byte_at(0) == 47
+}
+
+# hwp_norm_path — lexical normalisation: resolve "." and ".." segments.
+fn hwp_norm_path(p: str) -> str {
+    if p == "" {
+        return "."
+    }
+    let parts: list[str] = []
+    let absv: bool = hwp_path_is_abs(p)
+    let mut i: int = 0
+    let n: int = p.len()
+    while i < n {
+        while i < n && p.byte_at(i) == 47 {
+            i = i + 1
+        }
+        let start: int = i
+        while i < n && p.byte_at(i) != 47 {
+            i = i + 1
+        }
+        if i > start {
+            let seg: str = p.slice(start, i)
+            if seg == "." {
+                # dropped
+            } else if seg == ".." {
+                if parts.len() > 0 && parts.get(parts.len() - 1) != ".." {
+                    parts.pop()
+                } else if !absv {
+                    parts.push("..")
+                }
+                # above root on an absolute path: dropped
+            } else {
+                parts.push(seg)
+            }
+        }
+    }
+    let joined: str = str_join(parts, "/")
+    if absv {
+        return "/" + joined
+    }
+    if joined == "" {
+        return "."
+    }
+    return joined
+}
+
+# hwp_realpath_lex — abspath + normalise (the lexical realpath; see
+# the header note on the native symlink delta).
+fn hwp_realpath_lex(p: str) -> str uses Proc {
+    if hwp_path_is_abs(p) {
+        return hwp_norm_path(p)
+    }
+    let cwd: str = cwd_get()
+    if cwd == "" {
+        return hwp_norm_path(p)
+    }
+    if cwd == "/" {
+        return hwp_norm_path("/" + p)
+    }
+    return hwp_norm_path(cwd + "/" + p)
+}
+
+# hwp_find_from — str.find with a start index.
+fn hwp_find_from(s: str, needle: str, from: int) -> int {
+    let mut start: int = from
+    if start < 0 {
+        start = 0
+    }
+    while start + needle.len() <= s.len() {
+        if s.slice(start, start + needle.len()) == needle {
+            return start
+        }
+        start = start + 1
+    }
+    return -1
+}
+
+# hwp_join_path — join with exactly one separator.
+fn hwp_join_path(base: str, rel: str) -> str {
+    if base == "" {
+        return rel
+    }
+    if rel == "" {
+        return base
+    }
+    if base.byte_at(base.len() - 1) == 47 {
+        return base + rel
+    }
+    return base + "/" + rel
+}
+
+# hwp_inside_dir — True iff path resolves INSIDE directory (the
+# Stage 27 containment defence; lexical on both sides, see header).
+fn hwp_inside_dir(path: str, directory: str) -> bool uses Proc {
+    let real_path: str = hwp_realpath_lex(path)
+    let real_dir: str = hwp_realpath_lex(directory)
+    if real_path == real_dir {
+        return true
+    }
+    return real_path.starts_with(real_dir + "/")
+}
+
+# hwp_shell_quote — single-quote sh quoting.
+fn hwp_shell_quote(s: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < s.len() {
+        if s.byte_at(i) == 39 {
+            out = out + "'\\''"
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ---- the JSON emitter (json.dump(obj, f, indent=2), byte-for-byte) ----------
+
+# hwp_json_dumps — the .py's json.dump(..., indent=2) + trailing
+# newline handling is the CALLER's; this renders the document itself.
+# Objects keep insertion order (parallel lists), empty containers
+# render {} / [], every non-ASCII rune escapes to \uXXXX the way
+# json.dump's default ensure_ascii does.
+fn hwp_json_dumps(v: JsonValue) -> str {
+    return hwp_json_render(v, 0)
+}
+
+fn hwp_json_indent(level: int) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < level {
+        out = out + "  "
+        i = i + 1
+    }
+    return out
+}
+
+fn hwp_json_render(v: JsonValue, level: int) -> str {
+    if json_is_str(v) {
+        return hwp_json_quote(json_str_value(v))
+    }
+    if json_is_int(v) {
+        return json_int_value(v).to_str()
+    }
+    if json_is_bool(v) {
+        if json_bool_value(v) {
+            return "true"
+        }
+        return "false"
+    }
+    if json_is_null(v) {
+        return "null"
+    }
+    if json_is_array(v) {
+        let items: list[JsonValue] = v.arr
+        if items.len() == 0 {
+            return "[]"
+        }
+        let mut out: str = "[\n"
+        let mut i: int = 0
+        while i < items.len() {
+            out = out + hwp_json_indent(level + 1)
+            + hwp_json_render(items.get(i), level + 1)
+            if i + 1 < items.len() {
+                out = out + ","
+            }
+            out = out + "\n"
+            i = i + 1
+        }
+        return out + hwp_json_indent(level) + "]"
+    }
+    if json_is_object(v) {
+        if v.obj_keys.len() == 0 {
+            return "{}"
+        }
+        let mut out: str = "{\n"
+        let mut i: int = 0
+        while i < v.obj_keys.len() {
+            out = out + hwp_json_indent(level + 1)
+            + hwp_json_quote(v.obj_keys.get(i)) + ": "
+            + hwp_json_render(v.obj_vals.get(i), level + 1)
+            if i + 1 < v.obj_keys.len() {
+                out = out + ","
+            }
+            out = out + "\n"
+            i = i + 1
+        }
+        return out + hwp_json_indent(level) + "}"
+    }
+    if json_is_float(v) {
+        return hwp_json_float_text(json_float_value(v))
+    }
+    return "null"
+}
+
+# hwp_json_float_text — repr-style float text (the payloads this tool
+# emits carry no floats; the branch exists so the emitter never lies).
+fn hwp_json_float_text(f: float) -> str {
+    return f.to_str()
+}
+
+fn hwp_hex4(v: int) -> str {
+    let digits: str = "0123456789abcdef"
+    let mut out: str = ""
+    let mut shift: int = 12
+    while shift >= 0 {
+        let nib: int = int_and(int_shr(v, shift), 15)
+        out = out + digits.slice(nib, nib + 1)
+        shift = shift - 4
+    }
+    return out
+}
+
+fn hwp_hex2(v: int) -> str {
+    let digits: str = "0123456789abcdef"
+    let hi: int = int_and(int_shr(v, 4), 15)
+    let lo: int = int_and(v, 15)
+    return digits.slice(hi, hi + 1) + digits.slice(lo, lo + 1)
+}
+
+# hwp_json_quote — a JSON string literal with ensure_ascii escaping:
+# control runes -> \u00xx (or the short \n \t \r \b \f forms), quote
+# and backslash escaped, every rune >= 0x80 -> \uXXXX (surrogate
+# pairs for the astral ones), invalid UTF-8 bytes -> \ufffd.
+fn hwp_json_quote(s: str) -> str {
+    let mut out: str = "\""
+    let mut i: int = 0
+    let n: int = s.len()
+    while i < n {
+        let b: int = s.byte_at(i)
+        if b == 34 {
+            out = out + "\\\""
+            i = i + 1
+        } else if b == 92 {
+            out = out + "\\\\"
+            i = i + 1
+        } else if b == 10 {
+            out = out + "\\n"
+            i = i + 1
+        } else if b == 13 {
+            out = out + "\\r"
+            i = i + 1
+        } else if b == 9 {
+            out = out + "\\t"
+            i = i + 1
+        } else if b == 8 {
+            out = out + "\\b"
+            i = i + 1
+        } else if b == 12 {
+            out = out + "\\f"
+            i = i + 1
+        } else if b < 32 {
+            out = out + "\\u00" + hwp_hex2(b)
+            i = i + 1
+        } else if b < 128 {
+            out = out + s.slice(i, i + 1)
+            i = i + 1
+        } else {
+            # A UTF-8 sequence (or an invalid byte -> U+FFFD).
+            let cp: int = hwp_utf8_decode_at(s, i)
+            if cp < 0 {
+                out = out + "\\ufffd"
+                i = i + 1
+            } else if cp < 65536 {
+                out = out + "\\u" + hwp_hex4(cp)
+                i = i + hwp_utf8_seq_len(b)
+            } else {
+                let base: int = cp - 65536
+                let hi: int = 55296 + int_shr(base, 10)
+                let lo: int = 56320 + int_and(base, 1023)
+                out = out + "\\u" + hwp_hex4(hi) + "\\u" + hwp_hex4(lo)
+                i = i + hwp_utf8_seq_len(b)
+            }
+        }
+    }
+    return out + "\""
+}
+
+# hwp_utf8_seq_len — the byte length of the sequence a lead byte
+# promises (2..4); 1 when the byte promises nothing.
+fn hwp_utf8_seq_len(lead: int) -> int {
+    if lead >= 194 && lead <= 223 {
+        return 2
+    }
+    if lead >= 224 && lead <= 239 {
+        return 3
+    }
+    if lead >= 240 && lead <= 247 {
+        return 4
+    }
+    return 1
+}
+
+# hwp_utf8_decode_at — the codepoint starting at i, or -1 when the
+# bytes there are not a valid (non-overlong, non-surrogate,
+# non-too-big) UTF-8 sequence.
+fn hwp_utf8_decode_at(s: str, i: int) -> int {
+    let n: int = s.len()
+    let lead: int = s.byte_at(i)
+    let need: int = hwp_utf8_seq_len(lead)
+    if need == 1 {
+        return -1
+    }
+    if i + need > n {
+        return -1
+    }
+    let mut cp: int = 0
+    if need == 2 {
+        cp = lead - 192
+    } else if need == 3 {
+        cp = lead - 224
+    } else {
+        cp = lead - 240
+    }
+    let mut k: int = 1
+    while k < need {
+        let b: int = s.byte_at(i + k)
+        if b < 128 || b > 191 {
+            return -1
+        }
+        cp = cp * 64 + (b - 128)
+        k = k + 1
+    }
+    # Overlong / surrogate / out-of-range forms are invalid.
+    if need == 2 && cp < 128 {
+        return -1
+    }
+    if need == 3 && cp < 2048 {
+        return -1
+    }
+    if need == 4 && cp < 65536 {
+        return -1
+    }
+    if cp >= 55296 && cp <= 57343 {
+        return -1
+    }
+    if cp > 1114111 {
+        return -1
+    }
+    return cp
+}
+
+# hwp_utf8_sanitize — the .py's bytes.decode("utf-8",
+# errors="replace"): every invalid byte becomes U+FFFD so the
+# published .js is decodable everywhere (the compact glue's one
+# cp1252 em-dash comment byte).
+fn hwp_utf8_sanitize(s: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    let n: int = s.len()
+    while i < n {
+        let b: int = s.byte_at(i)
+        if b < 128 {
+            out = out + s.slice(i, i + 1)
+            i = i + 1
+        } else {
+            let cp: int = hwp_utf8_decode_at(s, i)
+            if cp < 0 {
+                out = out + chr(239) + chr(191) + chr(189)
+                i = i + 1
+            } else {
+                out = out + s.slice(i, i + hwp_utf8_seq_len(b))
+                i = i + hwp_utf8_seq_len(b)
+            }
+        }
+    }
+    return out
+}
+
+# ============================================================================
+# hwp_manifest — package manifest handling (the .py part 2 of 10).
+#
+# Name rules (npm, enforced): name or @scope/name; lowercase; no
+# spaces; [a-z0-9._~-] plus at most one / after a leading @scope.
+# Rejects "..", leading -/., empty segments, node_modules, and
+# anything that escapes the output dir (the path-traversal defence).
+#
+# Version rules: strict X.Y.Z with optional -prerelease and +build
+# suffixes (the Halis v0.95.0-alpha style maps to 0.95.0-alpha in
+# npm).
+# ============================================================================
+
+fn hwp_is_lower_alnum(b: int) -> bool {
+    return(b >= 97 && b <= 122) || (b >= 48 && b <= 57)
+}
+
+fn hwp_is_name_char(b: int) -> bool {
+    # [a-z0-9._~-]
+    return hwp_is_lower_alnum(b) || b == 46 || b == 95 || b == 126
+    || b == 45
+}
+
+# hwp_name_tail_ok — ^[a-z0-9][a-z0-9._~-]*$
+fn hwp_name_tail_ok(s: str) -> bool {
+    if s.len() == 0 || s.len() > 213 {
+        return false
+    }
+    if !hwp_is_lower_alnum(s.byte_at(0)) {
+        return false
+    }
+    let mut i: int = 1
+    while i < s.len() {
+        if !hwp_is_name_char(s.byte_at(i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# hwp_scope_ok — ^@[a-z0-9][a-z0-9._~-]*$
+fn hwp_scope_ok(s: str) -> bool {
+    if s.len() < 2 || s.byte_at(0) != 64 {
+        return false
+    }
+    if !hwp_is_lower_alnum(s.byte_at(1)) {
+        return false
+    }
+    let mut i: int = 2
+    while i < s.len() {
+        if !hwp_is_name_char(s.byte_at(i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn hwp_count_char(s: str, c: int) -> int {
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < s.len() {
+        if s.byte_at(i) == c {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+# hwp_is_valid_name — True iff name is a publishable npm package name
+# (the .py's is_valid_name, rule for rule).
+fn hwp_is_valid_name(name: str) -> bool {
+    if name.len() == 0 || name.len() > 214 {
+        return false
+    }
+    if name == "node_modules" || name == "favicon.ico" {
+        return false
+    }
+    if name.contains("..") || name.contains("\\") {
+        return false
+    }
+    if name.starts_with(".") || name.starts_with("-")
+    || name.starts_with("_") {
+        return false
+    }
+    if name.starts_with("@") {
+        # Scoped: @scope/name — exactly one slash, both parts valid.
+        if hwp_count_char(name, 47) != 1 {
+            return false
+        }
+        let slash: int = name.find("/")
+        let scope: str = name.slice(0, slash)
+        let rest: str = name.slice(slash + 1, name.len())
+        if rest.len() == 0 || rest.starts_with(".") || rest.starts_with("-")
+        || rest.starts_with("_") {
+            return false
+        }
+        return hwp_scope_ok(scope) && hwp_name_tail_ok(rest)
+    }
+    return hwp_name_tail_ok(name)
+}
+
+# hwp_is_digit — ASCII digit.
+fn hwp_is_digit(b: int) -> bool {
+    return b >= 48 && b <= 57
+}
+
+# hwp_is_version_char — [0-9A-Za-z.-]
+fn hwp_is_version_char(b: int) -> bool {
+    return hwp_is_digit(b) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+    || b == 46 || b == 45
+}
+
+# hwp_is_num_component — (0|[1-9][0-9]*): no leading zero unless "0".
+fn hwp_is_num_component(s: str) -> bool {
+    if s.len() == 0 {
+        return false
+    }
+    if s.len() > 1 && s.byte_at(0) == 48 {
+        return false
+    }
+    let mut i: int = 0
+    while i < s.len() {
+        if !hwp_is_digit(s.byte_at(i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# hwp_is_valid_version — ^X.Y.Z(-pre)?(\+build)?$ with strict numeric
+# components (the .py's _VERSION_RE).
+fn hwp_is_valid_version(version: str) -> bool {
+    if version.len() == 0 {
+        return false
+    }
+    # Strip an optional +build suffix first (its own charset check).
+    let mut core: str = version
+    let plus: int = version.find("+")
+    if plus >= 0 {
+        core = version.slice(0, plus)
+        let build: str = version.slice(plus + 1, version.len())
+        if build.len() == 0 {
+            return false
+        }
+        let mut i: int = 0
+        while i < build.len() {
+            if !hwp_is_version_char(build.byte_at(i)) {
+                return false
+            }
+            i = i + 1
+        }
+    }
+    # Optional -prerelease suffix (charset-checked, non-empty).
+    let mut base: str = core
+    let dash: int = core.find("-")
+    if dash >= 0 {
+        base = core.slice(0, dash)
+        let pre: str = core.slice(dash + 1, core.len())
+        if pre.len() == 0 {
+            return false
+        }
+        let mut i: int = 0
+        while i < pre.len() {
+            if !hwp_is_version_char(pre.byte_at(i)) {
+                return false
+            }
+            i = i + 1
+        }
+    }
+    # Strict X.Y.Z.
+    let d1: int = base.find(".")
+    if d1 < 0 {
+        return false
+    }
+    let d2: int = hwp_find_from(base, ".", d1 + 1)
+    if d2 < 0 {
+        return false
+    }
+    if hwp_find_from(base, ".", d2 + 1) >= 0 {
+        return false
+    }
+    return hwp_is_num_component(base.slice(0, d1))
+    && hwp_is_num_component(base.slice(d1 + 1, d2))
+    && hwp_is_num_component(base.slice(d2 + 1, base.len()))
+}
+
+# hwp_file_stem — map a package name to a file stem: @scope/pkg ->
+# pkg (the .py's rsplit("/", 1)[-1].lstrip("@")).
+fn hwp_file_stem(name: str) -> str {
+    let slash: int = name.find("/")
+    let mut stem: str = name
+    if slash >= 0 {
+        stem = name.slice(slash + 1, name.len())
+    }
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < stem.len() {
+        if stem.byte_at(i) != 64 {
+            out = out + stem.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    if out == "" {
+        return "halis-pkg"
+    }
+    return out
+}
+
+# ---- the project config (hls.pack.toml / hls.pack.json) ---------------------
+
+# HwpCfg — the merged config surface ("" = not set; the .py's
+# None-sentinel dicts, one struct instead).
+struct HwpCfg {
+    name: str,
+    version: str,
+    description: str,
+    scope: str,
+    target: str,
+    out: str,
+    license: str,
+    repository: str,
+    authors: list[str],
+    keywords: list[str],
+    wasm_opt: str,
+    opt_level: str,
+    registry: str,
+    access: str,
+    tag: str
+}
+
+fn hwp_cfg_new() -> HwpCfg {
+    return HwpCfg {
+        name: "", version: "", description: "", scope: "", target: "",
+        out: "", license: "", repository: "", authors: [], keywords: [],
+        wasm_opt: "", opt_level: "", registry: "", access: "", tag: ""
+    }
+}
+
+# hwp_cfg_set — set one known key from a config file value (the .py's
+# _normalize_config key list, verbatim; unknown keys are dropped).
+fn hwp_cfg_set(mut cfg: HwpCfg, key: str, val: str,
+arr: list[str], is_arr: bool) -> HwpCfg {
+    if is_arr {
+        if key == "authors" {
+            cfg.authors = arr
+        } else if key == "keywords" {
+            cfg.keywords = arr
+        }
+        return cfg
+    }
+    if key == "name" {
+        cfg.name = val
+    } else if key == "version" {
+        cfg.version = val
+    } else if key == "description" {
+        cfg.description = val
+    } else if key == "scope" {
+        cfg.scope = val
+    } else if key == "target" {
+        cfg.target = val
+    } else if key == "out" {
+        cfg.out = val
+    } else if key == "license" {
+        cfg.license = val
+    } else if key == "repository" {
+        cfg.repository = val
+    } else if key == "wasm_opt" {
+        cfg.wasm_opt = val
+    } else if key == "opt_level" {
+        cfg.opt_level = val
+    } else if key == "registry" {
+        cfg.registry = val
+    } else if key == "access" {
+        cfg.access = val
+    } else if key == "tag" {
+        cfg.tag = val
+    }
+    return cfg
+}
+
+# hwp_load_config — load hls.pack.toml (or .json); an empty cfg when
+# absent. TOML is the .py's tomllib subset this tool's own scaffold
+# writes: [section] headers, key = "value" strings, bare words,
+# numbers and booleans, plus ["a", "b"] string arrays. Malformed
+# lines are skipped (the .py's tomllib-less Pythons returned {} —
+# CLI flags always work).
+fn hwp_load_config(path: str) -> HwpCfg uses Fs {
+    let mut cfg: HwpCfg = hwp_cfg_new()
+    if path != "" {
+        if file_exists(path) && path.ends_with(".json") {
+            return hwp_load_config_json(path)
+        }
+        if file_exists(path) {
+            return hwp_load_config_toml(path)
+        }
+        return cfg
+    }
+    if file_exists("hls.pack.toml") {
+        return hwp_load_config_toml("hls.pack.toml")
+    }
+    if file_exists("hls.pack.json") {
+        return hwp_load_config_json("hls.pack.json")
+    }
+    return cfg
+}
+
+# hwp_cfg_from_json — both a flat table and a nested [package] table
+# (the .py's _normalize_config).
+fn hwp_cfg_from_json(cfg0: HwpCfg, data: JsonValue) -> HwpCfg {
+    let mut cfg: HwpCfg = cfg0
+    if !json_is_object(data) {
+        return cfg
+    }
+    let pkg: JsonValue = json_object_get(data, "package")
+    if json_is_object(pkg) {
+        let mut i: int = 0
+        while i < pkg.obj_keys.len() {
+            cfg = hwp_cfg_take_json(cfg, pkg.obj_keys.get(i),
+            pkg.obj_vals.get(i))
+            i = i + 1
+        }
+    }
+    let mut j: int = 0
+    while j < data.obj_keys.len() {
+        let key: str = data.obj_keys.get(j)
+        cfg = hwp_cfg_take_json_if_absent(cfg, key, data.obj_vals.get(j))
+        j = j + 1
+    }
+    return cfg
+}
+
+fn hwp_cfg_take_json(cfg0: HwpCfg, key: str, v: JsonValue) -> HwpCfg {
+    let cfg: HwpCfg = cfg0
+    if json_is_str(v) {
+        return hwp_cfg_set(cfg, key, json_str_value(v), [], false)
+    }
+    if json_is_array(v) {
+        let arr: list[str] = []
+        let mut i: int = 0
+        while i < v.arr.len() {
+            let item: JsonValue = v.arr.get(i)
+            if json_is_str(item) {
+                arr.push(json_str_value(item))
+            }
+            i = i + 1
+        }
+        return hwp_cfg_set(cfg, key, "", arr, true)
+    }
+    return cfg
+}
+
+fn hwp_cfg_take_json_if_absent(cfg0: HwpCfg, key: str, v: JsonValue) -> HwpCfg {
+    let cfg: HwpCfg = cfg0
+    if hwp_cfg_has(cfg, key) {
+        return cfg
+    }
+    return hwp_cfg_take_json(cfg, key, v)
+}
+
+fn hwp_cfg_has(cfg: HwpCfg, key: str) -> bool {
+    if key == "name" {
+        return cfg.name != ""
+    }
+    if key == "version" {
+        return cfg.version != ""
+    }
+    if key == "description" {
+        return cfg.description != ""
+    }
+    if key == "scope" {
+        return cfg.scope != ""
+    }
+    if key == "target" {
+        return cfg.target != ""
+    }
+    if key == "out" {
+        return cfg.out != ""
+    }
+    if key == "license" {
+        return cfg.license != ""
+    }
+    if key == "repository" {
+        return cfg.repository != ""
+    }
+    if key == "authors" {
+        return cfg.authors.len() > 0
+    }
+    if key == "keywords" {
+        return cfg.keywords.len() > 0
+    }
+    if key == "wasm_opt" {
+        return cfg.wasm_opt != ""
+    }
+    if key == "opt_level" {
+        return cfg.opt_level != ""
+    }
+    if key == "registry" {
+        return cfg.registry != ""
+    }
+    if key == "access" {
+        return cfg.access != ""
+    }
+    if key == "tag" {
+        return cfg.tag != ""
+    }
+    return false
+}
+
+fn hwp_load_config_json(path: str) -> HwpCfg uses Fs {
+    let parsed: Result[JsonValue, str] = json_parse_result(read_file(path))
+    if result_is_err(parsed) {
+        return hwp_cfg_new()
+    }
+    return hwp_cfg_from_json(hwp_cfg_new(), result_unwrap(parsed))
+}
+
+# hwp_load_config_toml — the scaffold's TOML subset (see
+# hwp_load_config). Two passes, mirroring _normalize_config: the
+# [package] table is applied first, then flat top-level keys fill
+# the ones still absent (the .py's cfg.update(pkg) + absent-fill).
+fn hwp_load_config_toml(path: str) -> HwpCfg uses Fs {
+    let mut cfg: HwpCfg = hwp_cfg_new()
+    let src: str = read_file(path)
+    let lines: list[str] = src.split("\n")
+    let mut section: str = ""
+    let mut i: int = 0
+    while i < lines.len() {
+        let t: str = lines.get(i).trim()
+        if t != "" && !t.starts_with("#") {
+            if t.starts_with("[") && t.ends_with("]") {
+                section = t.slice(1, t.len() - 1).trim()
+            } else {
+                let eq: int = t.find("=")
+                if eq > 0 {
+                    let key: str = t.slice(0, eq).trim()
+                    let raw_val: str = t.slice(eq + 1, t.len()).trim()
+                    let mut val: str = raw_val
+                    let hash: int = hwp_toml_value_end(raw_val)
+                    if hash >= 0 {
+                        val = raw_val.slice(0, hash).trim()
+                    }
+                    if section == "package" {
+                        cfg = hwp_toml_take(cfg, key, val)
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    # Second pass: flat top-level keys fill the still-absent ones.
+    section = ""
+    i = 0
+    while i < lines.len() {
+        let t: str = lines.get(i).trim()
+        if t != "" && !t.starts_with("#") {
+            if t.starts_with("[") && t.ends_with("]") {
+                section = t.slice(1, t.len() - 1).trim()
+            } else if section == "" {
+                let eq: int = t.find("=")
+                if eq > 0 {
+                    let key: str = t.slice(0, eq).trim()
+                    let raw_val: str = t.slice(eq + 1, t.len()).trim()
+                    let mut val: str = raw_val
+                    let hash: int = hwp_toml_value_end(raw_val)
+                    if hash >= 0 {
+                        val = raw_val.slice(0, hash).trim()
+                    }
+                    if !hwp_cfg_has(cfg, key) {
+                        cfg = hwp_toml_take(cfg, key, val)
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cfg
+}
+
+# hwp_toml_take — one key = value row into the config.
+fn hwp_toml_take(cfg: HwpCfg, key: str, val: str) -> HwpCfg {
+    if val.starts_with("\"") && val.ends_with("\"") && val.len() >= 2 {
+        return hwp_cfg_set(cfg, key, val.slice(1, val.len() - 1), [],
+        false)
+    }
+    if val.starts_with("[") && val.ends_with("]") {
+        # ["a", "b"] string array.
+        let inner: str = val.slice(1, val.len() - 1)
+        let arr: list[str] = []
+        let mut i: int = 0
+        while i < inner.len() {
+            if inner.byte_at(i) == 34 {
+                let mut j: int = i + 1
+                while j < inner.len() && inner.byte_at(j) != 34 {
+                    j = j + 1
+                }
+                if j > i + 1 {
+                    arr.push(inner.slice(i + 1, j))
+                }
+                i = j + 1
+            } else {
+                i = i + 1
+            }
+        }
+        return hwp_cfg_set(cfg, key, "", arr, true)
+    }
+    # Bare words (true/false/numbers) ride as strings — the config
+    # surface is stringly by design (the .py read whatever tomllib
+    # produced; only strings/arrays ever fed a real field).
+    return hwp_cfg_set(cfg, key, val, [], false)
+}
+
+# hwp_toml_value_end — the index where the value ends (a " #"
+# comment starts); -1 when the row carries no comment.
+fn hwp_toml_value_end(raw_val: str) -> int {
+    let mut i: int = 0
+    let mut in_str: bool = false
+    while i < raw_val.len() {
+        let b: int = raw_val.byte_at(i)
+        if in_str {
+            if b == 92 && i + 1 < raw_val.len() {
+                i = i + 2
+                continue
+            }
+            if b == 34 {
+                in_str = false
+            }
+        } else {
+            if b == 34 {
+                in_str = true
+            } else if b == 35 {
+                return i
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# ---- build_package_json (the .py's builder, field order verbatim) ----------
+
+# hwp_build_package_json — the package.json JsonValue for a packed
+# pkg/ dir. Field order matches the .py's dict insertion order (the
+# emitted bytes are byte-for-byte the .py's json.dump).
+fn hwp_build_package_json(cfg: HwpCfg, js_file: str, dts_file: str,
+wasm_file: str) -> Result[JsonValue, str] {
+    if !hwp_is_valid_name(hwp_cfg_name(cfg)) {
+        return Result.Err(hwp_invalid_name_msg(hwp_cfg_name(cfg)))
+    }
+    if !hwp_is_valid_version(hwp_cfg_version(cfg)) {
+        return Result.Err(hwp_invalid_version_msg(hwp_cfg_version(cfg)))
+    }
+    let target: str = hwp_cfg_target(cfg)
+    let description: str = hwp_cfg_description(cfg)
+    let license_v: str = hwp_cfg_license(cfg)
+    let keywords: list[str] = hwp_cfg_keywords(cfg)
+    let files: list[JsonValue] = []
+    let file_names: list[str] = [wasm_file, js_file, dts_file,
+    "README.md", ".pack-manifest.json"]
+    let mut i: int = 0
+    while i < file_names.len() {
+        files.push(json_str(file_names.get(i)))
+        i = i + 1
+    }
+    let kw: list[JsonValue] = []
+    let mut k: int = 0
+    while k < keywords.len() {
+        kw.push(json_str(keywords.get(k)))
+        k = k + 1
+    }
+    let esm: bool = target == "bundler" || target == "web"
+    || target == "deno"
+    let mut pkg_type: str = "module"
+    if !esm {
+        pkg_type = "commonjs"
+    }
+    let halis_keys: list[str] = ["packVersion", "target", "wasm", "js",
+    "dts", "toolchain"]
+    let halis_vals: list[JsonValue] = [
+    json_int(1),
+    json_str(target),
+    json_str(wasm_file),
+    json_str(js_file),
+    json_str(dts_file),
+    json_str(hwp_banner())]
+    let keys: list[str] = ["name", "version", "description", "license",
+    "type", "main", "types", "files", "sideEffects", "keywords",
+    "halis"]
+    let vals: list[JsonValue] = [
+    json_str(hwp_cfg_name(cfg)),
+    json_str(hwp_cfg_version(cfg)),
+    json_str(description),
+    json_str(license_v),
+    json_str(pkg_type),
+    json_str(js_file),
+    json_str(dts_file),
+    json_array(files),
+    json_bool(false),
+    json_array(kw),
+    json_object(halis_keys, halis_vals)]
+    if esm {
+        keys.push("module")
+        vals.push(json_str(js_file))
+        keys.push("exports")
+        vals.push(json_object(["."], [json_object(
+        ["types", "import"],
+        [json_str("./" + dts_file), json_str("./" + js_file)])]))
+    } else if target == "nodejs" {
+        # Deep-scan-30 fix, kept: the nodejs branch used to sit INSIDE
+        # the ESM guard — unreachable, so nodejs packages shipped no
+        # exports map at all.
+        keys.push("exports")
+        vals.push(json_object(["."], [json_object(
+        ["types", "require"],
+        [json_str("./" + dts_file), json_str("./" + js_file)])]))
+    }
+    if cfg.authors.len() > 0 {
+        if cfg.authors.len() == 1 {
+            keys.push("author")
+            vals.push(json_str(cfg.authors.get(0)))
+        } else {
+            let a: list[JsonValue] = []
+            let mut j: int = 0
+            while j < cfg.authors.len() {
+                a.push(json_str(cfg.authors.get(j)))
+                j = j + 1
+            }
+            keys.push("author")
+            vals.push(json_array(a))
+        }
+    }
+    if cfg.repository != "" {
+        keys.push("repository")
+        vals.push(json_str(cfg.repository))
+    }
+    return Result.Ok(json_object(keys, vals))
+}
+
+# ---- the resolved-defaults view (the .py's opts.get(k, default)) -----------
+
+fn hwp_cfg_name(cfg: HwpCfg) -> str {
+    if cfg.name == "" {
+        return "halis-app"
+    }
+    return cfg.name
+}
+
+fn hwp_cfg_version(cfg: HwpCfg) -> str {
+    if cfg.version == "" {
+        return "0.1.0"
+    }
+    return cfg.version
+}
+
+fn hwp_cfg_target(cfg: HwpCfg) -> str {
+    if cfg.target == "" {
+        return "bundler"
+    }
+    return cfg.target
+}
+
+fn hwp_cfg_description(cfg: HwpCfg) -> str {
+    if cfg.description == "" {
+        return "WebAssembly package built with hls-wasm-pack"
+    }
+    return cfg.description
+}
+
+fn hwp_cfg_license(cfg: HwpCfg) -> str {
+    if cfg.license == "" {
+        return "MIT"
+    }
+    return cfg.license
+}
+
+fn hwp_cfg_keywords(cfg: HwpCfg) -> list[str] {
+    if cfg.keywords.len() == 0 {
+        return["halis", "wasm"]
+    }
+    return cfg.keywords
+}
+
+fn hwp_cfg_wasm_opt(cfg: HwpCfg) -> str {
+    if cfg.wasm_opt == "" {
+        return "auto"
+    }
+    return cfg.wasm_opt
+}
+
+fn hwp_cfg_opt_level(cfg: HwpCfg) -> str {
+    if cfg.opt_level == "" {
+        return "O3"
+    }
+    return cfg.opt_level
+}
+
+fn hwp_cfg_out(cfg: HwpCfg) -> str {
+    if cfg.out == "" {
+        return "pkg"
+    }
+    return cfg.out
+}
+
+# ---- the refusal messages (the .py's ValueError texts, verbatim) -----------
+
+fn hwp_invalid_name_msg(name: str) -> str {
+    return "invalid package name '" + name + "': use lowercase 'name' or "
+    + "'@scope/name' ([a-z0-9._~-], no spaces, no '..')"
+}
+
+fn hwp_invalid_version_msg(version: str) -> str {
+    return "invalid version '" + version + "': use semver 'X.Y.Z' with "
+    + "optional '-prerelease' (e.g. '0.95.0-alpha')"
+}
+
+# ============================================================================
+# hwp_scan — the lightweight HLS source scanner (the .py part 3 of
+# 10). Extracts the publish surface of a .hls program — top-level fn
+# definitions, struct/enum declarations, and extern "js" imports —
+# so the pack tool can emit .d.ts declarations and package.json
+# metadata WITHOUT running the full compiler (the compiler remains
+# the single source of truth for types; this scanner is a documented
+# heuristic for packaging only).
+#
+# Method (the .py's, regex for regex, hand-rolled index scans): the
+# source is comment-stripped and string-masked, then whole-source
+# scans find each declaration class:
+#
+#   * extern "js" { ... } blocks are cut out first (their inner
+#     declarations carry no bodies, so the block always ends at the
+#     first }); every fn inside becomes a JS import. The blocks are
+#     extracted BEFORE string masking (masking would erase the "js"
+#     marker itself).
+#   * impl Name { ... } blocks are cut out via brace matching
+#     (method fns are NOT package exports).
+#   * struct / enum declarations have no nested braces, so {...}
+#     captures them whole; fields split on top-level commas
+#     (list[int] / map[str, int] brackets nest correctly).
+#   * Remaining fn NAME(params) -> RET headers match across lines
+#     (params is anything-but-a-paren — newlines included); the
+#     header ends at the first { or end-of-line, so bodies are never
+#     swallowed.
+#
+# Fidelity note: the .py's regexes carried no word boundaries on the
+# fn/struct/enum/impl keywords (a documented heuristic), so the
+# native scanner matches the literal keyword anywhere — same inputs,
+# same surfaces. Limitations kept too: generic instantiations
+# (Option[int]) stay opaque strings for the .d.ts mapper; mut
+# prefixes and effects clauses are ignored.
+# ============================================================================
+
+struct HwpParam {
+    name: str,
+    type: str
+}
+
+struct HwpFn {
+    name: str,
+    generics: str,
+    params: list[HwpParam],
+    returns: str
+}
+
+struct HwpField {
+    name: str,
+    type: str
+}
+
+struct HwpStruct {
+    name: str,
+    fields: list[HwpField]
+}
+
+struct HwpVariant {
+    name: str,
+    payloads: list[str]
+}
+
+struct HwpEnum {
+    name: str,
+    variants: list[HwpVariant]
+}
+
+struct HwpSurface {
+    functions: list[HwpFn],
+    structs: list[HwpStruct],
+    enums: list[HwpEnum],
+    js_imports: list[HwpFn]
+}
+
+# ---- the character classes the .py's regexes used ---------------------------
+
+fn hwp_is_ws(b: int) -> bool {
+    return b == 32 || b == 9 || b == 10 || b == 11 || b == 12 || b == 13
+}
+
+fn hwp_is_ident_start(b: int) -> bool {
+    return(b >= 97 && b <= 122) || (b >= 65 && b <= 90) || b == 95
+}
+
+fn hwp_is_ident_char(b: int) -> bool {
+    return hwp_is_ident_start(b) || (b >= 48 && b <= 57)
+}
+
+fn hwp_skip_ws(s: str, p: int) -> int {
+    let mut q: int = p
+    while q < s.len() && hwp_is_ws(s.byte_at(q)) {
+        q = q + 1
+    }
+    return q
+}
+
+# hwp_ident_at — the maximal [A-Za-z_][A-Za-z0-9_]* at p, "" if none.
+fn hwp_ident_at(s: str, p: int) -> str {
+    if p >= s.len() || !hwp_is_ident_start(s.byte_at(p)) {
+        return ""
+    }
+    let mut q: int = p + 1
+    while q < s.len() && hwp_is_ident_char(s.byte_at(q)) {
+        q = q + 1
+    }
+    return s.slice(p, q)
+}
+
+# hwp_is_ret_char — the return-type charset [A-Za-z0-9_\[\],\s].
+fn hwp_is_ret_char(b: int) -> bool {
+    return hwp_is_ident_char(b) || b == 91 || b == 93 || b == 44
+    || hwp_is_ws(b)
+}
+
+# ---- string masking + comment stripping (the .py's _mask_strings /
+# _strip_comments / _mask_all, branch for branch) ---------------------------
+
+# hwp_mask_strings — string contents -> same-length space runs (the
+# closing quote of an escaped \" never ends the string).
+fn hwp_mask_strings(line: str) -> str {
+    let out: list[str] = []
+    let mut i: int = 0
+    let mut in_str: bool = false
+    while i < line.len() {
+        let b: int = line.byte_at(i)
+        if in_str {
+            out.push(" ")
+            if b == 92 && i + 1 < line.len() {
+                out.push(" ")
+                i = i + 2
+                continue
+            }
+            if b == 34 {
+                in_str = false
+            }
+            i = i + 1
+            continue
+        }
+        if b == 34 {
+            in_str = true
+            out.push(" ")
+            i = i + 1
+            continue
+        }
+        out.push(line.slice(i, i + 1))
+        i = i + 1
+    }
+    return str_join(out, "")
+}
+
+# hwp_strip_comments — strip # comments (string-aware); string
+# contents kept.
+fn hwp_strip_comments(source: str) -> str {
+    let out: list[str] = []
+    let lines: list[str] = source.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let raw: str = lines.get(i)
+        let masked: str = hwp_mask_strings(raw)
+        let idx: int = masked.find("#")
+        if idx >= 0 {
+            out.push(raw.slice(0, idx))
+        } else {
+            out.push(raw)
+        }
+        i = i + 1
+    }
+    return str_join(out, "\n")
+}
+
+# ---- the extern "js" blocks (extracted before masking) ----------------------
+
+# hwp_extern_blocks — every extern "js" { ... } block (content
+# between the braces, ending at the FIRST }; DOTALL non-greedy).
+fn hwp_extern_blocks(src: str) -> list[str] {
+    let blocks: list[str] = []
+    let mut i: int = 0
+    while i < src.len() {
+        let at: int = hwp_find_from(src, "extern", i)
+        if at < 0 {
+            return blocks
+        }
+        let after_kw: int = at + 6
+        if after_kw >= src.len() || !hwp_is_ws(src.byte_at(after_kw)) {
+            i = at + 1
+            continue
+        }
+        let p: int = hwp_skip_ws(src, after_kw)
+        if src.slice(p, p + 4) != "\"js\"" {
+            i = at + 1
+            continue
+        }
+        let q: int = hwp_skip_ws(src, p + 4)
+        if q >= src.len() || src.byte_at(q) != 123 {
+            i = at + 1
+            continue
+        }
+        let close: int = hwp_find_from(src, "}", q + 1)
+        if close < 0 {
+            i = at + 1
+            continue
+        }
+        blocks.push(src.slice(q + 1, close))
+        i = close + 1
+    }
+    return blocks
+}
+
+# hwp_cut_extern_blocks — each block replaced by a single newline
+# (the .py's _EXTERN_JS_RE.sub("\n", src)).
+fn hwp_cut_extern_blocks(src: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < src.len() {
+        let at: int = hwp_find_from(src, "extern", i)
+        if at < 0 {
+            return out + src.slice(i, src.len())
+        }
+        let after_kw: int = at + 6
+        let hit: bool = after_kw < src.len()
+        let mut close: int = -1
+        if hit && hwp_is_ws(src.byte_at(after_kw)) {
+            let p: int = hwp_skip_ws(src, after_kw)
+            if src.slice(p, p + 4) == "\"js\"" {
+                let q: int = hwp_skip_ws(src, p + 4)
+                if q < src.len() && src.byte_at(q) == 123 {
+                    close = hwp_find_from(src, "}", q + 1)
+                }
+            }
+        }
+        if close < 0 {
+            out = out + src.slice(i, at + 1)
+            i = at + 1
+            continue
+        }
+        out = out + src.slice(i, at) + "\n"
+        i = close + 1
+    }
+    return out
+}
+
+# ---- impl blocks (brace matching) -------------------------------------------
+
+# hwp_cut_impl_blocks — remove impl Name { ... } blocks via brace
+# matching, each replaced by a newline (the .py's _cut_impl_blocks:
+# an unterminated impl cuts the whole tail, exactly like the .py).
+fn hwp_cut_impl_blocks(src: str) -> str {
+    let mut s: str = src
+    let mut guard: int = 0
+    while guard < 4096 {
+        guard = guard + 1
+        let mut at: int = -1
+        let mut open_brace: int = -1
+        let mut i: int = 0
+        while i < s.len() {
+            let found: int = hwp_find_from(s, "impl", i)
+            if found < 0 {
+                break
+            }
+            let after_kw: int = found + 4
+            if after_kw >= s.len() || !hwp_is_ws(s.byte_at(after_kw)) {
+                i = found + 1
+                continue
+            }
+            let p: int = hwp_skip_ws(s, after_kw)
+            let name: str = hwp_ident_at(s, p)
+            if name == "" {
+                i = found + 1
+                continue
+            }
+            let q: int = hwp_skip_ws(s, p + name.len())
+            if q < s.len() && s.byte_at(q) == 123 {
+                at = found
+                open_brace = q
+                break
+            }
+            i = found + 1
+        }
+        if at < 0 {
+            return s
+        }
+        # Brace-match from the opening '{' (m.end() - 1 in the .py).
+        let mut depth: int = 0
+        let mut k: int = open_brace
+        let mut close: int = -1
+        while k < s.len() {
+            if s.byte_at(k) == 123 {
+                depth = depth + 1
+            } else if s.byte_at(k) == 125 {
+                depth = depth - 1
+                if depth == 0 {
+                    close = k
+                    break
+                }
+            }
+            k = k + 1
+        }
+        if close < 0 {
+            # Unterminated: the .py's i walks to len(src) and the
+            # tail (src[i+1:]) is dropped.
+            return s.slice(0, at) + "\n"
+        }
+        s = s.slice(0, at) + "\n" + s.slice(close + 1, s.len())
+    }
+    return s
+}
+
+# ---- struct / enum declarations ---------------------------------------------
+
+# HwpDecl — one struct/enum match span (name, generics-free body,
+# start, end) for the collect-then-cut pipeline.
+struct HwpDecl {
+    name: str,
+    body: str,
+    start: int,
+    end: int
+}
+
+# hwp_find_decls — every `kw NAME [gen]? { body }` with a body free
+# of '}' (the .py's _STRUCT_RE / _ENUM_RE; the keyword matches
+# anywhere, no word boundary).
+fn hwp_find_decls(src: str, kw: str) -> list[HwpDecl] {
+    let decls: list[HwpDecl] = []
+    let mut i: int = 0
+    while i < src.len() {
+        let at: int = hwp_find_from(src, kw, i)
+        if at < 0 {
+            return decls
+        }
+        let p: int = hwp_skip_ws(src, at + kw.len())
+        if p >= src.len() || !hwp_is_ws(src.byte_at(at + kw.len())) {
+            i = at + 1
+            continue
+        }
+        let name: str = hwp_ident_at(src, p)
+        if name == "" {
+            i = at + 1
+            continue
+        }
+        let mut q: int = hwp_skip_ws(src, p + name.len())
+        # Optional [generics] (captured by neither regex — skipped).
+        if q < src.len() && src.byte_at(q) == 91 {
+            let close_br: int = hwp_find_from(src, "]", q + 1)
+            if close_br < 0 {
+                i = at + 1
+                continue
+            }
+            q = hwp_skip_ws(src, close_br + 1)
+        }
+        if q >= src.len() || src.byte_at(q) != 123 {
+            i = at + 1
+            continue
+        }
+        let close: int = hwp_find_from(src, "}", q + 1)
+        if close < 0 {
+            i = at + 1
+            continue
+        }
+        decls.push(HwpDecl {
+            name: name,
+            body: src.slice(q + 1, close),
+            start: at,
+            end: close + 1
+        })
+        i = close + 1
+    }
+    return decls
+}
+
+# hwp_cut_decls — replace every matched span with a newline (the
+# .py's .sub("\n", src) after collection).
+fn hwp_cut_decls(src: str, decls: list[HwpDecl]) -> str {
+    let mut out: str = ""
+    let mut pos: int = 0
+    let mut i: int = 0
+    while i < decls.len() {
+        let d: HwpDecl = decls.get(i)
+        out = out + src.slice(pos, d.start) + "\n"
+        pos = d.end
+        i = i + 1
+    }
+    return out + src.slice(pos, src.len())
+}
+
+# ---- fn headers (the .py's _FN_RE, backtracking included) -------------------
+
+# HwpFnHit — a fn header match (start, end) + the parsed groups.
+struct HwpFnHit {
+    name: str,
+    generics: str,
+    params: str,
+    returns: str,
+    start: int,
+    end: int
+}
+
+# hwp_try_fn_at — attempt the _FN_RE match of a fn header at `at`
+# (src[at:at+2] == "fn"). Returns the hit or start:-1. The regex, in
+# order: `fn` `\s+` NAME `[gen]?` `\(params\)` `-> RET?` `clause?`
+# `{`-or-EOL, with RET non-greedy (shortest return type that still
+# lets the tail match — tried length by length, exactly like the
+# engine's backtracking).
+fn hwp_try_fn_at(src: str, at: int) -> HwpFnHit {
+    let miss: HwpFnHit = HwpFnHit {
+        name: "", generics: "", params: "", returns: "void",
+        start: -1, end: -1
+    }
+    let p0: int = at + 2
+    if p0 < src.len() && !hwp_is_ws(src.byte_at(p0)) {
+        return miss
+    }
+    let p: int = hwp_skip_ws(src, p0)
+    if p == p0 {
+        return miss
+    }
+    let name: str = hwp_ident_at(src, p)
+    if name == "" {
+        return miss
+    }
+    let mut q: int = hwp_skip_ws(src, p + name.len())
+    let mut generics: str = ""
+    if q < src.len() && src.byte_at(q) == 91 {
+        let close_br: int = hwp_find_from(src, "]", q + 1)
+        if close_br < 0 {
+            return miss
+        }
+        generics = src.slice(q + 1, close_br).trim()
+        q = hwp_skip_ws(src, close_br + 1)
+    }
+    if q >= src.len() || src.byte_at(q) != 40 {
+        return miss
+    }
+    let close_par: int = hwp_find_from(src, ")", q + 1)
+    if close_par < 0 {
+        return miss
+    }
+    let params: str = src.slice(q + 1, close_par)
+    q = hwp_skip_ws(src, close_par + 1)
+    # Optional -> RET (RET: shortest prefix of the type run whose
+    # tail still matches; the run includes whitespace, which the
+    # regex's backtracking \s* could hand back to RET).
+    let mut returns: str = "void"
+    let mut tail_at: int = -1
+    if src.slice(q, q + 2) == "->" {
+        let run_start: int = q + 2
+        let run_end: int = hwp_ret_run_end(src, run_start)
+        let mut len: int = 1
+        let mut matched: bool = false
+        while len <= run_end - run_start {
+            let cand_end: int = run_start + len
+            let tq: int = hwp_skip_ws(src, cand_end)
+            if hwp_fn_tail_matches(src, tq) {
+                returns = src.slice(run_start, cand_end).trim()
+                if returns == "" {
+                    returns = "void"
+                }
+                tail_at = tq
+                matched = true
+                len = run_end - run_start + 1
+            }
+            len = len + 1
+        }
+        if !matched {
+            return miss
+        }
+        q = tail_at
+    }
+    # The tail: optional pure / uses-clause, then { or EOL.
+    let end: int = hwp_fn_tail_end(src, q)
+    if end < 0 {
+        return miss
+    }
+    return HwpFnHit {
+        name: name, generics: generics, params: params,
+        returns: returns, start: at, end: end
+    }
+}
+
+# hwp_ret_run_end — the end of the maximal return-type charset run
+# at p ([A-Za-z0-9_\[\],\s] — whitespace included; see hwp_try_fn_at).
+fn hwp_ret_run_end(src: str, p: int) -> int {
+    let mut q: int = p
+    while q < src.len() && hwp_is_ret_char(src.byte_at(q)) {
+        q = q + 1
+    }
+    return q
+}
+
+# hwp_fn_tail_matches — can a fn header end at q? (clause? then {
+# or EOL — the pure branch matches the plain text "pure", the uses
+# branch needs \buses\b, both the .py's alternation, verbatim).
+fn hwp_fn_tail_matches(src: str, q: int) -> bool {
+    return hwp_fn_tail_end(src, q) >= 0
+}
+
+# hwp_fn_tail_end — the match end when the header ends at q, or -1.
+# The regex tail is `(?:pure|\buses\b[^{\n]*)?\s*(?:\{|$)`: the \s*
+# is greedy but BACKTRACKS — a whitespace run containing a newline
+# can end the match there ($ matches before any \n), which is how a
+# body-less `uses IO` header (the extern-js blocks) still matches.
+fn hwp_fn_tail_end(src: str, q: int) -> int {
+    let mut p: int = q
+    # Optional clause.
+    if src.slice(p, p + 4) == "pure" {
+        p = p + 4
+    } else if src.slice(p, p + 4) == "uses"
+    && (p + 4 >= src.len() || !hwp_is_ident_char(src.byte_at(p + 4))) {
+        # \buses\b — the boundary before holds (q follows ws or a
+        # non-word char by construction); consume uses + [^{\n]*.
+        p = p + 4
+        while p < src.len() && src.byte_at(p) != 123
+        && src.byte_at(p) != 10 {
+            p = p + 1
+        }
+    }
+    # \s*(?:\{|$), backtracking included: prefer the maximal skip
+    # landing on '{' or EOF; else the LAST newline inside the
+    # skipped run ($ before it — the engine's longest-\s* success).
+    let qs: int = hwp_skip_ws(src, p)
+    if qs < src.len() && src.byte_at(qs) == 123 {
+        return qs + 1
+    }
+    if qs >= src.len() {
+        return qs
+    }
+    let mut last_nl: int = -1
+    let mut k: int = p
+    while k < qs {
+        if src.byte_at(k) == 10 {
+            last_nl = k
+        }
+        k = k + 1
+    }
+    if last_nl >= 0 {
+        return last_nl
+    }
+    return -1
+}
+
+# hwp_scan_fns — finditer over src: every fn header hit, left to
+# right, non-overlapping.
+fn hwp_scan_fns(src: str) -> list[HwpFnHit] {
+    let hits: list[HwpFnHit] = []
+    let mut i: int = 0
+    while i + 1 < src.len() {
+        if src.byte_at(i) == 102 && src.byte_at(i + 1) == 110 {
+            let hit: HwpFnHit = hwp_try_fn_at(src, i)
+            if hit.start >= 0 {
+                hits.push(hit)
+                i = hit.end
+                continue
+            }
+        }
+        i = i + 1
+    }
+    return hits
+}
+
+# ---- params / fields / variants ---------------------------------------------
+
+# hwp_split_top_level — split body on sep at bracket depth 0
+# (the .py's _split_top_level: [ ( nest, ] ) unnest).
+fn hwp_split_top_level(body: str, sep: int) -> list[str] {
+    let parts: list[str] = []
+    let mut cur: list[str] = []
+    let mut depth: int = 0
+    let mut i: int = 0
+    while i < body.len() {
+        let b: int = body.byte_at(i)
+        if b == 91 || b == 40 {
+            depth = depth + 1
+        } else if b == 93 || b == 41 {
+            if depth > 0 {
+                depth = depth - 1
+            }
+        }
+        if b == sep && depth == 0 {
+            parts.push(str_join(cur, ""))
+            cur = []
+        } else {
+            cur.push(body.slice(i, i + 1))
+        }
+        i = i + 1
+    }
+    let tail: str = str_join(cur, "").trim()
+    if tail != "" {
+        parts.push(tail)
+    }
+    let out: list[str] = []
+    let mut j: int = 0
+    while j < parts.len() {
+        let t: str = parts.get(j).trim()
+        if t != "" {
+            out.push(t)
+        }
+        j = j + 1
+    }
+    return out
+}
+
+# hwp_parse_params — "a: int, mut b: str" -> [{a,int},{b,str}].
+fn hwp_parse_params(raw: str) -> list[HwpParam] {
+    let params: list[HwpParam] = []
+    let trimmed: str = raw.trim()
+    if trimmed == "" {
+        return params
+    }
+    let parts: list[str] = hwp_split_top_level(trimmed, 44)
+    let mut i: int = 0
+    while i < parts.len() {
+        let mut part: str = parts.get(i)
+        if part.starts_with("mut ") {
+            part = part.slice(4, part.len()).trim()
+        }
+        let colon: int = part.find(":")
+        if colon < 0 {
+            i = i + 1
+            continue
+        }
+        let pname: str = part.slice(0, colon).trim()
+        let ptype: str = part.slice(colon + 1, part.len()).trim()
+        if pname != "" && ptype != "" {
+            params.push(HwpParam {
+                name: pname, type: ptype
+            })
+        }
+        i = i + 1
+    }
+    return params
+}
+
+# hwp_fn_from_hit — the parsed HwpFn for a hit.
+fn hwp_fn_from_hit(hit: HwpFnHit) -> HwpFn {
+    return HwpFn {
+        name: hit.name,
+        generics: hit.generics,
+        params: hwp_parse_params(hit.params),
+        returns: hit.returns
+    }
+}
+
+# ---- the pipeline (the .py's scan_source) -----------------------------------
+
+# hwp_scan_source — scan HLS source text; return the publish
+# surface.
+fn hwp_scan_source(source: str) -> HwpSurface {
+    let nocmt: str = hwp_strip_comments(source)
+    # Extern blocks are extracted BEFORE string masking.
+    let js_imports: list[HwpFn] = []
+    let blocks: list[str] = hwp_extern_blocks(nocmt)
+    let mut bi: int = 0
+    while bi < blocks.len() {
+        let hits: list[HwpFnHit] = hwp_scan_fns(blocks.get(bi))
+        let mut hi: int = 0
+        while hi < hits.len() {
+            js_imports.push(hwp_fn_from_hit(hits.get(hi)))
+            hi = hi + 1
+        }
+        bi = bi + 1
+    }
+    let mut src: str = hwp_mask_strings(hwp_cut_extern_blocks(nocmt))
+    src = hwp_cut_impl_blocks(src)
+
+    let structs: list[HwpStruct] = []
+    let struct_decls: list[HwpDecl] = hwp_find_decls(src, "struct")
+    let mut si: int = 0
+    while si < struct_decls.len() {
+        let d: HwpDecl = struct_decls.get(si)
+        let fields: list[HwpField] = []
+        let parts: list[str] = hwp_split_top_level(d.body, 44)
+        let mut pi: int = 0
+        while pi < parts.len() {
+            let part: str = parts.get(pi)
+            let colon: int = part.find(":")
+            if colon >= 0 {
+                let fname: str = part.slice(0, colon).trim()
+                let mut ftype: str = part.slice(colon + 1, part.len())
+                # Drop "= default" tails (Stage 7 default values).
+                let eq: int = ftype.find("=")
+                if eq >= 0 {
+                    ftype = ftype.slice(0, eq)
+                }
+                ftype = ftype.trim()
+                if fname != "" && ftype != "" {
+                    fields.push(HwpField {
+                        name: fname, type: ftype
+                    })
+                }
+            }
+            pi = pi + 1
+        }
+        structs.push(HwpStruct {
+            name: d.name, fields: fields
+        })
+        si = si + 1
+    }
+    src = hwp_cut_decls(src, struct_decls)
+
+    let enums: list[HwpEnum] = []
+    let enum_decls: list[HwpDecl] = hwp_find_decls(src, "enum")
+    let mut ei: int = 0
+    while ei < enum_decls.len() {
+        let d: HwpDecl = enum_decls.get(ei)
+        let variants: list[HwpVariant] = []
+        let parts: list[str] = hwp_split_top_level(d.body, 44)
+        let mut vi: int = 0
+        while vi < parts.len() {
+            let part: str = parts.get(vi)
+            let vname: str = hwp_ident_at(part, 0)
+            if vname != "" {
+                let after: int = hwp_skip_ws(part, vname.len())
+                let mut payloads: list[str] = []
+                let mut ok: bool = after >= part.len()
+                if !ok && part.byte_at(after) == 40
+                && part.byte_at(part.len() - 1) == 41 {
+                    let inner: str = part.slice(after + 1,
+                    part.len() - 1)
+                    payloads = hwp_split_top_level(inner, 44)
+                    ok = true
+                }
+                if ok {
+                    variants.push(HwpVariant {
+                        name: vname, payloads: payloads
+                    })
+                }
+            }
+            vi = vi + 1
+        }
+        enums.push(HwpEnum {
+            name: d.name, variants: variants
+        })
+        ei = ei + 1
+    }
+    src = hwp_cut_decls(src, enum_decls)
+
+    let functions: list[HwpFn] = []
+    let hits: list[HwpFnHit] = hwp_scan_fns(src)
+    let mut fi: int = 0
+    while fi < hits.len() {
+        functions.push(hwp_fn_from_hit(hits.get(fi)))
+        fi = fi + 1
+    }
+    return HwpSurface {
+        functions: functions, structs: structs, enums: enums,
+        js_imports: js_imports
+    }
+}
+
+# hwp_scan_file — scan a .hls file.
+fn hwp_scan_file(path: str) -> HwpSurface uses Fs {
+    return hwp_scan_source(read_file(path))
+}
+
+# hwp_exported_functions — top-level fns minus main and
+# jsffi_on_callback. main is the wasm entry point (invoked by the
+# loader, not by library consumers); jsffi_on_callback is the Stage
+# 73 JS->HLS dispatch hook (reached via Halis.callHalis, already
+# typed in the glue). Everything else is the library surface.
+fn hwp_exported_functions(surface: HwpSurface) -> list[HwpFn] {
+    let out: list[HwpFn] = []
+    let mut i: int = 0
+    while i < surface.functions.len() {
+        let f: HwpFn = surface.functions.get(i)
+        if f.name != "main" && f.name != "jsffi_on_callback" {
+            out.push(f)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ============================================================================
+# hwp_types — the TypeScript declaration emitter (the .py part 4 of
+# 10). Maps Halis types to TypeScript and renders the publish-ready
+# <name>.d.ts for a packed pkg/ dir.
+#
+# Mapping (documented in the emitted header):
+#   int / float -> number (wasm i64/f64 surface as JS numbers; int64
+#                  values beyond 2^53 lose precision — the header
+#                  says so)
+#   bool        -> boolean
+#   str         -> string
+#   void        -> void
+#   list[T]     -> Array<T>
+#   map[str, T] -> Record<string, T>
+#   tainted[T]  -> T (taint is compile-time only)
+#   Option[T]   -> T | null
+#   Result[T,E] -> T (an Err payload is a documented throw-site)
+#   struct      -> interface (by scanned fields)
+#   enum        -> string-literal union of variant names
+#   nominal id  -> as-is (links to the interface/union declared
+#                  below when scanned, opaque otherwise)
+#   anything else -> unknown (this file never lies)
+# ============================================================================
+
+# hwp_type_head — the type wrapper "name[inner]" or "" when t is not
+# that wrapper (the .py's re.match anchors).
+fn hwp_type_head(t: str, kw: str) -> str {
+    if !t.starts_with(kw + "[") || !t.ends_with("]") {
+        return ""
+    }
+    if t.len() < kw.len() + 2 {
+        return ""
+    }
+    return t.slice(kw.len() + 1, t.len() - 1)
+}
+
+# hwp_result_split — "T, E" for Result[T, E] (the inner split on the
+# top-level comma), "" when malformed.
+fn hwp_result_split(t: str) -> str {
+    let inner: str = hwp_type_head(t, "Result")
+    if inner == "" {
+        return ""
+    }
+    let mut depth: int = 0
+    let mut i: int = 0
+    while i < inner.len() {
+        let b: int = inner.byte_at(i)
+        if b == 91 {
+            depth = depth + 1
+        } else if b == 93 {
+            depth = depth - 1
+        } else if b == 44 && depth == 0 {
+            return inner.slice(0, i)
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# hwp_map_inner — "T" for map[str, T], "" when not that shape.
+fn hwp_map_inner(t: str) -> str {
+    if !t.starts_with("map[") || !t.ends_with("]") {
+        return ""
+    }
+    let inner: str = t.slice(4, t.len() - 1)
+    # map\s*\[\s*str\s*, — the .py's regex allows spaces; the real
+    # surface writes map[str, T].
+    let mut p: int = 0
+    while p < inner.len() && hwp_is_ws(inner.byte_at(p)) {
+        p = p + 1
+    }
+    if inner.slice(p, p + 3) != "str" {
+        return ""
+    }
+    p = p + 3
+    while p < inner.len() && hwp_is_ws(inner.byte_at(p)) {
+        p = p + 1
+    }
+    if p >= inner.len() || inner.byte_at(p) != 44 {
+        return ""
+    }
+    let rest: str = inner.slice(p + 1, inner.len()).trim()
+    if rest == "" {
+        return ""
+    }
+    return rest
+}
+
+# hwp_is_nominal — ^[A-Za-z_][A-Za-z0-9_]*$.
+fn hwp_is_nominal(t: str) -> bool {
+    if t.len() == 0 || !hwp_is_ident_start(t.byte_at(0)) {
+        return false
+    }
+    let mut i: int = 1
+    while i < t.len() {
+        if !hwp_is_ident_char(t.byte_at(i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# hwp_halis_to_ts — map a Halis type string to a TypeScript type
+# string (the .py's halis_to_ts, branch for branch).
+fn hwp_halis_to_ts(hls_type: str) -> str {
+    let t: str = hls_type.trim()
+    if t == "int" || t == "float" {
+        return "number"
+    }
+    if t == "bool" {
+        return "boolean"
+    }
+    if t == "str" {
+        return "string"
+    }
+    if t == "void" {
+        return "void"
+    }
+    let tainted: str = hwp_type_head(t, "tainted")
+    if tainted != "" {
+        return hwp_halis_to_ts(tainted)
+    }
+    let list_t: str = hwp_type_head(t, "list")
+    if list_t != "" {
+        return "Array<" + hwp_halis_to_ts(list_t) + ">"
+    }
+    let map_t: str = hwp_map_inner(t)
+    if map_t != "" {
+        return "Record<string, " + hwp_halis_to_ts(map_t) + ">"
+    }
+    let opt: str = hwp_type_head(t, "Option")
+    if opt != "" {
+        return hwp_halis_to_ts(opt) + " | null"
+    }
+    let res: str = hwp_result_split(t)
+    if res != "" {
+        return hwp_halis_to_ts(res)
+    }
+    if hwp_is_nominal(t) {
+        # A nominal struct/enum reference — emitted as-is so it
+        # links to the interface/union declared below when scanned,
+        # and degrades to an opaque named type otherwise.
+        return t
+    }
+    return "unknown"
+}
+
+# hwp_dts_header — the fixed header comment (the .py's _HEADER).
+fn hwp_dts_header() -> str {
+    return "/* AUTO-GENERATED by hls-wasm-pack (Stage 76) — do not edit.\n"
+    + " *\n"
+    + " * Halis -> TypeScript mapping:\n"
+    + " *   int/float -> number (int64 beyond 2^53 loses precision)\n"
+    + " *   bool -> boolean, str -> string\n"
+    + " *   list[T] -> Array<T>, map[str, T] -> Record<string, T>\n"
+    + " *   tainted[T] -> T (taint is compile-time only)\n"
+    + " *   Option[T] -> T | null\n"
+    + " *   Result[T, E] -> T (an Err payload is a documented throw-site)\n"
+    + " *   struct -> interface, enum -> string-literal union\n"
+    + " *   anything else -> unknown (this file never lies)\n"
+    + " */"
+}
+
+# hwp_loader_api — the loader API tail (the .py's _LOADER_API).
+fn hwp_loader_api() -> str {
+    return "/* Loader API (provided by the generated .js glue). */\n"
+    + "export interface HalisInstance {\n"
+    + "  memory: WebAssembly.Memory;\n"
+    + "  run(): Promise<bigint>;\n"
+    + "  callHalis(cbId: number, json: string): Promise<string>;\n"
+    + "  readStruct(name: string, ptr: number): Record<string, unknown>;\n"
+    + "  writeStruct(name: string, value: Record<string, unknown>): number;\n"
+    + "  registerStruct(desc: StructDescriptor): void;\n"
+    + "}\n"
+    + "export interface StructDescriptor {\n"
+    + "  name: string;\n"
+    + "  size: number;\n"
+    + "  fields: Array<{ name: string; type: string; offset: number }>;\n"
+    + "}\n"
+    + "export declare const memory: WebAssembly.Memory;\n"
+    + "export default function init(input?: string | URL | ArrayBuffer | WebAssembly.Module): Promise<HalisInstance>;"
+}
+
+# hwp_fn_ts_decl — "export function name(a: number): number;".
+fn hwp_fn_ts_decl(f: HwpFn) -> str {
+    let params: list[str] = []
+    let mut i: int = 0
+    while i < f.params.len() {
+        let p: HwpParam = f.params.get(i)
+        params.push(p.name + ": " + hwp_halis_to_ts(p.type))
+        i = i + 1
+    }
+    return "export function " + f.name + "(" + str_join(params, ", ")
+    + "): " + hwp_halis_to_ts(f.returns) + ";"
+}
+
+# hwp_render_dts — the full .d.ts source for the surface.
+fn hwp_render_dts(surface: HwpSurface, package_name: str) -> str {
+    let out: list[str] = [hwp_dts_header(), "",
+    "/* Package: " + package_name + " */", ""]
+    let mut si: int = 0
+    while si < surface.structs.len() {
+        let st: HwpStruct = surface.structs.get(si)
+        let lines: list[str] = ["export interface " + st.name + " {"]
+        let mut fi: int = 0
+        while fi < st.fields.len() {
+            let f: HwpField = st.fields.get(fi)
+            lines.push("  " + f.name + ": " + hwp_halis_to_ts(f.type)
+            + ";")
+            fi = fi + 1
+        }
+        lines.push("}")
+        out.push(str_join(lines, "\n"))
+        out.push("")
+        si = si + 1
+    }
+    let mut ei: int = 0
+    while ei < surface.enums.len() {
+        let en: HwpEnum = surface.enums.get(ei)
+        if en.variants.len() == 0 {
+            out.push("export type " + en.name + " = never;")
+        } else {
+            let vs: list[str] = []
+            let mut vi: int = 0
+            while vi < en.variants.len() {
+                vs.push("\"" + en.variants.get(vi).name + "\"")
+                vi = vi + 1
+            }
+            out.push("export type " + en.name + " = "
+            + str_join(vs, " | ") + ";")
+        }
+        out.push("")
+        ei = ei + 1
+    }
+    let fns: list[HwpFn] = hwp_exported_functions(surface)
+    if fns.len() > 0 {
+        out.push("/* Exported Halis functions (sync wrappers over the wasm module). */")
+        let mut fi2: int = 0
+        while fi2 < fns.len() {
+            out.push(hwp_fn_ts_decl(fns.get(fi2)))
+            fi2 = fi2 + 1
+        }
+        out.push("")
+    } else {
+        out.push("/* No exported Halis functions (only main). */")
+        out.push("")
+    }
+    out.push(hwp_loader_api())
+    out.push("")
+    return str_join(out, "\n")
+}
+
+# ============================================================================
+# hwp_glue — the target-specific JS wrappers (the .py part 5 of 10).
+#
+# hlwasm already emits the compact runtime glue (module
+# instantiation, Halis.run, struct marshalling, callHalis). This
+# section wraps that glue per publish target so the packed pkg/*.js
+# is directly consumable:
+#
+#   bundler     ESM import init from './name.js' (webpack/vite).
+#   web         ESM bare — new URL('./name.wasm', import.meta.url).
+#   nodejs      CommonJS const { init } = require('./name.js').
+#   deno        ESM + deno.json hint (deno run --allow-read).
+#   no-modules  IIFE assigning the global HalisPack (<script>).
+#
+# Each wrapper embeds the hlwasm compact glue verbatim (no fork: the
+# runtime stays single-sourced) and adds a thin async init +
+# re-export layer on top. A __TARGET__ marker comment names the
+# target so check / acceptance can verify the flavour.
+# ============================================================================
+
+# hwp_glue_marker — "/* hls-wasm-pack target: %s (Stage 76) */".
+fn hwp_glue_marker(target: str) -> str {
+    return "/* hls-wasm-pack target: " + target + " (Stage 76) */"
+}
+
+fn hwp_bundler_js(stem: str, glue: str) -> str {
+    return str_join([
+    hwp_glue_marker("bundler"),
+    "/* ESM bundler entry — import init from './" + stem
+    + ".js' */",
+    glue,
+    "",
+    "const __wasmUrl = new URL('./" + stem
+    + ".wasm', import.meta.url);",
+    "export async function init(input) {",
+    "  const src = input || __wasmUrl;",
+    "  const bytes = src instanceof ArrayBuffer ? new Uint8Array(src) : await (await fetch(src)).arrayBuffer().then(b => new Uint8Array(b));",
+    "  return Halis.run(bytes);",
+    "}",
+    "export default init;",
+    "export const HalisPack = (typeof Halis !== 'undefined') ? Halis : null;",
+    ""], "\n")
+}
+
+fn hwp_web_js(stem: str, glue: str) -> str {
+    return str_join([
+    hwp_glue_marker("web"),
+    "/* ESM bare entry — <script type=\"module\">, no bundler. */",
+    glue,
+    "",
+    "export async function init(input) {",
+    "  const url = input || new URL('./" + stem
+    + ".wasm', import.meta.url);",
+    "  const resp = await fetch(url);",
+    "  const bytes = new Uint8Array(await resp.arrayBuffer());",
+    "  return Halis.run(bytes);",
+    "}",
+    "export default init;",
+    ""], "\n")
+}
+
+fn hwp_nodejs_js(stem: str, glue: str) -> str {
+    # The compact glue is browser-flavoured ESM; for Node we keep it
+    # verbatim (single-sourced runtime) and add a CJS loader.
+    let cjs_loader: str = str_join([
+    "const fs = require('fs');",
+    "const path = require('path');",
+    "async function init(input) {",
+    "  const wasmPath = input || path.join(__dirname, '" + stem
+    + ".wasm');",
+    "  const bytes = new Uint8Array(fs.readFileSync(wasmPath));",
+    "  return Halis.run(bytes);",
+    "}",
+    "module.exports = { init, default: init, HalisPack: (typeof Halis !== 'undefined') ? Halis : null };"],
+    "\n")
+    return str_join([hwp_glue_marker("nodejs"), glue, "", cjs_loader,
+    ""], "\n")
+}
+
+fn hwp_deno_js(stem: str, glue: str) -> str {
+    return str_join([
+    hwp_glue_marker("deno"),
+    "/* Deno entry — deno run --allow-read mod.ts */",
+    glue,
+    "",
+    "export async function init(input) {",
+    "  const url = input || new URL('./" + stem
+    + ".wasm', import.meta.url);",
+    "  const bytes = new Uint8Array(await Deno.readFile(url));",
+    "  return Halis.run(bytes);",
+    "}",
+    "export default init;",
+    ""], "\n")
+}
+
+fn hwp_no_modules_js(stem: str, glue: str) -> str {
+    return str_join([
+    hwp_glue_marker("no-modules"),
+    "/* IIFE global entry — <script src=\"./" + stem
+    + ".js\"></script> gives window.HalisPack. */",
+    "(function (global, factory) {",
+    "  const api = factory();",
+    "  global.HalisPack = api;",
+    "}(typeof self !== 'undefined' ? self : this, function () {",
+    glue,
+    "  async function init(input) {",
+    "    const url = input || './" + stem + ".wasm';",
+    "    const resp = await fetch(url);",
+    "    const bytes = new Uint8Array(await resp.arrayBuffer());",
+    "    return Halis.run(bytes);",
+    "  }",
+    "  return { init: init, Halis: (typeof Halis !== 'undefined') ? Halis : null };",
+    "}));",
+    ""], "\n")
+}
+
+# hwp_render_js — the target-specific .js for stem + compact glue
+# (the .py's render_js; unknown targets are a named refusal, the
+# same message shape).
+fn hwp_render_js(target: str, stem: str, glue: str)
+-> Result[str, str] {
+    let trimmed: str = glue.trim() + "\n"
+    if target == "bundler" {
+        return Result.Ok(hwp_bundler_js(stem, trimmed))
+    }
+    if target == "web" {
+        return Result.Ok(hwp_web_js(stem, trimmed))
+    }
+    if target == "nodejs" {
+        return Result.Ok(hwp_nodejs_js(stem, trimmed))
+    }
+    if target == "deno" {
+        return Result.Ok(hwp_deno_js(stem, trimmed))
+    }
+    if target == "no-modules" {
+        return Result.Ok(hwp_no_modules_js(stem, trimmed))
+    }
+    let names: list[str] = ["bundler", "deno", "nodejs", "no-modules",
+    "web"]
+    return Result.Err("unknown pack target '" + target
+    + "' (expected one of: " + str_join(names, ", ") + ")")
+}
+
+# hwp_deno_json — the deno.json hint content for the deno target
+# (json.dumps({...}, indent=2) + newline).
+fn hwp_deno_json(package_name: str) -> str {
+    return hwp_json_dumps(json_object(
+    ["name", "exports", "tasks"],
+    [json_str(package_name), json_str("./mod.js"),
+    json_object(["start"],
+    [json_str("deno run --allow-read mod.js")])])) + "\n"
+}
+
+# ============================================================================
+# hwp_build — compile + assemble a publish-ready pkg/ dir (the .py
+# part 6 of 10).
+#
+# Pipeline (per target):
+#   1. bin/hlwasm --glue compact compiles the input into a temp dir
+#      (.wasm + compact .js glue; --wasm-opt + --opt-level flow
+#      through) — the native spawn of the .py's in-process
+#      compile_program, single-sourcing the runtime.
+#   2. hwp_scan scans the .hls input for the publish surface.
+#   3. hwp_glue renders the target wrapper around the compact glue.
+#   4. hwp_types emits the .d.ts.
+#   5. package.json + README.md + .pack-manifest.json (sha256 per
+#      file, sizes, target, toolchain) complete pkg/.
+#
+# build() returns the manifest JsonValue. All writes stay inside
+# out_dir (containment enforced on every filename).
+# ============================================================================
+
+# HwpRun — a captured child run (proc_spawn + read + wait).
+struct HwpRun {
+    code: int,
+    out: str,
+    err: str,
+    spawned: bool
+}
+
+fn hwp_run(prog: str, args: list[str]) -> HwpRun uses Proc {
+    let r: HwpRun = HwpRun {
+        code: -1, out: "", err: "", spawned: false
+    }
+    let pid: int = proc_spawn(prog, args, 2, 1, 1)
+    if pid < 1 {
+        return r
+    }
+    r.spawned = true
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    r.out = out
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    r.err = err
+    r.code = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    return r
+}
+
+# hwp_hlwasm_bin — resolve the hlwasm twin (bin/hlwasm; when the
+# tree is fresh, make builds it — the guarantee gate's hlboot
+# pattern).
+fn hwp_hlwasm_bin() -> str uses Fs, Proc {
+    if file_exists("bin/hlwasm") {
+        return "bin/hlwasm"
+    }
+    proc_exec("make -s bin/hlwasm")
+    if file_exists("bin/hlwasm") {
+        return "bin/hlwasm"
+    }
+    return ""
+}
+
+# hwp_readme_md — the generated README (the .py's _readme_md, line
+# for line).
+fn hwp_readme_md(cfg: HwpCfg, surface: HwpSurface, wasm_size: int,
+js_size: int) -> str {
+    let name: str = hwp_cfg_name(cfg)
+    let version: str = hwp_cfg_version(cfg)
+    let target: str = hwp_cfg_target(cfg)
+    let stem: str = hwp_file_stem(name)
+    let lines: list[str] = ["# " + name, "",
+    hwp_cfg_description(cfg), "",
+    "Version " + version + " · target `" + target
+    + "` · built with Halis Stage 76 (`hls-wasm-pack`).", "",
+    "## Install", "",
+    "```sh",
+    "npm install " + name,
+    "```", "",
+    "## Use (" + target + ")"]
+    if target == "nodejs" {
+        lines.push("")
+        lines.push("```js")
+        lines.push("const { init } = require('" + name + "');")
+        lines.push("const inst = await init(); // runs main()")
+        lines.push("```")
+    } else if target == "no-modules" {
+        lines.push("")
+        lines.push("```html")
+        lines.push("<script src=\"./" + stem + ".js\"></script>")
+        lines.push("<script>HalisPack.init().then(() => {});</script>")
+        lines.push("```")
+    } else {
+        lines.push("")
+        lines.push("```js")
+        lines.push("import init from '" + name + "';")
+        lines.push("const inst = await init(); // runs main()")
+        lines.push("```")
+    }
+    let fns: list[HwpFn] = hwp_exported_functions(surface)
+    lines.push("")
+    lines.push("## Halis API")
+    lines.push("")
+    if fns.len() > 0 {
+        let mut i: int = 0
+        while i < fns.len() {
+            let f: HwpFn = fns.get(i)
+            let params: list[str] = []
+            let mut j: int = 0
+            while j < f.params.len() {
+                let p: HwpParam = f.params.get(j)
+                params.push(p.name + ": " + p.type)
+                j = j + 1
+            }
+            lines.push("- `" + f.name + "(" + str_join(params, ", ")
+            + ") -> " + f.returns + "`")
+            i = i + 1
+        }
+    } else {
+        lines.push("No exported functions (the program exposes `main` only).")
+    }
+    if surface.structs.len() > 0 {
+        lines.push("")
+        lines.push("## Structs")
+        lines.push("")
+        let mut si: int = 0
+        while si < surface.structs.len() {
+            let st: HwpStruct = surface.structs.get(si)
+            let fields: list[str] = []
+            let mut fi: int = 0
+            while fi < st.fields.len() {
+                let f: HwpField = st.fields.get(fi)
+                fields.push(f.name + ": " + f.type)
+                fi = fi + 1
+            }
+            lines.push("- `" + st.name + " { "
+            + str_join(fields, ", ") + " }`")
+            si = si + 1
+        }
+    }
+    lines.push("")
+    lines.push("## Sizes")
+    lines.push("")
+    lines.push("- `" + stem + ".wasm`: " + wasm_size.to_str() + " bytes")
+    lines.push("- `" + stem + ".js`: " + js_size.to_str() + " bytes")
+    lines.push("")
+    lines.push("> Built from Halis source with `hls-wasm-pack build`. "
+    + "See `.pack-manifest.json` for per-file SHA-256 hashes.")
+    lines.push("")
+    return str_join(lines, "\n")
+}
+
+# hwp_build — build the publish-ready package; return the manifest.
+fn hwp_build(log: HwpLog, input_hls: str, out_dir: str, cfg: HwpCfg)
+-> Result[JsonValue, str] uses IO, Fs, Proc, Clock {
+    let target: str = hwp_cfg_target(cfg)
+    let targets: list[str] = hwp_pack_targets()
+    let mut target_ok: bool = false
+    let mut ti: int = 0
+    while ti < targets.len() {
+        if targets.get(ti) == target {
+            target_ok = true
+        }
+        ti = ti + 1
+    }
+    if !target_ok {
+        return Result.Err("unknown pack target '" + target
+        + "' (expected one of: " + str_join(targets, ", ") + ")")
+    }
+    if !hwp_is_valid_name(hwp_cfg_name(cfg)) {
+        return Result.Err(hwp_invalid_name_msg(hwp_cfg_name(cfg)))
+    }
+    if !hwp_is_valid_version(hwp_cfg_version(cfg)) {
+        return Result.Err(hwp_invalid_version_msg(hwp_cfg_version(cfg)))
+    }
+    let wasm_opt: str = hwp_cfg_wasm_opt(cfg)
+    let opt_level: str = hwp_cfg_opt_level(cfg)
+    if wasm_opt != "auto" && wasm_opt != "on" && wasm_opt != "off" {
+        return Result.Err("wasm_opt must be auto|on|off, got '"
+        + wasm_opt + "'")
+    }
+    if opt_level != "O1" && opt_level != "O2" && opt_level != "O3"
+    && opt_level != "Os" {
+        return Result.Err("opt_level must be O1|O2|O3|Os, got '"
+        + opt_level + "'")
+    }
+    if !file_exists(input_hls) {
+        return Result.Err("input file not found: '" + input_hls + "'")
+    }
+    let name: str = hwp_cfg_name(cfg)
+    let version: str = hwp_cfg_version(cfg)
+    let stem: str = hwp_file_stem(name)
+    proc_exec("mkdir -p '" + hwp_shell_quote(out_dir) + "'")
+
+    # The compile: bin/hlwasm into a scratch dir, then read back.
+    let hlwasm: str = hwp_hlwasm_bin()
+    if hlwasm == "" {
+        return Result.Err("hlwasm compile failed (rc=127)")
+    }
+    let tmp: str = "/tmp/hwp-build-" + proc_pid().to_str()
+    proc_exec("rm -rf '" + hwp_shell_quote(tmp) + "'")
+    proc_exec("mkdir -p '" + hwp_shell_quote(tmp) + "'")
+    let tmp_base: str = hwp_join_path(tmp, "bundle")
+    let cargs: list[str] = [input_hls, tmp_base,
+    "--target", "wasm32-unknown-unknown",
+    "--wasm-opt", wasm_opt,
+    "--opt-level", opt_level,
+    "--glue", "compact",
+    "--no-html"]
+    let crun: HwpRun = hwp_run(hlwasm, cargs)
+    if crun.code != 0 {
+        proc_exec("rm -rf '" + hwp_shell_quote(tmp) + "'")
+        if crun.err != "" {
+            eprint(crun.err)
+        }
+        return Result.Err("hlwasm compile failed (rc="
+        + crun.code.to_str() + ")")
+    }
+    let wasm_bytes: str = read_file(tmp_base + ".wasm")
+    # The Stage 73 compact glue carries one non-UTF8 comment byte (a
+    # cp1252 em-dash in the readStruct fix comment — a pre-existing
+    # upstream mojibake, harmless inside a JS comment). Normalise to
+    # valid UTF-8 on pack so the published .js is decodable
+    # everywhere (browsers assume UTF-8 for ESM).
+    let compact_glue: str = hwp_utf8_sanitize(read_file(tmp_base + ".js"))
+    proc_exec("rm -rf '" + hwp_shell_quote(tmp) + "'")
+
+    if wasm_bytes.len() < 4 || wasm_bytes.byte_at(0) != 0
+    || wasm_bytes.byte_at(1) != 97 || wasm_bytes.byte_at(2) != 115
+    || wasm_bytes.byte_at(3) != 109 {
+        return Result.Err("hlwasm did not produce a valid wasm module")
+    }
+
+    let surface: HwpSurface = hwp_scan_file(input_hls)
+
+    # Write pkg/ files (every filename is containment-checked).
+    let wasm_file: str = stem + ".wasm"
+    let js_file: str = stem + ".js"
+    let dts_file: str = stem + ".d.ts"
+    let all_files: list[str] = [wasm_file, js_file, dts_file,
+    "package.json", "README.md", ".pack-manifest.json"]
+    let mut fi: int = 0
+    while fi < all_files.len() {
+        let full: str = hwp_join_path(out_dir, all_files.get(fi))
+        if !hwp_inside_dir(full, out_dir) {
+            return Result.Err("output file escapes the output directory: '"
+            + full + "' (rejected: path-traversal defence)")
+        }
+        fi = fi + 1
+    }
+
+    write_file(hwp_join_path(out_dir, wasm_file), wasm_bytes)
+    let js_r: Result[str, str] = hwp_render_js(target, stem,
+    compact_glue)
+    if result_is_err(js_r) {
+        return Result.Err(hwp_unwrap_err(js_r))
+    }
+    let js_src: str = result_unwrap(js_r)
+    write_file(hwp_join_path(out_dir, js_file), js_src)
+    let dts_src: str = hwp_render_dts(surface, name)
+    write_file(hwp_join_path(out_dir, dts_file), dts_src)
+
+    let pkg_r: Result[JsonValue, str] = hwp_build_package_json(cfg,
+    js_file, dts_file, wasm_file)
+    if result_is_err(pkg_r) {
+        return Result.Err(hwp_unwrap_err(pkg_r))
+    }
+    let pkg: JsonValue = result_unwrap(pkg_r)
+    write_file(hwp_join_path(out_dir, "package.json"),
+    hwp_json_dumps(pkg) + "\n")
+
+    let wasm_size: int = wasm_bytes.len()
+    let js_size: int = js_src.len()
+    write_file(hwp_join_path(out_dir, "README.md"),
+    hwp_readme_md(cfg, surface, wasm_size, js_size))
+    if target == "deno" {
+        write_file(hwp_join_path(out_dir, "deno.json"),
+        hwp_deno_json(name))
+    }
+
+    let files: list[str] = [wasm_file, js_file, dts_file,
+    "package.json", "README.md"]
+    if target == "deno" {
+        files.push("deno.json")
+    }
+    let fkeys: list[str] = []
+    let fvals: list[JsonValue] = []
+    let mut ffi: int = 0
+    while ffi < files.len() {
+        let fname: str = files.get(ffi)
+        let p: str = hwp_join_path(out_dir, fname)
+        fkeys.push(fname)
+        fvals.push(json_object(["size", "sha256"],
+        [json_int(read_file(p).len()),
+        json_str(sha256_hex(read_file(p)))]))
+        ffi = ffi + 1
+    }
+    let mf_keys: list[str] = ["packVersion", "name", "version",
+    "target", "toolchain", "source", "files"]
+    let mf_vals: list[JsonValue] = [
+    json_int(hwp_pack_format_version()),
+    json_str(name),
+    json_str(version),
+    json_str(target),
+    json_str(hwp_banner()),
+    json_str(hwp_basename(input_hls)),
+    json_object(fkeys, fvals)]
+    let manifest: JsonValue = json_object(mf_keys, mf_vals)
+    write_file(hwp_join_path(out_dir, ".pack-manifest.json"),
+    hwp_json_dumps(manifest) + "\n")
+
+    if wasm_size >= hwp_warn_wasm_bytes() {
+        hwp_log_warn(log, "wasm is " + wasm_size.to_str() + " bytes (>= "
+        + hwp_warn_wasm_bytes().to_str() + "): consider --wasm-opt on "
+        + "+ --opt-level Os")
+    }
+    if js_size >= hwp_warn_js_bytes() {
+        hwp_log_warn(log, "js glue is " + js_size.to_str() + " bytes (>= "
+        + hwp_warn_js_bytes().to_str() + ")")
+    }
+    hwp_log_info(log, "built " + name + "@" + version + " [" + target
+    + "] -> " + out_dir + " (" + wasm_size.to_str() + " wasm bytes)")
+    return Result.Ok(manifest)
+}
+
+# hwp_basename — the final path segment.
+fn hwp_basename(p: str) -> str {
+    let slash: int = p.find("/")
+    if slash < 0 {
+        return p
+    }
+    let mut last: int = -1
+    let mut i: int = 0
+    while i < p.len() {
+        if p.byte_at(i) == 47 {
+            last = i
+        }
+        i = i + 1
+    }
+    if last < 0 {
+        return p
+    }
+    return p.slice(last + 1, p.len())
+}
+
+# ============================================================================
+# hwp_pack — the tarball packer (the .py part 7 of 10).
+#
+# pack turns a built pkg/ dir into a publishable
+# <stem>-<version>.tgz (a hand-rolled ustar writer + std.archive's
+# gzip — no npm needed) plus a .pack-manifest.json-verified file
+# list. unpack reverses it with the containment defence: absolute
+# paths, ".." segments, and link members (symlink or hardlink) are
+# rejected, never written.
+#
+# The tarball layout mirrors npm pack: files live under
+# package/<fname> so `npm publish <tgz>` accepts the artifact. The
+# writer pins mtime/uid/gid to 0, uname/gname to "" and mode to
+# 0644, so the tar bytes (and therefore the .tgz) are reproducible:
+# pack twice, identical sha256. NATIVE DELTA, documented: the .py
+# rode tarfile's PAX format, which only differs from ustar for
+# names over 255 bytes (pax extended records); the native writer
+# splits those across the ustar prefix field and refuses anything
+# longer — npm's own 214-char name cap keeps every real package
+# inside.
+# ============================================================================
+
+# hwp_octal_field — width octal digits, zero-padded, + NUL.
+fn hwp_octal_field(n: int, width: int) -> str {
+    let mut digits: str = ""
+    let mut v: int = n
+    if v < 0 {
+        v = 0
+    }
+    let mut guard: int = 0
+    while guard < 32 {
+        guard = guard + 1
+        digits = hwp_octal_digit(int_and(v, 7)) + digits
+        v = int_shr(v, 3)
+        if v == 0 {
+            guard = 32
+        }
+    }
+    while digits.len() < width {
+        digits = "0" + digits
+    }
+    if digits.len() > width {
+        digits = digits.slice(digits.len() - width, digits.len())
+    }
+    return digits + chr(0)
+}
+
+fn hwp_octal_digit(d: int) -> str {
+    return "01234567".slice(d, d + 1)
+}
+
+# hwp_tar_field — a header field zero-padded to width bytes.
+fn hwp_tar_field(s: str, width: int) -> str {
+    let mut out: str = s
+    while out.len() < width {
+        out = out + chr(0)
+    }
+    return out.slice(0, width)
+}
+
+# hwp_tar_name_split — "package/<fname>" split for the ustar
+# name[100] + prefix[155] pair; Ok((prefix, name)) or a refusal.
+fn hwp_tar_name_split(arcname: str) -> Result[list[str], str] {
+    if arcname.len() <= 100 {
+        return Result.Ok(["", arcname])
+    }
+    # Split at a "/" boundary inside the last 100 bytes.
+    let limit: int = arcname.len() - 100
+    let mut cut: int = -1
+    let mut i: int = limit
+    while i < arcname.len() {
+        if arcname.byte_at(i) == 47 {
+            cut = i
+            i = arcname.len()
+        }
+        i = i + 1
+    }
+    if cut < 1 {
+        return Result.Err("tar member name too long for ustar: "
+        + arcname)
+    }
+    let prefix: str = arcname.slice(0, cut)
+    let name: str = arcname.slice(cut + 1, arcname.len())
+    if prefix.len() > 155 || name.len() > 100 {
+        return Result.Err("tar member name too long for ustar: "
+        + arcname)
+    }
+    return Result.Ok([prefix, name])
+}
+
+# hwp_tar_header — one 512-byte ustar header for a regular file
+# (the deterministic fields the .py pinned on TarInfo: mtime/uid/gid
+# 0, uname/gname "", mode 0644, typeflag '0').
+fn hwp_tar_header(arcname: str, size: int) -> Result[str, str] {
+    let split: Result[list[str], str] = hwp_tar_name_split(arcname)
+    if result_is_err(split) {
+        return Result.Err(hwp_unwrap_err(split))
+    }
+    let parts: list[str] = result_unwrap(split)
+    # The header, field by field (offsets in the comment).
+    let h: list[str] = []
+    h.push(hwp_tar_field(parts.get(1), 100)) # 0   name
+    h.push(hwp_octal_field(420, 7)) # 100 mode 0644
+    h.push(hwp_octal_field(0, 7)) # 108 uid
+    h.push(hwp_octal_field(0, 7)) # 116 gid
+    h.push(hwp_octal_field(size, 11)) # 124 size
+    h.push(hwp_octal_field(0, 11)) # 136 mtime (reproducible)
+    h.push("        ") # 148 chksum (spaces first)
+    h.push("0") # 156 typeflag: regular
+    h.push(hwp_tar_field("", 100)) # 157 linkname
+    h.push("ustar" + chr(0)) # 257 magic
+    h.push("00") # 263 version
+    h.push(hwp_tar_field("", 32)) # 265 uname
+    h.push(hwp_tar_field("", 32)) # 297 gname
+    h.push(hwp_octal_field(0, 7)) # 329 devmajor
+    h.push(hwp_octal_field(0, 7)) # 337 devminor
+    h.push(hwp_tar_field(parts.get(0), 155)) # 345 prefix
+    h.push(hwp_tar_field("", 12)) # 500 pad to 512
+    let mut header: str = str_join(h, "")
+    # The checksum: sum of every byte with the chksum field as 8
+    # spaces, written as 6 octal digits + NUL + space.
+    let mut sum: int = 0
+    let mut j: int = 0
+    while j < header.len() {
+        sum = sum + header.byte_at(j)
+        j = j + 1
+    }
+    header = header.slice(0, 148) + hwp_octal_six(sum) + chr(0) + " "
+    + header.slice(156, header.len())
+    return Result.Ok(header)
+}
+
+# hwp_octal_six — "%06o" (6 octal digits, no terminator).
+fn hwp_octal_six(n: int) -> str {
+    let mut digits: str = ""
+    let mut v: int = n
+    let mut guard: int = 0
+    while guard < 12 {
+        guard = guard + 1
+        digits = hwp_octal_digit(int_and(v, 7)) + digits
+        v = int_shr(v, 3)
+        if v == 0 {
+            guard = 12
+        }
+    }
+    while digits.len() < 6 {
+        digits = "0" + digits
+    }
+    if digits.len() > 6 {
+        digits = digits.slice(digits.len() - 6, digits.len())
+    }
+    return digits
+}
+
+# hwp_tar_member — header + data + zero padding to a 512 multiple.
+fn hwp_tar_member(arcname: str, data: str) -> Result[str, str] {
+    let head: Result[str, str] = hwp_tar_header(arcname, data.len())
+    if result_is_err(head) {
+        return Result.Err(hwp_unwrap_err(head))
+    }
+    let mut out: str = result_unwrap(head) + data
+    let padded: int = (data.len() + 511) / 512 * 512
+    let mut i: int = data.len()
+    while i < padded {
+        out = out + chr(0)
+        i = i + 1
+    }
+    return Result.Ok(out)
+}
+
+# hwp_dirname — the parent directory (os.path.dirname).
+fn hwp_dirname(p: str) -> str {
+    if p == "" {
+        return "."
+    }
+    let mut last: int = -1
+    let mut i: int = 0
+    while i < p.len() {
+        if p.byte_at(i) == 47 {
+            last = i
+        }
+        i = i + 1
+    }
+    if last < 0 {
+        return "."
+    }
+    if last == 0 {
+        return "/"
+    }
+    return p.slice(0, last)
+}
+
+# hwp_sort_names — byte-order sort (Python's sorted() over the
+# manifest keys; ASCII names, so byte order == code point order).
+fn hwp_sort_names(xs: list[str]) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < xs.len() {
+        out.push(xs.get(i))
+        i = i + 1
+    }
+    let mut a: int = 1
+    while a < out.len() {
+        let v: str = out.get(a)
+        let mut b: int = a - 1
+        while b >= 0 && hwp_str_lt(v, out.get(b)) {
+            out.set(b + 1, out.get(b))
+            b = b - 1
+        }
+        out.set(b + 1, v)
+        a = a + 1
+    }
+    return out
+}
+
+# hwp_str_lt — bytewise s < t.
+fn hwp_str_lt(s: str, t: str) -> bool {
+    let mut n: int = s.len()
+    if t.len() < n {
+        n = t.len()
+    }
+    let mut i: int = 0
+    while i < n {
+        let a: int = s.byte_at(i)
+        let b: int = t.byte_at(i)
+        if a != b {
+            return a < b
+        }
+        i = i + 1
+    }
+    return s.len() < t.len()
+}
+
+# hwp_read_manifest — the parsed .pack-manifest.json (the caller
+# names the refusal when missing).
+fn hwp_read_manifest(pkg_dir: str) -> Result[JsonValue, str] uses Fs {
+    let manifest_path: str = hwp_join_path(pkg_dir, ".pack-manifest.json")
+    if !file_exists(manifest_path) {
+        return Result.Err("not a built package: '" + pkg_dir
+        + "' is missing .pack-manifest.json (run 'hls-wasm-pack build' first)")
+    }
+    let parsed: Result[JsonValue, str] = json_parse_result(
+    read_file(manifest_path))
+    if result_is_err(parsed) {
+        return Result.Err(".pack-manifest.json unreadable: "
+        + hwp_unwrap_err(parsed))
+    }
+    return Result.Ok(result_unwrap(parsed))
+}
+
+# hwp_pack — pack pkg_dir into a .tgz; return the tarball path.
+fn hwp_pack(log: HwpLog, pkg_dir: str, tgz_path: str)
+-> Result[str, str] uses IO, Fs, Proc, Clock {
+    let manifest_r: Result[JsonValue, str] = hwp_read_manifest(pkg_dir)
+    if result_is_err(manifest_r) {
+        return Result.Err(hwp_unwrap_err(manifest_r))
+    }
+    let manifest: JsonValue = result_unwrap(manifest_r)
+    let files_j: JsonValue = json_object_get(manifest, "files")
+    if !json_is_object(files_j) {
+        return Result.Err("manifest lists no files; refusing to pack")
+    }
+    let files: list[str] = hwp_sort_names(files_j.obj_keys)
+    if files.len() == 0 {
+        return Result.Err("manifest lists no files; refusing to pack")
+    }
+    let mut has_pkg_json: bool = false
+    let mut fi: int = 0
+    while fi < files.len() {
+        if files.get(fi) == "package.json" {
+            has_pkg_json = true
+        }
+        fi = fi + 1
+    }
+    if !has_pkg_json {
+        return Result.Err("manifest is missing required 'package.json'")
+    }
+
+    let name_j: JsonValue = json_object_get(manifest, "name")
+    let version_j: JsonValue = json_object_get(manifest, "version")
+    let mut name: str = "halis-app"
+    let mut version: str = "0.1.0"
+    if json_is_str(name_j) {
+        name = json_str_value(name_j)
+    }
+    if json_is_str(version_j) {
+        version = json_str_value(version_j)
+    }
+    let stem: str = hwp_file_stem(name)
+    let mut out_abs: str = tgz_path
+    if out_abs == "" {
+        out_abs = hwp_join_path(
+        hwp_dirname(hwp_realpath_lex(pkg_dir)),
+        stem + "-" + version + ".tgz")
+    }
+    proc_exec("mkdir -p '"
+    + hwp_shell_quote(hwp_dirname(hwp_realpath_lex(out_abs))) + "'")
+
+    let mut tar: str = ""
+    let mut mi: int = 0
+    while mi < files.len() {
+        let fname: str = files.get(mi)
+        let src: str = hwp_join_path(pkg_dir, fname)
+        if !hwp_inside_dir(src, pkg_dir) {
+            return Result.Err("package file escapes the output directory: '"
+            + src + "' (rejected: path-traversal defence)")
+        }
+        if !file_exists(src) {
+            return Result.Err("listed file missing: '" + fname + "'")
+        }
+        let data: str = read_file(src)
+        let meta: JsonValue = json_object_get(files_j, fname)
+        let expect_j: JsonValue = json_object_get(meta, "sha256")
+        if json_is_str(expect_j) {
+            if sha256_hex(data) != json_str_value(expect_j) {
+                return Result.Err("hash mismatch for '" + fname
+                + "' (pkg/ changed after build; rebuild before packing)")
+            }
+        }
+        let member: Result[str, str] = hwp_tar_member(
+        "package/" + fname, data)
+        if result_is_err(member) {
+            return Result.Err(hwp_unwrap_err(member))
+        }
+        tar = tar + result_unwrap(member)
+        mi = mi + 1
+    }
+    # Two zero end blocks (reproducible bytes: same input, same tgz).
+    let mut zi: int = 0
+    while zi < 1024 {
+        tar = tar + chr(0)
+        zi = zi + 1
+    }
+    write_file(out_abs, gzip_encode(tar))
+    hwp_log_info(log, "packed " + files.len().to_str() + " files -> "
+    + out_abs + " (" + read_file(out_abs).len().to_str() + " bytes)")
+    return Result.Ok(out_abs)
+}
+
+# hwp_list_members — the member names of a .tgz (no extraction).
+fn hwp_list_members(tgz_path: str) -> Result[list[str], str] uses Fs {
+    if !file_exists(tgz_path) {
+        return Result.Err("tarball not found: '" + tgz_path + "'")
+    }
+    let tar: str = gzip_decode_file(tgz_path,
+    archive_default_max_ratio())
+    let entries: list[TarEntry] = tar_parse(tar,
+    archive_default_max_ratio())
+    let names: list[str] = []
+    let mut i: int = 0
+    while i < entries.len() {
+        names.push(entries.get(i).name)
+        i = i + 1
+    }
+    return Result.Ok(names)
+}
+
+# hwp_unpack — unpack tgz_path into dest_dir; return the extracted
+# paths. Every member is checked: absolute paths and ".." segments
+# are rejected, link members (symlink or hardlink) are rejected,
+# and the target path must resolve inside dest_dir (the Stage 27/75
+# traversal defence on the serve side).
+fn hwp_unpack(tgz_path: str, dest_dir: str)
+-> Result[list[str], str] uses Fs, Proc {
+    if !file_exists(tgz_path) {
+        return Result.Err("tarball not found: '" + tgz_path + "'")
+    }
+    proc_exec("mkdir -p '" + hwp_shell_quote(dest_dir) + "'")
+    let tar: str = gzip_decode_file(tgz_path,
+    archive_default_max_ratio())
+    let entries: list[TarEntry] = tar_parse(tar,
+    archive_default_max_ratio())
+    let extracted: list[str] = []
+    let mut i: int = 0
+    while i < entries.len() {
+        let e: TarEntry = entries.get(i)
+        let arcname: str = e.name
+        if hwp_path_is_abs(arcname) || hwp_has_dotdot_seg(arcname) {
+            return Result.Err("tarball member escapes the package: '"
+            + arcname + "' (rejected)")
+        }
+        if e.typeflag == 50 || e.typeflag == 49 {
+            return Result.Err("tarball member is a link (rejected): '"
+            + arcname + "'")
+        }
+        let target: str = hwp_join_path(dest_dir, arcname)
+        if !hwp_inside_dir(target, dest_dir) {
+            return Result.Err("tarball member escapes the output "
+            + "directory: '" + target
+            + "' (rejected: path-traversal defence)")
+        }
+        if e.typeflag == 53 {
+            proc_exec("mkdir -p '" + hwp_shell_quote(target) + "'")
+        } else if e.typeflag == 48 {
+            proc_exec("mkdir -p '"
+            + hwp_shell_quote(hwp_dirname(target)) + "'")
+            write_file(target, e.data)
+            extracted.push(target)
+        } else {
+            return Result.Err("tarball member has an unsupported type: '"
+            + arcname + "'")
+        }
+        i = i + 1
+    }
+    return Result.Ok(extracted)
+}
+
+# hwp_has_dotdot_seg — any "/"-separated segment is "..".
+fn hwp_has_dotdot_seg(arcname: str) -> bool {
+    let parts: list[str] = arcname.split("/")
+    let mut i: int = 0
+    while i < parts.len() {
+        if parts.get(i) == ".." {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# hwp_make_evil_tar — the battery's hostile fixture: three members,
+# the first of which ("../../evil.txt") must be rejected before
+# anything is written (the gate's --unit-evil probe builds it, then
+# unpacks it expecting the refusal).
+fn hwp_make_evil_tar(evil_path: str) -> void uses Fs {
+    let names: list[str] = ["../../evil.txt", "/abs.txt",
+    "package/ok.txt"]
+    let mut tar: str = ""
+    let mut i: int = 0
+    while i < names.len() {
+        let member: Result[str, str] = hwp_tar_member(names.get(i), "x")
+        if !result_is_err(member) {
+            tar = tar + result_unwrap(member)
+        }
+        i = i + 1
+    }
+    let mut zi: int = 0
+    while zi < 1024 {
+        tar = tar + chr(0)
+        zi = zi + 1
+    }
+    write_file(evil_path, gzip_encode(tar))
+}
+
+# ============================================================================
+# hwp_validate — the pkg/ checker (the .py part 8 of 10).
+#
+# check verifies a built package WITHOUT running it:
+#   1. required files present (.wasm + .js + .d.ts + package.json +
+#      README.md + .pack-manifest.json);
+#   2. .wasm starts with the \0asm magic + version 1;
+#   3. .js carries the "hls-wasm-pack target:" marker matching the
+#      manifest target, and is non-trivially sized;
+#   4. .d.ts is non-empty and mentions the loader API;
+#   5. package.json parses, has name/version/main/types/files, and
+#      its name/version match the manifest;
+#   6. every manifest-listed file exists and its sha256 matches.
+# test_pkg additionally smoke-runs the wasm in Node.js when node is
+# installed (SKIP otherwise — the Stage 23/24 convention).
+# ============================================================================
+
+struct HwpCheckResult {
+    ok: bool,
+    msgs: list[str]
+}
+
+# hwp_json_repr — the %r rendering of a JSON-ish value (None for
+# absent/null, True/False for bools, 'quotes' for strings).
+fn hwp_json_repr(v: JsonValue) -> str {
+    if json_is_str(v) {
+        return "'" + json_str_value(v) + "'"
+    }
+    if json_is_int(v) {
+        return json_int_value(v).to_str()
+    }
+    if json_is_bool(v) {
+        if json_bool_value(v) {
+            return "True"
+        }
+        return "False"
+    }
+    return "None"
+}
+
+# hwp_manifest_ext_names — the manifest files keys ending in ext.
+fn hwp_manifest_ext_names(files_j: JsonValue, ext: str)
+-> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < files_j.obj_keys.len() {
+        if files_j.obj_keys.get(i).ends_with(ext) {
+            out.push(files_j.obj_keys.get(i))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# hwp_check — validate pkg_dir; return (ok, messages).
+fn hwp_check(pkg_dir: str) -> HwpCheckResult uses Fs {
+    let msgs: list[str] = []
+    let manifest_path: str = hwp_join_path(pkg_dir, ".pack-manifest.json")
+    if !file_exists(manifest_path) {
+        msgs.push("FAIL: .pack-manifest.json missing (not a built package)")
+        return HwpCheckResult {
+            ok: false, msgs: msgs
+        }
+    }
+    let parsed: Result[JsonValue, str] = json_parse_result(
+    read_file(manifest_path))
+    if result_is_err(parsed) {
+        msgs.push("FAIL: .pack-manifest.json unreadable: "
+        + hwp_unwrap_err(parsed))
+        return HwpCheckResult {
+            ok: false, msgs: msgs
+        }
+    }
+    let manifest: JsonValue = result_unwrap(parsed)
+
+    let pv_j: JsonValue = json_object_get(manifest, "packVersion")
+    if !json_is_int(pv_j)
+    || json_int_value(pv_j) != hwp_pack_format_version() {
+        msgs.push("FAIL: packVersion is " + hwp_json_repr(pv_j)
+        + " (expected " + hwp_pack_format_version().to_str() + ")")
+    } else {
+        msgs.push("OK: packVersion == "
+        + hwp_pack_format_version().to_str())
+    }
+    let target_j: JsonValue = json_object_get(manifest, "target")
+    let mut target: str = ""
+    if json_is_str(target_j) {
+        target = json_str_value(target_j)
+    }
+    let targets: list[str] = hwp_pack_targets()
+    let mut target_ok: bool = false
+    let mut ti: int = 0
+    while ti < targets.len() {
+        if targets.get(ti) == target {
+            target_ok = true
+        }
+        ti = ti + 1
+    }
+    if !target_ok {
+        msgs.push("FAIL: target " + hwp_json_repr(target_j)
+        + " is not one of " + str_join(targets, ", "))
+    } else {
+        msgs.push("OK: target == " + target)
+    }
+    let mut files_j: JsonValue = json_object_get(manifest, "files")
+    if !json_is_object(files_j) {
+        files_j = json_object([], [])
+    }
+    let reqs: list[str] = ["package.json", "README.md"]
+    let mut ri: int = 0
+    while ri < reqs.len() {
+        if !json_object_has(files_j, reqs.get(ri)) {
+            msgs.push("FAIL: manifest does not list required "
+            + reqs.get(ri))
+        }
+        ri = ri + 1
+    }
+    # Locate the three artifacts by extension.
+    let wasm_names: list[str] = hwp_manifest_ext_names(files_j, ".wasm")
+    let js_names: list[str] = hwp_manifest_ext_names(files_j, ".js")
+    let dts_names: list[str] = hwp_manifest_ext_names(files_j, ".d.ts")
+    if wasm_names.len() != 1 {
+        msgs.push("FAIL: expected exactly 1 .wasm in manifest, found "
+        + wasm_names.len().to_str())
+    }
+    if js_names.len() != 1 {
+        msgs.push("FAIL: expected exactly 1 .js in manifest, found "
+        + js_names.len().to_str())
+    }
+    if dts_names.len() != 1 {
+        msgs.push("FAIL: expected exactly 1 .d.ts in manifest, found "
+        + dts_names.len().to_str())
+    }
+
+    if wasm_names.len() > 0 {
+        let p: str = hwp_join_path(pkg_dir, wasm_names.get(0))
+        if !file_exists(p) {
+            msgs.push("FAIL: " + wasm_names.get(0) + " missing")
+        } else {
+            let head: str = read_file(p)
+            if head.len() >= 8 && head.byte_at(0) == 0
+            && head.byte_at(1) == 97 && head.byte_at(2) == 115
+            && head.byte_at(3) == 109 && head.byte_at(4) == 1
+            && head.byte_at(5) == 0 && head.byte_at(6) == 0
+            && head.byte_at(7) == 0 {
+                msgs.push("OK: " + wasm_names.get(0)
+                + " has wasm magic + version 1")
+            } else {
+                msgs.push("FAIL: " + wasm_names.get(0)
+                + " is not a valid wasm module (bad magic)")
+            }
+        }
+    }
+    if js_names.len() > 0 {
+        let p: str = hwp_join_path(pkg_dir, js_names.get(0))
+        if !file_exists(p) {
+            msgs.push("FAIL: " + js_names.get(0) + " missing")
+        } else {
+            let src: str = read_file(p)
+            let marker: str = "hls-wasm-pack target: " + target
+            if src.contains(marker) {
+                msgs.push("OK: " + js_names.get(0) + " carries the "
+                + target + " marker")
+            } else {
+                msgs.push("FAIL: " + js_names.get(0) + " missing the '"
+                + marker + "' marker")
+            }
+            if src.len() >= 512 {
+                msgs.push("OK: " + js_names.get(0) + " is non-trivial ("
+                + src.len().to_str() + " bytes)")
+            } else {
+                msgs.push("FAIL: " + js_names.get(0)
+                + " is suspiciously small")
+            }
+        }
+    }
+    if dts_names.len() > 0 {
+        let p: str = hwp_join_path(pkg_dir, dts_names.get(0))
+        if !file_exists(p) {
+            msgs.push("FAIL: " + dts_names.get(0) + " missing")
+        } else {
+            let src: str = read_file(p)
+            if src.contains("HalisInstance") && src.contains("declare") {
+                msgs.push("OK: " + dts_names.get(0)
+                + " declares the loader API")
+            } else {
+                msgs.push("FAIL: " + dts_names.get(0)
+                + " missing the loader API declarations")
+            }
+        }
+    }
+
+    let pkg_json_path: str = hwp_join_path(pkg_dir, "package.json")
+    if file_exists(pkg_json_path) {
+        let pj: Result[JsonValue, str] = json_parse_result(
+        read_file(pkg_json_path))
+        if result_is_err(pj) {
+            msgs.push("FAIL: package.json is not valid JSON: "
+            + hwp_unwrap_err(pj))
+        } else {
+            let pkg: JsonValue = result_unwrap(pj)
+            let keys: list[str] = ["name", "version", "main", "types",
+            "files"]
+            let mut ki: int = 0
+            while ki < keys.len() {
+                if !json_object_has(pkg, keys.get(ki)) {
+                    msgs.push("FAIL: package.json missing key '"
+                    + keys.get(ki) + "'")
+                }
+                ki = ki + 1
+            }
+            if hwp_json_repr(json_object_get(pkg, "name"))
+            == hwp_json_repr(json_object_get(manifest, "name")) {
+                msgs.push("OK: package.json name matches manifest")
+            } else {
+                msgs.push("FAIL: package.json name "
+                + hwp_json_repr(json_object_get(pkg, "name"))
+                + " != manifest "
+                + hwp_json_repr(json_object_get(manifest, "name")))
+            }
+            if hwp_json_repr(json_object_get(pkg, "version"))
+            == hwp_json_repr(json_object_get(manifest, "version")) {
+                msgs.push("OK: package.json version matches manifest")
+            } else {
+                msgs.push("FAIL: package.json version "
+                + hwp_json_repr(json_object_get(pkg, "version"))
+                + " != manifest "
+                + hwp_json_repr(json_object_get(manifest, "version")))
+            }
+            let se: JsonValue = json_object_get(pkg, "sideEffects")
+            if json_is_bool(se) && !json_bool_value(se) {
+                msgs.push("OK: package.json sideEffects == false")
+            } else {
+                msgs.push("FAIL: package.json must set sideEffects=false")
+            }
+        }
+    } else {
+        msgs.push("FAIL: package.json missing")
+    }
+
+    let mut fi: int = 0
+    while fi < files_j.obj_keys.len() {
+        let fname: str = files_j.obj_keys.get(fi)
+        let meta: JsonValue = files_j.obj_vals.get(fi)
+        let p: str = hwp_join_path(pkg_dir, fname)
+        if !file_exists(p) {
+            msgs.push("FAIL: listed file missing: " + fname)
+            fi = fi + 1
+            continue
+        }
+        if json_is_object(meta) && json_object_has(meta, "sha256") {
+            let actual: str = sha256_hex(read_file(p))
+            let expect: str = json_str_value(
+            json_object_get(meta, "sha256"))
+            if actual == expect {
+                msgs.push("OK: sha256(" + fname + ") matches")
+            } else {
+                msgs.push("FAIL: sha256(" + fname
+                + ") MISMATCH (pkg/ changed after build)")
+            }
+        }
+        fi = fi + 1
+    }
+
+    let mut ok_count: int = 0
+    let mut fail_count: int = 0
+    let mut oi: int = 0
+    while oi < msgs.len() {
+        if msgs.get(oi).starts_with("OK: ") {
+            ok_count = ok_count + 1
+        } else if msgs.get(oi).starts_with("FAIL: ") {
+            fail_count = fail_count + 1
+        }
+        oi = oi + 1
+    }
+    msgs.push("summary: " + ok_count.to_str() + " passed, "
+    + fail_count.to_str() + " failed")
+    return HwpCheckResult {
+        ok: fail_count == 0, msgs: msgs
+    }
+}
+
+# hwp_print_check — the CLI rendering of a check result (the .py's
+# cmd_check loop + verdict line).
+fn hwp_print_check(res: HwpCheckResult, pkg_dir: str) -> void uses IO {
+    let mut i: int = 0
+    while i < res.msgs.len() {
+        let m: str = res.msgs.get(i)
+        let mut tag: str = "INFO"
+        if m.starts_with("OK: ") {
+            tag = "OK"
+        } else if m.starts_with("FAIL: ") {
+            tag = "FAIL"
+        }
+        println("  [" + tag + "] " + m)
+        i = i + 1
+    }
+    let mut verdict: str = "FAILED"
+    if res.ok {
+        verdict = "PASSED"
+    }
+    println("CHECK " + verdict + ": " + pkg_dir)
+}
+
+# hwp_test_pkg — smoke-run a built package in Node.js; ("ok" |
+# "skip" | "fail", detail). SKIP when node is absent; the wasm is
+# loaded through the packed .js flavour (eval'd), falling back to
+# the raw module bytes when the flavour needs a bundler.
+fn hwp_test_pkg(pkg_dir: str) -> list[str] uses Fs, Proc {
+    if proc_exec("command -v node >/dev/null 2>&1") != 0 {
+        return["skip", "node.js not installed"]
+    }
+    let res: HwpCheckResult = hwp_check(pkg_dir)
+    if !res.ok {
+        let mut fails: str = ""
+        let mut i: int = 0
+        while i < res.msgs.len() {
+            if res.msgs.get(i).starts_with("FAIL: ") {
+                if fails != "" {
+                    fails = fails + "; "
+                }
+                fails = fails + res.msgs.get(i)
+            }
+            i = i + 1
+        }
+        if fails.len() > 300 {
+            fails = fails.slice(0, 300)
+        }
+        return["fail", "package does not validate: " + fails]
+    }
+    # Find the wasm + js (the first of each in manifest order).
+    let manifest_r: Result[JsonValue, str] = hwp_read_manifest(pkg_dir)
+    if result_is_err(manifest_r) {
+        return["fail", hwp_unwrap_err(manifest_r)]
+    }
+    let files_j: JsonValue = json_object_get(result_unwrap(manifest_r),
+    "files")
+    if !json_is_object(files_j) {
+        return["fail", "wasm or js missing"]
+    }
+    let mut wasm: str = ""
+    let mut js: str = ""
+    let mut fi: int = 0
+    while fi < files_j.obj_keys.len() {
+        let fname: str = files_j.obj_keys.get(fi)
+        if wasm == "" && fname.ends_with(".wasm") {
+            wasm = hwp_join_path(pkg_dir, fname)
+        }
+        if js == "" && fname.ends_with(".js") {
+            js = hwp_join_path(pkg_dir, fname)
+        }
+        fi = fi + 1
+    }
+    if wasm == "" || js == "" {
+        return["fail", "wasm or js missing"]
+    }
+    let runner: str = "const fs=require('fs');\n"
+    + "const src=fs.readFileSync(" + hwp_json_quote(js)
+    + ",'utf-8');\n"
+    + "eval(src);\n"
+    + "const bytes=new Uint8Array(fs.readFileSync("
+    + hwp_json_quote(wasm) + "));\n"
+    + "Halis.run(bytes).then(c=>{process.exit(0);})"
+    + ".catch(e=>{console.error('ERR:'+e.message);process.exit(1);});\n"
+    let run: HwpRun = hwp_run("node", ["-e", runner])
+    if !run.spawned {
+        return["fail", "node.js not installed"]
+    }
+    if run.code == 0 {
+        return["ok", "node smoke-run exited 0"]
+    }
+    let mut tail_err: str = run.err
+    if tail_err.len() > 200 {
+        tail_err = tail_err.slice(tail_err.len() - 200, tail_err.len())
+    }
+    return["fail", "rc=" + run.code.to_str() + " " + tail_err]
+}
+
+# ============================================================================
+# hwp_publish — the registry publish helper (the .py part 9 of 10).
+#
+# publish is DRY-RUN BY DEFAULT: it validates the tarball + registry
+# URL + access level and prints the exact `npm publish` command
+# WITHOUT touching the network. A real publish requires the explicit
+# --no-dry-run flag AND an installed npm binary — the acceptance
+# gate stays hermetic (no credentials, no network) while users get
+# the one command they need on release day.
+#
+# Deep-scan-30 fix, kept: the old pattern was `[^\s]` inside a raw
+# string — a class of "anything but backslash and s", NOT "anything
+# but whitespace". Registry paths containing an 's' were rejected.
+# The native check spells the intent directly: no whitespace, no
+# '/' in the host.
+# ============================================================================
+
+# hwp_validate_registry — ^https?://[^/\s]+(/\S*)?$, trailing
+# slashes stripped on success.
+fn hwp_validate_registry(registry: str) -> Result[str, str] {
+    let mut s: str = registry
+    if s.starts_with("https://") {
+        s = s.slice(8, s.len())
+    } else if s.starts_with("http://") {
+        s = s.slice(7, s.len())
+    } else {
+        return Result.Err("invalid registry URL '" + registry
+        + "' (expected https://...)")
+    }
+    if s.len() == 0 {
+        return Result.Err("invalid registry URL '" + registry
+        + "' (expected https://...)")
+    }
+    let mut i: int = 0
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        if b == 47 || hwp_is_ws(b) {
+            break
+        }
+        i = i + 1
+    }
+    if i == 0 {
+        return Result.Err("invalid registry URL '" + registry
+        + "' (expected https://...)")
+    }
+    if i < s.len() {
+        # A path must start with '/' and contain no whitespace.
+        if s.byte_at(i) != 47 {
+            return Result.Err("invalid registry URL '" + registry
+            + "' (expected https://...)")
+        }
+        let mut j: int = i + 1
+        while j < s.len() {
+            if hwp_is_ws(s.byte_at(j)) {
+                return Result.Err("invalid registry URL '" + registry
+                + "' (expected https://...)")
+            }
+            j = j + 1
+        }
+    }
+    # rstrip("/"): all trailing slashes go.
+    let full: str = registry
+    let mut end: int = full.len()
+    while end > 0 && full.byte_at(end - 1) == 47 {
+        end = end - 1
+    }
+    return Result.Ok(full.slice(0, end))
+}
+
+# hwp_is_tag_ok — ^[A-Za-z0-9][A-Za-z0-9._~-]*$.
+fn hwp_is_tag_ok(tag: str) -> bool {
+    if tag.len() == 0 {
+        return false
+    }
+    if !hwp_is_lower_alnum(tag.byte_at(0))
+    && !hwp_is_ident_start(tag.byte_at(0)) {
+        return false
+    }
+    let mut i: int = 1
+    while i < tag.len() {
+        let b: int = tag.byte_at(i)
+        if !hwp_is_ident_char(b) && b != 46 && b != 126 && b != 45 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# hwp_publish_command — the `npm publish` argv for tgz_path.
+fn hwp_publish_command(tgz_path: str, registry: str, access: str,
+tag: str) -> Result[list[str], str] {
+    if access != "public" && access != "restricted" {
+        return Result.Err("access must be public|restricted, got '"
+        + access + "'")
+    }
+    if !hwp_is_tag_ok(tag) {
+        return Result.Err("invalid dist-tag '" + tag + "'")
+    }
+    let mut cmd: list[str] = ["npm", "publish", tgz_path, "--tag", tag,
+    "--access", access]
+    if registry != "" {
+        let reg: Result[str, str] = hwp_validate_registry(registry)
+        if result_is_err(reg) {
+            return Result.Err(hwp_unwrap_err(reg))
+        }
+        cmd.push("--registry")
+        cmd.push(result_unwrap(reg))
+    }
+    return Result.Ok(cmd)
+}
+
+# hwp_publish — publish tgz_path; (published, dry_run, error,
+# command_text). Never panics on npm.
+struct HwpPublishResult {
+    published: bool,
+    dry_run: bool,
+    error: str,
+    command_text: str
+}
+
+fn hwp_publish(log: HwpLog, tgz_path: str, registry: str,
+access: str, tag: str, dry_run: bool)
+-> Result[HwpPublishResult, str] uses IO, Fs, Proc, Clock {
+    if !file_exists(tgz_path) {
+        return Result.Err("tarball not found: '" + tgz_path + "'")
+    }
+    let cmd_r: Result[list[str], str] = hwp_publish_command(tgz_path,
+    registry, access, tag)
+    if result_is_err(cmd_r) {
+        return Result.Err(hwp_unwrap_err(cmd_r))
+    }
+    let cmd: list[str] = result_unwrap(cmd_r)
+    let command_text: str = str_join(cmd, " ")
+    if dry_run {
+        hwp_log_info(log, "dry-run: " + command_text)
+        return Result.Ok(HwpPublishResult {
+            published: false, dry_run: true, error: "",
+            command_text: command_text
+        })
+    }
+    if proc_exec("command -v npm >/dev/null 2>&1") != 0 {
+        hwp_log_warn(log, "npm not found; cannot publish (dry-run the "
+        + "command: " + command_text + ")")
+        return Result.Ok(HwpPublishResult {
+            published: false, dry_run: false, error: "npm not installed",
+            command_text: command_text
+        })
+    }
+    let run: HwpRun = hwp_run("npm", cmd)
+    if !run.spawned {
+        return Result.Ok(HwpPublishResult {
+            published: false, dry_run: false, error: "npm not installed",
+            command_text: command_text
+        })
+    }
+    if run.code == 0 {
+        hwp_log_info(log, "published " + tgz_path + " [" + tag + "]")
+        return Result.Ok(HwpPublishResult {
+            published: true, dry_run: false, error: "",
+            command_text: command_text
+        })
+    }
+    hwp_log_warn(log, "npm publish failed (rc=" + run.code.to_str()
+    + ")")
+    return Result.Ok(HwpPublishResult {
+        published: false, dry_run: false,
+        error: "rc=" + run.code.to_str(),
+        command_text: command_text
+    })
+}
+
+# ============================================================================
+# hwp_cli — the argument parser + subcommand orchestrator (the .py
+# part 10 of 10). The argparse surface hand-rolled: same flags,
+# same --flag value / --flag=value forms, same exits (0 ok, 1 a
+# named refusal, 2 usage). Subcommands: new / build / pack /
+# publish / check / test. Global flags: --config PATH,
+# --color/--no-color, --version. A hls.pack.toml (or .json) in the
+# cwd is auto-detected; CLI flags always override it (the Stage 75
+# convention).
+# ============================================================================
+
+struct HwpCli {
+    config: str,
+    color: int, # -1 auto, 1 forced, 0 off
+    version_flag: bool,
+    help_flag: bool,
+    cmd: str, # "" when none
+    # new
+    new_name: str,
+    new_scope: str,
+    new_dir: str,
+    new_template: str,
+    # build
+    input: str,
+    out: str,
+    target: str,
+    name: str,
+    scope: str,
+    version: str,
+    description: str,
+    license: str,
+    repository: str,
+    authors: list[str],
+    keywords: list[str],
+    wasm_opt: str,
+    opt_level: str,
+    # pack
+    pkg: str,
+    tgz: str,
+    # publish
+    tarball: str,
+    registry: str,
+    access: str,
+    tag: str,
+    no_dry_run: bool,
+    # check / test
+    check_pkg: str,
+    # parse outcome
+    err: str
+}
+
+fn hwp_cli_new() -> HwpCli {
+    return HwpCli {
+        config: "", color: -1, version_flag: false, help_flag: false,
+        cmd: "",
+        new_name: "", new_scope: "", new_dir: "",
+        new_template: "minimal",
+        input: "", out: "", target: "", name: "", scope: "",
+        version: "", description: "", license: "", repository: "",
+        authors: [], keywords: [], wasm_opt: "", opt_level: "",
+        pkg: "", tgz: "",
+        tarball: "", registry: "", access: "", tag: "",
+        no_dry_run: false,
+        check_pkg: "",
+        err: ""
+    }
+}
+
+# hwp_cli_value — read the value of a flag arg ("--x v" / "--x=v");
+# ["", "-1"] and a named refusal when the value is absent (the mut
+# cli carries the message out, the hw_parse convention).
+fn hwp_cli_value(argv: list[str], i: int, flag: str, mut cli: HwpCli)
+-> list[str] {
+    let a: str = argv.get(i)
+    let eq: int = a.find("=")
+    if eq >= 0 {
+        return[a.slice(eq + 1, a.len()), i.to_str()]
+    }
+    if i + 1 >= argv.len() {
+        cli.err = "argument " + flag + ": expected one argument"
+        return["", (-1).to_str()]
+    }
+    return[argv.get(i + 1), (i + 1).to_str()]
+}
+
+# hwp_cli_choice — enforce an argparse choices= list (the mut cli
+# carries the refusal out).
+fn hwp_cli_choice(val: str, choices: list[str], what: str,
+mut cli: HwpCli) -> bool {
+    let mut i: int = 0
+    while i < choices.len() {
+        if choices.get(i) == val {
+            return true
+        }
+        i = i + 1
+    }
+    cli.err = "argument " + what + ": invalid choice '" + val
+    + "' (choose from " + str_join(choices, ", ") + ")"
+    return false
+}
+
+# hwp_parse_cli — the whole argv surface. Returns the cli with err
+# set on a usage error ("unrecognized arguments: X", "expected one
+# argument", "invalid choice ...", "the following arguments are
+# required: X").
+fn hwp_parse_cli(argv: list[str]) -> HwpCli {
+    let cli: HwpCli = hwp_cli_new()
+    let mut i: int = 1
+    # Global flags, until the subcommand.
+    while i < argv.len() {
+        let a: str = argv.get(i)
+        if a == "--version" {
+            cli.version_flag = true
+            i = i + 1
+        } else if a == "--color" {
+            cli.color = 1
+            i = i + 1
+        } else if a == "--no-color" {
+            cli.color = 0
+            i = i + 1
+        } else if a == "-h" || a == "--help" {
+            cli.help_flag = true
+            i = i + 1
+        } else if a == "--config" || a.starts_with("--config=") {
+            let got: list[str] = hwp_cli_value(argv, i, "--config", cli)
+            if got.get(1).to_int() < 0 {
+                return cli
+            }
+            cli.config = got.get(0)
+            i = got.get(1).to_int() + 1
+        } else {
+            break
+        }
+    }
+    if i >= argv.len() {
+        return cli
+    }
+    cli.cmd = argv.get(i)
+    i = i + 1
+    if cli.cmd == "new" {
+        while i < argv.len() {
+            let a: str = argv.get(i)
+            if a == "--scope" || a.starts_with("--scope=") {
+                let got: list[str] = hwp_cli_value(argv, i, "--scope", cli)
+                if got.get(1).to_int() < 0 {
+                    return cli
+                }
+                cli.new_scope = got.get(0)
+                i = got.get(1).to_int() + 1
+            } else if a == "--dir" || a.starts_with("--dir=") {
+                let got: list[str] = hwp_cli_value(argv, i, "--dir", cli)
+                if got.get(1).to_int() < 0 {
+                    return cli
+                }
+                cli.new_dir = got.get(0)
+                i = got.get(1).to_int() + 1
+            } else if a == "--template" || a.starts_with("--template=") {
+                let got: list[str] = hwp_cli_value(argv, i, "--template", cli)
+                if got.get(1).to_int() < 0 {
+                    return cli
+                }
+                if !hwp_cli_choice(got.get(0),
+                ["minimal", "jsffi", "counter"], "--template", cli) {
+                    return cli
+                }
+                cli.new_template = got.get(0)
+                i = got.get(1).to_int() + 1
+            } else if a == "-h" || a == "--help" {
+                cli.help_flag = true
+                i = i + 1
+            } else if a.starts_with("-") {
+                cli.err = "unrecognized arguments: " + a
+                return cli
+            } else if cli.new_name == "" {
+                cli.new_name = a
+                i = i + 1
+            } else {
+                cli.err = "unrecognized arguments: " + a
+                return cli
+            }
+        }
+        if cli.new_name == "" && !cli.help_flag {
+            cli.err = "the following arguments are required: name"
+        }
+        return cli
+    }
+    if cli.cmd == "build" {
+        while i < argv.len() {
+            let a: str = argv.get(i)
+            if a == "--out" || a.starts_with("--out=") {
+                let got: list[str] = hwp_cli_value(argv, i, "--out", cli)
+                if got.get(1).to_int() < 0 {
+                    return cli
+                }
+                cli.out = got.get(0)
+                i = got.get(1).to_int() + 1
+            } else if a == "--target" || a.starts_with("--target=") {
+                let got: list[str] = hwp_cli_value(argv, i, "--target", cli)
+                if got.get(1).to_int() < 0 {
+                    return cli
+                }
+                if !hwp_cli_choice(got.get(0), hwp_pack_targets(),
+                "--target", cli) {
+                    return cli
+                }
+                cli.target = got.get(0)
+                i = got.get(1).to_int() + 1
+            } else if a == "--name" || a.starts_with("--name=") {
+                let got: list[str] = hwp_cli_value(argv, i, "--name", cli)
+                if got.get(1).to_int() < 0 {
+                    return cli
+                }
+                cli.name = got.get(0)
+                i = got.get(1).to_int() + 1
+            } else if a == "--scope" || a.starts_with("--scope=") {
+                let got: list[str] = hwp_cli_value(argv, i, "--scope", cli)
+                if got.get(1).to_int() < 0 {
+                    return cli
+                }
+                cli.scope = got.get(0)
+                i = got.get(1).to_int() + 1
+            } else if a == "--version" || a.starts_with("--version=") {
+                let got: list[str] = hwp_cli_value(argv, i, "--version", cli)
+                if got.get(1).to_int() < 0 {
+                    return cli
+                }
+                cli.version = got.get(0)
+                i = got.get(1).to_int() + 1
+            } else if a == "--description" || a.starts_with("--description=") {
+                let got: list[str] = hwp_cli_value(argv, i, "--description", cli)
+                if got.get(1).to_int() < 0 {
+                    return cli
+                }
+                cli.description = got.get(0)
+                i = got.get(1).to_int() + 1
+            } else if a == "--license" || a.starts_with("--license=") {
+                let got: list[str] = hwp_cli_value(argv, i, "--license", cli)
+                if got.get(1).to_int() < 0 {
+                    return cli
+                }
+                cli.license = got.get(0)
+                i = got.get(1).to_int() + 1
+            } else if a == "--repository" || a.starts_with("--repository=") {
+                let got: list[str] = hwp_cli_value(argv, i, "--repository", cli)
+                if got.get(1).to_int() < 0 {
+                    return cli
+                }
+                cli.repository = got.get(0)
+                i = got.get(1).to_int() + 1
+            } else if a == "--authors" || a.starts_with("--authors=") {
+                if a.find("=") >= 0 {
+                    cli.authors.push(a.slice(a.find("=") + 1, a.len()))
+                    i = i + 1
+                } else {
+                    i = i + 1
+                    while i < argv.len() && !argv.get(i).starts_with("-") {
+                        cli.authors.push(argv.get(i))
+                        i = i + 1
+                    }
+                }
+            } else if a == "--keywords" || a.starts_with("--keywords=") {
+                if a.find("=") >= 0 {
+                    cli.keywords.push(a.slice(a.find("=") + 1, a.len()))
+                    i = i + 1
+                } else {
+                    i = i + 1
+                    while i < argv.len() && !argv.get(i).starts_with("-") {
+                        cli.keywords.push(argv.get(i))
+                        i = i + 1
+                    }
+                }
+            } else if a == "--wasm-opt" || a.starts_with("--wasm-opt=") {
+                let got: list[str] = hwp_cli_value(argv, i, "--wasm-opt", cli)
+                if got.get(1).to_int() < 0 {
+                    return cli
+                }
+                if !hwp_cli_choice(got.get(0), ["auto", "on", "off"],
+                "--wasm-opt", cli) {
+                    return cli
+                }
+                cli.wasm_opt = got.get(0)
+                i = got.get(1).to_int() + 1
+            } else if a == "--opt-level" || a.starts_with("--opt-level=") {
+                let got: list[str] = hwp_cli_value(argv, i, "--opt-level", cli)
+                if got.get(1).to_int() < 0 {
+                    return cli
+                }
+                if !hwp_cli_choice(got.get(0), ["O1", "O2", "O3", "Os"],
+                "--opt-level", cli) {
+                    return cli
+                }
+                cli.opt_level = got.get(0)
+                i = got.get(1).to_int() + 1
+            } else if a == "-h" || a == "--help" {
+                cli.help_flag = true
+                i = i + 1
+            } else if a.starts_with("-") {
+                cli.err = "unrecognized arguments: " + a
+                return cli
+            } else if cli.input == "" {
+                cli.input = a
+                i = i + 1
+            } else {
+                cli.err = "unrecognized arguments: " + a
+                return cli
+            }
+        }
+        if cli.input == "" && !cli.help_flag {
+            cli.err = "the following arguments are required: input"
+        }
+        return cli
+    }
+    if cli.cmd == "pack" {
+        while i < argv.len() {
+            let a: str = argv.get(i)
+            if a == "--pkg" || a.starts_with("--pkg=") {
+                let got: list[str] = hwp_cli_value(argv, i, "--pkg", cli)
+                if got.get(1).to_int() < 0 {
+                    return cli
+                }
+                cli.pkg = got.get(0)
+                i = got.get(1).to_int() + 1
+            } else if a == "--tgz" || a.starts_with("--tgz=") {
+                let got: list[str] = hwp_cli_value(argv, i, "--tgz", cli)
+                if got.get(1).to_int() < 0 {
+                    return cli
+                }
+                cli.tgz = got.get(0)
+                i = got.get(1).to_int() + 1
+            } else if a == "-h" || a == "--help" {
+                cli.help_flag = true
+                i = i + 1
+            } else {
+                cli.err = "unrecognized arguments: " + a
+                return cli
+            }
+        }
+        return cli
+    }
+    if cli.cmd == "publish" {
+        while i < argv.len() {
+            let a: str = argv.get(i)
+            if a == "--registry" || a.starts_with("--registry=") {
+                let got: list[str] = hwp_cli_value(argv, i, "--registry", cli)
+                if got.get(1).to_int() < 0 {
+                    return cli
+                }
+                cli.registry = got.get(0)
+                i = got.get(1).to_int() + 1
+            } else if a == "--access" || a.starts_with("--access=") {
+                let got: list[str] = hwp_cli_value(argv, i, "--access", cli)
+                if got.get(1).to_int() < 0 {
+                    return cli
+                }
+                if !hwp_cli_choice(got.get(0), ["public", "restricted"],
+                "--access", cli) {
+                    return cli
+                }
+                cli.access = got.get(0)
+                i = got.get(1).to_int() + 1
+            } else if a == "--tag" || a.starts_with("--tag=") {
+                let got: list[str] = hwp_cli_value(argv, i, "--tag", cli)
+                if got.get(1).to_int() < 0 {
+                    return cli
+                }
+                cli.tag = got.get(0)
+                i = got.get(1).to_int() + 1
+            } else if a == "--no-dry-run" {
+                cli.no_dry_run = true
+                i = i + 1
+            } else if a == "-h" || a == "--help" {
+                cli.help_flag = true
+                i = i + 1
+            } else if a.starts_with("-") {
+                cli.err = "unrecognized arguments: " + a
+                return cli
+            } else if cli.tarball == "" {
+                cli.tarball = a
+                i = i + 1
+            } else {
+                cli.err = "unrecognized arguments: " + a
+                return cli
+            }
+        }
+        if cli.tarball == "" && !cli.help_flag {
+            cli.err = "the following arguments are required: tarball"
+        }
+        return cli
+    }
+    if cli.cmd == "check" || cli.cmd == "test" {
+        while i < argv.len() {
+            let a: str = argv.get(i)
+            if a == "-h" || a == "--help" {
+                cli.help_flag = true
+                i = i + 1
+            } else if a.starts_with("-") {
+                cli.err = "unrecognized arguments: " + a
+                return cli
+            } else if cli.check_pkg == "" {
+                cli.check_pkg = a
+                i = i + 1
+            } else {
+                cli.err = "unrecognized arguments: " + a
+                return cli
+            }
+        }
+        if cli.check_pkg == "" && !cli.help_flag {
+            cli.err = "the following arguments are required: pkg"
+        }
+        return cli
+    }
+    cli.err = "invalid choice '" + cli.cmd
+    + "' (choose from new, build, pack, publish, check, test)"
+    return cli
+}
+
+# ---- the help texts (the .py's argparse output, same surface) ----
+
+fn hwp_help_text() -> str {
+    return "usage: hlwasm-pack [-h] [--config PATH] [--color] "
+    + "[--no-color] [--version]\n"
+    + "                   {new,build,pack,publish,check,test} ...\n"
+    + "\n"
+    + "Stage 76 hls-wasm-pack: publish-ready wasm + JS glue (the "
+    + "wasm-pack equivalent for Halis).\n"
+    + "\n"
+    + "positional arguments:\n"
+    + "  {new,build,pack,publish,check,test}\n"
+    + "    new                 scaffold a new Halis web library\n"
+    + "    build               compile INPUT.hls -> pkg/ dir\n"
+    + "    pack                tar a built pkg/ into a .tgz\n"
+    + "    publish             publish a .tgz (dry-run default)\n"
+    + "    check               validate a built pkg/ dir\n"
+    + "    test                node smoke-run a built pkg/ dir\n"
+    + "\n"
+    + "options:\n"
+    + "  -h, --help            show this help message and exit\n"
+    + "  --config PATH         explicit config file (default: "
+    + "auto-detect hls.pack.toml / hls.pack.json in cwd)\n"
+    + "  --color               force ANSI colors in log output\n"
+    + "  --no-color            disable ANSI colors\n"
+    + "  --version             print the banner and exit\n"
+}
+
+fn hwp_help_new() -> str {
+    return "usage: hlwasm-pack new [-h] [--scope SCOPE] [--dir DIR] "
+    + "[--template {minimal,jsffi,counter}] name\n"
+    + "\n"
+    + "scaffold a new Halis web library\n"
+    + "\n"
+    + "positional arguments:\n"
+    + "  name                  package name (or bare name with "
+    + "--scope)\n"
+    + "\n"
+    + "options:\n"
+    + "  -h, --help            show this help message and exit\n"
+    + "  --scope SCOPE         npm scope (e.g. @myorg)\n"
+    + "  --dir DIR             destination directory (default: slug "
+    + "of name)\n"
+    + "  --template {minimal,jsffi,counter}\n"
+    + "                        scaffold template (all three currently "
+    + "emit the minimal wasm-subset app)\n"
+}
+
+fn hwp_help_build() -> str {
+    return "usage: hlwasm-pack build [-h] [--out OUT] "
+    + "[--target {bundler,web,nodejs,deno,no-modules}] [--name NAME] "
+    + "[--scope SCOPE] [--version VERSION] [--description DESCRIPTION]\n"
+    + "                      [--license LICENSE] [--repository REPOSITORY] "
+    + "[--authors [AUTHORS ...]] [--keywords [KEYWORDS ...]]\n"
+    + "                      [--wasm-opt {auto,on,off}] "
+    + "[--opt-level {O1,O2,O3,Os}]\n"
+    + "                      input\n"
+    + "\n"
+    + "compile INPUT.hls -> pkg/ dir\n"
+    + "\n"
+    + "positional arguments:\n"
+    + "  input                 HLS source file\n"
+    + "\n"
+    + "options:\n"
+    + "  -h, --help            show this help message and exit\n"
+    + "  --out OUT             output dir (default: pkg)\n"
+    + "  --target {bundler,web,nodejs,deno,no-modules}\n"
+    + "                        pack target (default: bundler)\n"
+    + "  --name NAME           package name\n"
+    + "  --scope SCOPE         npm scope\n"
+    + "  --version VERSION     package version (semver X.Y.Z[-pre])\n"
+    + "  --description DESCRIPTION\n"
+    + "  --license LICENSE\n"
+    + "  --repository REPOSITORY\n"
+    + "  --authors [AUTHORS ...]\n"
+    + "  --keywords [KEYWORDS ...]\n"
+    + "  --wasm-opt {auto,on,off}\n"
+    + "  --opt-level {O1,O2,O3,Os}\n"
+}
+
+fn hwp_help_pack() -> str {
+    return "usage: hlwasm-pack pack [-h] [--pkg PKG] [--tgz TGZ]\n"
+    + "\n"
+    + "tar a built pkg/ into a .tgz\n"
+    + "\n"
+    + "options:\n"
+    + "  -h, --help            show this help message and exit\n"
+    + "  --pkg PKG             built pkg dir\n"
+    + "  --tgz TGZ             output tarball path\n"
+}
+
+fn hwp_help_publish() -> str {
+    return "usage: hlwasm-pack publish [-h] [--registry REGISTRY] "
+    + "[--access {public,restricted}] [--tag TAG] [--no-dry-run] "
+    + "tarball\n"
+    + "\n"
+    + "publish a .tgz (dry-run default)\n"
+    + "\n"
+    + "positional arguments:\n"
+    + "  tarball               tarball from 'pack'\n"
+    + "\n"
+    + "options:\n"
+    + "  -h, --help            show this help message and exit\n"
+    + "  --registry REGISTRY\n"
+    + "  --access {public,restricted}\n"
+    + "  --tag TAG\n"
+    + "  --no-dry-run          actually run 'npm publish' (default: "
+    + "dry-run)\n"
+}
+
+fn hwp_help_check() -> str {
+    return "usage: hlwasm-pack check [-h] pkg\n"
+    + "\n"
+    + "validate a built pkg/ dir (no execution)\n"
+    + "\n"
+    + "positional arguments:\n"
+    + "  pkg                   built pkg dir\n"
+    + "\n"
+    + "options:\n"
+    + "  -h, --help            show this help message and exit\n"
+}
+
+fn hwp_help_test() -> str {
+    return "usage: hlwasm-pack test [-h] pkg\n"
+    + "\n"
+    + "node smoke-run a built pkg/ dir\n"
+    + "\n"
+    + "positional arguments:\n"
+    + "  pkg                   built pkg dir\n"
+    + "\n"
+    + "options:\n"
+    + "  -h, --help            show this help message and exit\n"
+}
+
+# ---- the scaffold templates (the .py's TEMPLATE_*, one flat
+# substitution each; the build line points at the native twin) -----
+
+fn hwp_template_main(name: str, stem: str, fname: str) -> str {
+    return "# " + name + " — Halis web library (hls-wasm-pack Stage 76)\n"
+    + "#\n"
+    + "# Build a publish-ready npm package with:\n"
+    + "#   bin/hlwasm-pack build " + stem + ".hls --out pkg --target bundler\n"
+    + "#\n"
+    + "# NOTE ON THE SUBSET: the freestanding wasm emitter lowers let /\n"
+    + "# if / while / for-range / calls / literals — struct literals,\n"
+    + "# match, and method calls land with the HLIR emitter, so this\n"
+    + "# template stays inside the supported subset.\n"
+    + "\n"
+    + "import \"std.jsffi\"\n"
+    + "\n"
+    + "fn " + fname + "_add(a: int, b: int) -> int {\n"
+    + "    return a + b\n"
+    + "}\n"
+    + "\n"
+    + "fn " + fname + "_greet(name: str) -> str {\n"
+    + "    return \"Hello, \" + name + \"!\"\n"
+    + "}\n"
+    + "\n"
+    + "fn jsffi_on_callback(cb_id: int, arg: str) -> str uses IO {\n"
+    + "    if cb_id == 1 {\n"
+    + "        return " + fname + "_greet(arg)\n"
+    + "    }\n"
+    + "    return \"\"\n"
+    + "}\n"
+    + "\n"
+    + "fn main() -> int uses IO {\n"
+    + "    println(\"" + name + " ready (\" + " + fname
+    + "_add(40, 2).to_str() + \")\")\n"
+    + "    js_console_log(" + fname + "_greet(\"wasm-pack\"))\n"
+    + "    return 0\n"
+    + "}\n"
+}
+
+fn hwp_template_toml(name: str) -> str {
+    return "# hls.pack.toml — hls-wasm-pack project config (Stage 76).\n"
+    + "# CLI flags always override these values.\n"
+    + "[package]\n"
+    + "name = \"" + name + "\"\n"
+    + "version = \"0.1.0\"\n"
+    + "description = \"" + name + " — a Halis WebAssembly library\"\n"
+    + "license = \"MIT\"\n"
+    + "target = \"bundler\"\n"
+    + "out = \"pkg\"\n"
+    + "wasm_opt = \"auto\"\n"
+    + "opt_level = \"O3\"\n"
+}
+
+# hwp_slug — strip, lower, spaces and underscores to dashes.
+fn hwp_slug(name: str) -> str {
+    let lowered: str = str_to_lower_ascii(name.trim())
+    let dashed: str = str_replace(lowered, " ", "-")
+    return str_replace(dashed, "_", "-")
+}
+
+# hwp_fname — non-alnum chars to underscores (the template's fn
+# prefix).
+fn hwp_fname(stem: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < stem.len() {
+        let b: int = stem.byte_at(i)
+        if hwp_is_lower_alnum(b) || (b >= 65 && b <= 90) {
+            out = out + stem.slice(i, i + 1)
+        } else {
+            out = out + "_"
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# hwp_last_seg — the part after the final "/" (rsplit("/", 1)[-1]).
+fn hwp_last_seg(name: str) -> str {
+    let slash: int = name.find("/")
+    if slash < 0 {
+        return name
+    }
+    let mut last: int = -1
+    let mut i: int = 0
+    while i < name.len() {
+        if name.byte_at(i) == 47 {
+            last = i
+        }
+        i = i + 1
+    }
+    if last < 0 {
+        return name
+    }
+    return name.slice(last + 1, name.len())
+}
+
+# ---- the subcommand runners ----------------------------------------------
+
+# hwp_cmd_new — scaffold a new project; return the exit code.
+fn hwp_cmd_new(log: HwpLog, cli: HwpCli) -> int
+uses IO, Fs, Proc, Clock {
+    let mut full: str = cli.new_name
+    let mut scope: str = cli.new_scope
+    if scope != "" {
+        if !scope.starts_with("@") {
+            scope = "@" + scope
+        }
+        full = scope + "/" + cli.new_name
+    }
+    if !hwp_is_valid_name(full) {
+        hwp_log_error(log, "invalid package name '" + full + "'")
+        return 2
+    }
+    let mut dest: str = cli.new_dir
+    if dest == "" {
+        dest = hwp_slug(hwp_last_seg(cli.new_name))
+    }
+    if dest == "" || file_exists(dest) {
+        hwp_log_error(log, "destination already exists: '" + dest + "'")
+        return 1
+    }
+    proc_exec("mkdir -p '" + hwp_shell_quote(dest) + "'")
+    let stem: str = hwp_slug(hwp_last_seg(cli.new_name))
+    let mut fname: str = hwp_fname(stem)
+    if fname == "" {
+        fname = "app"
+    }
+    write_file(hwp_join_path(dest, stem + ".hls"),
+    hwp_template_main(full, stem, fname))
+    write_file(hwp_join_path(dest, "hls.pack.toml"),
+    hwp_template_toml(full))
+    write_file(hwp_join_path(dest, "README.md"),
+    "# " + full + "\n\nA Halis WebAssembly library. "
+    + "See `hls.pack.toml` for pack settings.\n")
+    hwp_log_info(log, "created " + dest + "/ (" + stem
+    + ".hls + hls.pack.toml + README.md)")
+    return 0
+}
+
+# hwp_resolve_cfg — load the config file, overlay the CLI flags
+# (CLI wins), fuse scope + name (the .py's _resolve_opts).
+fn hwp_resolve_cfg(cli: HwpCli) -> HwpCfg uses Fs {
+    let mut cfg: HwpCfg = hwp_load_config(cli.config)
+    if cli.name != "" {
+        cfg.name = cli.name
+    }
+    if cli.version != "" {
+        cfg.version = cli.version
+    }
+    if cli.description != "" {
+        cfg.description = cli.description
+    }
+    if cli.scope != "" {
+        cfg.scope = cli.scope
+    }
+    if cli.target != "" {
+        cfg.target = cli.target
+    }
+    if cli.out != "" {
+        cfg.out = cli.out
+    }
+    if cli.license != "" {
+        cfg.license = cli.license
+    }
+    if cli.repository != "" {
+        cfg.repository = cli.repository
+    }
+    if cli.authors.len() > 0 {
+        cfg.authors = cli.authors
+    }
+    if cli.keywords.len() > 0 {
+        cfg.keywords = cli.keywords
+    }
+    if cli.wasm_opt != "" {
+        cfg.wasm_opt = cli.wasm_opt
+    }
+    if cli.opt_level != "" {
+        cfg.opt_level = cli.opt_level
+    }
+    if cli.registry != "" {
+        cfg.registry = cli.registry
+    }
+    if cli.access != "" {
+        cfg.access = cli.access
+    }
+    if cli.tag != "" {
+        cfg.tag = cli.tag
+    }
+    if cfg.scope != "" && cfg.name != "" && !cfg.name.contains("/") {
+        let mut s: str = cfg.scope
+        if !s.starts_with("@") {
+            s = "@" + s
+        }
+        cfg.name = s + "/" + cfg.name
+    }
+    return cfg
+}
+
+# hwp_cmd_build — compile INPUT.hls -> publish-ready pkg/ dir.
+fn hwp_cmd_build(log: HwpLog, cli: HwpCli) -> int
+uses IO, Fs, Proc, Clock {
+    let mut cfg: HwpCfg = hwp_resolve_cfg(cli)
+    if cfg.name == "" && cli.input != "" {
+        let base: str = hwp_basename(cli.input)
+        let dot: int = base.find(".")
+        let mut stem: str = base
+        if dot >= 0 {
+            stem = base.slice(0, dot)
+        }
+        let slug: str = hwp_slug(stem)
+        if slug != "" {
+            cfg.name = slug
+        } else {
+            cfg.name = "halis-app"
+        }
+    }
+    let out_dir: str = hwp_cfg_out(cfg)
+    let built: Result[JsonValue, str] = hwp_build(log, cli.input,
+    out_dir, cfg)
+    if result_is_err(built) {
+        hwp_log_error(log, hwp_unwrap_err(built))
+        return 1
+    }
+    return 0
+}
+
+# hwp_cmd_pack — tar a built pkg/ into <stem>-<version>.tgz.
+fn hwp_cmd_pack(log: HwpLog, cli: HwpCli) -> int
+uses IO, Fs, Proc, Clock {
+    let mut pkg_dir: str = cli.pkg
+    if pkg_dir == "" {
+        pkg_dir = hwp_default_out_dir()
+    }
+    let packed: Result[str, str] = hwp_pack(log, pkg_dir, cli.tgz)
+    if result_is_err(packed) {
+        hwp_log_error(log, hwp_unwrap_err(packed))
+        return 1
+    }
+    return 0
+}
+
+# hwp_cmd_publish — dry-run (default) or real `npm publish`.
+fn hwp_cmd_publish(log: HwpLog, cli: HwpCli) -> int
+uses IO, Fs, Proc, Clock {
+    let mut access: str = cli.access
+    if access == "" {
+        access = "public"
+    }
+    let mut tag: str = cli.tag
+    if tag == "" {
+        tag = "latest"
+    }
+    let res: Result[HwpPublishResult, str] = hwp_publish(log,
+    cli.tarball, cli.registry, access, tag, !cli.no_dry_run)
+    if result_is_err(res) {
+        hwp_log_error(log, hwp_unwrap_err(res))
+        return 1
+    }
+    let out: HwpPublishResult = result_unwrap(res)
+    if out.published {
+        return 0
+    }
+    if out.dry_run {
+        return 0
+    }
+    return 1
+}
+
+# hwp_cmd_check — validate a built pkg/ dir (no execution).
+fn hwp_cmd_check(cli: HwpCli) -> int uses IO, Fs {
+    let res: HwpCheckResult = hwp_check(cli.check_pkg)
+    hwp_print_check(res, cli.check_pkg)
+    if res.ok {
+        return 0
+    }
+    return 1
+}
+
+# hwp_cmd_test — node smoke-run a built pkg/ dir.
+fn hwp_cmd_test(cli: HwpCli) -> int uses IO, Fs, Proc {
+    let res: list[str] = hwp_test_pkg(cli.check_pkg)
+    let status: str = str_to_upper_ascii(res.get(0))
+    println("TEST " + status + ": " + cli.check_pkg + " ("
+    + res.get(1) + ")")
+    if res.get(0) == "ok" || res.get(0) == "skip" {
+        return 0
+    }
+    return 1
+}
+
+# ============================================================================
+# The unit surface — the gates' shim questions, answered by the
+# binary (the .py era's importlib driver: surface, validate, scan,
+# ts, unpack, evil, publish_command). Every mode prints exactly
+# what the python driver printed; the comparisons stay in the gate.
+# ============================================================================
+
+# hwp_unit_surface — the import surface: the facade's main + the
+# ten part modules, each present as a section of this one file.
+fn hwp_unit_surface() -> int uses IO {
+    println("has_main=1")
+    let mods: list[str] = ["hwp_common", "hwp_manifest", "hwp_scan",
+    "hwp_types", "hwp_glue", "hwp_build", "hwp_pack",
+    "hwp_publish", "hwp_validate", "hwp_cli"]
+    let mut i: int = 0
+    while i < mods.len() {
+        println(mods.get(i) + "=1")
+        i = i + 1
+    }
+    return 0
+}
+
+# hwp_unit_validate — npm name/version rules over the battery's
+# vectors (fed on stdin as JSON), one verdict line each.
+fn hwp_unit_validate() -> int uses IO, Fs {
+    let parsed: Result[JsonValue, str] = json_parse_result(
+    read_file("/dev/stdin"))
+    if result_is_err(parsed) {
+        eprint("error: bad JSON on stdin: " + hwp_unwrap_err(parsed)
+        + "\n")
+        return 1
+    }
+    let d: JsonValue = result_unwrap(parsed)
+    let groups: list[str] = ["good_names", "bad_names",
+    "good_versions", "bad_versions"]
+    let prefixes: list[str] = ["gname", "bname", "gver", "bver"]
+    let mut g: int = 0
+    while g < groups.len() {
+        let arr: JsonValue = json_object_get(d, groups.get(g))
+        if json_is_array(arr) {
+            let mut i: int = 0
+            while i < arr.arr.len() {
+                let item: JsonValue = arr.arr.get(i)
+                let mut val: str = ""
+                if json_is_str(item) {
+                    val = json_str_value(item)
+                }
+                let mut verdict: int = 0
+                if g < 2 {
+                    if hwp_is_valid_name(val) {
+                        verdict = 1
+                    }
+                } else {
+                    if hwp_is_valid_version(val) {
+                        verdict = 1
+                    }
+                }
+                println(prefixes.get(g) + " " + i.to_str() + "="
+                + verdict.to_str())
+                i = i + 1
+            }
+        }
+        g = g + 1
+    }
+    return 0
+}
+
+# hwp_unit_scan — the demo's publish surface: fns, structs, enums,
+# the std/jsffi.hls extern imports, and the exported set.
+fn hwp_unit_scan() -> int uses IO, Fs {
+    let surface: HwpSurface = hwp_scan_file(
+    "examples/wasm_pack_demo.hls")
+    let mut i: int = 0
+    while i < surface.functions.len() {
+        let f: HwpFn = surface.functions.get(i)
+        println("fn " + f.name + " params=" + f.params.len().to_str()
+        + " returns=" + f.returns)
+        i = i + 1
+    }
+    let mut si: int = 0
+    while si < surface.structs.len() {
+        let st: HwpStruct = surface.structs.get(si)
+        println("struct " + st.name + " fields="
+        + st.fields.len().to_str())
+        si = si + 1
+    }
+    let mut ei: int = 0
+    while ei < surface.enums.len() {
+        let en: HwpEnum = surface.enums.get(ei)
+        println("enum " + en.name + " variants="
+        + en.variants.len().to_str())
+        ei = ei + 1
+    }
+    let jsffi: HwpSurface = hwp_scan_file("std/jsffi.hls")
+    println("js_imports=" + jsffi.js_imports.len().to_str())
+    let exps: list[HwpFn] = hwp_exported_functions(surface)
+    let mut xi: int = 0
+    while xi < exps.len() {
+        println("exp " + exps.get(xi).name)
+        xi = xi + 1
+    }
+    return 0
+}
+
+# hwp_unit_ts — the TypeScript mapping vectors (stdin JSON) + the
+# rendered d.ts for the demo package.
+fn hwp_unit_ts() -> int uses IO, Fs {
+    let parsed: Result[JsonValue, str] = json_parse_result(
+    read_file("/dev/stdin"))
+    if result_is_err(parsed) {
+        eprint("error: bad JSON on stdin: " + hwp_unwrap_err(parsed)
+        + "\n")
+        return 1
+    }
+    let d: JsonValue = result_unwrap(parsed)
+    let types: JsonValue = json_object_get(d, "types")
+    if json_is_array(types) {
+        let mut i: int = 0
+        while i < types.arr.len() {
+            let item: JsonValue = types.arr.get(i)
+            if json_is_str(item) {
+                println("ts " + json_str_value(item) + " => "
+                + hwp_halis_to_ts(json_str_value(item)))
+            }
+            i = i + 1
+        }
+    }
+    let surface: HwpSurface = hwp_scan_file(
+    "examples/wasm_pack_demo.hls")
+    let dts: str = hwp_render_dts(surface, "wasm-pack-demo")
+    println("dts-begin")
+    println(dts)
+    println("dts-end")
+    return 0
+}
+
+# hwp_unit_unpack — the tarball round-trip probe.
+fn hwp_unit_unpack(tgz: str, dest: str) -> int uses IO, Fs, Proc {
+    let res: Result[list[str], str] = hwp_unpack(tgz, dest)
+    if result_is_err(res) {
+        eprint("error: " + hwp_unwrap_err(res) + "\n")
+        return 1
+    }
+    println("extracted=" + result_unwrap(res).len().to_str())
+    return 0
+}
+
+# hwp_unit_evil — build the hostile tarball, then unpack it
+# expecting the refusal ("raised=1") with nothing written.
+fn hwp_unit_evil(evil: str, dest: str) -> int uses IO, Fs, Proc {
+    hwp_make_evil_tar(evil)
+    let res: Result[list[str], str] = hwp_unpack(evil, dest)
+    if result_is_err(res) {
+        println("raised=1")
+        return 0
+    }
+    println("raised=0")
+    return 0
+}
+
+# hwp_unit_publish_command — the dry-run command shape, one argv
+# element per line.
+fn hwp_unit_publish_command(tgz: str) -> int uses IO {
+    let res: Result[list[str], str] = hwp_publish_command(tgz,
+    "https://r.example.com/npm/", "restricted", "beta")
+    if result_is_err(res) {
+        eprint("error: " + hwp_unwrap_err(res) + "\n")
+        return 1
+    }
+    let cmd: list[str] = result_unwrap(res)
+    let mut i: int = 0
+    while i < cmd.len() {
+        println(cmd.get(i))
+        i = i + 1
+    }
+    return 0
+}
+
+# ============================================================================
+# main — the dispatch (global flags, subcommands, unit modes).
+# ============================================================================
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit, Clock {
+    let argv: list[str] = args()
+    let unit_modes: list[str] = ["--unit-surface", "--unit-validate",
+    "--unit-scan", "--unit-ts", "--unit-unpack", "--unit-evil",
+    "--unit-publish-command"]
+    if argv.len() > 1 {
+        let a1: str = argv.get(1)
+        let mut u: int = 0
+        while u < unit_modes.len() {
+            if a1 == unit_modes.get(u) {
+                if a1 == "--unit-surface" {
+                    return hwp_unit_surface()
+                }
+                if a1 == "--unit-validate" {
+                    return hwp_unit_validate()
+                }
+                if a1 == "--unit-scan" {
+                    return hwp_unit_scan()
+                }
+                if a1 == "--unit-ts" {
+                    return hwp_unit_ts()
+                }
+                if a1 == "--unit-unpack" {
+                    if argv.len() < 4 {
+                        eprintln("usage: hlwasm-pack --unit-unpack TGZ DEST")
+                        return 2
+                    }
+                    return hwp_unit_unpack(argv.get(2), argv.get(3))
+                }
+                if a1 == "--unit-evil" {
+                    if argv.len() < 4 {
+                        eprintln("usage: hlwasm-pack --unit-evil EVIL DEST")
+                        return 2
+                    }
+                    return hwp_unit_evil(argv.get(2), argv.get(3))
+                }
+                if a1 == "--unit-publish-command" {
+                    if argv.len() < 3 {
+                        eprintln("usage: hlwasm-pack --unit-publish-command TGZ")
+                        return 2
+                    }
+                    return hwp_unit_publish_command(argv.get(2))
+                }
+            }
+            u = u + 1
+        }
+    }
+
+    let cli: HwpCli = hwp_parse_cli(argv)
+    let log: HwpLog = hwp_log_new()
+    if cli.color == 1 {
+        log.auto = 1
+        log.color = true
+    }
+    if cli.color == 0 {
+        log.auto = 1
+        log.color = false
+    }
+    if cli.err != "" {
+        eprintln(hwp_help_text())
+        eprintln("hlwasm-pack: error: " + cli.err)
+        return 2
+    }
+    if cli.version_flag && cli.cmd == "" {
+        println(hwp_banner())
+        return 0
+    }
+    if cli.help_flag && cli.cmd == "" {
+        println(hwp_help_text())
+        return 0
+    }
+    if cli.cmd == "" {
+        println(hwp_help_text())
+        return 2
+    }
+    if cli.help_flag {
+        if cli.cmd == "new" {
+            println(hwp_help_new())
+        } else if cli.cmd == "build" {
+            println(hwp_help_build())
+        } else if cli.cmd == "pack" {
+            println(hwp_help_pack())
+        } else if cli.cmd == "publish" {
+            println(hwp_help_publish())
+        } else if cli.cmd == "check" {
+            println(hwp_help_check())
+        } else {
+            println(hwp_help_test())
+        }
+        return 0
+    }
+    if cli.cmd == "new" {
+        return hwp_cmd_new(log, cli)
+    }
+    if cli.cmd == "build" {
+        return hwp_cmd_build(log, cli)
+    }
+    if cli.cmd == "pack" {
+        return hwp_cmd_pack(log, cli)
+    }
+    if cli.cmd == "publish" {
+        return hwp_cmd_publish(log, cli)
+    }
+    if cli.cmd == "check" {
+        return hwp_cmd_check(cli)
+    }
+    return hwp_cmd_test(cli)
+}
