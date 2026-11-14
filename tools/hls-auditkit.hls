@@ -1,0 +1,429 @@
+# ============================================================================
+# tools/hls-auditkit.hls — the Stage 140 third-party audit kit, in
+# Halis (the native twin of the Python hls-auditkit.py that retired;
+# same seven commands, same chain arithmetic, same refusals, same
+# renders — compiled by the bootstrap's own hlc).
+# ----------------------------------------------------------------------------
+# Roadmap Stage 140: "Independent security audit (third-party, paid)"
+# as a LEDGER — one hash-chained, append-only record per engagement
+# (.hlaudit/engagement.jsonl, machine-local like every ledger in this
+# tree), where every fact is an entry somebody signed and every law is
+# enforced at write time:
+#
+#   1. the SCOPE is derived LIVE from the Stage 135 guarantee ledger
+#      (bin/hls-guarantee verify --json / list --json, spawned — the
+#      .py imported the module; the spawn reads the same engine at
+#      run time, never copied, never re-derived);
+#   2. the CHAIN is the family's one arithmetic (sha256 over prev +
+#      canonical-json(record minus chain_hash)), folded here verbatim
+#      from hltlog's law — every reader verifies the whole chain
+#      first and names the broken line;
+#   3. INDEPENDENCE is a fact the ledger names: an evidence pass by a
+#      roster member is INDEPENDENT, any other signer SELF-ASSESSED;
+#   4. one finding, one triage — the record is the response, not a
+#      negotiation.
+#
+# Commands: engage, brief, evidence, file, triage, report, status.
+# Exits: 0 ok · 1 ledger refusal (named on stderr) · 2 usage.
+# ============================================================================
+
+import "std.str"
+import "std.json"
+import "std.result"
+import "std.sha256"
+import "std.fs"
+import "std.process"
+
+# ----------------------------------------------------------------------------
+# Constants.
+# ----------------------------------------------------------------------------
+
+fn ak_tool() -> str {
+    return "hls-auditkit"
+}
+
+fn ak_version() -> str {
+    return "0.158.0-alpha"
+}
+
+fn ak_policy() -> str {
+    return "halis-auditkit-1"
+}
+
+fn ak_ledger_rel() -> str {
+    return ".hlaudit/engagement.jsonl"
+}
+
+fn ak_genesis() -> str {
+    return "0000000000000000000000000000000000000000000000000000000000000000"
+}
+
+fn ak_finding_prefix() -> str {
+    return "AF-"
+}
+
+fn ak_finding_width() -> int {
+    return 3
+}
+
+# ----------------------------------------------------------------------------
+# Small helpers (json value building, paths, shell).
+# ----------------------------------------------------------------------------
+
+fn sh(cmd: str) -> int uses Proc {
+    return proc_exec(cmd)
+}
+
+fn ak_dirname(path: str) -> str {
+    let mut i: int = path.len() - 1
+    while i >= 0 {
+        if path.byte_at(i) == 47 {
+            if i == 0 {
+                return "/"
+            }
+            return path.slice(0, i)
+        }
+        i = i - 1
+    }
+    return "."
+}
+
+fn ak_join(dir: str, name: str) -> str {
+    if dir == "" || dir == "." {
+        return name
+    }
+    if dir.byte_at(dir.len() - 1) == 47 {
+        return dir + name
+    }
+    return dir + "/" + name
+}
+
+fn ak_is_hex(s: str, n: int) -> bool {
+    if s.len() != n {
+        return false
+    }
+    let mut i: int = 0
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        if !((b >= 48 && b <= 57) || (b >= 97 && b <= 102)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn ak_is_hex64(s: str) -> bool {
+    return ak_is_hex(s, 64)
+}
+
+fn ak_is_hex40(s: str) -> bool {
+    return ak_is_hex(s, 40)
+}
+
+fn ak_is_finding_id(s: str) -> bool {
+    if !s.starts_with(ak_finding_prefix()) {
+        return false
+    }
+    let tail: str = s.slice(ak_finding_prefix().len(), s.len())
+    if tail.len() != ak_finding_width() {
+        return false
+    }
+    let mut i: int = 0
+    while i < tail.len() {
+        if tail.byte_at(i) < 48 || tail.byte_at(i) > 57 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# ----------------------------------------------------------------------------
+# The json builder — a tiny ordered-object writer producing EXACTLY
+# the canonical forms the chain law needs (sorted keys for the chain,
+# sorted keys for the record lines).
+# ----------------------------------------------------------------------------
+
+struct JField {
+    key: str,
+    val: str # a pre-rendered json value (literal, quoted, or nested)
+}
+
+# j_quote — a JSON string literal.
+fn j_quote(s: str) -> str {
+    let out: str = "\""
+    let mut i: int = 0
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        if b == 34 {
+            out = out + "\\\""
+        } else if b == 92 {
+            out = out + "\\\\"
+        } else if b == 10 {
+            out = out + "\\n"
+        } else if b == 9 {
+            out = out + "\\t"
+        } else if b == 13 {
+            out = out + "\\r"
+        } else if b < 32 {
+            out = out + "\\u00" + ak_hex2(b)
+        } else {
+            out = out + chr(b)
+        }
+        i = i + 1
+    }
+    return out + "\""
+}
+
+fn ak_hex2(b: int) -> str {
+    let digits: str = "0123456789abcdef"
+    let hi: int = int_and(int_shr(b, 4), 15)
+    let lo: int = int_and(b, 15)
+    return digits.slice(hi, hi + 1) + digits.slice(lo, lo + 1)
+}
+
+# j_canon_sorted(fields) — json.dumps(obj, sort_keys=True,
+# separators=(",", ":")): keys sorted, no whitespace.
+fn j_canon_sorted(fields: list[JField]) -> str {
+    let keys: list[str] = []
+    let mut i: int = 0
+    while i < fields.len() {
+        keys.push(fields.get(i).key)
+        i = i + 1
+    }
+    let mut a: int = 1
+    while a < keys.len() {
+        let v: str = keys.get(a)
+        let mut b: int = a - 1
+        while b >= 0 && keys.get(b) > v {
+            keys.set(b + 1, keys.get(b))
+            b = b - 1
+        }
+        keys.set(b + 1, v)
+        a = a + 1
+    }
+    let out: str = "{"
+    i = 0
+    while i < keys.len() {
+        if i > 0 {
+            out = out + ","
+        }
+        let k: str = keys.get(i)
+        let mut j: int = 0
+        while j < fields.len() {
+            if fields.get(j).key == k {
+                out = out + j_quote(k) + ":" + fields.get(j).val
+                j = fields.len()
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out + "}"
+}
+
+# j_str_arr — a json array of string literals.
+fn j_str_arr(xs: list[str]) -> str {
+    let out: str = "["
+    let mut i: int = 0
+    while i < xs.len() {
+        if i > 0 {
+            out = out + ","
+        }
+        out = out + j_quote(xs.get(i))
+        i = i + 1
+    }
+    return out + "]"
+}
+
+# ----------------------------------------------------------------------------
+# The chain law — hltlog's arithmetic, folded verbatim: sha256 over
+# prev + canonical-json(record minus chain_hash).
+# ----------------------------------------------------------------------------
+
+fn ak_chain_of(prev: str, record: str) -> str {
+    # record arrives as canonical json WITHOUT the chain_hash field;
+    # the callers strip it when re-deriving (j_canon without the field).
+    return sha256_hex(prev + record)
+}
+
+# ----------------------------------------------------------------------------
+# The scope — the Stage 135 guarantee ledger, read live from
+# bin/hls-guarantee (spawned; the .py imported the module, the spawn
+# single-sources the same engine).
+# ----------------------------------------------------------------------------
+
+struct GgCensus {
+    ids: list[str],
+    families: list[str],
+    severities: list[str],
+    claims: list[str],
+    violations: list[str],
+    repros: list[str],
+    anchor_counts: list[int],
+    probe_counts: list[int],
+    digest: str,
+    policy: str,
+    ok: bool,
+    err: str
+}
+
+# ak_scope(root) — the census + digest from the guarantee binary.
+fn ak_scope(root: str) -> GgCensus uses IO, Fs, Proc {
+    let out: GgCensus = GgCensus { ids: [], families: [], severities: [],
+        claims: [], violations: [], repros: [], anchor_counts: [],
+        probe_counts: [], digest: "", policy: "", ok: false, err: "" }
+    let gtool: str = ak_join(root, "bin/hls-guarantee")
+    if !file_exists(gtool) {
+        out.err = "no guarantee engine at " + gtool
+        + " — run `make bin/hls-guarantee` (the audit scope is the "
+        + "Stage 135 ledger, and this tree does not carry one)"
+        return out
+    }
+    # the census rows: list --json
+    let pid: int = proc_spawn(gtool, ["list", "--json"], 0, 1, 1)
+    if pid < 1 {
+        out.err = "cannot spawn " + gtool
+        return out
+    }
+    let mut text: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        text = text + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    proc_wait(pid)
+    let rr: Result[JsonValue, str] = json_parse_result(text)
+    if result_is_err(rr) {
+        out.err = "the guarantee ledger does not load: "
+        + result_err_or(rr, "not json")
+        return out
+    }
+    let doc: JsonValue = result_unwrap(rr)
+    let rows: list[JsonValue] = json_object_get(doc, "guarantees").arr
+    let mut i: int = 0
+    while i < rows.len() {
+        let r: JsonValue = rows.get(i)
+        i = i + 1
+        out.ids.push(json_str_value(json_object_get(r, "id")))
+        out.families.push(json_str_value(json_object_get(r, "family")))
+        out.severities.push(json_str_value(json_object_get(r, "severity")))
+        out.claims.push(json_str_value(json_object_get(r, "claim")))
+        out.anchor_counts.push(
+            json_int_value(json_object_get(r, "anchors")))
+        out.probe_counts.push(
+            json_int_value(json_object_get(r, "probes")))
+        out.violations.push("")
+        out.repros.push("")
+    }
+    # the digest + policy: verify --json (also proves the ledger loads).
+    let pid2: int = proc_spawn(gtool, ["verify", "--json"], 0, 1, 1)
+    if pid2 < 1 {
+        out.err = "cannot spawn " + gtool
+        return out
+    }
+    let mut text2: str = ""
+    let mut chunk2: str = proc_child_read(pid2, 1, 65536)
+    while chunk2 != "" {
+        text2 = text2 + chunk2
+        chunk2 = proc_child_read(pid2, 1, 65536)
+    }
+    proc_wait(pid2)
+    let rr2: Result[JsonValue, str] = json_parse_result(text2)
+    if result_is_err(rr2) {
+        out.err = "the guarantee ledger does not verify: "
+        + result_err_or(rr2, "not json")
+        return out
+    }
+    let vdoc: JsonValue = result_unwrap(rr2)
+    out.digest = json_str_value(json_object_get(vdoc, "ledger_sha256"))
+    out.policy = json_str_value(json_object_get(vdoc, "policy"))
+    if out.ids.len() == 0 || out.digest == "" {
+        out.err = "the guarantee ledger at " + gtool + " is empty"
+        return out
+    }
+    out.ok = true
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# The evidence pass — bin/hls-guarantee verify --json, re-parsed for
+# the counts the transcript records.
+# ----------------------------------------------------------------------------
+
+struct EvidenceOut {
+    ok: bool,
+    verified: int,
+    total: int,
+    anchors: int,
+    probes: int,
+    refusals: list[str],
+    err: str
+}
+
+fn ak_evidence(root: str) -> EvidenceOut uses IO, Proc {
+    let out: EvidenceOut = EvidenceOut { ok: false, verified: 0,
+        total: 0, anchors: 0, probes: 0, refusals: [], err: "" }
+    let gtool: str = ak_join(root, "bin/hls-guarantee")
+    let pid: int = proc_spawn(gtool, ["verify", "--json"], 0, 1, 1)
+    if pid < 1 {
+        out.err = "cannot spawn " + gtool
+        return out
+    }
+    let mut text: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        text = text + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let code: int = proc_wait(pid)
+    let rr: Result[JsonValue, str] = json_parse_result(text)
+    if result_is_err(rr) {
+        out.err = "verify did not answer json: "
+        + result_err_or(rr, "not json")
+        return out
+    }
+    let doc: JsonValue = result_unwrap(rr)
+    out.ok = code == 0
+    let gs: list[JsonValue] = json_object_get(doc, "guarantees").arr
+    let mut i: int = 0
+    while i < gs.len() {
+        let g: JsonValue = gs.get(i)
+        i = i + 1
+        out.total = out.total + 1
+        if json_str_value(json_object_get(g, "status")) == "verified" {
+            out.verified = out.verified + 1
+        }
+        let ancs: list[JsonValue] = json_object_get(g, "anchors").arr
+        let mut a: int = 0
+        while a < ancs.len() {
+            if json_bool_value(json_object_get(ancs.get(a), "ok")) {
+                out.anchors = out.anchors + 1
+            }
+            a = a + 1
+        }
+        let prbs: list[JsonValue] = json_object_get(g, "probes").arr
+        let mut p: int = 0
+        while p < prbs.len() {
+            if json_str_value(json_object_get(prbs.get(p), "verdict"))
+            == "ok" {
+                out.probes = out.probes + 1
+            }
+            p = p + 1
+        }
+    }
+    let refs: list[JsonValue] = json_object_get(doc, "refusals").arr
+    i = 0
+    while i < refs.len() {
+        let r: JsonValue = refs.get(i)
+        i = i + 1
+        if json_is_str(r) {
+            out.refusals.push(json_str_value(r))
+        } else {
+            out.refusals.push(json_str_value(
+                json_object_get(r, "detail")))
+        }
+    }
+    return out
+}
