@@ -6,7 +6,7 @@ Generated from the live state of the tree by `tools/hls-rc.hls` — this documen
 
 - the tag: **v1.0.0-rc.4** — the release candidate of v1.0.0, cut at roadmap Stage 149 (v1.0 Release Candidate 4, sign-off)
 - the anchor: commit `4015a7f79d2e99a6d9487bfdcba5cc5b777ed667`, cut on 2026-10-29 (the committer day), recorded in `.hls-rc.json`
-- the freeze: the API surface travels frozen at digest `84d1068f80d62f3f...` (Stage 141, frozen at 9dbed2e1138d since release 0.159.0-alpha); from this anchor to v1.0.0 the surface cannot move except through the amendment chain (`hls-freeze amend --reason ... --by ...`)
+- the freeze: the API surface travels frozen at digest `02b449f3e1b23322...` (Stage 141, frozen at 9dbed2e1138d since release 0.159.0-alpha, the census re-worded once on the chain — amendment 2 recorded the native parser's `irq_handler(N)` enumeration); from this anchor to v1.0.0 the surface cannot move except through the amendment chain (`hls-freeze amend --reason ... --by ...`)
 - the successor: v1.0.0 — the release itself, the last step of the road below, cut the way the final dry-run rehearsed: the roadmap row ticked, the markers moved, the anchor retiring with the release commit, the tag cut, the LTS line opened (`hls-lts init --tag v1.0.0`), the windows becoming the clock
 - the sign-off: **mhieuhonda**, 2026-10-29 — the candidate carries its signer's approval; `bin/hls-rc signoff --check` re-derives it at every gate
 

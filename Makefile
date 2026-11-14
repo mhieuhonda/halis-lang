@@ -1523,7 +1523,7 @@ freeze-verify:
 freeze-report:
 	@$(BIN)/hls-freeze report --out API.md
 
-freeze-acceptance: $(BIN)/acc-freeze bin/hlc
+freeze-acceptance: $(BIN)/acc-freeze $(BIN)/hls-freeze bin/hlc
 	@echo "[Stage 141 acceptance] running tests/acc/freeze_acceptance.hls..."
 	@$(BIN)/acc-freeze
 	@echo "ACCEPTANCE OK: Stage 141 -- API freeze (syntax + stdlib locked)"

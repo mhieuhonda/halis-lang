@@ -9928,9 +9928,10 @@ future is prose, and prose rots — nothing failed when a keyword
 appeared or a signature moved. This stage turns the promise into
 a FROZEN DOCUMENT — `tests/api_freeze.json`, committed to the
 tree, content-addressed by the sha256 of its own canonical
-surface — and a kit, `tools/hls-freeze.py`, with five commands
-(`snapshot` once, `verify`, `amend`, `report`, `status`) that
-refuses to let the surface and the document disagree.
+surface — and a kit, `tools/hls-freeze.hls` (built as
+`bin/hls-freeze`), with five commands (`snapshot` once, `verify`,
+`amend`, `report`, `status`) that refuses to let the surface and the
+document disagree.
 
 ### 80.1. The surface is derived live, from the real front-ends
 

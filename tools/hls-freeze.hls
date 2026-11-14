@@ -1,0 +1,3237 @@
+# ============================================================================
+# tools/hls-freeze.hls — the Stage 141 API-freeze kit, in Halis (the
+# native twin of the Python hls-freeze.py that retired; same CLI, same
+# wire law, same verdicts — driven through bin/hls-freeze, built by
+# the bootstrap's own compiler).
+# ----------------------------------------------------------------------------
+# Usage:
+#   bin/hls-freeze snapshot [--root PATH] [--json]
+#   bin/hls-freeze verify   [--root PATH] [--json] [--quiet]
+#   bin/hls-freeze amend    --reason "..." --by NAME
+#                          [--root PATH] [--json]
+#   bin/hls-freeze report   --out FILE.md [--stamp] [--root PATH]
+#   bin/hls-freeze status   [--root PATH] [--json]
+#
+# Roadmap Stage 141 is one phrase: "API freeze — syntax + stdlib
+# locked". The promise became a FROZEN DOCUMENT — tests/api_freeze.json,
+# committed to the tree, content-addressed by the sha256 of its own
+# surface — and this tool refuses to let the surface and the document
+# disagree:
+#
+#   1. the SURFACE is derived LIVE from the real sources, never from
+#      prose. The Python years imported the lab interpreter's tables
+#      (tools/hlinterp/, retired with it); the native derivation reads
+#      the tree it is POINTED AT the same way the .py did — the
+#      keyword, effect and builtin chains are grepped out of the
+#      tree's own src/hlc (the tables bin/hlc tests membership
+#      against), the token and attribute vocabularies out of the
+#      tree's lexer and parser, and the primitive method surface is
+#      read from the checker's own dispatch. The container and
+#      concurrency method surface stays DEMONSTRATED, not asserted:
+#      every roster entry is accepted by the real checker through
+#      bin/hlboot at derive time, every junk name refused, so a
+#      checker whose method table moved breaks the probes loudly
+#      instead of freezing a lie. The stdlib surface is every public
+#      item of every module under std/ and core/, parsed with the
+#      real parser (tools/hlfront.hls — the compiler itself, linked);
+#      line numbers are deliberately NOT part of the surface — the
+#      freeze pins the CONTRACT, not the bytes;
+#
+#   2. the TWO-FRONT-END law survived the interpreter's retirement by
+#      following it: the lab lexer is gone, and the two programs in
+#      this tree that LEX the language are the compiler (src/hlc/
+#      types.hls) and the formatter (tools/hlfmt.hls) — both keyword
+#      chains are grepped live and must be EQUAL, because a language
+#      whose front-ends disagree about what a keyword IS has no
+#      surface to freeze;
+#
+#   3. the DIGEST is the sha256 of the canonical JSON of the surface
+#      (sorted keys, compact separators, no wall-clock, no paths, no
+#      machine specifics). The frozen document carries it; every
+#      verify recomputes it two ways — the document must agree with
+#      ITSELF and with the WORLD. Either agreement failing is a named
+#      refusal;
+#
+#   4. the DRIFT CLASSIFICATION is closed: REMOVED, ADDED and CHANGED,
+#      each named at its dotted path. Post-freeze ADDITIONS are drift
+#      too: the API is LOCKED, not merely backwards-compatible;
+#
+#   5. the AMEND is the only legal mutation, and it is a ledger entry,
+#      not an edit: it refuses to run without a written reason, refuses
+#      a no-op, computes the exact delta, rewrites the frozen document
+#      to the live surface, and appends a hash-chained record to
+#      tests/api_freeze_amendments.jsonl. The chain is the family's
+#      ONE arithmetic (the hltlog law, carried by every native twin):
+#      sha256(prev_hash + canonical-json(entry minus chain_hash)),
+#      genesis from 64 zeros, every reader replaying from the start
+#      and naming the broken line;
+#
+#   6. the REPORT is the frozen API document rendered — deterministic
+#      per freeze, NEVER rendered from a drifted tree: report runs
+#      verify first and refuses.
+#
+# The freeze file is COMMITTED (unlike every machine-local ledger in
+# this tree) because the frozen API is exactly the part of the project
+# that must travel with the repository. The amendment chain travels
+# with it — the same file, the same commits.
+#
+# Exit codes: 0 the contract held / 1 a named refusal or a detected
+# drift (fail-closed) / 2 usage error. Every refusal names the rule,
+# not just the fact.
+# ============================================================================
+
+import "./hlfront.hls"
+import "std.str"
+import "std.json"
+import "std.result"
+import "std.sha256"
+
+# ----------------------------------------------------------------------------
+# The constants.
+# ----------------------------------------------------------------------------
+
+fn fz_version() -> str {
+    return "0.159.0-alpha"
+}
+
+fn fz_stage() -> int {
+    return 141
+}
+
+fn fz_freeze_rel() -> str {
+    return "tests/api_freeze.json"
+}
+
+fn fz_chain_rel() -> str {
+    return "tests/api_freeze_amendments.jsonl"
+}
+
+fn fz_surface_version() -> int {
+    return 1
+}
+
+fn fz_genesis() -> str {
+    return "0000000000000000000000000000000000000000000000000000000000000000"
+}
+
+# ----------------------------------------------------------------------------
+# Canonical JSON — json.dumps(sort_keys=True, separators=(",", ":"),
+# ensure_ascii=True): sorted keys, no whitespace, non-ASCII escaped.
+# One rendering, two doors: strings built at derive time, values
+# re-canonicalised at verify time — they must agree, and the
+# document's own digest check enforces that they do.
+# ----------------------------------------------------------------------------
+
+fn fz_hex4(cp: int) -> str {
+    let digits: str = "0123456789abcdef"
+    let a: int = (cp / 4096) % 16
+    let b: int = (cp / 256) % 16
+    let c: int = (cp / 16) % 16
+    let d: int = cp % 16
+    return "\\u" + digits.slice(a, a + 1) + digits.slice(b, b + 1)
+    + digits.slice(c, c + 1) + digits.slice(d, d + 1)
+}
+
+# fz_hex4_surro — the escaped UTF-16 form of a codepoint above the
+# BMP: a surrogate pair, \uXXXX twice.
+fn fz_hex4_surro(cp: int) -> str {
+    let v: int = cp - 65536
+    let hi: int = 55296 + (v / 1024)
+    let lo: int = 56320 + (v % 1024)
+    return fz_hex4(hi) + fz_hex4(lo)
+}
+
+fn fz_jstr(s: str) -> str {
+    let mut out: str = "\""
+    let mut i: int = 0
+    let n: int = s.len()
+    while i < n {
+        let c: int = s.byte_at(i)
+        if c == 34 {
+            out = out + "\\\""
+        } else if c == 92 {
+            out = out + "\\\\"
+        } else if c == 10 {
+            out = out + "\\n"
+        } else if c == 13 {
+            out = out + "\\r"
+        } else if c == 9 {
+            out = out + "\\t"
+        } else if c < 32 {
+            out = out + fz_hex4(c)
+        } else if c < 127 {
+            out = out + s.slice(i, i + 1)
+        } else {
+            # a multi-byte UTF-8 sequence: decode it, escape it as
+            # UTF-16 (a surrogate pair above the BMP).
+            if c >= 240 && i + 3 < n {
+                let cp: int = ((c - 240) * 262144)
+                + ((s.byte_at(i + 1) - 128) * 4096)
+                + ((s.byte_at(i + 2) - 128) * 64)
+                + (s.byte_at(i + 3) - 128)
+                out = out + fz_hex4_surro(cp)
+                i = i + 4
+                continue
+            }
+            if c >= 224 && i + 2 < n {
+                let cp2: int = ((c - 224) * 4096)
+                + ((s.byte_at(i + 1) - 128) * 64)
+                + (s.byte_at(i + 2) - 128)
+                out = out + fz_hex4(cp2)
+                i = i + 3
+                continue
+            }
+            if c >= 192 && i + 1 < n {
+                let cp3: int = ((c - 192) * 64) + (s.byte_at(i + 1) - 128)
+                out = out + fz_hex4(cp3)
+                i = i + 2
+                continue
+            }
+            out = out + fz_hex4(c)
+        }
+        i = i + 1
+    }
+    return out + "\""
+}
+
+# fz_canon_v — the canonical rendering of a parsed JsonValue (sorted
+# keys at every level, compact separators).
+fn fz_canon_v(v: JsonValue) -> str {
+    if json_is_null(v) {
+        return "null"
+    }
+    if json_is_bool(v) {
+        if json_bool_value(v) {
+            return "true"
+        }
+        return "false"
+    }
+    if json_is_int(v) {
+        return json_int_value(v).to_str()
+    }
+    if json_is_float(v) {
+        return fz_canon_float(json_float_value(v))
+    }
+    if json_is_str(v) {
+        return fz_jstr(json_str_value(v))
+    }
+    if json_is_array(v) {
+        let mut out: str = "["
+        let mut i: int = 0
+        while i < v.arr.len() {
+            if i > 0 {
+                out = out + ","
+            }
+            out = out + fz_canon_v(v.arr.get(i))
+            i = i + 1
+        }
+        return out + "]"
+    }
+    # object: keys sorted
+    let keys: list[str] = fz_sorted(v.obj_keys)
+    let mut out2: str = "{"
+    let mut j: int = 0
+    while j < keys.len() {
+        if j > 0 {
+            out2 = out2 + ","
+        }
+        let mut ki: int = 0
+        let mut vi: JsonValue = json_null()
+        let mut found: bool = false
+        while ki < v.obj_keys.len() {
+            if v.obj_keys.get(ki) == keys.get(j) {
+                vi = v.obj_vals.get(ki)
+                found = true
+            }
+            ki = ki + 1
+        }
+        if !found {
+            return "{}"
+        }
+        out2 = out2 + fz_jstr(keys.get(j)) + ":" + fz_canon_v(vi)
+        j = j + 1
+    }
+    return out2 + "}"
+}
+
+# fz_canon_float — integral floats render as N.0 (Python repr); the
+# general form takes the float's shortest text. No frozen surface
+# carries a float today; the branch exists so a future one cannot
+# crash the renderer.
+fn fz_canon_float(v: float) -> str {
+    if v == 0.0 {
+        return "0.0"
+    }
+    let neg: bool = v < 0.0
+    let mut a: float = v
+    if neg {
+        a = -v
+    }
+    if a < 9007199254740992.0 {
+        let i: int = fz_float_to_int(a)
+        if a == i.to_float() {
+            if neg {
+                return "-" + i.to_str() + ".0"
+            }
+            return i.to_str() + ".0"
+        }
+    }
+    return v.to_str()
+}
+
+fn fz_float_to_int(v: float) -> int {
+    return v.to_int()
+}
+
+fn fz_sorted(xs: list[str]) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < xs.len() {
+        out.push(xs.get(i))
+        i = i + 1
+    }
+    let mut j: int = 1
+    while j < out.len() {
+        let v: str = out.get(j)
+        let mut m: int = j - 1
+        while m >= 0 && fz_str_lt(v, out.get(m)) {
+            out.set(m + 1, out.get(m))
+            m = m - 1
+        }
+        out.set(m + 1, v)
+        j = j + 1
+    }
+    return out
+}
+
+# fz_find — the first index of sub at or after from (-1 when absent).
+fn fz_find(s: str, sub: str, from: int) -> int {
+    let n: int = s.len()
+    let m: int = sub.len()
+    if m == 0 {
+        return -1
+    }
+    let mut i: int = from
+    while i + m <= n {
+        if s.slice(i, i + m) == sub {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn fz_str_lt(a: str, b: str) -> bool {
+    let n: int = a.len()
+    let m: int = b.len()
+    let mut i: int = 0
+    while i < n && i < m {
+        if a.byte_at(i) != b.byte_at(i) {
+            return a.byte_at(i) < b.byte_at(i)
+        }
+        i = i + 1
+    }
+    return n < m
+}
+
+fn fz_join_q(xs: list[str]) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < xs.len() {
+        if i > 0 {
+            out = out + ","
+        }
+        out = out + fz_jstr(xs.get(i))
+        i = i + 1
+    }
+    return out
+}
+
+fn fz_digest_of_v(v: JsonValue) -> str {
+    return sha256_hex(fz_canon_v(v))
+}
+
+# ----------------------------------------------------------------------------
+# The chain — the family's ONE arithmetic, carried from hltlog_common
+# verbatim: sha256(prev + canonical(record minus chain_hash)).
+# ----------------------------------------------------------------------------
+
+# fz_chain_of(prev, rec) — the hash that binds a record onto its
+# predecessor. The chain_hash field itself is left out of the body.
+fn fz_chain_of(prev: str, rec: JsonValue) -> str {
+    let keys: list[str] = []
+    let vals: list[JsonValue] = []
+    let mut i: int = 0
+    while i < rec.obj_keys.len() {
+        if rec.obj_keys.get(i) != "chain_hash" {
+            keys.push(rec.obj_keys.get(i))
+            vals.push(rec.obj_vals.get(i))
+        }
+        i = i + 1
+    }
+    let body: JsonValue = json_object(keys, vals)
+    return sha256_hex(prev + fz_canon_v(body))
+}
+
+# fz_chain_str(rec, key) — a record's string field ("" when absent).
+fn fz_chain_str(rec: JsonValue, key: str) -> str {
+    let v: JsonValue = json_object_get(rec, key)
+    if json_is_str(v) {
+        return json_str_value(v)
+    }
+    return ""
+}
+
+# fz_chain_int(rec, key) — a record's int field (-1 when absent).
+fn fz_chain_int(rec: JsonValue, key: str) -> int {
+    let v: JsonValue = json_object_get(rec, key)
+    if json_is_int(v) {
+        return json_int_value(v)
+    }
+    return -1
+}
+
+# fz_verify_chain(records, origin) -> the breaks, every one named at
+# its line; the replay continues after a break so one report names
+# every break in the file, not just the first.
+fn fz_verify_chain(records: list[JsonValue], origin: str) -> list[str] {
+    let out: list[str] = []
+    let mut prev: str = fz_genesis()
+    let mut expect_seq: int = 1
+    let mut i: int = 0
+    while i < records.len() {
+        let rec: JsonValue = records.get(i)
+        let place: str = origin + ": record " + (i + 1).to_str()
+        let seq: int = fz_chain_int(rec, "seq")
+        if seq != expect_seq {
+            out.push(place + " :: seq " + seq.to_str()
+            + " out of order (want " + expect_seq.to_str() + ")")
+            if seq > 0 {
+                expect_seq = seq
+            }
+        }
+        if fz_chain_str(rec, "prev_hash") != prev {
+            out.push(place + " :: prev_hash does not chain to the "
+            + "record before it")
+        }
+        let want: str = fz_chain_of(fz_chain_str(rec, "prev_hash"), rec)
+        if fz_chain_str(rec, "chain_hash") != want {
+            out.push(place + " :: chain_hash does not match the "
+            + "record's content (recomputed " + want.slice(0, 12)
+            + "...)")
+        }
+        let ch: str = fz_chain_str(rec, "chain_hash")
+        if ch != "" {
+            prev = ch
+        }
+        expect_seq = expect_seq + 1
+        i = i + 1
+    }
+    return out
+}
+
+# fz_chain_head — the last record's chain_hash (genesis for an empty
+# log).
+fn fz_chain_head(records: list[JsonValue]) -> str {
+    if records.len() == 0 {
+        return fz_genesis()
+    }
+    let ch: str = fz_chain_str(records.get(records.len() - 1),
+    "chain_hash")
+    if ch == "" {
+        return fz_genesis()
+    }
+    return ch
+}
+
+# ----------------------------------------------------------------------------
+# The run helper — captured children (the probe channel).
+# ----------------------------------------------------------------------------
+
+struct FzRun {
+    code: int,
+    out: str,
+    err: str
+}
+
+fn fz_run_at(prog: str, argv: list[str]) -> FzRun uses Proc {
+    let full: list[str] = ["-c", "exec '" + prog + "' "
+    + fz_join_quoted(argv)]
+    let r: FzRun = FzRun {
+        code: -1, out: "", err: ""
+    }
+    let pid: int = proc_spawn("sh", full, 2, 1, 1)
+    if pid < 1 {
+        return r
+    }
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    r.code = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    r.out = out
+    r.err = err
+    return r
+}
+
+fn fz_join_quoted(xs: list[str]) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < xs.len() {
+        if i > 0 {
+            out = out + " "
+        }
+        out = out + "'" + xs.get(i) + "'"
+        i = i + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# Paths and tree plumbing.
+# ----------------------------------------------------------------------------
+
+# fz_tree_of(root) — --root as given (absolute), else the repo the
+# binary lives in, always absolute (the .py's os.path.abspath).
+fn fz_tree_of(root: str) -> str uses Args, Proc {
+    if root != "" {
+        if root.byte_at(0) == 47 {
+            return fz_normpath(root)
+        }
+        return fz_normpath(cwd_get() + "/" + root)
+    }
+    let a: list[str] = args()
+    if a.len() == 0 {
+        return cwd_get()
+    }
+    let argv0: str = a.get(0)
+    let rel: str = fz_normpath(fz_normpath(argv0 + "/..") + "/..")
+    if rel == "." {
+        return cwd_get()
+    }
+    if rel.byte_at(0) == 47 {
+        return rel
+    }
+    return fz_normpath(cwd_get() + "/" + rel)
+}
+
+fn fz_normpath(p: str) -> str {
+    let abs: bool = p.len() > 0 && p.byte_at(0) == 47
+    let parts: list[str] = p.split("/")
+    let stack: list[str] = []
+    let mut i: int = 0
+    while i < parts.len() {
+        let seg: str = parts.get(i)
+        if seg == "" || seg == "." {
+            i = i + 1
+            continue
+        }
+        if seg == ".." {
+            if stack.len() > 0 && stack.get(stack.len() - 1) != ".." {
+                stack.pop()
+            } else {
+                if !abs {
+                    stack.push("..")
+                }
+            }
+            i = i + 1
+            continue
+        }
+        stack.push(seg)
+        i = i + 1
+    }
+    let mut out: str = ""
+    if abs {
+        out = "/"
+    }
+    let mut j: int = 0
+    while j < stack.len() {
+        if j > 0 {
+            out = out + "/"
+        }
+        out = out + stack.get(j)
+        j = j + 1
+    }
+    if out == "" {
+        return "."
+    }
+    return out
+}
+
+fn fz_join(a: str, b: str) -> str {
+    if a.len() == 0 {
+        return b
+    }
+    if a.byte_at(a.len() - 1) == 47 {
+        return a + b
+    }
+    return a + "/" + b
+}
+
+fn fz_is_dir(path: str) -> bool uses Fs {
+    return fs_is_dir(path)
+}
+
+# fz_boot_path — the evaluator the probes ride: the repo the binary
+# lives in, built when missing (the guarantee tool's own law).
+fn fz_boot_path() -> str uses Args, Proc, Fs {
+    let a: list[str] = args()
+    if a.len() == 0 {
+        return "bin/hlboot"
+    }
+    let argv0: str = a.get(0)
+    let root: str = fz_normpath(fz_normpath(argv0 + "/..") + "/..")
+    let boot: str = fz_join(root, "bin/hlboot")
+    if !file_exists(boot) {
+        let r: FzRun = fz_run_at("make", ["-s", "bin/hlboot"])
+        let _drop: int = r.code
+    }
+    if !file_exists(boot) {
+        return "bin/hlboot"
+    }
+    return boot
+}
+
+# ----------------------------------------------------------------------------
+# The source greps — the tables the .py imported, read out of the
+# tree's own front-end source. Fail-closed: a table that cannot be
+# read is a refusal, never a guess.
+# ----------------------------------------------------------------------------
+
+# fz_read_tree(tree, rel) — a file from the tree, or the empty string
+# when missing (callers refuse with their own words).
+fn fz_read_tree(tree: str, rel: str) -> str uses Fs {
+    let full: str = fz_join(tree, rel)
+    if !file_exists(full) {
+        return ""
+    }
+    return read_file(full)
+}
+
+# fz_fn_chain_words — the `== "word"` chain inside `fn NAME(...)` in a
+# source text, sorted and deduped. class "lower" takes [a-z_0-9],
+# "upper" takes [A-Za-z_].
+fn fz_fn_chain_words(text: str, fname: str, word_class: str) -> list[str] {
+    let needle: str = "fn " + fname + "("
+    let at: int = text.find(needle)
+    if at < 0 {
+        return[]
+    }
+    let end: int = fz_find(text, "\n}", at)
+    if end < 0 {
+        return[]
+    }
+    let body: str = text.slice(at, end)
+    let words: list[str] = []
+    let mut i: int = 0
+    let n: int = body.len()
+    while i < n {
+        if body.byte_at(i) == 61 && i + 1 < n
+        && body.byte_at(i + 1) == 61 && i + 2 < n
+        && body.byte_at(i + 2) == 32 && i + 3 < n
+        && body.byte_at(i + 3) == 34 {
+            # == "..." — collect the word
+            let mut j: int = i + 4
+            let mut w: str = ""
+            while j < n {
+                let c: int = body.byte_at(j)
+                let ok: bool = fz_word_char(c, word_class)
+                if !ok {
+                    break
+                }
+                w = w + body.slice(j, j + 1)
+                j = j + 1
+            }
+            if w != "" && j < n && body.byte_at(j) == 34 {
+                if !fz_list_has(words, w) {
+                    words.push(w)
+                }
+            }
+            i = j
+            continue
+        }
+        i = i + 1
+    }
+    return fz_sorted(words)
+}
+
+fn fz_word_char(c: int, word_class: str) -> bool {
+    if word_class == "upper" {
+        return(c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+    }
+    return(c >= 97 && c <= 122) || c == 95
+    || (c >= 48 && c <= 57)
+}
+
+fn fz_list_has(xs: list[str], x: str) -> bool {
+    let mut i: int = 0
+    while i < xs.len() {
+        if xs.get(i) == x {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# fz_line_with — the first line containing needle ("" when absent).
+fn fz_line_with(lines: list[str], needle: str) -> str {
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).contains(needle) {
+            return lines.get(i)
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# fz_extract_quoted_after — every "..." that follows `pattern == ` or
+# `pattern != ` occurrences on one line (pattern = "two" / "c" /
+# "name").
+fn fz_quoted_on_line(line: str, pattern: str) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    let n: int = line.len()
+    while i < n {
+        if line.byte_at(i) == 61 && i + 1 < n
+        && line.byte_at(i + 1) == 61 && i + 2 < n
+        && line.byte_at(i + 2) == 32 && i + 3 < n
+        && line.byte_at(i + 3) == 34 {
+            let mut j: int = i + 4
+            let mut w: str = ""
+            while j < n && line.byte_at(j) != 34 {
+                w = w + line.slice(j, j + 1)
+                j = j + 1
+            }
+            if w != "" {
+                out.push(w)
+            }
+            i = j
+            continue
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# The probe roster — the candidate container / concurrency method
+# surface, DEMONSTRATED through the real checker (the .py's table,
+# verbatim: a method the roster never names cannot be probed, and
+# extending it is an amendable change to THIS tool).
+# ----------------------------------------------------------------------------
+
+struct FzProbeMethod {
+    name: str,
+    call: str,
+    ret: str,
+    bind: str,
+    params: list[str]
+}
+
+fn fz_junk_method() -> str {
+    return "zz_freeze_junk_probe"
+}
+
+fn fz_receiver(kind: str) -> str {
+    if kind == "list" {
+        return "xs"
+    }
+    if kind == "map" {
+        return "m"
+    }
+    if kind == "chan" {
+        return "ch"
+    }
+    return "t"
+}
+
+fn fz_probe_setup(kind: str) -> str {
+    if kind == "list" {
+        return "let xs: list[int] = [1, 2]"
+    }
+    if kind == "map" {
+        return "let m: map[str, int] = map_new()"
+    }
+    if kind == "chan" {
+        return "let ch: Chan[int] = chan_new()"
+    }
+    return "let t: Task[int] = spawn(__freeze_work)"
+}
+
+fn fz_probe_uses(kind: str) -> str {
+    if kind == "chan" {
+        return "Conc"
+    }
+    if kind == "task" {
+        return "Conc"
+    }
+    return ""
+}
+
+fn fz_probe_workfn(kind: str) -> str {
+    if kind == "task" {
+        return "fn __freeze_work() -> int { return 7 }"
+    }
+    return ""
+}
+
+# fz_probe_program — the roster entry rendered as a real program. ret
+# is the SURFACE shape ("T" = the element type); bind is the concrete
+# type the probe binds the result to.
+fn fz_probe_program(kind: str, name: str) -> str {
+    let mut call: str = ""
+    let mut bind: str = "int"
+    if name == fz_junk_method() {
+        call = fz_receiver(kind) + "." + name + "(1)"
+        bind = "int"
+    } else {
+        let m: FzProbeMethod = fz_roster_method(kind, name)
+        call = m.call
+        bind = m.bind
+    }
+    let eff: str = fz_probe_uses(kind)
+    let mut head: str = "fn main() -> void"
+    if eff != "" {
+        head = head + " uses " + eff
+    }
+    let mut body: str = "    " + fz_probe_setup(kind) + "\n"
+    if bind == "void" {
+        body = body + "    " + call + "\n"
+    } else {
+        body = body + "    let _v: " + bind + " = " + call + "\n"
+    }
+    body = body + "    return\n"
+    let work: str = fz_probe_workfn(kind)
+    let mut out: str = ""
+    if work != "" {
+        out = out + work + "\n"
+    }
+    out = out + head + " {\n" + body + "}\n"
+    return out
+}
+
+# fz_roster_method — one roster entry (call/bind/ret/params).
+fn fz_roster_method(kind: str, name: str) -> FzProbeMethod {
+    # list
+    if kind == "list" {
+        if name == "len" {
+            return FzProbeMethod {
+                name: "len", call: "xs.len()",
+                ret: "int", bind: "int", params: []
+            }
+        }
+        if name == "push" {
+            let ps: list[str] = ["T"]
+            return FzProbeMethod {
+                name: "push", call: "xs.push(3)",
+                ret: "void", bind: "void", params: ps
+            }
+        }
+        if name == "get" {
+            let ps2: list[str] = ["int"]
+            return FzProbeMethod {
+                name: "get", call: "xs.get(0)",
+                ret: "T", bind: "int", params: ps2
+            }
+        }
+        if name == "set" {
+            let ps3: list[str] = ["int", "T"]
+            return FzProbeMethod {
+                name: "set", call: "xs.set(0, 3)",
+                ret: "void", bind: "void", params: ps3
+            }
+        }
+        if name == "pop" {
+            return FzProbeMethod {
+                name: "pop", call: "xs.pop()",
+                ret: "T", bind: "int", params: []
+            }
+        }
+    }
+    # map
+    if kind == "map" {
+        if name == "len" {
+            return FzProbeMethod {
+                name: "len", call: "m.len()",
+                ret: "int", bind: "int", params: []
+            }
+        }
+        if name == "set" {
+            let ps: list[str] = ["str", "T"]
+            return FzProbeMethod {
+                name: "set", call: "m.set(\"k\", 1)",
+                ret: "void", bind: "void", params: ps
+            }
+        }
+        if name == "get_or" {
+            let ps2: list[str] = ["str", "T"]
+            return FzProbeMethod {
+                name: "get_or",
+                call: "m.get_or(\"k\", 1)", ret: "T", bind: "int",
+                params: ps2
+            }
+        }
+        if name == "has" {
+            let ps3: list[str] = ["str"]
+            return FzProbeMethod {
+                name: "has", call: "m.has(\"k\")",
+                ret: "bool", bind: "bool", params: ps3
+            }
+        }
+        if name == "keys" {
+            let ps4: list[str] = []
+            return FzProbeMethod {
+                name: "keys", call: "m.keys()",
+                ret: "list[str]", bind: "list[str]", params: ps4
+            }
+        }
+    }
+    # chan
+    if kind == "chan" {
+        if name == "send" {
+            let ps: list[str] = ["T"]
+            return FzProbeMethod {
+                name: "send", call: "ch.send(1)",
+                ret: "void", bind: "void", params: ps
+            }
+        }
+        if name == "try_send" {
+            let ps2: list[str] = ["T"]
+            return FzProbeMethod {
+                name: "try_send",
+                call: "ch.try_send(1)", ret: "bool", bind: "bool",
+                params: ps2
+            }
+        }
+        if name == "recv" {
+            return FzProbeMethod {
+                name: "recv", call: "ch.recv()",
+                ret: "T", bind: "int", params: []
+            }
+        }
+        if name == "recv_or" {
+            let ps3: list[str] = ["T"]
+            return FzProbeMethod {
+                name: "recv_or",
+                call: "ch.recv_or(1)", ret: "T", bind: "int",
+                params: ps3
+            }
+        }
+        if name == "len" {
+            return FzProbeMethod {
+                name: "len", call: "ch.len()",
+                ret: "int", bind: "int", params: []
+            }
+        }
+    }
+    # task
+    if kind == "task" {
+        if name == "join" {
+            return FzProbeMethod {
+                name: "join", call: "t.join()",
+                ret: "T", bind: "int", params: []
+            }
+        }
+    }
+    let none: list[str] = []
+    return FzProbeMethod {
+        name: "", call: "", ret: "", bind: "",
+        params: none
+    }
+}
+
+fn fz_roster_kinds() -> list[str] {
+    let ks: list[str] = ["chan", "list", "map", "task"]
+    return ks
+}
+
+fn fz_roster_names(kind: str) -> list[str] {
+    if kind == "list" {
+        let ns: list[str] = ["get", "len", "pop", "push", "set"]
+        return ns
+    }
+    if kind == "map" {
+        let ns2: list[str] = ["get_or", "has", "keys", "len", "set"]
+        return ns2
+    }
+    if kind == "chan" {
+        let ns3: list[str] = ["len", "recv", "recv_or", "send",
+        "try_send"]
+        return ns3
+    }
+    let ns4: list[str] = ["join"]
+    return ns4
+}
+
+# ----------------------------------------------------------------------------
+# The probe channel — one program through the real checker.
+# ----------------------------------------------------------------------------
+
+struct FzVerdict {
+    ok: bool,
+    diag: str
+}
+
+# fz_checker_verdict — None when accepted, else the diagnostic text.
+fn fz_checker_verdict(prog: str, boot: str, counter: int) -> FzVerdict
+uses Fs, Proc, Clock {
+    let path: str = "/tmp/hls-freeze-probe-" + clock_ms().to_str() + "-"
+    + counter.to_str() + ".hls"
+    write_file(path, prog)
+    let r: FzRun = fz_run_at(boot, ["--check", path])
+    let _drop: int = proc_spawn("rm", ["-f", path], 2, 2, 2)
+    let blob: str = r.out + r.err
+    if r.code == 0 {
+        return FzVerdict {
+            ok: true, diag: ""
+        }
+    }
+    return FzVerdict {
+        ok: false, diag: blob
+    }
+}
+
+# ----------------------------------------------------------------------------
+# The refusal — the rule, not just the fact.
+# ----------------------------------------------------------------------------
+
+struct FzRefusal {
+    msg: str
+}
+
+fn fz_refuse(msg: str) -> FzRefusal {
+    return FzRefusal {
+        msg: msg
+    }
+}
+# ============================================================================
+# PART 2 — the derivation (appended; concatenated into tools/hls-freeze.hls)
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# The fn-attribute census — the parser's own words, read live through
+# the probe channel (a junk attribute is refused with the known-list
+# enumeration; the raw enumeration is frozen verbatim alongside the
+# cleaned name list).
+# ----------------------------------------------------------------------------
+
+struct FzCensus {
+    raw: str,
+    names: list[str]
+}
+
+fn fz_attr_census(boot: str, counter: int) -> FzCensus uses Fs, Proc,
+Clock {
+    let src: str = "#[zz_freeze_census]\nfn main() -> void { return }\n"
+    let v: FzVerdict = fz_checker_verdict(src, boot, counter)
+    if v.ok || !v.diag.contains("unknown attribute")
+    || !v.diag.contains("known:") {
+        let mut got: str = v.diag
+        if got == "" {
+            got = "ACCEPTED"
+        }
+        return FzCensus {
+            raw: "!PROBE!the attribute census probe was "
+            + "not refused with the known-attributes enumeration (got: "
+            + got + ") — the parser's attribute vocabulary cannot be "
+            + "read live", names: []
+        }
+    }
+    let at: int = v.diag.find("known:")
+    let mut tail: str = v.diag.slice(at + 6, v.diag.len())
+    let cut: int = tail.find(" (line")
+    if cut >= 0 {
+        tail = tail.slice(0, cut)
+    }
+    tail = tail.trim()
+    if !tail.ends_with("))") {
+        return FzCensus {
+            raw: "!PROBE!the attribute enumeration does "
+            + "not end with the expected '...))' shape (" + tail + ") — "
+            + "the parser's diagnostic format moved; update the census "
+            + "reader", names: []
+        }
+    }
+    let raw: str = tail.slice(0, tail.len() - 1)
+    # the cleaned name list: names with their argument shapes where the
+    # shape is a vocabulary word (always/never), plain names otherwise.
+    let names: list[str] = []
+    let pieces: list[str] = raw.split(",")
+    let mut i: int = 0
+    while i < pieces.len() {
+        let mut piece: str = pieces.get(i).trim()
+        if piece.starts_with("and ") {
+            # "and — inside extern blocks only — taint_source"
+            let parts: list[str] = piece.split("—")
+            piece = parts.get(parts.len() - 1).trim()
+        }
+        let nm: str = fz_clean_attr_name(piece)
+        if nm != "" {
+            names.push(nm)
+        }
+        i = i + 1
+    }
+    if names.len() == 0 {
+        return FzCensus {
+            raw: "!PROBE!the parser's attribute "
+            + "enumeration cleaned to an empty vocabulary — the census "
+            + "format moved; update the cleaner", names: []
+        }
+    }
+    return FzCensus {
+        raw: raw, names: names
+    }
+}
+
+# fz_clean_attr_name — "inline(always)" keeps its argshape; a
+# non-vocabulary argshape is dropped ("stack_size(N)" -> "stack_size");
+# pieces that are not a name(argshape) shape are skipped.
+fn fz_clean_attr_name(piece: str) -> str {
+    # name part
+    let mut i: int = 0
+    let mut name: str = ""
+    while i < piece.len() {
+        let c: int = piece.byte_at(i)
+        if(c >= 97 && c <= 122) || c == 95 {
+            name = name + piece.slice(i, i + 1)
+            i = i + 1
+            continue
+        }
+        break
+    }
+    if name == "" {
+        return ""
+    }
+    if i >= piece.len() {
+        return name
+    }
+    if piece.byte_at(i) != 40 {
+        return ""
+    }
+    # argshape "(...)"
+    let close: int = fz_find(piece, ")", i)
+    if close < 0 {
+        return ""
+    }
+    if close + 1 != piece.len() {
+        return ""
+    }
+    let inner: str = piece.slice(i + 1, close).trim()
+    let stripped: str = fz_strip_quotes(inner)
+    if stripped == "always" || stripped == "never" {
+        return name + "(" + stripped + ")"
+    }
+    return name
+}
+
+fn fz_strip_quotes(s: str) -> str {
+    let mut out: str = s
+    if out.len() >= 2 && out.byte_at(0) == 34
+    && out.byte_at(out.len() - 1) == 34 {
+        out = out.slice(1, out.len() - 1)
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# The primitive method surface — read from the checker's own dispatch
+# (src/hlc/check_call.hls): the arms the checker accepts, with their
+# parameter pushes and return types, exactly as the .py's imported
+# tables carried them.
+# ----------------------------------------------------------------------------
+
+struct FzMethod {
+    name: str,
+    params: list[str],
+    ret: str
+}
+
+# fz_prim_methods — one primitive receiver's dispatch block, as the
+# canonical fragment body (method -> {params, ret}), or "!REFUSAL!..."
+# when the checker source cannot be read.
+fn fz_prim_methods_fragment(tree: str, ty: str) -> str uses Fs {
+    let src: str = fz_read_tree(tree, "src/hlc/check_call.hls")
+    if src == "" {
+        return "!REFUSAL!the self-hosted checker is missing: "
+        + "src/hlc/check_call.hls"
+    }
+    let lines: list[str] = src.split("\n")
+    let mut out: str = ""
+    let tbl: list[FzMethod] = fz_dispatch_block(lines, ty)
+    let mut m: int = 0
+    while m < tbl.len() {
+        if m > 0 {
+            out = out + ","
+        }
+        let meth: FzMethod = tbl.get(m)
+        out = out + fz_jstr(meth.name) + ":{\"params\":["
+        + fz_join_q(meth.params) + "],\"ret\":"
+        + fz_jstr(meth.ret) + "}"
+        m = m + 1
+    }
+    return out
+}
+
+# fz_dispatch_block — one `tt == "<ty>"` block's method arms, sorted
+# by name (canonical order).
+fn fz_dispatch_block(lines: list[str], ty: str) -> list[FzMethod] {
+    let opener: str = "tt == \"" + ty + "\" {"
+    let mut start: int = -1
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).contains(opener) {
+            start = i
+            break
+        }
+        i = i + 1
+    }
+    if start < 0 {
+        return[]
+    }
+    # the block ends at the next line matching "    } else if" (the
+    # dispatch chain's next arm).
+    let mut end: int = lines.len()
+    let mut j: int = start + 1
+    while j < lines.len() {
+        let l: str = lines.get(j)
+        if l.len() >= 10 && l.slice(0, 10) == "    } else" {
+            end = j
+            break
+        }
+        j = j + 1
+    }
+    let tbl: list[FzMethod] = []
+    let mut cur: str = ""
+    let mut params: list[str] = []
+    let mut ret: str = "void"
+    let mut have: bool = false
+    let mut k: int = start + 1
+    while k < end {
+        let l2: str = lines.get(k)
+        # arm opener: `if name == "X" {` or `else if name == "X" {`
+        let arm: str = fz_arm_name(l2)
+        if arm != "" {
+            if have {
+                tbl.push(FzMethod {
+                    name: cur, params: params, ret: ret
+                })
+            }
+            cur = arm
+            let fresh: list[str] = []
+            params = fresh
+            ret = "void"
+            have = true
+            k = k + 1
+            continue
+        }
+        if have {
+            # ptypes.push("T") — a parameter type, in order
+            if l2.contains("ptypes.push(\"") {
+                let at: int = l2.find("ptypes.push(\"")
+                let rest: str = l2.slice(at + 13, l2.len())
+                let q: int = rest.find("\"")
+                if q > 0 {
+                    params.push(rest.slice(0, q))
+                }
+            }
+            # ret = "R" — the return type (last wins; the freestanding
+            # guards contribute no assignment)
+            let rat: int = l2.find("ret = \"")
+            if rat >= 0 {
+                let rest2: str = l2.slice(rat + 7, l2.len())
+                let q2: int = rest2.find("\"")
+                if q2 > 0 {
+                    ret = rest2.slice(0, q2)
+                }
+            }
+        }
+        k = k + 1
+    }
+    if have {
+        tbl.push(FzMethod {
+            name: cur, params: params, ret: ret
+        })
+    }
+    # sort by name
+    let mut a: int = 1
+    while a < tbl.len() {
+        let v: FzMethod = tbl.get(a)
+        let mut b: int = a - 1
+        while b >= 0 && fz_str_lt(v.name, tbl.get(b).name) {
+            tbl.set(b + 1, tbl.get(b))
+            b = b - 1
+        }
+        tbl.set(b + 1, v)
+        a = a + 1
+    }
+    return tbl
+}
+
+# fz_arm_name — the method name when the line opens a dispatch arm.
+fn fz_arm_name(line: str) -> str {
+    let trimmed: str = line.trim()
+    let mut rest: str = ""
+    if trimmed.starts_with("if name == \"") {
+        rest = trimmed.slice(12, trimmed.len())
+    } else {
+        if trimmed.starts_with("else if name == \"") {
+            rest = trimmed.slice(17, trimmed.len())
+        } else {
+            return ""
+        }
+    }
+    let q: int = rest.find("\"")
+    if q <= 0 {
+        return ""
+    }
+    return rest.slice(0, q)
+}
+
+# ----------------------------------------------------------------------------
+# The container method surface — demonstrated through the probe
+# channel (the roster, the junk negative first).
+# ----------------------------------------------------------------------------
+
+# fz_container_methods_fragment — one probed receiver's fragment
+# body, or "!PROBE!..." when the channel cannot be trusted
+# (fail-closed).
+fn fz_container_methods_fragment(boot: str, kind: str) -> str uses Fs,
+Proc, Clock {
+    let counter: Counter = Counter {
+        n: 1000
+    }
+    # the negative first: the channel must refuse
+    let neg: FzVerdict = fz_checker_verdict(
+    fz_probe_program(kind, fz_junk_method()), boot, counter.n)
+    counter.n = counter.n + 1
+    let mut negmsg: str = neg.diag
+    if negmsg == "" {
+        negmsg = "ACCEPTED"
+    }
+    if neg.ok || !negmsg.contains("no method") {
+        return "!PROBE!the " + kind + " negative probe was not "
+        + "refused with a no-method diagnostic (got: " + negmsg
+        + ") — the probe channel cannot be trusted for this type"
+    }
+    let mut out: str = ""
+    let names: list[str] = fz_roster_names(kind)
+    let mut n: int = 0
+    while n < names.len() {
+        let nm: str = names.get(n)
+        let verdict: FzVerdict = fz_checker_verdict(
+        fz_probe_program(kind, nm), boot, counter.n)
+        counter.n = counter.n + 1
+        if !verdict.ok {
+            return "!PROBE!the probe roster disagrees with the live "
+            + "checker: " + kind + "." + nm + " was refused ("
+            + verdict.diag + ") — the method surface moved; the "
+            + "roster in tools/hls-freeze.hls must be amended to "
+            + "match reality before the surface can be frozen"
+        }
+        let m: FzProbeMethod = fz_roster_method(kind, nm)
+        if n > 0 {
+            out = out + ","
+        }
+        out = out + fz_jstr(m.name) + ":{\"params\":["
+        + fz_join_q(m.params) + "],\"ret\":" + fz_jstr(m.ret)
+        + "}"
+        n = n + 1
+    }
+    return out
+}
+
+struct Counter {
+    n: int
+}
+
+# ----------------------------------------------------------------------------
+# The syntax surface — the canonical fragment, derived live.
+# ----------------------------------------------------------------------------
+
+# fz_syntax_fragment(tree, boot) -> the canonical JSON fragment for
+# the "syntax" key, or "!REFUSAL!..."/"!PROBE!..." on failure (the
+# caller turns those into named refusals).
+fn fz_syntax_fragment(tree: str, boot: str) -> str uses Fs, Proc,
+Clock {
+    let types_src: str = fz_read_tree(tree, "src/hlc/types.hls")
+    if types_src == "" {
+        return "!REFUSAL!the self-hosted compiler is missing: "
+        + "src/hlc/types.hls"
+    }
+    let keywords: list[str] = fz_fn_chain_words(types_src, "is_keyword",
+    "lower")
+    if keywords.len() == 0 {
+        return "!REFUSAL!the is_keyword chain in src/hlc/types.hls "
+        + "parsed to an empty keyword set — the derivation is broken"
+    }
+    # the two-front-end law: the formatter's chain must equal the
+    # compiler's.
+    let fmt_src: str = fz_read_tree(tree, "tools/hlfmt.hls")
+    if fmt_src == "" {
+        return "!REFUSAL!the formatter is missing: tools/hlfmt.hls — "
+        + "the second front-end the agreement law reads"
+    }
+    let fmt_kw: list[str] = fz_fn_chain_words(fmt_src, "is_keyword",
+    "lower")
+    if fmt_kw.len() == 0 {
+        return "!REFUSAL!the is_keyword chain in tools/hlfmt.hls "
+        + "parsed to an empty keyword set — the derivation is broken"
+    }
+    if fz_strs_ne(fmt_kw, keywords) {
+        return "!REFUSAL!the two front-ends disagree about the "
+        + "keywords: src/hlc/types.hls has [" + str_join(keywords, ", ")
+        + "], tools/hlfmt.hls has [" + str_join(fmt_kw, ", ")
+        + "] — a language whose front-ends disagree has no surface "
+        + "to freeze"
+    }
+    # the reserved identifiers: the parser's own reserved check
+    let parser_src: str = fz_read_tree(tree, "src/hlc/parser.hls")
+    if parser_src == "" {
+        return "!REFUSAL!the self-hosted parser is missing: "
+        + "src/hlc/parser.hls"
+    }
+    let reserved: list[str] = fz_reserved_ids(parser_src)
+    if reserved.len() == 0 {
+        return "!REFUSAL!the reserved-identifier check in "
+        + "src/hlc/parser.hls could not be read — the derivation "
+        + "is broken"
+    }
+    # the token vocabularies: the lexer's own chains
+    let lexer_src: str = fz_read_tree(tree, "src/hlc/lexer.hls")
+    if lexer_src == "" {
+        return "!REFUSAL!the self-hosted lexer is missing: "
+        + "src/hlc/lexer.hls"
+    }
+    let two: list[str] = fz_two_char(lexer_src)
+    let one: list[str] = fz_one_char(lexer_src)
+    if two.len() == 0 || one.len() == 0 {
+        return "!REFUSAL!the token vocabularies in src/hlc/lexer.hls "
+        + "could not be read — the derivation is broken"
+    }
+    let effects: list[str] = fz_fn_chain_words(types_src,
+    "is_effect_name", "upper")
+    if effects.len() == 0 {
+        return "!REFUSAL!the is_effect_name chain in src/hlc/types.hls "
+        + "parsed to an empty effect set — the derivation is broken"
+    }
+    let crate_attrs: list[str] = fz_crate_attrs(parser_src)
+    if crate_attrs.len() == 0 {
+        return "!REFUSAL!the crate-attribute vocabulary in "
+        + "src/hlc/parser.hls could not be read — the derivation "
+        + "is broken"
+    }
+    let builtins: list[str] = fz_builtin_fns(tree)
+    if builtins.len() == 0 {
+        return "!REFUSAL!the builtin-fn chain in src/hlc/checker.hls "
+        + "could not be read — the derivation is broken"
+    }
+    # the attribute census: the parser's own words, live
+    let census: FzCensus = fz_attr_census(boot, 99)
+    if census.names.len() == 0 {
+        return census.raw
+    }
+    # the method tables: every receiver in canonical (sorted) order —
+    # bool, chan, float, int, list, map, str, task — primitives from
+    # the checker's dispatch, containers through the probes
+    let recvs: list[str] = ["bool", "chan", "float", "int", "list",
+    "map", "str", "task"]
+    let frags: list[str] = []
+    let mut r: int = 0
+    while r < recvs.len() {
+        let recv: str = recvs.get(r)
+        let mut frag: str = ""
+        if recv == "bool" || recv == "float" || recv == "int"
+        || recv == "str" {
+            frag = fz_prim_methods_fragment(tree, recv)
+        } else {
+            frag = fz_container_methods_fragment(boot, recv)
+        }
+        if frag.starts_with("!") {
+            return frag
+        }
+        frags.push(fz_jstr(recv) + ":{" + frag + "}")
+        r = r + 1
+    }
+    let mut methods_j: str = ""
+    let mut ri: int = 0
+    while ri < frags.len() {
+        if ri > 0 {
+            methods_j = methods_j + ","
+        }
+        methods_j = methods_j + frags.get(ri)
+        ri = ri + 1
+    }
+    # the canonical fragment — keys in sorted order:
+    # builtin_fns, builtin_methods, crate_attrs, effects,
+    # fn_attr_census_raw, fn_attrs, keywords, probe_law,
+    # reserved_identifiers, selfhost_keyword_agreement,
+    # tokens_one_char, tokens_two_char
+    return "{\"builtin_fns\":[" + fz_join_q(builtins)
+    + "],\"builtin_methods\":{" + methods_j
+    + "},\"crate_attrs\":[" + fz_join_q(crate_attrs)
+    + "],\"effects\":[" + fz_join_q(effects)
+    + "],\"fn_attr_census_raw\":" + fz_jstr(census.raw)
+    + ",\"fn_attrs\":[" + fz_join_q(census.names)
+    + "],\"keywords\":[" + fz_join_q(keywords)
+    + "],\"probe_law\":true,\"reserved_identifiers\":["
+    + fz_join_q(reserved)
+    + "],\"selfhost_keyword_agreement\":true,\"tokens_one_char\":["
+    + fz_join_q(one) + "],\"tokens_two_char\":["
+    + fz_join_q(two) + "]}"
+}
+
+fn fz_strs_ne(a: list[str], b: list[str]) -> bool {
+    if a.len() != b.len() {
+        return true
+    }
+    let mut i: int = 0
+    while i < a.len() {
+        if a.get(i) != b.get(i) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# fz_reserved_ids — the `t.value == "..."` words in the parser's
+# reserved-identifier check (the lines above the diagnostic).
+fn fz_reserved_ids(parser_src: str) -> list[str] {
+    let lines: list[str] = parser_src.split("\n")
+    let mut at: int = -1
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).contains("is a reserved identifier") {
+            at = i
+        }
+        i = i + 1
+    }
+    if at < 0 {
+        return[]
+    }
+    let words: list[str] = []
+    # the condition sits on the line(s) immediately above; scan back
+    # up to 3 lines for t.value == "..." occurrences.
+    let mut j: int = at - 1
+    let mut steps: int = 0
+    while j >= 0 && steps < 3 {
+        let l: str = lines.get(j)
+        let mut k: int = 0
+        while k < l.len() {
+            if l.slice(k, l.len()).starts_with("t.value == \"") {
+                let rest: str = l.slice(k + 12, l.len())
+                let q: int = rest.find("\"")
+                if q > 0 {
+                    if !fz_list_has(words, rest.slice(0, q)) {
+                        words.push(rest.slice(0, q))
+                    }
+                }
+            }
+            k = k + 1
+        }
+        if l.trim().starts_with("if t.value") {
+            break
+        }
+        j = j - 1
+        steps = steps + 1
+    }
+    return fz_sorted(words)
+}
+
+# fz_two_char — the `two == "XX"` chain in the lexer's operator case.
+fn fz_two_char(lexer_src: str) -> list[str] {
+    let lines: list[str] = lexer_src.split("\n")
+    let line: str = fz_line_with(lines, "two == \"->\"")
+    if line == "" {
+        return[]
+    }
+    let words: list[str] = fz_quoted_on_line(line, "two")
+    return fz_sorted(words)
+}
+
+# fz_one_char — the `c == N` byte-code chain, rendered as characters.
+fn fz_one_char(lexer_src: str) -> list[str] {
+    let lines: list[str] = lexer_src.split("\n")
+    let line: str = fz_line_with(lines, "c == 40")
+    if line == "" {
+        return[]
+    }
+    let chars: list[str] = []
+    let mut i: int = 0
+    let n: int = line.len()
+    while i < n {
+        if line.slice(i, n).starts_with("c == ") {
+            let mut j: int = i + 5
+            let mut num: str = ""
+            while j < n && line.byte_at(j) >= 48 && line.byte_at(j) <= 57 {
+                num = num + line.slice(j, j + 1)
+                j = j + 1
+            }
+            if num != "" {
+                chars.push(chr(num.to_int()))
+            }
+            i = j
+            continue
+        }
+        i = i + 1
+    }
+    return fz_sorted(chars)
+}
+
+# fz_crate_attrs — the `name != "..."` chain above the parser's
+# unknown-crate-attribute diagnostic.
+fn fz_crate_attrs(parser_src: str) -> list[str] {
+    let lines: list[str] = parser_src.split("\n")
+    let mut at: int = -1
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).contains("unknown crate attribute") {
+            at = i
+        }
+        i = i + 1
+    }
+    if at < 0 {
+        return[]
+    }
+    let words: list[str] = []
+    # the condition is on the line above the diagnostic
+    let mut j: int = at - 1
+    let mut steps: int = 0
+    while j >= 0 && steps < 3 {
+        let l: str = lines.get(j)
+        let mut k: int = 0
+        while k < l.len() {
+            if l.slice(k, l.len()).starts_with("name != \"") {
+                let rest: str = l.slice(k + 9, l.len())
+                let q: int = rest.find("\"")
+                if q > 0 {
+                    if !fz_list_has(words, rest.slice(0, q)) {
+                        words.push(rest.slice(0, q))
+                    }
+                }
+            }
+            k = k + 1
+        }
+        if l.trim().starts_with("if name !=") {
+            break
+        }
+        j = j - 1
+        steps = steps + 1
+    }
+    return fz_sorted(words)
+}
+
+# fz_builtin_fns — the is_builtin_fn chain out of the tree's checker.
+fn fz_builtin_fns(tree: str) -> list[str] uses Fs {
+    let chk: str = fz_read_tree(tree, "src/hlc/checker.hls")
+    if chk == "" {
+        return[]
+    }
+    return fz_fn_chain_words(chk, "is_builtin_fn", "lower")
+}
+# ============================================================================
+# PART 3 — the stdlib census, the surface, the freeze IO, the diff
+# (appended; concatenated into tools/hls-freeze.hls)
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# The stdlib surface — every public item of every module under std/
+# and core/, parsed with the real parser (the compiler itself,
+# linked through hlfront). Line numbers are NOT part of the surface.
+# ----------------------------------------------------------------------------
+
+fn fz_d_fn() -> FnInfo {
+    let no_body: list[int] = []
+    return FnInfo {
+        name: "", params: [], ptypes: [], pmuts: [], ret: "", effects: [],
+        is_pure: false, body: no_body, is_method: false, struct_of: "",
+        typeparams: [], line: 0, is_extern: false,
+        requires_e: -1, ensures_e: -1,
+        attr_stack_size: -1, attr_no_red_zone: false,
+        attr_irq_handler: false, attr_irq_vector: -1,
+        attr_inline: "", attr_hot: false, attr_cold: false,
+        attr_tail_call: false, attr_panic_handler: false,
+        attr_section: "", attr_align: -1, src_file: "",
+        param_preds: map_new(), ret_pred: "", has_refinements: false,
+        attr_secrets: "", attr_ct: false, attr_deprecated: false,
+        attr_deprecated_msg: "", attr_taint_source: false,
+        attr_taint_sinks: ""
+    }
+}
+
+# fz_expr_text — the deterministic text form of a contract expression
+# (requires / ensures).
+fn fz_expr_text(ctx: Ctx, e: int) -> str {
+    let n: ExprN = ctx.exprs.get(e)
+    if n.kind == "bin" {
+        return "(" + fz_expr_text(ctx, n.left) + " " + n.op + " "
+        + fz_expr_text(ctx, n.right) + ")"
+    }
+    if n.kind == "un" {
+        return n.op + "(" + fz_expr_text(ctx, n.left) + ")"
+    }
+    if n.kind == "ident" {
+        return n.name
+    }
+    if n.kind == "int" {
+        return n.ival.to_str()
+    }
+    if n.kind == "float" {
+        return fz_canon_float(n.fval)
+    }
+    if n.kind == "str" {
+        return fz_jstr(n.sval)
+    }
+    if n.kind == "bool" {
+        if n.bval {
+            return "true"
+        }
+        return "false"
+    }
+    if n.kind == "call" {
+        let args: list[str] = []
+        let mut i: int = 0
+        while i < n.args.len() {
+            args.push(fz_expr_text(ctx, n.args.get(i)))
+            i = i + 1
+        }
+        return n.name + "(" + str_join(args, ", ") + ")"
+    }
+    if n.kind == "fieldcall" {
+        let args2: list[str] = []
+        let mut k: int = 0
+        while k < n.args.len() {
+            args2.push(fz_expr_text(ctx, n.args.get(k)))
+            k = k + 1
+        }
+        return fz_expr_text(ctx, n.left) + "." + n.name + "("
+        + str_join(args2, ", ") + ")"
+    }
+    if n.kind == "field" {
+        return fz_expr_text(ctx, n.left) + "." + n.name
+    }
+    if n.kind == "index" {
+        return fz_expr_text(ctx, n.left) + "["
+        + fz_expr_text(ctx, n.right) + "]"
+    }
+    if n.kind == "qmark" {
+        return fz_expr_text(ctx, n.left) + "?"
+    }
+    return "ast:" + n.kind
+}
+
+# fz_fn_rec — one fn record, canonical (keys sorted: deprecated,
+# effects, extern, generic, params, pure, ret, requires, ensures,
+# taint_sinks, taint_source).
+fn fz_fn_rec(ctx: Ctx, key: str) -> str {
+    let f: FnInfo = ctx.fns.get_or(key, fz_d_fn())
+    let mut ps: str = ""
+    let mut i: int = 0
+    while i < f.params.len() {
+        if i > 0 {
+            ps = ps + ","
+        }
+        ps = ps + "[\"" + f.params.get(i) + "\",\"" + f.ptypes.get(i)
+        + "\"," + (f.pmuts.get(i) == true).to_str() + "]"
+        i = i + 1
+    }
+    let mut out: str = "{"
+    if f.attr_deprecated {
+        out = out + "\"deprecated\":" + fz_jstr(f.attr_deprecated_msg)
+        + ","
+    }
+    out = out + "\"effects\":[" + fz_join_q(fz_sorted(f.effects)) + "]"
+    out = out + ",\"extern\":" + f.is_extern.to_str()
+    out = out + ",\"generic\":[" + fz_join_q(f.typeparams) + "]"
+    out = out + ",\"params\":[" + ps + "]"
+    out = out + ",\"pure\":" + f.is_pure.to_str()
+    out = out + ",\"ret\":" + fz_jstr(f.ret)
+    if f.requires_e >= 0 {
+        out = out + ",\"requires\":"
+        + fz_jstr(fz_expr_text(ctx, f.requires_e))
+    }
+    if f.ensures_e >= 0 {
+        out = out + ",\"ensures\":"
+        + fz_jstr(fz_expr_text(ctx, f.ensures_e))
+    }
+    if f.attr_taint_source {
+        out = out + ",\"taint_source\":true"
+    }
+    if f.attr_taint_sinks != "" {
+        let sinks: list[str] = fz_sorted(f.attr_taint_sinks.split(","))
+        out = out + ",\"taint_sinks\":[" + fz_join_q(sinks) + "]"
+    }
+    return out + "}"
+}
+
+# fz_module_record — one module's census, canonical (enums, fns,
+# imports, structs — sorted keys).
+fn fz_module_record(path: str) -> str uses IO {
+    let ctx: Ctx = hl_parse_file(path)
+    let fkeys: list[str] = fz_sorted(ctx.fn_order)
+    let mut fns_j: str = ""
+    let mut i: int = 0
+    while i < fkeys.len() {
+        if i > 0 {
+            fns_j = fns_j + ","
+        }
+        fns_j = fns_j + fz_jstr(fkeys.get(i)) + ":"
+        + fz_fn_rec(ctx, fkeys.get(i))
+        i = i + 1
+    }
+    let skeys: list[str] = fz_sorted(ctx.structs.keys())
+    let mut structs_j: str = ""
+    let mut j: int = 0
+    while j < skeys.len() {
+        let s: StructInfo = ctx.structs.get_or(skeys.get(j), StructInfo {
+            name: "", fields: [], ftypes: [], fdefaults: [],
+            typeparams: [], line: 0, field_preds: map_new()
+        })
+        let mut fields: str = ""
+        let mut k: int = 0
+        while k < s.fields.len() {
+            if k > 0 {
+                fields = fields + ","
+            }
+            let mut dfl: str = "false"
+            if s.fdefaults.get(k) >= 0 {
+                dfl = "true"
+            }
+            fields = fields + "[\"" + s.fields.get(k) + "\",\""
+            + s.ftypes.get(k) + "\"," + dfl + "]"
+            k = k + 1
+        }
+        if j > 0 {
+            structs_j = structs_j + ","
+        }
+        structs_j = structs_j + fz_jstr(skeys.get(j))
+        + ":{\"fields\":[" + fields + "],\"generic\":["
+        + fz_join_q(s.typeparams) + "]}"
+        j = j + 1
+    }
+    let ekeys: list[str] = fz_sorted(ctx.enums.keys())
+    let mut enums_j: str = ""
+    let mut m: int = 0
+    while m < ekeys.len() {
+        let e: EnumInfo = ctx.enums.get_or(ekeys.get(m), EnumInfo {
+            name: "", variants: [], payloads: [], typeparams: [],
+            line: 0
+        })
+        let mut vs: str = ""
+        let mut n: int = 0
+        while n < e.variants.len() {
+            if n > 0 {
+                vs = vs + ","
+            }
+            vs = vs + "[\"" + e.variants.get(n) + "\",["
+            + fz_join_q(e.payloads.get(n)) + "]]"
+            n = n + 1
+        }
+        if m > 0 {
+            enums_j = enums_j + ","
+        }
+        enums_j = enums_j + fz_jstr(ekeys.get(m))
+        + ":{\"generic\":[" + fz_join_q(e.typeparams)
+        + "],\"variants\":[" + vs + "]}"
+        m = m + 1
+    }
+    let imps: list[str] = fz_sorted(ctx.imports)
+    return "{\"enums\":{" + enums_j + "},\"fns\":{" + fns_j
+    + "},\"imports\":[" + fz_join_q(imps) + "],\"structs\":{"
+    + structs_j + "}}"
+}
+
+# fz_module_files — every module file under std/ and core/, sorted by
+# module id (the .py's os.walk with sorted names; order-independent
+# because the census sorts).
+struct FzModule {
+    id: str,
+    path: str
+}
+
+fn fz_module_files(tree: str) -> list[FzModule] uses Fs {
+    let out: list[FzModule] = []
+    let fams: list[str] = ["core", "std"]
+    let mut missing: str = ""
+    let mut f: int = 0
+    while f < fams.len() {
+        let fam: str = fams.get(f)
+        let base: str = fz_join(tree, fam)
+        if !fz_is_dir(base) {
+            missing = fam
+        }
+        fz_walk_modules(base, fam, out)
+        f = f + 1
+    }
+    if missing != "" {
+        let empty: list[FzModule] = []
+        return empty
+    }
+    let mut a: int = 1
+    while a < out.len() {
+        let v: FzModule = out.get(a)
+        let mut b: int = a - 1
+        while b >= 0 && fz_str_lt(v.id, out.get(b).id) {
+            out.set(b + 1, out.get(b))
+            b = b - 1
+        }
+        out.set(b + 1, v)
+        a = a + 1
+    }
+    return out
+}
+
+fn fz_walk_modules(dir: str, prefix: str, out: list[FzModule]) -> void
+uses Fs {
+    let names: list[str] = fz_sorted(fs_read_dir(dir))
+    let mut i: int = 0
+    while i < names.len() {
+        let nm: str = names.get(i)
+        if nm == "." || nm == ".." {
+            i = i + 1
+            continue
+        }
+        let full: str = fz_join(dir, nm)
+        if fz_is_dir(full) {
+            fz_walk_modules(full, prefix + "." + nm, out)
+        } else {
+            if nm.ends_with(".hls") {
+                out.push(FzModule {
+                    id: prefix + "."
+                    + nm.slice(0, nm.len() - 4), path: full
+                })
+            }
+        }
+        i = i + 1
+    }
+}
+
+# fz_parse_json — a parse that yields null on failure (callers pass
+# strings they just built canonically).
+fn fz_parse_json(text: str) -> JsonValue {
+    let rr: Result[JsonValue, str] = json_parse_result(text)
+    if result_is_ok(rr) {
+        return result_unwrap(rr)
+    }
+    return json_null()
+}
+
+# ----------------------------------------------------------------------------
+# The surface, the counts.
+# ----------------------------------------------------------------------------
+
+# fz_derive — the whole live surface as canonical JSON, or
+# "!REFUSAL!..."/"!PROBE!..." on failure.
+fn fz_derive(tree: str, boot: str) -> str uses IO, Fs, Proc, Clock {
+    let syn: str = fz_syntax_fragment(tree, boot)
+    if syn.starts_with("!") {
+        return syn
+    }
+    let mods: list[FzModule] = fz_module_files(tree)
+    if mods.len() == 0 {
+        return "!REFUSAL!the std/ family is missing under " + tree
+        + " — the stdlib surface can only be frozen from a tree "
+        + "that carries its modules"
+    }
+    let mut std_j: str = "{"
+    let mut i: int = 0
+    while i < mods.len() {
+        if i > 0 {
+            std_j = std_j + ","
+        }
+        std_j = std_j + fz_jstr(mods.get(i).id) + ":"
+        + fz_module_record(mods.get(i).path)
+        i = i + 1
+    }
+    std_j = std_j + "}"
+    return "{\"stdlib\":" + std_j + ",\"syntax\":" + syn + "}"
+}
+
+# fz_counts — the census counts off the parsed surface (the .py's
+# counts_of, verbatim keys).
+struct FzCounts {
+    keywords: int,
+    reserved_identifiers: int,
+    tokens: int,
+    effects: int,
+    crate_attrs: int,
+    fn_attrs: int,
+    builtin_fns: int,
+    builtin_methods: int,
+    modules: int,
+    stdlib_fns: int,
+    stdlib_structs: int,
+    stdlib_enums: int,
+    import_edges: int
+}
+
+fn fz_jstr_of(v: JsonValue, key: str) -> str {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_str(x) {
+        return json_str_value(x)
+    }
+    return ""
+}
+
+fn fz_jarr_of(v: JsonValue, key: str) -> list[JsonValue] {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_array(x) {
+        return x.arr
+    }
+    let empty: list[JsonValue] = []
+    return empty
+}
+
+fn fz_obj_len(v: JsonValue) -> int {
+    if json_is_object(v) {
+        return v.obj_keys.len()
+    }
+    return 0
+}
+
+fn fz_obj_get(v: JsonValue, key: str) -> JsonValue {
+    let x: JsonValue = json_object_get(v, key)
+    return x
+}
+
+fn fz_counts_of(surface: JsonValue) -> FzCounts {
+    let syn: JsonValue = json_object_get(surface, "syntax")
+    let std: JsonValue = json_object_get(surface, "stdlib")
+    let c: FzCounts = FzCounts {
+        keywords: fz_jarr_of(syn, "keywords").len(),
+        reserved_identifiers:
+        fz_jarr_of(syn, "reserved_identifiers").len(),
+        tokens: fz_jarr_of(syn, "tokens_two_char").len()
+        + fz_jarr_of(syn, "tokens_one_char").len(),
+        effects: fz_jarr_of(syn, "effects").len(),
+        crate_attrs: fz_jarr_of(syn, "crate_attrs").len(),
+        fn_attrs: fz_jarr_of(syn, "fn_attrs").len(),
+        builtin_fns: fz_jarr_of(syn, "builtin_fns").len(),
+        builtin_methods: 0,
+        modules: std.obj_keys.len(),
+        stdlib_fns: 0,
+        stdlib_structs: 0,
+        stdlib_enums: 0,
+        import_edges: 0
+    }
+    let methods: JsonValue = json_object_get(syn, "builtin_methods")
+    let mut mi: int = 0
+    while mi < methods.obj_keys.len() {
+        let tbl: JsonValue = methods.obj_vals.get(mi)
+        c.builtin_methods = c.builtin_methods + tbl.obj_keys.len()
+        mi = mi + 1
+    }
+    let mut si: int = 0
+    while si < std.obj_keys.len() {
+        let mod: JsonValue = std.obj_vals.get(si)
+        c.stdlib_fns = c.stdlib_fns
+        + fz_obj_len(fz_obj_get(mod, "fns"))
+        c.stdlib_structs = c.stdlib_structs
+        + fz_obj_len(fz_obj_get(mod, "structs"))
+        c.stdlib_enums = c.stdlib_enums
+        + fz_obj_len(fz_obj_get(mod, "enums"))
+        c.import_edges = c.import_edges
+        + fz_jarr_of(mod, "imports").len()
+        si = si + 1
+    }
+    return c
+}
+
+# ----------------------------------------------------------------------------
+# Freeze IO, the chain files.
+# ----------------------------------------------------------------------------
+
+fn fz_freeze_path(tree: str) -> str {
+    return fz_join(tree, fz_freeze_rel())
+}
+
+fn fz_chain_path(tree: str) -> str {
+    return fz_join(tree, fz_chain_rel())
+}
+
+# FzDoc — a loaded document or its refusal (err != "" means the doc
+# is unusable; err prefixed "!REFUSAL!").
+struct FzDoc {
+    doc: JsonValue,
+    err: str
+}
+
+fn fz_load_freeze(tree: str) -> FzDoc uses Fs {
+    let p: str = fz_freeze_path(tree)
+    if !file_exists(p) {
+        return FzDoc {
+            doc: json_null(), err: "!REFUSAL!no freeze "
+            + "exists (" + fz_freeze_rel() + ") — the surface cannot "
+            + "be verified against a document that was never written; "
+            + "run snapshot first"
+        }
+    }
+    let text: str = read_file(p)
+    let rr: Result[JsonValue, str] = json_parse_result(text)
+    if result_is_err(rr) {
+        return FzDoc {
+            doc: json_null(), err: "!REFUSAL!the freeze "
+            + "document is not valid JSON — a frozen document that "
+            + "cannot be read is not frozen, it is lost"
+        }
+    }
+    let doc: JsonValue = result_unwrap(rr)
+    let sv: JsonValue = json_object_get(doc, "surface_version")
+    if !json_is_int(sv) || json_int_value(sv) != fz_surface_version() {
+        let mut shown: str = "?"
+        if json_is_int(sv) {
+            shown = json_int_value(sv).to_str()
+        }
+        return FzDoc {
+            doc: json_null(), err: "!REFUSAL!the freeze "
+            + "document carries surface version " + shown + ", this "
+            + "tool speaks version "
+            + fz_surface_version().to_str()
+        }
+    }
+    let surf: JsonValue = json_object_get(doc, "surface")
+    let dig: JsonValue = json_object_get(doc, "digest")
+    if !json_is_object(surf) || !json_is_str(dig) {
+        return FzDoc {
+            doc: json_null(), err: "!REFUSAL!the freeze "
+            + "document is missing its surface or its digest — it "
+            + "disagrees with itself by construction"
+        }
+    }
+    return FzDoc {
+        doc: doc, err: ""
+    }
+}
+
+# fz_check_self — the document must agree with ITSELF: the digest is
+# the sha256 of the canonical surface it carries.
+fn fz_check_self(doc: JsonValue) -> str {
+    let want: str = fz_digest_of_v(json_object_get(doc, "surface"))
+    let have: str = fz_jstr_of(doc, "digest")
+    if have != want {
+        return "!REFUSAL!the freeze document disagrees with itself: "
+        + "the recorded digest is " + have + ", the surface it "
+        + "carries hashes to " + want + " — the document was "
+        + "hand-edited or corrupted"
+    }
+    return ""
+}
+
+# fz_load_chain — the jsonl records, naming a broken line.
+fn fz_load_chain(tree: str) -> FzDoc uses Fs {
+    let p: str = fz_chain_path(tree)
+    if !file_exists(p) {
+        let empty: JsonValue = json_array([])
+        return FzDoc {
+            doc: empty, err: ""
+        }
+    }
+    let text: str = read_file(p)
+    let lines: list[str] = text.split("\n")
+    let recs: list[JsonValue] = []
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i).trim()
+        if line == "" {
+            i = i + 1
+            continue
+        }
+        let rr: Result[JsonValue, str] = json_parse_result(line)
+        if result_is_err(rr) {
+            return FzDoc {
+                doc: json_null(), err: "!REFUSAL!the "
+                + "amendment chain is not valid JSON at line "
+                + (i + 1).to_str() + " — a chain that cannot be "
+                + "replayed proves nothing"
+            }
+        }
+        recs.push(result_unwrap(rr))
+        i = i + 1
+    }
+    return FzDoc {
+        doc: json_array(recs), err: ""
+    }
+}
+
+# fz_verify_chain_records — the replay; [err, head, records-json] with
+# err prefixed "!REFUSAL!" when broken.
+fn fz_verify_chain_records(tree: str) -> list[str] uses Fs {
+    let lc: FzDoc = fz_load_chain(tree)
+    if lc.err != "" {
+        return[lc.err, "", ""]
+    }
+    let recs: list[JsonValue] = lc.doc.arr
+    let breaks_list: list[str] = fz_verify_chain(recs, fz_chain_rel())
+    let head: str = fz_chain_head(recs)
+    if breaks_list.len() > 0 {
+        return["!REFUSAL!the amendment chain is BROKEN at "
+        + fz_chain_break_where(breaks_list) + ": "
+        + fz_chain_break_msg(breaks_list) + " — a tampered chain is "
+        + "evidence, not a document, and nothing proceeds from it ("
+        + breaks_list.len().to_str() + " break(s) total)", head,
+        fz_canon_v(lc.doc)]
+    }
+    return["", head, fz_canon_v(lc.doc)]
+}
+
+fn fz_chain_break_where(replay: list[str]) -> str {
+    let first: str = replay.get(1)
+    let at: int = first.find(" :: ")
+    if at > 0 {
+        return first.slice(0, at)
+    }
+    return first
+}
+
+fn fz_chain_break_msg(replay: list[str]) -> str {
+    let first: str = replay.get(1)
+    let at: int = first.find(" :: ")
+    if at > 0 {
+        return first.slice(at + 4, first.len())
+    }
+    return first
+}
+
+# ----------------------------------------------------------------------------
+# The drift classification — closed, path-addressed. REMOVED (in the
+# freeze, gone from the tree), ADDED (in the tree, absent from the
+# freeze), CHANGED (present in both, different) — each named at its
+# dotted path.
+# ----------------------------------------------------------------------------
+
+struct FzDriftSet {
+    removed: list[str],
+    added: list[str],
+    changed: list[str]
+}
+
+fn fz_new_drift() -> FzDriftSet {
+    let r: list[str] = []
+    let a: list[str] = []
+    let c: list[str] = []
+    return FzDriftSet {
+        removed: r, added: a, changed: c
+    }
+}
+
+# fz_diff_surface — compare two parsed surfaces into the three
+# path lists (changed entries carry "path : old -> new" with the
+# canonical values, 60-char clipped by the line renderer).
+fn fz_diff_surface(frozen: JsonValue, live: JsonValue) -> FzDriftSet {
+    let d: FzDriftSet = fz_new_drift()
+    fz_walk_diff(frozen, live, "", d)
+    return d
+}
+
+fn fz_join_path(prefix: str, seg: str) -> str {
+    if prefix == "" {
+        return seg
+    }
+    return prefix + "." + seg
+}
+
+fn fz_walk_diff(a: JsonValue, b: JsonValue, path: str, d: FzDriftSet)
+-> void {
+    if json_is_object(a) && json_is_object(b) {
+        let ak: list[str] = fz_sorted(a.obj_keys)
+        let bk: list[str] = fz_sorted(b.obj_keys)
+        let mut i: int = 0
+        while i < ak.len() {
+            if !fz_list_has(bk, ak.get(i)) {
+                d.removed.push(fz_join_path(path, ak.get(i)))
+            }
+            i = i + 1
+        }
+        let mut j: int = 0
+        while j < bk.len() {
+            if !fz_list_has(ak, bk.get(j)) {
+                d.added.push(fz_join_path(path, bk.get(j)))
+            }
+            j = j + 1
+        }
+        let mut k: int = 0
+        while k < ak.len() {
+            if fz_list_has(bk, ak.get(k)) {
+                fz_walk_diff(fz_obj_get(a, ak.get(k)),
+                fz_obj_get(b, ak.get(k)),
+                fz_join_path(path, ak.get(k)), d)
+            }
+            k = k + 1
+        }
+        return
+    }
+    if fz_canon_v(a) != fz_canon_v(b) {
+        # a scalar or list leaf that differs: one CHANGED row. "<surface>"
+        # names the whole-document case (never reached through the
+        # object walk, kept for the .py's shape).
+        let mut at: str = path
+        if at == "" {
+            at = "<surface>"
+        }
+        d.changed.push(at + " : " + fz_clip60(fz_canon_v(a)) + " -> "
+        + fz_clip60(fz_canon_v(b)))
+    }
+}
+
+fn fz_clip60(s: str) -> str {
+    if s.len() > 60 {
+        return s.slice(0, 57) + "..."
+    }
+    return s
+}
+
+# fz_drift_count — the total drift points.
+fn fz_drift_count(d: FzDriftSet) -> int {
+    return d.removed.len() + d.added.len() + d.changed.len()
+}
+
+# fz_drift_lines — the report lines, capped.
+fn fz_drift_lines(d: FzDriftSet, cap: int) -> list[str] {
+    let lines: list[str] = []
+    let mut i: int = 0
+    while i < d.removed.len() {
+        lines.push("REMOVED   " + d.removed.get(i))
+        i = i + 1
+    }
+    let mut j: int = 0
+    while j < d.added.len() {
+        lines.push("ADDED     " + d.added.get(j))
+        j = j + 1
+    }
+    let mut k: int = 0
+    while k < d.changed.len() {
+        lines.push("CHANGED   " + d.changed.get(k))
+        k = k + 1
+    }
+    if lines.len() > cap {
+        let kept: list[str] = []
+        let mut m: int = 0
+        while m < cap {
+            kept.push(lines.get(m))
+            m = m + 1
+        }
+        kept.push("... and " + (lines.len() - cap).to_str() + " more")
+        return kept
+    }
+    return lines
+}
+
+# fz_drift_json — the --json delta object ({"added": [...],
+# "changed": [...], "removed": [...]}).
+fn fz_drift_json(d: FzDriftSet) -> str {
+    return "{\"added\":[" + fz_join_q(d.added) + "],\"changed\":["
+    + fz_join_q_strs(d.changed) + "],\"removed\":["
+    + fz_join_q(d.removed) + "]}"
+}
+
+fn fz_join_q_strs(xs: list[str]) -> str {
+    # changed lines are already "path : old -> new" strings; the
+    # delta records the PATHS only (the .py's delta: paths).
+    let paths: list[str] = []
+    let mut i: int = 0
+    while i < xs.len() {
+        let l: str = xs.get(i)
+        let at: int = l.find(" : ")
+        if at > 0 {
+            paths.push(l.slice(0, at))
+        } else {
+            paths.push(l)
+        }
+        i = i + 1
+    }
+    return fz_join_q(paths)
+}
+# ============================================================================
+# PART 4 — verify_full, the commands, the report, the CLI (appended;
+# concatenated into tools/hls-freeze.hls)
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# verify_full — the whole contract: self-consistency, chain integrity,
+# and the world.
+# ----------------------------------------------------------------------------
+
+struct FzFull {
+    err: str,
+    doc: JsonValue,
+    counts: FzCounts,
+    drift: FzDriftSet
+}
+
+fn fz_zero_counts() -> FzCounts {
+    return FzCounts {
+        keywords: 0, reserved_identifiers: 0, tokens: 0,
+        effects: 0, crate_attrs: 0, fn_attrs: 0, builtin_fns: 0,
+        builtin_methods: 0, modules: 0, stdlib_fns: 0, stdlib_structs: 0,
+        stdlib_enums: 0, import_edges: 0
+    }
+}
+
+fn fz_verify_full(tree: str, boot: str) -> FzFull
+uses IO, Fs, Proc, Clock {
+    let lf: FzDoc = fz_load_freeze(tree)
+    if lf.err != "" {
+        return FzFull {
+            err: lf.err, doc: json_null(),
+            counts: fz_zero_counts(), drift: fz_new_drift()
+        }
+    }
+    let self_err: str = fz_check_self(lf.doc)
+    if self_err != "" {
+        return FzFull {
+            err: self_err, doc: json_null(),
+            counts: fz_zero_counts(), drift: fz_new_drift()
+        }
+    }
+    let chain: list[str] = fz_verify_chain_records(tree)
+    if chain.get(0) != "" {
+        return FzFull {
+            err: chain.get(0), doc: json_null(),
+            counts: fz_zero_counts(), drift: fz_new_drift()
+        }
+    }
+    let live_s: str = fz_derive(tree, boot)
+    if live_s.starts_with("!") {
+        return FzFull {
+            err: live_s, doc: json_null(),
+            counts: fz_zero_counts(), drift: fz_new_drift()
+        }
+    }
+    let frozen: JsonValue = json_object_get(lf.doc, "surface")
+    let live: JsonValue = fz_parse_json(live_s)
+    let drift: FzDriftSet = fz_diff_surface(frozen, live)
+    return FzFull {
+        err: "", doc: lf.doc,
+        counts: fz_counts_of(frozen), drift: drift
+    }
+}
+
+# ----------------------------------------------------------------------------
+# git, stamping.
+# ----------------------------------------------------------------------------
+
+fn fz_git_commit(tree: str) -> str uses Proc {
+    let r: FzRun = fz_run_at("git", ["rev-parse", "HEAD"])
+    if r.code == 0 {
+        return r.out.trim()
+    }
+    return ""
+}
+
+# ----------------------------------------------------------------------------
+# The commands.
+# ----------------------------------------------------------------------------
+
+# fz_cmd_snapshot — freeze the live surface (once).
+fn fz_cmd_snapshot(tree: str, boot: str, as_json: bool) -> int
+uses IO, Fs, Proc, Clock {
+    let p: str = fz_freeze_path(tree)
+    if file_exists(p) {
+        eprint("REFUSED: a freeze already exists ("
+        + fz_freeze_rel() + ") — the freeze is created ONCE; the "
+        + "surface is changed through amend, never by "
+        + "re-snapshotting, or it freezes nothing\n")
+        return 1
+    }
+    if file_exists(fz_chain_path(tree)) {
+        eprint("REFUSED: an amendment chain already exists ("
+        + fz_chain_rel() + ") without a freeze beside it — that is "
+        + "a corrupted state no snapshot may paper over\n")
+        return 1
+    }
+    let surface_s: str = fz_derive(tree, boot)
+    if surface_s.starts_with("!") {
+        eprint("REFUSED: " + surface_s.slice(10, surface_s.len())
+        + "\n")
+        return 1
+    }
+    let surface: JsonValue = fz_parse_json(surface_s)
+    let counts: FzCounts = fz_counts_of(surface)
+    let digest: str = sha256_hex(surface_s)
+    let commit: str = fz_git_commit(tree)
+    # canonical doc — keys sorted: digest, frozen_commit, release,
+    # stage, surface, surface_version, tool
+    let doc_s: str = "{\"digest\":" + fz_jstr(digest)
+    + ",\"frozen_commit\":" + fz_jstr(commit)
+    + ",\"release\":" + fz_jstr(fz_version())
+    + ",\"stage\":" + fz_stage().to_str()
+    + ",\"surface\":" + surface_s
+    + ",\"surface_version\":" + fz_surface_version().to_str()
+    + ",\"tool\":\"hls-freeze\"}"
+    write_file(p, doc_s + "\n")
+    if as_json {
+        let cj: str = "{\"command\":\"snapshot\",\"counts\":"
+        + fz_counts_json(counts) + ",\"digest\":" + fz_jstr(digest)
+        + ",\"frozen_commit\":" + fz_jstr(commit) + ",\"ok\":true}"
+        println(fz_canon_v(fz_parse_json(cj)))
+    } else {
+        println("FROZEN: the API surface is locked under "
+        + fz_freeze_rel())
+        println("  digest        " + digest)
+        if commit == "" {
+            println("  frozen at     (no git)")
+        } else {
+            println("  frozen at     " + commit)
+        }
+        println("  keywords      " + counts.keywords.to_str()
+        + "   tokens " + counts.tokens.to_str() + "   effects "
+        + counts.effects.to_str())
+        println("  builtin fns   " + counts.builtin_fns.to_str()
+        + "   builtin methods "
+        + counts.builtin_methods.to_str())
+        println("  modules       " + counts.modules.to_str()
+        + "   fns " + counts.stdlib_fns.to_str() + "   structs "
+        + counts.stdlib_structs.to_str() + "   enums "
+        + counts.stdlib_enums.to_str())
+        println("The surface moves from here only through amend "
+        + "--reason.")
+    }
+    return 0
+}
+
+# fz_counts_json — the counts object, canonical.
+fn fz_counts_json(c: FzCounts) -> str {
+    return "{\"builtin_fns\":" + c.builtin_fns.to_str()
+    + ",\"builtin_methods\":" + c.builtin_methods.to_str()
+    + ",\"crate_attrs\":" + c.crate_attrs.to_str()
+    + ",\"effects\":" + c.effects.to_str()
+    + ",\"fn_attrs\":" + c.fn_attrs.to_str()
+    + ",\"import_edges\":" + c.import_edges.to_str()
+    + ",\"keywords\":" + c.keywords.to_str()
+    + ",\"modules\":" + c.modules.to_str()
+    + ",\"reserved_identifiers\":"
+    + c.reserved_identifiers.to_str()
+    + ",\"stdlib_enums\":" + c.stdlib_enums.to_str()
+    + ",\"stdlib_fns\":" + c.stdlib_fns.to_str()
+    + ",\"stdlib_structs\":" + c.stdlib_structs.to_str()
+    + ",\"tokens\":" + c.tokens.to_str() + "}"
+}
+
+# fz_cmd_verify — the anti-rot pass.
+fn fz_cmd_verify(tree: str, boot: str, as_json: bool, quiet: bool)
+-> int uses IO, Fs, Proc, Clock {
+    let full: FzFull = fz_verify_full(tree, boot)
+    if full.err != "" {
+        eprint("REFUSED: " + full.err.slice(10, full.err.len()) + "\n")
+        return 1
+    }
+    let n: int = fz_drift_count(full.drift)
+    if n > 0 {
+        if as_json {
+            let j: str = "{\"command\":\"verify\",\"digest\":"
+            + fz_jstr(fz_jstr_of(full.doc, "digest"))
+            + ",\"drift\":" + n.to_str() + ",\"ok\":false"
+            + ",\"verdict\":\"DRIFTED\""
+            + ",\"removed\":" + fz_join_q(full.drift.removed)
+            + ",\"added\":" + fz_join_q(full.drift.added)
+            + ",\"changed\":" + fz_join_q_strs(full.drift.changed)
+            + "}"
+            println(fz_canon_v(fz_parse_json(j)))
+        } else {
+            println("DRIFTED: the live surface disagrees with the "
+            + "freeze (" + n.to_str() + " drift point(s))")
+            let lines: list[str] = fz_drift_lines(full.drift, 40)
+            let mut i: int = 0
+            while i < lines.len() {
+                println("  " + lines.get(i))
+                i = i + 1
+            }
+            println("The API is frozen. The surface moves through "
+            + "amend --reason, or the drift is reverted.")
+        }
+        return 1
+    }
+    if as_json {
+        let j2: str = "{\"command\":\"verify\",\"counts\":"
+        + fz_counts_json(full.counts) + ",\"digest\":"
+        + fz_jstr(fz_jstr_of(full.doc, "digest"))
+        + ",\"ok\":true,\"verdict\":\"IDENTICAL\"}"
+        println(fz_canon_v(fz_parse_json(j2)))
+    } else {
+        if !quiet {
+            println("IDENTICAL: the live surface matches the freeze.")
+            println("  digest  " + fz_jstr_of(full.doc, "digest"))
+            println("  modules " + full.counts.modules.to_str()
+            + "   stdlib fns " + full.counts.stdlib_fns.to_str()
+            + "   builtin fns " + full.counts.builtin_fns.to_str()
+            + "   keywords " + full.counts.keywords.to_str())
+        }
+    }
+    return 0
+}
+
+# fz_cmd_status — the quick verdict.
+fn fz_cmd_status(tree: str, boot: str, as_json: bool) -> int
+uses IO, Fs, Proc, Clock {
+    let full: FzFull = fz_verify_full(tree, boot)
+    if full.err != "" {
+        eprint("REFUSED: " + full.err.slice(10, full.err.len()) + "\n")
+        return 1
+    }
+    let n: int = fz_drift_count(full.drift)
+    if as_json {
+        let mut verdict: str = "IDENTICAL"
+        if n > 0 {
+            verdict = "DRIFTED"
+        }
+        let mut ok: str = "true"
+        if n > 0 {
+            ok = "false"
+        }
+        let j: str = "{\"command\":\"status\",\"counts\":"
+        + fz_counts_json(full.counts) + ",\"digest\":"
+        + fz_jstr(fz_jstr_of(full.doc, "digest")) + ",\"drift\":"
+        + n.to_str() + ",\"ok\":" + ok + ",\"verdict\":"
+        + fz_jstr(verdict) + "}"
+        println(fz_canon_v(fz_parse_json(j)))
+    } else {
+        let mut v: str = "IDENTICAL"
+        if n > 0 {
+            v = "DRIFTED"
+        }
+        println(v + ": freeze " + fz_jstr_of(full.doc, "digest"))
+        println("  modules " + full.counts.modules.to_str()
+        + "   stdlib fns " + full.counts.stdlib_fns.to_str()
+        + "   structs " + full.counts.stdlib_structs.to_str()
+        + "   enums " + full.counts.stdlib_enums.to_str())
+        if n > 0 {
+            let lines: list[str] = fz_drift_lines(full.drift, 40)
+            let mut i: int = 0
+            while i < lines.len() {
+                println("  " + lines.get(i))
+                i = i + 1
+            }
+        }
+    }
+    if n == 0 {
+        return 0
+    }
+    return 1
+}
+
+# fz_cmd_amend — the only legal mutation.
+fn fz_cmd_amend(tree: str, boot: str, reason: str, by: str,
+as_json: bool) -> int uses IO, Fs, Proc, Clock {
+    if reason.trim() == "" {
+        eprint("REFUSED: an amendment without a written reason is "
+        + "refused — an unnamed change to a frozen API is how "
+        + "freezes die (--reason is required)\n")
+        return 1
+    }
+    if by.trim() == "" {
+        eprint("REFUSED: an amendment without a name is refused — the "
+        + "sanction law applies to the freezer too (--by is "
+        + "required)\n")
+        return 1
+    }
+    let full: FzFull = fz_verify_full(tree, boot)
+    if full.err != "" {
+        eprint("REFUSED: " + full.err.slice(10, full.err.len()) + "\n")
+        return 1
+    }
+    let n: int = fz_drift_count(full.drift)
+    if n == 0 {
+        eprint("REFUSED: nothing to amend: the live surface already "
+        + "equals the freeze — a no-op amendment is noise, and "
+        + "noise in the amendment ledger is how real amendments "
+        + "stop being read\n")
+        return 1
+    }
+    let live_s: str = fz_derive(tree, boot)
+    if live_s.starts_with("!") {
+        eprint("REFUSED: " + live_s.slice(10, live_s.len()) + "\n")
+        return 1
+    }
+    let new_digest: str = sha256_hex(live_s)
+    let chain: list[str] = fz_verify_chain_records(tree)
+    if chain.get(0) != "" {
+        eprint("REFUSED: " + chain.get(0).slice(10, chain.get(0).len())
+        + "\n")
+        return 1
+    }
+    let head: str = chain.get(1)
+    let recs: JsonValue = fz_parse_json(chain.get(2))
+    # the entry — canonical keys: by, chain_hash, commit, delta,
+    # from_digest, kind, prev_hash, reason, seq, to_digest
+    let delta_s: str = "{\"added\":[" + fz_join_q(full.drift.added)
+    + "],\"changed\":[" + fz_join_q_strs(full.drift.changed)
+    + "],\"removed\":[" + fz_join_q(full.drift.removed) + "]}"
+    let seq: int = recs.arr.len() + 1
+    let entry_pre: str = "{\"by\":" + fz_jstr(by.trim())
+    + ",\"commit\":" + fz_jstr(fz_git_commit(tree))
+    + ",\"delta\":" + delta_s
+    + ",\"from_digest\":"
+    + fz_jstr(fz_jstr_of(full.doc, "digest"))
+    + ",\"kind\":\"amend\",\"prev_hash\":" + fz_jstr(head)
+    + ",\"reason\":" + fz_jstr(reason.trim())
+    + ",\"seq\":" + seq.to_str()
+    + ",\"to_digest\":" + fz_jstr(new_digest) + "}"
+    let chain_hash: str = fz_chain_of(head,
+    fz_parse_json(entry_pre))
+    let entry_s: str = "{\"by\":" + fz_jstr(by.trim())
+    + ",\"chain_hash\":" + fz_jstr(chain_hash)
+    + ",\"commit\":" + fz_jstr(fz_git_commit(tree))
+    + ",\"delta\":" + delta_s
+    + ",\"from_digest\":"
+    + fz_jstr(fz_jstr_of(full.doc, "digest"))
+    + ",\"kind\":\"amend\",\"prev_hash\":" + fz_jstr(head)
+    + ",\"reason\":" + fz_jstr(reason.trim())
+    + ",\"seq\":" + seq.to_str()
+    + ",\"to_digest\":" + fz_jstr(new_digest) + "}"
+    let new_doc_s: str = "{\"digest\":" + fz_jstr(new_digest)
+    + ",\"frozen_commit\":" + fz_jstr(fz_git_commit(tree))
+    + ",\"release\":" + fz_jstr(fz_version())
+    + ",\"stage\":" + fz_stage().to_str()
+    + ",\"surface\":" + live_s
+    + ",\"surface_version\":" + fz_surface_version().to_str()
+    + ",\"tool\":\"hls-freeze\"}"
+    write_file(fz_freeze_path(tree), new_doc_s + "\n")
+    let cp: str = fz_chain_path(tree)
+    if file_exists(cp) {
+        let prev_text: str = read_file(cp)
+        if !prev_text.ends_with("\n") && prev_text != "" {
+            let _drop: int = proc_spawn("sh",
+            ["-c", "printf '\\n' >> '" + cp + "'"], 2, 2, 2)
+        }
+    }
+    let _drop2: int = proc_spawn("sh",
+    ["-c", "printf '%s\\n' '" + str_replace(entry_s, "'", "'\\''")
+    + "' >> '" + cp + "'"], 2, 2, 2)
+    if as_json {
+        let j: str = "{\"chain_hash\":" + fz_jstr(chain_hash)
+        + ",\"command\":\"amend\",\"delta\":" + n.to_str()
+        + ",\"digest\":" + fz_jstr(new_digest) + ",\"ok\":true"
+        + ",\"seq\":" + seq.to_str() + "}"
+        println(fz_canon_v(fz_parse_json(j)))
+    } else {
+        println("AMENDED: the freeze now carries the live surface "
+        + "(seq " + seq.to_str() + ").")
+        println("  from  " + fz_jstr_of(full.doc, "digest"))
+        println("  to    " + new_digest)
+        println("  delta " + n.to_str() + " drift point(s), recorded "
+        + "on the chain")
+        let lines: list[str] = fz_drift_lines(full.drift, 12)
+        let mut i: int = 0
+        while i < lines.len() {
+            println("  " + lines.get(i))
+            i = i + 1
+        }
+        println("Commit BOTH " + fz_freeze_rel() + " and "
+        + fz_chain_rel() + " together — the document and its "
+        + "history are one contract.")
+    }
+    return 0
+}
+# ============================================================================
+# PART 5 — the report, the CLI (appended; concatenated into
+# tools/hls-freeze.hls)
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# The report — the frozen API document rendered, deterministic per
+# freeze, NEVER rendered from a drifted tree.
+# ----------------------------------------------------------------------------
+
+fn fz_cmd_report(tree: str, boot: str, out_path: str, stamp_on: bool)
+-> int uses IO, Fs, Proc, Clock {
+    let full: FzFull = fz_verify_full(tree, boot)
+    if full.err != "" {
+        eprint("REFUSED: " + full.err.slice(10, full.err.len()) + "\n")
+        return 1
+    }
+    let n: int = fz_drift_count(full.drift)
+    if n > 0 {
+        let mut first: str = "<surface>"
+        let lines: list[str] = fz_drift_lines(full.drift, 1)
+        if lines.len() > 0 {
+            let l: str = lines.get(0)
+            # "REMOVED   path" / "ADDED     path" / "CHANGED   path : ..."
+            # every drift line pads its verb to 10 columns
+            if l.len() > 10 {
+                first = l.slice(10, l.len())
+            }
+            let tail_at: int = first.find(" : ")
+            if tail_at > 0 {
+                first = first.slice(0, tail_at)
+            }
+        }
+        eprint("REFUSED: the tree has drifted from the freeze ("
+        + n.to_str() + " drift point(s), starting at " + first
+        + ") — a report is never rendered from a surface the tree "
+        + "no longer has; amend or revert first\n")
+        return 1
+    }
+    let chain: list[str] = fz_verify_chain_records(tree)
+    if chain.get(0) != "" {
+        eprint("REFUSED: " + chain.get(0).slice(10, chain.get(0).len())
+        + "\n")
+        return 1
+    }
+    let head: str = chain.get(1)
+    let recs: list[JsonValue] = fz_parse_json(chain.get(2)).arr
+    let doc: JsonValue = full.doc
+    let counts: FzCounts = full.counts
+    let surface: JsonValue = json_object_get(doc, "surface")
+    let syn: JsonValue = json_object_get(surface, "syntax")
+    let std: JsonValue = json_object_get(surface, "stdlib")
+    let L: list[str] = []
+    L.push("# The frozen API of Halis — Stage "
+    + fz_stage().to_str() + " (v0.159.0-alpha)")
+    L.push("")
+    L.push("Rendered from the Stage 141 freeze ledger by"
+    + " `bin/hls-freeze report`; deterministic per freeze —")
+    L.push("sorted walks, no wall-clock"
+    + (fz_stamp_word(stamp_on)) + ", the digest embedded — so"
+    + " two renders of one freeze are byte-identical and any"
+    + " hand-edit is a diff.")
+    if stamp_on {
+        L.push("")
+        L.push("Generated: " + fz_stamp())
+    }
+    L.push("")
+    L.push("| Field | Value |")
+    L.push("|---|---|")
+    L.push("| Freeze digest | `" + fz_jstr_of(doc, "digest") + "` |")
+    let mut fc: str = fz_jstr_of(doc, "frozen_commit")
+    if fc == "" {
+        fc = "(unknown)"
+    }
+    L.push("| Frozen at commit | `" + fc + "` |")
+    L.push("| Release | " + fz_jstr_of(doc, "release") + " |")
+    L.push("| Amendment head | `" + head.slice(0, 16) + "` |")
+    L.push("| Amendments | " + recs.len().to_str() + " |")
+    L.push("")
+    L.push("## The contract")
+    L.push("")
+    L.push("From this freeze the language's surface is LOCKED: no"
+    + " keyword, token, attribute, builtin, method or stdlib"
+    + " signature moves — not even by addition — without an"
+    + " `amend --reason` record on the chain. Verify with"
+    + " `make freeze-verify`; the surface moves with"
+    + " `bin/hls-freeze amend`.")
+    L.push("")
+    L.push("## Counts")
+    L.push("")
+    L.push("| Census | Count |")
+    L.push("|---|---|")
+    let ckeys: list[str] = ["builtin_fns", "builtin_methods",
+    "crate_attrs", "effects", "fn_attrs", "import_edges",
+    "keywords", "modules", "reserved_identifiers", "stdlib_enums",
+    "stdlib_fns", "stdlib_structs", "tokens"]
+    let cvals: list[int] = [counts.builtin_fns, counts.builtin_methods,
+    counts.crate_attrs, counts.effects, counts.fn_attrs,
+    counts.import_edges, counts.keywords, counts.modules,
+    counts.reserved_identifiers, counts.stdlib_enums,
+    counts.stdlib_fns, counts.stdlib_structs, counts.tokens]
+    let mut ci: int = 0
+    while ci < ckeys.len() {
+        L.push("| " + str_replace(ckeys.get(ci), "_", " ") + " | "
+        + cvals.get(ci).to_str() + " |")
+        ci = ci + 1
+    }
+    L.push("")
+    L.push("## The syntax surface")
+    L.push("")
+    L.push("Derived live from the tree's own front-end sources; the"
+    + " formatter's keyword chain is grepped and must agree.")
+    L.push("")
+    L.push("**Keywords (" + fz_jarr_of(syn, "keywords").len().to_str()
+    + "):** " + fz_join_cs(fz_json_strs(fz_obj_get(syn,
+    "keywords"))))
+    L.push("")
+    L.push("**Reserved identifiers ("
+    + fz_jarr_of(syn, "reserved_identifiers").len().to_str()
+    + "):** " + fz_join_cs(fz_json_strs(fz_obj_get(syn,
+    "reserved_identifiers"))))
+    L.push("")
+    L.push("**Tokens:** two-char " + fz_join_sp(fz_json_strs(
+    fz_obj_get(syn, "tokens_two_char"))) + "; one-char "
+    + fz_join_sp(fz_json_strs(fz_obj_get(syn, "tokens_one_char"))))
+    L.push("")
+    L.push("**Effects (" + fz_jarr_of(syn, "effects").len().to_str()
+    + "):** " + fz_join_cs(fz_json_strs(fz_obj_get(syn,
+    "effects"))))
+    L.push("")
+    L.push("**Crate attributes:** " + fz_join_cs(fz_json_strs(
+    fz_obj_get(syn, "crate_attrs"))))
+    L.push("")
+    L.push("**Function attributes:** " + fz_join_cs(fz_json_strs(
+    fz_obj_get(syn, "fn_attrs"))))
+    L.push("")
+    L.push("**Builtin functions ("
+    + fz_jarr_of(syn, "builtin_fns").len().to_str()
+    + "):** " + fz_join_cs(fz_json_strs(fz_obj_get(syn,
+    "builtin_fns"))))
+    L.push("")
+    L.push("**Builtin methods:**")
+    L.push("")
+    L.push("| Receiver | Method | Params | Returns |")
+    L.push("|---|---|---|---|")
+    let methods: JsonValue = json_object_get(syn, "builtin_methods")
+    let mk: list[str] = fz_sorted(methods.obj_keys)
+    let mut mi: int = 0
+    while mi < mk.len() {
+        let tbl: JsonValue = fz_obj_get(methods, mk.get(mi))
+        let nk: list[str] = fz_sorted(tbl.obj_keys)
+        let mut ni: int = 0
+        while ni < nk.len() {
+            let m: JsonValue = fz_obj_get(tbl, nk.get(ni))
+            L.push("| " + mk.get(mi) + " | " + nk.get(ni) + " | ("
+            + fz_join_cs(fz_json_strs(fz_obj_get(m, "params")))
+            + ") | " + fz_jstr_of(m, "ret") + " |")
+            ni = ni + 1
+        }
+        mi = mi + 1
+    }
+    L.push("")
+    L.push("## The stdlib surface")
+    L.push("")
+    let mids: list[str] = fz_sorted(std.obj_keys)
+    let mut si: int = 0
+    while si < mids.len() {
+        let mid: str = mids.get(si)
+        let mod: JsonValue = fz_obj_get(std, mid)
+        let fns: JsonValue = fz_obj_get(mod, "fns")
+        let structs: JsonValue = fz_obj_get(mod, "structs")
+        let enums: JsonValue = fz_obj_get(mod, "enums")
+        let imports: list[str] = fz_json_strs(fz_obj_get(mod,
+        "imports"))
+        let mut tail: str = ""
+        if structs.obj_keys.len() > 0 {
+            tail = structs.obj_keys.len().to_str() + " struct(s)"
+        }
+        if enums.obj_keys.len() > 0 {
+            if tail != "" {
+                tail = tail + ", "
+            }
+            tail = tail + enums.obj_keys.len().to_str() + " enum(s)"
+        }
+        if tail != "" {
+            tail = tail + ", "
+        }
+        tail = tail + fns.obj_keys.len().to_str() + " fn(s)"
+        L.push("### `" + mid + "` — " + tail)
+        L.push("")
+        if imports.len() > 0 {
+            let quoted: list[str] = []
+            let mut ii: int = 0
+            while ii < imports.len() {
+                quoted.push("`" + imports.get(ii) + "`")
+                ii = ii + 1
+            }
+            L.push("Imports: " + str_join(quoted, ", "))
+            L.push("")
+        }
+        # structs
+        let sk: list[str] = fz_sorted(structs.obj_keys)
+        let mut ski: int = 0
+        while ski < sk.len() {
+            let s: JsonValue = fz_obj_get(structs, sk.get(ski))
+            let gp: str = fz_generic_of(s)
+            let fields: list[str] = []
+            let fl: list[JsonValue] = fz_jarr_of(s, "fields")
+            let mut fi: int = 0
+            while fi < fl.len() {
+                let f: JsonValue = fl.get(fi)
+                let mut dfl: str = ""
+                if json_is_bool(f.arr.get(2)) {
+                    if json_bool_value(f.arr.get(2)) {
+                        dfl = " = default"
+                    }
+                }
+                fields.push(json_str_value(f.arr.get(0)) + ": "
+                + json_str_value(f.arr.get(1)) + dfl)
+                fi = fi + 1
+            }
+            L.push("- `struct " + sk.get(ski) + gp + " { "
+            + str_join(fields, ", ") + " }`")
+            ski = ski + 1
+        }
+        # enums
+        let ek: list[str] = fz_sorted(enums.obj_keys)
+        let mut eki: int = 0
+        while eki < ek.len() {
+            let e: JsonValue = fz_obj_get(enums, ek.get(eki))
+            let gp2: str = fz_generic_of(e)
+            let vs: list[str] = []
+            let vl: list[JsonValue] = fz_jarr_of(e, "variants")
+            let mut vi: int = 0
+            while vi < vl.len() {
+                let v: JsonValue = vl.get(vi)
+                let pays: list[str] = fz_json_strs(v.arr.get(1))
+                if pays.len() > 0 {
+                    vs.push(json_str_value(v.arr.get(0)) + " ("
+                    + str_join(pays, ", ") + ")")
+                } else {
+                    vs.push(json_str_value(v.arr.get(0)))
+                }
+                vi = vi + 1
+            }
+            L.push("- `enum " + ek.get(eki) + gp2 + " { "
+            + str_join(vs, " | ") + " }`")
+            eki = eki + 1
+        }
+        # fns
+        let fk: list[str] = fz_sorted(fns.obj_keys)
+        let mut fki: int = 0
+        while fki < fk.len() {
+            let f2: JsonValue = fz_obj_get(fns, fk.get(fki))
+            let gp3: str = fz_generic_of(f2)
+            let params: list[str] = []
+            let pl: list[JsonValue] = fz_jarr_of(f2, "params")
+            let mut pi: int = 0
+            while pi < pl.len() {
+                let p: JsonValue = pl.get(pi)
+                let mut muts: str = ""
+                if json_is_bool(p.arr.get(2)) {
+                    if json_bool_value(p.arr.get(2)) {
+                        muts = "mut "
+                    }
+                }
+                params.push(muts + json_str_value(p.arr.get(0)) + ": "
+                + json_str_value(p.arr.get(1)))
+                pi = pi + 1
+            }
+            let sig: str = "`fn " + fk.get(fki) + gp3 + "("
+            + str_join(params, ", ") + ") -> "
+            + fz_jstr_of(f2, "ret") + "`"
+            let notes: list[str] = []
+            if json_is_bool(json_object_get(f2, "extern")) {
+                if json_bool_value(json_object_get(f2, "extern")) {
+                    notes.push("extern")
+                }
+            }
+            if json_is_bool(json_object_get(f2, "pure")) {
+                if json_bool_value(json_object_get(f2, "pure")) {
+                    notes.push("pure")
+                }
+            }
+            let effs: list[str] = fz_json_strs(fz_obj_get(f2,
+            "effects"))
+            if effs.len() > 0 {
+                notes.push("uses " + str_join(effs, ", "))
+            }
+            if json_is_str(json_object_get(f2, "deprecated")) {
+                notes.push("deprecated")
+            }
+            let req: JsonValue = json_object_get(f2, "requires")
+            if json_is_str(req) {
+                notes.push("requires " + json_str_value(req))
+            }
+            let ens: JsonValue = json_object_get(f2, "ensures")
+            if json_is_str(ens) {
+                notes.push("ensures " + json_str_value(ens))
+            }
+            if notes.len() > 0 {
+                L.push("- " + sig + " — " + str_join(notes, "; "))
+            } else {
+                L.push("- " + sig)
+            }
+            fki = fki + 1
+        }
+        L.push("")
+        si = si + 1
+    }
+    L.push("## The amendment history")
+    L.push("")
+    if recs.len() == 0 {
+        L.push("No amendments — the freeze of v0.159.0-alpha is the"
+        + " surface as it was frozen.")
+    } else {
+        L.push("| Seq | By | Delta | Reason |")
+        L.push("|---|---|---|---|")
+        let mut ri: int = 0
+        while ri < recs.len() {
+            let rec: JsonValue = recs.get(ri)
+            let delta: JsonValue = json_object_get(rec, "delta")
+            let nd: int = fz_jarr_of(delta, "removed").len()
+            + fz_jarr_of(delta, "added").len()
+            + fz_jarr_of(delta, "changed").len()
+            let mut seq: str = "0"
+            if json_is_int(json_object_get(rec, "seq")) {
+                seq = json_int_value(json_object_get(rec, "seq"))
+                .to_str()
+            }
+            let mut by: str = fz_jstr_of(rec, "by")
+            if by == "" {
+                by = "?"
+            }
+            let reason: str = fz_jstr_of(rec, "reason")
+            L.push("| " + seq + " | " + by + " | " + nd.to_str()
+            + " | " + str_replace(reason, "|", "\\|") + " |")
+            ri = ri + 1
+        }
+    }
+    L.push("")
+    L.push("---")
+    L.push("")
+    L.push("Freeze digest `" + fz_jstr_of(doc, "digest")
+    + "` · amendment head `" + head + "` · rendered by hls-freeze "
+    + fz_version() + ". This document is generated; edit the"
+    + " surface through the tree, not through the prose.")
+    L.push("")
+    let mut doc_out: str = ""
+    let mut li: int = 0
+    while li < L.len() {
+        doc_out = doc_out + L.get(li) + "\n"
+        li = li + 1
+    }
+    write_file(out_path, doc_out)
+    println("REPORT: " + out_path + " written from freeze "
+    + fz_jstr_of(doc, "digest").slice(0, 16) + "... ("
+    + counts.modules.to_str() + " modules, " + recs.len().to_str()
+    + " amendments)")
+    return 0
+}
+
+fn fz_stamp_word(on: bool) -> str {
+    if on {
+        return " (stamped)"
+    }
+    return ""
+}
+
+fn fz_stamp() -> str uses Proc {
+    let r: FzRun = fz_run_at("date", ["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+    return r.out.trim()
+}
+
+fn fz_generic_of(v: JsonValue) -> str {
+    let gs: list[str] = fz_json_strs(fz_obj_get(v, "generic"))
+    if gs.len() == 0 {
+        return ""
+    }
+    return "[" + str_join(gs, ", ") + "]"
+}
+
+fn fz_json_strs(arr: JsonValue) -> list[str] {
+    let out: list[str] = []
+    if json_is_array(arr) {
+        let mut i: int = 0
+        while i < arr.arr.len() {
+            if json_is_str(arr.arr.get(i)) {
+                out.push(json_str_value(arr.arr.get(i)))
+            }
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn fz_join_cs(xs: list[str]) -> str {
+    return str_join(xs, ", ")
+}
+
+fn fz_join_sp(xs: list[str]) -> str {
+    return str_join(xs, " ")
+}
+
+# ----------------------------------------------------------------------------
+# The CLI.
+# ----------------------------------------------------------------------------
+
+fn fz_usage() -> int uses IO {
+    eprint("usage: hls-freeze snapshot|verify|amend|report|status "
+    + "[...]\n")
+    return 2
+}
+
+fn fz_find_value(argv: list[str], flag: str) -> str {
+    let mut i: int = 2
+    while i + 1 < argv.len() {
+        if argv.get(i) == flag {
+            return argv.get(i + 1)
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn fz_has_flag(argv: list[str], flag: str) -> bool {
+    let mut i: int = 2
+    while i < argv.len() {
+        if argv.get(i) == flag {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn fz_find_root(argv: list[str]) -> str uses Args, Proc {
+    let mut i: int = 1
+    while i + 1 < argv.len() {
+        if argv.get(i) == "--root" {
+            return argv.get(i + 1)
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit, Clock {
+    let argv: list[str] = args()
+    if argv.len() < 2 {
+        return fz_usage()
+    }
+    let cmd: str = argv.get(1)
+    if cmd != "snapshot" && cmd != "verify" && cmd != "amend"
+    && cmd != "report" && cmd != "status" {
+        return fz_usage()
+    }
+    let tree: str = fz_tree_of(fz_find_root(argv))
+    let boot: str = fz_boot_path()
+
+    if cmd == "snapshot" {
+        if !fz_is_dir(tree) {
+            eprint("REFUSED: --root is not a directory: " + tree
+            + "\n")
+            return 1
+        }
+        return fz_cmd_snapshot(tree, boot, fz_has_flag(argv, "--json"))
+    }
+    if cmd == "verify" {
+        return fz_cmd_verify(tree, boot, fz_has_flag(argv, "--json"),
+        fz_has_flag(argv, "--quiet"))
+    }
+    if cmd == "status" {
+        return fz_cmd_status(tree, boot, fz_has_flag(argv, "--json"))
+    }
+    if cmd == "amend" {
+        let reason: str = fz_find_value(argv, "--reason")
+        if reason == "" && !fz_has_flag(argv, "--reason") {
+            eprint("usage: hls-freeze amend --reason REASON --by NAME "
+            + "[--root PATH] [--json]\n")
+            return 2
+        }
+        let by: str = fz_find_value(argv, "--by")
+        if by == "" && !fz_has_flag(argv, "--by") {
+            eprint("usage: hls-freeze amend --reason REASON --by NAME "
+            + "[--root PATH] [--json]\n")
+            return 2
+        }
+        return fz_cmd_amend(tree, boot, reason, by,
+        fz_has_flag(argv, "--json"))
+    }
+    # report
+    let out_path: str = fz_find_value(argv, "--out")
+    if out_path == "" {
+        eprint("usage: hls-freeze report --out FILE.md [--stamp] "
+        + "[--root PATH]\n")
+        return 2
+    }
+    return fz_cmd_report(tree, boot, out_path,
+    fz_has_flag(argv, "--stamp"))
+}
