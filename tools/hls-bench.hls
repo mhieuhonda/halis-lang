@@ -1357,31 +1357,45 @@ fn json_sig17(x: float) -> str {
         a = 0.0 - x
     }
     let mut e: int = math_floor(math_log10(a)).to_int()
+    # the mantissa lives in [1, 10): divide the exponent out, format
+    # the digits, then append the exponent (the value is
+    # mant * 10^e, and str.to_float parses the e-form natively).
+    let mut mant: float = a / math_power_float(10.0, e)
+    # guard the floor: a tiny mantissa below 1 (log10 rounding) shifts
+    # one exponent down; a mantissa at 10 shifts one up.
+    if mant >= 10.0 {
+        mant = mant / 10.0
+        e = e + 1
+    }
+    while mant < 1.0 && mant > 0.0 {
+        mant = mant * 10.0
+        e = e - 1
+    }
     # try 15..17 significant digits; the first whose parse-back
     # round-trips is the shortest stable form (Python's repr law).
     let mut sig: int = 15
     let mut body: str = ""
     while sig <= 17 {
-        body = fmt_sig_dec_exp(a, e, sig)
-        if parse_float(body) * math_power_float(10.0, e) == a {
+        body = fmt_sig_dec_exp(mant, e, sig)
+        if body.to_float() == x {
             sig = 18
         } else {
             sig = sig + 1
         }
     }
-    let mut out: str = body + "e" + e.to_str()
+    let mut out: str = body
     if neg {
         return "-" + out
     }
     return out
 }
 
-# fmt_sig_dec_exp(mant, e, sig) — mantissa with sig significant
-# digits, followed by "e<exp>" (scientific; the exponent's sign kept
-# so the round-trip multiply is exact).
+# fmt_sig_dec_exp(mant, e, sig) — the mantissa (already in [1, 10))
+# with sig significant digits and the "e<exp>" tail, so the literal
+# parses back to mant * 10^e exactly.
 fn fmt_sig_dec_exp(mant: float, e: int, sig: int) -> str {
     let mut dec: int = sig - 1
-    return fmt_sig_dec(mant, dec)
+    return fmt_sig_dec(mant, dec) + "e" + e.to_str()
 }
 
 # parse_float(s) — a plain decimal float literal parser for the
@@ -1971,12 +1985,13 @@ uses IO, Fs, Proc {
         cfg.backend, bench, units_rec, samples, est)
     }
 
-    # render + carry.
+    # render + carry. The raw samples ride in the json payload, so
+    # they must be on the result BEFORE the renderer walks them.
     let mut res: BenchResult = bench_result(filepath, bench, "ok", "")
+    res.raw_samples = samples
     render_bench(res, med, med_ci, mean, mean_ci, std, m, outliers,
     est.len(), slope, units_val, have_thrpt, thrpt_pt, thrpt_ci,
     harness_per_iter, change)
-    res.raw_samples = samples
     return res
 }
 
@@ -2154,7 +2169,7 @@ change: Change) -> void uses IO {
         J.push("   },")
     }
     if res.raw_samples.len() > 0 {
-        let mut ss: str = "   \"samples\": ["
+        let mut ss: str = "   \"raw_samples\": ["
         let mut i: int = 0
         while i < res.raw_samples.len() {
             if i > 0 {
@@ -2594,6 +2609,267 @@ fn hex4(b: int) -> str {
     return digits.slice(hi, hi + 1) + digits.slice(lo, lo + 1)
 }
 
+# ----------------------------------------------------------------------------
+# The --unit-* modes — the .py years' importlib legs, a binary surface
+# (the repro-gate pattern: CHECK lines under the battery's own names).
+# ----------------------------------------------------------------------------
+
+fn unit_b(x: bool) -> str {
+    if x {
+        return "1"
+    }
+    return "0"
+}
+
+# hb_unit_stats — the statistics unit checks, the battery's own
+# vectors and hand-computed values.
+fn hb_unit_stats() -> int uses IO {
+    # xs = [3,1,4,1,5,9,2,6,5,3]; s = sorted
+    let mut xs: list[float] = [3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0,
+    5.0, 3.0]
+    let mut s: list[float] = float_sort(xs)
+    println("CHECK q50 " + unit_b(stat_quantile(s, 0.5) == 3.5))
+    println("CHECK median " + unit_b(stat_median(xs) == 3.5))
+    println("CHECK q25 " + unit_b(stat_quantile(s, 0.25) > 2.25 - 1e-12
+    && stat_quantile(s, 0.25) < 2.25 + 1e-12))
+    println("CHECK mad " + unit_b(stat_mad(xs) > 1.5 - 1e-12
+    && stat_mad(xs) < 1.5 + 1e-12))
+    # crafted = [-100, -15, 1..9, 20, 100]: q1=4, q3=8, iqr=4
+    # lo_sev = 4 - 12 = -8 (only -100 below), lo_mild = 4 - 6 = -2
+    # (-15), hi_mild = 8 + 6 = 14 (20), hi_sev = 8 + 12 = 20 (100).
+    let mut crafted: list[float] = [-100.0, -15.0, 1.0, 2.0, 3.0, 4.0,
+    5.0, 6.0, 7.0, 8.0, 9.0, 20.0, 100.0]
+    let mut o: Outliers = stat_classify_outliers(crafted)
+    println("CHECK low_severe " + unit_b(o.low_severe == 1))
+    println("CHECK low_mild " + unit_b(o.low_mild == 1))
+    println("CHECK high_cells " + unit_b(o.high_mild == 1
+    && o.high_severe == 1))
+    # clean = 1..12: no outliers.
+    let mut clean: list[float] = []
+    let mut i: int = 1
+    while i <= 12 {
+        clean.push(i.to_float())
+        i = i + 1
+    }
+    let mut o2: Outliers = stat_classify_outliers(clean)
+    println("CHECK no_outliers " + unit_b(o2.low_severe + o2.low_mild
+    + o2.high_mild + o2.high_severe == 0))
+    # a constant vector's CI collapses to the point.
+    let mut const20: list[float] = []
+    i = 0
+    while i < 20 {
+        const20.push(7.0)
+        i = i + 1
+    }
+    let mut ci: list[float] = stat_bootstrap_ci(const20, true,
+    BOOTSTRAP_B(), 42)
+    println("CHECK collapse " + unit_b(ci.get(0) == 7.0
+    && ci.get(1) == 7.0))
+    # the bootstrap is seeded: same seed, same interval; and the
+    # interval brackets the point estimate.
+    let mut xs2: list[float] = []
+    i = 1
+    while i <= 30 {
+        xs2.push((i * i).to_float())
+        i = i + 1
+    }
+    let mut ci1: list[float] = stat_bootstrap_ci(xs2, true,
+    BOOTSTRAP_B(), 1234)
+    let mut ci2: list[float] = stat_bootstrap_ci(xs2, true,
+    BOOTSTRAP_B(), 1234)
+    println("CHECK seeded " + unit_b(ci1.get(0) == ci2.get(0)
+    && ci1.get(1) == ci2.get(1)))
+    let mut med2: float = stat_median(xs2)
+    println("CHECK brackets " + unit_b(ci1.get(0) <= med2
+    && med2 <= ci1.get(1)))
+    # the slope law: total-elapsed over total-iters (3200/35), and the
+    # throughput bootstrap's ordered interval.
+    let mut samples: list[ProtoRec] = []
+    samples.push(ProtoRec {
+        kind: "sample", bench: "", a: 10, b: 1000
+    })
+    samples.push(ProtoRec {
+        kind: "sample", bench: "", a: 20, b: 1500
+    })
+    samples.push(ProtoRec {
+        kind: "sample", bench: "", a: 5, b: 700
+    })
+    let mut slope: float = 3200.0 / 35.0
+    let mut thr: list[float] = bootstrap_ci_slope(samples, 100,
+    BOOTSTRAP_B(), 1)
+    println("CHECK thr_ordered " + unit_b(0.0 < thr.get(0)
+    && thr.get(0) <= thr.get(1)))
+    println("CHECK slope " + unit_b(slope > 3200.0 / 35.0 - 1e-12
+    && slope < 3200.0 / 35.0 + 1e-12))
+    println("CHECK none_units " + unit_b(bootstrap_ci_slope(samples, 0,
+    BOOTSTRAP_B(), 1).get(0) == 0.0
+    && bootstrap_ci_slope(samples, 0, BOOTSTRAP_B(), 1).get(1) == 0.0))
+    # Welch: identical vectors give p > 0.05; shifted ones p < 0.001;
+    # tiny vectors stay in [0, 1].
+    let mut same: list[float] = []
+    i = 0
+    while i < 12 {
+        same.push(10.0 + (i % 3).to_float())
+        i = i + 1
+    }
+    let mut p_same: float = welch_p(same, same)
+    println("CHECK p_same " + unit_b(p_same > 0.05))
+    let mut a8: list[float] = [10.0, 10.2, 9.8, 10.1, 9.9, 10.05, 9.95,
+    10.15]
+    let mut c8: list[float] = [20.0, 20.2, 19.8, 20.1, 19.9, 20.05,
+    19.95, 20.15]
+    let mut p_diff: float = welch_p(a8, c8)
+    println("CHECK p_diff " + unit_b(p_diff < 0.001))
+    let mut p_tiny: float = welch_p([1.0, 2.0], [3.0, 4.0])
+    println("CHECK p_tiny " + unit_b(p_tiny >= 0.0 && p_tiny <= 1.0))
+    # fmt_time's unit ladder.
+    println("CHECK ft_ns " + unit_b(fmt_time(500.0) == "500 ns"))
+    println("CHECK ft_us " + unit_b(fmt_time(1234.0).ends_with(
+    chr(194) + chr(181) + "s")))
+    println("CHECK ft_ms " + unit_b(fmt_time(1500000.0).ends_with("ms")))
+    println("CHECK ft_s " + unit_b(fmt_time(2000000000.0).ends_with("s")))
+    return 0
+}
+
+# hb_unit_craft(mode, bpath, bdir) — the battery's baseline surgery:
+# the 100x-faster slowreg companion, the 1000x-slower fastimp one,
+# the cross-backend nat one.
+fn hb_unit_craft(mode: str, bpath: str, bdir: str) -> int uses IO, Fs, Proc {
+    let mut base: BaseRec = load_baseline(bpath)
+    if !base.ok {
+        eprintln("craft: " + base.err)
+        return 1
+    }
+    if mode == "slowfast" {
+        let mut mx: float = 0.0
+        let mut i: int = 0
+        while i < base.estimates.len() {
+            if base.estimates.get(i) > mx {
+                mx = base.estimates.get(i)
+            }
+            i = i + 1
+        }
+        let mut slow: list[float] = []
+        let mut huge: list[float] = []
+        i = 0
+        while i < 4 {
+            slow.push(mx * 0.01)
+            huge.push(mx * 1000.0)
+            i = i + 1
+        }
+        save_baseline(hb_join(bdir, "bench_loop_sum.slowreg.json"),
+        base.backend, base.bench, base.units, base.samples, slow)
+        save_baseline(hb_join(bdir, "bench_loop_sum.fastimp.json"),
+        base.backend, base.bench, base.units, base.samples, huge)
+    } else if mode == "nat" {
+        save_baseline(hb_join(bdir, "bench_loop_sum.nat.json"),
+        "native", base.bench, base.units, base.samples,
+        base.estimates)
+    } else {
+        eprintln("craft: unknown mode " + mode)
+        return 2
+    }
+    println("CRAFT " + mode + " done")
+    return 0
+}
+
+# hb_unit_rewrite(bpath, out) — load + save the same record: the bytes
+# must not move (byte-stability of the store).
+fn hb_unit_rewrite(bpath: str, out: str) -> int uses IO, Fs, Proc {
+    let mut obj: BaseRec = load_baseline(bpath)
+    if !obj.ok {
+        eprintln("rewrite: " + obj.err)
+        return 1
+    }
+    save_baseline(out, obj.backend, obj.bench, obj.units, obj.samples,
+    obj.estimates)
+    println("REWRITE done")
+    return 0
+}
+
+# hb_unit_json(path) — the report's float assertions over a written
+# --json document.
+fn hb_unit_json(path: str) -> int uses IO, Fs {
+    let mut doc: JsonValue = json_parse(read_file(path))
+    let mut files: list[JsonValue] = doc.obj_vals.get(0).arr
+    # files[0].benches — find by key, the gate's own walk.
+    let mut f0: JsonValue = json_null()
+    let mut i: int = 0
+    while i < doc.obj_keys.len() {
+        if doc.obj_keys.get(i) == "files" {
+            f0 = doc.obj_vals.get(i)
+        }
+        i = i + 1
+    }
+    let mut benches: list[JsonValue] = json_object_get(f0.arr.get(0),
+    "benches").arr
+    let mut loop: JsonValue = json_null()
+    let mut no_units: JsonValue = json_null()
+    i = 0
+    while i < benches.len() {
+        let mut bn: str = json_str_value(json_object_get(benches.get(i),
+        "name"))
+        if bn == "bench_loop_sum" {
+            loop = benches.get(i)
+        }
+        if bn == "bench_no_units" {
+            no_units = benches.get(i)
+        }
+        i = i + 1
+    }
+    let mut est: JsonValue = json_object_get(loop,
+    "estimates_ns_per_iter")
+    let mut mci: list[JsonValue] = json_object_get(est, "median_ci").arr
+    let mut med: float = json_float_value(json_object_get(est, "median"))
+    println("CHECK median_in_ci " + unit_b(json_float_value(mci.get(0))
+    <= med && med <= json_float_value(mci.get(1))))
+    # throughput appears exactly when units are declared.
+    let mut tp: JsonValue = json_object_get(loop,
+    "throughput_units_per_s")
+    let mut tn: JsonValue = json_object_get(no_units,
+    "throughput_units_per_s")
+    println("CHECK throughput " + unit_b(json_is_float(tp)
+    && json_float_value(tp) > 0.0 && json_is_null(tn)))
+    return 0
+}
+
+# hb_unit_diff(ipath, npath) — the differential's float assertion:
+# native decisively faster (the interpreter is ~4 orders slower; 20x
+# is the honest floor).
+fn hb_unit_diff(ipath: str, npath: str) -> int uses IO, Fs {
+    let mut di: JsonValue = json_parse(read_file(ipath))
+    let mut dn: JsonValue = json_parse(read_file(npath))
+    let mut mi: float = unit_report_median(di)
+    let mut mn: float = unit_report_median(dn)
+    println("CHECK native20 " + unit_b(mn * 20.0 < mi))
+    return 0
+}
+
+# unit_report_median(doc) — files[0]/bench_loop_sum/median of a report.
+fn unit_report_median(doc: JsonValue) -> float {
+    let mut i: int = 0
+    while i < doc.obj_keys.len() {
+        if doc.obj_keys.get(i) == "files" {
+            let mut files: list[JsonValue] = doc.obj_vals.get(i).arr
+            let mut benches: list[JsonValue] = json_object_get(
+            files.get(0), "benches").arr
+            let mut j: int = 0
+            while j < benches.len() {
+                if json_str_value(json_object_get(benches.get(j),
+                "name")) == "bench_loop_sum" {
+                    let mut est: JsonValue = json_object_get(
+                    benches.get(j), "estimates_ns_per_iter")
+                    return json_float_value(json_object_get(est,
+                    "median"))
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    return 0.0
+}
+
 fn hb_main_inner(argv: list[str]) -> int uses IO, Fs, Proc, Args, Exit, Clock {
     let mut self_path: str = hb_self_path()
     let mut root: str = hb_repo_root(self_path)
@@ -2605,6 +2881,53 @@ fn hb_main_inner(argv: list[str]) -> int uses IO, Fs, Proc, Args, Exit, Clock {
             return 2
         }
         return hb_run_probe_child(argv.get(2))
+    }
+
+    # --unit-stats — the statistics battery the .py years exposed to
+    # the gate as importlib legs, printed as CHECK lines (the
+    # repro-gate pattern: the module surface a binary has).
+    if argv.len() > 1 && argv.get(1) == "--unit-stats" {
+        return hb_unit_stats()
+    }
+
+    # --unit-craft <mode> <baseline> <dir> — the battery's dict(base)
+    # surgery with float math (slowreg/fastimp/nat companions).
+    if argv.len() > 1 && argv.get(1) == "--unit-craft" {
+        if argv.len() < 5 {
+            eprintln("error: --unit-craft needs <mode> <baseline> <dir>")
+            return 2
+        }
+        return hb_unit_craft(argv.get(2), argv.get(3), argv.get(4))
+    }
+
+    # --unit-rewrite <baseline> <out> — load_baseline + save_baseline
+    # round trip (the record byte-stability leg).
+    if argv.len() > 1 && argv.get(1) == "--unit-rewrite" {
+        if argv.len() < 4 {
+            eprintln("error: --unit-rewrite needs <baseline> <out>")
+            return 2
+        }
+        return hb_unit_rewrite(argv.get(2), argv.get(3))
+    }
+
+    # --unit-json <report> — the report's float assertions (median
+    # inside its CI; the throughput pairing).
+    if argv.len() > 1 && argv.get(1) == "--unit-json" {
+        if argv.len() < 3 {
+            eprintln("error: --unit-json needs a report")
+            return 2
+        }
+        return hb_unit_json(argv.get(2))
+    }
+
+    # --unit-diff <interp-report> <native-report> — the differential's
+    # float assertion (native decisively faster, 20x the floor).
+    if argv.len() > 1 && argv.get(1) == "--unit-diff" {
+        if argv.len() < 4 {
+            eprintln("error: --unit-diff needs two reports")
+            return 2
+        }
+        return hb_unit_diff(argv.get(2), argv.get(3))
     }
 
     let mut files_arg: list[str] = []

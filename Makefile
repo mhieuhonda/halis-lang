@@ -1002,7 +1002,7 @@ repl-acceptance: $(BIN)/acc-repl $(BIN)/hls-repl
 # the CLI matrix, the fixed-plan interpreter-vs-native differential,
 # and the corpus hygiene. The differential half compiles on bin/hlc
 # and gcc, so the native build is a prerequisite.
-bench-acceptance: $(BIN)/acc-bench bin/hlc
+bench-acceptance: $(BIN)/acc-bench $(BIN)/hls-bench bin/hlc $(BIN)/hlfmt $(BIN)/hllint $(BIN)/hlboot
 	@echo "[Stage 124 acceptance] running tests/acc/bench_acceptance.hls..."
 	@$(BIN)/acc-bench
 
