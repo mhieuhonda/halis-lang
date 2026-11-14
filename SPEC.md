@@ -8635,7 +8635,8 @@ is precisely what the drift ledger exists to name.
 
 Stage 128's ledger tells you what changed and why it was sanctioned;
 the source a sanctioned change left behind still has to be updated.
-Stage 129 closes that loop: `tools/hls-migrate.py` (`hls migrate`) is
+Stage 129 closes that loop: `tools/hls-migrate.hls` (built as
+`bin/hls-migrate`, `hls migrate`) is
 a codemod engine whose rules are derived from the project's real,
 documented breaking changes — the same events the Stage 128 ledger
 records — each carrying the release that introduced it (`since`).

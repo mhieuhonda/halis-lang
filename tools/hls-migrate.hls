@@ -1,0 +1,2498 @@
+# ============================================================================
+# tools/hls-migrate.hls — the Stage 129 migration tool, in Halis (the
+# native twin of the Python hls-migrate.py that retired; same rules,
+# same walk, same honesty gates — driven through bin/hls-migrate, built
+# by the bootstrap's own compiler).
+# ----------------------------------------------------------------------------
+# Stage 128's suite measures compatibility: it replays every prior
+# release's ok corpus against today's toolchain and names every
+# sanctioned drift in a ledger. Stage 129 is the other half of the same
+# bargain. A ledger tells you WHAT changed; a migration tool UPDATES
+# the source that the change left behind. This is a codemod engine
+# whose rules are derived from the project's real, documented breaking
+# changes — the same events the Stage 128 ledger records — each
+# carrying the release that introduced it ("since"):
+#
+#   html-escape-slash   v0.8.0-alpha    recompute html_escape golden
+#                                       expectations to today's exact
+#                                       rendering (the forward-slash
+#                                       hardening onwards)
+#   rename-project      v0.20.0-alpha   "Hieu Louis" -> "Halis", the
+#                                       project rename, in strings and
+#                                       comments alike
+#   import-guard        v0.51.1-alpha   absolute import paths rewritten
+#                                       to file-relative form (AUTO);
+#                                       `..` segments reported as MANUAL
+#                                       — the deep-scan-19 guard exists
+#                                       because `..` is a local-file-
+#                                       inclusion vector, and a codemod
+#                                       that silently rewrote one would
+#                                       change what the program loads
+#   xxh64-spec          v0.82.0-alpha   pinned XXH64 digest expectations
+#                                       recomputed with the spec-correct
+#                                       algorithm (std.hash's own — the
+#                                       one the differential suites pin
+#                                       to libxxhash 0.8.3 vectors);
+#                                       fires only where the pinned
+#                                       value and the computed value
+#                                       disagree
+#   asm-width           v0.102.0-alpha  narrow GPR names in asm!
+#                                       constraints rewritten to the
+#                                       full 64-bit spelling (Stage 83:
+#                                       a named register binds exactly
+#                                       the register the source spells)
+#   hex64-word          v0.103.0-alpha  hex64 golden expectations
+#                                       re-rendered as the full 16-digit
+#                                       unsigned word (Stage 85 —
+#                                       core/section.hls's own hex64,
+#                                       the ONE definition)
+#
+# THE WALK. A file is migrated by walking it through history: the rules
+# run oldest-first, each seeing the previous rule's output, so a file
+# crosses every release boundary in order. Every rule is individually
+# idempotent, so the pipeline is idempotent: --apply twice leaves the
+# second run CLEAN.
+#
+# THE GATE. --from names the dialect the source is written in (a
+# release tag; default v0.1.0-alpha) and --to the target (default:
+# this tool's version). A rule fires only when since > --from — code
+# written at or after a breaking change already conforms to it.
+#
+# THE HONESTY RULES. A plan never touches a file. --apply writes a
+# .bak beside every file it rewrites (the FIRST backup wins) and
+# reports every edit with file:line precision. --verify runs the
+# Stage-0 evaluator's --check (bin/hlboot) on every file the tool
+# rewrote and fails loudly on the first error — but SKIPS files that
+# still carry unresolved MANUAL findings, named: the tool refuses to
+# certify a file it knows is still broken for a reason it could not
+# fix. (The .py years pointed at tools/hlinterp/boot.py, which retired
+# with the interpreter; the check rides the evaluator the suites pin
+# to the same verdicts.)
+#
+# Exit codes: 0 = CLEAN or APPLIED (verification green when
+# requested); 1 = the plan has findings, or --verify failed; 2 = usage
+# (a missing or non-.hls path, a malformed version, an unknown rule
+# id, --from > --to).
+#
+# Usage:
+#   bin/hls-migrate <path>...                    # the plan
+#   bin/hls-migrate <path>... --diff             # the plan as diffs
+#   bin/hls-migrate <path>... --apply            # rewrite the files
+#   bin/hls-migrate <path>... --apply --verify   # + --check per file
+#   bin/hls-migrate <path>... --json report.json # machine-readable
+#   bin/hls-migrate --rules                      # the rule registry
+# ============================================================================
+
+import "std.str"
+import "std.regex"
+import "std.json"
+import "std.result"
+import "std.hash"
+import "std.fs"
+import "std.bits"
+
+# ----------------------------------------------------------------------------
+# The rule registry, oldest first.
+# ----------------------------------------------------------------------------
+
+fn MG_VERSION() -> str {
+    return "0.147.0-alpha"
+}
+
+struct RuleDef {
+    id: str,
+    since: str,
+    title: str,
+    desc: str
+}
+
+fn MG_RULES() -> list[RuleDef] {
+    let out: list[RuleDef] = []
+    out.push(RuleDef {
+        id: "html-escape-slash", since: "v0.8.0-alpha",
+        title: "recompute html_escape goldens",
+        desc: "golden expectations compared against a direct"
+        + " html_escape(<literal>) call are re-rendered to today's"
+        + " exact output (the forward-slash hardening onwards)"
+    })
+    out.push(RuleDef {
+        id: "rename-project", since: "v0.20.0-alpha",
+        title: "the project rename",
+        desc: "\"Hieu Louis\" / \"Hieu-Louis\" -> \"Halis\", in strings"
+        + " and comments alike (the rename was total)"
+    })
+    out.push(RuleDef {
+        id: "import-guard", since: "v0.51.1-alpha",
+        title: "the deep-scan-19 import guard",
+        desc: "absolute import paths rewritten to file-relative form"
+        + " (AUTO); `..` segments reported as MANUAL — never"
+        + " auto-rewritten, they change what the program loads"
+    })
+    out.push(RuleDef {
+        id: "xxh64-spec", since: "v0.82.0-alpha",
+        title: "the spec-correct XXH64",
+        desc: "pinned digest expectations recomputed with the spec"
+        + " algorithm (verified against libxxhash 0.8.3 vectors);"
+        + " fires only where the pinned value and the computed"
+        + " value disagree"
+    })
+    out.push(RuleDef {
+        id: "asm-width", since: "v0.102.0-alpha",
+        title: "Stage 83 register widths",
+        desc: "narrow GPR names in asm! constraints rewritten to the"
+        + " full 64-bit spelling (a named register binds exactly"
+        + " the register the source spells)"
+    })
+    out.push(RuleDef {
+        id: "hex64-word", since: "v0.103.0-alpha",
+        title: "Stage 85 hex64 words",
+        desc: "hex64 golden expectations re-rendered as the full"
+        + " 16-digit unsigned word"
+    })
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# Version keys — v(major).(minor)[.(patch)][-suffix], tuple-ordered
+# (the suffix drops out of the comparison: the gate speaks in release
+# boundaries, not channels). Same grammar the Stage 128 census uses.
+# ----------------------------------------------------------------------------
+
+struct Ver3 {
+    maj: int,
+    min: int,
+    pat: int,
+    ok: bool
+}
+
+fn mg_digits_end(s: str, from: int) -> int {
+    let mut i: int = from
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        if b < 48 || b > 57 {
+            break
+        }
+        i = i + 1
+    }
+    return i
+}
+
+fn mg_is_version(v: str) -> bool {
+    if v.len() < 4 || v.byte_at(0) != 118 {
+        return false
+    }
+    let rest: str = v.slice(1, v.len())
+    let d1: int = mg_digits_end(rest, 0)
+    if d1 <= 0 || d1 >= rest.len() || rest.byte_at(d1) != 46 {
+        return false
+    }
+    let d2: int = mg_digits_end(rest, d1 + 1)
+    if d2 <= d1 + 1 {
+        return false
+    }
+    let mut pos: int = d2
+    if pos < rest.len() && rest.byte_at(pos) == 46 {
+        let d3: int = mg_digits_end(rest, pos + 1)
+        if d3 > pos + 1 {
+            pos = d3
+        }
+    }
+    if pos >= rest.len() {
+        return true
+    }
+    let c: int = rest.byte_at(pos)
+    if c != 45 && c != 46 {
+        return false
+    }
+    let suf: str = rest.slice(pos + 1, rest.len())
+    if suf.len() == 0 {
+        return false
+    }
+    let mut i: int = 0
+    while i < suf.len() {
+        let b: int = suf.byte_at(i)
+        let ok: bool = (b >= 48 && b <= 57) || (b >= 65 && b <= 90)
+        || (b >= 97 && b <= 122) || b == 45 || b == 46
+        if !ok {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn mg_parse_version(v: str) -> Ver3 {
+    let bad: Ver3 = Ver3 {
+        maj: 0, min: 0, pat: 0, ok: false
+    }
+    if !mg_is_version(v) {
+        return bad
+    }
+    let rest: str = v.slice(1, v.len())
+    let d1: int = mg_digits_end(rest, 0)
+    let d2: int = mg_digits_end(rest, d1 + 1)
+    let mut pat: int = 0
+    let mut pos: int = d2
+    if pos < rest.len() && rest.byte_at(pos) == 46 {
+        let d3: int = mg_digits_end(rest, pos + 1)
+        if d3 > pos + 1 {
+            pat = int(rest.slice(pos + 1, d3))
+            pos = d3
+        }
+    }
+    return Ver3 {
+        maj: int(rest.slice(0, d1)),
+        min: int(rest.slice(d1 + 1, d2)),
+        pat: pat,
+        ok: true
+    }
+}
+
+fn mg_ver_lt(a: Ver3, b: Ver3) -> bool {
+    if a.maj != b.maj {
+        return a.maj < b.maj
+    }
+    if a.min != b.min {
+        return a.min < b.min
+    }
+    return a.pat < b.pat
+}
+
+fn mg_ver_str(v: Ver3) -> str {
+    return "v" + v.maj.to_str() + "." + v.min.to_str() + "." + v.pat.to_str()
+}
+
+fn mg_rule_since(rid: str) -> str {
+    let rules: list[RuleDef] = MG_RULES()
+    let mut i: int = 0
+    while i < rules.len() {
+        if rules.get(i).id == rid {
+            return rules.get(i).since
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# ----------------------------------------------------------------------------
+# Halis string-literal helpers: the lexer's escape set is exactly
+# \n \t \\ \" — anything else is an invalid escape, so a literal the
+# decoder cannot handle is skipped (never guessed at).
+# ----------------------------------------------------------------------------
+
+# mg_decode_literal(lit) -> str, or ok=false when the literal carries
+# an escape the lexer itself would reject (or malformed quoting).
+struct Decoded {
+    data: str,
+    ok: bool
+}
+
+fn mg_decode_literal(lit: str) -> Decoded {
+    let bad: Decoded = Decoded {
+        data: "", ok: false
+    }
+    if lit.len() < 2 {
+        return bad
+    }
+    if lit.byte_at(0) != 34 || lit.byte_at(lit.len() - 1) != 34 {
+        return bad
+    }
+    let body: str = lit.slice(1, lit.len() - 1)
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < body.len() {
+        let c: int = body.byte_at(i)
+        if c == 92 {
+            if i + 1 >= body.len() {
+                return bad
+            }
+            let e: int = body.byte_at(i + 1)
+            if e == 110 {
+                out = out + "\n"
+            } else if e == 116 {
+                out = out + "\t"
+            } else if e == 92 {
+                out = out + "\\"
+            } else if e == 34 {
+                out = out + "\""
+            } else {
+                return bad
+            }
+            i = i + 2
+            continue
+        }
+        if c < 32 {
+            return bad
+        }
+        out = out + body.slice(i, i + 1)
+        i = i + 1
+    }
+    return Decoded {
+        data: out, ok: true
+    }
+}
+
+# mg_encode_literal — bytes -> a Halis literal, escaping exactly the
+# lexer's set.
+fn mg_encode_literal(data: str) -> str {
+    let mut out: str = "\""
+    let mut i: int = 0
+    while i < data.len() {
+        let b: int = data.byte_at(i)
+        if b == 10 {
+            out = out + "\\n"
+        } else if b == 9 {
+            out = out + "\\t"
+        } else if b == 92 {
+            out = out + "\\\\"
+        } else if b == 34 {
+            out = out + "\\\""
+        } else {
+            out = out + data.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out + "\""
+}
+
+# mg_html_escape_today — what std.html's html_escape renders today
+# (& < > " ' /, byte-wise — see std/html.hls).
+fn mg_html_escape_today(data: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < data.len() {
+        let b: int = data.byte_at(i)
+        if b == 38 {
+            out = out + "&amp;"
+        } else if b == 60 {
+            out = out + "&lt;"
+        } else if b == 62 {
+            out = out + "&gt;"
+        } else if b == 34 {
+            out = out + "&quot;"
+        } else if b == 39 {
+            out = out + "&#39;"
+        } else if b == 47 {
+            out = out + "&#x2F;"
+        } else {
+            out = out + data.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# mg_hex64 — the Stage 85 rendering: '0x' + 16 lower-case digits of
+# the unsigned two's-complement word (core/section.hls's own law,
+# rebuilt on std.bits — core.option and std.option cannot share a
+# program, so the one-definition link rides the bits primitives the
+# core module itself uses).
+fn mg_hex64(v: int) -> str {
+    let mut n: int = v
+    let ds: list[int] = []
+    let mut i: int = 0
+    while i < 16 {
+        ds.push(bits_and(n, 15))
+        n = bits_shr(n, 4)
+        i = i + 1
+    }
+    let hex: str = "0123456789abcdef"
+    let mut out: str = "0x"
+    let mut k: int = 15
+    while k >= 0 {
+        out = out + hex.slice(ds.get(k), ds.get(k) + 1)
+        k = k - 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# The Stage 83 register facts: a narrow GPR spelling binds a register
+# the operand cannot occupy, so every narrow spelling migrates to its
+# 64-bit name. 52 narrow spellings, 16 destinations.
+# ----------------------------------------------------------------------------
+
+fn mg_reg64() -> list[str] {
+    let out: list[str] = ["rax", "rbx", "rcx", "rdx", "rsi", "rdi",
+    "rbp", "rsp"]
+    let mut n: int = 8
+    while n < 16 {
+        out.push("r" + n.to_str())
+        n = n + 1
+    }
+    return out
+}
+
+# mg_narrow_to_64(name) -> [wide, bits], ["", 0] when the name is not
+# narrow.
+fn mg_narrow_to_64(name: str) -> list[int] {
+    # families, in resolution order: 32-bit, 16-bit, 8-bit high, 8-bit low
+    let wide: list[str] = mg_reg64()
+    # 32-bit names
+    let r32: list[str] = ["eax", "ebx", "ecx", "edx", "esi", "edi",
+    "ebp", "esp"]
+    let mut n: int = 8
+    while n < 16 {
+        r32.push("r" + n.to_str() + "d")
+        n = n + 1
+    }
+    # 16-bit names
+    let r16: list[str] = ["ax", "bx", "cx", "dx", "si", "di", "bp", "sp"]
+    n = 8
+    while n < 16 {
+        r16.push("r" + n.to_str() + "w")
+        n = n + 1
+    }
+    # 8-bit high
+    let r8h: list[str] = ["ah", "bh", "ch", "dh"]
+    # 8-bit low
+    let r8l: list[str] = ["al", "bl", "cl", "dl", "sil", "dil", "bpl",
+    "spl"]
+    n = 8
+    while n < 16 {
+        r8l.push("r" + n.to_str() + "b")
+        n = n + 1
+    }
+    let mut i: int = 0
+    while i < r32.len() {
+        if r32.get(i) == name {
+            return[i, 32]
+        }
+        if r16.get(i) == name {
+            return[i, 16]
+        }
+        if r8l.get(i) == name {
+            return[i, 8]
+        }
+        i = i + 1
+    }
+    let mut j: int = 0
+    while j < r8h.len() {
+        if r8h.get(j) == name {
+            return[j, 8]
+        }
+        j = j + 1
+    }
+    return[-1, 0]
+}
+
+# ----------------------------------------------------------------------------
+# The edit record: [start, end) in the CURRENT text; new == "" with
+# kind "manual" is advice, never a rewrite.
+# ----------------------------------------------------------------------------
+
+struct Edit {
+    start: int,
+    end: int,
+    new: str,
+    kind: str, # auto | manual
+    note: str
+}
+
+struct Finding {
+    rule: str,
+    line: int,
+    col: int,
+    kind: str,
+    old: str,
+    new: str,
+    has_new: bool,
+    note: str
+}
+
+# ----------------------------------------------------------------------------
+# The scans (the .py's regexes, one for one — std.regex carries them:
+# non-capturing groups, optionals, classes and word boundaries).
+# ----------------------------------------------------------------------------
+
+# mg_compile — one pattern, compiled (the error is impossible: the
+# patterns are constants; the panic names a bug if it ever fires).
+fn mg_compile(pattern: str) -> Regex {
+    let rr: Result[Regex, str] = regex_compile(pattern)
+    if result_is_err(rr) {
+        panic("hls-migrate: internal regex error: " + pattern)
+    }
+    return result_unwrap(rr)
+}
+
+# mg_find_all(re, text) — every match in order.
+fn mg_find_all(re: Regex, text: str) -> list[RegexMatch] {
+    return regex_find_all(re, text, 100000)
+}
+
+# mg_group(m, i) — the group's span text ("" when the group did not
+# take part; callers pass the hay).
+fn mg_group(m: RegexMatch, i: int, hay: str) -> str {
+    if i >= m.groups.len() {
+        return ""
+    }
+    let g: RegexGroupSpan = m.groups.get(i)
+    if g.start < 0 || g.end < g.start {
+        return ""
+    }
+    return hay.slice(g.start, g.end)
+}
+
+fn mg_group_start(m: RegexMatch, i: int) -> int {
+    if i >= m.groups.len() {
+        return -1
+    }
+    return m.groups.get(i).start
+}
+
+# ---- rule: html-escape-slash ----
+
+fn MG_RE_HTML() -> str {
+    return "html_escape\\s*\\(\\s*(\"(?:[^\"\\\\]|\\\\.)*\")\\s*\\)\\s*(==|!=)\\s*(\"(?:[^\"\\\\]|\\\\.)*\")"
+}
+
+fn MG_RE_HTML_REV() -> str {
+    return "(\"(?:[^\"\\\\]|\\\\.)*\")\\s*(==|!=)\\s*html_escape\\s*\\(\\s*(\"(?:[^\"\\\\]|\\\\.)*\")\\s*\\)"
+}
+
+# mg_scan_html(text) — a golden literal compared against a direct
+# html_escape(<literal>) call is re-rendered to today's exact output.
+# Both operand orders; the INPUT literal is never touched.
+fn mg_scan_html(text: str) -> list[Edit] {
+    let edits: list[Edit] = []
+    let re: Regex = mg_compile(MG_RE_HTML())
+    let ms: list[RegexMatch] = mg_find_all(re, text)
+    let mut i: int = 0
+    while i < ms.len() {
+        let m: RegexMatch = ms.get(i)
+        let exp_lit: str = mg_group(m, 3, text)
+        let inp_lit: str = mg_group(m, 1, text)
+        mg_html_edit(edits, mg_group_start(m, 3), exp_lit, inp_lit, text)
+        i = i + 1
+    }
+    let re2: Regex = mg_compile(MG_RE_HTML_REV())
+    let ms2: list[RegexMatch] = mg_find_all(re2, text)
+    let mut j: int = 0
+    while j < ms2.len() {
+        let m2: RegexMatch = ms2.get(j)
+        let exp_lit2: str = mg_group(m2, 1, text)
+        let inp_lit2: str = mg_group(m2, 3, text)
+        mg_html_edit(edits, mg_group_start(m2, 1), exp_lit2, inp_lit2, text)
+        j = j + 1
+    }
+    return edits
+}
+
+fn mg_html_edit(edits: list[Edit], exp_start: int, exp_lit: str,
+inp_lit: str, text: str) -> void {
+    let inp: Decoded = mg_decode_literal(inp_lit)
+    let cur: Decoded = mg_decode_literal(exp_lit)
+    if !inp.ok || !cur.ok {
+        # Not decodable (a lexer-invalid escape): report, never guess.
+        edits.push(Edit {
+            start: exp_start, end: exp_start + exp_lit.len(),
+            new: "", kind: "manual",
+            note: "golden expectation not decodable as a Halis "
+            + "string literal; recompute html_escape output by hand"
+        })
+        return
+    }
+    let want: str = mg_encode_literal(mg_html_escape_today(inp.data))
+    if want == exp_lit {
+        return # the golden already pins today's output
+    }
+    edits.push(Edit {
+        start: exp_start, end: exp_start + exp_lit.len(),
+        new: want, kind: "auto",
+        note: "html_escape output changed (forward-slash escaping, "
+        + "v0.8.0-alpha); golden re-rendered"
+    })
+}
+
+# ---- rule: rename-project ----
+
+fn mg_scan_rename(text: str) -> list[Edit] {
+    let edits: list[Edit] = []
+    let mut i: int = 0
+    while i + 11 <= text.len() {
+        if text.slice(i, i + 4) == "Hieu"
+        && (text.byte_at(i + 4) == 32 || text.byte_at(i + 4) == 45)
+        && text.slice(i + 5, i + 10) == "Louis" {
+            edits.push(Edit {
+                start: i, end: i + 10, new: "Halis", kind: "auto",
+                note: "the project renamed to Halis (v0.20.0-alpha)"
+            })
+            i = i + 10
+            continue
+        }
+        i = i + 1
+    }
+    return edits
+}
+
+# ---- rule: import-guard ----
+
+# mg_scan_imports — `import "..."` LINES only (the .py's ^-anchored
+# multiline pattern, as a line walk: line-leading whitespace, the
+# keyword, the literal).
+fn mg_scan_imports(text: str) -> list[Edit] {
+    let edits: list[Edit] = []
+    let lines: list[str] = text.split("\n")
+    let mut off: int = 0
+    let mut li: int = 0
+    while li < lines.len() {
+        let line: str = lines.get(li)
+        let t: str = mg_lstrip(line)
+        if t.starts_with("import ") {
+            let ws: int = line.len() - t.len()
+            let rest_kw: str = t.slice(6, t.len())
+            let after: str = mg_lstrip(rest_kw)
+            let kwspace: int = 6 + (rest_kw.len() - after.len())
+            if after.starts_with("\"") {
+                let close: int = mg_find_from(after, "\"", 1)
+                if close > 1 {
+                    let lit: str = after.slice(0, close + 1)
+                    let path: str = after.slice(1, close)
+                    let lit_start: int = off + ws + kwspace
+                    mg_import_edit(edits, lit_start, lit, path)
+                }
+            }
+        }
+        off = off + line.len() + 1
+        li = li + 1
+    }
+    return edits
+}
+
+fn mg_lstrip(s: str) -> str {
+    let mut i: int = 0
+    while i < s.len() && s.byte_at(i) <= 32 {
+        i = i + 1
+    }
+    return s.slice(i, s.len())
+}
+
+fn mg_lstrip_len(s: str) -> int {
+    let mut i: int = 0
+    while i < s.len() && s.byte_at(i) <= 32 {
+        i = i + 1
+    }
+    return s.len() - i
+}
+
+fn mg_find_from(s: str, sub: str, from: int) -> int {
+    let mut i: int = from
+    while i + sub.len() <= s.len() {
+        if s.slice(i, i + sub.len()) == sub {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn mg_import_edit(edits: list[Edit], lit_start: int, lit: str,
+path: str) -> void {
+    if path.byte_at(0) == 47 || path.byte_at(0) == 92 {
+        # absolute: rewrite file-relative — unless it smuggles a '..'
+        let stripped: str = mg_lstrip_chars(path, "/\\")
+        let new_path: str = "./" + mg_slashes(stripped)
+        if mg_has_dotdot_segment(new_path) {
+            edits.push(Edit {
+                start: lit_start, end: lit_start + lit.len(),
+                new: "", kind: "manual",
+                note: "absolute import path carrying a '..' segment — "
+                + "rejected by the deep-scan-19 guard; move the "
+                + "module below the importer and import downward"
+            })
+            return
+        }
+        edits.push(Edit {
+            start: lit_start, end: lit_start + lit.len(),
+            new: "\"" + new_path + "\"", kind: "auto",
+            note: "absolute import paths are rejected (deep-scan-19); "
+            + "rewritten relative to the importing file — the "
+            + "target must live at the new path"
+        })
+        return
+    }
+    if mg_has_dotdot_segment(mg_slashes(path)) {
+        edits.push(Edit {
+            start: lit_start, end: lit_start + lit.len(),
+            new: "", kind: "manual",
+            note: "import path contains a '..' segment, rejected by "
+            + "the deep-scan-19 local-file-inclusion guard; move "
+            + "the module below the importer and import downward "
+            + "(never auto-rewritten)"
+        })
+        return
+    }
+    let prefixes: list[str] = ["std.", "core."]
+    let mut pi: int = 0
+    while pi < prefixes.len() {
+        let prefix: str = prefixes.get(pi)
+        if path.starts_with(prefix) {
+            let mod: str = path.slice(prefix.len(), path.len())
+            if mod.byte_at(0) == 47 || mod.byte_at(0) == 92 {
+                let new_path: str = prefix
+                + mg_lstrip_chars(mod, "/\\")
+                edits.push(Edit {
+                    start: lit_start, end: lit_start + lit.len(),
+                    new: "\"" + new_path + "\"", kind: "auto",
+                    note: "module path must be relative after '" + prefix
+                    + "' (deep-scan-19)"
+                })
+            } else {
+                if mg_has_dotdot_segment(mg_slashes(mod)) {
+                    edits.push(Edit {
+                        start: lit_start, end: lit_start + lit.len(),
+                        new: "", kind: "manual",
+                        note: "module path contains a '..' segment, "
+                        + "rejected by the deep-scan-19 guard"
+                    })
+                }
+            }
+            return
+        }
+        pi = pi + 1
+    }
+}
+
+fn mg_lstrip_chars(s: str, chars: str) -> str {
+    let mut i: int = 0
+    while i < s.len() && chars.contains(s.slice(i, i + 1)) {
+        i = i + 1
+    }
+    return s.slice(i, s.len())
+}
+
+fn mg_slashes(s: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < s.len() {
+        if s.byte_at(i) == 92 {
+            out = out + "/"
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn mg_has_dotdot_segment(path: str) -> bool {
+    let parts: list[str] = path.split("/")
+    let mut i: int = 0
+    while i < parts.len() {
+        if parts.get(i) == ".." {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# ---- rule: xxh64-spec ----
+
+fn MG_RE_XXH() -> str {
+    return "(xxhash_str(?:_seeded)?)\\s*\\(\\s*(\"(?:[^\"\\\\]|\\\\.)*\")\\s*(?:,\\s*(-?\\d+)\\s*)?\\)\\s*(==|!=)\\s*(-?\\d+)"
+}
+
+fn MG_RE_XXH_REV() -> str {
+    return "(-?\\d+)\\s*(==|!=)\\s*(xxhash_str(?:_seeded)?)\\s*\\(\\s*(\"(?:[^\"\\\\]|\\\\.)*\")\\s*(?:,\\s*(-?\\d+)\\s*)?\\)"
+}
+
+# mg_scan_xxh — pinned digest expectations on literal inputs are
+# recomputed with the spec algorithm (std.hash's own, the one the
+# suites pin to libxxhash 0.8.3); a disagreement is rewritten.
+fn mg_scan_xxh(text: str) -> list[Edit] {
+    let edits: list[Edit] = []
+    let re: Regex = mg_compile(MG_RE_XXH())
+    let ms: list[RegexMatch] = mg_find_all(re, text)
+    let mut i: int = 0
+    while i < ms.len() {
+        let m: RegexMatch = ms.get(i)
+        mg_xxh_edit(edits, mg_group_start(m, 5), mg_group(m, 5, text),
+        mg_group(m, 2, text), mg_group(m, 3, text),
+        mg_group(m, 1, text))
+        i = i + 1
+    }
+    let re2: Regex = mg_compile(MG_RE_XXH_REV())
+    let ms2: list[RegexMatch] = mg_find_all(re2, text)
+    let mut j: int = 0
+    while j < ms2.len() {
+        let m2: RegexMatch = ms2.get(j)
+        mg_xxh_edit(edits, mg_group_start(m2, 1), mg_group(m2, 1, text),
+        mg_group(m2, 4, text), mg_group(m2, 5, text),
+        mg_group(m2, 3, text))
+        j = j + 1
+    }
+    return edits
+}
+
+fn mg_xxh_edit(edits: list[Edit], exp_start: int, expect: str,
+inp_lit: str, seed_tok: str, fname: str) -> void {
+    let inp: Decoded = mg_decode_literal(inp_lit)
+    if !inp.ok {
+        edits.push(Edit {
+            start: exp_start, end: exp_start + expect.len(),
+            new: "", kind: "manual",
+            note: "digest input is not a decodable literal; recompute "
+            + "by hand"
+        })
+        return
+    }
+    if fname == "xxhash_str_seeded" && seed_tok == "" {
+        return
+    }
+    if fname == "xxhash_str" && seed_tok != "" {
+        return
+    }
+    let mut seed: int = 0
+    if seed_tok != "" {
+        seed = int(seed_tok)
+    }
+    let mut want: int = 0
+    if seed == 0 {
+        want = xxhash_str(inp.data)
+    } else {
+        want = xxhash_str_seeded(inp.data, seed)
+    }
+    if mg_int_eq_str(expect, want) {
+        return
+    }
+    edits.push(Edit {
+        start: exp_start, end: exp_start + expect.len(),
+        new: want.to_str(), kind: "auto",
+        note: "pinned XXH64 digest disagrees with the spec algorithm "
+        + "(v0.82.0-alpha, libxxhash 0.8.3 vectors); recomputed"
+    })
+}
+
+# mg_int_eq_str(tok, v) — the .py's int(tok) == v, without the
+# arbitrary-precision luxury: numerically for in-range tokens, false
+# for anything a signed int64 cannot hold (the recomputed value always
+# fits, so an out-of-range pin is a disagreement, exactly like the
+# bigint compare).
+fn mg_int_eq_str(tok: str, v: int) -> bool {
+    let t: str = tok.trim()
+    if t.len() == 0 {
+        return false
+    }
+    let neg: bool = t.byte_at(0) == 45
+    let mut digits: str = t
+    if neg || t.byte_at(0) == 43 {
+        digits = t.slice(1, t.len())
+    }
+    if digits.len() == 0 {
+        return false
+    }
+    let mut val: int = 0
+    let mut i: int = 0
+    while i < digits.len() {
+        let b: int = digits.byte_at(i)
+        if b < 48 || b > 57 {
+            return false
+        }
+        let d: int = b - 48
+        if val > (9223372036854775807 - d) / 10 {
+            return false # out of int64 range: a disagreement
+        }
+        val = val * 10 + d
+        i = i + 1
+    }
+    if neg {
+        # INT64_MIN is the one magnitude the positive walk cannot hold
+        if val == 9223372036854775807 {
+            return v == 0 - 9223372036854775807 - 1
+        }
+        if val > 9223372036854775807 {
+            return false
+        }
+        return v == 0 - val
+    }
+    return v == val
+}
+
+# ---- rule: asm-width ----
+
+fn MG_RE_ASM_CON() -> str {
+    return "\\b(in|out|inout|clobber)\\s*\\(\\s*\"([A-Za-z0-9]+)\"\\s*\\)"
+}
+
+# mg_asm_spans(text) — the [start, end] pairs of every asm!( ... )
+# argument list: the opening paren's offset and its matching close,
+# strings and comments respected.
+fn mg_asm_spans(text: str) -> list[int] {
+    let spans: list[int] = []
+    let n: int = text.len()
+    let mut i: int = 0
+    while i + 5 <= n {
+        if text.slice(i, i + 4) == "asm!"
+        && text.byte_at(i + 4) == 40 {
+            let mut j: int = i + 5
+            let mut depth: int = 1
+            while j < n && depth > 0 {
+                let c: int = text.byte_at(j)
+                if c == 34 {
+                    j = j + 1
+                    while j < n {
+                        if text.byte_at(j) == 92 {
+                            j = j + 2
+                            continue
+                        }
+                        if text.byte_at(j) == 34 {
+                            break
+                        }
+                        j = j + 1
+                    }
+                } else if c == 35 {
+                    while j < n && text.byte_at(j) != 10 {
+                        j = j + 1
+                    }
+                } else if c == 40 {
+                    depth = depth + 1
+                } else if c == 41 {
+                    depth = depth - 1
+                    if depth == 0 {
+                        spans.push(i + 4)
+                        spans.push(j)
+                    }
+                }
+                j = j + 1
+            }
+            i = i + 5
+            continue
+        }
+        i = i + 1
+    }
+    return spans
+}
+
+# mg_scan_asm — inside asm!( ... ) spans only, every narrow GPR
+# spelling in an in/out/inout/clobber constraint becomes its 64-bit
+# name.
+fn mg_scan_asm(text: str) -> list[Edit] {
+    let edits: list[Edit] = []
+    let spans: list[int] = mg_asm_spans(text)
+    let re: Regex = mg_compile(MG_RE_ASM_CON())
+    let mut si: int = 0
+    while si + 1 < spans.len() {
+        let lo: int = spans.get(si)
+        let hi: int = spans.get(si + 1)
+        let span: str = text.slice(lo, hi)
+        let ms: list[RegexMatch] = mg_find_all(re, span)
+        let mut mi: int = 0
+        while mi < ms.len() {
+            let m: RegexMatch = ms.get(mi)
+            let name: str = mg_group(m, 2, span)
+            let wide_i: int = mg_narrow_to_64(name).get(0)
+            let bits: int = mg_narrow_to_64(name).get(1)
+            if wide_i < 0 {
+                mi = mi + 1
+                continue
+            }
+            let wide: str = mg_reg64().get(wide_i)
+            edits.push(Edit {
+                start: lo + m.groups.get(2).start,
+                end: lo + m.groups.get(2).end,
+                new: wide, kind: "auto",
+                note: "'" + name + "' binds a " + bits.to_str() + "-bit "
+                + "register; Stage 83 rewrites narrow names to the "
+                + "full 64-bit spelling ('" + wide + "')"
+            })
+            mi = mi + 1
+        }
+        si = si + 2
+    }
+    return edits
+}
+
+# ---- rule: hex64-word ----
+
+fn MG_RE_HEX() -> str {
+    return "hex64\\s*\\((?:[^()]|\\([^()]*\\))*\\)\\s*(==|!=)\\s*(\"(?:[^\"\\\\]|\\\\.)*\")"
+}
+
+fn MG_RE_HEX_REV() -> str {
+    return "(\"(?:[^\"\\\\]|\\\\.)*\")\\s*(==|!=)\\s*hex64\\s*\\((?:[^()]|\\([^()]*\\))*\\)"
+}
+
+# mg_scan_hex64 — string literals compared against hex64(...) calls,
+# re-rendered as the Stage 85 full word.
+fn mg_scan_hex64(text: str) -> list[Edit] {
+    let edits: list[Edit] = []
+    let re: Regex = mg_compile(MG_RE_HEX())
+    let ms: list[RegexMatch] = mg_find_all(re, text)
+    let mut i: int = 0
+    while i < ms.len() {
+        let m: RegexMatch = ms.get(i)
+        mg_hex_edit(edits, mg_group(m, 2, text), mg_group_start(m, 2))
+        i = i + 1
+    }
+    let re2: Regex = mg_compile(MG_RE_HEX_REV())
+    let ms2: list[RegexMatch] = mg_find_all(re2, text)
+    let mut j: int = 0
+    while j < ms2.len() {
+        let m2: RegexMatch = ms2.get(j)
+        mg_hex_edit(edits, mg_group(m2, 1, text), mg_group_start(m2, 1))
+        j = j + 1
+    }
+    return edits
+}
+
+fn mg_hex_edit(edits: list[Edit], lit: str, lit_start: int) -> void {
+    if lit.len() < 2 {
+        return
+    }
+    let s: str = lit.slice(1, lit.len() - 1)
+    if !mg_is_hex64_literal(s) {
+        return
+    }
+    # the .py parsed arbitrary-precision ints and rendered v & U64; the
+    # port computes the u64 PATTERN directly: the word's two's-
+    # complement reading, negated when the literal carries a sign
+    # (mod 2^64 — the one magnitude whose negation is itself).
+    let neg: bool = s.byte_at(0) == 45
+    let mut pattern: int = mg_hex_word(s)
+    if neg {
+        if pattern != 0 - 9223372036854775807 - 1 {
+            pattern = 0 - pattern
+        }
+    }
+    let want: str = mg_hex64(pattern)
+    if want == s {
+        return
+    }
+    edits.push(Edit {
+        start: lit_start, end: lit_start + lit.len(),
+        new: "\"" + want + "\"", kind: "auto",
+        note: "hex64 renders the full 16-digit unsigned word (Stage "
+        + "85); '" + s + "' -> '" + want + "'"
+    })
+}
+
+# mg_is_hex64_literal — ^-?0[xX][0-9a-fA-F]+$ (the .py's gate).
+fn mg_is_hex64_literal(s: str) -> bool {
+    let mut t: str = s
+    if t.len() > 0 && t.byte_at(0) == 45 {
+        t = t.slice(1, t.len())
+    }
+    if t.len() < 3 {
+        return false
+    }
+    if t.byte_at(0) != 48 {
+        return false
+    }
+    if t.byte_at(1) != 120 && t.byte_at(1) != 88 {
+        return false
+    }
+    let body: str = t.slice(2, t.len())
+    if body.len() == 0 {
+        return false
+    }
+    let mut i: int = 0
+    while i < body.len() {
+        let b: int = body.byte_at(i)
+        if !((b >= 48 && b <= 57) || (b >= 97 && b <= 102)
+        || (b >= 65 && b <= 70)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# mg_hex_word — the literal's u64 word as an int64 BIT PATTERN (the
+# top nibble carries the two's-complement wrap; the sign, if any, is
+# the caller's business — the .py's arbitrary-precision int & U64,
+# made static).
+fn mg_hex_word(s: str) -> int {
+    let mut t: str = s
+    if t.len() > 0 && t.byte_at(0) == 45 {
+        t = t.slice(1, t.len())
+    }
+    if t.len() < 3 || t.byte_at(0) != 48 {
+        return 0
+    }
+    let body: str = t.slice(2, t.len())
+    if body.len() > 16 {
+        return 0 # beyond the word: nobody pins this
+    }
+    let padded: str = mg_pad_left_str(body, 16)
+    let top: int = mg_hex_digit(padded.byte_at(0))
+    let mut val: int = 0
+    if top >= 8 {
+        val = (top - 16) * 1152921504606846976 # (top-16) * 16^15
+    } else {
+        val = top * 1152921504606846976
+    }
+    let mut i: int = 1
+    while i < 16 {
+        let d: int = mg_hex_digit(padded.byte_at(i))
+        val = val + d * mg_pow16(15 - i)
+        i = i + 1
+    }
+    return val
+}
+
+fn mg_hex_digit(b: int) -> int {
+    if b >= 48 && b <= 57 {
+        return b - 48
+    }
+    if b >= 97 && b <= 102 {
+        return b - 87
+    }
+    if b >= 65 && b <= 70 {
+        return b - 55
+    }
+    return 0
+}
+
+fn mg_pow16(n: int) -> int {
+    let mut out: int = 1
+    let mut i: int = 0
+    while i < n {
+        out = out * 16
+        i = i + 1
+    }
+    return out
+}
+
+fn mg_pad_left_str(s: str, n: int) -> str {
+    let mut out: str = s
+    while out.len() < n {
+        out = "0" + out
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# The migrator: one file's walk, rules oldest-first, each seeing the
+# previous rule's output.
+# ----------------------------------------------------------------------------
+
+struct Mig {
+    path: str,
+    text: str,
+    only: list[str], # empty = all
+    skip: list[str],
+    findings: list[Finding],
+    changed: bool,
+    rules_fired: list[str]
+}
+
+fn mg_mig_new(path: str, text: str, only: list[str], skip: list[str]) -> Mig {
+    return Mig {
+        path: path, text: text, only: only, skip: skip,
+        findings: [], changed: false, rules_fired: []
+    }
+}
+
+# mg_gated — the gate: a rule fires when the source's dialect (--from)
+# predates the rule's breaking change (since > --from).
+fn mg_gated(m: Mig, rid: str, from_v: Ver3) -> bool {
+    if m.only.len() > 0 && !mg_list_has(m.only, rid) {
+        return false
+    }
+    if mg_list_has(m.skip, rid) {
+        return false
+    }
+    let since: Ver3 = mg_parse_version(mg_rule_since(rid))
+    return mg_ver_lt(from_v, since)
+}
+
+fn mg_list_has(xs: list[str], x: str) -> bool {
+    let mut i: int = 0
+    while i < xs.len() {
+        if xs.get(i) == x {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# mg_line_starts — offset of each line's first byte.
+fn mg_line_starts(text: str) -> list[int] {
+    let starts: list[int] = [0]
+    let mut i: int = 0
+    while i < text.len() {
+        if text.byte_at(i) == 10 {
+            starts.push(i + 1)
+        }
+        i = i + 1
+    }
+    return starts
+}
+
+# mg_line_of — bisect_right(starts, off): the 1-based line of offset.
+fn mg_line_of(starts: list[int], off: int) -> int {
+    let mut lo: int = 0
+    let mut hi: int = starts.len()
+    while lo < hi {
+        let mid: int = (lo + hi) / 2
+        if starts.get(mid) <= off {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    return lo
+}
+
+# mg_run — the walk itself. Edits apply bottom-up so offsets stay
+# valid; AUTO edits rewrite, MANUAL edits only record.
+fn mg_run(m: Mig, from_v: Ver3) -> void {
+    let rules: list[RuleDef] = MG_RULES()
+    let mut ri: int = 0
+    while ri < rules.len() {
+        let rid: str = rules.get(ri).id
+        if !mg_gated(m, rid, from_v) {
+            ri = ri + 1
+            continue
+        }
+        let edits: list[Edit] = mg_scan_rule(rid, m.text)
+        if edits.len() == 0 {
+            ri = ri + 1
+            continue
+        }
+        m.rules_fired.push(rid)
+        let starts: list[int] = mg_line_starts(m.text)
+        # sort by (start, end), then apply bottom-up
+        let order: list[int] = mg_sort_edits(edits)
+        let mut k: int = order.len() - 1
+        while k >= 0 {
+            let e: Edit = edits.get(order.get(k))
+            let ln: int = mg_line_of(starts, e.start)
+            let col: int = e.start - starts.get(ln - 1) + 1
+            m.findings.push(Finding {
+                rule: rid, line: ln, col: col, kind: e.kind,
+                old: m.text.slice(e.start, e.end), new: e.new,
+                has_new: e.kind == "auto", note: e.note
+            })
+            if e.kind == "auto" {
+                m.text = m.text.slice(0, e.start) + e.new
+                + m.text.slice(e.end, m.text.len())
+                m.changed = true
+            }
+            k = k - 1
+        }
+        ri = ri + 1
+    }
+    mg_sort_findings(m.findings)
+}
+
+fn mg_scan_rule(rid: str, text: str) -> list[Edit] {
+    if rid == "html-escape-slash" {
+        return mg_scan_html(text)
+    }
+    if rid == "rename-project" {
+        return mg_scan_rename(text)
+    }
+    if rid == "import-guard" {
+        return mg_scan_imports(text)
+    }
+    if rid == "xxh64-spec" {
+        return mg_scan_xxh(text)
+    }
+    if rid == "asm-width" {
+        return mg_scan_asm(text)
+    }
+    return mg_scan_hex64(text)
+}
+
+fn mg_sort_edits(edits: list[Edit]) -> list[int] {
+    let order: list[int] = []
+    let mut i: int = 0
+    while i < edits.len() {
+        order.push(i)
+        i = i + 1
+    }
+    let mut j: int = 1
+    while j < order.len() {
+        let v: int = order.get(j)
+        let ev: Edit = edits.get(v)
+        let mut k: int = j - 1
+        while k >= 0 {
+            let ke: Edit = edits.get(order.get(k))
+            let mut gt: bool = ke.start > ev.start
+            if ke.start == ev.start {
+                gt = ke.end > ev.end
+            }
+            if !gt {
+                break
+            }
+            order.set(k + 1, order.get(k))
+            k = k - 1
+        }
+        order.set(k + 1, v)
+        j = j + 1
+    }
+    return order
+}
+
+fn mg_sort_findings(fs: list[Finding]) -> void {
+    let mut j: int = 1
+    while j < fs.len() {
+        let v: Finding = fs.get(j)
+        let mut k: int = j - 1
+        while k >= 0 {
+            let kf: Finding = fs.get(k)
+            let mut gt: bool = kf.line > v.line
+            if kf.line == v.line {
+                gt = kf.col > v.col
+            }
+            if !gt {
+                break
+            }
+            fs.set(k + 1, fs.get(k))
+            k = k - 1
+        }
+        fs.set(k + 1, v)
+        j = j + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# File discovery, apply, verify.
+# ----------------------------------------------------------------------------
+
+# mg_collect — files to migrate: a path may be a single .hls file or a
+# directory (walked recursively; hidden dirs and *.bak skipped; results
+# sorted for a deterministic report).
+fn mg_collect(paths: list[str]) -> list[str] uses IO, Fs, Proc, Exit {
+    let files: list[str] = []
+    let mut i: int = 0
+    while i < paths.len() {
+        let p: str = paths.get(i)
+        let pp: Path = path_from_str(p)
+        if path_is_file(pp) {
+            if !p.ends_with(".hls") {
+                mg_usage("not a .hls file: " + p)
+            }
+            files.push(mg_norm_abs(p))
+        } else {
+            if !path_is_dir(pp) {
+                mg_usage("no such file or directory: " + p)
+            }
+            let walked: list[str] = mg_walk(p)
+            let mut j: int = 0
+            while j < walked.len() {
+                files.push(walked.get(j))
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    return files
+}
+
+fn mg_norm_abs(p: str) -> str uses Proc {
+    if p.len() > 0 && p.byte_at(0) == 47 {
+        return cc_normpath_of(p)
+    }
+    return cc_normpath_of(cwd_get() + "/" + p)
+}
+
+fn cc_normpath_of(p: str) -> str {
+    let abs: bool = p.len() > 0 && p.byte_at(0) == 47
+    let parts: list[str] = p.split("/")
+    let stack: list[str] = []
+    let mut i: int = 0
+    while i < parts.len() {
+        let seg: str = parts.get(i)
+        if seg == "" || seg == "." {
+            i = i + 1
+            continue
+        }
+        if seg == ".." {
+            if stack.len() > 0 && stack.get(stack.len() - 1) != ".." {
+                stack.pop()
+            } else {
+                if !abs {
+                    stack.push("..")
+                }
+            }
+            i = i + 1
+            continue
+        }
+        stack.push(seg)
+        i = i + 1
+    }
+    let mut out: str = ""
+    if abs {
+        out = "/"
+    }
+    let mut j: int = 0
+    while j < stack.len() {
+        if j > 0 {
+            out = out + "/"
+        }
+        out = out + stack.get(j)
+        j = j + 1
+    }
+    if out == "" {
+        return "."
+    }
+    return out
+}
+
+# mg_walk(dir) — the .hls files under dir, recursively, sorted, hidden
+# dirs and *.bak skipped (os.walk with dirs[:] pruned, made static).
+fn mg_walk(dir: str) -> list[str] uses Fs {
+    let out: list[str] = []
+    let pp: Path = path_from_str(dir)
+    if !path_is_dir(pp) {
+        return out
+    }
+    let all: list[Path] = path_walk_files(pp)
+    let rels: list[str] = []
+    let mut i: int = 0
+    while i < all.len() {
+        let full: str = path_to_str(all.get(i))
+        let mut rel: str = full
+        if full.len() > dir.len() + 1 && full.slice(0, dir.len() + 1) == dir + "/" {
+            rel = full.slice(dir.len() + 1, full.len())
+        }
+        # hidden dirs pruned: any segment starting with "."
+        let parts: list[str] = rel.split("/")
+        let mut hidden: bool = false
+        let mut pi: int = 0
+        while pi < parts.len() - 1 {
+            if parts.get(pi).len() > 0 && parts.get(pi).byte_at(0) == 46 {
+                hidden = true
+            }
+            pi = pi + 1
+        }
+        let name: str = parts.get(parts.len() - 1)
+        if !hidden && name.ends_with(".hls") && !name.ends_with(".bak") {
+            rels.push(full)
+        }
+        i = i + 1
+    }
+    let mut j: int = 1
+    while j < rels.len() {
+        let v: str = rels.get(j)
+        let mut k: int = j - 1
+        while k >= 0 && mg_str_lt(v, rels.get(k)) {
+            rels.set(k + 1, rels.get(k))
+            k = k - 1
+        }
+        rels.set(k + 1, v)
+        j = j + 1
+    }
+    let mut m: int = 0
+    while m < rels.len() {
+        out.push(rels.get(m))
+        m = m + 1
+    }
+    return out
+}
+
+fn mg_str_lt(a: str, b: str) -> bool {
+    let n: int = a.len()
+    let m: int = b.len()
+    let mut i: int = 0
+    while i < n && i < m {
+        let ba: int = a.byte_at(i)
+        let bb: int = b.byte_at(i)
+        if ba != bb {
+            return ba < bb
+        }
+        i = i + 1
+    }
+    return n < m
+}
+
+# mg_usage(msg) — the CLI's usage failures (exit 2, stderr, named).
+fn mg_usage(msg: str) -> int uses IO, Exit {
+    eprint("error: " + msg + "\n")
+    exit(2)
+}
+
+# ----------------------------------------------------------------------------
+# The verify gate: bin/hlboot --check on a migrated file.
+# ----------------------------------------------------------------------------
+
+struct RunRes {
+    code: int,
+    out: str,
+    err: str,
+    spawned: bool
+}
+
+fn mg_spawn_capture(prog: str, args: list[str]) -> RunRes uses Proc {
+    let r: RunRes = RunRes {
+        code: -1, out: "", err: "", spawned: false
+    }
+    let pid: int = proc_spawn(prog, args, 2, 1, 1)
+    if pid < 1 {
+        return r
+    }
+    r.spawned = true
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    r.code = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    r.out = out
+    r.err = err
+    return r
+}
+
+# mg_boot_check(path) — (ok, first error line). The .py merged the
+# streams; --check failures land on stderr with stdout empty, so the
+# first combined line is the first non-blank of either.
+fn mg_boot_check(path: str) -> list[str] uses Proc {
+    let r: RunRes = mg_spawn_capture("bin/hlboot", ["--check", path])
+    if r.code == 0 {
+        return["true", ""]
+    }
+    let combined: str = r.out + r.err
+    let lines: list[str] = combined.split("\n")
+    let mut first: str = "exit " + r.code.to_str()
+    let mut i: int = 0
+    while i < lines.len() {
+        let l: str = lines.get(i).trim()
+        if l != "" {
+            first = l
+            break
+        }
+        i = i + 1
+    }
+    return["false", first]
+}
+
+# ----------------------------------------------------------------------------
+# The unified diff (difflib.unified_diff, n=2): an LCS over lines, the
+# hunks packed the way python packs them.
+# ----------------------------------------------------------------------------
+
+# mg_diff_lines(a, b) — the LCS edit script as [op, line] rows:
+# op 0 = keep, 1 = delete, 2 = insert.
+fn mg_diff_lines(a: list[str], b: list[str]) -> list[int] {
+    # opcodes flattened: [op, ai, bi] triples
+    let n: int = a.len()
+    let m: int = b.len()
+    # LCS table (n+1) x (m+1); the corpora are small (source files)
+    let widths: list[int] = []
+    let mut wi: int = 0
+    while wi <= m {
+        widths.push(0)
+        wi = wi + 1
+    }
+    let rows: list[list[int]] = []
+    let mut ri: int = 0
+    while ri <= n {
+        rows.push(widths)
+        ri = ri + 1
+    }
+    let mut i: int = n
+    while i >= 0 {
+        let mut j: int = m
+        while j >= 0 {
+            let mut v: int = 0
+            if i < n && j < m {
+                if a.get(i) == b.get(j) {
+                    v = rows.get(i + 1).get(j + 1) + 1
+                } else {
+                    let d1: int = rows.get(i + 1).get(j)
+                    let d2: int = rows.get(i).get(j + 1)
+                    v = d1
+                    if d2 > d1 {
+                        v = d2
+                    }
+                }
+            }
+            rows.get(i).set(j, v)
+            j = j - 1
+        }
+        i = i - 1
+    }
+    # walk the table
+    let ops: list[int] = []
+    let mut ai: int = 0
+    let mut bi: int = 0
+    while ai < n || bi < m {
+        if ai < n && bi < m && a.get(ai) == b.get(bi) {
+            ops.push(0)
+            ops.push(ai)
+            ops.push(bi)
+            ai = ai + 1
+            bi = bi + 1
+        } else {
+            let mut down: int = 0 - 1
+            let mut right: int = 0 - 1
+            if ai < n {
+                down = rows.get(ai + 1).get(bi)
+            }
+            if bi < m {
+                right = rows.get(ai).get(bi + 1)
+            }
+            if bi >= m || (ai < n && down >= right) {
+                ops.push(1)
+                ops.push(ai)
+                ops.push(bi)
+                ai = ai + 1
+            } else {
+                ops.push(2)
+                ops.push(ai)
+                ops.push(bi)
+                bi = bi + 1
+            }
+        }
+    }
+    return ops
+}
+
+# mg_unified_diff(path, before, after) — the diff body lines, python's
+# shape: --- / +++ headers, @@ hunks with 2 lines of context.
+fn mg_unified_diff(path: str, before: str, after: str) -> list[str] {
+    let out: list[str] = []
+    let a: list[str] = mg_split_keep_trailing(before)
+    let b: list[str] = mg_split_keep_trailing(after)
+    let ops: list[int] = mg_diff_lines(a, b)
+    out.push("--- " + path + " (before)")
+    out.push("+++ " + path + " (after)")
+    # group into hunks with context 2
+    let ctx: int = 2
+    let n_ops: int = ops.len() / 3
+    let mut idx: int = 0
+    while idx < n_ops {
+        let op: int = ops.get(idx * 3)
+        if op == 0 {
+            idx = idx + 1
+            continue
+        }
+        # a change starts at idx; find its end (last non-equal within
+        # ctx-distance of another change)
+        let start: int = idx
+        let mut end: int = idx
+        let mut k: int = idx
+        while k < n_ops {
+            if ops.get(k * 3) != 0 {
+                end = k
+            }
+            k = k + 1
+        }
+        # pack trailing context: extend end while within ctx of a change
+        let mut last_change: int = end
+        let mut j: int = idx
+        while j < n_ops {
+            if ops.get(j * 3) != 0 {
+                last_change = j
+            } else {
+                if j > last_change + ctx {
+                    break
+                }
+            }
+            j = j + 1
+        }
+        end = last_change + ctx
+        if end >= n_ops {
+            end = n_ops - 1
+        }
+        let mut hunk_start: int = start - ctx
+        if hunk_start < 0 {
+            hunk_start = 0
+        }
+        # hunk header: 1-based line numbers, python's count style
+        let a_start: int = ops.get(hunk_start * 3 + 1)
+        let b_start: int = ops.get(hunk_start * 3 + 2)
+        let mut a_count: int = 0
+        let mut b_count: int = 0
+        let mut q: int = hunk_start
+        while q <= end {
+            let o: int = ops.get(q * 3)
+            if o == 0 {
+                a_count = a_count + 1
+                b_count = b_count + 1
+            } else {
+                if o == 1 {
+                    a_count = a_count + 1
+                } else {
+                    b_count = b_count + 1
+                }
+            }
+            q = q + 1
+        }
+        out.push("@@ -" + mg_range(a_start, a_count) + " +"
+        + mg_range(b_start, b_count) + " @@")
+        let mut p: int = hunk_start
+        while p <= end {
+            let o: int = ops.get(p * 3)
+            if o == 0 {
+                out.push(" " + a.get(ops.get(p * 3 + 1)))
+            } else {
+                if o == 1 {
+                    out.push("-" + a.get(ops.get(p * 3 + 1)))
+                } else {
+                    out.push("+" + b.get(ops.get(p * 3 + 2)))
+                }
+            }
+            p = p + 1
+        }
+        idx = end + 1
+    }
+    return out
+}
+
+# mg_range(start, count) — difflib's "@@ -l,n @@" range: count 1 drops
+# the ",1"; an empty range is "l,0" with l one past the region.
+fn mg_range(start0: int, count: int) -> str {
+    let start: int = start0 + 1
+    if count == 1 {
+        return start.to_str()
+    }
+    if count == 0 {
+        return(start - 1).to_str() + ",0"
+    }
+    return start.to_str() + "," + count.to_str()
+}
+
+# mg_split_keep_trailing — python's splitlines(): no trailing empty
+# piece after the final newline.
+fn mg_split_keep_trailing(s: str) -> list[str] {
+    if s == "" {
+        return[]
+    }
+    let parts: list[str] = s.split("\n")
+    if parts.get(parts.len() - 1) == "" {
+        parts.pop()
+    }
+    return parts
+}
+
+# ----------------------------------------------------------------------------
+# Reporting.
+# ----------------------------------------------------------------------------
+
+# mg_finding_line — the human report's one row.
+fn mg_finding_line(f: Finding, path: str) -> str {
+    let mut tag: str = "AUTO"
+    if f.kind != "auto" {
+        tag = "MANUAL"
+    }
+    let mut arrow: str = ""
+    if f.kind == "auto" && f.old.len() <= 40 {
+        let mut shown_new: str = f.new
+        if shown_new.len() > 60 {
+            shown_new = shown_new.slice(0, 57) + "..."
+        }
+        arrow = "  " + mg_repr(f.old) + " -> " + mg_repr(shown_new)
+    }
+    return path + ":" + f.line.to_str() + ":" + f.col.to_str() + ": ["
+    + f.rule + "] " + tag + ": " + f.note + arrow
+}
+
+# mg_repr — python's %r for the strings the tool prints (single
+# quotes, the lexer's escapes shown raw).
+fn mg_repr(s: str) -> str {
+    return "'" + s + "'"
+}
+
+# ----------------------------------------------------------------------------
+# JSON rendering — json.dumps(indent=2).
+# ----------------------------------------------------------------------------
+
+fn mg_json_escape(s: str) -> str {
+    let mut out: str = "\""
+    let mut i: int = 0
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        if b == 34 {
+            out = out + "\\\""
+        } else if b == 92 {
+            out = out + "\\\\"
+        } else if b == 10 {
+            out = out + "\\n"
+        } else if b == 9 {
+            out = out + "\\t"
+        } else if b == 13 {
+            out = out + "\\r"
+        } else if b < 32 {
+            out = out + "\\u" + mg_hex4(b)
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out + "\""
+}
+
+fn mg_hex4(v: int) -> str {
+    let hex: str = "0123456789abcdef"
+    let mut n: int = v
+    if n < 0 {
+        n = 0
+    }
+    if n > 65535 {
+        n = 65535
+    }
+    let d3: int = n % 16
+    let d2: int = (n / 16) % 16
+    let d1: int = (n / 256) % 16
+    let d0: int = (n / 4096) % 16
+    return hex.slice(d0, d0 + 1) + hex.slice(d1, d1 + 1)
+    + hex.slice(d2, d2 + 1) + hex.slice(d3, d3 + 1)
+}
+
+fn mg_spaces(n: int) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < n {
+        out = out + " "
+        i = i + 1
+    }
+    return out
+}
+
+fn mg_json_dump_at(v: JsonValue, indent: int) -> str {
+    let pad: str = mg_spaces(indent * 2)
+    let pad2: str = mg_spaces((indent + 1) * 2)
+    if json_is_null(v) {
+        return "null"
+    }
+    if json_is_bool(v) {
+        if json_bool_value(v) {
+            return "true"
+        }
+        return "false"
+    }
+    if json_is_int(v) {
+        return json_int_value(v).to_str()
+    }
+    if json_is_str(v) {
+        return mg_json_escape(json_str_value(v))
+    }
+    if json_is_array(v) {
+        if v.arr.len() == 0 {
+            return "[]"
+        }
+        let mut out: str = "[\n"
+        let mut i: int = 0
+        while i < v.arr.len() {
+            out = out + pad2 + mg_json_dump_at(v.arr.get(i), indent + 1)
+            if i + 1 < v.arr.len() {
+                out = out + ","
+            }
+            out = out + "\n"
+            i = i + 1
+        }
+        return out + pad + "]"
+    }
+    if json_is_object(v) {
+        if v.obj_keys.len() == 0 {
+            return "{}"
+        }
+        let mut out2: str = "{\n"
+        let mut n: int = 0
+        while n < v.obj_keys.len() {
+            out2 = out2 + pad2 + mg_json_escape(v.obj_keys.get(n)) + ": "
+            + mg_json_dump_at(v.obj_vals.get(n), indent + 1)
+            if n + 1 < v.obj_keys.len() {
+                out2 = out2 + ","
+            }
+            out2 = out2 + "\n"
+            n = n + 1
+        }
+        return out2 + pad + "}"
+    }
+    return "null"
+}
+
+fn mg_json_dump(v: JsonValue) -> str {
+    return mg_json_dump_at(v, 0)
+}
+
+# ----------------------------------------------------------------------------
+# The file record (one migrated file's whole story).
+# ----------------------------------------------------------------------------
+
+struct FileRec {
+    rel: str,
+    abs_path: str,
+    changed: bool,
+    before: str,
+    after: str,
+    findings: list[Finding],
+    rules_fired: list[str],
+    auto_n: int,
+    manual_n: int
+}
+
+fn mg_auto_count(fs: list[Finding]) -> int {
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < fs.len() {
+        if fs.get(i).kind == "auto" {
+            n = n + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn mg_manual_rules(m: Mig) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < m.findings.len() {
+        let f: Finding = m.findings.get(i)
+        if f.kind != "auto" && !mg_list_has(out, f.rule) {
+            out.push(f.rule)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# main — the CLI.
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let argv: list[str] = args()
+    let mut paths: list[str] = []
+    let mut from_ver: str = "v0.1.0-alpha"
+    let mut to_ver: str = "v" + MG_VERSION()
+    let mut apply_on: bool = false
+    let mut no_backup: bool = false
+    let mut verify_on: bool = false
+    let mut diff_on: bool = false
+    let mut json_path: str = ""
+    let mut json_stdout: bool = false
+    let mut rules_on: bool = false
+    let mut only_arg: str = ""
+    let mut skip_arg: str = ""
+    let mut version_on: bool = false
+    let mut bad: str = ""
+
+    let mut i: int = 1
+    while i < argv.len() {
+        let a: str = argv.get(i)
+        if a == "--from" {
+            if i + 1 >= argv.len() {
+                bad = "--from needs a value"
+            } else {
+                i = i + 1
+                from_ver = argv.get(i)
+            }
+        } else if a == "--to" {
+            if i + 1 >= argv.len() {
+                bad = "--to needs a value"
+            } else {
+                i = i + 1
+                to_ver = argv.get(i)
+            }
+        } else if a == "--apply" {
+            apply_on = true
+        } else if a == "--no-backup" {
+            no_backup = true
+        } else if a == "--verify" {
+            verify_on = true
+        } else if a == "--diff" {
+            diff_on = true
+        } else if a == "--json" {
+            if i + 1 < argv.len() && !argv.get(i + 1).starts_with("--") {
+                i = i + 1
+                if argv.get(i) == "-" {
+                    json_stdout = true
+                } else {
+                    json_path = argv.get(i)
+                }
+            } else {
+                json_stdout = true
+            }
+        } else if a == "--rules" {
+            rules_on = true
+        } else if a == "--only" {
+            if i + 1 >= argv.len() {
+                bad = "--only needs a value"
+            } else {
+                i = i + 1
+                only_arg = argv.get(i)
+            }
+        } else if a == "--skip" {
+            if i + 1 >= argv.len() {
+                bad = "--skip needs a value"
+            } else {
+                i = i + 1
+                skip_arg = argv.get(i)
+            }
+        } else if a == "--version" {
+            version_on = true
+        } else if a == "--help" || a == "-h" {
+            print("usage: hls-migrate <path>... [--from VER] [--to VER]\n"
+            + "                     [--apply] [--no-backup] [--verify]\n"
+            + "                     [--diff] [--json [FILE]] [--rules]\n"
+            + "                     [--only ID,ID] [--skip ID,ID]\n")
+            return 0
+        } else {
+            paths.push(a)
+        }
+        i = i + 1
+    }
+    if bad != "" {
+        eprint("error: " + bad + "\n")
+        return 2
+    }
+
+    if version_on {
+        println("hls-migrate " + MG_VERSION() + " (Stage 129)")
+        return 0
+    }
+    if rules_on {
+        mg_print_rules()
+        return 0
+    }
+
+    let from_v: Ver3 = mg_parse_version(from_ver)
+    if !from_v.ok {
+        eprint("error: --from must be a release tag like v0.34.0-alpha,"
+        + " got: " + from_ver + "\n")
+        return 2
+    }
+    let to_v: Ver3 = mg_parse_version(to_ver)
+    if !to_v.ok {
+        eprint("error: --to must be a release tag like v1.0, got: "
+        + to_ver + "\n")
+        return 2
+    }
+    if !mg_ver_lt(from_v, to_v) && !(from_v.maj == to_v.maj
+    && from_v.min == to_v.min && from_v.pat == to_v.pat) {
+        eprint("error: --from (" + from_ver + ") is newer than --to ("
+        + to_ver + "); migration walks forward\n")
+        return 2
+    }
+    let only: list[str] = []
+    if only_arg != "" {
+        let parts: list[str] = only_arg.split(",")
+        let mut pi: int = 0
+        while pi < parts.len() {
+            if parts.get(pi) != "" {
+                only.push(parts.get(pi))
+            }
+            pi = pi + 1
+        }
+        let mut oi: int = 0
+        while oi < only.len() {
+            if !mg_rule_known(only.get(oi)) {
+                eprint("error: unknown rule id: " + only.get(oi)
+                + " (--rules lists the registry)\n")
+                return 2
+            }
+            oi = oi + 1
+        }
+    }
+    let skip: list[str] = []
+    if skip_arg != "" {
+        let parts2: list[str] = skip_arg.split(",")
+        let mut si: int = 0
+        while si < parts2.len() {
+            if parts2.get(si) != "" {
+                skip.push(parts2.get(si))
+            }
+            si = si + 1
+        }
+        let mut ski: int = 0
+        while ski < skip.len() {
+            if !mg_rule_known(skip.get(ski)) {
+                eprint("error: unknown rule id: " + skip.get(ski) + "\n")
+                return 2
+            }
+            ski = ski + 1
+        }
+    }
+    if paths.len() == 0 {
+        eprint("error: no PATH given (a .hls file or a directory)\n")
+        return 2
+    }
+
+    let files: list[str] = mg_collect(paths)
+    if files.len() == 0 {
+        eprint("error: no .hls files under the given path(s)\n")
+        return 2
+    }
+
+    # The walk: every file crosses every gated release boundary, oldest
+    # first; each rule sees the previous rule's output.
+    let root: str = mg_repo_root()
+    let recs: list[FileRec] = []
+    let mut fi: int = 0
+    while fi < files.len() {
+        let path: str = files.get(fi)
+        let original: str = read_file(path)
+        let m: Mig = mg_mig_new(path, original, only, skip)
+        mg_run(m, from_v)
+        recs.push(FileRec {
+            rel: mg_relpath(path, root),
+            abs_path: path,
+            changed: m.changed,
+            before: original,
+            after: m.text,
+            findings: m.findings,
+            rules_fired: m.rules_fired,
+            auto_n: mg_auto_count(m.findings),
+            manual_n: m.findings.len() - mg_auto_count(m.findings)
+        })
+        fi = fi + 1
+    }
+
+    # --json: the machine-readable census
+    if json_stdout || json_path != "" {
+        let jtext: str = mg_json_dump(mg_report_json(recs, from_v, to_v,
+        only, skip))
+        if json_stdout {
+            print(jtext + "\n")
+        } else {
+            write_file(json_path, jtext + "\n")
+        }
+        let mut total: int = 0
+        let mut ji: int = 0
+        while ji < recs.len() {
+            total = total + recs.get(ji).auto_n + recs.get(ji).manual_n
+            ji = ji + 1
+        }
+        if total > 0 {
+            return 1
+        }
+        return 0
+    }
+
+    # --diff: the plan as unified diffs
+    if diff_on {
+        let mut any_diff: bool = false
+        let mut di: int = 0
+        while di < recs.len() {
+            let fr: FileRec = recs.get(di)
+            if fr.before != fr.after {
+                any_diff = true
+                let lines: list[str] = mg_unified_diff(fr.rel, fr.before,
+                fr.after)
+                let mut li: int = 0
+                while li < lines.len() {
+                    println(lines.get(li))
+                    li = li + 1
+                }
+            }
+            di = di + 1
+        }
+        if any_diff {
+            return 1
+        }
+        return 0
+    }
+
+    # the plan (or the apply preamble)
+    mg_print_human(recs)
+    let mut total2: int = 0
+    let mut ti: int = 0
+    while ti < recs.len() {
+        total2 = total2 + recs.get(ti).auto_n + recs.get(ti).manual_n
+        ti = ti + 1
+    }
+
+    if !apply_on {
+        if total2 > 0 {
+            return 1
+        }
+        return 0
+    }
+
+    # --apply: rewrite, back up, verify.
+    let rewritten: list[int] = []
+    let mut ai: int = 0
+    while ai < recs.len() {
+        let fr: FileRec = recs.get(ai)
+        if !fr.changed {
+            ai = ai + 1
+            continue
+        }
+        if !no_backup {
+            let bak: str = fr.abs_path + ".bak"
+            if !file_exists(bak) { # the FIRST backup wins
+                write_file(bak, fr.before)
+            }
+        }
+        write_file(fr.abs_path, fr.after)
+        rewritten.push(ai)
+        ai = ai + 1
+    }
+
+    let mut edits_total: int = 0
+    let mut ei: int = 0
+    while ei < recs.len() {
+        edits_total = edits_total + recs.get(ei).auto_n
+        ei = ei + 1
+    }
+    println("hls-migrate: applied " + edits_total.to_str() + " edit"
+    + mg_plural(edits_total) + " across " + rewritten.len().to_str()
+    + " file" + mg_plural(rewritten.len()))
+    let mut mi: int = 0
+    while mi < recs.len() {
+        let fr2: FileRec = recs.get(mi)
+        if fr2.manual_n > 0 {
+            let lines: list[str] = []
+            let mut fj: int = 0
+            while fj < fr2.findings.len() {
+                let f: Finding = fr2.findings.get(fj)
+                if f.kind != "auto" {
+                    lines.push("line " + f.line.to_str())
+                }
+                fj = fj + 1
+            }
+            println("hls-migrate: MANUAL work remains in " + fr2.rel
+            + " (" + mg_join_strs(lines, ", ") + ") — see the "
+            + "findings above or --json")
+        }
+        mi = mi + 1
+    }
+
+    if verify_on {
+        let mut failures: int = 0
+        let mut vi: int = 0
+        while vi < rewritten.len() {
+            let fr3: FileRec = recs.get(rewritten.get(vi))
+            if fr3.manual_n > 0 {
+                println("hls-migrate: verify skipped " + fr3.rel
+                + " (unresolved MANUAL findings: "
+                + mg_join_strs(mg_manual_rules_of(fr3), ", ") + ")")
+                vi = vi + 1
+                continue
+            }
+            let res: list[str] = mg_boot_check(fr3.abs_path)
+            if res.get(0) == "true" {
+                println("hls-migrate: verify OK  " + fr3.rel)
+            } else {
+                failures = failures + 1
+                println("hls-migrate: verify FAIL " + fr3.rel + " — "
+                + res.get(1))
+            }
+            vi = vi + 1
+        }
+        if failures > 0 {
+            println("hls-migrate: verification FAILED for "
+            + failures.to_str() + " file(s)")
+            return 1
+        }
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# The reporting helpers main rides.
+# ----------------------------------------------------------------------------
+
+fn mg_rule_known(rid: str) -> bool {
+    let rules: list[RuleDef] = MG_RULES()
+    let mut i: int = 0
+    while i < rules.len() {
+        if rules.get(i).id == rid {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn mg_repo_root() -> str uses Args {
+    let a: list[str] = args()
+    if a.len() == 0 {
+        return "."
+    }
+    let argv0: str = a.get(0)
+    # bin/hls-migrate -> the repo root above bin/
+    let dir: str = cc_normpath_of(argv0 + "/..")
+    let dir2: str = cc_normpath_of(dir + "/..")
+    return dir2
+}
+
+# mg_relpath(path, root) — the report's display path.
+fn mg_relpath(path: str, root: str) -> str {
+    if root == "." || root == "" {
+        return path
+    }
+    let mut pre: str = root
+    if pre.byte_at(pre.len() - 1) != 47 {
+        pre = pre + "/"
+    }
+    if path.len() >= pre.len() && path.slice(0, pre.len()) == pre {
+        return path.slice(pre.len(), path.len())
+    }
+    return path
+}
+
+fn mg_plural(n: int) -> str {
+    if n == 1 {
+        return ""
+    }
+    return "s"
+}
+
+fn mg_join_strs(xs: list[str], sep: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < xs.len() {
+        if i > 0 {
+            out = out + sep
+        }
+        out = out + xs.get(i)
+        i = i + 1
+    }
+    return out
+}
+
+fn mg_manual_rules_of(fr: FileRec) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < fr.findings.len() {
+        let f: Finding = fr.findings.get(i)
+        if f.kind != "auto" && !mg_list_has(out, f.rule) {
+            out.push(f.rule)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# mg_print_human — the findings, then the census line.
+fn mg_print_human(recs: list[FileRec]) -> void uses IO {
+    let mut ri: int = 0
+    while ri < recs.len() {
+        let fr: FileRec = recs.get(ri)
+        let mut fi: int = 0
+        while fi < fr.findings.len() {
+            println(mg_finding_line(fr.findings.get(fi), fr.rel))
+            fi = fi + 1
+        }
+        ri = ri + 1
+    }
+    let mut n_files: int = 0
+    let mut auto: int = 0
+    let mut manual: int = 0
+    let mut ci: int = 0
+    while ci < recs.len() {
+        if recs.get(ci).findings.len() > 0 {
+            n_files = n_files + 1
+        }
+        auto = auto + recs.get(ci).auto_n
+        manual = manual + recs.get(ci).manual_n
+        ci = ci + 1
+    }
+    let total: int = auto + manual
+    if total == 0 {
+        println("hls-migrate: CLEAN — " + recs.len().to_str()
+        + " files, nothing to migrate")
+        return
+    }
+    println("hls-migrate: " + total.to_str() + " finding"
+    + mg_plural(total) + " across " + n_files.to_str() + " file"
+    + mg_plural(n_files) + " (" + auto.to_str() + " auto, "
+    + manual.to_str() + " manual)")
+}
+
+fn mg_print_rules() -> void uses IO {
+    let rules: list[RuleDef] = MG_RULES()
+    println("hls-migrate " + MG_VERSION() + " — " + rules.len().to_str()
+    + " rules, oldest first (a rule fires when the source dialect "
+    + "--from predates its breaking change):")
+    let mut i: int = 0
+    while i < rules.len() {
+        let r: RuleDef = rules.get(i)
+        println("  " + mg_pad(r.id, 18) + " since " + mg_pad(r.since, 14)
+        + " " + r.title)
+        println("      " + r.desc)
+        i = i + 1
+    }
+}
+
+fn mg_pad(s: str, n: int) -> str {
+    let mut out: str = s
+    while out.len() < n {
+        out = out + " "
+    }
+    return out
+}
+
+# mg_report_json — the machine-readable census.
+fn mg_report_json(recs: list[FileRec], from_v: Ver3, to_v: Ver3,
+only: list[str], skip: list[str]) -> JsonValue {
+    let rules: list[RuleDef] = MG_RULES()
+    let registered: list[JsonValue] = []
+    let mut ri: int = 0
+    while ri < rules.len() {
+        registered.push(json_str(rules.get(ri).id))
+        ri = ri + 1
+    }
+    let selected: list[JsonValue] = []
+    let mut si: int = 0
+    while si < rules.len() {
+        let rid: str = rules.get(si).id
+        let chosen: bool = (only.len() == 0 || mg_list_has(only, rid))
+        && !mg_list_has(skip, rid)
+        && mg_ver_lt(from_v, mg_parse_version(rules.get(si).since))
+        if chosen {
+            selected.push(json_str(rid))
+        }
+        si = si + 1
+    }
+    let files_j: list[JsonValue] = []
+    let mut changed_n: int = 0
+    let mut auto_n: int = 0
+    let mut manual_n: int = 0
+    let mut fi: int = 0
+    while fi < recs.len() {
+        let fr: FileRec = recs.get(fi)
+        if fr.changed {
+            changed_n = changed_n + 1
+        }
+        auto_n = auto_n + fr.auto_n
+        manual_n = manual_n + fr.manual_n
+        let findings_j: list[JsonValue] = []
+        let mut fj: int = 0
+        while fj < fr.findings.len() {
+            let f: Finding = fr.findings.get(fj)
+            let mut new_j: JsonValue = json_null()
+            if f.has_new {
+                new_j = json_str(f.new)
+            }
+            findings_j.push(json_object(
+            ["rule", "line", "col", "kind", "old", "new", "note"],
+            [json_str(f.rule), json_int(f.line), json_int(f.col),
+            json_str(f.kind), json_str(f.old), new_j,
+            json_str(f.note)]))
+            fj = fj + 1
+        }
+        let fired_j: list[JsonValue] = []
+        let mut gi: int = 0
+        while gi < fr.rules_fired.len() {
+            fired_j.push(json_str(fr.rules_fired.get(gi)))
+            gi = gi + 1
+        }
+        files_j.push(json_object(
+        ["path", "changed", "findings", "rules_fired", "auto",
+        "manual"],
+        [json_str(fr.rel), json_bool(fr.changed),
+        json_array(findings_j), json_array(fired_j),
+        json_int(fr.auto_n), json_int(fr.manual_n)]))
+        fi = fi + 1
+    }
+    return json_object(
+    ["tool", "version", "from", "to", "rules_registered",
+    "rules_selected", "files", "summary"],
+    [json_str("hls-migrate"), json_str(MG_VERSION()),
+    json_str(mg_ver_str(from_v)), json_str(mg_ver_str(to_v)),
+    json_array(registered), json_array(selected),
+    json_array(files_j),
+    json_object(
+    ["files_scanned", "files_changed", "findings_auto",
+    "findings_manual"],
+    [json_int(recs.len()), json_int(changed_n),
+    json_int(auto_n), json_int(manual_n)])])
+}

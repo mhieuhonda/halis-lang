@@ -373,9 +373,10 @@ $(BIN)/hls-compat: tools/hls-compat.hls $(wildcard std/*.hls) $(wildcard core/*.
 	@$(CC) $(CFLAGS) -o $@ $@.c -lm -pthread
 	@rm -f $@.c
 
-# hls-migrate -- in Halis (the native twin of the Python hls-migrate.py that
-# retired; same CLI, same wire, same exits).
-$(BIN)/hls-migrate: tools/hls-migrate.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+# hls-migrate -- in Halis (the native twin of the Python hls-migrate.py
+# that retired; same rules, same walk, same honesty gates — the verify
+# leg rides the Stage-0 evaluator, bin/hlboot).
+$(BIN)/hls-migrate: tools/hls-migrate.hls $(wildcard std/*.hls) $(wildcard std/regex/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
 	@mkdir -p $(BIN)
 	@echo "[hls-migrate] hlc compiles the tool (self-hosted, no python)..."
 	@$(BIN)/hlc tools/hls-migrate.hls $@.c
@@ -1124,7 +1125,7 @@ compat-acceptance: $(BIN)/acc-compat $(BIN)/hls-compat bin/hlc
 # exactly the pre-migration places, no .bak litter). The gate needs
 # bin/hlc + gcc for its native legs, so the native build is a
 # prerequisite.
-migrate-acceptance: $(BIN)/acc-migrate bin/hlc
+migrate-acceptance: $(BIN)/acc-migrate $(BIN)/hls-migrate bin/hlc
 	@echo "[Stage 129 acceptance] running tests/acc/migrate_acceptance.hls..."
 	@$(BIN)/acc-migrate
 	@echo "ACCEPTANCE OK: Stage 129 -- migration tooling (hls migrate)"
