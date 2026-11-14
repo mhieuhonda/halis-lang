@@ -1283,7 +1283,7 @@ guarantee:
 guarantee-report:
 	@$(BIN)/hls-guarantee report --out SOUNDNESS.md
 
-guarantee-acceptance: $(BIN)/acc-guarantee bin/hlc
+guarantee-acceptance: $(BIN)/acc-guarantee $(BIN)/hls-guarantee bin/hlc
 	@echo "[Stage 135 acceptance] running tests/acc/guarantee_acceptance.hls..."
 	@$(BIN)/acc-guarantee
 	@echo "ACCEPTANCE OK: Stage 135 -- bug-bounty-eligible soundness guarantees documented"

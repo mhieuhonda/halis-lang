@@ -9254,7 +9254,8 @@ harness whose call precedes its parameter lets is malformed).
 ## 74. The soundness guarantee ledger
 
 SECURITY.md states the security model in prose. Stage 135 makes the
-model AUDITABLE: `tools/hls-guarantee.py` carries the guarantee
+model AUDITABLE: `tools/hls-guarantee.hls` (built as
+`bin/hls-guarantee`) carries the guarantee
 LEDGER — fifteen machine-readable rows, each a soundness guarantee
 the toolchain makes, each bound to the tree it is claimed against by
 three live parts.
@@ -9303,7 +9304,7 @@ seconds.
 
 ### 74.3. The report and the anti-rot law
 
-`hls-guarantee.py report --out SOUNDNESS.md` regenerates the
+`bin/hls-guarantee report --out SOUNDNESS.md` regenerates the
 bug-bounty scope document from the ledger — never hand-written,
 never written from a violated ledger. The render is deterministic:
 fixed row order (critical rows first, the definition order), no
@@ -9878,7 +9879,7 @@ contradiction.
 ### 79.4. Fail-closed, fail-recorded, the state, the battery
 
 An evidence pass re-runs the whole scope through the real checker
-(the hls-guarantee engine, imported; the same counts) and exits 1
+(the hls-guarantee engine, `bin/hls-guarantee`; the same counts) and exits 1
 naming its refusals — and the transcript is still written, with
 `outcome: failed` and the refusals verbatim: a failed pass is a
 record, not a shame. THE STATE is derived from the census on

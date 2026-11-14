@@ -1,0 +1,2060 @@
+# ============================================================================
+# tools/hls-guarantee.hls — the Stage 135 soundness guarantee ledger, in
+# Halis (the native twin of the Python hls-guarantee.py that retired;
+# same ledger, same anchors, same probes — driven through
+# bin/hls-guarantee, built by the bootstrap's own compiler).
+# ----------------------------------------------------------------------------
+# Bug-bounty-eligible guarantees, documented AND re-demonstrated:
+#
+#   1. an ANCHOR is a (file, pattern) pair that must exist in the live
+#      tree — the enforcement point the guarantee rests on, grepped at
+#      run time, with the line number recorded. A deleted or renamed
+#      enforcement point Voids its guarantee and the tool refuses;
+#   2. a PROBE is a real program re-run through the REAL toolchain at
+#      verify time (the Stage-0 evaluator, bin/hlboot): a static probe
+#      must be REFUSED by the checker with the pinned message
+#      substring, a runtime probe must PANIC with the pinned exit code
+#      and message. The guarantee is demonstrated, not asserted;
+#   3. the REPORT regenerates the bug-bounty scope document from the
+#      ledger, anchored to the current commit sha and the ledger
+#      digest. It is deterministic — sorted walks, no wall-clock
+#      unless --stamp — so two regenerations at the same tree are
+#      byte-identical, and any hand-edit is visible as a diff.
+#
+# The anchors were re-pointed when the lab interpreter retired: every
+# enforcement anchor that lived under tools/hlinterp/ now names the
+# self-hosted front-end (src/hlc/) or the evaluator library
+# (tools/hlboot_eval.hls) that carries the same law — the ledger
+# refused to verify until it did, which is the tool working exactly as
+# designed. The --unit-ledger mode answers the gates' module checks
+# (the .py era importlib-loaded the module; the binary prints the same
+# CHECK lines), and `dump` prints the ledger as canonical JSON — the
+# library surface the audit family (hls-auditkit, hls-finalaudit)
+# reads where it once importlib-loaded this module; a TREE's own
+# ledger is read by evaluating that tree's copy of this file
+# (`bin/hlboot <tree>/tools/hls-guarantee.hls dump`).
+#
+# Exit codes: 0 verified / 1 a named violation (fail-closed) /
+# 2 usage error. Every refusal names the rule, not just the fact.
+#
+# Usage:
+#   bin/hls-guarantee list   [--family FAM] [--json]
+#   bin/hls-guarantee show <ID>
+#   bin/hls-guarantee verify [--root PATH] [--json] [--quiet]
+#   bin/hls-guarantee report --out FILE.md [--json FILE.json]
+#                            [--stamp] [--root PATH]
+#   bin/hls-guarantee dump          (the ledger as canonical JSON)
+#   bin/hls-guarantee --unit-ledger (CHECK lines for the gates)
+# ============================================================================
+
+import "std.str"
+import "std.json"
+import "std.result"
+import "std.sha256"
+
+# ----------------------------------------------------------------------------
+# The policy and the vocabulary.
+# ----------------------------------------------------------------------------
+
+fn GG_POLICY() -> str {
+    return "halis-guarantee-1"
+}
+
+fn GG_SECURITY_MD() -> str {
+    return "SECURITY.md"
+}
+
+fn GG_FAMILIES() -> list[str] {
+    return["types", "memory", "arithmetic", "effects", "taint", "concurrency", "match", "capabilities", "sandbox", "consttime", "ffi", "determinism"]
+}
+
+fn GG_SEVERITIES() -> list[str] {
+    return["critical", "high", "medium"]
+}
+
+fn GG_SEV_RANK(sev: str) -> int {
+    if sev == "critical" {
+        return 0
+    }
+    if sev == "high" {
+        return 1
+    }
+    return 2
+}
+
+fn GG_SEV_MEANING(sev: str) -> str {
+    if sev == "critical" {
+        return "the guarantee's failure means memory unsafety, unchecked"
+        + " world effects, or silent cross-implementation divergence"
+    }
+    if sev == "high" {
+        return "the guarantee's failure means a security boundary"
+        + " (exhaustive matching, capability authority, sandbox,"
+        + " constant-time, FFI honesty) is bypassed without the user's"
+        + " consent"
+    }
+    if sev == "medium" {
+        return "the guarantee's failure means a soundness-adjacent"
+        + " property (name resolution, corpus agreement) no longer"
+        + " holds"
+    }
+    return ""
+}
+
+# The policy anchors: the scope document quotes the reporting channel
+# from SECURITY.md LIVE — if the channel moves or the disclosure
+# window changes, the quote must follow, or the ledger refuses.
+struct GgAnchor {
+    file: str,
+    pattern: str
+}
+
+fn GG_POLICY_ANCHORS() -> list[GgAnchor] {
+    return[
+    GgAnchor {
+        file: "SECURITY.md", pattern: "security/advisories"
+    },
+    GgAnchor {
+        file: "SECURITY.md", pattern: "90-day window"
+    },
+    ]
+}
+
+# ----------------------------------------------------------------------------
+# The ledger. Definition order is the presentation order: the two
+# memory guarantees open the table because memory unsafety is the
+# bounty's worst class, the meta guarantees (bootstrap determinism,
+# corpus agreement) close it because they are guarantees ABOUT the
+# guarantees. Every anchor was grepped at the tree this stage shipped
+# from; every probe is a real fixture the suite already runs.
+# ----------------------------------------------------------------------------
+
+struct GgProbe {
+    path: str,
+    expect: str,
+    kind: str, # refuse | panic
+    args: list[str]
+}
+
+struct GgRow {
+    id: str,
+    family: str,
+    severity: str,
+    claim: str,
+    mechanism: str,
+    enforced_by: str,
+    anchors: list[GgAnchor],
+    probes: list[GgProbe],
+    violation: str,
+    repro: str,
+    out_of_scope: str
+}
+
+fn GG_LEDGER() -> list[GgRow] {
+    let rows: list[GgRow] = []
+    rows.push(GgRow {
+        id: "G-MEM-01",
+        family: "memory",
+        severity: "critical",
+        claim:
+        "A moved or dropped binding is unusable: ownership is"
+        + " checked statically on every control-flow path.",
+        mechanism:
+        "The checker carries a moved-flag per binding and refuses"
+        + " any later read, including through if/while/for arms, with"
+        + " a use-of-moved-value error naming the binding.",
+        enforced_by:
+        "the self-hosted checker in src/hlc/ (check_expr.hls,"
+        + " check_match.hls)",
+        anchors: [
+        GgAnchor {
+            file: "src/hlc/check_expr.hls", pattern: "use of moved value"
+        },
+        GgAnchor {
+            file: "src/hlc/check_match.hls", pattern: "use of moved value"
+        },
+        ],
+        probes: [
+        GgProbe {
+            path: "tests/fail/fail_use_after_drop.hls", expect: "use of moved value", kind: "refuse", args: []
+        },
+        GgProbe {
+            path: "tests/fail/fail_take_moved.hls", expect: "use of moved value", kind: "refuse", args: []
+        },
+        GgProbe {
+            path: "tests/fail/fail_uaf_if.hls", expect: "use of moved value", kind: "refuse", args: []
+        },
+        ],
+        violation:
+        "A program the checker ACCEPTS that uses a binding after"
+        + " its ownership was released (drop/take/move), on any path.",
+        repro:
+        "One .hls file where a binding is released and later read;"
+        + " the checker output showing acceptance; the interpreter or"
+        + " native run exhibiting the use-after-release.",
+        out_of_scope:
+        "A user explicitly re-binding with clone() and calling it a"
+        + " violation; drops the checker correctly proves dead.",
+    })
+    rows.push(GgRow {
+        id: "G-MEM-02",
+        family: "memory",
+        severity: "critical",
+        claim:
+        "There is no manual free: the refcounted runtime releases"
+        + " exactly at scope exit, so double-free and use-after-free"
+        + " are structural impossibilities in generated code.",
+        mechanism:
+        "The codegen emits exact retain/release pairs"
+        + " (hl_retain/hl_release) on every control-flow path; the"
+        + " memory-stress acceptance holds RSS flat under ulimit -v"
+        + " 262144.",
+        enforced_by:
+        "src/hlc codegen (refcount emission) + the C runtime +"
+        + " tests/memcheck",
+        anchors: [
+        GgAnchor {
+            file: "src/hlc/codegen.hls", pattern: "hl_release"
+        },
+        GgAnchor {
+            file: "src/hlc/runtime.hls", pattern: "hl_release"
+        },
+        ],
+        probes: [
+        GgProbe {
+            path: "tests/fail/fail_double_drop.hls", expect: "use of moved value", kind: "refuse", args: []
+        },
+        ],
+        violation:
+        "Generated C that frees a refcounted value twice, or reads"
+        + " one after its count reached zero, for a program the"
+        + " checker accepts.",
+        repro:
+        "The accepted .hls program, the generated .c, and the"
+        + " native run under valgrind/ASan showing the double free or"
+        + " UAF.",
+        out_of_scope:
+        "User C code reached through extern blocks; allocator"
+        + " exhaustion (an OOM is a controlled panic, not unsafety).",
+    })
+    rows.push(GgRow {
+        id: "G-TYPE-01",
+        family: "types",
+        severity: "critical",
+        claim:
+        "Every value's type is known statically and no implicit"
+        + " conversion ever changes it.",
+        mechanism:
+        "The checker rejects int-to-float and any cross-primitive"
+        + " coercion without an explicit conversion call, rejects"
+        + " mismatched assignments and non-bool conditions, and the"
+        + " lexer rejects integer literals beyond int64.",
+        enforced_by:
+        "the self-hosted checker in src/hlc/check_expr.hls (the"
+        + " type checks + the literal bounds)",
+        anchors: [
+        GgAnchor {
+            file: "src/hlc/check_expr.hls", pattern: "type mismatch"
+        },
+        GgAnchor {
+            file: "src/hlc/check_expr.hls", pattern: "integer literal too large"
+        },
+        ],
+        probes: [
+        GgProbe {
+            path: "tests/fail/fail_implicit_cast.hls", expect: "type mismatch", kind: "refuse", args: []
+        },
+        GgProbe {
+            path: "tests/fail/fail_type_mismatch.hls", expect: "type mismatch", kind: "refuse", args: []
+        },
+        GgProbe {
+            path: "tests/fail/fail_int_overflow_literal.hls", expect: "integer literal too large", kind: "refuse", args: []
+        },
+        ],
+        violation:
+        "A program the checker accepts where a value changes type"
+        + " without an explicit conversion, or where a condition is"
+        + " not bool.",
+        repro:
+        "The accepted .hls file and the checker output; a divergent"
+        + " interpreter-vs-native run for the same file strengthens"
+        + " it.",
+        out_of_scope:
+        "Explicit conversions (to_float, to_str) doing exactly what"
+        + " SPEC section 7 documents, including their panics.",
+    })
+    rows.push(GgRow {
+        id: "G-ARITH-01",
+        family: "arithmetic",
+        severity: "critical",
+        claim:
+        "Every arithmetic operation is checked: overflow, division"
+        + " by zero and out-of-bounds access are controlled panics"
+        + " (exit 101), never undefined behaviour.",
+        mechanism:
+        "The interpreter raises HLPanic at each checked op; the C"
+        + " runtime mirrors the checks so native binaries panic with"
+        + " the same message and code; literals beyond int64 are"
+        + " refused at compile time.",
+        enforced_by:
+        "the Stage-0 evaluator (tools/hlboot_eval.hls) + the"
+        + " emitted C runtime (HL_CHECK paths)",
+        anchors: [
+        GgAnchor {
+            file: "tools/hlboot_eval.hls", pattern: "integer overflow"
+        },
+        GgAnchor {
+            file: "tools/hlboot_eval.hls", pattern: "division by zero"
+        },
+        ],
+        probes: [
+        GgProbe {
+            path: "tests/ok/panic_divzero.hls", expect: "division by zero", kind: "panic", args: []
+        },
+        GgProbe {
+            path: "tests/ok/panic_bounds.hls", expect: "out of bounds", kind: "panic", args: []
+        },
+        GgProbe {
+            path: "tests/ok/panic_overflow.hls", expect: "integer overflow", kind: "panic", args: []
+        },
+        ],
+        violation:
+        "Any accepted program where an overflowing operation, a"
+        + " division by zero or an out-of-bounds access produces a"
+        + " wrong value, an interpreter/native divergence, or a signal"
+        + " other than the controlled panic.",
+        repro:
+        "The .hls program, the observed output/exit, and the"
+        + " expected panic per SPEC section 7.",
+        out_of_scope:
+        "Float NaN/inf semantics (SPEC pins them as values, not"
+        + " panics); wraparound explicitly requested through a"
+        + " documented wrapping builtin, when one exists.",
+    })
+    rows.push(GgRow {
+        id: "G-EFF-01",
+        family: "effects",
+        severity: "critical",
+        claim:
+        "No function reaches a world effect (IO, Fs, Clock, Args,"
+        + " Exit, Net, Rand, Proc, Conc) that it does not declare; the"
+        + " fixpoint runs over the whole static call graph.",
+        mechanism:
+        "Effect sets are computed to fixpoint over the call graph"
+        + " and compared against the declared uses clause; pure"
+        + " functions must transitively call nothing effectful, with"
+        + " the offending edge named in the error.",
+        enforced_by:
+        "the self-hosted checker in src/hlc/ (the effect fixpoint)"
+        + " + the audit surface (hlc --audit)",
+        anchors: [
+        GgAnchor {
+            file: "src/hlc/check_match.hls", pattern: "requires effect"
+        },
+        GgAnchor {
+            file: "src/hlc/check_match.hls", pattern: "missing: "
+        },
+        ],
+        probes: [
+        GgProbe {
+            path: "tests/fail/fail_effect_io.hls", expect: "requires effect", kind: "refuse", args: []
+        },
+        GgProbe {
+            path: "tests/fail/fail_pure_uses_io.hls", expect: "requires effect", kind: "refuse", args: []
+        },
+        GgProbe {
+            path: "tests/fail/fail_effect_transitive.hls", expect: "requires effect", kind: "refuse", args: []
+        },
+        ],
+        violation:
+        "A program accepted whose function performs console, file,"
+        + " clock, network, randomness, subprocess or concurrency work"
+        + " its declared effect set does not cover.",
+        repro:
+        "The accepted .hls file, the checker output, and the"
+        + " observed world effect (e.g. a file written) from the run.",
+        out_of_scope:
+        "Effects a user grants deliberately via uses; the alias law"
+        + " (uses IO covering the IO family) documented in SPEC 9.",
+    })
+    rows.push(GgRow {
+        id: "G-TAINT-01",
+        family: "taint",
+        severity: "critical",
+        claim:
+        "A tainted value cannot reach a declared sink — builtin or"
+        + " #[taint_sink] extern — without passing a sanitizer.",
+        mechanism:
+        "tainted[T] flows through the type graph to every sink"
+        + " argument; print/eprint/file/exit/net/proc sinks refuse at"
+        + " compile time naming the sanitizer options; extern"
+        + " boundaries declare their own sinks via #[taint_sink(...)].",
+        enforced_by:
+        "src/hlc/check_call.hls (sink enforcement) +"
+        + " src/hlc/check_expr.hls (the FFI boundary)",
+        anchors: [
+        GgAnchor {
+            file: "src/hlc/check_call.hls", pattern: "taint-sink violation"
+        },
+        GgAnchor {
+            file: "src/hlc/check_expr.hls", pattern: "taint_sink"
+        },
+        ],
+        probes: [
+        GgProbe {
+            path: "tests/fail/fail_taint_print.hls", expect: "taint-sink violation", kind: "refuse", args: []
+        },
+        GgProbe {
+            path: "tests/fail/fail_eprint_tainted.hls", expect: "taint-sink violation", kind: "refuse", args: []
+        },
+        GgProbe {
+            path: "tests/fail/fail_stage109_ffi_sink.hls", expect: "taint-sink violation", kind: "refuse", args: []
+        },
+        ],
+        violation:
+        "A program accepted where a value derived from"
+        + " tainted_args(), read_file_tainted() or read_line() reaches"
+        + " a sink without a sanitizer or an explicit taint_unwrap().",
+        repro:
+        "The accepted .hls file, the checker output, and the sink"
+        + " output showing the unsanitised data.",
+        out_of_scope:
+        "taint_unwrap() is an explicit user decision (SECURITY.md);"
+        + " a user who unwraps everything has opted out, not found a"
+        + " bug.",
+    })
+    rows.push(GgRow {
+        id: "G-CONC-01",
+        family: "concurrency",
+        severity: "critical",
+        claim:
+        "Owned values cannot be shared across task boundaries"
+        + " except by clone or ownership transfer; the Send rules"
+        + " close the remaining channels, so data races are refused at"
+        + " compile time.",
+        mechanism:
+        "spawn/chan.send/async_spawn/stream_send argument sharing"
+        + " is refused unless the value crosses as clone(x) or"
+        + " take(x); Task handles and Cap values are not Send and"
+        + " cannot cross.",
+        enforced_by:
+        "src/hlc/check_call.hls (sharing + Send rules) +"
+        + " the deterministic scheduler for testing",
+        anchors: [
+        GgAnchor {
+            file: "src/hlc/check_call.hls", pattern: "cannot share"
+        },
+        GgAnchor {
+            file: "src/hlc/check_call.hls", pattern: "is not Send"
+        },
+        ],
+        probes: [
+        GgProbe {
+            path: "tests/fail/fail_spawn_shared.hls", expect: "cannot share", kind: "refuse", args: []
+        },
+        GgProbe {
+            path: "tests/fail/fail_send_shared.hls", expect: "cannot share", kind: "refuse", args: []
+        },
+        GgProbe {
+            path: "tests/fail/fail_task_not_send.hls", expect: "is not Send", kind: "refuse", args: []
+        },
+        ],
+        violation:
+        "A program accepted where two tasks can read or write the"
+        + " same owned value without a channel or an ownership"
+        + " transfer.",
+        repro:
+        "The accepted .hls file, the checker output, and (if the"
+        + " race manifests) the divergent runs under hls-det.",
+        out_of_scope:
+        "Logical deadlocks between tasks that legally share"
+        + " channels (the Stage 127 detector reports them; they are"
+        + " not memory unsafety).",
+    })
+    rows.push(GgRow {
+        id: "G-MATCH-01",
+        family: "match",
+        severity: "high",
+        claim:
+        "Every match is exhaustive over its enum's variants; a"
+        + " missing arm is a compile error naming the missing variant.",
+        mechanism:
+        "The checker enumerates the matched enum's variants and"
+        + " refuses non-exhaustive matches, wrong-enum matches and"
+        + " wrong-arity payloads.",
+        enforced_by:
+        "src/hlc/check_match.hls",
+        anchors: [
+        GgAnchor {
+            file: "src/hlc/check_match.hls", pattern: "not exhaustive"
+        },
+        ],
+        probes: [
+        GgProbe {
+            path: "tests/fail/fail_match_nonexhaustive.hls", expect: "not exhaustive", kind: "refuse", args: []
+        },
+        ],
+        violation:
+        "An accepted match that silently falls through for a"
+        + " variant it does not cover.",
+        repro:
+        "The accepted .hls file and the checker output; the run"
+        + " reaching the uncovered variant.",
+        out_of_scope:
+        "Wildcard arms (_): they are exhaustive by intent and the"
+        + " language documents them as such.",
+    })
+    rows.push(GgRow {
+        id: "G-CAP-01",
+        family: "capabilities",
+        severity: "high",
+        claim:
+        "Privileged builtins demand their capability as a Cap[E]"
+        + " value; capabilities cannot be forged, cloned or taken"
+        + " outside a grant.",
+        mechanism:
+        "cap_take(\"E\") yields Cap[E] only inside main or a function"
+        + " declaring uses E; clone() refuses Cap types; unknown"
+        + " capability names are refused at the type level.",
+        enforced_by:
+        "src/hlc/check_call.hls (cap enforcement) + the"
+        + " clone rules",
+        anchors: [
+        GgAnchor {
+            file: "src/hlc/check_call.hls", pattern: "unknown capability"
+        },
+        GgAnchor {
+            file: "src/hlc/check_call.hls", pattern: "cap_take"
+        },
+        ],
+        probes: [
+        GgProbe {
+            path: "tests/fail/fail_stage111_cap_missing_grant.hls", expect: "requires effect", kind: "refuse", args: []
+        },
+        GgProbe {
+            path: "tests/fail/fail_stage111_cap_clone.hls", expect: "is not supported", kind: "refuse", args: []
+        },
+        GgProbe {
+            path: "tests/fail/fail_stage111_cap_take_outside.hls", expect: "may only be called", kind: "refuse", args: []
+        },
+        ],
+        violation:
+        "A program accepted that obtains Cap[E] without the grant,"
+        + " duplicates one, or passes one where the callee never"
+        + " declared the capability.",
+        repro:
+        "The accepted .hls file and the checker output showing the"
+        + " ungranted capability flowing to the privileged builtin.",
+        out_of_scope:
+        "The effect-system alias: Cap[E] is stricter than uses E"
+        + " and the two are documented as different grants (SPEC 65).",
+    })
+    rows.push(GgRow {
+        id: "G-SBX-01",
+        family: "sandbox",
+        severity: "high",
+        claim:
+        "Under --sandbox, extern blocks and Proc-reaching programs"
+        + " are refused outright, and the four file builtins are"
+        + " confined to the sandbox directory.",
+        mechanism:
+        "hlboot refuses extern \"C\" blocks and any function whose"
+        + " computed effects reach Proc when --sandbox is active; the"
+        + " runtime confines read_file, read_file_tainted, write_file"
+        + " and file_exists to DIR, in both the interpreter and native"
+        + " paths.",
+        enforced_by:
+        "tools/hlboot_eval.hls (the sandbox gate) + the runtime"
+        + " path confinement",
+        anchors: [
+        GgAnchor {
+            file: "tools/hlboot_eval.hls", pattern: "--sandbox is incompatible"
+        },
+        GgAnchor {
+            file: "tools/hlboot_eval.hls", pattern: "restrict filesystem builtins"
+        },
+        ],
+        probes: [
+        GgProbe {
+            path: "tests/guarantee_probes/sandbox_extern.hls", expect: "--sandbox is incompatible", kind: "refuse", args: ["--sandbox", "tests/guarantee_probes"]
+        },
+        ],
+        violation:
+        "A program compiled or run under --sandbox that reads,"
+        + " writes or probes outside DIR, or that reaches libc through"
+        + " an extern block.",
+        repro:
+        "The accepted command line, the .hls file, and the observed"
+        + " out-of-sandbox access (strace or the file appearing).",
+        out_of_scope:
+        "Sandbox ESCAPE via a kernel vulnerability; the seccomp-bpf"
+        + " layer (Stage 110) is belt-and-braces over THIS gate, not a"
+        + " substitute for it.",
+    })
+    rows.push(GgRow {
+        id: "G-CT-01",
+        family: "consttime",
+        severity: "high",
+        claim:
+        "A #[ct] function is verified branch-free, loop-bound-free"
+        + " and secret-indexed-memory-free over its declared"
+        + " #[secrets] parameters; an unverifiable claim is a compile"
+        + " error.",
+        mechanism:
+        "The checker refuses #[ct] without #[secrets], unknown"
+        + " secret names, duplicate claims, and any branch or memory"
+        + " access that depends on a secret parameter.",
+        enforced_by:
+        "src/hlc/checker.hls (the ct verifier) + the Stage 101"
+        + " side-channel pass",
+        anchors: [
+        GgAnchor {
+            file: "src/hlc/checker.hls", pattern: "constant-time claim"
+        },
+        ],
+        probes: [
+        GgProbe {
+            path: "tests/fail/fail_stage102_ct_nosecrets.hls", expect: "must name the parameters", kind: "refuse", args: []
+        },
+        GgProbe {
+            path: "tests/fail/fail_stage101_secret_unknown_param.hls", expect: "not a parameter", kind: "refuse", args: []
+        },
+        ],
+        violation:
+        "A #[ct] claim accepted where a branch, loop bound or"
+        + " memory index depends on a declared secret — the classic"
+        + " timing or cache side channel.",
+        repro:
+        "The accepted .hls file, the checker output, and (if"
+        + " available) the timing distribution demonstrating the leak.",
+        out_of_scope:
+        "Micro-architectural leaks below the model (port"
+        + " contention, power) — the claim is about the verified"
+        + " source-level fragment, as Stage 102 documents.",
+    })
+    rows.push(GgRow {
+        id: "G-FFI-01",
+        family: "ffi",
+        severity: "high",
+        claim:
+        "Extern declarations are FFI-fenced: they demand declared"
+        + " effects, and taint flows through the boundary into sinks.",
+        mechanism:
+        "Calling an extern requires the callee's declared effect"
+        + " set in the caller; #[taint_source]/#[taint_sink]"
+        + " attributes on externs are checked for arity and"
+        + " void-return honesty, and tainted args to extern sinks are"
+        + " refused.",
+        enforced_by:
+        "src/hlc/check_expr.hls + src/hlc/check_call.hls",
+        anchors: [
+        GgAnchor {
+            file: "src/hlc/check_expr.hls", pattern: "taint_source"
+        },
+        GgAnchor {
+            file: "src/hlc/check_expr.hls", pattern: "taint-sink violation: extern"
+        },
+        ],
+        probes: [
+        GgProbe {
+            path: "tests/fail/fail_stage109_ffi_sink.hls", expect: "taint-sink violation: extern", kind: "refuse", args: []
+        },
+        GgProbe {
+            path: "tests/fail/fail_stage109_ffi_source_void.hls", expect: "returns void", kind: "refuse", args: []
+        },
+        ],
+        violation:
+        "An accepted program where an extern call escapes effect"
+        + " accounting, or where a tainted value enters an extern the"
+        + " program declared as a taint sink.",
+        repro:
+        "The accepted .hls file with the extern block and"
+        + " attributes, plus the checker output.",
+        out_of_scope:
+        "A MIS-DECLARED extern (the C side lying about its"
+        + " signature) — SECURITY.md scopes this honestly: the fence"
+        + " is sound, the C header is trusted; hlbindgen mitigates by"
+        + " generating from the header.",
+    })
+    rows.push(GgRow {
+        id: "G-SPEC-01",
+        family: "types",
+        severity: "medium",
+        claim:
+        "Bindings are single-assignment by default, never shadowed,"
+        + " always initialised, and every name resolves or the program"
+        + " is refused.",
+        mechanism:
+        "The statement checker refuses shadowing, reassignment of"
+        + " immutable bindings, use of undefined names and duplicate"
+        + " definitions; there is no null and no uninitialised value.",
+        enforced_by:
+        "src/hlc/check_expr.hls (the statement checks) + the"
+        + " name-resolution pass",
+        anchors: [
+        GgAnchor {
+            file: "src/hlc/check_expr.hls", pattern: "shadowing not allowed"
+        },
+        ],
+        probes: [
+        GgProbe {
+            path: "tests/fail/fail_shadow.hls", expect: "shadowing not allowed", kind: "refuse", args: []
+        },
+        GgProbe {
+            path: "tests/fail/fail_undefined_var.hls", expect: "does not exist", kind: "refuse", args: []
+        },
+        ],
+        violation:
+        "An accepted program where two bindings share a name in one"
+        + " scope, or a name resolves to nothing and still compiles.",
+        repro:
+        "The accepted .hls file and the checker output.",
+        out_of_scope:
+        "Deliberate distinct scopes (function boundaries, blocks)"
+        + " reusing a name — that is the language's documented"
+        + " scoping.",
+    })
+    rows.push(GgRow {
+        id: "G-DET-01",
+        family: "determinism",
+        severity: "high",
+        claim:
+        "The bootstrap is a fixed point: hlc compiled from its own"
+        + " source re-emits that source byte-identically, so every"
+        + " guarantee above holds identically for the Stage-0"
+        + " interpreter and the native compiler.",
+        mechanism:
+        "make bootstrap compiles the snapshot's native hlc and"
+        + " diffs its re-emission against the committed snapshot (the"
+        + " fixed-point law, step 3); the cross-bootstrap ladder"
+        + " extends the law to the freestanding binary, and `make"
+        + " snapshot-chain` re-proves it as two independent ignitions.",
+        enforced_by:
+        "Makefile (bootstrap + snapshot-chain targets) +"
+        + " tests/acc/xbootstrap_acceptance.hls",
+        anchors: [
+        GgAnchor {
+            file: "Makefile", pattern: "fixed-point law: the derivation must equal the snapshot"
+        },
+        GgAnchor {
+            file: "tests/acc/xbootstrap_acceptance.hls", pattern: "byte"
+        },
+        ],
+        probes: [
+        ],
+        violation:
+        "A source change after which the two bootstrap passes"
+        + " differ, or the freestanding compiler disagreeing with the"
+        + " hosted one.",
+        repro:
+        "make bootstrap output showing the diff, or the"
+        + " xbootstrap-acceptance failure log.",
+        out_of_scope:
+        "Whitespace in emitted C that carries no semantic"
+        + " difference — the law is the fixed point itself, which the"
+        + " diff enforces exactly.",
+    })
+    rows.push(GgRow {
+        id: "G-CORPUS-01",
+        family: "determinism",
+        severity: "medium",
+        claim:
+        "The interpreter and the native backend agree byte-for-byte"
+        + " over the entire ok corpus and the differential table, with"
+        + " every known divergence sanctioned in the cross-impl"
+        + " ledger.",
+        mechanism:
+        "tests/run_tests.sh runs every tests/ok program on both"
+        + " implementations and diffs; hls-xdiff sits the corpus in"
+        + " front of three executing backends and compares bytes and"
+        + " halt classes against the ledger.",
+        enforced_by:
+        "tests/acc/suite_02_differential_acceptance.hls +"
+        + " tools/hls-xdiff.hls (bin/hls-xdiff)",
+        anchors: [
+        GgAnchor {
+            file: "tests/acc/suite_02_differential_acceptance.hls", pattern: "native vs interpreter"
+        },
+        GgAnchor {
+            file: "tools/hls-xdiff.hls", pattern: "ledger"
+        },
+        ],
+        probes: [
+        ],
+        violation:
+        "An ok-corpus program (or an xdiff case) where the two"
+        + " implementations disagree on bytes or halt class,"
+        + " unsanctioned by tests/xdiff/ledger.json.",
+        repro:
+        "The program, both outputs, and the diff; note the xdiff"
+        + " case id if the divergence is already a ledger row.",
+        out_of_scope:
+        "Sanctioned ledger rows (tests/xdiff/ledger.json): they are"
+        + " documented, pinned classes, not new divergences.",
+    })
+    return rows
+}
+
+# ----------------------------------------------------------------------------
+# Small helpers.
+# ----------------------------------------------------------------------------
+
+struct GgRun {
+    code: int,
+    out: str,
+    err: str,
+    spawned: bool
+}
+
+fn gg_run(prog: str, args: list[str]) -> GgRun uses Proc {
+    let r: GgRun = GgRun {
+        code: -1, out: "", err: "", spawned: false
+    }
+    let pid: int = proc_spawn(prog, args, 2, 1, 1)
+    if pid < 1 {
+        return r
+    }
+    r.spawned = true
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    r.code = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    r.out = out
+    r.err = err
+    return r
+}
+
+# gg_run_at — a child with its OWN cwd (the probe's tree), captured.
+fn gg_run_at(prog: str, args: list[str], cwd: str) -> GgRun uses Proc {
+    let argv: list[str] = ["-c", "cd '" + cwd + "' && exec '" + prog + "' "
+    + gg_join_quoted(args)]
+    return gg_run("sh", argv)
+}
+
+fn gg_join_quoted(args: list[str]) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < args.len() {
+        if i > 0 {
+            out = out + " "
+        }
+        out = out + "'" + args.get(i) + "'"
+        i = i + 1
+    }
+    return out
+}
+
+fn gg_list_has(xs: list[str], x: str) -> bool {
+    let mut i: int = 0
+    while i < xs.len() {
+        if xs.get(i) == x {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn gg_pad(s: str, n: int) -> str {
+    let mut out: str = s
+    while out.len() < n {
+        out = out + " "
+    }
+    return out
+}
+
+fn gg_first_line(blob: str) -> str {
+    let lines: list[str] = blob.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let l: str = lines.get(i).trim()
+        if l != "" {
+            if l.len() > 120 {
+                return l.slice(0, 120)
+            }
+            return l
+        }
+        i = i + 1
+    }
+    return "<no output>"
+}
+
+# ----------------------------------------------------------------------------
+# JSON rendering — json.dumps(indent=2, sort_keys=True).
+# ----------------------------------------------------------------------------
+
+fn gg_json_escape(s: str) -> str {
+    let mut out: str = "\""
+    let mut i: int = 0
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        if b == 34 {
+            out = out + "\\\""
+        } else if b == 92 {
+            out = out + "\\\\"
+        } else if b == 10 {
+            out = out + "\\n"
+        } else if b == 9 {
+            out = out + "\\t"
+        } else if b == 13 {
+            out = out + "\\r"
+        } else if b < 32 {
+            out = out + "\\u" + gg_hex4(b)
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out + "\""
+}
+
+fn gg_hex4(v: int) -> str {
+    let hex: str = "0123456789abcdef"
+    let mut n: int = v
+    if n < 0 {
+        n = 0
+    }
+    if n > 65535 {
+        n = 65535
+    }
+    let d3: int = n % 16
+    let d2: int = (n / 16) % 16
+    let d1: int = (n / 256) % 16
+    let d0: int = (n / 4096) % 16
+    return hex.slice(d0, d0 + 1) + hex.slice(d1, d1 + 1)
+    + hex.slice(d2, d2 + 1) + hex.slice(d3, d3 + 1)
+}
+
+fn gg_spaces(n: int) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < n {
+        out = out + " "
+        i = i + 1
+    }
+    return out
+}
+
+fn gg_json_dump_at(v: JsonValue, indent: int) -> str {
+    let pad: str = gg_spaces(indent * 2)
+    let pad2: str = gg_spaces((indent + 1) * 2)
+    if json_is_null(v) {
+        return "null"
+    }
+    if json_is_bool(v) {
+        if json_bool_value(v) {
+            return "true"
+        }
+        return "false"
+    }
+    if json_is_int(v) {
+        return json_int_value(v).to_str()
+    }
+    if json_is_str(v) {
+        return gg_json_escape(json_str_value(v))
+    }
+    if json_is_array(v) {
+        if v.arr.len() == 0 {
+            return "[]"
+        }
+        let mut out: str = "[\n"
+        let mut i: int = 0
+        while i < v.arr.len() {
+            out = out + pad2 + gg_json_dump_at(v.arr.get(i), indent + 1)
+            if i + 1 < v.arr.len() {
+                out = out + ","
+            }
+            out = out + "\n"
+            i = i + 1
+        }
+        return out + pad + "]"
+    }
+    if json_is_object(v) {
+        if v.obj_keys.len() == 0 {
+            return "{}"
+        }
+        # sorted keys (sort_keys=True)
+        let order: list[int] = []
+        let mut k: int = 0
+        while k < v.obj_keys.len() {
+            order.push(k)
+            k = k + 1
+        }
+        let mut j: int = 1
+        while j < order.len() {
+            let oi: int = order.get(j)
+            let mut m: int = j - 1
+            while m >= 0 && gg_str_lt(v.obj_keys.get(oi),
+            v.obj_keys.get(order.get(m))) {
+                order.set(m + 1, order.get(m))
+                m = m - 1
+            }
+            order.set(m + 1, oi)
+            j = j + 1
+        }
+        let mut out2: str = "{\n"
+        let mut n: int = 0
+        while n < order.len() {
+            let ki: int = order.get(n)
+            out2 = out2 + pad2 + gg_json_escape(v.obj_keys.get(ki)) + ": "
+            + gg_json_dump_at(v.obj_vals.get(ki), indent + 1)
+            if n + 1 < order.len() {
+                out2 = out2 + ","
+            }
+            out2 = out2 + "\n"
+            n = n + 1
+        }
+        return out2 + pad + "}"
+    }
+    return "null"
+}
+
+fn gg_json_dump(v: JsonValue) -> str {
+    return gg_json_dump_at(v, 0)
+}
+
+fn gg_str_lt(a: str, b: str) -> bool {
+    let n: int = a.len()
+    let m: int = b.len()
+    let mut i: int = 0
+    while i < n && i < m {
+        let ba: int = a.byte_at(i)
+        let bb: int = b.byte_at(i)
+        if ba != bb {
+            return ba < bb
+        }
+        i = i + 1
+    }
+    return n < m
+}
+
+# ----------------------------------------------------------------------------
+# The ledger's own validation (the .py's validate_ledger, verbatim
+# law; the --unit-ledger mode prints it as CHECK lines).
+# ----------------------------------------------------------------------------
+
+fn gg_validate_ledger() -> list[str] {
+    let problems: list[str] = []
+    let seen: list[str] = []
+    let rows: list[GgRow] = GG_LEDGER()
+    let mut i: int = 0
+    while i < rows.len() {
+        let g: GgRow = rows.get(i)
+        let mut gid: str = g.id
+        if gid == "" {
+            gid = "<no id>"
+        }
+        if gg_list_has(seen, gid) {
+            problems.push("duplicate guarantee id " + gid)
+        }
+        seen.push(gid)
+        if !gg_list_has(GG_FAMILIES(), g.family) {
+            problems.push(gid + ": unknown family '" + g.family + "'")
+        }
+        if !gg_list_has(GG_SEVERITIES(), g.severity) {
+            problems.push(gid + ": unknown severity '" + g.severity + "'")
+        }
+        if g.anchors.len() == 0 {
+            problems.push(gid + ": no anchors — an unanchored guarantee "
+            + "is a wish, not a guarantee")
+        }
+        let mut pi: int = 0
+        while pi < g.probes.len() {
+            let p: GgProbe = g.probes.get(pi)
+            if p.kind != "refuse" && p.kind != "panic" {
+                problems.push(gid + ": probe kind must be refuse|panic")
+            }
+            if p.path == "" || p.expect == "" {
+                problems.push(gid + ": probe needs path+expect")
+            }
+            pi = pi + 1
+        }
+        if g.claim == "" || g.violation == "" || g.repro == "" {
+            problems.push(gid + ": claim/violation/repro are all "
+            + "mandatory (a bounty entry maps onto them)")
+        }
+        i = i + 1
+    }
+    return problems
+}
+
+# ----------------------------------------------------------------------------
+# Anchors. A grep, honestly: the pattern must appear in the file at
+# the given tree. The line number is recorded so the report can point
+# at the live enforcement point.
+# ----------------------------------------------------------------------------
+
+# gg_anchor_resolve -> [ok, detail] where detail is "line N" or the
+# reason.
+fn gg_anchor_resolve(tree: str, a: GgAnchor) -> list[str] uses Fs {
+    let full: str = gg_join(tree, a.file)
+    if !file_exists(full) {
+        return["false", "missing anchor file: " + a.file]
+    }
+    let src: str = read_file(full)
+    let lines: list[str] = src.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if lines.get(i).contains(a.pattern) {
+            return["true", "line " + (i + 1).to_str()]
+        }
+        i = i + 1
+    }
+    return["false", "pattern '" + a.pattern + "' not found in "
+    + a.file + " — the enforcement point this guarantee rests on "
+    + "is gone"]
+}
+
+fn gg_join(a: str, b: str) -> str {
+    if a.len() == 0 {
+        return b
+    }
+    if a.byte_at(a.len() - 1) == 47 {
+        return a + b
+    }
+    return a + "/" + b
+}
+
+fn gg_git_sha(tree: str) -> str uses Proc {
+    let r: GgRun = gg_run_at("git", ["rev-parse", "HEAD"], tree)
+    if r.code == 0 {
+        return r.out.trim()
+    }
+    return "unknown (not a git tree)"
+}
+
+# gg_rows_json — the ledger as canonical JSON rows (sorted keys),
+# the exact blob the digest hashes and the `dump` command prints:
+# one definition, one rendering, every consumer.
+fn gg_rows_json(rows: list[GgRow]) -> JsonValue {
+    let arr: list[JsonValue] = []
+    let mut i: int = 0
+    while i < rows.len() {
+        let g: GgRow = rows.get(i)
+        let anchors_j: list[JsonValue] = []
+        let mut ai: int = 0
+        while ai < g.anchors.len() {
+            anchors_j.push(json_object(["file", "pattern"],
+            [json_str(g.anchors.get(ai).file),
+            json_str(g.anchors.get(ai).pattern)]))
+            ai = ai + 1
+        }
+        let probes_j: list[JsonValue] = []
+        let mut pi: int = 0
+        while pi < g.probes.len() {
+            let p: GgProbe = g.probes.get(pi)
+            let args_j: list[JsonValue] = []
+            let mut xi: int = 0
+            while xi < p.args.len() {
+                args_j.push(json_str(p.args.get(xi)))
+                xi = xi + 1
+            }
+            probes_j.push(json_object(
+            ["args", "expect", "kind", "path"],
+            [json_array(args_j), json_str(p.expect),
+            json_str(p.kind), json_str(p.path)]))
+            pi = pi + 1
+        }
+        arr.push(json_object(
+        ["anchors", "claim", "enforced_by", "family", "id",
+        "mechanism", "out_of_scope", "probes", "repro", "severity",
+        "violation"],
+        [json_array(anchors_j), json_str(g.claim),
+        json_str(g.enforced_by), json_str(g.family), json_str(g.id),
+        json_str(g.mechanism), json_str(g.out_of_scope),
+        json_array(probes_j), json_str(g.repro),
+        json_str(g.severity), json_str(g.violation)]))
+        i = i + 1
+    }
+    return json_array(arr)
+}
+
+# gg_ledger_digest — sha256 over the canonical JSON of the ledger (the
+# sorted-key rendering; the digest the report stamps, so a hand-edited
+# ledger is visible in every document it produced).
+fn gg_ledger_digest() -> str {
+    return sha256_hex(gg_json_dump(gg_rows_json(GG_LEDGER())))
+}
+
+# ----------------------------------------------------------------------------
+# Probes. The real toolchain judges: the Stage-0 evaluator's --check
+# for refusals, the evaluator itself for runtime panics. Nothing here
+# trusts the ledger's own opinion about the code — the checker is the
+# only witness.
+# ----------------------------------------------------------------------------
+
+# gg_boot_path — the evaluator the probes ride: the repo the binary
+# lives in (argv0/../..), built when missing.
+fn gg_boot_path() -> str uses Args, Proc, Fs {
+    let a: list[str] = args()
+    if a.len() == 0 {
+        return "bin/hlboot"
+    }
+    let argv0: str = a.get(0)
+    let root: str = gg_normpath(gg_normpath(argv0 + "/..") + "/..")
+    let boot: str = gg_join(root, "bin/hlboot")
+    if !file_exists(boot) {
+        gg_run_at("make", ["-s", "bin/hlboot"], root)
+    }
+    if !file_exists(boot) {
+        return "bin/hlboot"
+    }
+    return boot
+}
+
+fn gg_normpath(p: str) -> str {
+    let abs: bool = p.len() > 0 && p.byte_at(0) == 47
+    let parts: list[str] = p.split("/")
+    let stack: list[str] = []
+    let mut i: int = 0
+    while i < parts.len() {
+        let seg: str = parts.get(i)
+        if seg == "" || seg == "." {
+            i = i + 1
+            continue
+        }
+        if seg == ".." {
+            if stack.len() > 0 && stack.get(stack.len() - 1) != ".." {
+                stack.pop()
+            } else {
+                if !abs {
+                    stack.push("..")
+                }
+            }
+            i = i + 1
+            continue
+        }
+        stack.push(seg)
+        i = i + 1
+    }
+    let mut out: str = ""
+    if abs {
+        out = "/"
+    }
+    let mut j: int = 0
+    while j < stack.len() {
+        if j > 0 {
+            out = out + "/"
+        }
+        out = out + stack.get(j)
+        j = j + 1
+    }
+    if out == "" {
+        return "."
+    }
+    return out
+}
+
+# gg_probe_run -> [verdict, detail]. verdict in ok|violated|error.
+fn gg_probe_run(tree: str, probe: GgProbe, boot: str) -> list[str] uses Fs, Proc {
+    let path: str = gg_join(tree, probe.path)
+    if !file_exists(path) {
+        return["error", "probe file missing: " + probe.path]
+    }
+    let argv: list[str] = [boot]
+    let mut i: int = 0
+    while i < probe.args.len() {
+        argv.push(probe.args.get(i))
+        i = i + 1
+    }
+    if probe.kind == "refuse" {
+        argv.push("--check")
+        argv.push(path)
+    } else {
+        argv.push(path)
+    }
+    let out: GgRun = gg_run_at(argv.get(0), gg_rest(argv), tree)
+    let blob: str = out.out + out.err
+    if probe.kind == "refuse" {
+        if out.code == 1 && blob.contains(probe.expect) {
+            return["ok", "refused: '" + gg_first_line(blob) + "'"]
+        }
+        if out.code == 0 {
+            return["violated", "probe was ACCEPTED — expected refusal "
+            + "naming '" + probe.expect + "'"]
+        }
+        return["violated", "refused with the wrong message (exit "
+        + out.code.to_str() + "): '" + gg_first_line(blob) + "'"]
+    }
+    # panic probe: exit 101, message pinned
+    if out.code == 101 && blob.contains(probe.expect) {
+        return["ok", "panicked: '" + gg_first_line(blob) + "'"]
+    }
+    if out.code == 0 {
+        return["violated", "probe ran clean — expected panic '"
+        + probe.expect + "'"]
+    }
+    return["violated", "wrong halt (exit " + out.code.to_str() + "): '"
+    + gg_first_line(blob) + "'"]
+}
+
+fn gg_rest(argv: list[str]) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 1
+    while i < argv.len() {
+        out.push(argv.get(i))
+        i = i + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# verify — the anti-rot pass. Anchors, probes, policy anchors; every
+# miss is a named refusal. Returns the results JSON plus ok.
+# ----------------------------------------------------------------------------
+
+struct GgVerify {
+    ok: bool,
+    results: JsonValue,
+    refusals: list[str]
+}
+
+fn gg_verify(tree: str, quiet: bool, progress: bool) -> GgVerify uses IO, Fs, Proc {
+    let rows: list[GgRow] = GG_LEDGER()
+    let boot: str = gg_boot_path()
+    let recs: list[JsonValue] = []
+    let refusals: list[str] = []
+
+    let problems: list[str] = gg_validate_ledger()
+    let mut pi: int = 0
+    while pi < problems.len() {
+        refusals.push("ledger: " + problems.get(pi))
+        pi = pi + 1
+    }
+
+    let pa: list[GgAnchor] = GG_POLICY_ANCHORS()
+    let mut pai: int = 0
+    while pai < pa.len() {
+        let res: list[str] = gg_anchor_resolve(tree, pa.get(pai))
+        if res.get(0) != "true" {
+            refusals.push("policy: the reporting channel anchor is gone ("
+            + pa.get(pai).file + ": " + res.get(1) + ")")
+        }
+        pai = pai + 1
+    }
+
+    let mut i: int = 0
+    while i < rows.len() {
+        let g: GgRow = rows.get(i)
+        let anchors_j: list[JsonValue] = []
+        let probes_j: list[JsonValue] = []
+        let mut status: str = "verified"
+        let mut n_a: int = 0
+        let mut n_p: int = 0
+        let mut ai: int = 0
+        while ai < g.anchors.len() {
+            let res2: list[str] = gg_anchor_resolve(tree, g.anchors.get(ai))
+            let okc: bool = res2.get(0) == "true"
+            anchors_j.push(json_object(
+            ["detail", "file", "ok", "pattern"],
+            [json_str(res2.get(1)), json_str(g.anchors.get(ai).file),
+            json_bool(okc), json_str(g.anchors.get(ai).pattern)]))
+            if okc {
+                n_a = n_a + 1
+            } else {
+                status = "void"
+                refusals.push(g.id + ": anchor void — " + res2.get(1))
+            }
+            ai = ai + 1
+        }
+        let mut pri: int = 0
+        while pri < g.probes.len() {
+            let pv: list[str] = gg_probe_run(tree, g.probes.get(pri), boot)
+            probes_j.push(json_object(
+            ["detail", "kind", "path", "verdict"],
+            [json_str(pv.get(1)), json_str(g.probes.get(pri).kind),
+            json_str(g.probes.get(pri).path), json_str(pv.get(0))]))
+            if pv.get(0) == "ok" {
+                n_p = n_p + 1
+            } else {
+                if pv.get(0) == "violated" {
+                    status = "violated"
+                } else {
+                    status = "error"
+                }
+                refusals.push(g.id + ": probe " + g.probes.get(pri).path
+                + " — " + pv.get(1))
+            }
+            pri = pri + 1
+        }
+        if status == "verified" && progress && !quiet {
+            println("  verified  " + gg_pad(g.id, 14) + " "
+            + gg_pad(g.family, 12) + " " + gg_pad(g.severity, 8)
+            + " anchors " + n_a.to_str() + " probes " + n_p.to_str())
+        }
+        recs.push(json_object(
+        ["anchors", "family", "id", "probes", "severity", "status"],
+        [json_array(anchors_j), json_str(g.family), json_str(g.id),
+        json_array(probes_j), json_str(g.severity),
+        json_str(status)]))
+        i = i + 1
+    }
+
+    let mut verdict: str = "verified"
+    if refusals.len() > 0 {
+        verdict = "violated"
+    }
+    let results: JsonValue = json_object(
+    ["guarantees", "ledger_sha256", "policy", "refusals", "tree",
+    "verdict"],
+    [json_array(recs), json_str(gg_ledger_digest()),
+    json_str(GG_POLICY()), jv_strs(refusals),
+    json_str(gg_git_sha(tree)), json_str(verdict)])
+    return GgVerify {
+        ok: refusals.len() == 0, results: results, refusals: refusals
+    }
+}
+
+fn jv_strs(xs: list[str]) -> JsonValue {
+    let vals: list[JsonValue] = []
+    let mut i: int = 0
+    while i < xs.len() {
+        vals.push(json_str(xs.get(i)))
+        i = i + 1
+    }
+    return json_array(vals)
+}
+
+# jv_anchors — the anchor list as JSON objects (the dump's
+# policy_anchors leg).
+fn jv_anchors(xs: list[GgAnchor]) -> JsonValue {
+    let vals: list[JsonValue] = []
+    let mut i: int = 0
+    while i < xs.len() {
+        vals.push(json_object(["file", "pattern"],
+        [json_str(xs.get(i).file), json_str(xs.get(i).pattern)]))
+        i = i + 1
+    }
+    return json_array(vals)
+}
+
+# ----------------------------------------------------------------------------
+# The report. The bug-bounty scope document, regenerated from the
+# ledger — never hand-written, never written from a violated ledger.
+# Deterministic: fixed order, no wall-clock unless --stamp.
+# ----------------------------------------------------------------------------
+
+fn gg_render_report(tree: str, results: JsonValue, stamp: str) -> str uses IO {
+    let L: list[str] = []
+    let sha: str = jstr_of(results, "tree")
+    let rows: list[GgRow] = GG_LEDGER()
+    let grows: list[JsonValue] = arr_of(results, "guarantees")
+    let mut n_ok: int = 0
+    let mut n_a: int = 0
+    let mut n_p: int = 0
+    let mut i: int = 0
+    while i < grows.len() {
+        if jstr_of(grows.get(i), "status") == "verified" {
+            n_ok = n_ok + 1
+        }
+        let anchors: list[JsonValue] = arr_of(grows.get(i), "anchors")
+        let mut ai: int = 0
+        while ai < anchors.len() {
+            if jbool_of(anchors.get(ai), "ok") {
+                n_a = n_a + 1
+            }
+            ai = ai + 1
+        }
+        let probes: list[JsonValue] = arr_of(grows.get(i), "probes")
+        let mut pi: int = 0
+        while pi < probes.len() {
+            if jstr_of(probes.get(pi), "verdict") == "ok" {
+                n_p = n_p + 1
+            }
+            pi = pi + 1
+        }
+        i = i + 1
+    }
+    L.push("# Halis soundness guarantees — bug-bounty scope")
+    L.push("")
+    L.push("Regenerated from the Stage 135 guarantee ledger")
+    L.push("(`tools/hls-guarantee.hls`, built as `bin/hls-guarantee`).")
+    L.push("This document is generated, not maintained: what it")
+    L.push("claims is exactly what the tree below still")
+    L.push("demonstrates. Do not hand-edit; regenerate with")
+    L.push("`bin/hls-guarantee report --out SOUNDNESS.md`.")
+    L.push("")
+    L.push("- Policy: " + GG_POLICY())
+    L.push("- Tree: `" + sha + "`")
+    L.push("- Ledger digest: `sha256:" + jstr_of(results, "ledger_sha256") + "`")
+    L.push("- Verification: **" + jstr_of(results, "verdict") + "** — "
+    + n_ok.to_str() + "/" + rows.len().to_str()
+    + " guarantees re-demonstrated (" + n_a.to_str()
+    + " anchors resolved, " + n_p.to_str() + " probes green)")
+    if stamp != "" {
+        L.push("- Generated: " + stamp)
+    }
+    L.push("")
+    L.push("## What the ledger is")
+    L.push("")
+    L.push("Every row is a soundness guarantee the Halis toolchain")
+    L.push("makes, with three live parts: the ANCHORS (enforcement")
+    L.push("points grepped in this tree — a deleted enforcement")
+    L.push("point voids the guarantee before any bounty argument")
+    L.push("starts), the PROBES (real programs re-run through the")
+    L.push("real checker and interpreter at report time — refusal")
+    L.push("messages pinned), and the CONTRACT (what a")
+    L.push("bounty-eligible violation of this row looks like).")
+    L.push("A report that cannot be regenerated is a report nobody")
+    L.push("can audit; the digest above pins the ledger this")
+    L.push("document was rendered from.")
+    L.push("")
+    L.push("## Eligibility — what a bounty pays for")
+    L.push("")
+    L.push("A report is bounty-eligible when it names one ledger")
+    L.push("entry, ships a reproducer the toolchain ACCEPTS (or a")
+    L.push("command line for the runtime rows), and demonstrates")
+    L.push("the violation that entry's contract describes — at the")
+    L.push("boundary the guarantee claims, not at a boundary nobody")
+    L.push("claimed. Reports outside every contract land in the")
+    L.push("out-of-scope register below and are closed, not paid.")
+    L.push("")
+    L.push("## Severity vocabulary")
+    L.push("")
+    L.push("| severity | rank | meaning |")
+    L.push("|----------|-----:|---------|")
+    let sevs: list[str] = GG_SEVERITIES()
+    let mut si: int = 0
+    while si < sevs.len() {
+        L.push("| " + sevs.get(si) + " | " + GG_SEV_RANK(sevs.get(si)).to_str()
+        + " | " + GG_SEV_MEANING(sevs.get(si)) + " |")
+        si = si + 1
+    }
+    L.push("")
+    L.push("## The guarantees")
+    L.push("")
+    let mut ri: int = 0
+    while ri < rows.len() {
+        let g: GgRow = rows.get(ri)
+        let rec: JsonValue = grows.get(ri)
+        L.push("### " + g.id + " — " + g.family + " — " + g.severity)
+        L.push("")
+        L.push("**Claim.** " + g.claim)
+        L.push("")
+        L.push("**Mechanism.** " + g.mechanism)
+        L.push("")
+        L.push("**Enforced by.** " + g.enforced_by)
+        L.push("")
+        L.push("**Anchors (verified at this tree).**")
+        L.push("")
+        let anchors: list[JsonValue] = arr_of(rec, "anchors")
+        let mut ai2: int = 0
+        while ai2 < anchors.len() {
+            let a: JsonValue = anchors.get(ai2)
+            let mut mark: str = "yes"
+            if !jbool_of(a, "ok") {
+                mark = "VOID"
+            }
+            L.push("- `" + jstr_of(a, "file") + "` — \""
+            + jstr_of(a, "pattern") + "\" (" + mark + ": "
+            + jstr_of(a, "detail") + ")")
+            ai2 = ai2 + 1
+        }
+        let probes: list[JsonValue] = arr_of(rec, "probes")
+        if probes.len() > 0 {
+            L.push("")
+            L.push("**Demonstrated by (re-run at this tree).**")
+            L.push("")
+            let mut pi2: int = 0
+            while pi2 < probes.len() {
+                let p: JsonValue = probes.get(pi2)
+                let mut mark2: str = jstr_of(p, "verdict")
+                if mark2 == "ok" {
+                    mark2 = "green"
+                } else {
+                    mark2 = upper_ascii(mark2)
+                }
+                L.push("- `" + jstr_of(p, "path") + "` ("
+                + jstr_of(p, "kind") + ") — " + mark2 + ": "
+                + jstr_of(p, "detail"))
+                pi2 = pi2 + 1
+            }
+        }
+        L.push("")
+        L.push("**Violation contract.** " + g.violation)
+        L.push("")
+        L.push("**Reproduction.** " + g.repro)
+        L.push("")
+        L.push("**Out of scope.** " + g.out_of_scope)
+        L.push("")
+        ri = ri + 1
+    }
+    L.push("## Out of scope — the honest boundary")
+    L.push("")
+    L.push("The register below is the aggregate of what the")
+    L.push("toolchain does NOT guarantee, carried over from")
+    L.push("SECURITY.md's honesty section and kept current by the")
+    L.push("ledger:")
+    L.push("")
+    L.push("- a user who calls `taint_unwrap()` has opted out of")
+    L.push("  the taint system — that is the documented escape,")
+    L.push("  not a bug;")
+    L.push("- a mis-declared `extern \"C\"` (the C side lying about")
+    L.push("  its signature) is trusted by design; `hlbindgen`")
+    L.push("  mitigates by generating from the header;")
+    L.push("- deep native recursion can exhaust the OS stack —")
+    L.push("  the interpreter panics cleanly, the native binary")
+    L.push("  uses the OS stack (documented in SECURITY.md);")
+    L.push("- the proof engine reasons about its documented")
+    L.push("  fragment only; outside it, `-O fast` keeps the")
+    L.push("  runtime check conservatively;")
+    L.push("- micro-architectural side channels below the #[ct]")
+    L.push("  source-level model (port contention, power, EM);")
+    L.push("- kernel/OS vulnerabilities under the sandbox — the")
+    L.push("  sandbox gates the toolchain's own surface;")
+    L.push("- sanctioned `tests/xdiff/ledger.json` rows — pinned,")
+    L.push("  documented divergence classes, not new ones.")
+    L.push("")
+    L.push("## Reporting")
+    L.push("")
+    L.push("The channel is quoted from SECURITY.md live (the ledger")
+    L.push("anchors it): open a private GitHub Security Advisory at")
+    L.push("<https://github.com/mhieuhonda/halis-lang/security/advisories/new>")
+    L.push("— never a public issue. The project follows a 90-day")
+    L.push("coordinated-disclosure window and aims to acknowledge")
+    L.push("within 48 hours.")
+    L.push("")
+    L.push("## The reproduction contract")
+    L.push("")
+    L.push("Every eligible report carries:")
+    L.push("")
+    L.push("1. the ledger id (e.g. `G-TAINT-01`) the claim violates;")
+    L.push("2. a minimal `.hls` reproducer (one file, or one command")
+    L.push("   line for the runtime rows) the toolchain ACCEPTS;")
+    L.push("3. the toolchain used — commit sha, the evaluator")
+    L.push("   (`bin/hlboot`) vs `bin/hlc` or both (a divergence")
+    L.push("   report names both outputs);")
+    L.push("4. observed vs expected, in the terms of the row's")
+    L.push("   violation contract;")
+    L.push("5. for runtime rows: the exit code and the panic line.")
+    L.push("")
+    L.push("Reports missing the id are triaged against the ledger;")
+    L.push("reports the ledger cannot name are out of scope by")
+    L.push("definition — extend the ledger first, then the bounty")
+    L.push("applies to the new row.")
+    L.push("")
+    let mut out: str = ""
+    let mut li: int = 0
+    while li < L.len() {
+        out = out + L.get(li) + "\n"
+        li = li + 1
+    }
+    return out
+}
+
+# JSON accessors over JsonValue.
+fn jstr_of(v: JsonValue, key: str) -> str {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_str(x) {
+        return json_str_value(x)
+    }
+    return ""
+}
+
+fn jbool_of(v: JsonValue, key: str) -> bool {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_bool(x) {
+        return json_bool_value(x)
+    }
+    return false
+}
+
+# arr_of — the object's array field (extension-style helper).
+fn arr_of(v: JsonValue, key: str) -> list[JsonValue] {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_array(x) {
+        return x.arr
+    }
+    return[]
+}
+
+# upper_ascii — the .py's str.upper() for the ASCII verdict words.
+fn upper_ascii(s: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        if b >= 97 && b <= 122 {
+            out = out + chr(b - 32)
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# main — the CLI.
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Fs, Proc, Args, Exit {
+    let argv: list[str] = args()
+    if argv.len() < 2 {
+        eprint("usage: hls-guarantee list|show|verify|report [...]\n")
+        return 2
+    }
+    let cmd: str = argv.get(1)
+
+    # --unit-ledger: the gates' module checks, printed as CHECK lines
+    if cmd == "--unit-ledger" {
+        let rows: list[GgRow] = GG_LEDGER()
+        let mut contract: bool = true
+        let mut anchored: bool = true
+        let mut i: int = 0
+        while i < rows.len() {
+            let g: GgRow = rows.get(i)
+            if g.claim == "" || g.violation == "" || g.repro == ""
+            || g.out_of_scope == "" {
+                contract = false
+            }
+            if g.anchors.len() < 1 {
+                anchored = false
+            }
+            i = i + 1
+        }
+        let valid: bool = gg_validate_ledger().len() == 0
+        println("CHECK contract " + gg_b01(contract))
+        println("CHECK anchored " + gg_b01(anchored))
+        println("CHECK valid " + gg_b01(valid))
+        return 0
+    }
+
+    # dump — the library surface: the whole ledger as canonical JSON
+    # (rows with their contract fields, the vocabularies, the policy
+    # anchors, the digest). What the .py era importlib-loaded, a
+    # binary consumer reads here — `bin/hlboot <tree>/tools/
+    # hls-guarantee.hls dump` evaluates a TREE's own ledger the way
+    # the module import once did.
+    if cmd == "dump" {
+        print(gg_json_dump(json_object(
+        ["families", "guarantees", "ledger_sha256", "policy",
+        "policy_anchors", "severities"],
+        [jv_strs(GG_FAMILIES()), gg_rows_json(GG_LEDGER()),
+        json_str(gg_ledger_digest()), json_str(GG_POLICY()),
+        jv_anchors(GG_POLICY_ANCHORS()),
+        jv_strs(GG_SEVERITIES())])) + "\n")
+        return 0
+    }
+
+    if cmd == "list" {
+        let mut family: str = ""
+        let mut as_json: bool = false
+        let mut i: int = 2
+        while i < argv.len() {
+            if argv.get(i) == "--family" && i + 1 < argv.len() {
+                i = i + 1
+                family = argv.get(i)
+            } else {
+                if argv.get(i) == "--json" {
+                    as_json = true
+                }
+            }
+            i = i + 1
+        }
+        let rows: list[GgRow] = GG_LEDGER()
+        let picked: list[GgRow] = []
+        let mut ri: int = 0
+        while ri < rows.len() {
+            if family == "" || rows.get(ri).family == family {
+                picked.push(rows.get(ri))
+            }
+            ri = ri + 1
+        }
+        if family != "" && picked.len() == 0 {
+            eprint("error: unknown family '" + family + "' (families: "
+            + gg_join_strs(GG_FAMILIES(), ", ") + ")\n")
+            return 2
+        }
+        if as_json {
+            let rows_j: list[JsonValue] = []
+            let mut pj: int = 0
+            while pj < picked.len() {
+                let g: GgRow = picked.get(pj)
+                rows_j.push(json_object(
+                ["anchors", "claim", "family", "id", "probes",
+                "severity"],
+                [json_int(g.anchors.len()), json_str(g.claim),
+                json_str(g.family), json_str(g.id),
+                json_int(g.probes.len()), json_str(g.severity)]))
+                pj = pj + 1
+            }
+            print(gg_json_dump(json_object(
+            ["guarantees", "ledger_sha256", "policy"],
+            [json_array(rows_j), json_str(gg_ledger_digest()),
+            json_str(GG_POLICY())])) + "\n")
+            return 0
+        }
+        let mut title: str = gg_join_strs(GG_FAMILIES(), "|")
+        if family != "" {
+            title = family
+        }
+        println("hls-guarantee " + title + " — " + picked.len().to_str()
+        + " guarantees (policy " + GG_POLICY() + ")")
+        let mut pk: int = 0
+        while pk < picked.len() {
+            let g2: GgRow = picked.get(pk)
+            println("  " + gg_pad(g2.id, 14) + " " + gg_pad(g2.family, 12)
+            + " " + gg_pad(g2.severity, 8) + " " + g2.claim)
+            pk = pk + 1
+        }
+        return 0
+    }
+
+    if cmd == "show" {
+        if argv.len() < 3 {
+            eprint("error: show needs an id\n")
+            return 2
+        }
+        let gid: str = argv.get(2)
+        let rows: list[GgRow] = GG_LEDGER()
+        let mut i: int = 0
+        while i < rows.len() {
+            let g: GgRow = rows.get(i)
+            if g.id == gid {
+                println(g.id + " — " + g.family + " — " + g.severity)
+                println("")
+                println("Claim      : " + g.claim)
+                println("Mechanism  : " + g.mechanism)
+                println("Enforced by: " + g.enforced_by)
+                println("Anchors    :")
+                let mut ai: int = 0
+                while ai < g.anchors.len() {
+                    println("  - " + g.anchors.get(ai).file + " : '"
+                    + g.anchors.get(ai).pattern + "'")
+                    ai = ai + 1
+                }
+                if g.probes.len() > 0 {
+                    println("Probes     :")
+                    let mut pi: int = 0
+                    while pi < g.probes.len() {
+                        println("  - " + g.probes.get(pi).path + " ("
+                        + g.probes.get(pi).kind + ") expects '"
+                        + g.probes.get(pi).expect + "'")
+                        pi = pi + 1
+                    }
+                }
+                println("Violation  : " + g.violation)
+                println("Repro      : " + g.repro)
+                println("Out of scope: " + g.out_of_scope)
+                return 0
+            }
+            i = i + 1
+        }
+        let ids: list[str] = []
+        let mut ki: int = 0
+        while ki < rows.len() {
+            ids.push(rows.get(ki).id)
+            ki = ki + 1
+        }
+        eprint("error: unknown guarantee id '" + gid + "' (known: "
+        + gg_join_strs(ids, ", ") + ")\n")
+        return 2
+    }
+
+    if cmd == "verify" {
+        let mut root: str = ""
+        let mut as_json: bool = false
+        let mut quiet: bool = false
+        let mut i: int = 2
+        while i < argv.len() {
+            if argv.get(i) == "--root" && i + 1 < argv.len() {
+                i = i + 1
+                root = argv.get(i)
+            } else {
+                if argv.get(i) == "--json" {
+                    as_json = true
+                } else {
+                    if argv.get(i) == "--quiet" {
+                        quiet = true
+                    }
+                }
+            }
+            i = i + 1
+        }
+        let tree: str = gg_tree_of(root)
+        if !gg_is_dir(tree) {
+            eprint("error: --root is not a directory: " + tree + "\n")
+            return 2
+        }
+        let v: GgVerify = gg_verify(tree, quiet || as_json, true)
+        if as_json {
+            print(gg_json_dump(v.results) + "\n")
+        }
+        if !v.ok {
+            if !as_json {
+                eprint("LEDGER VIOLATED — " + v.refusals.len().to_str()
+                + " refusal(s):\n")
+                let mut ri: int = 0
+                while ri < v.refusals.len() {
+                    eprint("  - " + v.refusals.get(ri) + "\n")
+                    ri = ri + 1
+                }
+            } else {
+                eprint("LEDGER VIOLATED — see the refusals array\n")
+            }
+            return 1
+        }
+        if !as_json && !quiet {
+            let rows: list[GgRow] = GG_LEDGER()
+            let mut n_a: int = 0
+            let mut ri2: int = 0
+            while ri2 < rows.len() {
+                n_a = n_a + rows.get(ri2).anchors.len()
+                ri2 = ri2 + 1
+            }
+            println("LEDGER VERIFIED: " + rows.len().to_str()
+            + " guarantees, " + n_a.to_str() + " anchors, "
+            + "policy anchors green")
+        }
+        return 0
+    }
+
+    if cmd == "report" {
+        let mut out_path: str = ""
+        let mut json_path: str = ""
+        let mut stamp_on: bool = false
+        let mut root: str = ""
+        let mut i: int = 2
+        while i < argv.len() {
+            if argv.get(i) == "--out" && i + 1 < argv.len() {
+                i = i + 1
+                out_path = argv.get(i)
+            } else {
+                if argv.get(i) == "--json" && i + 1 < argv.len() {
+                    i = i + 1
+                    json_path = argv.get(i)
+                } else {
+                    if argv.get(i) == "--stamp" {
+                        stamp_on = true
+                    } else {
+                        if argv.get(i) == "--root" && i + 1 < argv.len() {
+                            i = i + 1
+                            root = argv.get(i)
+                        }
+                    }
+                }
+            }
+            i = i + 1
+        }
+        if out_path == "" {
+            eprint("error: report needs --out FILE.md\n")
+            return 2
+        }
+        let tree: str = gg_tree_of(root)
+        if !gg_is_dir(tree) {
+            eprint("error: --root is not a directory: " + tree + "\n")
+            return 2
+        }
+        let v: GgVerify = gg_verify(tree, true, false)
+        if !v.ok {
+            eprint("error: the ledger is violated — no report is written "
+            + "from a violated ledger. Refusals:\n")
+            let mut ri: int = 0
+            while ri < v.refusals.len() {
+                eprint("  - " + v.refusals.get(ri) + "\n")
+                ri = ri + 1
+            }
+            return 1
+        }
+        let mut stamp: str = ""
+        if stamp_on {
+            let dr: GgRun = gg_run("date", ["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+            stamp = dr.out.trim()
+        }
+        let doc: str = gg_render_report(tree, v.results, stamp)
+        write_file(out_path, doc)
+        if json_path != "" {
+            write_file(json_path, gg_json_dump(v.results) + "\n")
+        }
+        # the .py printed the path relative to its own tree when the
+        # output landed there — the binary keeps the same courtesy.
+        let mut shown: str = out_path
+        if out_path != "" && out_path.byte_at(0) != 47 {
+            shown = cwd_get() + "/" + out_path
+        }
+        let own: str = gg_tree_of("")
+        if shown == own {
+            shown = "."
+        } else {
+            if shown.len() > own.len() && shown.starts_with(own + "/") {
+                shown = shown.slice(own.len() + 1, shown.len())
+            }
+        }
+        println("report: " + shown + " ("
+        + arr_of(v.results, "guarantees").len().to_str()
+        + " guarantees, tree " + jstr_of(v.results, "tree").slice(0, 12)
+        + ")")
+        return 0
+    }
+
+    eprint("error: unknown command '" + cmd + "' "
+    + "(list|show|verify|report)\n")
+    return 2
+}
+
+# ----------------------------------------------------------------------------
+# main's small helpers.
+# ----------------------------------------------------------------------------
+
+fn gg_b01(b: bool) -> str {
+    if b {
+        return "1"
+    }
+    return "0"
+}
+
+fn gg_join_strs(xs: list[str], sep: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < xs.len() {
+        if i > 0 {
+            out = out + sep
+        }
+        out = out + xs.get(i)
+        i = i + 1
+    }
+    return out
+}
+
+# gg_tree_of — --root as given, else the repo the binary lives in
+# (always absolute, the .py's os.path.abspath discipline, so the
+# report's relative-path courtesy works from any cwd).
+fn gg_tree_of(root: str) -> str uses Args, Proc {
+    if root != "" {
+        if root.byte_at(0) == 47 {
+            return gg_normpath(root)
+        }
+        return gg_normpath(cwd_get() + "/" + root)
+    }
+    let a: list[str] = args()
+    if a.len() == 0 {
+        return cwd_get()
+    }
+    let argv0: str = a.get(0)
+    let rel: str = gg_normpath(gg_normpath(argv0 + "/..") + "/..")
+    if rel == "." {
+        return cwd_get()
+    }
+    if rel.byte_at(0) == 47 {
+        return rel
+    }
+    return gg_normpath(cwd_get() + "/" + rel)
+}
+
+# gg_is_dir — a directory probe without std.fs (a listing spawn).
+fn gg_is_dir(path: str) -> bool uses Proc {
+    let r: GgRun = gg_run("sh", ["-c", "test -d '" + path + "'"])
+    return r.code == 0
+}
