@@ -230,7 +230,7 @@ serve:
 # real HTTP server (overlay / SPA fallback / public dir / source /
 # banner / gzip), and a real WebSocket handshake that round-trips the
 # hello JSON frame.
-serve-acceptance: $(BIN)/acc-serve
+serve-acceptance: $(BIN)/acc-serve $(BIN)/hlserve bin/hlwasm
 	@echo "[Stage 75 acceptance] running tests/acc/serve_acceptance.hls..."
 	@$(BIN)/acc-serve
 	@echo "ACCEPTANCE OK: Stage 75 -- hls-serve (webpack-dev-server equivalent)"

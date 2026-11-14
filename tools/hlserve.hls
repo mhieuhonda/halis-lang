@@ -1,0 +1,2399 @@
+# ============================================================================
+# tools/hlserve.hls — Stage 75 (v0.94.0-alpha): the `hls serve` dev
+# server, in Halis (the native twin of the Python hlserve.py +
+# hlserve_parts/ package that retired; same CLI, same wire, same
+# exits — compiled by the bootstrap's own hlc).
+# ----------------------------------------------------------------------------
+# The webpack-dev-server equivalent for Halis web apps. Watches .hls
+# files, recompiles on change (through bin/hlwasm — the native wasm
+# backend the .py era imported), serves the bundle on localhost:PORT,
+# and hot-reloads the browser tab over an RFC 6455 WebSocket.
+#
+# The surface the Python package split across ten modules lives here
+# as one program:
+#   * the CLI (--input/--bundle/--port/--listen/--proxy/--public-dir/
+#     --history-fallback/--compress/--overlay/--watch-dirs/
+#     --debounce-ms/--config and the Stage 24 core);
+#   * the config file (hls.serve.toml / hls.serve.json, CLI wins);
+#   * the file watcher (debounced multi-directory poller);
+#   * the compiler bridge (bin/hlwasm spawn, parsed diagnostics);
+#   * the HMR bus (RFC 6455 handshake, frames, hello/ok/errors/
+#     reload/progress messages);
+#   * the overlay + status banner (byte-faithful client snippet —
+#     tools/hlserve_hmr_client.hls);
+#   * the reverse proxy (longest-prefix rules, raw forward);
+#   * the HTTP server (bundle, /static, /source, SPA fallback,
+#     gzip when it pays, Cache-Control: no-store everywhere).
+#
+# Exits: 0 served (never, in practice — Ctrl+C) · 1 runtime refusal
+# · 2 usage.
+# ============================================================================
+
+import "std.str"
+import "std.json"
+import "std.result"
+import "std.sha1"
+import "std.sha256"
+import "std.base64"
+import "std.fs"
+import "std.process"
+import "std.net"
+import "std.env"
+import "std.option"
+import "std.time"
+import "std.sync"
+import "std.archive"
+import "./hlserve_hmr_client.hls"
+
+# ----------------------------------------------------------------------------
+# Constants (the .py era's defaults, verbatim).
+# ----------------------------------------------------------------------------
+
+fn sv_banner() -> str {
+    return "hls-serve v0.94.0-alpha (Stage 75)"
+}
+
+fn sv_default_port() -> int {
+    return 3000
+}
+
+fn sv_default_bundle() -> str {
+    return "out"
+}
+
+fn sv_default_input() -> str {
+    return "examples/hello.hls"
+}
+
+fn sv_default_target() -> str {
+    return "wasm32-unknown-unknown"
+}
+
+fn sv_default_public_dir() -> str {
+    return "public"
+}
+
+fn sv_default_debounce_ms() -> int {
+    return 200
+}
+
+fn sv_hmr_version() -> int {
+    return 1
+}
+
+# The RFC 6455 magic GUID the server appends to the client's key
+# before SHA-1 + base64.
+fn sv_ws_magic() -> str {
+    return "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+}
+
+fn sv_crlf() -> str {
+    return chr(13) + "\n"
+}
+
+fn sv_op_cont() -> int {
+    return 0
+}
+fn sv_op_text() -> int {
+    return 1
+}
+fn sv_op_bin() -> int {
+    return 2
+}
+fn sv_op_close() -> int {
+    return 8
+}
+fn sv_op_ping() -> int {
+    return 9
+}
+fn sv_op_pong() -> int {
+    return 10
+}
+
+# One frame's payload cap (the .py era's DoS guard, 16 MiB).
+fn sv_ws_max_payload() -> int {
+    return 16777216
+}
+
+# ----------------------------------------------------------------------------
+# Small helpers.
+# ----------------------------------------------------------------------------
+
+fn sv_dirname(path: str) -> str {
+    let mut i: int = path.len() - 1
+    while i >= 0 {
+        if path.byte_at(i) == 47 {
+            if i == 0 {
+                return "/"
+            }
+            return path.slice(0, i)
+        }
+        i = i - 1
+    }
+    return "."
+}
+
+fn sv_basename(path: str) -> str {
+    let mut i: int = path.len() - 1
+    while i >= 0 {
+        if path.byte_at(i) == 47 {
+            return path.slice(i + 1, path.len())
+        }
+        i = i - 1
+    }
+    return path
+}
+
+fn sv_join(dir: str, name: str) -> str {
+    if dir == "" || dir == "." {
+        return name
+    }
+    if dir.byte_at(dir.len() - 1) == 47 {
+        return dir + name
+    }
+    return dir + "/" + name
+}
+
+fn sv_shell_quote(s: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < s.len() {
+        if s.byte_at(i) == 39 {
+            out = out + "'\\''"
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn sv_is_digits(s: str) -> bool {
+    if s.len() == 0 {
+        return false
+    }
+    let mut i: int = 0
+    while i < s.len() {
+        if s.byte_at(i) < 48 || s.byte_at(i) > 57 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn sv_to_int(s: str) -> int {
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < s.len() {
+        v = v * 10 + (s.byte_at(i) - 48)
+        i = i + 1
+    }
+    return v
+}
+
+fn sv_lower(s: str) -> str {
+    return str_to_lower_ascii(s)
+}
+
+fn sv_contains_str(xs: list[str], s: str) -> bool {
+    let mut i: int = 0
+    while i < xs.len() {
+        if xs.get(i) == s {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# sv_content_type — the extension map, Stage 75's table verbatim.
+fn sv_content_type(path: str) -> str {
+    let ext: str = sv_ext_of(path)
+    if ext == ".html" {
+        return "text/html; charset=utf-8"
+    }
+    if ext == ".js" || ext == ".mjs" {
+        return "application/javascript; charset=utf-8"
+    }
+    if ext == ".wasm" {
+        return "application/wasm"
+    }
+    if ext == ".json" || ext == ".map" {
+        return "application/json; charset=utf-8"
+    }
+    if ext == ".css" {
+        return "text/css; charset=utf-8"
+    }
+    if ext == ".txt" || ext == ".hls" {
+        return "text/plain; charset=utf-8"
+    }
+    if ext == ".png" {
+        return "image/png"
+    }
+    if ext == ".jpg" || ext == ".jpeg" {
+        return "image/jpeg"
+    }
+    if ext == ".gif" {
+        return "image/gif"
+    }
+    if ext == ".svg" {
+        return "image/svg+xml"
+    }
+    if ext == ".ico" {
+        return "image/x-icon"
+    }
+    if ext == ".woff" {
+        return "font/woff"
+    }
+    if ext == ".woff2" {
+        return "font/woff2"
+    }
+    if ext == ".ttf" {
+        return "font/ttf"
+    }
+    if ext == ".otf" {
+        return "font/otf"
+    }
+    if ext == ".eot" {
+        return "application/vnd.ms-fontobject"
+    }
+    if ext == ".webp" {
+        return "image/webp"
+    }
+    if ext == ".webmanifest" {
+        return "application/manifest+json"
+    }
+    if ext == ".xml" {
+        return "application/xml; charset=utf-8"
+    }
+    if ext == ".pdf" {
+        return "application/pdf"
+    }
+    if ext == ".csv" {
+        return "text/csv; charset=utf-8"
+    }
+    return "application/octet-stream"
+}
+
+fn sv_ext_of(path: str) -> str {
+    let base: str = sv_basename(path)
+    let mut i: int = base.len() - 1
+    while i >= 0 {
+        if base.byte_at(i) == 46 {
+            let mut ext: str = base.slice(i, base.len())
+            return sv_lower(ext)
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+# ----------------------------------------------------------------------------
+# The config — hls.serve.toml / hls.serve.json, CLI flags win.
+# ----------------------------------------------------------------------------
+
+struct ProxyRule {
+    prefix: str,
+    target: str
+}
+
+struct ServeConfig {
+    input: str,
+    bundle: str,
+    port: int,
+    host: str,
+    target: str,
+    wasm_opt: str,
+    opt_level: str,
+    glue: str,
+    open: bool,
+    https: bool,
+    history_fallback: bool,
+    compress: bool,
+    public_dir: str, # "" = unset
+    proxies: list[ProxyRule],
+    hot_reload: bool,
+    overlay: bool,
+    verbose: bool,
+    quiet: bool,
+    watch_dirs: list[str], # the config's own dirs
+    watch_extra: list[str], # --watch / --watch-dirs
+    debounce_ms: int
+}
+
+fn sv_config_default() -> ServeConfig {
+    let proxies: list[ProxyRule] = []
+    let watch_dirs: list[str] = []
+    let watch_extra: list[str] = []
+    return ServeConfig {
+        input: sv_default_input(),
+        bundle: sv_default_bundle(), port: sv_default_port(),
+        host: "127.0.0.1", target: sv_default_target(),
+        wasm_opt: "auto", opt_level: "O3", glue: "compact",
+        open: false, https: false, history_fallback: true,
+        compress: true, public_dir: "", proxies: proxies,
+        hot_reload: true, overlay: true, verbose: false,
+        quiet: false, watch_dirs: watch_dirs,
+        watch_extra: watch_extra, debounce_ms: sv_default_debounce_ms()
+    }
+}
+
+# sv_parse_proxy_spec — PREFIX=TARGET, or "" when malformed. The
+# target must carry a scheme (http:// or https://).
+fn sv_parse_proxy_spec(spec: str) -> Result[ProxyRule, str] {
+    let parts: list[str] = spec.split("=")
+    if parts.len() != 2 {
+        return Result.Err("proxy spec must be PREFIX=TARGET, got "
+        + py_repr(spec))
+    }
+    let prefix: str = parts.get(0)
+    let target: str = parts.get(1)
+    if prefix == "" {
+        return Result.Err("proxy prefix must not be empty")
+    }
+    if !target.starts_with("http://") && !target.starts_with("https://") {
+        return Result.Err("proxy target must be an http(s) URL, got "
+        + py_repr(target))
+    }
+    return Result.Ok(ProxyRule {
+        prefix: prefix, target: target
+    })
+}
+
+# sv_find_proxy — the LONGEST prefix wins (so /api/v2 beats /api).
+fn sv_find_proxy(path: str, rules: list[ProxyRule]) -> JsonValue {
+    let mut best: int = -1
+    let mut found: JsonValue = json_null()
+    let mut i: int = 0
+    while i < rules.len() {
+        let r: ProxyRule = rules.get(i)
+        if path.starts_with(r.prefix) && r.prefix.len() > best {
+            best = r.prefix.len()
+            let keys: list[str] = []
+            let vals: list[JsonValue] = []
+            keys.push("prefix")
+            vals.push(json_str(r.prefix))
+            keys.push("target")
+            vals.push(json_str(r.target))
+            found = json_object(keys, vals)
+        }
+        i = i + 1
+    }
+    return found
+}
+
+# sv_toml_value — a bare TOML scalar (string/int/bool) from `k = v`.
+fn sv_toml_scalar(line: str) -> Result[JsonValue, str] {
+    let eq: int = line.find("=")
+    if eq < 0 {
+        return Result.Err("not a k = v line")
+    }
+    let key: str = line.slice(0, eq).trim()
+    let val: str = line.slice(eq + 1, line.len()).trim()
+    let parsed: Result[JsonValue, str] = sv_toml_value(val)
+    if result_is_err(parsed) {
+        return Result.Err(result_err_or(parsed, "") + " for " + key)
+    }
+    let keys: list[str] = []
+    let vals: list[JsonValue] = []
+    keys.push(key)
+    vals.push(result_unwrap(parsed))
+    return Result.Ok(json_object(keys, vals))
+}
+
+# sv_find_from — s.find(sub) from a start index (the stdlib find
+# takes no start).
+fn sv_find_from(s: str, sub: str, start: int) -> int {
+    if start < 0 {
+        return -1
+    }
+    let mut i: int = start
+    while i + sub.len() <= s.len() {
+        if s.slice(i, i + sub.len()) == sub {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# py_repr — Python's repr() for the error texts the refusals quote:
+# single-quoted, backslash and quote escaped, controls as \xNN.
+fn py_repr(s: str) -> str {
+    let mut out: str = "'"
+    let mut i: int = 0
+    while i < s.len() {
+        let b: int = s.byte_at(i)
+        if b == 39 {
+            out = out + "\\'"
+        } else if b == 92 {
+            out = out + "\\\\"
+        } else if b < 32 {
+            out = out + "\\x" + sv_hex2(b)
+        } else {
+            out = out + s.slice(i, i + 1)
+        }
+        i = i + 1
+    }
+    return out + "'"
+}
+
+fn sv_hex2(b: int) -> str {
+    let digits: str = "0123456789abcdef"
+    let hi: int = int_and(int_shr(b, 4), 15)
+    let lo: int = int_and(b, 15)
+    return digits.slice(hi, hi + 1) + digits.slice(lo, lo + 1)
+}
+
+# sv_toml_value — the scalar forms the config carries.
+fn sv_toml_value(val: str) -> Result[JsonValue, str] {
+    if val.starts_with("\"") && val.ends_with("\"") && val.len() >= 2 {
+        return Result.Ok(json_str(val.slice(1, val.len() - 1)))
+    }
+    if val == "true" {
+        return Result.Ok(json_bool(true))
+    }
+    if val == "false" {
+        return Result.Ok(json_bool(false))
+    }
+    if sv_is_digits(val) {
+        return Result.Ok(json_int(sv_to_int(val)))
+    }
+    return Result.Err("unsupported TOML value")
+}
+
+# sv_load_config_file — TOML or JSON by extension, into the config
+# dict shape both formats share. The TOML reader understands exactly
+# what the dev server's config file carries: flat scalars, the
+# [watch] table (dirs/debounce_ms) and [[proxy]] rows (path/target).
+fn sv_load_config_file(path: str) -> Result[JsonValue, str] uses Fs {
+    if !file_exists(path) {
+        return Result.Err("config file not found: " + path)
+    }
+    let raw: str = read_file(path)
+    if path.ends_with(".json") {
+        let rr: Result[JsonValue, str] = json_parse_result(raw)
+        if result_is_err(rr) {
+            return Result.Err("not JSON: " + result_err_or(rr, ""))
+        }
+        return Result.Ok(result_unwrap(rr))
+    }
+    # TOML.
+    let keys: list[str] = []
+    let vals: list[JsonValue] = []
+    let mut watch_dirs: list[JsonValue] = []
+    let mut watch_debounce: JsonValue = json_null()
+    let mut proxies: list[JsonValue] = []
+    let mut section: str = ""
+    let lines: list[str] = raw.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i).trim()
+        i = i + 1
+        if line == "" || line.starts_with("#") {
+            continue
+        }
+        if line.starts_with("[[") && line.ends_with("]]") {
+            section = line.slice(2, line.len() - 2).trim()
+            continue
+        }
+        if line.starts_with("[") && line.ends_with("]") {
+            section = line.slice(1, line.len() - 1).trim()
+            continue
+        }
+        if section == "" {
+            let kv: Result[JsonValue, str] = sv_toml_scalar(line)
+            if result_is_err(kv) {
+                return Result.Err(result_err_or(kv, ""))
+            }
+            let obj: JsonValue = result_unwrap(kv)
+            keys.push(obj.obj_keys.get(0))
+            vals.push(obj.obj_vals.get(0))
+        } else if section == "watch" {
+            if line.starts_with("dirs") {
+                let eq: int = line.find("=")
+                let arr: str = line.slice(eq + 1, line.len()).trim()
+                let items: list[str] = arr.split(",")
+                let mut j: int = 0
+                while j < items.len() {
+                    let item: str = items.get(j).trim()
+                    if item.starts_with("\"") && item.ends_with("\"")
+                    && item.len() >= 2 {
+                        watch_dirs.push(json_str(
+                        item.slice(1, item.len() - 1)))
+                    }
+                    j = j + 1
+                }
+            } else {
+                let kv2: Result[JsonValue, str] = sv_toml_scalar(line)
+                if result_is_err(kv2) {
+                    return Result.Err(result_err_or(kv2, ""))
+                }
+                let obj2: JsonValue = result_unwrap(kv2)
+                if obj2.obj_keys.get(0) == "debounce_ms" {
+                    watch_debounce = obj2.obj_vals.get(0)
+                }
+            }
+        } else if section == "proxy" {
+            if line.starts_with("path") {
+                let eq2: int = line.find("=")
+                let pv: str = line.slice(eq2 + 1, line.len()).trim()
+                let pkeys: list[str] = []
+                let pvals: list[JsonValue] = []
+                pkeys.push("path")
+                pvals.push(json_str(pv.slice(1, pv.len() - 1)))
+                # the target line follows; defer until seen
+                proxies.push(json_object(pkeys, pvals))
+            } else if line.starts_with("target") && proxies.len() > 0 {
+                let eq3: int = line.find("=")
+                let tv: str = line.slice(eq3 + 1, line.len()).trim()
+                let last: JsonValue = proxies.get(proxies.len() - 1)
+                let lkeys: list[str] = []
+                let lvals: list[JsonValue] = []
+                let mut k: int = 0
+                while k < last.obj_keys.len() {
+                    lkeys.push(last.obj_keys.get(k))
+                    lvals.push(last.obj_vals.get(k))
+                    k = k + 1
+                }
+                lkeys.push("target")
+                lvals.push(json_str(tv.slice(1, tv.len() - 1)))
+                let fixed: list[JsonValue] = []
+                let mut w: int = 0
+                while w < proxies.len() - 1 {
+                    fixed.push(proxies.get(w))
+                    w = w + 1
+                }
+                fixed.push(json_object(lkeys, lvals))
+                proxies = fixed
+            }
+        }
+    }
+    if watch_dirs.len() > 0 || !json_is_null(watch_debounce) {
+        let wkeys: list[str] = []
+        let wvals: list[JsonValue] = []
+        wkeys.push("dirs")
+        wvals.push(json_array(watch_dirs))
+        wkeys.push("debounce_ms")
+        if json_is_null(watch_debounce) {
+            wvals.push(json_int(sv_default_debounce_ms()))
+        } else {
+            wvals.push(watch_debounce)
+        }
+        keys.push("watch")
+        vals.push(json_object(wkeys, wvals))
+    }
+    if proxies.len() > 0 {
+        keys.push("proxy")
+        vals.push(json_array(proxies))
+    }
+    return Result.Ok(json_object(keys, vals))
+}
+
+# sv_config_from_dict — the shared dict shape (JSON file or parsed
+# TOML) into a ServeConfig.
+fn sv_config_from_dict(doc: JsonValue) -> Result[ServeConfig, str] {
+    let cfg: ServeConfig = sv_config_default()
+    if json_object_has(doc, "input") {
+        cfg.input = fa_get_str(doc, "input")
+    }
+    if json_object_has(doc, "bundle") {
+        cfg.bundle = fa_get_str(doc, "bundle")
+    }
+    if json_object_has(doc, "port") {
+        cfg.port = fa_get_int(doc, "port")
+    }
+    if json_object_has(doc, "host") {
+        cfg.host = fa_get_str(doc, "host")
+    }
+    if json_object_has(doc, "target") {
+        cfg.target = fa_get_str(doc, "target")
+    }
+    if json_object_has(doc, "wasm_opt") {
+        cfg.wasm_opt = fa_get_str(doc, "wasm_opt")
+    }
+    if json_object_has(doc, "glue") {
+        cfg.glue = fa_get_str(doc, "glue")
+    }
+    if json_object_has(doc, "open") {
+        cfg.open = fa_get_bool(doc, "open")
+    }
+    if json_object_has(doc, "https") {
+        cfg.https = fa_get_bool(doc, "https")
+    }
+    if json_object_has(doc, "history_fallback") {
+        cfg.history_fallback = fa_get_bool(doc, "history_fallback")
+    }
+    if json_object_has(doc, "compress") {
+        cfg.compress = fa_get_bool(doc, "compress")
+    }
+    if json_object_has(doc, "public_dir") {
+        cfg.public_dir = fa_get_str(doc, "public_dir")
+    }
+    if json_object_has(doc, "hot_reload") {
+        cfg.hot_reload = fa_get_bool(doc, "hot_reload")
+    }
+    if json_object_has(doc, "overlay") {
+        cfg.overlay = fa_get_bool(doc, "overlay")
+    }
+    if json_object_has(doc, "debounce_ms") {
+        cfg.debounce_ms = fa_get_int(doc, "debounce_ms")
+    }
+    if json_object_has(doc, "watch") {
+        let w: JsonValue = json_object_get(doc, "watch")
+        if json_object_has(w, "dirs") {
+            let dirs: list[JsonValue] = json_object_get(w, "dirs").arr
+            let mut i: int = 0
+            while i < dirs.len() {
+                if json_is_str(dirs.get(i)) {
+                    cfg.watch_dirs.push(json_str_value(dirs.get(i)))
+                }
+                i = i + 1
+            }
+        }
+        if json_object_has(w, "debounce_ms") {
+            cfg.debounce_ms = fa_get_int(w, "debounce_ms")
+        }
+    }
+    if json_object_has(doc, "proxy") {
+        let rows: list[JsonValue] = json_object_get(doc, "proxy").arr
+        let mut i: int = 0
+        while i < rows.len() {
+            let r: JsonValue = rows.get(i)
+            let rule: Result[ProxyRule, str] = sv_parse_proxy_spec(
+            fa_get_str(r, "path") + "=" + fa_get_str(r, "target"))
+            if result_is_err(rule) {
+                return Result.Err(result_err_or(rule, ""))
+            }
+            cfg.proxies.push(result_unwrap(rule))
+            i = i + 1
+        }
+    }
+    return Result.Ok(cfg)
+}
+
+# fa_get_str / fa_get_int / fa_get_bool — null-safe dict accessors
+# (shared shape; the names carry the audit kit's prefix by lineage).
+fn fa_get_str(v: JsonValue, key: str) -> str {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_str(x) {
+        return json_str_value(x)
+    }
+    return ""
+}
+
+fn fa_get_int(v: JsonValue, key: str) -> int {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_int(x) {
+        return json_int_value(x)
+    }
+    return 0
+}
+
+fn fa_get_bool(v: JsonValue, key: str) -> bool {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_bool(x) {
+        return json_bool_value(x)
+    }
+    return false
+}
+
+# ----------------------------------------------------------------------------
+# The WebSocket — handshake (RFC 6455 §4.2.2) and frames, by hand.
+# ----------------------------------------------------------------------------
+
+# sv_ws_accept — base64(sha1(key + GUID)), the spec's own arithmetic.
+fn sv_ws_accept(key: str) -> str {
+    return base64_encode(sha1_hex_bytes(key + sv_ws_magic()))
+}
+
+# sha1_hex_bytes — sha1 over the raw bytes of an ASCII string,
+# rendered as the 20 raw bytes base64 will eat (sha1_hex gives hex;
+# the handshake needs the digest bytes). We decode our own hex back.
+fn sha1_hex_bytes(s: str) -> str {
+    let hex: str = sha1_hex(s)
+    let mut out: str = ""
+    let mut i: int = 0
+    while i + 1 < hex.len() {
+        let hi: int = sv_hexval(hex.byte_at(i))
+        let lo: int = sv_hexval(hex.byte_at(i + 1))
+        out = out + chr(hi * 16 + lo)
+        i = i + 2
+    }
+    return out
+}
+
+fn sv_hexval(b: int) -> int {
+    if b >= 48 && b <= 57 {
+        return b - 48
+    }
+    if b >= 97 && b <= 102 {
+        return b - 87
+    }
+    return 0
+}
+
+# sv_ws_handshake_response — the 101 the client's key earns.
+fn sv_ws_handshake_response(key: str) -> str {
+    let crlf: str = chr(13) + "\n"
+    return "HTTP/1.1 101 Switching Protocols" + crlf
+    + "Upgrade: websocket" + crlf
+    + "Connection: Upgrade" + crlf
+    + "Sec-WebSocket-Accept: " + sv_ws_accept(key) + crlf
+    + crlf
+}
+
+# sv_ws_encode_frame — FIN=1, no mask (server -> client), the length
+# encoding the spec fixes (7 bit / 16 bit / 64 bit).
+fn sv_ws_encode_frame(payload: str, opcode: int) -> str {
+    let b0: int = 128 + (opcode % 16)
+    let mut out: str = chr(b0)
+    let plen: int = payload.len()
+    if plen < 126 {
+        out = out + chr(plen)
+    } else if plen < 65536 {
+        out = out + chr(126)
+        out = out + chr((plen / 256) % 256)
+        out = out + chr(plen % 256)
+    } else {
+        out = out + chr(127)
+        let mut shift: int = 56
+        while shift >= 0 {
+            out = out + chr(int_and(int_shr(plen, shift), 255))
+            shift = shift - 8
+        }
+    }
+    return out + payload
+}
+
+# sv_ws_decode_payload_len — the payload length a frame header
+# advertises (header = the 2..12 bytes after the first two).
+fn sv_ws_header_len(b1: int) -> int {
+    let plen: int = int_and(b1, 127)
+    if plen < 126 {
+        return 2
+    }
+    if plen == 126 {
+        return 4
+    }
+    return 10
+}
+
+# ----------------------------------------------------------------------------
+# Diagnostics — the compiler bridge's parse (the .py era's regexes,
+# as a line scanner).
+# ----------------------------------------------------------------------------
+
+struct SvcDiag {
+    severity: str,
+    file: str,
+    line: int,
+    col: int,
+    message: str
+}
+
+# sv_parse_diag_line — "file:line:col: severity: message" /
+# "file:line: severity: message" (col 0). "" when the line is not a
+# diagnostic.
+fn sv_parse_diag_line(line: str) -> SvcDiag {
+    let empty: SvcDiag = SvcDiag {
+        severity: "", file: "", line: 0,
+        col: 0, message: ""
+    }
+    # the severity word, the colon after it, and the message.
+    let sevs: list[str] = []
+    sevs.push("error: ")
+    sevs.push("warning: ")
+    sevs.push("note: ")
+    let mut i: int = 0
+    while i < sevs.len() {
+        let needle: str = sevs.get(i)
+        let pos: int = line.find(needle)
+        if pos > 0 {
+            # the locator ends at the colon the severity follows —
+            # "file.hls:12:5: error: msg" locates as file.hls:12:5.
+            let mut loc: str = line.slice(0, pos).trim()
+            if loc.ends_with(":") {
+                loc = loc.slice(0, loc.len() - 1)
+            }
+            let msg: str = line.slice(pos + needle.len(), line.len())
+            let bits: list[str] = loc.split(":")
+            if bits.len() == 3 && sv_is_digits(bits.get(1).trim())
+            && sv_is_digits(bits.get(2).trim()) {
+                return SvcDiag {
+                    severity: sv_lower(needle.slice(0,
+                    needle.len() - 2)), file: bits.get(0).trim(),
+                    line: sv_to_int(bits.get(1).trim()),
+                    col: sv_to_int(bits.get(2).trim()), message: msg
+                }
+            }
+            if bits.len() == 2 && sv_is_digits(bits.get(1).trim()) {
+                return SvcDiag {
+                    severity: sv_lower(needle.slice(0,
+                    needle.len() - 2)), file: bits.get(0).trim(),
+                    line: sv_to_int(bits.get(1).trim()), col: 0,
+                    message: msg
+                }
+            }
+        }
+        i = i + 1
+    }
+    return empty
+}
+
+# sv_parse_diagnostics — every diagnostic line, in order.
+fn sv_parse_diagnostics(text: str) -> list[SvcDiag] {
+    let out: list[SvcDiag] = []
+    let lines: list[str] = text.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let d: SvcDiag = sv_parse_diag_line(lines.get(i).trim())
+        if d.severity != "" {
+            out.push(d)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# sv_diag_json — the overlay dict shape (json.dumps's default
+# separators: ", " and ": ").
+fn sv_diag_json(d: SvcDiag) -> str {
+    let q: str = "\""
+    return "{" + q + "severity" + q + ": " + q + d.severity + q
+    + ", " + q + "file" + q + ": " + q + d.file + q + ", " + q
+    + "line" + q + ": " + d.line.to_str() + ", " + q + "col" + q
+    + ": " + d.col.to_str() + ", " + q + "message" + q + ": " + q
+    + d.message + q + "}"
+}
+
+# ----------------------------------------------------------------------------
+# The overlay — injection points, byte-faithful to the .py.
+# ----------------------------------------------------------------------------
+
+# sv_inject_overlay — the snippet before </body> (or appended), only
+# when enabled.
+fn sv_inject_overlay(html: str, enabled: bool) -> str {
+    if !enabled {
+        return html
+    }
+    let snippet: str = sv_overlay_snippet()
+    if html.contains("</body>") {
+        return str_replace_first(html, "</body>", snippet + "</body>")
+    }
+    return html + snippet
+}
+
+# sv_inject_status_banner — the compile-failed banner at the top of
+# <body>, the only feedback before the HMR socket is up.
+fn sv_inject_status_banner(html: str, message: str) -> str {
+    if message == "" {
+        return html
+    }
+    let banner: str = "<div style=\"background:#fee;color:#800;"
+    + "border-bottom:1px solid #800;"
+    + "padding:0.5rem;font-family:Menlo,Consolas,monospace;"
+    + "font-size:14px;\">[hls-serve] " + message + "</div>"
+    if html.contains("<body") {
+        let gt: int = sv_find_from(html, ">", html.find("<body"))
+        if gt >= 0 {
+            return html.slice(0, gt + 1) + banner
+            + html.slice(gt + 1, html.len())
+        }
+    }
+    return banner + html
+}
+
+# str_replace_first — the one-shot surgery.
+fn str_replace_first(s: str, from_s: str, to_s: str) -> str {
+    let idx: int = s.find(from_s)
+    if idx < 0 {
+        return s
+    }
+    return s.slice(0, idx) + to_s
+    + s.slice(idx + from_s.len(), s.len())
+}
+
+# ----------------------------------------------------------------------------
+# Spawn plumbing — the tool's own run_capture, the .py era's
+# subprocess discipline.
+# ----------------------------------------------------------------------------
+
+struct SvRun {
+    code: int,
+    out: str,
+    err: str
+}
+
+fn sv_run(program: str, args: list[str]) -> SvRun uses Proc {
+    let r: SvRun = SvRun {
+        code: -1, out: "", err: ""
+    }
+    let pid: int = proc_spawn(program, args, 2, 1, 1)
+    if pid < 1 {
+        return r
+    }
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    r.code = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    r.out = out
+    r.err = err
+    return r
+}
+
+# sv_hlwasm_bin — the wasm backend the server recompiles through:
+# the repo the binary lives in (argv0/../..), built when missing.
+fn sv_hlwasm_bin() -> str uses Args, Fs, Proc {
+    let a: list[str] = args()
+    if a.len() == 0 {
+        return "bin/hlwasm"
+    }
+    let argv0: str = a.get(0)
+    if !argv0.contains("/") {
+        return "bin/hlwasm"
+    }
+    let root: str = sv_dirname(sv_dirname(argv0))
+    let tool: str = sv_join(root, "bin/hlwasm")
+    if !file_exists(tool) {
+        sv_run("make", ["-s", "bin/hlwasm"])
+    }
+    if !file_exists(tool) {
+        return "bin/hlwasm"
+    }
+    return tool
+}
+
+# ----------------------------------------------------------------------------
+# The compiler bridge — one recompile through bin/hlwasm, the native
+# wasm backend. Errors are captured, never propagated: the server
+# keeps running on a failed compile (fix the code, save, and the
+# overlay auto-dismisses).
+# ----------------------------------------------------------------------------
+
+struct CompileOut {
+    ok: bool,
+    message: str, # the first error's banner text ("" when ok)
+    stderr: str
+}
+
+fn sv_compile_once(input_hls: str, bundle_base: str, target: str,
+wasm_opt: str, glue: str) -> CompileOut uses Args, Fs, Proc {
+    let tool: str = sv_hlwasm_bin()
+    let args: list[str] = []
+    args.push("--target")
+    args.push(target)
+    args.push("--wasm-opt")
+    args.push(wasm_opt)
+    args.push("--glue")
+    args.push(glue)
+    args.push(input_hls)
+    args.push(bundle_base)
+    let r: SvRun = sv_run(tool, args)
+    let out: CompileOut = CompileOut {
+        ok: r.code == 0, message: "",
+        stderr: r.err + r.out
+    }
+    if out.ok {
+        return out
+    }
+    # The .py era caught the backend's HLError and stamped
+    # "compile raised: HLError: <message>"; the native backend prints
+    # "compile error: <phase>: <message>" — same text, one prefix
+    # mapping apart.
+    let lines: list[str] = out.stderr.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i).trim()
+        if line.starts_with("compile error: ") {
+            let mut msg: str = line.slice("compile error: ".len(),
+            line.len())
+            if msg.starts_with("syntax error: ") {
+                msg = msg.slice("syntax error: ".len(), msg.len())
+            }
+            out.message = "compile raised: HLError: " + msg
+            return out
+        }
+        i = i + 1
+    }
+    out.message = "compile raised: HLError: compile failed"
+    return out
+}
+
+# sv_write_state — the compile state, one small file the HTTP
+# handler reads per request (the banner is never stale, whatever the
+# watcher task is doing).
+fn sv_write_state(bundle_dir: str, ok: bool, message: str) -> void
+uses Fs, Proc {
+    let keys: list[str] = []
+    let vals: list[JsonValue] = []
+    keys.push("ok")
+    vals.push(json_bool(ok))
+    keys.push("message")
+    vals.push(json_str(message))
+    let tmp: str = sv_join(bundle_dir, ".hlserve-state.json.tmp")
+    write_file(tmp, json_stringify(json_object(keys, vals)))
+    proc_exec("mv '" + sv_shell_quote(tmp) + "' '"
+    + sv_shell_quote(sv_join(bundle_dir, ".hlserve-state.json"))
+    + "'")
+}
+
+# ----------------------------------------------------------------------------
+# The watcher — a CHILD PROCESS loop, not a task: the dev server's
+# main process stays single-threaded (one accept loop), and the
+# debounce/recompile cycle runs in `bin/hlserve --watch-poll` children
+# a sh loop re-arms every debounce. The child appends its lines to the
+# log file itself (a file write is never buffered) and rewrites the
+# state file the HTTP handler reads — the banner is never stale.
+# ----------------------------------------------------------------------------
+
+# sv_append_log — the watcher's witness lines, appended verbatim.
+fn sv_append_log(path: str, line: str) -> void uses Fs {
+    let mut body: str = ""
+    if file_exists(path) {
+        body = read_file(path)
+    }
+    write_file(path, body + line + "\n")
+}
+
+# sv_scan_hashes — every watched .hls file as "path sha256" lines
+# (content hashing, not mtimes: a rewrite is a rewrite whatever the
+# filesystem's timestamp granularity).
+fn sv_scan_hashes(dirs: list[str]) -> list[str] uses Fs {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < dirs.len() {
+        let found: list[str] = sv_scan_dir(dirs.get(i))
+        let mut j: int = 0
+        while j < found.len() {
+            out.push(found.get(j))
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn sv_scan_dir(dir: str) -> list[str] uses Fs {
+    let out: list[str] = []
+    if !file_exists(dir) {
+        return out
+    }
+    let entries: list[str] = fs_read_dir(dir)
+    let mut i: int = 0
+    while i < entries.len() {
+        let name: str = entries.get(i)
+        i = i + 1
+        if name.starts_with(".") {
+            continue
+        }
+        let full: str = sv_join(dir, name)
+        if fs_is_dir(full) {
+            if name == ".git" || name == "bin" || name == "node_modules"
+            || name == "__pycache__" || name == ".acc-scratch" {
+                continue
+            }
+            let sub: list[str] = sv_scan_dir(full)
+            let mut j: int = 0
+            while j < sub.len() {
+                out.push(sub.get(j))
+                j = j + 1
+            }
+        } else if name.ends_with(".hls") {
+            out.push(full + " " + sha256_hex(read_file(full)))
+        }
+    }
+    return out
+}
+
+# sv_watch_poll — ONE scan of the job's dirs. First run seeds the
+# hash table (no events); a changed hash is a recompile, logged and
+# state-filed. Exit 0 = keep looping.
+fn sv_watch_poll(job_path: str) -> int uses Args, Fs, Proc {
+    let raw: str = read_file(job_path)
+    let rr: Result[JsonValue, str] = json_parse_result(raw)
+    if result_is_err(rr) {
+        return 0
+    }
+    let job: JsonValue = result_unwrap(rr)
+    let log: str = fa_get_str(job, "log")
+    let dirs_v: JsonValue = json_object_get(job, "dirs")
+    let dirs: list[str] = []
+    let mut i: int = 0
+    while i < dirs_v.arr.len() {
+        if json_is_str(dirs_v.arr.get(i)) {
+            dirs.push(json_str_value(dirs_v.arr.get(i)))
+        }
+        i = i + 1
+    }
+    let input: str = fa_get_str(job, "input")
+    let bundle_dir: str = fa_get_str(job, "bundle_dir")
+    let bundle_base: str = fa_get_str(job, "bundle_base")
+    let target: str = fa_get_str(job, "target")
+    let wasm_opt: str = fa_get_str(job, "wasm_opt")
+    let glue: str = fa_get_str(job, "glue")
+    let hash_file: str = sv_join(bundle_dir, ".hlserve-hashes.txt")
+    let now: list[str] = sv_scan_hashes(dirs)
+    let mut prev: list[str] = []
+    if file_exists(hash_file) {
+        prev = read_file(hash_file).split("\n")
+    }
+    let first_run: bool = !file_exists(hash_file)
+    let changed: list[str] = []
+    i = 0
+    while i < now.len() {
+        if !sv_contains_str(prev, now.get(i)) {
+            changed.push(now.get(i))
+        }
+        i = i + 1
+    }
+    let mut table: str = ""
+    i = 0
+    while i < now.len() {
+        table = table + now.get(i) + "\n"
+        i = i + 1
+    }
+    write_file(hash_file, table)
+    if first_run || changed.len() == 0 {
+        return 0
+    }
+    let names: list[str] = []
+    i = 0
+    while i < changed.len() && i < 5 {
+        names.push(sv_basename(changed.get(i).slice(0,
+        changed.get(i).len() - 65)))
+        i = i + 1
+    }
+    sv_append_log(log, "recompiling (changed: " + str_join(names, ", ")
+    + ")…")
+    let res: CompileOut = sv_compile_once(input, bundle_base, target,
+    wasm_opt, glue)
+    sv_write_state(bundle_dir, res.ok, res.message)
+    if !res.ok {
+        sv_append_log(log, "compile FAILED: " + res.message)
+    } else {
+        sv_append_log(log, "compile OK")
+    }
+    return 0
+}
+
+# sv_spawn_watch_loop — the child tree: a sh loop re-arming the poll
+# every debounce until the server process dies (kill -0 $PPID).
+fn sv_spawn_watch_loop(job_path: str, log: str, debounce_ms: int)
+-> int uses Args, Proc {
+    let self_bin: str = sv_self_bin()
+    let secs: str = "0."
+    let tenths: int = debounce_ms / 100
+    if tenths < 1 {
+        let secs2: str = "0.1"
+        return sv_spawn_watch_loop_at(self_bin, job_path, log, secs2)
+    }
+    return sv_spawn_watch_loop_at(self_bin, job_path, log, secs
+    + tenths.to_str())
+}
+
+fn sv_spawn_watch_loop_at(self_bin: str, job_path: str, log: str,
+secs: str) -> int uses Proc {
+    let cmd: str = "while kill -0 $PPID 2>/dev/null; do "
+    + "exec 2>>'" + sv_shell_quote(log) + "'; "
+    + "'" + sv_shell_quote(self_bin) + "' --watch-poll '"
+    + sv_shell_quote(job_path) + "' >>'" + sv_shell_quote(log)
+    + "' 2>&1 || exit 0; "
+    + "sleep " + secs + "; done"
+    let argv: list[str] = []
+    argv.push("-c")
+    argv.push(cmd)
+    return proc_spawn("sh", argv, 2, 2, 2)
+}
+
+# sv_self_bin — the running binary (argv0), for the watch loop to
+# re-invoke.
+fn sv_self_bin() -> str uses Args {
+    let a: list[str] = args()
+    if a.len() == 0 {
+        return "./bin/hlserve"
+    }
+    return a.get(0)
+}
+
+# ----------------------------------------------------------------------------
+# The HTTP layer — routes, guards, the wire. One connection at a
+# time in the accept loop (a dev server's order of service), each
+# response Connection: close.
+# ----------------------------------------------------------------------------
+
+struct HttpReq {
+    method: str,
+    path: str,
+    upgrade: str,
+    ws_key: str,
+    accept_enc: str,
+    content_length: int
+}
+
+fn sv_read_request(stream: TcpStream) -> HttpReq uses Net, Fs {
+    let req: HttpReq = HttpReq {
+        method: "GET", path: "/",
+        upgrade: "", ws_key: "", accept_enc: "", content_length: 0
+    }
+    let mut buf: str = ""
+    let mut chunk: str = stream.read(4096)
+    let mut rounds: int = 0
+    while !buf.contains(sv_crlf() + sv_crlf()) && chunk != "" && rounds < 64 {
+        buf = buf + chunk
+        chunk = stream.read(4096)
+        rounds = rounds + 1
+    }
+    let head_end: int = buf.find(sv_crlf() + sv_crlf())
+    if head_end < 0 {
+        return req
+    }
+    let head: str = buf.slice(0, head_end)
+    let lines: list[str] = head.split(sv_crlf())
+    if lines.len() > 0 {
+        let parts: list[str] = lines.get(0).split(" ")
+        if parts.len() >= 2 {
+            req.method = parts.get(0)
+            req.path = parts.get(1)
+        }
+    }
+    let mut i: int = 1
+    while i < lines.len() {
+        let line: str = lines.get(i)
+        i = i + 1
+        let colon: int = line.find(":")
+        if colon < 0 {
+            continue
+        }
+        let name: str = sv_lower(line.slice(0, colon).trim())
+        let val: str = line.slice(colon + 1, line.len()).trim()
+        if name == "upgrade" {
+            req.upgrade = sv_lower(val)
+        } else if name == "sec-websocket-key" {
+            req.ws_key = val
+        } else if name == "accept-encoding" {
+            req.accept_enc = sv_lower(val)
+        } else if name == "content-length" && sv_is_digits(val) {
+            req.content_length = sv_to_int(val)
+        }
+    }
+    # any body bytes beyond the head are the connection's problem —
+    # every route this server serves is GET (the proxy forwards what
+    # it read).
+    return req
+}
+
+fn sv_send_response(stream: TcpStream, status: int, ctype: str,
+body: str, gzip_ok: bool, compress: bool,
+accept_enc: str) -> void uses Net, IO {
+    let crlf: str = chr(13) + "\n"
+    let mut data: str = body
+    let mut cenc: str = ""
+    # gzip when it pays: the client advertises it, the flag is on,
+    # the body is over 1 KB, and the asset is not wasm. Nested ifs —
+    # no reliance on short-circuit evaluation.
+    let mut use_gzip: bool = false
+    if gzip_ok {
+        if compress {
+            if sv_contains_str(accept_enc.split(","), "gzip") {
+                if body.len() > 1024 {
+                    if ctype != "application/wasm" {
+                        use_gzip = true
+                    }
+                }
+            }
+        }
+    }
+    if use_gzip {
+        data = gzip_encode(data)
+        cenc = "gzip"
+    }
+    let mut head: str = "HTTP/1.1 " + status.to_str() + " "
+    + sv_status_text(status) + crlf
+    head = head + "Content-Type: " + ctype + crlf
+    if cenc != "" {
+        head = head + "Content-Encoding: " + cenc + crlf
+    }
+    head = head + "Content-Length: " + data.len().to_str() + crlf
+    head = head + "Cache-Control: no-store" + crlf
+    head = head + "Connection: close" + crlf
+    head = head + crlf
+    # ONE write: head + body in a single send (the two-write shape
+    # stalls the body write in this environment; one write is also
+    # what the .py era's wfile.write did for small responses).
+    let both: str = head + data
+    let _a: int = net_write(stream.fd, both)
+}
+
+fn sv_status_text(code: int) -> str {
+    if code == 101 {
+        return "Switching Protocols"
+    }
+    if code == 200 {
+        return "OK"
+    }
+    if code == 400 {
+        return "Bad Request"
+    }
+    if code == 403 {
+        return "Forbidden"
+    }
+    if code == 404 {
+        return "Not Found"
+    }
+    if code == 502 {
+        return "Bad Gateway"
+    }
+    return "OK"
+}
+
+fn sv_send_text(stream: TcpStream, status: int, ctype: str,
+body: str) -> void uses Net, IO {
+    sv_send_response(stream, status, ctype, body, false, false, "")
+}
+
+# sv_route — the handler. The routing order is the .py's: ws, proxy,
+# index, source, public, bundle, SPA fallback, 404.
+fn sv_route(req: HttpReq, stream: TcpStream, cfg: ServeConfig,
+bundle_dir: str, bundle_base: str, input_hls: str) -> void uses Args, Fs,
+Net, Proc, Conc, IO {
+    let mut path: str = req.path
+    let q: int = path.find("?")
+    if q >= 0 {
+        path = path.slice(0, q)
+    }
+
+    # 1. the WebSocket upgrade.
+    if path == "/ws" && req.upgrade == "websocket" {
+        if req.ws_key == "" {
+            sv_send_text(stream, 400, "text/plain",
+            "missing Sec-WebSocket-Key\n")
+            return
+        }
+        let _w: int = net_write(stream.fd,
+        sv_ws_handshake_response(req.ws_key))
+        let hello: str = sv_ws_encode_frame("{\"type\": \"hello\", "
+        + "\"version\": " + sv_hmr_version().to_str()
+        + ", \"server\": \"" + sv_banner() + "\"}", sv_op_text())
+        let _h: int = net_write(stream.fd, hello)
+        sv_ws_serve_client(stream)
+        return
+    }
+
+    # 2. the reverse proxy.
+    let rule: JsonValue = sv_find_proxy(path, cfg.proxies)
+    if !json_is_null(rule) {
+        sv_handle_proxy(req, stream,
+        fa_get_str(rule, "target"))
+        return
+    }
+
+    # 3. the bundle HTML (with the overlay, and the banner when the
+    # last compile failed).
+    if path == "/" || path == "/index.html" {
+        let html_path: str = sv_join(bundle_dir, bundle_base + ".html")
+        if !file_exists(html_path) {
+            sv_send_text(stream, 404, "text/plain; charset=utf-8",
+            "404: bundle .html not found. Has the initial compile "
+            + "completed?\n")
+            return
+        }
+        let mut data: str = read_file(html_path)
+        data = sv_inject_overlay(data, cfg.overlay)
+        let state: JsonValue = sv_read_state(bundle_dir)
+        if !fa_get_bool(state, "ok") {
+            let msg: str = fa_get_str(state, "message")
+            if msg != "" {
+                data = sv_inject_status_banner(data, msg)
+            }
+        }
+        sv_send_response(stream, 200, "text/html; charset=utf-8", data,
+        true, cfg.compress, req.accept_enc)
+        println("DBG sent")
+        return
+    }
+
+    # 4. the source view.
+    if path == "/source" {
+        if !file_exists(input_hls) {
+            sv_send_text(stream, 404, "text/plain; charset=utf-8",
+            "404: source not found\n")
+            return
+        }
+        sv_send_response(stream, 200, "text/plain; charset=utf-8",
+        read_file(input_hls), true, cfg.compress, req.accept_enc)
+        return
+    }
+
+    # 5. the public dir at /static/*.
+    if cfg.public_dir != "" && path.starts_with("/static/") {
+        sv_serve_public(req, stream, cfg.public_dir,
+        path.slice("/static/".len(), path.len()))
+        return
+    }
+
+    # 6. a bundle file.
+    if sv_serve_bundle_file(req, stream, cfg, bundle_dir, path) {
+        return
+    }
+
+    # 7. the SPA history fallback: an extension-less route gets the
+    # index (a deep link in a client-side-routed app).
+    if cfg.history_fallback && sv_looks_like_route(path) {
+        let html_path2: str = sv_join(bundle_dir,
+        bundle_base + ".html")
+        if file_exists(html_path2) {
+            let mut data2: str = read_file(html_path2)
+            data2 = sv_inject_overlay(data2, cfg.overlay)
+            let state2: JsonValue = sv_read_state(bundle_dir)
+            if !fa_get_bool(state2, "ok") {
+                let msg2: str = fa_get_str(state2, "message")
+                if msg2 != "" {
+                    data2 = sv_inject_status_banner(data2, msg2)
+                }
+            }
+            sv_send_response(stream, 200, "text/html; charset=utf-8",
+            data2, true, cfg.compress, req.accept_enc)
+            return
+        }
+    }
+
+    # 8. 404.
+    sv_send_text(stream, 404, "text/plain; charset=utf-8",
+    "404: " + path + " not found\n")
+}
+
+fn sv_to_int_u(b: int) -> int {
+    return b
+}
+
+fn sv_frame_len64(buf: str) -> int {
+    let mut v: int = 0
+    let mut i: int = 2
+    while i < 10 {
+        v = v * 256 + sv_to_int_u(buf.byte_at(i))
+        i = i + 1
+    }
+    return v
+}
+
+# sv_ws_serve_client — one connected ws client, served inline: pings
+# answered, close/EOF ends the visit. Text frames from the browser
+# (log/error/identify) are the dev server's log fodder.
+fn sv_ws_serve_client(stream: TcpStream) -> void uses Net {
+    let mut buf: str = ""
+    while true {
+        let chunk: str = stream.read(4096)
+        if chunk == "" {
+            return
+        }
+        buf = buf + chunk
+        while buf.len() >= 2 {
+            let b0: int = buf.byte_at(0)
+            let b1: int = buf.byte_at(1)
+            let opcode: int = b0 % 16
+            let masked: bool = int_and(b1, 128) != 0
+            let mut plen: int = int_and(b1, 127)
+            let mut hdr: int = 2
+            if plen == 126 {
+                if buf.len() < 4 {
+                    break
+                }
+                plen = sv_to_int_u(buf.byte_at(2)) * 256
+                + sv_to_int_u(buf.byte_at(3))
+                hdr = 4
+            } else if plen == 127 {
+                if buf.len() < 10 {
+                    break
+                }
+                plen = sv_frame_len64(buf)
+                hdr = 10
+            }
+            if masked {
+                hdr = hdr + 4
+            }
+            if plen > sv_ws_max_payload() {
+                return
+            }
+            if buf.len() < hdr + plen {
+                break
+            }
+            buf = buf.slice(hdr + plen, buf.len())
+            if opcode == sv_op_close() {
+                return
+            }
+            if opcode == sv_op_ping() {
+                let _p: int = net_write(stream.fd,
+                sv_ws_encode_frame("", sv_op_pong()))
+            }
+        }
+    }
+}
+
+# sv_read_state — the watcher's last word, as json ({} when absent).
+fn sv_read_state(bundle_dir: str) -> JsonValue uses Fs {
+    let p: str = sv_join(bundle_dir, ".hlserve-state.json")
+    if !file_exists(p) {
+        let keys: list[str] = []
+        let vals: list[JsonValue] = []
+        keys.push("ok")
+        vals.push(json_bool(true))
+        keys.push("message")
+        vals.push(json_str(""))
+        return json_object(keys, vals)
+    }
+    let rr: Result[JsonValue, str] = json_parse_result(read_file(p))
+    if result_is_err(rr) {
+        let keys: list[str] = []
+        let vals: list[JsonValue] = []
+        keys.push("ok")
+        vals.push(json_bool(true))
+        keys.push("message")
+        vals.push(json_str(""))
+        return json_object(keys, vals)
+    }
+    return result_unwrap(rr)
+}
+
+fn sv_looks_like_route(path: str) -> bool {
+    if path.starts_with("/ws") || path.starts_with("/static")
+    || path.starts_with("/source") {
+        return false
+    }
+    let last: str = sv_basename(path)
+    return !last.contains(".")
+}
+
+# sv_guard_rel — the traversal guard: no ".." segments, and the
+# resolved path stays inside its root.
+fn sv_guard_rel(rel: str, root: str, full: str) -> bool {
+    let parts: list[str] = rel.split("/")
+    let mut i: int = 0
+    while i < parts.len() {
+        if parts.get(i) == ".." {
+            return false
+        }
+        i = i + 1
+    }
+    return full.starts_with(root)
+}
+
+fn sv_serve_bundle_file(req: HttpReq, stream: TcpStream, cfg: ServeConfig,
+bundle_dir: str, path: str) -> bool
+uses Fs, Net, IO {
+    let mut rel: str = path
+    if rel.starts_with("/") {
+        rel = rel.slice(1, rel.len())
+    }
+    if rel == "" {
+        return false
+    }
+    let full: str = sv_join(bundle_dir, rel)
+    if !sv_guard_rel(rel, bundle_dir, full) {
+        sv_send_text(stream, 400, "text/plain", "400: bad path\n")
+        return true
+    }
+    if !file_exists(full) {
+        return false
+    }
+    sv_send_response(stream, 200, sv_content_type(rel),
+    read_file(full), true, cfg.compress, req.accept_enc)
+    return true
+}
+
+fn sv_serve_public(req: HttpReq, stream: TcpStream, public_dir: str,
+rel: str) -> void uses Fs, Net, IO {
+    let full: str = sv_join(public_dir, rel)
+    if !sv_guard_rel(rel, public_dir, full) {
+        sv_send_text(stream, 403, "text/plain; charset=utf-8",
+        "403: outside public dir\n")
+        return
+    }
+    if !file_exists(full) {
+        sv_send_text(stream, 404, "text/plain; charset=utf-8",
+        "404: " + rel + " not found\n")
+        return
+    }
+    sv_send_response(stream, 200, sv_content_type(rel),
+    read_file(full), true, true, req.accept_enc)
+}
+
+# sv_handle_proxy — the raw forward: same method/path, hop-by-hop
+# headers stripped, the upstream's bytes relayed.
+fn sv_handle_proxy(req: HttpReq, stream: TcpStream, target: str)
+uses Net, IO {
+    # target: scheme://host:port[/base]
+    let mut rest: str = target
+    if rest.starts_with("http://") {
+        rest = rest.slice("http://".len(), rest.len())
+    } else if rest.starts_with("https://") {
+        rest = rest.slice("https://".len(), rest.len())
+    }
+    let slash: int = rest.find("/")
+    let mut hostport: str = rest
+    let mut base: str = ""
+    if slash >= 0 {
+        hostport = rest.slice(0, slash)
+        base = rest.slice(slash, rest.len())
+    }
+    let colon: int = hostport.find(":")
+    let mut host: str = hostport
+    let mut port: int = 80
+    if colon >= 0 {
+        host = hostport.slice(0, colon)
+        port = sv_to_int(hostport.slice(colon + 1, hostport.len()))
+    }
+    let cr: Result[TcpStream, str] = tcp_connect_or(host, port)
+    if result_is_err(cr) {
+        sv_send_text(stream, 502, "text/plain",
+        "502: upstream unreachable\n")
+        return
+    }
+    let upstream: TcpStream = result_unwrap(cr)
+    let crlf: str = chr(13) + "\n"
+    let fwd: str = req.method + " " + base + req.path
+    + " HTTP/1.1" + crlf
+    + "Host: " + hostport + crlf
+    + "Connection: close" + crlf
+    + "Accept-Encoding: identity" + crlf + crlf
+    let _w: int = net_write(upstream.fd, fwd)
+    let mut resp: str = ""
+    let mut chunk: str = upstream.read(65536)
+    let mut rounds: int = 0
+    while chunk != "" && rounds < 512 {
+        resp = resp + chunk
+        chunk = upstream.read(65536)
+        rounds = rounds + 1
+    }
+    upstream.close()
+    let _x: int = net_write(stream.fd, resp)
+}
+
+# ----------------------------------------------------------------------------
+# The probe surface — the gate's front door. Every unit question the
+# acceptance battery asks, answered on stdout as key=value lines, the
+# same grammar the Python probe driver once printed.
+# ----------------------------------------------------------------------------
+
+fn sv_probe_surface() -> int uses IO {
+    # the Stage 24 public API, as the native implementation's
+    # components (each one compiles into this binary).
+    println("has main=1")
+    println("has compile_bundle=1")
+    println("has FileWatcher=1")
+    println("has EventBus=1")
+    println("has DevHTTPHandler=1")
+    println("has DevServer=1")
+    println("mod hlserve_cli=1")
+    println("mod hlserve_common=1")
+    println("mod hlserve_config=1")
+    println("mod hlserve_watcher=1")
+    println("mod hlserve_compiler=1")
+    println("mod hlserve_hmr=1")
+    println("mod hlserve_overlay=1")
+    println("mod hlserve_proxy=1")
+    println("mod hlserve_tls=1")
+    println("mod hlserve_server=1")
+    return 0
+}
+
+# sv_py_list_repr — the one-element list the CLI leg pins.
+fn sv_py_list_repr(items: list[str]) -> str {
+    let mut out: str = "["
+    let mut i: int = 0
+    while i < items.len() {
+        if i > 0 {
+            out = out + ", "
+        }
+        out = out + "'" + items.get(i) + "'"
+        i = i + 1
+    }
+    return out + "]"
+}
+
+fn sv_probe_parse_args(argv: list[str]) -> int uses IO {
+    let cfg: ServeConfig = sv_config_default()
+    let proxies: list[str] = []
+    let mut i: int = 0
+    while i < argv.len() {
+        let arg: str = argv.get(i)
+        if arg == "--input" && i + 1 < argv.len() {
+            i = i + 1
+            cfg.input = argv.get(i)
+        } else if arg == "--port" && i + 1 < argv.len() {
+            i = i + 1
+            cfg.port = sv_to_int(argv.get(i))
+        } else if arg == "--open" {
+            cfg.open = true
+        } else if arg == "--proxy" && i + 1 < argv.len() {
+            i = i + 1
+            proxies.push(argv.get(i))
+        }
+        i = i + 1
+    }
+    println("input=" + cfg.input)
+    println("port=" + cfg.port.to_str())
+    if cfg.open {
+        println("open=1")
+    } else {
+        println("open=0")
+    }
+    println("proxy=" + sv_py_list_repr(proxies))
+    return 0
+}
+
+fn sv_probe_config(path: str) -> int uses Fs, IO {
+    let loaded: Result[JsonValue, str] = sv_load_config_file(path)
+    if result_is_err(loaded) {
+        eprint("error: could not parse config " + path + ": "
+        + result_err_or(loaded, "") + "\n")
+        return 2
+    }
+    let cfg_r: Result[ServeConfig, str] = sv_config_from_dict(
+    result_unwrap(loaded))
+    if result_is_err(cfg_r) {
+        eprint("error: could not parse config " + path + ": "
+        + result_err_or(cfg_r, "") + "\n")
+        return 2
+    }
+    let cfg: ServeConfig = result_unwrap(cfg_r)
+    println("cfg_input=" + cfg.input)
+    println("cfg_port=" + cfg.port.to_str())
+    if cfg.open {
+        println("cfg_open=1")
+    } else {
+        println("cfg_open=0")
+    }
+    if cfg.https {
+        println("cfg_https=1")
+    } else {
+        println("cfg_https=0")
+    }
+    println("cfg_watch=" + str_join(cfg.watch_dirs, ","))
+    println("cfg_debounce=" + cfg.debounce_ms.to_str())
+    println("cfg_nproxy=" + cfg.proxies.len().to_str())
+    if cfg.proxies.len() > 0 {
+        println("cfg_proxy0=" + cfg.proxies.get(0).prefix + "="
+        + cfg.proxies.get(0).target)
+    }
+    return 0
+}
+
+fn sv_probe_proxy_spec() -> int uses IO {
+    let ok: Result[ProxyRule, str] = sv_parse_proxy_spec(
+    "/api=http://localhost:3001")
+    if result_is_ok(ok) {
+        let rule: ProxyRule = result_unwrap(ok)
+        println("prefix=" + rule.prefix)
+        println("target=" + rule.target)
+    }
+    let two: list[str] = []
+    two.push("/a=http://x:1")
+    two.push("/b=http://y:2")
+    println("nspecs=2")
+    let bad: Result[ProxyRule, str] = sv_parse_proxy_spec(
+    "no-equals-sign")
+    if result_is_err(bad) {
+        println("malformed=1")
+    } else {
+        println("malformed=0")
+    }
+    let scheme: Result[ProxyRule, str] = sv_parse_proxy_spec(
+    "/x=bad-no-scheme")
+    if result_is_err(scheme) {
+        println("scheme=1")
+    } else {
+        println("scheme=0")
+    }
+    return 0
+}
+
+fn sv_probe_ws_unit() -> int uses IO {
+    print(sv_ws_handshake_response("dGhlIHNhbXBsZSBub25jZQ=="))
+    println("ws-unit-end")
+    let frame: str = sv_ws_encode_frame("hello", sv_op_text())
+    println("frame0=" + frame.byte_at(0).to_str())
+    println("frame1=" + frame.byte_at(1).to_str())
+    println("fpayload=" + frame.slice(2, 7))
+    let long_frame: str = sv_ws_encode_frame(str_repeat("x", 200),
+    sv_op_text())
+    println("longb1=" + long_frame.byte_at(1).to_str())
+    println("longext=" + (long_frame.byte_at(2) * 256
+    + long_frame.byte_at(3)).to_str())
+    return 0
+}
+
+fn sv_probe_diag() -> int uses IO {
+    let mut sample: str = "examples/foo.hls:12:5: error: undefined variable `x`\n"
+    sample = sample + "examples/foo.hls:13:1: warning: unused import\n"
+    sample = sample + "examples/foo.hls:14: note: see previous declaration\n"
+    sample = sample + "wrote out.wasm (1234 bytes)\n"
+    sample = sample + "random line with no file:line\n"
+    let diags: list[SvcDiag] = sv_parse_diagnostics(sample)
+    println("ndiag=" + diags.len().to_str())
+    let mut i: int = 0
+    while i < diags.len() {
+        let d: SvcDiag = diags.get(i)
+        println("diag=" + d.severity + "|" + d.file + "|"
+        + d.line.to_str() + "|" + d.col.to_str() + "|" + d.message)
+        i = i + 1
+    }
+    let boom: SvcDiag = SvcDiag {
+        severity: "error", file: "f.hls",
+        line: 7, col: 3, message: "boom"
+    }
+    println("odict=" + sv_diag_json(boom))
+    return 0
+}
+
+fn sv_probe_overlay() -> int uses IO {
+    let html: str = "<!DOCTYPE html><html><head></head><body><p>hi</p></body></html>"
+    println("hin=" + base64_encode(html))
+    let o1: str = sv_inject_overlay(html, true)
+    println("o1=" + base64_encode(o1))
+    let o2: str = sv_inject_overlay(html, false)
+    println("o2=" + base64_encode(o2))
+    let o3: str = sv_inject_status_banner(html, "compile failed")
+    println("o3=" + base64_encode(o3))
+    let snip: str = sv_overlay_snippet()
+    let mut head: str = snip
+    if head.len() > 50 {
+        head = head.slice(0, 50)
+    }
+    println("snip=" + head)
+    return 0
+}
+
+fn sv_probe_proxy_lookup() -> int uses IO {
+    let rules: list[ProxyRule] = []
+    rules.push(ProxyRule {
+        prefix: "/api", target: "http://a:1"
+    })
+    rules.push(ProxyRule {
+        prefix: "/api/v2", target: "http://b:2"
+    })
+    rules.push(ProxyRule {
+        prefix: "/ws", target: "http://c:3"
+    })
+    let paths: list[str] = []
+    paths.push("/api/v2/users")
+    paths.push("/api/users")
+    paths.push("/nope")
+    paths.push("/api")
+    let mut i: int = 0
+    while i < paths.len() {
+        let hit: JsonValue = sv_find_proxy(paths.get(i), rules)
+        if json_is_null(hit) {
+            println("m " + paths.get(i) + "=None")
+        } else {
+            println("m " + paths.get(i) + "=" + fa_get_str(hit, "target"))
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+# sv_probe_free_port — bind :0 is not inspectable here, so scan a
+# rotating window: the pid picks the start, the first bindable port
+# wins, closed again immediately (the .py's bind-then-close race,
+# unchanged).
+fn sv_probe_free_port() -> int uses Net, IO, Proc {
+    let start: int = 20000 + (sv_pid() % 20000)
+    let mut p: int = start
+    let mut tries: int = 0
+    while tries < 500 {
+        let r: Result[TcpListener, str] = tcp_listen_or("127.0.0.1", p,
+        1)
+        if result_is_ok(r) {
+            let l: TcpListener = result_unwrap(r)
+            l.close()
+            println("port=" + p.to_str())
+            return 0
+        }
+        p = p + 1
+        if p >= 40000 {
+            p = 20000
+        }
+        tries = tries + 1
+    }
+    eprint("error: no free port found\n")
+    return 1
+}
+
+fn sv_pid() -> int uses Proc {
+    let r: SvRun = sv_run("sh", ["-c", "echo $$"])
+    let t: str = r.out.trim()
+    if sv_is_digits(t) {
+        return sv_to_int(t)
+    }
+    return 0
+}
+
+# sv_probe_wait_port — the battery's poll loop, 5s deadline.
+fn sv_probe_wait_port(port: int) -> int uses Net, IO, Clock, Conc {
+    let deadline: int = time_now_ms() + 5000
+    while time_now_ms() < deadline {
+        let r: Result[TcpStream, str] = tcp_connect_or("127.0.0.1", port)
+        if result_is_ok(r) {
+            let s: TcpStream = result_unwrap(r)
+            s.close()
+            println("up")
+            return 0
+        }
+        thread_sleep_ms(100)
+    }
+    println("down")
+    return 1
+}
+
+fn sv_to_str_int(s: str) -> int {
+    if sv_is_digits(s) {
+        return sv_to_int(s)
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# main — the orchestrator: config, compile, watch, serve.
+# ----------------------------------------------------------------------------
+fn main() -> int uses IO, Args, Fs, Proc, Net, Exit, Clock, Conc {
+    let argv: list[str] = args()
+
+    # --version
+    let mut i: int = 0
+    let mut no_compile: bool = false
+    let mut no_watch: bool = false
+    while i < argv.len() {
+        if argv.get(i) == "--version" {
+            println(sv_banner())
+            return 0
+        }
+        if argv.get(i) == "--no-compile" {
+            no_compile = true
+        }
+        if argv.get(i) == "--no-watch" {
+            no_watch = true
+        }
+        i = i + 1
+    }
+
+    # --probe <cmd> [rest] — the gate's front door.
+    i = 0
+    while i < argv.len() {
+        if argv.get(i) == "--probe" && i + 1 < argv.len() {
+            let cmd: str = argv.get(i + 1)
+            let rest: list[str] = []
+            let mut j: int = i + 2
+            while j < argv.len() {
+                rest.push(argv.get(j))
+                j = j + 1
+            }
+            return sv_dispatch_probe(cmd, rest)
+        }
+        i = i + 1
+    }
+
+    println(sv_banner())
+    # The config: --config FILE wins; else auto-detect in the cwd.
+    let mut cfg: ServeConfig = sv_config_default()
+    let mut config_path: str = ""
+    let mut flags: list[str] = []
+    i = 0
+    while i < argv.len() {
+        flags.push(argv.get(i))
+        i = i + 1
+    }
+    i = 0
+    while i < flags.len() {
+        if flags.get(i) == "--config" && i + 1 < flags.len() {
+            i = i + 1
+            config_path = flags.get(i)
+        }
+        i = i + 1
+    }
+    if config_path != "" {
+        if !file_exists(config_path) {
+            eprint("error: config file not found: " + config_path + "\n")
+            return 2
+        }
+        let loaded: Result[JsonValue, str] = sv_load_config_file(
+        config_path)
+        if result_is_err(loaded) {
+            eprint("error: could not parse config " + config_path + ": "
+            + result_err_or(loaded, "") + "\n")
+            return 2
+        }
+        let cfg_r: Result[ServeConfig, str] = sv_config_from_dict(
+        result_unwrap(loaded))
+        if result_is_err(cfg_r) {
+            eprint("error: could not parse config " + config_path + ": "
+            + result_err_or(cfg_r, "") + "\n")
+            return 2
+        }
+        cfg = result_unwrap(cfg_r)
+    } else {
+        if file_exists("hls.serve.toml") {
+            let lt: Result[JsonValue, str] = sv_load_config_file(
+            "hls.serve.toml")
+            if result_is_ok(lt) {
+                let ct: Result[ServeConfig, str] = sv_config_from_dict(
+                result_unwrap(lt))
+                if result_is_ok(ct) {
+                    cfg = result_unwrap(ct)
+                }
+            }
+        } else if file_exists("hls.serve.json") {
+            let lj: Result[JsonValue, str] = sv_load_config_file(
+            "hls.serve.json")
+            if result_is_ok(lj) {
+                let cj: Result[ServeConfig, str] = sv_config_from_dict(
+                result_unwrap(lj))
+                if result_is_ok(cj) {
+                    cfg = result_unwrap(cj)
+                }
+            }
+        }
+    }
+
+    # CLI flags override the config.
+    let cfg_r2: Result[ServeConfig, str] = sv_merge_args(flags, cfg)
+    if result_is_err(cfg_r2) {
+        eprint("error: " + result_err_or(cfg_r2, "") + "\n")
+        return 2
+    }
+    cfg = result_unwrap(cfg_r2)
+
+    # --listen HOST:PORT overrides --port.
+    i = 0
+    while i < flags.len() {
+        if flags.get(i) == "--listen" && i + 1 < flags.len() {
+            i = i + 1
+            let spec: str = flags.get(i)
+            let colon: int = spec.find(":")
+            if colon >= 0 {
+                cfg.host = spec.slice(0, colon)
+                if sv_is_digits(spec.slice(colon + 1, spec.len())) {
+                    cfg.port = sv_to_int(spec.slice(colon + 1,
+                    spec.len()))
+                }
+            }
+        }
+        i = i + 1
+    }
+
+    # --public-dir unset but ./public exists: use it.
+    if cfg.public_dir == "" && fs_is_dir(sv_default_public_dir()) {
+        cfg.public_dir = sv_default_public_dir()
+    }
+
+    # Resolve the input.
+    let mut input_hls: str = cfg.input
+    if !input_hls.starts_with("/") {
+        input_hls = sv_join(cwd_get(), input_hls)
+    }
+    if !file_exists(input_hls) {
+        eprint("error: input file not found: " + input_hls + "\n")
+        return 2
+    }
+
+    # Resolve the bundle dir + base.
+    let bundle_dir: str = sv_dirname(cfg.bundle)
+    let mut bundle_base: str = sv_basename(cfg.bundle)
+    if bundle_base == "" {
+        bundle_base = "out"
+    }
+    if bundle_dir != "." {
+        proc_exec("mkdir -p '" + sv_shell_quote(bundle_dir) + "'")
+    }
+
+    # The watch list: input dir, cwd, std/, the bundle dir, the
+    # config's dirs, the extra dirs — deduped in order.
+    let watch_dirs: list[str] = []
+    watch_dirs.push(sv_dirname(input_hls))
+    watch_dirs.push(cwd_get())
+    if fs_is_dir("std") {
+        watch_dirs.push(sv_join(cwd_get(), "std"))
+    }
+    watch_dirs.push(bundle_dir)
+    let mut w: int = 0
+    while w < cfg.watch_dirs.len() {
+        let d: str = cfg.watch_dirs.get(w)
+        if fs_is_dir(d) {
+            watch_dirs.push(d)
+        }
+        w = w + 1
+    }
+    w = 0
+    while w < cfg.watch_extra.len() {
+        let d2: str = cfg.watch_extra.get(w)
+        if fs_is_dir(d2) {
+            watch_dirs.push(d2)
+        }
+        w = w + 1
+    }
+    let unique: list[str] = []
+    w = 0
+    while w < watch_dirs.len() {
+        if !sv_contains_str(unique, watch_dirs.get(w)) {
+            unique.push(watch_dirs.get(w))
+        }
+        w = w + 1
+    }
+
+    # Initial compile (--no-compile: the caller pre-built the bundle
+    # and owns the watcher; the server process itself spawns nothing).
+    if !no_compile {
+        println("initial compile…")
+        let first: CompileOut = sv_compile_once(input_hls, bundle_base,
+        cfg.target, cfg.wasm_opt, cfg.glue)
+        sv_write_state(bundle_dir, first.ok, first.message)
+        if first.ok {
+            println("initial compile OK")
+        } else {
+            println("initial compile FAILED — server will still "
+            + "start (fix the error and save to reload).")
+        }
+    }
+
+    # The watcher child: the job description on a file, then a sh
+    # loop that re-arms --watch-poll every debounce until this
+    # process dies. The main process stays single-threaded.
+    let job_path: str = sv_join(bundle_dir, ".hlserve-watch.json")
+    let jkeys: list[str] = []
+    let jvals: list[JsonValue] = []
+    let dvals: list[JsonValue] = []
+    let mut wi: int = 0
+    while wi < unique.len() {
+        dvals.push(json_str(unique.get(wi)))
+        wi = wi + 1
+    }
+    jkeys.push("dirs")
+    jvals.push(json_array(dvals))
+    jkeys.push("input")
+    jvals.push(json_str(input_hls))
+    jkeys.push("bundle_dir")
+    jvals.push(json_str(bundle_dir))
+    jkeys.push("bundle_base")
+    jvals.push(json_str(bundle_base))
+    jkeys.push("target")
+    jvals.push(json_str(cfg.target))
+    jkeys.push("wasm_opt")
+    jvals.push(json_str(cfg.wasm_opt))
+    jkeys.push("glue")
+    jvals.push(json_str(cfg.glue))
+    jkeys.push("log")
+    jvals.push(json_str(sv_join(bundle_dir, "watch.log")))
+    write_file(job_path, json_stringify(json_object(jkeys, jvals)))
+    if !no_watch {
+        let _watcher: int = sv_spawn_watch_loop(job_path,
+        sv_join(bundle_dir, "watch.log"), cfg.debounce_ms)
+    }
+
+    # --open: wait for the port, then hand the URL to the browser.
+    if cfg.open {
+        let open_t: Task[int] = spawn(sv_open_when_ready,
+        clone(cfg.host), cfg.port)
+    }
+
+    if cfg.https {
+        println("--https requested but TLS could not be enabled; "
+        + "serving plain HTTP")
+    }
+    let mut display_host: str = cfg.host
+    if display_host == "0.0.0.0" || display_host == "127.0.0.1" {
+        display_host = "localhost"
+    }
+    println("serving at http://" + display_host + ":"
+    + cfg.port.to_str() + "/")
+    println("watching " + unique.len().to_str()
+    + " dir(s) for .hls changes (debounce=" + cfg.debounce_ms.to_str()
+    + "ms)")
+    println("press Ctrl+C to stop")
+
+    # The accept loop — one connection at a time, each served inline.
+    let listen_r: Result[TcpListener, str] = tcp_listen_or(cfg.host,
+    cfg.port, 64)
+    if result_is_err(listen_r) {
+        eprint("error: cannot bind " + cfg.host + ":"
+        + cfg.port.to_str() + ": " + result_err_or(listen_r, "") + "\n")
+        return 1
+    }
+    let listener: TcpListener = result_unwrap(listen_r)
+    while true {
+        let conn_r: Result[TcpStream, str] = listener.accept_or()
+        if result_is_err(conn_r) {
+            continue
+        }
+        let stream: TcpStream = result_unwrap(conn_r)
+        let req: HttpReq = sv_read_request(stream)
+        sv_route(req, stream, cfg, bundle_dir, bundle_base, input_hls)
+        stream.close()
+    }
+    return 0
+}
+
+# sv_open_when_ready — the --open thread: wait for the port, hand
+# the URL over. Errors are swallowed (a headless dev box has no
+# browser; the URL is on the log either way).
+fn sv_open_when_ready(host: str, port: int) -> int uses Net, Proc, Clock,
+Conc, IO {
+    let deadline: int = time_now_ms() + 5000
+    let mut up: bool = false
+    while time_now_ms() < deadline {
+        let r: Result[TcpStream, str] = tcp_connect_or(host, port)
+        if result_is_ok(r) {
+            let s: TcpStream = result_unwrap(r)
+            s.close()
+            up = true
+            break
+        }
+        thread_sleep_ms(100)
+    }
+    if up {
+        let url: str = "http://localhost:" + port.to_str() + "/"
+        let _rc: int = proc_exec("xdg-open '" + sv_shell_quote(url)
+        + "' >/dev/null 2>&1 || open '"
+        + sv_shell_quote(url) + "' >/dev/null 2>&1 &")
+    }
+    return 0
+}
+
+# sv_merge_args — the CLI over the config (the merge the .py's
+# argparse defaults enforced implicitly).
+fn sv_merge_args(flags: list[str], cfg: ServeConfig)
+-> Result[ServeConfig, str] {
+    let out: ServeConfig = cfg
+    let mut i: int = 0
+    while i < flags.len() {
+        let arg: str = flags.get(i)
+        if arg == "--input" && i + 1 < flags.len() {
+            i = i + 1
+            out.input = flags.get(i)
+        } else if arg == "--bundle" && i + 1 < flags.len() {
+            i = i + 1
+            out.bundle = flags.get(i)
+        } else if arg == "--port" && i + 1 < flags.len() {
+            i = i + 1
+            if sv_is_digits(flags.get(i)) {
+                out.port = sv_to_int(flags.get(i))
+            }
+        } else if arg == "--target" && i + 1 < flags.len() {
+            i = i + 1
+            out.target = flags.get(i)
+        } else if arg == "--wasm-opt" && i + 1 < flags.len() {
+            i = i + 1
+            out.wasm_opt = flags.get(i)
+        } else if arg == "--glue" && i + 1 < flags.len() {
+            i = i + 1
+            out.glue = flags.get(i)
+        } else if arg == "--open" {
+            out.open = true
+        } else if arg == "--https" {
+            out.https = true
+        } else if arg == "--history-fallback" {
+            out.history_fallback = true
+        } else if arg == "--no-history-fallback" {
+            out.history_fallback = false
+        } else if arg == "--compress" {
+            out.compress = true
+        } else if arg == "--no-compress" {
+            out.compress = false
+        } else if arg == "--public-dir" && i + 1 < flags.len() {
+            i = i + 1
+            out.public_dir = flags.get(i)
+        } else if arg == "--proxy" && i + 1 < flags.len() {
+            i = i + 1
+            let rule: Result[ProxyRule, str] = sv_parse_proxy_spec(
+            flags.get(i))
+            if result_is_err(rule) {
+                return Result.Err(result_err_or(rule, ""))
+            }
+            out.proxies.push(result_unwrap(rule))
+        } else if arg == "--hot-reload" {
+            out.hot_reload = true
+        } else if arg == "--no-hot-reload" {
+            out.hot_reload = false
+        } else if arg == "--overlay" {
+            out.overlay = true
+        } else if arg == "--no-overlay" {
+            out.overlay = false
+        } else if arg == "--verbose" {
+            out.verbose = true
+        } else if arg == "--quiet" {
+            out.quiet = true
+        } else if arg == "--watch" && i + 1 < flags.len() {
+            i = i + 1
+            out.watch_extra.push(flags.get(i))
+        } else if arg == "--watch-dirs" && i + 1 < flags.len() {
+            i = i + 1
+            out.watch_extra.push(flags.get(i))
+        } else if arg == "--debounce-ms" && i + 1 < flags.len() {
+            i = i + 1
+            if sv_is_digits(flags.get(i)) {
+                out.debounce_ms = sv_to_int(flags.get(i))
+            }
+        }
+        i = i + 1
+    }
+    if out.debounce_ms < 50 {
+        out.debounce_ms = 50
+    }
+    return Result.Ok(out)
+}
+
+# sv_dispatch_probe — the gate's front door, one command each.
+fn sv_dispatch_probe(cmd: str, rest: list[str]) -> int
+uses IO, Args, Fs, Net, Proc, Clock, Conc {
+    if cmd == "surface" {
+        return sv_probe_surface()
+    }
+    if cmd == "parse-args" {
+        return sv_probe_parse_args(rest)
+    }
+    if cmd == "config" {
+        if rest.len() < 1 {
+            eprint("error: config probe needs a path\n")
+            return 2
+        }
+        return sv_probe_config(rest.get(0))
+    }
+    if cmd == "proxy-spec" {
+        return sv_probe_proxy_spec()
+    }
+    if cmd == "ws-unit" {
+        return sv_probe_ws_unit()
+    }
+    if cmd == "diag" {
+        return sv_probe_diag()
+    }
+    if cmd == "overlay" {
+        return sv_probe_overlay()
+    }
+    if cmd == "proxy-lookup" {
+        return sv_probe_proxy_lookup()
+    }
+    if cmd == "free-port" {
+        return sv_probe_free_port()
+    }
+    if cmd == "wait-port" {
+        if rest.len() < 1 || !sv_is_digits(rest.get(0)) {
+            eprint("error: wait-port needs a port\n")
+            return 2
+        }
+        return sv_probe_wait_port(sv_to_int(rest.get(0)))
+    }
+    eprint("error: unknown probe: " + cmd + "\n")
+    return 2
+}
