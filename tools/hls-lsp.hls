@@ -1622,6 +1622,11 @@ fn ls_ext_load(st: LsState, path: str) -> int uses Proc, Fs, Args {
     st.ext.push(rec)
     st.ext_paths.push(path)
     # The cap: evict the OLDEST external (open docs are never here).
+    # BOTH lists shift left together — the old code shifted ext but
+    # popped ext_paths' TAIL, so the two fell out of step: path[i]
+    # named one file while ext[i] held another's record, and a lookup
+    # into an evicted-and-shifted path answered from the wrong record
+    # (same byte size, wrong symbols) instead of re-loading it.
     while st.ext_paths.len() > ls_external_doc_cap() {
         let mut j: int = 0
         while j + 1 < st.ext.len() {
@@ -1629,6 +1634,11 @@ fn ls_ext_load(st: LsState, path: str) -> int uses Proc, Fs, Args {
             j = j + 1
         }
         let _d: ExtRec = st.ext.pop()
+        j = 0
+        while j + 1 < st.ext_paths.len() {
+            st.ext_paths.set(j, st.ext_paths.get(j + 1))
+            j = j + 1
+        }
         let _dp: str = st.ext_paths.pop()
     }
     return st.ext.len() - 1
@@ -2206,6 +2216,28 @@ uses Proc, Fs, Args {
     return ls_find_in_syms(st.ext.get(ei).syms, name)
 }
 
+# ls_find_def_cached — the import-list lookup: open documents first,
+# then the external table AS IT STANDS (no disk re-load — an import
+# the LRU cap evicted answers 0 here; only the dependency walk
+# re-loads). This is the .py's _find_definition_in over _import_uris.
+fn ls_find_def_cached(st: LsState, path: str, name: str) -> int {
+    let mut i: int = 0
+    while i < st.docs.len() {
+        if st.docs.get(i).path == path {
+            return ls_find_in_syms(st.docs.get(i).syms, name)
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < st.ext_paths.len() {
+        if st.ext_paths.get(i) == path {
+            return ls_find_in_syms(st.ext.get(i).syms, name)
+        }
+        i = i + 1
+    }
+    return 0
+}
+
 # ls_handle_definition(st, params) — the single Location or null.
 fn ls_handle_definition(st: LsState, params: JsonValue) -> JsonValue
 uses Proc, Fs, Args, IO {
@@ -2259,12 +2291,17 @@ uses Proc, Fs, Args, IO {
     if here > 0 {
         return ls_location_json(d.uri, here - 1)
     }
-    # 3. the imports (open buffers beat disk — ls_find_def_in_path
-    # answers the open table when the path is an open doc's).
+    # 3. the imports (open buffers beat disk — the .py's _import_uris
+    # loaded every import AS IT LISTED them, then its
+    # _find_definition_in answered only from the loaded table: an
+    # import the LRU cap had evicted mid-list answered NULL here —
+    # that null IS the eviction, observed — and only the dependency
+    # walk (step 4) re-loads from disk. ls_import_paths performs the
+    # loading wave; the CACHED lookup below refuses to re-load.)
     let imps: list[str] = ls_import_paths(st, di)
     let mut i: int = 0
     while i < imps.len() {
-        let line: int = ls_find_def_in_path(st, imps.get(i), name)
+        let line: int = ls_find_def_cached(st, imps.get(i), name)
         if line > 0 {
             return ls_location_json(
             ls_path_to_uri(imps.get(i)), line - 1)
