@@ -299,7 +299,10 @@ fn ls_lex(src: str) -> list[LTok] {
                     is_float = true
                     j = j + 1
                 } else {
-                    j = n
+                    # stop AT the first non-digit byte — j must stay
+                    # the token's END, not jump to EOF (the slice
+                    # below would swallow the whole rest of the file).
+                    break
                 }
             }
             if is_float {
@@ -804,6 +807,208 @@ fn ls_sym_enum(syms: Syms, name: str) -> int {
 }
 
 # ----------------------------------------------------------------------------
+# The Stage 114 walk — the probe's source-order inventory of call sites
+# and match arms for the inlay-hint engine. The .py's _walk_program /
+# _walk_stmt / _walk_expr, ported onto the real AST: children walk in
+# field order around each yield, top-level items are line-sorted (fns
+# by their keyword line, struct field defaults are expressions too) so
+# the server's per-family token cursors stay monotonic. Every call and
+# fieldcall yields one CALL line; every match yields its arms as ARM
+# lines at the match itself (the .py emitted every arm's binding hints
+# at the match node, before the scrutinee and arm bodies recursed).
+# ----------------------------------------------------------------------------
+
+# pw_expr(ctx, ei, out) — one expression subtree.
+fn pw_expr(ctx: Ctx, ei: int, out: list[str]) -> void {
+    if ei < 0 || ei >= ctx.exprs.len() {
+        return
+    }
+    let e: ExprN = ctx.exprs.get(ei)
+    if e.kind == "call" {
+        out.push("CALL " + e.line.to_str() + " 0 " + e.name)
+        let mut i: int = 0
+        while i < e.args.len() {
+            pw_expr(ctx, e.args.get(i), out)
+            i = i + 1
+        }
+        return
+    }
+    if e.kind == "fieldcall" {
+        # the receiver's tokens precede the `.name(`: target first,
+        # then the yield, then the arguments.
+        pw_expr(ctx, e.left, out)
+        out.push("CALL " + e.line.to_str() + " 1 " + e.name)
+        let mut j: int = 0
+        while j < e.args.len() {
+            pw_expr(ctx, e.args.get(j), out)
+            j = j + 1
+        }
+        return
+    }
+    if e.kind == "match" {
+        # the arms yield with the match; then the scrutinee; then the
+        # arm bodies (a body's call sites sit after the arm patterns).
+        let mut a: int = 0
+        while a < e.args.len() {
+            let arm: MatchArm = ctx.match_arms.get(e.args.get(a))
+            out.push("ARM " + e.args.get(a).to_str() + " "
+            + arm.line.to_str() + " " + arm.enum_name + " "
+            + arm.variant + " " + ls_bool_int(arm.has_paren).to_str()
+            + " " + str_join(arm.bindings, "|"))
+            a = a + 1
+        }
+        pw_expr(ctx, e.left, out)
+        a = 0
+        while a < e.args.len() {
+            let arm2: MatchArm = ctx.match_arms.get(e.args.get(a))
+            pw_expr(ctx, arm2.body, out)
+            a = a + 1
+        }
+        return
+    }
+    if e.kind == "field" || e.kind == "qmark" || e.kind == "un" {
+        pw_expr(ctx, e.left, out)
+        return
+    }
+    if e.kind == "index" || e.kind == "bin" {
+        pw_expr(ctx, e.left, out)
+        pw_expr(ctx, e.right, out)
+        return
+    }
+    if e.kind == "listlit" || e.kind == "structlit" {
+        let mut k: int = 0
+        while k < e.args.len() {
+            pw_expr(ctx, e.args.get(k), out)
+            k = k + 1
+        }
+        return
+    }
+    # ident / int / float / bool / str: leaves.
+}
+
+# pw_stmt(ctx, si, out) — one statement subtree.
+fn pw_stmt(ctx: Ctx, si: int, out: list[str]) -> void {
+    if si < 0 || si >= ctx.stmts.len() {
+        return
+    }
+    let s: StmtN = ctx.stmts.get(si)
+    if s.kind == "let" || s.kind == "return" {
+        pw_expr(ctx, s.value, out)
+    } else if s.kind == "assign" {
+        pw_expr(ctx, s.target, out)
+        pw_expr(ctx, s.value, out)
+    } else if s.kind == "expr" {
+        pw_expr(ctx, s.e, out)
+    } else if s.kind == "if" {
+        pw_expr(ctx, s.cond, out)
+        let mut i: int = 0
+        while i < s.body.len() {
+            pw_stmt(ctx, s.body.get(i), out)
+            i = i + 1
+        }
+        i = 0
+        while i < s.else_body.len() {
+            pw_stmt(ctx, s.else_body.get(i), out)
+            i = i + 1
+        }
+    } else if s.kind == "while" {
+        pw_expr(ctx, s.cond, out)
+        let mut j: int = 0
+        while j < s.body.len() {
+            pw_stmt(ctx, s.body.get(j), out)
+            j = j + 1
+        }
+    } else if s.kind == "for" {
+        pw_expr(ctx, s.iter, out)
+        let mut k: int = 0
+        while k < s.body.len() {
+            pw_stmt(ctx, s.body.get(k), out)
+            k = k + 1
+        }
+    } else if s.kind == "asm" {
+        # operands are (constraint, expr) pairs; the constraint side is
+        # a plain string and walks as a no-op.
+        let mut m: int = 0
+        while m < s.asm_operands.len() {
+            pw_expr(ctx, s.asm_operands.get(m).expr_idx, out)
+            m = m + 1
+        }
+    }
+    # break / continue: no expressions.
+}
+
+# WalkItem — one line-sorted top-level payload.
+struct WalkItem {
+    line: int,
+    kind: int, # 0: fn body, 1: struct field defaults
+    name: str
+}
+
+# pw_program(ctx, out) — the whole file, items line-sorted (the .py's
+# items.sort(key=line); the insertion sort is stable, and only pointer
+# slots move — no field writes, no aliasing hazard).
+fn pw_program(ctx: Ctx, out: list[str]) -> void {
+    let items: list[WalkItem] = []
+    let mut i: int = 0
+    while i < ctx.fn_order.len() {
+        let key: str = ctx.fn_order.get(i)
+        let fi: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        items.push(WalkItem { line: fi.line, kind: 0, name: key })
+        i = i + 1
+    }
+    let skeys: list[str] = ctx.structs.keys()
+    let mut si: int = 0
+    while si < skeys.len() {
+        let st: StructInfo = ctx.structs.get_or(skeys.get(si),
+        dummy_struct())
+        let mut has_dflt: bool = false
+        let mut di2: int = 0
+        while di2 < st.fdefaults.len() {
+            if st.fdefaults.get(di2) >= 0 {
+                has_dflt = true
+            }
+            di2 = di2 + 1
+        }
+        if has_dflt {
+            items.push(WalkItem { line: st.line, kind: 1, name: st.name })
+        }
+        si = si + 1
+    }
+    let mut a: int = 1
+    while a < items.len() {
+        let it: WalkItem = items.get(a)
+        let mut b: int = a - 1
+        while b >= 0 && items.get(b).line > it.line {
+            items.set(b + 1, items.get(b))
+            b = b - 1
+        }
+        items.set(b + 1, it)
+        a = a + 1
+    }
+    let mut w: int = 0
+    while w < items.len() {
+        let it2: WalkItem = items.get(w)
+        if it2.kind == 0 {
+            let fi2: FnInfo = ctx.fns.get_or(it2.name, dummy_fn())
+            let mut bi: int = 0
+            while bi < fi2.body.len() {
+                pw_stmt(ctx, fi2.body.get(bi), out)
+                bi = bi + 1
+            }
+        } else {
+            let st2: StructInfo = ctx.structs.get_or(it2.name,
+            dummy_struct())
+            let mut di3: int = 0
+            while di3 < st2.fdefaults.len() {
+                pw_expr(ctx, st2.fdefaults.get(di3), out)
+                di3 = di3 + 1
+            }
+        }
+        w = w + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
 # The probe child — one file, parse + symbol table + check verdict.
 #
 #   --probe-file PATH
@@ -814,10 +1019,18 @@ fn ls_sym_enum(syms: Syms, name: str) -> int {
 #   STRUCT <name> <line> <fields |> <ftypes |>
 #   ENUM <name> <line> <variants ,> <payloads ;>
 #   IMP <import>
+#   CALL <line> <is_method 0/1> <name>      (the Stage 114 walk)
+#   ARM <seq> <line> <enum> <variant> <has_paren> <bindings |>
+# A CLEAN check then adds (a check panic skips them — the server falls
+# back to the raw enum payloads for those arms):
+#   ARMB <seq> <name:type>|<name:type>|...  (the checker's
+#        instantiated binding types, "|" so payload types keep their
+#        spaces)
+# and finally CHECK OK.
 # A parse panic dies before any line (exit 101, the syntax error on
-# stderr); a check panic dies after them (exit 101, the type error on
-# stderr). The parent reads the same outcome the .py's try/except
-# HLError produced.
+# stderr); a check panic dies after the pre-check block (exit 101, the
+# type error on stderr). The parent reads the same outcome the .py's
+# try/except HLError produced.
 # ----------------------------------------------------------------------------
 
 # ls_probe_file(path) — the child side. Panics propagate (that IS the
@@ -865,7 +1078,37 @@ fn ls_probe_file(path: str) -> int uses IO, Args, Fs {
         println("IMP " + ctx.imports.get(ii))
         ii = ii + 1
     }
+    # the Stage 114 walk — pre-check, so a type-error document still
+    # carries its call sites and arm shapes (the guards' fallback).
+    let walk: list[str] = []
+    pw_program(ctx, walk)
+    let mut wi: int = 0
+    while wi < walk.len() {
+        println(walk.get(wi))
+        wi = wi + 1
+    }
     hl_check(ctx)
+    # ARMB — the checker's instantiated binding types, only reached on
+    # a clean check (a panic skips these lines and the server falls
+    # back to the raw enum payloads).
+    let mut ai: int = 0
+    while ai < ctx.match_arms.len() {
+        let arm: MatchArm = ctx.match_arms.get(ai)
+        if arm.bind_ts.len() > 0 {
+            let mut s: str = "ARMB " + ai.to_str() + " "
+            let mut bi: int = 0
+            while bi < arm.bindings.len() {
+                if bi > 0 {
+                    s = s + "|"
+                }
+                s = s + arm.bindings.get(bi) + ":"
+                + arm.bind_ts.get(bi)
+                bi = bi + 1
+            }
+            println(s)
+        }
+        ai = ai + 1
+    }
     println("CHECK OK")
     return 0
 }
@@ -889,7 +1132,31 @@ struct ProbeOut {
     err_col: int, # 1-based (0 when unknown)
     err_msg: str, # the RAW message (no classifier, no position suffix)
     err_text: str, # the full panic text (classifier + suffix)
-    syms: Syms
+    syms: Syms,
+    calls: list[WalkCall], # the Stage 114 walk (empty on parse error)
+    arms: list[WalkArm]
+}
+
+# WalkCall — one call-site yield: the callee's line, whether the site
+# is a `.name(` method call, and the callee's source name.
+struct WalkCall {
+    line: int,
+    is_method: bool,
+    name: str
+}
+
+# WalkArm — one match-arm yield. bind_ts carries the checker's
+# instantiated binding types (name-index-aligned) when the check ran
+# clean; a check-broken document leaves it empty and the engine falls
+# back to the enum's raw variant payloads.
+struct WalkArm {
+    seq: int, # the probe's arm index (ARMB's key)
+    line: int,
+    enum_name: str,
+    variant: str,
+    has_paren: bool,
+    bindings: list[str],
+    bind_ts: list[str]
 }
 
 # ls_probe_parse_err(err) — classify a child's stderr: ["kind", line,
@@ -991,7 +1258,8 @@ fn ls_probe_run(path: str) -> ProbeOut uses Proc, Args {
 fn ls_probe_result(r: RunRes) -> ProbeOut {
     let out: ProbeOut = ProbeOut {
         parse_err: false, check_err: false, err_line: 0, err_col: 0,
-        err_msg: "", err_text: "", syms: ls_syms_empty()
+        err_msg: "", err_text: "", syms: ls_syms_empty(),
+        calls: [], arms: []
     }
     let cls: list[str] = ls_probe_parse_err(r.err)
     let kind: str = cls.get(0)
@@ -1010,7 +1278,9 @@ fn ls_probe_result(r: RunRes) -> ProbeOut {
         }
         return out
     }
-    # The symbol table rides stdout whatever the check said.
+    # The symbol table and the Stage 114 walk ride stdout whatever the
+    # check said.
+    ls_parse_walk_lines(r.out, out)
     out.syms = ls_parse_sym_lines(r.out)
     if kind == "check" {
         out.check_err = true
@@ -1020,6 +1290,70 @@ fn ls_probe_result(r: RunRes) -> ProbeOut {
         out.err_text = cls.get(4)
     }
     return out
+}
+
+# ls_parse_walk_lines — the CALL/ARM/ARMB lines of the probe's stdout
+# into out.calls / out.arms (ARMB fills the arm's bind_ts by seq).
+fn ls_parse_walk_lines(out_text: str, out: ProbeOut) -> void {
+    let lines: list[str] = out_text.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i)
+        if ls_starts(line, "CALL ") {
+            let parts: list[str] = line.split(" ")
+            if parts.len() >= 4 {
+                out.calls.push(WalkCall {
+                    line: ls_atoi(parts.get(1)),
+                    is_method: parts.get(2) == "1",
+                    name: parts.get(3)
+                })
+            }
+        } else if ls_starts(line, "ARM ") {
+            let parts: list[str] = line.split(" ")
+            if parts.len() >= 7 {
+                out.arms.push(WalkArm {
+                    seq: ls_atoi(parts.get(1)),
+                    line: ls_atoi(parts.get(2)),
+                    enum_name: parts.get(3),
+                    variant: parts.get(4),
+                    has_paren: parts.get(5) == "1",
+                    bindings: ls_split_list(parts.get(6), "|"),
+                    bind_ts: []
+                })
+            }
+        } else if ls_starts(line, "ARMB ") {
+            # "ARMB <seq> <name:type>|..." — the pairs ride the REST of
+            # the line verbatim: payload types keep their spaces
+            # ("map[str, int]"), so a split(" ") would shred them.
+            let rest: str = line.slice("ARMB ".len(), line.len())
+            let sp: int = rest.find(" ")
+            if sp > 0 {
+                let seq: int = ls_atoi(rest.slice(0, sp))
+                let pairs: list[str] = ls_split_list(
+                rest.slice(sp + 1, rest.len()), "|")
+                let mut ai: int = 0
+                while ai < out.arms.len() {
+                    if out.arms.get(ai).seq == seq {
+                        let mut pi: int = 0
+                        while pi < pairs.len() {
+                            let colon: int = pairs.get(pi).find(":")
+                            if colon > 0 {
+                                out.arms.get(ai).bind_ts.push(
+                                pairs.get(pi).slice(colon + 1,
+                                pairs.get(pi).len()))
+                            } else {
+                                out.arms.get(ai).bind_ts.push("")
+                            }
+                            pi = pi + 1
+                        }
+                        break
+                    }
+                    ai = ai + 1
+                }
+            }
+        }
+        i = i + 1
+    }
 }
 
 # ls_parse_sym_lines — the probe's stdout into a Syms.
@@ -1099,7 +1433,9 @@ struct DocRec {
     err_line: int,
     err_col: int,
     err_msg: str, # raw (checker) or full-with-suffix (parse)
-    dead: bool # the program is unusable (the .py's program=None)
+    dead: bool, # the program is unusable (the .py's program=None)
+    calls: list[WalkCall], # the Stage 114 walk ([] on parse error)
+    arms: list[WalkArm]
 }
 
 # ls_doc_new(uri, version, text) — store + probe one buffer. The
@@ -1111,13 +1447,16 @@ Fs, IO {
         uri: uri, path: ls_uri_to_path(uri), version: version,
         text: text, toks: ls_lex(text), offs: ls_line_offsets(text),
         syms: ls_syms_empty(), parse_err: false, err_line: 0,
-        err_col: 0, err_msg: "", dead: false
+        err_col: 0, err_msg: "", dead: false, calls: [], arms: []
     }
     ls_scratch_write(text)
     let p: ProbeOut = ls_probe_run(ls_scratch_path())
     d.syms = p.syms
+    d.calls = p.calls
+    d.arms = p.arms
     if p.parse_err {
         d.parse_err = true
+        d.dead = true
         d.err_line = p.err_line
         d.err_col = p.err_col
         d.err_msg = p.err_text
@@ -2316,17 +2655,579 @@ fn ls_handle_document_symbol(st: LsState, params: JsonValue)
 }
 
 # ----------------------------------------------------------------------------
-# Inlay hints, rename, codeAction — the Stage 114/115 surface. The
-# parameter-hint engine and the refactor planners ride the same
-# token-stream machinery as definition (the token index IS the
-# coordinate system); this build ships the protocol surface with the
-# .py's degrade laws, and the engines land with their batteries.
+# Inlay hints (Stage 114) — the .py engine, ported whole. The AST
+# records no columns, so hint POSITIONS come from the token stream:
+# the probe's walk (CALL/ARM lines, source order) drives two
+# monotonic cursors — one per hint family — that re-locate each site.
+# A site that cannot be re-located is skipped, never guessed at.
+# Resolution mirrors the checker: builtins first, then local fns,
+# then the files the document imports; a hint is emitted only when
+# the argument count exactly matches the parameter count. Failures
+# degrade to fewer hints, never to a wrong one.
 # ----------------------------------------------------------------------------
 
+# ParamRes — a resolution's verdict (ok=false means "no hints here",
+# never an error; names empty with ok=true is a real zero-param hit).
+struct ParamRes {
+    ok: bool,
+    names: list[str]
+}
+
+# ls_builtin_method_exists — a KEY-EXISTS check (the ambiguous "set"
+# has a table entry with no names; it still silences user methods and
+# yields nothing itself).
+fn ls_builtin_method_exists(name: str) -> bool {
+    return ls_builtin_method_params(name).len() > 0 || name == "set"
+}
+
+# ls_str_list_eq — element-wise equality.
+fn ls_str_list_eq(a: list[str], b: list[str]) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    let mut i: int = 0
+    while i < a.len() {
+        if a.get(i) != b.get(i) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# ls_push_unique — append unless present (the .py's set add).
+fn ls_push_unique(lst: list[str], s: str) -> void {
+    let mut i: int = 0
+    while i < lst.len() {
+        if lst.get(i) == s {
+            return
+        }
+        i = i + 1
+    }
+    lst.push(s)
+}
+
+# ls_syms_for_path — an open buffer's live table when the path is
+# open (the layer law's "open beats disk"), else the external load.
+fn ls_syms_for_path(st: LsState, path: str) -> Syms uses Proc, Fs,
+Args {
+    let mut i: int = 0
+    while i < st.docs.len() {
+        if st.docs.get(i).path == path {
+            return st.docs.get(i).syms
+        }
+        i = i + 1
+    }
+    let ei: int = ls_ext_fresh(st, path)
+    if ei < 0 {
+        return ls_syms_empty()
+    }
+    return st.ext.get(ei).syms
+}
+
+# ls_resolve_fn_params — the .py's _resolve_fn_params: builtins beat
+# user fns (a user fn cannot shadow one), then the local program,
+# then the imports — two imports disagreeing on the signature is
+# ambiguous and answers nothing.
+fn ls_resolve_fn_params(st: LsState, di: int, name: str) -> ParamRes
+uses Proc, Fs, Args {
+    let bp: list[str] = ls_builtin_params(name)
+    if bp.len() > 0 {
+        return ParamRes { ok: true, names: bp }
+    }
+    let d: DocRec = st.docs.get(di)
+    let li: int = ls_sym_fn(d.syms, name)
+    if li >= 0 {
+        return ParamRes { ok: true, names: d.syms.fns.get(li).params }
+    }
+    let paths: list[str] = ls_import_paths(st, di)
+    let mut found_p: list[str] = []
+    let mut found_t: list[str] = []
+    let mut have: bool = false
+    let mut ambig: bool = false
+    let mut i: int = 0
+    while i < paths.len() {
+        let syms: Syms = ls_syms_for_path(st, paths.get(i))
+        let fi: int = ls_sym_fn(syms, name)
+        if fi >= 0 {
+            let cand: SymFn = syms.fns.get(fi)
+            if !have {
+                found_p = cand.params
+                found_t = cand.ptypes
+                have = true
+            } else {
+                if !ls_str_list_eq(found_p, cand.params)
+                || !ls_str_list_eq(found_t, cand.ptypes) {
+                    ambig = true
+                }
+            }
+        }
+        i = i + 1
+    }
+    if have && !ambig {
+        return ParamRes { ok: true, names: found_p }
+    }
+    return ParamRes { ok: false, names: [] }
+}
+
+# ls_method_cands — every fn key "Owner.name" of that method name in
+# the symbol table (unique keys, local and imports merged).
+fn ls_method_cands(syms: Syms, name: str, cands: list[str]) -> void {
+    let mut i: int = 0
+    while i < syms.fns.len() {
+        let k: str = syms.fns.get(i).key
+        if ls_ends(k, "." + name) {
+            ls_push_unique(cands, k)
+        }
+        i = i + 1
+    }
+}
+
+# ls_params_tail — params[1:] (the receiver is not an argument).
+fn ls_params_tail(f: SymFn) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 1
+    while i < f.params.len() {
+        out.push(f.params.get(i))
+        i = i + 1
+    }
+    return out
+}
+
+# ls_resolve_method_params — the .py's _resolve_method_params: an
+# `Enum.Variant(...)` constructor names nothing; a user method hints
+# only as the UNIQUE candidate and never when a builtin method of the
+# same name exists (the receiver could be either); builtin methods
+# hint from the table ("set" exists but yields nothing).
+fn ls_resolve_method_params(st: LsState, di: int, paren: int,
+name: str) -> ParamRes uses Proc, Fs, Args {
+    let d: DocRec = st.docs.get(di)
+    let toks: list[LTok] = d.toks
+    # Enum-variant constructor: the token three back from the paren
+    # (the head of `Head.name(`) names a local enum whose variant the
+    # method is.
+    if paren >= 3 {
+        let head: LTok = toks.get(paren - 3)
+        if head.kind == "ident" {
+            let ei: int = ls_sym_enum(d.syms, head.value)
+            if ei >= 0 {
+                let en: SymEnum = d.syms.enums.get(ei)
+                let mut vi: int = 0
+                while vi < en.variants.len() {
+                    if en.variants.get(vi) == name {
+                        return ParamRes { ok: false, names: [] }
+                    }
+                    vi = vi + 1
+                }
+            }
+        }
+    }
+    # User methods — unique candidate only.
+    let cands: list[str] = []
+    ls_method_cands(d.syms, name, cands)
+    let paths: list[str] = ls_import_paths(st, di)
+    let mut pi: int = 0
+    while pi < paths.len() {
+        ls_method_cands(ls_syms_for_path(st, paths.get(pi)), name,
+        cands)
+        pi = pi + 1
+    }
+    if cands.len() > 0 {
+        if cands.len() != 1 || ls_builtin_method_exists(name) {
+            return ParamRes { ok: false, names: [] }
+        }
+        let key: str = cands.get(0)
+        let li: int = ls_sym_fn(d.syms, key)
+        if li >= 0 {
+            return ParamRes { ok: true,
+            names: ls_params_tail(d.syms.fns.get(li)) }
+        }
+        pi = 0
+        while pi < paths.len() {
+            let syms: Syms = ls_syms_for_path(st, paths.get(pi))
+            let fi2: int = ls_sym_fn(syms, key)
+            if fi2 >= 0 {
+                return ParamRes { ok: true,
+                names: ls_params_tail(syms.fns.get(fi2)) }
+            }
+            pi = pi + 1
+        }
+        return ParamRes { ok: false, names: [] }
+    }
+    # Builtin methods (the ambiguous "set" exists but yields none).
+    let mp: list[str] = ls_builtin_method_params(name)
+    if mp.len() == 0 {
+        return ParamRes { ok: false, names: [] }
+    }
+    return ParamRes { ok: true, names: mp }
+}
+
+# ls_scan_call_site — the open-paren token of the call site for
+# `name` at/after `start`, preferring the node's own line (the AST
+# line is the callee-name token's line); a later line is the
+# multi-line-spelling fallback; an earlier line is stale, skipped.
+fn ls_scan_call_site(toks: list[LTok], start: int, name: str,
+node_line: int, want_method: bool) -> int {
+    let n: int = toks.len()
+    let mut fallback: int = -1
+    let mut i: int = start
+    while i < n {
+        let t: LTok = toks.get(i)
+        if want_method {
+            if t.kind == "sym" && t.value == "." && i + 2 < n
+            && toks.get(i + 1).kind == "ident"
+            && toks.get(i + 1).value == name
+            && toks.get(i + 2).kind == "sym"
+            && toks.get(i + 2).value == "(" {
+                let ln: int = toks.get(i + 1).line
+                if ln == node_line {
+                    return i + 2
+                }
+                if fallback < 0 && ln > node_line {
+                    fallback = i + 2
+                }
+                i = i + 3
+                continue
+            }
+        } else {
+            if t.kind == "ident" && t.value == name && i + 1 < n
+            && toks.get(i + 1).kind == "sym"
+            && toks.get(i + 1).value == "(" {
+                let ln: int = t.line
+                if ln == node_line {
+                    return i + 1
+                }
+                if fallback < 0 && ln > node_line {
+                    fallback = i + 1
+                }
+                i = i + 2
+                continue
+            }
+        }
+        i = i + 1
+    }
+    return fallback
+}
+
+# ls_arg_spans — the top-level argument token spans [start, end) of
+# the call whose open paren sits at `paren`. A group that never
+# closes answers the failure marker [[-1, -1]] (the .py's None);
+# nesting counts brackets of every shape, and strings are single
+# tokens so they cannot tilt the depth counter.
+fn ls_arg_spans(toks: list[LTok], paren: int) -> list[list[int]] {
+    let n: int = toks.len()
+    let spans: list[list[int]] = []
+    let mut depth: int = 1
+    let mut j: int = paren + 1
+    let mut expect_arg: bool = true
+    let mut start: int = -1
+    while j < n {
+        let t: LTok = toks.get(j)
+        if depth == 1 && expect_arg {
+            start = j
+            expect_arg = false
+        }
+        if t.kind == "sym" {
+            let v: str = t.value
+            if v == "(" || v == "[" || v == "{" {
+                depth = depth + 1
+            } else if v == ")" || v == "]" || v == "}" {
+                depth = depth - 1
+                if depth == 0 {
+                    if start >= 0 {
+                        spans.push([start, j])
+                    }
+                    return spans
+                }
+            } else if v == "," && depth == 1 {
+                if start >= 0 {
+                    spans.push([start, j])
+                }
+                expect_arg = true
+            }
+        }
+        j = j + 1
+    }
+    return [[-1, -1]]
+}
+
+# ls_pattern_bindings_before — the binding identifier tokens inside
+# the `(...)` group that closes immediately before `arrow`, in source
+# order. A backward scan cannot be confused by braces in the
+# scrutinee or in an earlier arm's body. [] when the arrow has no
+# balanced paren group before it (a wildcard arm, a bare pattern, or
+# anything this scan refuses to guess about).
+fn ls_pattern_bindings_before(toks: list[LTok], arrow: int)
+-> list[int] {
+    let n: int = toks.len()
+    let mut j: int = arrow - 1
+    if j < 0 || toks.get(j).kind != "sym"
+    || toks.get(j).value != ")" {
+        return []
+    }
+    let mut depth: int = 1
+    let rev: list[int] = []
+    j = j - 1
+    while j >= 0 && depth > 0 {
+        let t: LTok = toks.get(j)
+        if t.kind == "sym" {
+            if t.value == ")" || t.value == "]" || t.value == "}" {
+                depth = depth + 1
+            } else if t.value == "(" || t.value == "["
+            || t.value == "{" {
+                depth = depth - 1
+                if depth == 0 {
+                    break
+                }
+            }
+        } else if t.kind == "ident" && depth == 1 && t.value != "_" {
+            rev.push(j)
+        }
+        j = j - 1
+    }
+    let out: list[int] = []
+    let mut k: int = rev.len() - 1
+    while k >= 0 {
+        out.push(rev.get(k))
+        k = k - 1
+    }
+    return out
+}
+
+# ls_emit_binding_hint — one `: T` hint just past the binding name.
+fn ls_emit_binding_hint(d: DocRec, t: LTok, btype: str, lo: int,
+hi: int, hints: list[JsonValue]) -> void {
+    if btype == "" {
+        return
+    }
+    let line0: int = t.line - 1
+    if line0 < lo || line0 > hi {
+        return
+    }
+    let col_byte: int = t.off - d.offs.get(line0)
+    let char16: int = ls_utf16_of_byte_col(d.text, d.offs, line0,
+    col_byte + t.len)
+    hints.push(json_object(
+    ["position", "label", "kind", "paddingLeft", "paddingRight",
+    "tooltip"],
+    [ls_pos_json(line0, char16), json_str(": " + btype), json_int(1),
+    json_bool(false), json_bool(false),
+    json_str("inferred match binding type")]))
+}
+
+# ls_inlay_arm — one match arm's binding hints. The arm's arrow is
+# the first at/after the cursor (arms walk in source order, so the
+# cursor stays monotonic); an arm that cannot be located ends the
+# family's hinting. Types prefer the checker's instantiation (ARMB),
+# falling back to the raw variant payloads of a qualified pattern —
+# a check-broken document still types its bindings.
+fn ls_inlay_arm(d: DocRec, wa: WalkArm, cursor: int, lo: int, hi: int,
+hints: list[JsonValue]) -> int {
+    let toks: list[LTok] = d.toks
+    let n: int = toks.len()
+    let mut i: int = cursor
+    let mut arrow: int = -1
+    while i < n {
+        let t: LTok = toks.get(i)
+        if t.kind == "sym" && t.value == "=>" {
+            arrow = i
+            break
+        }
+        i = i + 1
+    }
+    if arrow < 0 {
+        return i
+    }
+    if wa.has_paren {
+        let idents: list[int] = ls_pattern_bindings_before(toks, arrow)
+        let checked: bool = wa.bind_ts.len() == wa.bindings.len()
+        && wa.bindings.len() > 0
+        let mut ti: int = 0
+        while ti < idents.len() {
+            let t2: LTok = toks.get(idents.get(ti))
+            let mut btype: str = ""
+            if checked {
+                # the checker's instantiation, by name
+                let mut bi: int = 0
+                while bi < wa.bindings.len() {
+                    if wa.bindings.get(bi) == t2.value {
+                        btype = wa.bind_ts.get(bi)
+                        break
+                    }
+                    bi = bi + 1
+                }
+            } else if wa.enum_name != "" {
+                # the raw variant payloads, zipped by position
+                let ei: int = ls_sym_enum(d.syms, wa.enum_name)
+                if ei >= 0 {
+                    let en: SymEnum = d.syms.enums.get(ei)
+                    let mut vidx: int = -1
+                    let mut vi: int = 0
+                    while vi < en.variants.len() {
+                        if en.variants.get(vi) == wa.variant {
+                            vidx = vi
+                        }
+                        vi = vi + 1
+                    }
+                    if vidx >= 0 {
+                        let pls: list[str] = en.payloads.get(vidx)
+                        if pls.len() == idents.len() {
+                            btype = pls.get(ti)
+                        }
+                    }
+                }
+            }
+            ls_emit_binding_hint(d, t2, btype, lo, hi, hints)
+            ti = ti + 1
+        }
+    }
+    return arrow + 1
+}
+
+# ls_inlay_call — one call site's parameter hints. Every guard
+# degrades to "no hints for this site": unresolved callee, arity
+# mismatch, unlocatable site, enum-variant constructor.
+fn ls_inlay_call(st: LsState, di: int, wc: WalkCall, cursor: int,
+lo: int, hi: int, hints: list[JsonValue]) -> int uses IO, Proc, Fs,
+Args {
+    let d: DocRec = st.docs.get(di)
+    if wc.name == "" {
+        return cursor
+    }
+    let paren: int = ls_scan_call_site(d.toks, cursor, wc.name,
+    wc.line, wc.is_method)
+    if paren < 0 {
+        return cursor
+    }
+    let mut pr: ParamRes = ParamRes { ok: false, names: [] }
+    if wc.is_method {
+        pr = ls_resolve_method_params(st, di, paren, wc.name)
+    } else {
+        pr = ls_resolve_fn_params(st, di, wc.name)
+    }
+    if !pr.ok {
+        return paren + 1
+    }
+    let spans: list[list[int]] = ls_arg_spans(d.toks, paren)
+    if spans.len() > 0 && spans.get(0).get(0) == -1 {
+        return paren + 1
+    }
+    if spans.len() != pr.names.len() {
+        return paren + 1
+    }
+    let mut callee: str = wc.name
+    if wc.is_method {
+        callee = "." + wc.name
+    }
+    let mut i: int = 0
+    while i < spans.len() {
+        let sp: list[int] = spans.get(i)
+        let pname: str = pr.names.get(i)
+        let first: LTok = d.toks.get(sp.get(0))
+        # Redundancy rule: `f(x: x)` — a single bare identifier
+        # argument spelled exactly like its parameter says nothing
+        # the source does not already say.
+        if sp.get(1) - sp.get(0) == 1 && first.kind == "ident"
+        && first.value == pname {
+            i = i + 1
+            continue
+        }
+        let line0: int = first.line - 1
+        if line0 < lo || line0 > hi {
+            i = i + 1
+            continue
+        }
+        let col_byte: int = first.off - d.offs.get(line0)
+        let char16: int = ls_utf16_of_byte_col(d.text, d.offs, line0,
+        col_byte)
+        hints.push(json_object(
+        ["position", "label", "kind", "paddingLeft", "paddingRight",
+        "tooltip"],
+        [ls_pos_json(line0, char16), json_str(pname + ":"),
+        json_int(2), json_bool(false), json_bool(true),
+        json_str("parameter '" + pname + "' of '" + callee + "'")]))
+        i = i + 1
+    }
+    return paren + 1
+}
+
+# ls_hint_line / ls_hint_char — a hint's sort keys.
+fn ls_hint_line(h: JsonValue) -> int {
+    return ls_jint(ls_jget(h, "position"), "line")
+}
+
+fn ls_hint_char(h: JsonValue) -> int {
+    return ls_jint(ls_jget(h, "position"), "character")
+}
+
+# ls_handle_inlay_hint — the request: two family walks over the
+# probe's site inventory, then the protocol's sorted-output law. A
+# syntax-error document answers [] (never an error).
 fn ls_handle_inlay_hint(st: LsState, params: JsonValue) -> JsonValue
-uses IO {
-    # a syntax-error document answers [] (never an error).
-    return json_array([])
+uses IO, Proc, Fs, Args {
+    let td: JsonValue = ls_jget(params, "textDocument")
+    let uri: str = ls_jstr(td, "uri")
+    let di: int = ls_find_doc(st, uri)
+    if di < 0 {
+        return json_array([])
+    }
+    let d: DocRec = st.docs.get(di)
+    if d.parse_err || d.dead {
+        return json_array([])
+    }
+    # the range filter; a missing range answers the whole document
+    let mut lo: int = 0
+    let mut hi: int = 1000000000
+    let rng: JsonValue = ls_jget(params, "range")
+    if json_is_object(rng) {
+        let s0: int = ls_jint(ls_jget(rng, "start"), "line")
+        let e0: int = ls_jint(ls_jget(rng, "end"), "line")
+        if s0 >= 0 {
+            lo = s0
+        }
+        if e0 >= 0 {
+            hi = e0
+        }
+    }
+    let hints: list[JsonValue] = []
+    let mut cur: int = 0
+    let mut ci: int = 0
+    while ci < d.calls.len() {
+        cur = ls_inlay_call(st, di, d.calls.get(ci), cur, lo, hi,
+        hints)
+        ci = ci + 1
+    }
+    let mut acur: int = 0
+    let mut ai: int = 0
+    while ai < d.arms.len() {
+        acur = ls_inlay_arm(d, d.arms.get(ai), acur, lo, hi, hints)
+        ai = ai + 1
+    }
+    # sorted by (line, character) — editors depend on it. Only
+    # pointer slots move; no field writes, no aliasing hazard.
+    let mut a: int = 1
+    while a < hints.len() {
+        let it: JsonValue = hints.get(a)
+        let al: int = ls_hint_line(it)
+        let ac: int = ls_hint_char(it)
+        let mut b: int = a - 1
+        let mut pos: int = a
+        while b >= 0 {
+            let bt: JsonValue = hints.get(b)
+            let bl: int = ls_hint_line(bt)
+            let bc: int = ls_hint_char(bt)
+            if bl > al || (bl == al && bc > ac) {
+                hints.set(b + 1, bt)
+                pos = b
+                b = b - 1
+            } else {
+                break
+            }
+        }
+        hints.set(pos, it)
+        a = a + 1
+    }
+    return json_array(hints)
 }
 
 fn ls_handle_rename(st: LsState, params: JsonValue) -> JsonValue
@@ -2580,6 +3481,32 @@ fn main() -> int uses IO, Args, Exit, Proc, Fs {
         }
         if argv.get(i) == "--probe-file" && i + 1 < argv.len() {
             return ls_probe_file(argv.get(i + 1))
+        }
+        if argv.get(i) == "--debug-walk" && i + 1 < argv.len() {
+            let p: ProbeOut = ls_probe_run(argv.get(i + 1))
+            println("parse_err=" + ls_bool_int(p.parse_err).to_str()
+            + " check_err=" + ls_bool_int(p.check_err).to_str()
+            + " calls=" + p.calls.len().to_str()
+            + " arms=" + p.arms.len().to_str())
+            let mut ci: int = 0
+            while ci < p.calls.len() {
+                println("  CALL line=" + p.calls.get(ci).line.to_str()
+                + " method=" + ls_bool_int(p.calls.get(ci).is_method).to_str()
+                + " name=" + p.calls.get(ci).name)
+                ci = ci + 1
+            }
+            let mut ai: int = 0
+            while ai < p.arms.len() {
+                let wa: WalkArm = p.arms.get(ai)
+                println("  ARM seq=" + wa.seq.to_str() + " line="
+                + wa.line.to_str() + " enum=" + wa.enum_name
+                + " variant=" + wa.variant + " paren="
+                + ls_bool_int(wa.has_paren).to_str() + " binds="
+                + str_join(wa.bindings, ",") + " bind_ts.len="
+                + wa.bind_ts.len().to_str())
+                ai = ai + 1
+            }
+            return 0
         }
         i = i + 1
     }
