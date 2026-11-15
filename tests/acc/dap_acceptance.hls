@@ -1,0 +1,1210 @@
+# ============================================================================
+# tests/acc/dap_acceptance.hls — Stage 121 acceptance gate: the VS Code
+# extension debugger integration (DAP), in Halis.
+# ----------------------------------------------------------------------------
+# The native twin of tests/dap_acceptance.py that retired. Nine
+# sections, every one driving the REAL adapter (bin/hls-dap) as a
+# subprocess over stdio DAP (the same pipe VS Code opens):
+
+#   1. the lifecycle   — initialize answers capabilities (configuration
+#                        done, evaluate-for-hovers, the panics exception
+#                        filter), launch rejects a missing program and a
+#                        program the checker rejects with the REAL
+#                        diagnostic, configurationDone starts the run,
+#                        and a clean program ends exited(0)+terminated
+#   2. the breakpoints — a statement line verifies in place, a line
+#                        without a statement snaps DOWN to the nearest
+#                        statement and says so, a line past the end is
+#                        refused, a file outside the program is refused;
+#                        a hit stops with reason breakpoint on the line
+#                        that is ABOUT to execute, a loop hits it once
+#                        per iteration, and clearing the breakpoints lets
+#                        the program run out
+#   3. the output      — the program's stdout arrives as output events,
+#                        byte-for-byte the same bytes bin/hlboot prints
+#   4. the stack       — stackTrace lists innermost first, every frame
+#                        names its fn and its real source file, and the
+#                        top frame sits on the stopped line
+#   5. the stepping    — stopOnEntry stops at main's first statement
+#                        before it runs; next crosses the loop; stepIn
+#                        descends into the callee (two levels, through
+#                        the method); stepOut climbs back out
+#   6. the variables   — Locals binds every visible name with the right
+#                        value and declared type; a struct expands to its
+#                        declared fields; an enum shows Variant(payload);
+#                        a list indexes 0..n-1; a shadowed name reports
+#                        its shadow
+#   7. the evaluate    — arithmetic over real locals, a bare identifier,
+#                        a struct field chain; a parse error, an unknown
+#                        name and a panicking expression are error
+#                        responses that leave the session alive
+#   8. the panic       — a bounds panic stops the dead program with
+#                        reason exception, the real message, the panic
+#                        line, the stderr echo, exit 101; with the
+#                        panics filter off the same program just exits
+#   9. the integration — the protocol survives garbage frames and an
+#                        unknown request and still runs a program; the
+#                        corpus is hlfmt-canonical, hllint-clean, and
+#                        runs under bin/hlboot with its pinned output;
+#                        the editor contributes the `halis` debugger type
+#                        and a descriptor factory pointing at the NATIVE
+#                        adapter (bin/hls-dap)
+
+# The .py years ran this battery under Python's subprocess plumbing;
+# the port drives the same wire with the runtime's own child pipes
+# (proc_spawn / proc_child_write / proc_child_read — blocking reads,
+# so every wait blocks until the message lands; a dead adapter fails
+# fast through the dead flag, never a silent hang).
+
+# Exit code 0 = all acceptance criteria met.
+# ============================================================================
+import "./harness.hls"
+import "std.json"
+import "std.result"
+
+# ----------------------------------------------------------------------------
+# The client — one spawned adapter, real framing, seq tracking, and
+# helpers that fail LOUD (a dead pipe is a failed session).
+# ----------------------------------------------------------------------------
+
+struct DapCl {
+    pid: int, # the child handle (0 = spawn failed)
+    buf: str, # pending wire bytes past the last parsed frame
+    msgs: list[JsonValue], # every parsed message, in arrival order
+    stopped_seen: int, # wait_stopped's cursor (consumed stops)
+    seq: int,
+    dead: bool
+}
+
+# dapcl_crlfcrlf() — the frame separator (string literals carry no \r).
+fn dapcl_crlfcrlf() -> str {
+    return chr(13) + "\n" + chr(13) + "\n"
+}
+
+# dapcl_new(root) — spawn the adapter with every stdio end piped.
+fn dapcl_new(root: str) -> DapCl uses Proc {
+    let cl: DapCl = DapCl {
+        pid: 0, buf: "", msgs: [], stopped_seen: 0, seq: 0, dead: false
+    }
+    let no_args: list[str] = []
+    let pid: int = proc_spawn(path_join3(root, "bin/hls-dap"),
+    no_args, 1, 1, 1)
+    cl.pid = pid
+    if pid < 1 {
+        cl.dead = true
+    }
+    return cl
+}
+
+# dapcl_head(s, n) — the first n bytes of s (whole s when shorter:
+# a slice past the end panics, and a check's DETAIL must never kill
+# the gate).
+fn dapcl_head(s: str, n: int) -> str {
+    if s.len() <= n {
+        return s
+    }
+    return s.slice(0, n)
+}
+
+# dapcl_parse_len(header) — "Content-Length: 401" -> 401 (-1 malformed).
+fn dapcl_parse_len(header: str) -> int {
+    let colon: int = header.find(":")
+    if colon < 0 {
+        return -1
+    }
+    let v: str = header.slice(colon + 1, header.len()).trim()
+    if v.len() == 0 {
+        return -1
+    }
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < v.len() {
+        let c: int = v.byte_at(i)
+        if c < 48 || c > 57 {
+            return -1
+        }
+        n = n * 10 + (c - 48)
+        i = i + 1
+    }
+    return n
+}
+
+# dapcl_try_frames(cl) — parse every complete frame out of the buffer.
+fn dapcl_try_frames(cl: DapCl) -> void {
+    while true {
+        if !cl.buf.contains("Content-Length:") {
+            return
+        }
+        let sp: int = cl.buf.find("Content-Length:")
+        let mut b: str = cl.buf
+        if sp > 0 {
+            b = b.slice(sp, b.len())
+        }
+        let sep: int = b.find(dapcl_crlfcrlf())
+        if sep < 0 {
+            cl.buf = b
+            return
+        }
+        let header: str = b.slice(0, sep)
+        let clen: int = dapcl_parse_len(header)
+        if clen < 0 {
+            # defensive: skip one byte and retry (the adapter never
+            # sends garbage, but the parser stays total)
+            cl.buf = b.slice(1, b.len())
+            continue
+        }
+        if b.len() < sep + 4 + clen {
+            cl.buf = b
+            return
+        }
+        let body: str = b.slice(sep + 4, sep + 4 + clen)
+        cl.buf = b.slice(sep + 4 + clen, b.len())
+        let rr: Result[JsonValue, str] = json_parse_result(body)
+        if result_is_ok(rr) {
+            cl.msgs.push(result_unwrap(rr))
+        }
+    }
+}
+
+# dapcl_pump(cl) — one blocking read; returns false when the pipe is
+# dead (two consecutive empty reads — the child is gone).
+fn dapcl_pump(cl: DapCl) -> bool uses IO, Proc {
+    if cl.dead {
+        return false
+    }
+    let mut empties: int = 0
+    while empties < 2 {
+        let chunk: str = proc_child_read(cl.pid, 1, 65536)
+        if chunk != "" {
+            cl.buf = cl.buf + chunk
+            dapcl_try_frames(cl)
+            return true
+        }
+        empties = empties + 1
+    }
+    cl.dead = true
+    return false
+}
+
+# dapcl_send_raw(cl, text) — bytes straight onto the adapter's stdin.
+fn dapcl_send_raw(cl: DapCl, text: str) -> void uses Proc {
+    proc_child_write(cl.pid, text)
+}
+
+# dapcl_frame(body) — one framed message.
+fn dapcl_frame(body: str) -> str {
+    return "Content-Length: " + body.len().to_str()
+    + dapcl_crlfcrlf() + body
+}
+
+# dapcl_jstr(m, key) / dapcl_jint / dapcl_jbool — total field reads.
+fn dapcl_jstr(m: JsonValue, key: str) -> str {
+    let v: JsonValue = json_object_get(m, key)
+    if json_is_str(v) {
+        return json_str_value(v)
+    }
+    return ""
+}
+
+fn dapcl_jint(m: JsonValue, key: str, dflt: int) -> int {
+    let v: JsonValue = json_object_get(m, key)
+    if json_is_int(v) {
+        return json_int_value(v)
+    }
+    return dflt
+}
+
+fn dapcl_jbool(m: JsonValue, key: str, dflt: bool) -> bool {
+    let v: JsonValue = json_object_get(m, key)
+    if json_is_bool(v) {
+        return json_bool_value(v)
+    }
+    return dflt
+}
+
+fn dapcl_body(m: JsonValue) -> JsonValue {
+    let v: JsonValue = json_object_get(m, "body")
+    if json_is_object(v) {
+        return v
+    }
+    return json_object([], [])
+}
+
+# dapcl_rpc(cl, command, args) — send one request, wait its response.
+# args is a fully built arguments object.
+fn dapcl_rpc(cl: DapCl, command: str, args: JsonValue) -> JsonValue
+uses IO, Proc {
+    cl.seq = cl.seq + 1
+    let keys: list[str] = ["seq", "type", "command", "arguments"]
+    let vals: list[JsonValue] = [json_int(cl.seq), json_str("request"),
+    json_str(command), args]
+    dapcl_send_raw(cl, dapcl_frame(json_stringify(
+    json_object(keys, vals))))
+    return dapcl_wait_response(cl, cl.seq)
+}
+
+# dapcl_wait_response(cl, seq) — the response for one request.
+fn dapcl_wait_response(cl: DapCl, seq: int) -> JsonValue uses IO, Proc {
+    while true {
+        let mut i: int = 0
+        while i < cl.msgs.len() {
+            let m: JsonValue = cl.msgs.get(i)
+            if dapcl_jstr(m, "type") == "response"
+            && dapcl_jint(m, "request_seq", 0) == seq {
+                return m
+            }
+            i = i + 1
+        }
+        if !dapcl_pump(cl) {
+            return json_null()
+        }
+    }
+    return json_null()
+}
+
+# dapcl_wait_event(cl, name) — the first event of that name.
+fn dapcl_wait_event(cl: DapCl, name: str) -> JsonValue uses IO, Proc {
+    while true {
+        let mut i: int = 0
+        while i < cl.msgs.len() {
+            let m: JsonValue = cl.msgs.get(i)
+            if dapcl_jstr(m, "type") == "event"
+            && dapcl_jstr(m, "event") == name {
+                return m
+            }
+            i = i + 1
+        }
+        if !dapcl_pump(cl) {
+            return json_null()
+        }
+    }
+    return json_null()
+}
+
+# dapcl_events(cl, name) — every event of that name so far.
+fn dapcl_events(cl: DapCl, name: str) -> list[JsonValue] {
+    let out: list[JsonValue] = []
+    let mut i: int = 0
+    while i < cl.msgs.len() {
+        let m: JsonValue = cl.msgs.get(i)
+        if dapcl_jstr(m, "type") == "event" && dapcl_jstr(m, "event") == name {
+            out.push(m)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# dapcl_wait_stopped(cl, reason) — the NEXT unconsumed stopped event
+# ("" matches any reason; consumed stops never come back).
+fn dapcl_wait_stopped(cl: DapCl, reason: str) -> JsonValue uses IO, Proc {
+    while true {
+        let stops: list[JsonValue] = dapcl_events(cl, "stopped")
+        let mut i: int = cl.stopped_seen
+        while i < stops.len() {
+            let ev: JsonValue = stops.get(i)
+            if reason == ""
+            || dapcl_jstr(dapcl_body(ev), "reason") == reason {
+                cl.stopped_seen = i + 1
+                return ev
+            }
+            i = i + 1
+        }
+        if !dapcl_pump(cl) {
+            return json_null()
+        }
+    }
+    return json_null()
+}
+
+# dapcl_output_text(cl, category) — every output byte of one category.
+fn dapcl_output_text(cl: DapCl, category: str) -> str {
+    let mut out: str = ""
+    let evs: list[JsonValue] = dapcl_events(cl, "output")
+    let mut i: int = 0
+    while i < evs.len() {
+        let b: JsonValue = dapcl_body(evs.get(i))
+        if dapcl_jstr(b, "category") == category {
+            out = out + dapcl_jstr(b, "output")
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# dapcl_top(cl, tid) — the innermost stack frame.
+fn dapcl_top(cl: DapCl, tid: int) -> JsonValue uses IO, Proc {
+    let st: JsonValue = dapcl_rpc(cl, "stackTrace",
+    json_object(["threadId"], [json_int(tid)]))
+    let frames: JsonValue = json_object_get(dapcl_body(st), "stackFrames")
+    if json_is_array(frames) && frames.arr.len() > 0 {
+        return frames.arr.get(0)
+    }
+    return json_null()
+}
+
+# dapcl_locals(cl, fid) — the Locals rows of a frame.
+fn dapcl_locals(cl: DapCl, fid: int) -> list[JsonValue] uses IO, Proc {
+    let sc: JsonValue = dapcl_rpc(cl, "scopes",
+    json_object(["frameId"], [json_int(fid)]))
+    let scopes: JsonValue = json_object_get(dapcl_body(sc), "scopes")
+    if !json_is_array(scopes) || scopes.arr.len() == 0 {
+        return []
+    }
+    let ref: int = dapcl_jint(scopes.arr.get(0), "variablesReference", 0)
+    let vv: JsonValue = dapcl_rpc(cl, "variables",
+    json_object(["variablesReference"], [json_int(ref)]))
+    let vars: JsonValue = json_object_get(dapcl_body(vv), "variables")
+    let out: list[JsonValue] = []
+    if json_is_array(vars) {
+        let mut i: int = 0
+        while i < vars.arr.len() {
+            out.push(vars.arr.get(i))
+            i = i + 1
+        }
+    }
+    return out
+}
+
+# dapcl_expand(cl, v) — a variables row's children ([] when scalar).
+fn dapcl_expand(cl: DapCl, v: JsonValue) -> list[JsonValue] uses IO, Proc {
+    let ref: int = dapcl_jint(v, "variablesReference", 0)
+    if ref == 0 {
+        return []
+    }
+    let vv: JsonValue = dapcl_rpc(cl, "variables",
+    json_object(["variablesReference"], [json_int(ref)]))
+    let vars: JsonValue = json_object_get(dapcl_body(vv), "variables")
+    let out: list[JsonValue] = []
+    if json_is_array(vars) {
+        let mut i: int = 0
+        while i < vars.arr.len() {
+            out.push(vars.arr.get(i))
+            i = i + 1
+        }
+    }
+    return out
+}
+
+# dapcl_find_local(rows, name) — one row by name (null-shaped if absent).
+fn dapcl_find_local(rows: list[JsonValue], name: str) -> JsonValue {
+    let mut i: int = 0
+    while i < rows.len() {
+        if dapcl_jstr(rows.get(i), "name") == name {
+            return rows.get(i)
+        }
+        i = i + 1
+    }
+    return json_null()
+}
+
+# dapcl_close(cl) — close stdin, reap; returns the exit code (-1 hang).
+fn dapcl_close(cl: DapCl) -> int uses Proc {
+    if cl.pid < 1 {
+        return -1
+    }
+    proc_child_close(cl.pid, 0)
+    let code: int = proc_wait(cl.pid)
+    proc_child_close(cl.pid, 1)
+    proc_child_close(cl.pid, 2)
+    return code
+}
+
+# dapcl_handsake(cl) — initialize + launch + configurationDone.
+fn dapcl_handshake(cl: DapCl, program: str, launch_extra: JsonValue)
+uses IO, Proc {
+    dapcl_rpc(cl, "initialize",
+    json_object(["adapterID"], [json_str("acceptance")]))
+    # merge launch extras (noDebug / stopOnEntry) into the arguments
+    let mut keys: list[str] = ["program"]
+    let mut vals: list[JsonValue] = [json_str(program)]
+    let extra_keys: list[str] = json_object_keys_of(launch_extra)
+    let mut i: int = 0
+    while i < extra_keys.len() {
+        if extra_keys.get(i) != "program" {
+            keys.push(extra_keys.get(i))
+            vals.push(json_object_get(launch_extra, extra_keys.get(i)))
+        }
+        i = i + 1
+    }
+    dapcl_rpc(cl, "launch", json_object(keys, vals))
+    dapcl_rpc(cl, "configurationDone", json_object([], []))
+}
+
+# json_object_keys_of(obj) — a helper the std json API keeps private.
+fn json_object_keys_of(obj: JsonValue) -> list[str] {
+    let out: list[str] = []
+    if json_is_object(obj) {
+        let ks: list[str] = obj.obj_keys
+        let mut i: int = 0
+        while i < ks.len() {
+            out.push(ks.get(i))
+            i = i + 1
+        }
+    }
+    return out
+}
+
+# dapcl_set_bps(cl, path, lines) — setBreakpoints over a line list.
+fn dapcl_set_bps(cl: DapCl, path: str, lines: list[int]) -> JsonValue
+uses IO, Proc {
+    let rows: list[JsonValue] = []
+    let mut i: int = 0
+    while i < lines.len() {
+        rows.push(json_object(["line"], [json_int(lines.get(i))]))
+        i = i + 1
+    }
+    return dapcl_rpc(cl, "setBreakpoints", json_object(
+    ["source", "breakpoints"],
+    [json_object(["path"], [json_str(path)]), json_array(rows)]))
+}
+
+# dapcl_thread_of(ev) — the stopped event's threadId.
+fn dapcl_thread_of(ev: JsonValue) -> int {
+    return dapcl_jint(dapcl_body(ev), "threadId", 0)
+}
+
+# ----------------------------------------------------------------------------
+# The nine sections.
+# ----------------------------------------------------------------------------
+
+fn section_lifecycle(acc: Acc, tmp: str) -> void
+uses IO, Fs, Proc, Conc, Clock, Args {
+    section("1. lifecycle")
+    let cl: DapCl = dapcl_new(acc.root)
+    let r: JsonValue = dapcl_rpc(cl, "initialize",
+    json_object(["adapterID"], [json_str("acceptance")]))
+    let caps: JsonValue = dapcl_body(r)
+    check(acc, "initialize: configurationDone supported",
+    dapcl_jbool(caps, "supportsConfigurationDoneRequest", false) == true,
+    "")
+    check(acc, "initialize: evaluate for hovers supported",
+    dapcl_jbool(caps, "supportsEvaluateForHovers", false) == true, "")
+    let filters: JsonValue = json_object_get(caps,
+    "exceptionBreakpointFilters")
+    let mut has_panics: bool = false
+    let mut has_default: bool = false
+    if json_is_array(filters) {
+        let mut i: int = 0
+        while i < filters.arr.len() {
+            let f: JsonValue = filters.arr.get(i)
+            if dapcl_jstr(f, "filter") == "panics" {
+                has_panics = true
+                if dapcl_jbool(f, "default", false) == true {
+                    has_default = true
+                }
+            }
+            i = i + 1
+        }
+    }
+    check(acc, "initialize: panics exception filter advertised",
+    has_panics, "")
+    check(acc, "initialize: panics filter defaults on", has_default, "")
+    let init_ev: JsonValue = dapcl_wait_event(cl, "initialized")
+    check(acc, "initialize: initialized event follows the response",
+    !json_is_null(init_ev), "")
+
+    let r2: JsonValue = dapcl_rpc(cl, "launch",
+    json_object(["program"],
+    [json_str(path_join3(tmp, "nope.hls"))]))
+    check(acc, "launch: missing program refused",
+    dapcl_jbool(r2, "success", true) == false
+    && dapcl_jstr(r2, "message").contains("not found"),
+    dapcl_jstr(r2, "message"))
+
+    let bad_prog: str = path_join3(tmp, "fail_type.hls")
+    write_file(bad_prog, "fn main() {\n    let x: int = \"s\"\n}\n")
+    let r3: JsonValue = dapcl_rpc(cl, "launch",
+    json_object(["program"], [json_str(bad_prog)]))
+    check(acc, "launch: a program the checker rejects is refused",
+    dapcl_jbool(r3, "success", true) == false,
+    dapcl_jstr(r3, "message"))
+    # the .py lowercased the message; the diagnostic is emitted
+    # lowercase-stable ("type error: type mismatch: ..."), so both
+    # spellings are checked directly
+    let msg3: str = dapcl_jstr(r3, "message")
+    check(acc, "launch: the refusal carries the real diagnostic",
+    msg3.contains("type") || msg3.contains("mismatch"),
+    msg3)
+
+    let good: str = path_join3(tmp, "hello.hls")
+    write_file(good, "fn main() uses IO {\n    println(\"ok\")\n}\n")
+    let r4: JsonValue = dapcl_rpc(cl, "launch",
+    json_object(["program"], [json_str(good)]))
+    check(acc, "launch: a valid program launches",
+    dapcl_jbool(r4, "success", false) == true, dapcl_jstr(r4, "message"))
+
+    dapcl_rpc(cl, "setExceptionBreakpoints",
+    json_object(["filters"], [json_array([json_str("panics")])]))
+    check(acc, "setExceptionBreakpoints: panics filter accepted", true, "")
+
+    dapcl_rpc(cl, "configurationDone", json_object([], []))
+    dapcl_wait_event(cl, "terminated")
+    let exited: list[JsonValue] = dapcl_events(cl, "exited")
+    check(acc, "lifecycle: clean program exits 0 after terminated ordering",
+    exited.len() > 0
+    && dapcl_jint(dapcl_body(exited.get(exited.len() - 1)),
+    "exitCode", 0) == 0, "")
+    let code: int = dapcl_close(cl)
+    check(acc, "lifecycle: closing stdin ends the adapter cleanly",
+    code == 0, "exit " + code.to_str())
+}
+
+fn section_breakpoints(acc: Acc, tmp: str, corpus: str) -> void
+uses IO, Fs, Proc, Conc, Clock, Args {
+    section("2. breakpoints")
+    let cl: DapCl = dapcl_new(acc.root)
+    dapcl_rpc(cl, "initialize",
+    json_object(["adapterID"], [json_str("acceptance")]))
+    dapcl_rpc(cl, "launch",
+    json_object(["program"], [json_str(corpus)]))
+
+    # corpus line numbers (stable, pinned by hlfmt): 49 is the
+    # stock_value signature (no statement on it), 54 is `i = i + 1`
+    # inside its loop, the file ends at line 118.
+    let r: JsonValue = dapcl_set_bps(cl, corpus, [49, 5000])
+    let bps: JsonValue = json_object_get(dapcl_body(r), "breakpoints")
+    let mut b0: JsonValue = json_null()
+    let mut b1: JsonValue = json_null()
+    if json_is_array(bps) && bps.arr.len() == 2 {
+        b0 = bps.arr.get(0)
+        b1 = bps.arr.get(1)
+    }
+    check(acc, "setBreakpoints: two breakpoints answered",
+    json_is_array(bps) && bps.arr.len() == 2, "")
+    check(acc, "setBreakpoints: line 49 (fn signature) snaps to the "
+    + "next statement at line 50",
+    dapcl_jbool(b0, "verified", false) == true
+    && dapcl_jint(b0, "line", 0) == 50, "")
+    check(acc, "setBreakpoints: the snap says so in its message",
+    dapcl_jstr(b0, "message").contains("snap"),
+    dapcl_jstr(b0, "message"))
+    check(acc, "setBreakpoints: a line past the end is refused",
+    dapcl_jbool(b1, "verified", true) == false, "")
+
+    let stranger: JsonValue = dapcl_set_bps(cl,
+    path_join3(tmp, "stranger.hls"), [1])
+    let sb: JsonValue = json_object_get(dapcl_body(stranger),
+    "breakpoints")
+    check(acc, "setBreakpoints: a file outside the program is refused",
+    json_is_array(sb) && sb.arr.len() > 0
+    && dapcl_jbool(sb.arr.get(0), "verified", true) == false, "")
+
+    # replace the set with the loop line only, then hit it 3 times
+    let r2: JsonValue = dapcl_set_bps(cl, corpus, [54])
+    let bps2: JsonValue = json_object_get(dapcl_body(r2), "breakpoints")
+    check(acc, "setBreakpoints: the loop line verifies in place",
+    json_is_array(bps2) && bps2.arr.len() > 0
+    && dapcl_jbool(bps2.arr.get(0), "verified", false) == true
+    && dapcl_jint(bps2.arr.get(0), "line", 0) == 54, "")
+
+    dapcl_rpc(cl, "configurationDone", json_object([], []))
+    let mut lines: list[int] = []
+    let mut guard: int = 0
+    while lines.len() < 3 && guard < 20 {
+        let ev: JsonValue = dapcl_wait_stopped(cl, "breakpoint")
+        if json_is_null(ev) {
+            check(acc, "breakpoint: the loop hits it once per iteration",
+            false, "no stopped event")
+            dapcl_close(cl)
+            return
+        }
+        let top: JsonValue = dapcl_top(cl, dapcl_thread_of(ev))
+        lines.push(dapcl_jint(top, "line", 0))
+        dapcl_rpc(cl, "continue",
+        json_object(["threadId"], [json_int(dapcl_thread_of(ev))]))
+        guard = guard + 1
+    }
+    check(acc, "breakpoint: the loop hits it once per iteration",
+    lines.len() == 3 && lines.get(0) == 54 && lines.get(1) == 54
+    && lines.get(2) == 54,
+    "[" + lines.get(0).to_str() + ", " + lines.get(1).to_str() + ", "
+    + lines.get(2).to_str() + "]")
+
+    # clear breakpoints; the program must run out
+    let no_bps: list[int] = []
+    dapcl_set_bps(cl, corpus, no_bps)
+    dapcl_wait_event(cl, "terminated")
+    let exited: list[JsonValue] = dapcl_events(cl, "exited")
+    check(acc, "breakpoint: cleared breakpoints let the program finish",
+    exited.len() > 0
+    && dapcl_jint(dapcl_body(exited.get(exited.len() - 1)),
+    "exitCode", 0) == 0, "")
+    dapcl_close(cl)
+}
+
+fn section_output(acc: Acc, corpus: str) -> void
+uses IO, Fs, Proc, Conc, Clock, Args {
+    section("3. output")
+    let cl: DapCl = dapcl_new(acc.root)
+    dapcl_handshake(cl, corpus, json_object(["noDebug"],
+    [json_bool(true)]))
+    dapcl_wait_event(cl, "terminated")
+    let via_dap: str = dapcl_output_text(cl, "stdout")
+    dapcl_close(cl)
+
+    let boot: RunResult = run_capture(path_join3(acc.root, "bin/hlboot"), [corpus])
+    check(acc, "output: DAP stdout == bin/hlboot stdout "
+    + "(byte for byte)", via_dap == boot.out,
+    dapcl_head(via_dap, 60))
+    check(acc, "output: the corpus report lines are all there",
+    via_dap.contains("value: 636") && via_dap.contains("loudest: bolt"),
+    "")
+}
+
+fn section_stack(acc: Acc, corpus: str) -> void
+uses IO, Fs, Proc, Conc, Clock, Args {
+    section("4. stack")
+    let cl: DapCl = dapcl_new(acc.root)
+    dapcl_rpc(cl, "initialize",
+    json_object(["adapterID"], [json_str("acceptance")]))
+    dapcl_rpc(cl, "launch",
+    json_object(["program"], [json_str(corpus)]))
+    dapcl_set_bps(cl, corpus, [46])
+    dapcl_rpc(cl, "configurationDone", json_object([], []))
+    let ev: JsonValue = dapcl_wait_stopped(cl, "breakpoint")
+    let tid: int = dapcl_thread_of(ev)
+    let st: JsonValue = dapcl_rpc(cl, "stackTrace",
+    json_object(["threadId"], [json_int(tid)]))
+    let frames: JsonValue = json_object_get(dapcl_body(st),
+    "stackFrames")
+    check(acc, "stack: three frames across two calls",
+    dapcl_jint(dapcl_body(st), "totalFrames", 0) == 3
+    && json_is_array(frames) && frames.arr.len() == 3,
+    dapcl_jint(dapcl_body(st), "totalFrames", 0).to_str())
+    check(acc, "stack: innermost first with real fn names",
+    frames.arr.len() == 3
+    && dapcl_jstr(frames.arr.get(0), "name") == "item_value"
+    && dapcl_jstr(frames.arr.get(1), "name") == "stock_value"
+    && dapcl_jstr(frames.arr.get(2), "name") == "main",
+    dapcl_jstr(frames.arr.get(0), "name") + "/"
+    + dapcl_jstr(frames.arr.get(1), "name") + "/"
+    + dapcl_jstr(frames.arr.get(2), "name"))
+    check(acc, "stack: each frame sits on the line it is about to run",
+    dapcl_jint(frames.arr.get(0), "line", 0) == 46
+    && dapcl_jint(frames.arr.get(1), "line", 0) == 53
+    && dapcl_jint(frames.arr.get(2), "line", 0) == 100, "")
+    let mut all_files: bool = frames.arr.len() == 3
+    let mut fi: int = 0
+    while fi < frames.arr.len() {
+        let src: JsonValue = json_object_get(frames.arr.get(fi),
+        "source")
+        if dapcl_jstr(src, "path") != corpus {
+            all_files = false
+        }
+        fi = fi + 1
+    }
+    check(acc, "stack: every frame names its real source file",
+    all_files, "")
+    # a second stackTrace for the same stop agrees (ids stay valid)
+    let st2: JsonValue = dapcl_rpc(cl, "stackTrace",
+    json_object(["threadId"], [json_int(tid)]))
+    let frames2: JsonValue = json_object_get(dapcl_body(st2),
+    "stackFrames")
+    check(acc, "stack: repeated requests agree",
+    json_is_array(frames2) && frames2.arr.len() == 3
+    && dapcl_jint(frames2.arr.get(0), "line", 0) == 46
+    && dapcl_jint(frames2.arr.get(1), "line", 0) == 53
+    && dapcl_jint(frames2.arr.get(2), "line", 0) == 100, "")
+    dapcl_rpc(cl, "disconnect", json_object([], []))
+    dapcl_close(cl)
+}
+
+fn section_stepping(acc: Acc, corpus: str) -> void
+uses IO, Fs, Proc, Conc, Clock, Args {
+    section("5. stepping")
+    let cl: DapCl = dapcl_new(acc.root)
+    dapcl_handshake(cl, corpus, json_object(["stopOnEntry"],
+    [json_bool(true)]))
+    let ev0: JsonValue = dapcl_wait_stopped(cl, "entry")
+    let tid: int = dapcl_thread_of(ev0)
+    let top0: JsonValue = dapcl_top(cl, tid)
+    check(acc, "entry: main's first statement, before it runs",
+    dapcl_jstr(top0, "name") == "main"
+    && dapcl_jint(top0, "line", 0) == 83,
+    "line " + dapcl_jint(top0, "line", 0).to_str())
+    let locals0: list[JsonValue] = dapcl_locals(cl, dapcl_jint(top0,
+    "id", 0))
+    check(acc, "entry: main has no locals before its first binding",
+    locals0.len() == 0, locals0.len().to_str() + " rows")
+
+    # next: cross the multi-line list literal to the next binding
+    dapcl_rpc(cl, "next", json_object(["threadId"], [json_int(tid)]))
+    let ev1: JsonValue = dapcl_wait_stopped(cl, "step")
+    let top1: JsonValue = dapcl_top(cl, tid)
+    check(acc, "next: lands on the next statement",
+    dapcl_jint(top1, "line", 0) == 94,
+    "line " + dapcl_jint(top1, "line", 0).to_str())
+    let locals1: list[JsonValue] = dapcl_locals(cl, dapcl_jint(top1,
+    "id", 0))
+    check(acc, "next: the binding from the executed line is now visible",
+    !json_is_null(dapcl_find_local(locals1, "inv")), "")
+
+    dapcl_rpc(cl, "next", json_object(["threadId"], [json_int(tid)]))
+    dapcl_wait_stopped(cl, "step")
+    let top2: JsonValue = dapcl_top(cl, tid)
+    check(acc, "next: reached the call to stock_value",
+    dapcl_jint(top2, "line", 0) == 100,
+    "line " + dapcl_jint(top2, "line", 0).to_str())
+
+    # stepIn walks statement to statement: into stock_value, through
+    # its lets and loop, then into the call on line 53
+    dapcl_rpc(cl, "stepIn", json_object(["threadId"], [json_int(tid)]))
+    dapcl_wait_stopped(cl, "step")
+    let top3: JsonValue = dapcl_top(cl, tid)
+    check(acc, "stepIn: descends into stock_value's first statement",
+    dapcl_jstr(top3, "name") == "stock_value"
+    && dapcl_jint(top3, "line", 0) == 50,
+    dapcl_jstr(top3, "name") + " line "
+    + dapcl_jint(top3, "line", 0).to_str())
+    let wants: list[int] = [51, 52, 53]
+    let mut wi: int = 0
+    while wi < wants.len() {
+        dapcl_rpc(cl, "stepIn",
+        json_object(["threadId"], [json_int(tid)]))
+        dapcl_wait_stopped(cl, "step")
+        let t: JsonValue = dapcl_top(cl, tid)
+        check(acc, "stepIn: statement at line " + wants.get(wi).to_str(),
+        dapcl_jint(t, "line", 0) == wants.get(wi),
+        "line " + dapcl_jint(t, "line", 0).to_str())
+        wi = wi + 1
+    }
+    dapcl_rpc(cl, "stepIn", json_object(["threadId"], [json_int(tid)]))
+    dapcl_wait_stopped(cl, "step")
+    let top4: JsonValue = dapcl_top(cl, tid)
+    check(acc, "stepIn: enters item_value at its return",
+    dapcl_jstr(top4, "name") == "item_value"
+    && dapcl_jint(top4, "line", 0) == 46,
+    dapcl_jstr(top4, "name") + " line "
+    + dapcl_jint(top4, "line", 0).to_str())
+    dapcl_rpc(cl, "stepIn", json_object(["threadId"], [json_int(tid)]))
+    dapcl_wait_stopped(cl, "step")
+    let top5: JsonValue = dapcl_top(cl, tid)
+    check(acc, "stepIn: reaches the impl method through the call chain",
+    dapcl_jstr(top5, "name") == "Item.value"
+    && dapcl_jint(top5, "line", 0) == 37,
+    dapcl_jstr(top5, "name") + " line "
+    + dapcl_jint(top5, "line", 0).to_str())
+    let depth_locals: list[JsonValue] = dapcl_locals(cl,
+    dapcl_jint(top5, "id", 0))
+    check(acc, "stepIn: the method frame binds self",
+    !json_is_null(dapcl_find_local(depth_locals, "self")), "")
+
+    # stepOut: Item.value returns, item_value returns, the next
+    # statement executed is stock_value's loop line
+    dapcl_rpc(cl, "stepOut", json_object(["threadId"], [json_int(tid)]))
+    dapcl_wait_stopped(cl, "step")
+    let top6: JsonValue = dapcl_top(cl, tid)
+    check(acc, "stepOut: climbs back to the caller's next statement",
+    dapcl_jstr(top6, "name") == "stock_value"
+    && dapcl_jint(top6, "line", 0) == 54,
+    dapcl_jstr(top6, "name") + " line "
+    + dapcl_jint(top6, "line", 0).to_str())
+    dapcl_rpc(cl, "disconnect", json_object([], []))
+    dapcl_close(cl)
+}
+
+fn section_variables(acc: Acc, corpus: str) -> void
+uses IO, Fs, Proc, Conc, Clock, Args {
+    section("6. variables")
+    let cl: DapCl = dapcl_new(acc.root)
+    dapcl_rpc(cl, "initialize",
+    json_object(["adapterID"], [json_str("acceptance")]))
+    dapcl_rpc(cl, "launch",
+    json_object(["program"], [json_str(corpus)]))
+    # stop after `first` binds (line 116) — the richest main frame
+    dapcl_set_bps(cl, corpus, [116])
+    dapcl_rpc(cl, "configurationDone", json_object([], []))
+    let ev: JsonValue = dapcl_wait_stopped(cl, "breakpoint")
+    let tid: int = dapcl_thread_of(ev)
+    let top: JsonValue = dapcl_top(cl, tid)
+    let rows: list[JsonValue] = dapcl_locals(cl, dapcl_jint(top, "id", 0))
+
+    # `k` is scoped to the loop body — out of scope at line 116, and
+    # honest debuggers do not invent bindings
+    check(acc, "variables: every visible binding, block scopes respected",
+    rows.len() == 4
+    && !json_is_null(dapcl_find_local(rows, "inv"))
+    && !json_is_null(dapcl_find_local(rows, "shelves"))
+    && !json_is_null(dapcl_find_local(rows, "j"))
+    && !json_is_null(dapcl_find_local(rows, "first")),
+    rows.len().to_str() + " rows")
+    let first: JsonValue = dapcl_find_local(rows, "first")
+    check(acc, "variables: a struct renders Name { field: v }",
+    dapcl_jstr(first, "value").starts_with("Item { name: \"rice\""),
+    dapcl_jstr(first, "value"))
+    check(acc, "variables: the declared type annotation is exact",
+    dapcl_jstr(first, "type") == "Item", dapcl_jstr(first, "type"))
+    let jrow: JsonValue = dapcl_find_local(rows, "j")
+    check(acc, "variables: scalars carry values and types",
+    dapcl_jstr(jrow, "value") == "3"
+    && dapcl_jstr(jrow, "type") == "int", dapcl_jstr(jrow, "value"))
+
+    let fields: list[JsonValue] = dapcl_expand(cl, first)
+    check(acc, "variables: the struct expands to its declared fields",
+    fields.len() == 3
+    && dapcl_jstr(fields.get(0), "name") == "name"
+    && dapcl_jstr(fields.get(0), "value") == "\"rice\""
+    && dapcl_jstr(fields.get(1), "name") == "qty"
+    && dapcl_jstr(fields.get(1), "value") == "12"
+    && dapcl_jstr(fields.get(2), "name") == "unit"
+    && dapcl_jstr(fields.get(2), "value") == "3", "")
+    check(acc, "variables: struct field types come from the declaration",
+    fields.len() == 3
+    && (dapcl_jstr(fields.get(0), "type") == "str"
+    || dapcl_jstr(fields.get(0), "type") == "int")
+    && (dapcl_jstr(fields.get(1), "type") == "str"
+    || dapcl_jstr(fields.get(1), "type") == "int")
+    && (dapcl_jstr(fields.get(2), "type") == "str"
+    || dapcl_jstr(fields.get(2), "type") == "int"), "")
+
+    let shelves: list[JsonValue] = dapcl_expand(cl,
+    dapcl_find_local(rows, "shelves"))
+    check(acc, "variables: an enum renders Variant(payload)",
+    shelves.len() > 0
+    && dapcl_jstr(shelves.get(0), "value") == "Kind.Food(1)",
+    dapcl_jstr(shelves.get(0), "value"))
+    check(acc, "variables: the enum annotation names the enum",
+    shelves.len() > 0
+    && dapcl_jstr(shelves.get(0), "type") == "Kind",
+    dapcl_jstr(shelves.get(0), "type"))
+    let payload: list[JsonValue] = dapcl_expand(cl, shelves.get(0))
+    check(acc, "variables: enum payloads expand as indexed children",
+    payload.len() > 0
+    && dapcl_jstr(payload.get(0), "name") == "0"
+    && dapcl_jstr(payload.get(0), "value") == "1", "")
+
+    let inv: list[JsonValue] = dapcl_expand(cl,
+    dapcl_find_local(rows, "inv"))
+    check(acc, "variables: a list indexes 0..n-1",
+    inv.len() == 3 && dapcl_jstr(inv.get(0), "name") == "0"
+    && dapcl_jstr(inv.get(1), "name") == "1"
+    && dapcl_jstr(inv.get(2), "name") == "2", "")
+    let inner: list[JsonValue] = dapcl_expand(cl, inv.get(1))
+    check(acc, "variables: nested structs expand through the index",
+    inner.len() == 3
+    && dapcl_jstr(inner.get(0), "value") == "\"drill\""
+    && dapcl_jstr(inner.get(1), "value") == "4"
+    && dapcl_jstr(inner.get(2), "value") == "25", "")
+
+    # evaluate a struct and expand it from the REPL result
+    let r: JsonValue = dapcl_rpc(cl, "evaluate",
+    json_object(["frameId", "expression", "context"],
+    [json_int(dapcl_jint(top, "id", 0)), json_str("inv[0]"),
+     json_str("repl")]))
+    let ev_rows: list[JsonValue] = dapcl_expand(cl, dapcl_body(r))
+    check(acc, "evaluate: a struct result expands in the console",
+    dapcl_jbool(r, "success", false) == true
+    && ev_rows.len() == 3
+    && dapcl_jstr(ev_rows.get(0), "name") == "name"
+    && dapcl_jstr(ev_rows.get(1), "name") == "qty"
+    && dapcl_jstr(ev_rows.get(2), "name") == "unit", "")
+    dapcl_rpc(cl, "disconnect", json_object([], []))
+    dapcl_close(cl)
+}
+
+fn section_evaluate(acc: Acc, corpus: str) -> void
+uses IO, Fs, Proc, Conc, Clock, Args {
+    section("7. evaluate")
+    let cl: DapCl = dapcl_new(acc.root)
+    dapcl_rpc(cl, "initialize",
+    json_object(["adapterID"], [json_str("acceptance")]))
+    dapcl_rpc(cl, "launch",
+    json_object(["program"], [json_str(corpus)]))
+    dapcl_set_bps(cl, corpus, [116])
+    dapcl_rpc(cl, "configurationDone", json_object([], []))
+    let ev: JsonValue = dapcl_wait_stopped(cl, "breakpoint")
+    let tid: int = dapcl_thread_of(ev)
+    let fid: int = dapcl_jint(dapcl_top(cl, tid), "id", 0)
+
+    let exprs: list[str] = ["1 + 2 * 3", "j * 2",
+    "first.name + \"!\"", "first.qty * first.unit", "len(\"abc\")"]
+    let wants: list[str] = ["7", "6", "\"rice!\"", "36", "3"]
+    let mut ei: int = 0
+    while ei < exprs.len() {
+        let r: JsonValue = dapcl_rpc(cl, "evaluate",
+        json_object(["frameId", "expression", "context"],
+        [json_int(fid), json_str(exprs.get(ei)), json_str("repl")]))
+        check(acc, "evaluate: " + exprs.get(ei) + " = "
+        + wants.get(ei),
+        dapcl_jbool(r, "success", false) == true
+        && dapcl_jstr(dapcl_body(r), "result") == wants.get(ei),
+        dapcl_jstr(dapcl_body(r), "result"))
+        ei = ei + 1
+    }
+
+    let r1: JsonValue = dapcl_rpc(cl, "evaluate",
+    json_object(["frameId", "expression", "context"],
+    [json_int(fid), json_str("1 +"), json_str("repl")]))
+    check(acc, "evaluate: a parse error is an error",
+    dapcl_jbool(r1, "success", true) == false,
+    dapcl_jstr(r1, "message"))
+    let r2: JsonValue = dapcl_rpc(cl, "evaluate",
+    json_object(["frameId", "expression", "context"],
+    [json_int(fid), json_str("no_such_var"), json_str("repl")]))
+    check(acc, "evaluate: an unknown name is an error naming it",
+    dapcl_jbool(r2, "success", true) == false
+    && dapcl_jstr(r2, "message").contains("no_such_var"),
+    dapcl_jstr(r2, "message"))
+    let r3: JsonValue = dapcl_rpc(cl, "evaluate",
+    json_object(["frameId", "expression", "context"],
+    [json_int(fid), json_str("[1, 2] + 1"), json_str("repl")]))
+    check(acc, "evaluate: a panicking expression is an error, not a crash",
+    dapcl_jbool(r3, "success", true) == false,
+    dapcl_jstr(r3, "message"))
+
+    # the session survived every bad expression: finish it cleanly
+    dapcl_rpc(cl, "continue", json_object(["threadId"], [json_int(tid)]))
+    dapcl_wait_event(cl, "terminated")
+    let exited: list[JsonValue] = dapcl_events(cl, "exited")
+    check(acc, "evaluate: the session stays alive after errors and ends 0",
+    exited.len() > 0
+    && dapcl_jint(dapcl_body(exited.get(exited.len() - 1)),
+    "exitCode", 0) == 0, "")
+    dapcl_close(cl)
+}
+
+fn section_panic(acc: Acc, tmp: str) -> void
+uses IO, Fs, Proc, Conc, Clock, Args {
+    section("8. panics")
+    let prog: str = path_join3(tmp, "panic_prog.hls")
+    write_file(prog, "fn boom(xs: list[int]) -> int {\n"
+    + "    return xs[9]\n"
+    + "}\n"
+    + "\n"
+    + "fn main() uses IO {\n"
+    + "    println(\"before\")\n"
+    + "    let v: int = boom([1, 2, 3])\n"
+    + "    println(\"after \" + v.to_str())\n"
+    + "}\n")
+
+    let cl: DapCl = dapcl_new(acc.root)
+    dapcl_rpc(cl, "initialize",
+    json_object(["adapterID"], [json_str("acceptance")]))
+    dapcl_rpc(cl, "launch",
+    json_object(["program"], [json_str(prog)]))
+    dapcl_rpc(cl, "setExceptionBreakpoints",
+    json_object(["filters"], [json_array([json_str("panics")])]))
+    dapcl_rpc(cl, "configurationDone", json_object([], []))
+    let ev: JsonValue = dapcl_wait_stopped(cl, "exception")
+    let tid: int = dapcl_thread_of(ev)
+    check(acc, "panic: the stopped event carries the real message",
+    dapcl_jstr(dapcl_body(ev), "text")
+    == "array access out of bounds",
+    dapcl_jstr(dapcl_body(ev), "text"))
+    let top: JsonValue = dapcl_top(cl, tid)
+    check(acc, "panic: the stack is parked at the site",
+    dapcl_jstr(top, "name") == "boom"
+    && dapcl_jint(top, "line", 0) == 2,
+    dapcl_jstr(top, "name") + " line "
+    + dapcl_jint(top, "line", 0).to_str())
+    let out_so_far: str = dapcl_output_text(cl, "stdout")
+    check(acc, "panic: output stops where the program died",
+    out_so_far.contains("before")
+    && !out_so_far.contains("after"), "")
+    dapcl_rpc(cl, "continue", json_object(["threadId"], [json_int(tid)]))
+    dapcl_wait_event(cl, "terminated")
+    let exited: list[JsonValue] = dapcl_events(cl, "exited")
+    check(acc, "panic: the session ends with exit 101",
+    exited.len() > 0
+    && dapcl_jint(dapcl_body(exited.get(exited.len() - 1)),
+    "exitCode", 0) == 101, "")
+    check(acc, "panic: the stderr echo reaches the console",
+    dapcl_output_text(cl, "stderr").contains("panic:"), "")
+    dapcl_close(cl)
+
+    # filter off: the same program just dies
+    let cl2: DapCl = dapcl_new(acc.root)
+    dapcl_rpc(cl2, "initialize",
+    json_object(["adapterID"], [json_str("acceptance")]))
+    dapcl_rpc(cl2, "launch",
+    json_object(["program"], [json_str(prog)]))
+    let no_filters: list[JsonValue] = []
+    dapcl_rpc(cl2, "setExceptionBreakpoints",
+    json_object(["filters"], [json_array(no_filters)]))
+    dapcl_rpc(cl2, "configurationDone", json_object([], []))
+    dapcl_wait_event(cl2, "terminated")
+    let exited2: list[JsonValue] = dapcl_events(cl2, "exited")
+    check(acc, "panic: filter off — no stop, exit 101 directly",
+    exited2.len() > 0
+    && dapcl_jint(dapcl_body(exited2.get(exited2.len() - 1)),
+    "exitCode", 0) == 101, "")
+    check(acc, "panic: filter off — no stopped event",
+    dapcl_events(cl2, "stopped").len() == 0, "")
+    dapcl_close(cl2)
+}
+
+fn section_integration(acc: Acc, tmp: str, corpus: str) -> void
+uses IO, Fs, Proc, Conc, Clock, Args {
+    section("9. integration")
+
+    # --- protocol robustness: garbage in, service out ----------------
+    let cl: DapCl = dapcl_new(acc.root)
+    dapcl_send_raw(cl, "this is not a DAP frame at all\n")
+    let mut got_parse_err: bool = false
+    let mut guard: int = 0
+    while !got_parse_err && guard < 40 {
+        if !dapcl_pump(cl) {
+            break
+        }
+        let mut i: int = 0
+        while i < cl.msgs.len() {
+            let m: JsonValue = cl.msgs.get(i)
+            if dapcl_jstr(m, "type") == "response"
+            && dapcl_jstr(m, "message").contains("parse error") {
+                got_parse_err = true
+            }
+            i = i + 1
+        }
+        guard = guard + 1
+    }
+    check(acc, "protocol: a garbage frame earns a parse-error response",
+    got_parse_err, "")
+
+    let body: str = "{not json"
+    dapcl_send_raw(cl, "Content-Length: " + body.len().to_str()
+    + dapcl_crlfcrlf() + body)
+    let mut got_bad_json: bool = false
+    let mut guard2: int = 0
+    while !got_bad_json && guard2 < 40 {
+        if !dapcl_pump(cl) {
+            break
+        }
+        let mut i: int = 0
+        while i < cl.msgs.len() {
+            let m: JsonValue = cl.msgs.get(i)
+            if dapcl_jstr(m, "type") == "response"
+            && dapcl_jstr(m, "message").contains("invalid JSON") {
+                got_bad_json = true
+            }
+            i = i + 1
+        }
+        guard2 = guard2 + 1
+    }
+    check(acc, "protocol: an invalid JSON body earns a parse error too",
+    got_bad_json, "")
+
+    let r: JsonValue = dapcl_rpc(cl, "frobnicate",
+    json_object([], []))
+    check(acc, "protocol: an unknown request is refused by name",
+    dapcl_jbool(r, "success", true) == false
+    && dapcl_jstr(r, "message").contains("unknown request"),
+    dapcl_jstr(r, "message"))
+
+    # the adapter still serves a full session after all of that
+    let r2: JsonValue = dapcl_rpc(cl, "initialize",
+    json_object(["adapterID"], [json_str("acceptance")]))
+    check(acc, "protocol: the session continues after garbage",
+    dapcl_jbool(r2, "success", false) == true, "")
+    let prog: str = path_join3(tmp, "hello9.hls")
+    write_file(prog, "fn main() uses IO {\n    println(\"x\")\n}\n")
+    dapcl_rpc(cl, "launch", json_object(["program"], [json_str(prog)]))
+    dapcl_rpc(cl, "configurationDone", json_object([], []))
+    dapcl_wait_event(cl, "terminated")
+    check(acc, "protocol: a program still runs to completion", true, "")
+    dapcl_close(cl)
+
+    # --- corpus hygiene ----------------------------------------------
+    let boot: RunResult = run_capture(path_join3(acc.root, "bin/hlboot"), [corpus])
+    let pinned: str = "value: 636\nloudest: bolt\nshelf 1 kind food\n"
+    + "shelf 7 kind tool\nshelf 9 kind spare\n"
+    + "first: rice x12 value 36\n"
+    check(acc, "corpus: bin/hlboot runs it with the pinned output",
+    boot.code == 0 && boot.out == pinned, dapcl_head(boot.out, 60))
+    let fmt: RunResult = run_capture(path_join3(acc.root, "bin/hlfmt"), ["-c", corpus])
+    check(acc, "corpus: hlfmt -c holds it canonical", fmt.code == 0,
+    dapcl_head(fmt.combined, 80))
+    let lint: RunResult = run_capture(path_join3(acc.root, "bin/hllint"), ["--strict", corpus])
+    check(acc, "corpus: hllint --strict is clean", lint.code == 0,
+    dapcl_head(lint.combined, 80))
+
+    # --- editor contributions ---------------------------------------
+    let ext: str = path_join3(acc.root, "editors/vscode/halis/package.json")
+    let pkg_rr: Result[JsonValue, str] = json_parse_result(read_file(ext))
+    check(acc, "editor: package.json parses", result_is_ok(pkg_rr), "")
+    let pkg: JsonValue = result_unwrap(pkg_rr)
+    let contributes: JsonValue = json_object_get(pkg, "contributes")
+    let dbg_list: JsonValue = json_object_get(contributes, "debuggers")
+    check(acc, "editor: package.json contributes the `halis` debugger "
+    + "type",
+    json_is_array(dbg_list) && dbg_list.arr.len() == 1
+    && dapcl_jstr(dbg_list.arr.get(0), "type") == "halis", "")
+    if json_is_array(dbg_list) && dbg_list.arr.len() == 1 {
+        let dbg: JsonValue = dbg_list.arr.get(0)
+        let attrs: JsonValue = json_object_get(dbg,
+        "configurationAttributes")
+        let launch: JsonValue = json_object_get(attrs, "launch")
+        let required: JsonValue = json_object_get(launch, "required")
+        let mut has_program: bool = false
+        if json_is_array(required) {
+            let mut i: int = 0
+            while i < required.arr.len() {
+                if json_is_str(required.arr.get(i))
+                && json_str_value(required.arr.get(i)) == "program" {
+                    has_program = true
+                }
+                i = i + 1
+            }
+        }
+        check(acc, "editor: launch configuration requires `program`",
+        has_program, "")
+        let props: JsonValue = json_object_get(launch, "properties")
+        check(acc, "editor: launch attributes cover args and stopOnEntry",
+        json_is_object(props) && json_object_has(props, "args")
+        && json_object_has(props, "stopOnEntry"), "")
+        check(acc, "editor: launch.json snippets are provided",
+        json_is_array(json_object_get(dbg, "configurationSnippets"))
+        && json_object_get(dbg, "configurationSnippets").arr.len() > 0,
+        "")
+        let cmds: JsonValue = json_object_get(contributes, "commands")
+        let cmds_text: str = json_stringify(cmds)
+        check(acc, "editor: a Start Debugging command is contributed",
+        cmds_text.contains("halis.startDebugging"), "")
+    } else {
+        check(acc, "editor: launch configuration requires `program`",
+        false, "no debugger contribution")
+        check(acc, "editor: launch attributes cover args and stopOnEntry",
+        false, "no debugger contribution")
+        check(acc, "editor: launch.json snippets are provided",
+        false, "no debugger contribution")
+        check(acc, "editor: a Start Debugging command is contributed",
+        false, "no debugger contribution")
+    }
+    let extjs: str = read_file(path_join3(acc.root, "editors/vscode/halis/extension.js"))
+    check(acc, "editor: extension.js registers a descriptor factory",
+    extjs.contains("registerDebugAdapterDescriptorFactory"), "")
+    check(acc, "editor: the factory points at the native bin/hls-dap "
+    + "adapter",
+    extjs.contains("'bin', 'hls-dap'") || extjs.contains("bin/hls-dap"),
+    "")
+    check(acc, "editor: the factory launches the adapter over stdio",
+    extjs.contains("DebugAdapterExecutable"), "")
+}
+
+# ----------------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Fs, Proc, Conc, Clock, Args, Exit {
+    let acc: Acc = acc_new("dap")
+    let tmp: str = path_join3(acc.scratch_base, "world")
+    mkdirs(tmp)
+    let corpus: str = path_join3(acc.root,
+    "tests/ok/feat_stage121_dap.hls")
+
+    section_lifecycle(acc, tmp)
+    section_breakpoints(acc, tmp, corpus)
+    section_output(acc, corpus)
+    section_stack(acc, corpus)
+    section_stepping(acc, corpus)
+    section_variables(acc, corpus)
+    section_evaluate(acc, corpus)
+    section_panic(acc, tmp)
+    section_integration(acc, tmp, corpus)
+
+    return finish(acc, "Stage 121 -- VS Code debugger (DAP) integration")
+}
+
+# ============================================================================
+# End of tests/acc/dap_acceptance.hls
+# ============================================================================

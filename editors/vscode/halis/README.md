@@ -20,7 +20,7 @@ linter and the `hls-dap` debugger into the editor.
   shows the output in a dedicated channel; `halis.lintOnSave`
   repeats it on save.
 - **Debugger** — debug a Halis program through the debug adapter
-  (`tools/hls-dap.py`, Debug Adapter Protocol over stdio):
+  (`bin/hls-dap`, the native adapter, Debug Adapter Protocol over stdio):
   - breakpoints verified against the real AST (a line without a
     statement snaps to the nearest one and says so)
   - step over / into / out, stop on entry, pause
@@ -55,7 +55,7 @@ Add a launch configuration to `.vscode/launch.json`:
 Or run `Halis: Debug Program` from the command palette with a `.hls`
 file open. The adapter is launched automatically with the configured
 Python (`halis.pythonPath`); point `halis.debugAdapterPath` at a
-specific `hls-dap.py` to override auto-discovery.
+specific `hls-dap` binary to override auto-discovery.
 
 ## Installation
 
@@ -80,7 +80,7 @@ To run it in the Extension Development Host:
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `halis.languageServerPath` | `""` | Path to `hls-lsp.py`. Empty = auto-discover. |
-| `halis.debugAdapterPath` | `""` | Path to `hls-dap.py`. Empty = auto-discover. |
+| `halis.debugAdapterPath` | `""` | Path to the `hls-dap` binary. Empty = auto-discover. |
 | `halis.formatOnSave` | `false` | Run `hlfmt -w` on save. |
 | `halis.lintOnSave` | `true` | Run `hllint` on save. |
 | `halis.pythonPath` | `"python3"` | Interpreter for the toolchain (LSP, formatter, linter, debug adapter). |
@@ -90,5 +90,5 @@ To run it in the Extension Development Host:
 When a path setting is empty, the extension looks for:
 
 1. `<workspace>/tools/<tool>.py` (`hls-lsp.py`, `hlfmt.py`,
-   `hllint.py`, `hls-dap.py`)
+   `hllint`, `hls-dap`)
 2. the tool name on `PATH` (for system-wide installs)

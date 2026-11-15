@@ -287,17 +287,14 @@ struct DapRunRes {
 }
 
 # dap_run_capture(prog, args) — stdout+stderr piped, stdin null.
-fn dap_run_capture(prog: str, cargs: list[str]) -> DapRunRes uses Proc {
+fn dap_run_capture(prog: str, cargs: list[str]) -> DapRunRes uses IO, Proc {
     let r: DapRunRes = DapRunRes {
         code: -1, out: "", err: "", combined: "", spawned: false
     }
-    let argv: list[str] = [prog]
-    let mut i: int = 0
-    while i < cargs.len() {
-        argv.push(cargs.get(i))
-        i = i + 1
-    }
-    let pid: int = proc_spawn(prog, argv, 2, 1, 1)
+    # proc_spawn PREPENDS the program to the child's argv itself —
+    # cargs are the arguments ONLY (the harness's run_capture law;
+    # doubling the program here once cost a whole debugging session)
+    let pid: int = proc_spawn(prog, cargs, 2, 1, 1)
     if pid < 1 {
         return r
     }
@@ -329,17 +326,8 @@ fn dap_run_capture(prog: str, cargs: list[str]) -> DapRunRes uses Proc {
 
 # dap_send(sess, keys, vals) — one message: seq prepended, framed,
 # written. keys/vals carry "type" and everything past it.
-# NOTE (the wire-sync writes, Stage 121 port): every eprintln in this
-# file is LOAD-BEARING on the current runtime build — without the
-# interleaving stderr writes, this thread's stdout pipe writes stall
-# until stdin EOF (reproduced minimally: reader thread blocked in
-# read(0) + main writing frames to fd 1; one stderr write per print
-# makes every frame land promptly; root cause still open — see
-# download/halis-lang-trang-thai.md for the bisect history). Keep them
-# until the runtime interaction is understood; they cost one tiny
 # write(2) per wire message.
 fn dap_send(sess: DapSess, keys: list[str], vals: list[JsonValue]) -> void uses IO {
-    eprintln("[wire-sync: send begin]")
     sess.seq = sess.seq + 1
     let mut k2: list[str] = ["seq"]
     let mut v2: list[JsonValue] = [json_int(sess.seq)]
@@ -351,9 +339,12 @@ fn dap_send(sess: DapSess, keys: list[str], vals: list[JsonValue]) -> void uses 
     }
     let body: str = json_stringify(json_object(k2, v2))
     let crlf2: str = chr(13) + "\n"
-    eprintln("[wire-sync: pre-print]")
     print("Content-Length: " + body.len().to_str() + crlf2 + crlf2 + body)
-    eprintln("[wire-sync: post-print]")
+    # hosted C stdout is block-buffered on a pipe: without the flush
+    # every frame sits in the buffer until exit (the wire-sync
+    # mystery of the first session — hl_eprint's own fflush(stdout)
+    # was what the debug writes were accidentally doing)
+    stdout_flush()
 }
 
 # dap_respond_ok(sess, req, body_keys, body_vals) — a success response.
@@ -460,9 +451,7 @@ fn dap_read_message() -> list[str] uses IO {
     let mut clen: int = -1
     let mut saw_any: bool = false
     while true {
-        eprintln("[wire-sync: pre-readline]")
         let line: str = taint_unwrap(read_line())
-        eprintln("[wire-sync: post-readline]")
         if line == "" {
             if !saw_any {
                 return ["eof", ""]
@@ -569,12 +558,10 @@ fn dap_reader_entry(ra: ReadArgs) -> int uses IO, Conc {
             })
             continue
         }
-        eprintln("[wire-sync: pre-send-request]")
         ra.events.send(DbgEvent {
             kind: "request", category: "", text: body, reason: "",
             thread: "", code: 0, snap: []
         })
-        eprintln("[wire-sync: post-send-request]")
     }
     return 0
 }
@@ -588,6 +575,7 @@ fn dap_run_entry(ra: RunArgs) -> int
 uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
     let boot: Boot = hb_load_checked(ra.program, ra.prog_args, false,
     "", "", "")
+    dap_stamp_entry(boot.ctx, ra.program)
     let dbg: DbgState = boot.dbg
     dbg.active = true
     dbg.no_debug = ra.no_debug
@@ -711,6 +699,24 @@ fn dap_sort_ints(vals: list[int]) -> void {
             j = j - 1
         }
         vals.set(j + 1, v)
+        i = i + 1
+    }
+}
+
+# dap_stamp_entry(ctx, path) — hl_parse_file leaves the ENTRY file's
+# cur_map_file unstamped (only load_file_into stamps, and the entry
+# arrives through hl_parse_file), so every fn the entry declares
+# carries src_file "". The debugger attributes statements, frames and
+# breakpoints through FnInfo.src_file; both boots (the main thread's
+# tables and the run thread's own load) stamp the entry through here.
+fn dap_stamp_entry(ctx: Ctx, path: str) -> void {
+    let keys: list[str] = ctx.fns.keys()
+    let mut i: int = 0
+    while i < keys.len() {
+        let f: FnInfo = ctx.fns.get_or(keys.get(i), dummy_fn())
+        if f.src_file == "" {
+            f.src_file = path
+        }
         i = i + 1
     }
 }
@@ -1438,6 +1444,7 @@ uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
     }
     let boot: Boot = hb_load_checked(program, sess.prog_args, false,
     "", "", "")
+    dap_stamp_entry(boot.ctx, program)
     sess.boot = boot
     sess.info = dap_prog_info(boot.ctx)
     sess.bps = map_new()
@@ -2050,7 +2057,6 @@ uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
     let _reader: Task[int] = spawn(dap_reader_entry, clone(ra))
     while true {
         let ev: DbgEvent = sess.events.recv()
-        eprintln("[wire-sync: main got " + ev.kind + "]")
         if ev.kind == "request" {
             dap_handle_request(sess, ev.text)
         } else if ev.kind == "badframe" {

@@ -6,7 +6,7 @@
  *   - language server (tools/hls-lsp.py) over stdio
  *   - on-save formatter (tools/hlfmt.py -w)
  *   - on-save linter (tools/hllint.py)
- *   - debugger (tools/hls-dap.py): the Debug Adapter Protocol over
+ *   - debugger (bin/hls-dap): the Debug Adapter Protocol over
  *     stdio, launched through a descriptor factory — no extra npm
  *     dependency, the API is built into VS Code
  *   - syntax highlighting via TextMate grammar
@@ -186,16 +186,22 @@ function activate(context) {
     // A descriptor factory is all VS Code needs — DebugAdapterExecutable
     // is built-in, so the extension ships with zero npm dependencies.
     function registerDebugger(context) {
+        // Stage 121 native port: the adapter is bin/hls-dap (the .py
+        // twin retired) — one executable over stdio, no interpreter.
         const factory = {
             createDebugAdapterDescriptor(session) {
                 const cfg = vscode.workspace.getConfiguration('halis');
-                const python = cfg.get('pythonPath') || 'python3';
-                const dapPath = findTool(
-                    vscode.workspace.workspaceFolders,
-                    'debugAdapterPath',
-                    'hls-dap.py'
-                );
-                return new vscode.DebugAdapterExecutable(python, [dapPath]);
+                const explicit = cfg.get('debugAdapterPath');
+                let dapPath = explicit && fs.existsSync(explicit) ? explicit : null;
+                if (!dapPath && vscode.workspace.workspaceFolders
+                    && vscode.workspace.workspaceFolders.length > 0) {
+                    const candidate = path.join(
+                        vscode.workspace.workspaceFolders[0].uri.fsPath,
+                        'bin', 'hls-dap');
+                    if (fs.existsSync(candidate)) dapPath = candidate;
+                }
+                if (!dapPath) dapPath = 'bin/hls-dap';  // rely on PATH
+                return new vscode.DebugAdapterExecutable(dapPath);
             }
         };
         context.subscriptions.push(
