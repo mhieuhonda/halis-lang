@@ -1,0 +1,1603 @@
+# ============================================================================
+# tests/acc/lsp_refactor_acceptance.hls — Stage 115 acceptance gate, in
+# Halis (the native twin of the retired tests/lsp_refactor_acceptance.py;
+# same eight sections, same laws, same needles — the harness is
+# tests/acc/harness.hls and the gate runs native, built by bin/hlc).
+# ----------------------------------------------------------------------------
+# Run with `make lsp-refactor-acceptance`.
+#
+#  1. the scope law    — a local renames exactly the occurrences its
+#                        declaration binds; the top-level contract
+#                        survives
+#  2. the renames      — fields move through the dot, methods move with
+#                        their impls, ambiguity is an error
+#  3. the inlines      — one splice, one deletion, and the refusals
+#  4. the extracts     — the probe decides the type; targets, arms and
+#                        junk all refuse
+#  5. the protocol     — capabilities, version, determinism,
+#                        invalidation
+#  6. the utf-16 line  — the rocket shifts bytes, not characters
+#  7. the edits land   — every offered edit applied, re-checked, re-run
+#  8. the corpus       — smoke green, boot pinned, fmt stable, lint
+#                        clean, the round-trip re-checks
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+import "std.json"
+import "std.result"
+import "std.thread"
+
+# ----------------------------------------------------------------------------
+# The battery's check grammar (names verbatim, [OK]/[FAIL] flags).
+# ----------------------------------------------------------------------------
+
+fn chk(acc: Acc, name: str, okc: bool, detail: str) -> bool uses IO {
+    return check(acc, name, okc, detail)
+}
+
+struct LspOut {
+    results: list[JsonValue],
+    rc: int,
+    err: str,
+    init: JsonValue
+}
+
+# frame(obj) — one request frame's JSON.
+fn frame(obj: JsonValue) -> str {
+    let body: str = json_stringify(obj)
+    let crlf: str = chr(13) + chr(10)
+    return "Content-Length: " + body.len().to_str() + crlf + crlf + body
+}
+
+fn req(method: str, id: int, params: JsonValue) -> JsonValue {
+    return JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+        sval: "", arr: [],
+        obj_keys: ["id", "jsonrpc", "method", "params"],
+        obj_vals: [json_int(id), json_str("2.0"), json_str(method), params] }
+}
+
+fn note(method: str, params: JsonValue) -> JsonValue {
+    return JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+        sval: "", arr: [],
+        obj_keys: ["jsonrpc", "method", "params"],
+        obj_vals: [json_str("2.0"), json_str(method), params] }
+}
+
+fn td_object(uri: str, version: int, text: str) -> JsonValue {
+    return JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+        sval: "", arr: [],
+        obj_keys: ["text", "uri", "version"],
+        obj_vals: [json_str(text), json_str(uri), json_int(version)] }
+}
+
+fn jstr(v: JsonValue, key: str) -> str {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_str(x) {
+        return json_str_value(x)
+    }
+    return ""
+}
+
+fn jint(v: JsonValue, key: str) -> int {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_int(x) {
+        return json_int_value(x)
+    }
+    return -1
+}
+
+fn jobj(v: JsonValue, key: str) -> JsonValue {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_object(x) {
+        return x
+    }
+    return json_null()
+}
+
+fn jbool(v: JsonValue, key: str) -> bool {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_bool(x) {
+        return json_bool_value(x)
+    }
+    return false
+}
+
+fn jarray(v: JsonValue, key: str) -> list[JsonValue] {
+    let x: JsonValue = json_object_get(v, key)
+    if json_is_array(x) {
+        return x.arr
+    }
+    let empty: list[JsonValue] = []
+    return empty
+}
+
+fn is_null(v: JsonValue) -> bool {
+    return json_is_null(v)
+}
+
+fn parse_uint(s: str) -> int {
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c >= 48 && c <= 57 {
+            v = v * 10 + (c - 48)
+        } else {
+            break
+        }
+        i = i + 1
+    }
+    return v
+}
+
+# crlfcrlf() — the frame separator, four real bytes.
+fn crlfcrlf() -> str {
+    let c: str = chr(13) + chr(10)
+    return c + c
+}
+
+# parse_frames(buf) — the server's frames back into parsed JSON values.
+fn parse_frames(buf: str) -> list[JsonValue] {
+    let msgs: list[JsonValue] = []
+    let mut rest: str = buf
+    let mut guard: int = 0
+    while rest.contains("Content-Length:") && guard < 1000 {
+        guard = guard + 1
+        let i: int = index_of_str(rest, "Content-Length:")
+        let j: int = index_of_str(rest.slice(i, rest.len()), crlfcrlf())
+        if j < 0 {
+            break
+        }
+        let hdr: str = rest.slice(i + 15, i + j)
+        let n: int = parse_uint(hdr.trim())
+        if j + 4 + n > rest.len() {
+            break
+        }
+        msgs.push(parse_json_or_null(rest.slice(j + 4, j + 4 + n)))
+        rest = rest.slice(j + 4 + n, rest.len())
+    }
+    return msgs
+}
+
+fn parse_json_or_null(text: str) -> JsonValue {
+    let r: Result[JsonValue, str] = json_parse_result(text)
+    if result_is_ok(r) {
+        return result_unwrap(r)
+    }
+    return json_null()
+}
+
+fn index_of_str(hay: str, needle: str) -> int {
+    let mut i: int = 0
+    while i + needle.len() <= hay.len() {
+        if hay.slice(i, i + needle.len()) == needle {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# ----------------------------------------------------------------------------
+# The session — one server run over stdio, the way an editor drives it.
+# Requests target open 0; pre-change k is flushed before request k.
+# ----------------------------------------------------------------------------
+
+struct PreChange {
+    req_idx: int,
+    open_idx: int,
+    text: str
+}
+
+fn session(acc: Acc, ws_name: str, opens_rels: list[str],
+opens_text: list[str], req_methods: list[str],
+req_params: list[JsonValue], pre_changes: list[PreChange]) -> LspOut
+uses Fs, Proc {
+    let base: str = scratch(acc, ws_name)
+    let uris: list[str] = []
+    let mut i: int = 0
+    while i < opens_rels.len() {
+        uris.push("file://" + path_join3(base, opens_rels.get(i)))
+        i = i + 1
+    }
+    let payload: list[str] = []
+    payload.push(frame(req("initialize", 1, json_null())))
+    i = 0
+    while i < opens_rels.len() {
+        payload.push(frame(note("textDocument/didOpen",
+            JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+                sval: "", arr: [], obj_keys: ["textDocument"],
+                obj_vals: [td_object(uris.get(i), 1,
+                opens_text.get(i))] })))
+        i = i + 1
+    }
+    i = 0
+    while i < req_methods.len() {
+        let mut pi: int = 0
+        while pi < pre_changes.len() {
+            if pre_changes.get(pi).req_idx == i {
+                let pc: PreChange = pre_changes.get(pi)
+                payload.push(frame(note("textDocument/didChange",
+                    JsonValue { kind: "object", bval: false, ival: 0,
+                        fval: 0.0, sval: "", arr: [],
+                        obj_keys: ["contentChanges", "textDocument"],
+                        obj_vals: [
+                        JsonValue { kind: "array", bval: false, ival: 0,
+                            fval: 0.0, sval: "",
+                            arr: [td_object("", 0, pc.text)],
+                            obj_keys: [], obj_vals: [] },
+                        td_object(uris.get(pc.open_idx), 2, "")] })))
+            }
+            pi = pi + 1
+        }
+        let p: JsonValue = req_params.get(i)
+        let with_td: JsonValue = JsonValue { kind: "object", bval: false,
+            ival: 0, fval: 0.0, sval: "", arr: [],
+            obj_keys: ["textDocument"],
+            obj_vals: [td_object(uris.get(0), 0, "")] }
+        payload.push(frame(req(req_methods.get(i), 100 + i,
+        merge_objects(with_td, p))))
+        i = i + 1
+    }
+    payload.push(frame(req("shutdown", 2, json_null())))
+    payload.push(frame(note("exit", json_null())))
+
+    let r: RunResult = run_feed("./bin/hls-lsp", [], str_join(payload, ""))
+    let out: LspOut = LspOut { results: [], rc: r.code, err: r.err,
+                               init: json_null() }
+    let frames: list[JsonValue] = parse_frames(r.out)
+    let mut k: int = 0
+    while k < req_methods.len() {
+        out.results.push(json_null())
+        k = k + 1
+    }
+    k = 0
+    while k < frames.len() {
+        let m: JsonValue = frames.get(k)
+        let id: int = jint(m, "id")
+        if id == 1 {
+            out.init = json_object_get(m, "result")
+        }
+        if id >= 100 && id - 100 < out.results.len() {
+            out.results.set(id - 100, json_object_get(m, "result"))
+        }
+        k = k + 1
+    }
+    return out
+}
+
+fn no_pre() -> list[PreChange] {
+    return []
+}
+
+# merge_objects(a, b) — a's keys, then b's keys overriding.
+fn merge_objects(a: JsonValue, b: JsonValue) -> JsonValue {
+    if !json_is_object(b) {
+        return a
+    }
+    let keys: list[str] = []
+    let vals: list[JsonValue] = []
+    let mut i: int = 0
+    while i < a.obj_keys.len() {
+        keys.push(a.obj_keys.get(i))
+        vals.push(a.obj_vals.get(i))
+        i = i + 1
+    }
+    i = 0
+    while i < b.obj_keys.len() {
+        let k: str = b.obj_keys.get(i)
+        let mut found: bool = false
+        let mut j: int = 0
+        while j < keys.len() {
+            if keys.get(j) == k {
+                vals.set(j, b.obj_vals.get(i))
+                found = true
+            }
+            j = j + 1
+        }
+        if !found {
+            keys.push(k)
+            vals.push(b.obj_vals.get(i))
+        }
+        i = i + 1
+    }
+    return JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+                       sval: "", arr: [], obj_keys: keys, obj_vals: vals }
+}
+
+# ----------------------------------------------------------------------------
+# Edit application (client side): LSP ranges are UTF-16.
+# ----------------------------------------------------------------------------
+
+# utf16_to_idx(line, units) — UTF-16 unit offset -> byte index in line.
+fn utf16_to_idx(line: str, units: int) -> int {
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < line.len() && n < units {
+        let c: int = line.byte_at(i)
+        if c >= 240 {
+            n = n + 2
+            i = i + 4
+        } else if c >= 224 {
+            n = n + 1
+            i = i + 3
+        } else if c >= 192 {
+            n = n + 1
+            i = i + 2
+        } else {
+            n = n + 1
+            i = i + 1
+        }
+    }
+    return i
+}
+
+# line_starts(text) — byte offset of every line's first byte.
+fn line_starts(text: str) -> list[int] {
+    let offs: list[int] = [0]
+    let mut i: int = 0
+    while i < text.len() {
+        if text.byte_at(i) == 10 {
+            offs.push(i + 1)
+        }
+        i = i + 1
+    }
+    return offs
+}
+
+# line_of(text, offs, off) — the 0-based line of a byte offset.
+fn line_of_off(offs: list[int], off: int) -> int {
+    let mut lo: int = 0
+    let mut hi: int = offs.len() - 1
+    while lo < hi {
+        let mid: int = (lo + hi + 1) / 2
+        if offs.get(mid) <= off {
+            lo = mid
+        } else {
+            hi = mid - 1
+        }
+    }
+    return lo
+}
+
+# line_text_of(text, offs, line0) — the line's bytes, newline excluded.
+fn line_text_of(text: str, offs: list[int], line0: int) -> str {
+    let a: int = offs.get(line0)
+    let mut b: int = text.len()
+    if line0 + 1 < offs.len() {
+        b = offs.get(line0 + 1) - 1
+    }
+    if b > a {
+        return text.slice(a, b)
+    }
+    return ""
+}
+
+# pos_to_off(text, offs, pos) — an LSP position to a byte offset.
+fn pos_to_off(text: str, offs: list[int], pos: JsonValue) -> int {
+    let l0: int = jint(pos, "line")
+    let c16: int = jint(pos, "character")
+    let line: str = line_text_of(text, offs, l0)
+    let col: int = utf16_to_idx(line, c16)
+    return offs.get(l0) + col
+}
+
+# apply_lsp_edits(text, edits) — apply bottom-up, positions UTF-16.
+fn apply_lsp_edits(text: str, edits: list[JsonValue]) -> str {
+    let offs: list[int] = line_starts(text)
+    # sort the edits by start offset DESCENDING (an insertion sort over
+    # a copy — the caller's list keeps its order)
+    let sorted: list[JsonValue] = []
+    let mut i: int = 0
+    while i < edits.len() {
+        sorted.push(edits.get(i))
+        i = i + 1
+    }
+    i = 1
+    while i < sorted.len() {
+        let it: JsonValue = sorted.get(i)
+        let it_off: int = pos_to_off(text, offs,
+        jobj(jobj(it, "range"), "start"))
+        let mut j: int = i - 1
+        let mut pos_i: int = i
+        while j >= 0 {
+            let prev: JsonValue = sorted.get(j)
+            let prev_off: int = pos_to_off(text, offs,
+            jobj(jobj(prev, "range"), "start"))
+            if prev_off < it_off {
+                sorted.set(j + 1, prev)
+                pos_i = j
+                j = j - 1
+            } else {
+                break
+            }
+        }
+        sorted.set(pos_i, it)
+        i = i + 1
+    }
+    let mut out: str = text
+    i = 0
+    while i < sorted.len() {
+        let e: JsonValue = sorted.get(i)
+        let a: int = pos_to_off(out, line_starts(out),
+        jobj(jobj(e, "range"), "start"))
+        let b: int = pos_to_off(out, line_starts(out),
+        jobj(jobj(e, "range"), "end"))
+        out = out.slice(0, a) + jstr(e, "newText") + out.slice(b, out.len())
+        i = i + 1
+    }
+    return out
+}
+
+# edits_of(result) — flatten a WorkspaceEdit into one edit list (the
+# rename shape {changes} and the CodeAction shape {edit:{changes}}).
+fn edits_of(result: JsonValue) -> list[JsonValue] {
+    if json_is_null(result) {
+        let empty: list[JsonValue] = []
+        return empty
+    }
+    let mut changes: JsonValue = jobj(result, "changes")
+    if json_is_null(changes) {
+        let inner: JsonValue = jobj(result, "edit")
+        if !json_is_null(inner) {
+            changes = jobj(inner, "changes")
+        }
+    }
+    if !json_is_object(changes) {
+        let empty2: list[JsonValue] = []
+        return empty2
+    }
+    let mut ci: int = 0
+    while ci < changes.obj_keys.len() {
+        let v: JsonValue = changes.obj_vals.get(ci)
+        if json_is_array(v) {
+            return v.arr
+        }
+        ci = ci + 1
+    }
+    let empty3: list[JsonValue] = []
+    return empty3
+}
+
+# action_of_kind(result, kind) — the CodeAction of that kind, or null.
+fn action_of_kind(result: JsonValue, kind: str) -> JsonValue {
+    if json_is_null(result) {
+        return json_null()
+    }
+    if json_is_array(result) {
+        let mut i: int = 0
+        while i < result.arr.len() {
+            let a: JsonValue = result.arr.get(i)
+            if jstr(a, "kind") == kind {
+                return a
+            }
+            i = i + 1
+        }
+    }
+    return json_null()
+}
+
+fn line_of(text: str, needle: str) -> int {
+    let offs: list[int] = line_starts(text)
+    let mut i: int = 0
+    while i < offs.len() {
+        if line_text_of(text, offs, i).contains(needle) {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# col_of(text, line0, needle) — the UTF-16 column of needle in a line.
+fn col_of(text: str, line0: int, needle: str) -> int {
+    let offs: list[int] = line_starts(text)
+    let line: str = line_text_of(text, offs, line0)
+    let byte_col: int = index_of_str(line, needle)
+    if byte_col < 0 {
+        return -1
+    }
+    let prefix: str = line.slice(0, byte_col)
+    return utf16_len(prefix)
+}
+
+# utf16_len(s) — the LSP character units of a string.
+fn utf16_len(s: str) -> int {
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c >= 240 {
+            n = n + 2
+            i = i + 4
+        } else if c >= 224 {
+            n = n + 1
+            i = i + 3
+        } else if c >= 192 {
+            n = n + 1
+            i = i + 2
+        } else {
+            n = n + 1
+            i = i + 1
+        }
+    }
+    return n
+}
+
+# range_json(sl, sc, el, ec) — a request range.
+fn range_json(sl: int, sc: int, el: int, ec: int) -> JsonValue {
+    return JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+        sval: "", arr: [],
+        obj_keys: ["start", "end"],
+        obj_vals: [
+            JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+                sval: "", arr: [],
+                obj_keys: ["line", "character"],
+                obj_vals: [json_int(sl), json_int(sc)] },
+            JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+                sval: "", arr: [],
+                obj_keys: ["line", "character"],
+                obj_vals: [json_int(el), json_int(ec)] }] }
+}
+
+# rename_params(line0, char16, new_name) — a rename request's params.
+fn rename_params(line0: int, char16: int, new_name: str) -> JsonValue {
+    return JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+        sval: "", arr: [],
+        obj_keys: ["position", "newName"],
+        obj_vals: [
+            JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+                sval: "", arr: [],
+                obj_keys: ["line", "character"],
+                obj_vals: [json_int(line0), json_int(char16)] },
+            json_str(new_name)] }
+}
+
+# action_params(rng) — a codeAction request's params.
+fn action_params(rng: JsonValue) -> JsonValue {
+    return JsonValue { kind: "object", bval: false, ival: 0, fval: 0.0,
+        sval: "", arr: [], obj_keys: ["range"], obj_vals: [rng] }
+}
+
+# one_open(s) / one_req helpers — the small list constructors.
+fn one_open(s: str) -> list[str] {
+    return [s]
+}
+
+fn one_text(s: str) -> list[str] {
+    return [s]
+}
+
+fn one_method(s: str) -> list[str] {
+    return [s]
+}
+
+fn one_param(p: JsonValue) -> list[JsonValue] {
+    return [p]
+}
+
+# ----------------------------------------------------------------------------
+# The fixtures (the .py era's heredocs, verbatim).
+# ----------------------------------------------------------------------------
+
+fn sibling_src() -> str {
+    return "fn pick(kind: int) -> int uses IO {\n"
+        + "    if kind == 1 {\n"
+        + "        let label: str = \"one\"\n"
+        + "        println(label)\n"
+        + "    }\n"
+        + "    if kind == 2 {\n"
+        + "        let label: str = \"two\"\n"
+        + "        println(label)\n"
+        + "    }\n"
+        + "    return kind\n"
+        + "}\n"
+}
+
+fn two_fn_src() -> str {
+    return "fn alpha(n: int) -> int {\n"
+        + "    return n + 1\n"
+        + "}\n"
+        + "\n"
+        + "fn beta(n: int) -> int {\n"
+        + "    return n * 2\n"
+        + "}\n"
+        + "\n"
+        + "fn main() -> int uses IO {\n"
+        + "    println(alpha(1).to_str())\n"
+        + "    println(beta(2).to_str())\n"
+        + "    return 0\n"
+        + "}\n"
+}
+
+fn for_src() -> str {
+    return "fn total_up(limit: int) -> int {\n"
+        + "    let mut total: int = 0\n"
+        + "    for i: int in range(0, limit) {\n"
+        + "        total = total + i\n"
+        + "    }\n"
+        + "    return total\n"
+        + "}\n"
+        + "\n"
+        + "fn main() -> int uses IO {\n"
+        + "    println(total_up(3).to_str())\n"
+        + "    return 0\n"
+        + "}\n"
+}
+
+fn match_src() -> str {
+    return "enum Shape {\n"
+        + "    Circle(int),\n"
+        + "    Square(int)\n"
+        + "}\n"
+        + "\n"
+        + "fn area(sh: Shape) -> int {\n"
+        + "    return match sh {\n"
+        + "        Shape.Circle(r) => 3 * r * r,\n"
+        + "        Shape.Square(s) => s * s\n"
+        + "    }\n"
+        + "}\n"
+        + "\n"
+        + "fn main() -> int uses IO {\n"
+        + "    println(area(Shape.Circle(2)).to_str())\n"
+        + "    println(area(Shape.Square(3)).to_str())\n"
+        + "    return 0\n"
+        + "}\n"
+}
+
+fn field_src() -> str {
+    return "struct Item {\n"
+        + "    size: int,\n"
+        + "    name: str\n"
+        + "}\n"
+        + "\n"
+        + "fn weigh(it: Item) -> int {\n"
+        + "    return it.size * 2\n"
+        + "}\n"
+        + "\n"
+        + "fn main() -> int uses IO {\n"
+        + "    let it: Item = Item { size: 3, name: \"x\" }\n"
+        + "    println(it.size.to_str())\n"
+        + "    println(it.name)\n"
+        + "    return 0\n"
+        + "}\n"
+}
+
+fn meth_src() -> str {
+    return "struct Box2 {\n"
+        + "    size: int\n"
+        + "}\n"
+        + "\n"
+        + "impl Box2 {\n"
+        + "    fn grow(self: Box2) -> int {\n"
+        + "        return self.size\n"
+        + "    }\n"
+        + "}\n"
+        + "\n"
+        + "fn main() -> int uses IO {\n"
+        + "    let b: Box2 = Box2 { size: 1 }\n"
+        + "    println(b.grow().to_str())\n"
+        + "    return 0\n"
+        + "}\n"
+}
+
+fn inline_ok_src() -> str {
+    return "fn double(n: int) -> int {\n"
+        + "    return n * 2\n"
+        + "}\n"
+        + "\n"
+        + "fn main() -> int uses IO {\n"
+        + "    let base: int = 21\n"
+        + "    let doubled: int = double(base)\n"
+        + "    println(doubled.to_str())\n"
+        + "    return 0\n"
+        + "}\n"
+}
+
+fn inline_paren_src() -> str {
+    return "fn main() -> int uses IO {\n"
+        + "    let a: int = 2\n"
+        + "    let b: int = 3\n"
+        + "    let sum: int = (a + b)\n"
+        + "    println((sum * 4).to_str())\n"
+        + "    return 0\n"
+        + "}\n"
+}
+
+fn inline_multi_use_src() -> str {
+    return "fn double(n: int) -> int {\n"
+        + "    return n * 2\n"
+        + "}\n"
+        + "\n"
+        + "fn main() -> int uses IO {\n"
+        + "    let v: int = double(5)\n"
+        + "    println(v.to_str())\n"
+        + "    println((v + 1).to_str())\n"
+        + "    return 0\n"
+        + "}\n"
+}
+
+fn inline_reassign_src() -> str {
+    return "fn main() -> int uses IO {\n"
+        + "    let mut acc: int = 0\n"
+        + "    acc = acc + 1\n"
+        + "    println(acc.to_str())\n"
+        + "    return 0\n"
+        + "}\n"
+}
+
+fn inline_assign_through_src() -> str {
+    return "fn main() -> int uses IO {\n"
+        + "    let xs: list[int] = [1, 2]\n"
+        + "    xs[0] = 9\n"
+        + "    println(xs[0].to_str())\n"
+        + "    return 0\n"
+        + "}\n"
+}
+
+fn inline_reassigned_init_src() -> str {
+    return "fn main() -> int uses IO {\n"
+        + "    let mut base: int = 1\n"
+        + "    let snapshot: int = base\n"
+        + "    base = base + 1\n"
+        + "    println((snapshot + base).to_str())\n"
+        + "    return 0\n"
+        + "}\n"
+}
+
+fn inline_zero_use_src() -> str {
+    return "fn main() -> int uses IO {\n"
+        + "    let unused: int = 7\n"
+        + "    println(\"ok\")\n"
+        + "    return 0\n"
+        + "}\n"
+}
+
+fn inline_attr_src() -> str {
+    return "fn main() -> int uses IO {\n"
+        + "    #[stack]\n"
+        + "    let buf: list[int] = [1, 2]\n"
+        + "    println(buf[0].to_str())\n"
+        + "    return 0\n"
+        + "}\n"
+}
+
+fn extract_int_src() -> str {
+    return "fn main() -> int uses IO {\n"
+        + "    let area: int = 3 * 4 + 5\n"
+        + "    println(area.to_str())\n"
+        + "    return 0\n"
+        + "}\n"
+}
+
+fn extract_bump_src() -> str {
+    return "fn main() -> int uses IO {\n"
+        + "    let extracted: int = 1\n"
+        + "    let area: int = 3 * 4 + 5\n"
+        + "    println((area + extracted).to_str())\n"
+        + "    return 0\n"
+        + "}\n"
+}
+
+fn extract_struct_src() -> str {
+    return "struct P2 {\n"
+        + "    x: int\n"
+        + "}\n"
+        + "\n"
+        + "fn make() -> P2 {\n"
+        + "    return P2 { x: 1 }\n"
+        + "}\n"
+        + "\n"
+        + "fn main() -> int uses IO {\n"
+        + "    let p: P2 = make()\n"
+        + "    println(p.x.to_str())\n"
+        + "    return 0\n"
+        + "}\n"
+}
+
+fn extract_str_src() -> str {
+    return "fn main() -> int uses IO {\n"
+        + "    println((\"lo\" + \"hi\").to_str())\n"
+        + "    return 0\n"
+        + "}\n"
+}
+
+fn extract_target_src() -> str {
+    return "fn main() -> int uses IO {\n"
+        + "    let mut acc: int = 0\n"
+        + "    acc = acc + 5\n"
+        + "    println(acc.to_str())\n"
+        + "    return 0\n"
+        + "}\n"
+}
+
+fn extract_arm_src() -> str {
+    return "enum Shape {\n"
+        + "    Circle(int),\n"
+        + "    Square(int)\n"
+        + "}\n"
+        + "\n"
+        + "fn area(sh: Shape) -> int {\n"
+        + "    return match sh {\n"
+        + "        Shape.Circle(r) => 3 * r * r,\n"
+        + "        Shape.Square(s) => s * s\n"
+        + "    }\n"
+        + "}\n"
+        + "\n"
+        + "fn main() -> int uses IO {\n"
+        + "    println(area(Shape.Circle(2)).to_str())\n"
+        + "    return 0\n"
+        + "}\n"
+}
+
+fn extract_call_src() -> str {
+    return "fn double(n: int) -> int {\n"
+        + "    return n * 2\n"
+        + "}\n"
+        + "\n"
+        + "fn main() -> int uses IO {\n"
+        + "    println(double(21).to_str())\n"
+        + "    return 0\n"
+        + "}\n"
+}
+
+fn extract_structlit_src() -> str {
+    return "struct P2 {\n"
+        + "    x: int\n"
+        + "}\n"
+        + "\n"
+        + "fn main() -> int uses IO {\n"
+        + "    let p: P2 = P2 {\n"
+        + "        x: 7\n"
+        + "    }\n"
+        + "    println(p.x.to_str())\n"
+        + "    return 0\n"
+        + "}\n"
+}
+
+fn extract_panic_src() -> str {
+    return "fn main() -> int uses IO {\n"
+        + "    println(panic(\"boom\").to_str())\n"
+        + "    return 0\n"
+        + "}\n"
+}
+
+fn proto_src() -> str {
+    return "fn add(a: int, b: int) -> int {\n"
+        + "    return a + b\n"
+        + "}\n"
+        + "\n"
+        + "fn main() -> int uses IO {\n"
+        + "    let total: int = add(40, 2)\n"
+        + "    println(total.to_str())\n"
+        + "    return 0\n"
+        + "}\n"
+}
+
+# rocket() — the four UTF-8 bytes of the rocket emoji.
+fn rocket() -> str {
+    return chr(240) + chr(159) + chr(154) + chr(128)
+}
+
+fn emoji_src() -> str {
+    return "fn main() -> int uses IO {\n"
+        + "    let msg: str = \"" + rocket() + " ready\"\n"
+        + "    println(\"" + rocket() + " \" + msg)\n"
+        + "    return 0\n"
+        + "}\n"
+}
+
+# ----------------------------------------------------------------------------
+# 1. the scope law.
+# ----------------------------------------------------------------------------
+
+fn s1_scope_law(acc: Acc) -> void uses IO, Fs, Proc {
+    section("1. the scope law — a local renames only what its declaration binds; the top-level contract survives")
+
+    # Sibling blocks: same name, different variables.
+    let l1: int = line_of(sibling_src(), "let label: str = \"one\"")
+    let out: LspOut = session(acc, "s1a", one_open("sibling.hls"),
+        one_text(sibling_src()), one_method("textDocument/rename"),
+        one_param(rename_params(l1, 12, "tag")), no_pre())
+    let eds: list[JsonValue] = edits_of(out.results.get(0))
+    chk(acc, "renaming the first block's label touches exactly two sites (got "
+        + eds.len().to_str() + ")",
+        out.rc == 0 && eds.len() == 2, "")
+    let mut only_first: bool = eds.len() == 2
+    let mut ei: int = 0
+    while ei < eds.len() {
+        let ln: int = jint(jobj(jobj(eds.get(ei), "range"), "start"),
+        "line")
+        if ln != l1 && ln != l1 + 1 {
+            only_first = false
+        }
+        ei = ei + 1
+    }
+    chk(acc, "the second block's same-named local is a different variable and stays untouched",
+        only_first, "")
+    let new_text: str = apply_lsp_edits(sibling_src(), eds)
+    chk(acc, "applied edits rename one block and spare the other",
+        new_text.contains("let tag: str = \"one\"")
+        && new_text.contains("let label: str = \"two\""), "")
+
+    # Another function's same-named param stays put.
+    let lq: int = line_of(two_fn_src(), "fn alpha(n: int)")
+    let outb: LspOut = session(acc, "s1b", one_open("two.hls"),
+        one_text(two_fn_src()), one_method("textDocument/rename"),
+        one_param(rename_params(lq, 9, "x")), no_pre())
+    let edsb: list[JsonValue] = edits_of(outb.results.get(0))
+    chk(acc, "renaming alpha's param touches the declaration and alpha's one use",
+        outb.rc == 0 && edsb.len() == 2, "")
+    let lb: int = line_of(two_fn_src(), "fn beta(n: int)")
+    let mut beta_clean: bool = edsb.len() == 2
+    let mut bi: int = 0
+    while bi < edsb.len() {
+        let ln2: int = jint(jobj(jobj(edsb.get(bi), "range"), "start"),
+        "line")
+        if ln2 == lb || ln2 == lb + 1 {
+            beta_clean = false
+        }
+        bi = bi + 1
+    }
+    chk(acc, "beta's same-named param never moves", beta_clean, "")
+
+    # for-loop variable: declaration and uses rename together.
+    let li: int = line_of(for_src(), "for i: int in range")
+    let outc: LspOut = session(acc, "s1c", one_open("for.hls"),
+        one_text(for_src()), one_method("textDocument/rename"),
+        one_param(rename_params(li, 8, "j")), no_pre())
+    let edsc: list[JsonValue] = edits_of(outc.results.get(0))
+    chk(acc, "the loop variable renames in its header and in the body's use",
+        outc.rc == 0 && edsc.len() == 2, "")
+    let new_c: str = apply_lsp_edits(for_src(), edsc)
+    chk(acc, "the renamed loop re-checks by construction",
+        new_c.contains("for j: int in range(0, limit)")
+        && new_c.contains("total = total + j"), "")
+
+    # Match payload binding — the pattern token and both body uses.
+    let lr: int = line_of(match_src(), "Shape.Circle(r) =>")
+    let outd: LspOut = session(acc, "s1d", one_open("match.hls"),
+        one_text(match_src()), one_method("textDocument/rename"),
+        one_param(rename_params(lr, 21, "radius")), no_pre())
+    let edsd: list[JsonValue] = edits_of(outd.results.get(0))
+    chk(acc, "the payload binding renames in the pattern and both arm-body uses (got "
+        + edsd.len().to_str() + ")",
+        outd.rc == 0 && edsd.len() == 3, "")
+    let new_d: str = apply_lsp_edits(match_src(), edsd)
+    chk(acc, "the renamed arm reads the way the scope engine resolved it",
+        new_d.contains("Shape.Circle(radius) => 3 * radius * radius"), "")
+    chk(acc, "the Square arm's own binding never moves",
+        new_d.contains("Shape.Square(s) => s * s"), "")
+
+    # Top-level fn: the Stage 14 textual contract across open documents.
+    let lalpha: int = line_of(two_fn_src(), "fn alpha")
+    let lcall: int = line_of(two_fn_src(), "println(alpha(1)")
+    let rels: list[str] = ["a.hls", "b.hls"]
+    let texts: list[str] = [two_fn_src(), two_fn_src()]
+    let methods: list[str] = ["textDocument/rename", "textDocument/rename"]
+    let params: list[JsonValue] = [rename_params(lalpha, 4, "alpha2"),
+    rename_params(lcall, 12, "alpha2")]
+    let oute: LspOut = session(acc, "s1e", rels, texts, methods, params,
+    no_pre())
+    let e0: list[JsonValue] = edits_of(oute.results.get(0))
+    let e1: list[JsonValue] = edits_of(oute.results.get(1))
+    chk(acc, "a top-level fn renames from its declaration and from a call site alike",
+        oute.rc == 0 && e0.len() >= 2 && e1.len() >= 2, "")
+}
+
+# ----------------------------------------------------------------------------
+# 2. the renames (fields, methods, refusals).
+# ----------------------------------------------------------------------------
+
+fn s2_renames(acc: Acc) -> void uses IO, Fs, Proc {
+    section("2. the renames — fields move through the dot, methods move with their impls, ambiguity is an error")
+
+    let ld: int = line_of(field_src(), "    size: int,")
+    let out: LspOut = session(acc, "s2a", one_open("field.hls"),
+        one_text(field_src()), one_method("textDocument/rename"),
+        one_param(rename_params(ld, 5, "width")), no_pre())
+    let eds: list[JsonValue] = edits_of(out.results.get(0))
+    chk(acc, "the declaration, both `.size` accesses and the struct-literal key rename (got "
+        + eds.len().to_str() + ")",
+        out.rc == 0 && eds.len() == 4, "")
+    let new_text: str = apply_lsp_edits(field_src(), eds)
+    chk(acc, "the struct literal's key renames with the field",
+        new_text.contains("width: int,")
+        && new_text.contains("it.width * 2")
+        && !new_text.contains("Item { size: 3")
+        && new_text.contains("Item { width: 3"), new_text)
+    chk(acc, "the sibling field never moves",
+        new_text.contains("it.name") && new_text.contains("name: str"), "")
+
+    # The same rename from an access site.
+    let la: int = line_of(field_src(), "it.size * 2")
+    let outb: LspOut = session(acc, "s2b", one_open("field2.hls"),
+        one_text(field_src()), one_method("textDocument/rename"),
+        one_param(rename_params(la, 14, "width")), no_pre())
+    chk(acc, "renaming from the `.size` access site finds the same four edits",
+        outb.rc == 0 && edits_of(outb.results.get(0)).len() == 4, "")
+
+    # Method rename from a call site: impl decl + call site.
+    let lc: int = line_of(meth_src(), "b.grow().to_str()")
+    let outc: LspOut = session(acc, "s2c", one_open("meth.hls"),
+        one_text(meth_src()), one_method("textDocument/rename"),
+        one_param(rename_params(lc, 14, "bump")), no_pre())
+    let edsc: list[JsonValue] = edits_of(outc.results.get(0))
+    chk(acc, "the method renames at its impl declaration and its call site (got "
+        + edsc.len().to_str() + ")",
+        outc.rc == 0 && edsc.len() == 2, "")
+    let new_c: str = apply_lsp_edits(meth_src(), edsc)
+    chk(acc, "the renamed method reads like any other impl method",
+        new_c.contains("fn bump(self: Box2)")
+        && new_c.contains("b.bump()"), new_c)
+
+    # Refusals: keyword as newName; builtin as a new local name; a
+    # duplicate field.
+    let lw: int = line_of(field_src(), "fn weigh(it: Item)")
+    let methods: list[str] = ["textDocument/rename", "textDocument/rename",
+    "textDocument/rename"]
+    let params: list[JsonValue] = [rename_params(la, 14, "let"),
+    rename_params(lw, 9, "print"), rename_params(ld, 5, "name")]
+    let oute: LspOut = session(acc, "s2e", one_open("refuse.hls"),
+        one_text(field_src()), methods, params, no_pre())
+    chk(acc, "newName `let` is refused (the lexer would tokenize it as a keyword)",
+        oute.rc == 0 && is_null(oute.results.get(0)), "")
+    chk(acc, "newName `print` is refused for a local (a builtin cannot be shadowed into confusion)",
+        is_null(oute.results.get(1)), "")
+    chk(acc, "newName `name` is refused (the struct already has that field — the rename would duplicate it)",
+        is_null(oute.results.get(2)), "")
+}
+
+# ----------------------------------------------------------------------------
+# 3. the inlines.
+# ----------------------------------------------------------------------------
+
+fn s3_inlines(acc: Acc) -> void uses IO, Fs, Proc {
+    section("3. the inlines — one splice, one deletion, and the refusals that guard the semantics")
+
+    # Single use, call initializer: splice parenthesised, line deleted.
+    let lu: int = line_of(inline_ok_src(), "println(doubled.to_str())")
+    let out: LspOut = session(acc, "s3a", one_open("inl.hls"),
+        one_text(inline_ok_src()), one_method("textDocument/codeAction"),
+        one_param(action_params(range_json(lu, 12, lu, 12))), no_pre())
+    let act: JsonValue = action_of_kind(out.results.get(0),
+    "refactor.inline")
+    chk(acc, "the cursor on a use offers Inline variable",
+        !is_null(act), "")
+    if !is_null(act) {
+        let new_text: str = apply_lsp_edits(inline_ok_src(),
+        edits_of(act))
+        chk(acc, "the binding's line is gone — no orphan indent, no orphan let",
+            !new_text.contains("let doubled"), new_text)
+        chk(acc, "the call initializer splices parenthesised into the use",
+            new_text.contains("println((double(base)).to_str())"),
+            new_text)
+    }
+
+    # Already-parenthesised single-token-shaped init splices bare.
+    let ls: int = line_of(inline_paren_src(), "let sum: int = (a + b)")
+    let outb: LspOut = session(acc, "s3b", one_open("inl2.hls"),
+        one_text(inline_paren_src()), one_method("textDocument/codeAction"),
+        one_param(action_params(range_json(ls, 8, ls, 8))), no_pre())
+    let actb: JsonValue = action_of_kind(outb.results.get(0),
+    "refactor.inline")
+    chk(acc, "the cursor on the `let` keyword itself offers the inline",
+        !is_null(actb), "")
+    if !is_null(actb) {
+        let new_b: str = apply_lsp_edits(inline_paren_src(),
+        edits_of(actb))
+        chk(acc, "a fully-parenthesised initializer splices bare — no double wrapping",
+            new_b.contains("println(((a + b) * 4).to_str())"), new_b)
+    }
+
+    # Multi-use with a call: refused.
+    let lm: int = line_of(inline_multi_use_src(), "let v: int = double(5)")
+    let outc: LspOut = session(acc, "s3c", one_open("inl3.hls"),
+        one_text(inline_multi_use_src()),
+        one_method("textDocument/codeAction"),
+        one_param(action_params(range_json(lm, 8, lm, 8))), no_pre())
+    chk(acc, "a call-bearing initializer with two uses earns no inline",
+        is_null(action_of_kind(outc.results.get(0), "refactor.inline")), "")
+
+    # Reassigned binding: refused.
+    let lr: int = line_of(inline_reassign_src(), "let mut acc: int = 0")
+    let outd: LspOut = session(acc, "s3d", one_open("inl4.hls"),
+        one_text(inline_reassign_src()),
+        one_method("textDocument/codeAction"),
+        one_param(action_params(range_json(lr, 12, lr, 12))), no_pre())
+    chk(acc, "a reassigned binding earns no inline — `mut` means nothing to the splice",
+        is_null(action_of_kind(outd.results.get(0), "refactor.inline")), "")
+
+    # Assignment through a use: refused.
+    let lx: int = line_of(inline_assign_through_src(), "xs[0] = 9")
+    let oute: LspOut = session(acc, "s3e", one_open("inl5.hls"),
+        one_text(inline_assign_through_src()),
+        one_method("textDocument/codeAction"),
+        one_param(action_params(range_json(lx, 1, lx, 1))), no_pre())
+    chk(acc, "a use an assignment writes through earns no inline",
+        is_null(action_of_kind(oute.results.get(0), "refactor.inline")), "")
+
+    # Initializer naming a reassigned local: refused.
+    let ln: int = line_of(inline_reassigned_init_src(),
+    "let snapshot: int = base")
+    let outf: LspOut = session(acc, "s3f", one_open("inl6.hls"),
+        one_text(inline_reassigned_init_src()),
+        one_method("textDocument/codeAction"),
+        one_param(action_params(range_json(ln, 8, ln, 8))), no_pre())
+    chk(acc, "an initializer naming a reassigned local earns no inline — the splice could read a different value",
+        is_null(action_of_kind(outf.results.get(0), "refactor.inline")), "")
+
+    # Zero uses: the binding simply dies.
+    let lz: int = line_of(inline_zero_use_src(), "let unused: int = 7")
+    let outg: LspOut = session(acc, "s3g", one_open("inl7.hls"),
+        one_text(inline_zero_use_src()),
+        one_method("textDocument/codeAction"),
+        one_param(action_params(range_json(lz, 8, lz, 8))), no_pre())
+    let actg: JsonValue = action_of_kind(outg.results.get(0),
+    "refactor.inline")
+    chk(acc, "a zero-use binding still offers the inline",
+        !is_null(actg), "")
+    if !is_null(actg) {
+        let new_g: str = apply_lsp_edits(inline_zero_use_src(),
+        edits_of(actg))
+        chk(acc, "the dead binding is deleted, the rest untouched",
+            !new_g.contains("let unused")
+            && new_g.contains("println(\"ok\")"), new_g)
+    }
+
+    # #[stack] attribute line dies with its binding.
+    let lat: int = line_of(inline_attr_src(), "#[stack]")
+    let outh: LspOut = session(acc, "s3h", one_open("inl8.hls"),
+        one_text(inline_attr_src()),
+        one_method("textDocument/codeAction"),
+        one_param(action_params(range_json(lat + 1, 8, lat + 1, 8))),
+        no_pre())
+    let acth: JsonValue = action_of_kind(outh.results.get(0),
+    "refactor.inline")
+    chk(acc, "the cursor after an attribute still finds the binding",
+        !is_null(acth), "")
+    if !is_null(acth) {
+        let new_h: str = apply_lsp_edits(inline_attr_src(), edits_of(acth))
+        chk(acc, "the attribute list dies with the binding — no orphan #[stack]",
+            !new_h.contains("#[stack]") && !new_h.contains("let buf"),
+            new_h)
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 4. the extracts.
+# ----------------------------------------------------------------------------
+
+fn s4_extracts(acc: Acc) -> void uses IO, Fs, Proc {
+    section("4. the extracts — the probe decides the type; ambiguity, targets, arms and junk all refuse")
+
+    # int expression.
+    let la: int = line_of(extract_int_src(), "let area: int = 3 * 4 + 5")
+    let out: LspOut = session(acc, "s4a", one_open("x.hls"),
+        one_text(extract_int_src()), one_method("textDocument/codeAction"),
+        one_param(action_params(range_json(la, 20, la, 25))), no_pre())
+    let act: JsonValue = action_of_kind(out.results.get(0),
+    "refactor.extract")
+    chk(acc, "`3 * 4` offers Extract variable", !is_null(act), "")
+    if !is_null(act) {
+        let txt: str = json_stringify(jobj(act, "edit"))
+        chk(acc, "the probe bound int — and only int — to the fresh binding",
+            txt.contains("let extracted: int = 3 * 4"), txt)
+        let new_text: str = apply_lsp_edits(extract_int_src(),
+        edits_of(act))
+        chk(acc, "the extract lands as a line above the statement, with its indent",
+            new_text == "fn main() -> int uses IO {\n"
+            + "    let extracted: int = 3 * 4\n"
+            + "    let area: int = extracted + 5\n"
+            + "    println(area.to_str())\n"
+            + "    return 0\n"
+            + "}\n", new_text)
+    }
+
+    # Existing `extracted` bumps to `extracted2`.
+    let lb: int = line_of(extract_bump_src(), "let area: int = 3 * 4 + 5")
+    let outb: LspOut = session(acc, "s4b", one_open("x.hls"),
+        one_text(extract_bump_src()),
+        one_method("textDocument/codeAction"),
+        one_param(action_params(range_json(lb, 20, lb, 25))), no_pre())
+    let actb: JsonValue = action_of_kind(outb.results.get(0),
+    "refactor.extract")
+    if !is_null(actb) {
+        let txtb: str = json_stringify(jobj(actb, "edit"))
+        chk(acc, "a taken name bumps to extracted2 instead of colliding",
+            txtb.contains("let extracted2: int = 3 * 4"), txtb)
+    }
+
+    # Struct-typed call: the probe binds the struct, not int.
+    let ld: int = line_of(extract_struct_src(), "println(p.x.to_str())")
+    let outc: LspOut = session(acc, "s4c", one_open("x.hls"),
+        one_text(extract_struct_src()),
+        one_method("textDocument/codeAction"),
+        one_param(action_params(range_json(ld, 12, ld, 13))), no_pre())
+    let actc: JsonValue = action_of_kind(outc.results.get(0),
+    "refactor.extract")
+    if !is_null(actc) {
+        let txtc: str = json_stringify(jobj(actc, "edit"))
+        chk(acc, "a cursor on `p` probes the struct type through the binding",
+            txtc.contains("let extracted: P2 = p"), txtc)
+    }
+
+    # str expression.
+    let lstr: int = line_of(extract_str_src(),
+    "println((\"lo\" + \"hi\").to_str())")
+    let outd: LspOut = session(acc, "s4d", one_open("x.hls"),
+        one_text(extract_str_src()),
+        one_method("textDocument/codeAction"),
+        one_param(action_params(range_json(lstr, 13, lstr, 24))), no_pre())
+    let actd: JsonValue = action_of_kind(outd.results.get(0),
+    "refactor.extract")
+    if !is_null(actd) {
+        let edsd: list[JsonValue] = edits_of(actd)
+        let mut found_str: bool = false
+        let mut i: int = 0
+        while i < edsd.len() {
+            if jstr(edsd.get(i), "newText")
+            .starts_with("let extracted: str = \"lo\" + \"hi\"") {
+                found_str = true
+            }
+            i = i + 1
+        }
+        chk(acc, "a string concatenation binds str — the shipped insert says so verbatim",
+            found_str, "")
+    }
+
+    # Cursor on a call identifier extracts the WHOLE call.
+    let lk: int = line_of(extract_call_src(), "println(double(21).to_str())")
+    let oute: LspOut = session(acc, "s4e", one_open("x.hls"),
+        one_text(extract_call_src()),
+        one_method("textDocument/codeAction"),
+        one_param(action_params(range_json(lk, 12, lk, 12))), no_pre())
+    let acte: JsonValue = action_of_kind(oute.results.get(0),
+    "refactor.extract")
+    if !is_null(acte) {
+        let txte: str = json_stringify(jobj(acte, "edit"))
+        chk(acc, "a cursor on `double` extends to the whole call — that is what extract-this means at a call",
+            txte.contains("let extracted: int = double(21)"), txte)
+    }
+
+    # A multi-line struct literal selection probes the struct type.
+    let lm: int = line_of(extract_structlit_src(), "let p: P2 = P2 {")
+    let outf: LspOut = session(acc, "s4f", one_open("x.hls"),
+        one_text(extract_structlit_src()),
+        one_method("textDocument/codeAction"),
+        one_param(action_params(range_json(lm, 15, lm + 2, 5))), no_pre())
+    let actf: JsonValue = action_of_kind(outf.results.get(0),
+    "refactor.extract")
+    if !is_null(actf) {
+        let txtf: str = json_stringify(jobj(actf, "edit"))
+        chk(acc, "a three-line struct literal extracts whole, type P2",
+            txtf.contains("let extracted: P2 = P2 {"), txtf)
+    }
+
+    # Refusal: selection inside an assignment target.
+    let lt: int = line_of(extract_target_src(), "acc = acc + 5")
+    let outg: LspOut = session(acc, "s4g", one_open("x.hls"),
+        one_text(extract_target_src()),
+        one_method("textDocument/codeAction"),
+        one_param(action_params(range_json(lt, 4, lt, 7))), no_pre())
+    chk(acc, "the assignment target earns no extract — the splice would write somewhere else",
+        is_null(action_of_kind(outg.results.get(0), "refactor.extract")), "")
+
+    # Refusal: selection inside a match arm body.
+    let lar: int = line_of(extract_arm_src(), "Shape.Circle(r) =>")
+    let outh: LspOut = session(acc, "s4h", one_open("x.hls"),
+        one_text(extract_arm_src()),
+        one_method("textDocument/codeAction"),
+        one_param(action_params(range_json(lar, 20, lar, 25))), no_pre())
+    chk(acc, "a match arm body has no statement position — no extract",
+        is_null(action_of_kind(outh.results.get(0), "refactor.extract")), "")
+
+    # Refusal: a selection spanning two statements.
+    let outi: LspOut = session(acc, "s4i", one_open("x.hls"),
+        one_text(extract_int_src()),
+        one_method("textDocument/codeAction"),
+        one_param(action_params(range_json(la, 20, la + 1, 12))), no_pre())
+    chk(acc, "a selection spanning two statements is not one expression",
+        is_null(action_of_kind(outi.results.get(0), "refactor.extract")), "")
+
+    # Refusal: `panic(...)` — every candidate passes, so none may ship.
+    let lp: int = line_of(extract_panic_src(), "panic(\"boom\")")
+    let outj: LspOut = session(acc, "s4j", one_open("x.hls"),
+        one_text(extract_panic_src()),
+        one_method("textDocument/codeAction"),
+        one_param(action_params(range_json(lp, 12, lp, 24))), no_pre())
+    chk(acc, "a `panic(...)` selection passes every candidate type and therefore earns none — never guess",
+        is_null(action_of_kind(outj.results.get(0), "refactor.extract")), "")
+}
+
+# ----------------------------------------------------------------------------
+# 5. the protocol.
+# ----------------------------------------------------------------------------
+
+fn s5_protocol(acc: Acc) -> void uses IO, Fs, Proc {
+    section("5. the protocol — capabilities, version, determinism, invalidation")
+
+    let la: int = line_of(proto_src(), "let total: int = add(40, 2)")
+    let methods: list[str] = ["textDocument/codeAction",
+    "textDocument/codeAction", "textDocument/codeAction",
+    "textDocument/rename", "textDocument/codeAction"]
+    let params: list[JsonValue] = [
+        action_params(range_json(la, 8, la, 8)),
+        action_params(range_json(la, 8, la, 8)),
+        action_params(range_json(400, 0, 400, 0)),
+        rename_params(400, 0, "zz"),
+        action_params(range_json(la, 4, la, 4))]
+    let out: LspOut = session(acc, "s5", one_open("p.hls"),
+        one_text(proto_src()), methods, params, no_pre())
+    let caps: JsonValue = jobj(out.init, "capabilities")
+    chk(acc, "codeActionProvider advertises exactly the two refactor kinds",
+        json_stringify(jobj(caps, "codeActionProvider"))
+        == json_stringify(json_object(["codeActionKinds"],
+        [json_array([json_str("refactor.extract"),
+        json_str("refactor.inline")])]))
+        || jstr(jobj(caps, "codeActionProvider"), "codeActionKinds")
+        == "refactor.extract", json_stringify(jobj(caps, "codeActionProvider")))
+    chk(acc, "serverInfo version is 0.134.0-alpha",
+        jstr(jobj(out.init, "serverInfo"), "version") == "0.134.0-alpha",
+        jstr(jobj(out.init, "serverInfo"), "version"))
+    chk(acc, "the whole session runs without a server-side traceback",
+        out.rc == 0 && out.err.trim() == "", clip(out.err, 120))
+    chk(acc, "repeated codeAction requests agree byte for byte",
+        json_stringify(out.results.get(0))
+        == json_stringify(out.results.get(1)), "")
+    chk(acc, "a garbage position answers empty (codeAction, rename) without dying",
+        json_stringify(out.results.get(2)) == "[]"
+        && json_stringify(out.results.get(3))
+        == json_stringify(json_object(["changes"],
+        [json_object([], [])])), json_stringify(out.results.get(2)))
+    let inline: JsonValue = action_of_kind(out.results.get(0),
+    "refactor.inline")
+    chk(acc, "the cursor on the binding offers the inline",
+        !is_null(inline), "")
+    if !is_null(inline) {
+        chk(acc, "isPreferred marks the inline",
+            jbool(inline, "isPreferred"), "")
+    }
+    chk(acc, "the binding's own name earns no extract — `let p: T = total` before the binding reads nothing new",
+        is_null(action_of_kind(out.results.get(0), "refactor.extract")), "")
+
+    # The initializer's call DOES earn the extract (cursor extends to
+    # the whole call).
+    let out2: LspOut = session(acc, "s5c", one_open("p3.hls"),
+        one_text(proto_src()), one_method("textDocument/codeAction"),
+        one_param(action_params(range_json(la, 22, la, 22))), no_pre())
+    let extract: JsonValue = action_of_kind(out2.results.get(0),
+    "refactor.extract")
+    if !is_null(extract) {
+        chk(acc, "the cursor on `add` offers the extract of the whole call, not preferred",
+            !jbool(extract, "isPreferred"), "")
+    }
+
+    # didChange invalidation: apply the inline, THEN ask again — the
+    # plan must see the EDITED buffer.
+    if !is_null(inline) {
+        let inlined_text: str = apply_lsp_edits(proto_src(),
+        edits_of(inline))
+        let pre: list[PreChange] = [PreChange { req_idx: 0, open_idx: 0,
+        text: inlined_text }]
+        let out3: LspOut = session(acc, "s5b", one_open("p2.hls"),
+            one_text(proto_src()), one_method("textDocument/codeAction"),
+            one_param(action_params(range_json(la, 8, la, 8))), pre)
+        chk(acc, "the post-edit session runs", out3.rc == 0, "")
+        chk(acc, "after the inline was applied, the same position no longer offers it — the plan saw the edited buffer",
+            is_null(action_of_kind(out3.results.get(0), "refactor.inline")), "")
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 6. the utf-16 line.
+# ----------------------------------------------------------------------------
+
+fn s6_utf16(acc: Acc) -> void uses IO, Fs, Proc {
+    section("6. the utf-16 line — the rocket shifts bytes, not character offsets")
+
+    let lm: int = line_of(emoji_src(), "let msg")
+    let luse: int = lm + 1
+    let offs: list[int] = line_starts(emoji_src())
+    let use_line: str = line_text_of(emoji_src(), offs, luse)
+    let byte_col: int = index_of_str(use_line, "msg")
+    let char16: int = utf16_len(use_line.slice(0, byte_col))
+    chk(acc, "the line really is byte-shifting (byte "
+        + byte_col.to_str() + " != utf16 " + char16.to_str()
+        + ") — the guard has something to guard",
+        byte_col != char16, "")
+
+    # Rename from the USE — the client sends UTF-16, the engine replies
+    # in UTF-16, and both land ON the identifier.
+    let methods: list[str] = ["textDocument/rename", "textDocument/rename"]
+    let params: list[JsonValue] = [rename_params(luse, char16, "note"),
+    rename_params(lm, 8, "note")]
+    let out: LspOut = session(acc, "s6", one_open("e.hls"),
+        one_text(emoji_src()), methods, params, no_pre())
+    let eds: list[JsonValue] = edits_of(out.results.get(0))
+    chk(acc, "renaming from the post-rocket use finds declaration and use (got "
+        + eds.len().to_str() + ")",
+        out.rc == 0 && eds.len() == 2, "")
+    let mut use_char_ok: bool = false
+    let mut ui: int = 0
+    while ui < eds.len() {
+        let st: JsonValue = jobj(jobj(eds.get(ui), "range"), "start")
+        if jint(st, "line") == luse {
+            use_char_ok = jint(st, "character") == char16
+        }
+        ui = ui + 1
+    }
+    chk(acc, "the use edit's character offset counts the rocket as TWO utf-16 units, not four bytes",
+        use_char_ok, "")
+    let new_text: str = apply_lsp_edits(emoji_src(), eds)
+    chk(acc, "the renamed emoji file reads correctly",
+        new_text.contains("let note: str") && new_text.contains("+ note)"),
+        new_text)
+
+    # The decl-side rename agrees.
+    let eds2: list[JsonValue] = edits_of(out.results.get(1))
+    chk(acc, "the plain-ASCII declaration edit's character offset is 8",
+        out.rc == 0 && eds2.len() == 2
+        && jint(jobj(jobj(eds2.get(0), "range"), "start"), "character")
+        == 8, json_stringify(json_array(eds2)))
+}
+
+# ----------------------------------------------------------------------------
+# 7. the edits land.
+# ----------------------------------------------------------------------------
+
+fn pinned_six(out: str) -> bool {
+    let offs: list[int] = line_starts(out)
+    if offs.len() < 7 {
+        return false
+    }
+    return line_text_of(out, offs, 0) == "42"
+    && line_text_of(out, offs, 1) == "43"
+    && line_text_of(out, offs, 2) == "12"
+    && line_text_of(out, offs, 3) == "24"
+    && line_text_of(out, offs, 4) == "10"
+    && line_text_of(out, offs, 5) == "big"
+}
+
+fn s7_edits_land(acc: Acc) -> void uses IO, Fs, Proc {
+    section("7. the edits land — every offered edit is applied and the result must check and run")
+
+    let corpus: str = read_file("tests/ok/feat_stage115_lsp_refactor.hls")
+
+    # Inline on the corpus: `scaled` is the single-use, call-free binding.
+    let ld: int = line_of(corpus, "let scaled: int = base * 2 + 1")
+    let out: LspOut = session(acc, "s7a", one_open("c.hls"),
+        one_text(corpus), one_method("textDocument/codeAction"),
+        one_param(action_params(range_json(ld, 8, ld, 8))), no_pre())
+    let act: JsonValue = action_of_kind(out.results.get(0),
+    "refactor.inline")
+    chk(acc, "the corpus's single-use binding offers the inline",
+        !is_null(act), "")
+    if !is_null(act) {
+        let new_text: str = apply_lsp_edits(corpus, edits_of(act))
+        let wf: str = scratch(acc, "s7a_inline.hls")
+        write_file(wf, new_text)
+        let boot: RunResult = run_capture("./bin/hlboot", [wf])
+        let boot_out: str = boot.out
+        chk(acc, "the inlined corpus runs and prints the same first two lines",
+            boot.code == 0
+            && line_starts(boot_out).len() >= 3
+            && line_text_of(boot_out, line_starts(boot_out), 0) == "42"
+            && line_text_of(boot_out, line_starts(boot_out), 1) == "43",
+            clip(boot_out, 120))
+    }
+
+    # Rename on the corpus: the match binding r -> radius.
+    let lr: int = line_of(corpus, "Shape.Circle(r) =>")
+    let outb: LspOut = session(acc, "s7b", one_open("c2.hls"),
+        one_text(corpus), one_method("textDocument/rename"),
+        one_param(rename_params(lr, 21, "radius")), no_pre())
+    let edsb: list[JsonValue] = edits_of(outb.results.get(0))
+    chk(acc, "the corpus match binding renames at two sites",
+        outb.rc == 0 && edsb.len() == 2, "")
+    if edsb.len() == 2 {
+        let new_b: str = apply_lsp_edits(corpus, edsb)
+        let wfb: str = scratch(acc, "s7b_rename.hls")
+        write_file(wfb, new_b)
+        let bootb: RunResult = run_capture("./bin/hlboot", [wfb])
+        chk(acc, "the renamed corpus prints the pinned six lines",
+            bootb.code == 0 && pinned_six(bootb.out),
+            clip(bootb.out, 120))
+    }
+
+    # Extract on the corpus: `base * 2` in the scaled line.
+    let lsc: int = line_of(corpus, "let scaled: int = base * 2 + 1")
+    let outc: LspOut = session(acc, "s7c", one_open("c3.hls"),
+        one_text(corpus), one_method("textDocument/codeAction"),
+        one_param(action_params(range_json(lsc, 22, lsc, 30))), no_pre())
+    let actc: JsonValue = action_of_kind(outc.results.get(0),
+    "refactor.extract")
+    chk(acc, "the corpus's `base * 2` offers the extract",
+        !is_null(actc), "")
+    if !is_null(actc) {
+        let new_c: str = apply_lsp_edits(corpus, edits_of(actc))
+        let wfc: str = scratch(acc, "s7c_extract.hls")
+        write_file(wfc, new_c)
+        let bootc: RunResult = run_capture("./bin/hlboot", [wfc])
+        chk(acc, "the extracted corpus prints the pinned six lines",
+            bootc.code == 0 && pinned_six(bootc.out),
+            clip(bootc.out, 120))
+    }
+}
+
+# ----------------------------------------------------------------------------
+# 8. the corpus.
+# ----------------------------------------------------------------------------
+
+fn s8_corpus(acc: Acc) -> void uses IO, Fs, Proc {
+    section("8. the corpus — smoke green, boot pinned, fmt stable, lint clean, the round-trip re-checks")
+
+    let smoke: RunResult = run_capture("python3", ["tools/lsp_smoke.py"])
+    chk(acc, "lsp_smoke.py passes (protocol resilience intact)",
+        smoke.code == 0, clip(smoke.err, 120))
+
+    let corpus_path: str = "tests/ok/feat_stage115_lsp_refactor.hls"
+    let corpus: str = read_file(corpus_path)
+    let boot: RunResult = run_capture("./bin/hlboot", [corpus_path])
+    chk(acc, "the corpus file runs under boot", boot.code == 0, "")
+    chk(acc, "the corpus output is the pinned 42 / 43 / 12 / 24 / 10 / big",
+        pinned_six(boot.out), clip(boot.out, 120))
+
+    let fmt: RunResult = run_capture("./bin/hlfmt", ["-c", corpus_path])
+    chk(acc, "hlfmt holds the corpus stable", fmt.code == 0,
+        clip(fmt.err, 120))
+
+    let lint: RunResult = run_capture("./bin/hllint", [corpus_path])
+    chk(acc, "hllint is clean on the corpus", lint.code == 0,
+        clip(lint.out + lint.err, 120))
+
+    # Round-trip: rename + inline + extract all at once, then re-check.
+    let ld: int = line_of(corpus, "let doubled: int = double(base)")
+    let lsc: int = line_of(corpus, "let scaled: int = base * 2 + 1")
+    let methods: list[str] = ["textDocument/rename",
+    "textDocument/codeAction", "textDocument/codeAction"]
+    let params: list[JsonValue] = [
+        rename_params(ld, 8, "twice"),
+        action_params(range_json(ld + 1, 12, ld + 1, 12)),
+        action_params(range_json(lsc, 24, lsc, 32))]
+    let out: LspOut = session(acc, "s8r", one_open("r.hls"),
+        one_text(corpus), methods, params, no_pre())
+    chk(acc, "the round-trip session runs", out.rc == 0, "")
+    let mut text: str = corpus
+    text = apply_lsp_edits(text, edits_of(out.results.get(0)))
+    let act_i: JsonValue = action_of_kind(out.results.get(1),
+    "refactor.inline")
+    if !is_null(act_i) {
+        text = apply_lsp_edits(text, edits_of(act_i))
+    }
+    let act_e: JsonValue = action_of_kind(out.results.get(2),
+    "refactor.extract")
+    if !is_null(act_e) {
+        text = apply_lsp_edits(text, edits_of(act_e))
+    }
+    chk(acc, "the rename landed in the round-trip text",
+        text.contains("let twice: int = double(base)"), clip(text, 200))
+    let wfr: str = scratch(acc, "s8_roundtrip.hls")
+    write_file(wfr, text)
+    let bootr: RunResult = run_capture("./bin/hlboot", [wfr])
+    chk(acc, "the round-tripped corpus prints the pinned six lines",
+        bootr.code == 0 && pinned_six(bootr.out), clip(bootr.out, 120))
+}
+
+# ----------------------------------------------------------------------------
+# The gate.
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Fs, Proc, Exit {
+    let acc: Acc = acc_new("lsp_refactor")
+    s1_scope_law(acc)
+    s2_renames(acc)
+    s3_inlines(acc)
+    s4_extracts(acc)
+    s5_protocol(acc)
+    s6_utf16(acc)
+    s7_edits_land(acc)
+    s8_corpus(acc)
+    return finish(acc, "Stage 115 -- LSP refactor actions")
+}

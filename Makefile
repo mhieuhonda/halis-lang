@@ -947,9 +947,9 @@ lsp-hints-acceptance: $(BIN)/acc-lsp_hints
 # protocol, the utf-16 line, the edits land, the smoke + corpus).
 # Protocol-level - the gate drives the real server over stdio JSON-RPC
 # and applies every offered edit before re-checking and re-running it.
-lsp-refactor-acceptance: $(BIN)/hlfmt
-	@echo "[Stage 115 acceptance] running tests/lsp_refactor_acceptance.py..."
-	@$(PYTHON) tests/lsp_refactor_acceptance.py
+lsp-refactor-acceptance: $(BIN)/acc-lsp_refactor $(BIN)/hlfmt
+	@echo "[Stage 115 acceptance] running tests/acc/lsp_refactor_acceptance.hls..."
+	@$(BIN)/acc-lsp_refactor
 
 # Stage 116 acceptance gate: the eight-section battery for hlfmt's
 # comment preservation (the sigils, the duplication law, the

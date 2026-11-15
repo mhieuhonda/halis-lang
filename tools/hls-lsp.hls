@@ -1412,7 +1412,10 @@ fn ls_parse_sym_lines(out: str) -> Syms {
             }
         } else if ls_starts(line, "STRUCT ") {
             let parts: list[str] = line.split(" ")
-            if parts.len() >= 6 {
+            # "STRUCT <name> <line> <fields|> <ftypes|>" — FIVE parts
+            # (an empty field list prints the bare "|" pairs of the
+            # empty-list law, never a missing column).
+            if parts.len() >= 5 {
                 syms.structs.push(SymStruct {
                     name: parts.get(1), line: ls_atoi(parts.get(2)),
                     fields: ls_split_list(parts.get(3), "|"),
@@ -3543,18 +3546,26 @@ struct ByteEdit {
 
 # rf_apply_edits — apply byte edits bottom-up (reverse-sorted by a).
 fn rf_apply_edits(text: str, edits: list[ByteEdit]) -> str {
-    # insertion sort by a, descending — only pointer slots move.
+    # Sort a COPY descending by a — the caller's list keeps its source
+    # order (the .py's sorted(); an in-place sort here used to leak the
+    # reordering into the edits the handlers then shipped).
+    let sorted: list[ByteEdit] = []
+    let mut ci: int = 0
+    while ci < edits.len() {
+        sorted.push(edits.get(ci))
+        ci = ci + 1
+    }
     let mut i: int = 1
-    while i < edits.len() {
-        let it: ByteEdit = edits.get(i)
+    while i < sorted.len() {
+        let it: ByteEdit = sorted.get(i)
         let mut j: int = i - 1
         let mut pos: int = i
-        while j >= 0 && edits.get(j).a < it.a {
-            edits.set(j + 1, edits.get(j))
+        while j >= 0 && sorted.get(j).a < it.a {
+            sorted.set(j + 1, sorted.get(j))
             pos = j
             j = j - 1
         }
-        edits.set(pos, it)
+        sorted.set(pos, it)
         i = i + 1
     }
     let mut out: str = text
@@ -3564,8 +3575,8 @@ fn rf_apply_edits(text: str, edits: list[ByteEdit]) -> str {
     # first, and every later edit landed shifted by the splice before
     # it — an inline's use-site replacements landed mid-identifier.)
     let mut k: int = 0
-    while k < edits.len() {
-        let e: ByteEdit = edits.get(k)
+    while k < sorted.len() {
+        let e: ByteEdit = sorted.get(k)
         out = out.slice(0, e.a) + e.new_text + out.slice(e.b, out.len())
         k = k + 1
     }
@@ -4078,19 +4089,21 @@ fn ls_handle_rename(st: LsState, params: JsonValue, idv: JsonValue)
             return rf_rename_local(st, idv, di, decls, decl_i,
             new_name, lo, hi)
         }
-        # 2. FIELD / METHOD — reachable only through a dot.
-        let docs: list[DocRec] = []
-        let mut dj: int = 0
-        while dj < st.docs.len() {
-            if !st.docs.get(dj).dead {
-                docs.push(st.docs.get(dj))
-            }
-            dj = dj + 1
+    }
+    # 2. FIELD / METHOD — reachable through a dot or a struct-body
+    # declaration, which sits OUTSIDE every fn span: classify runs
+    # wherever the local engine missed (the .py's level).
+    let docs: list[DocRec] = []
+    let mut dj: int = 0
+    while dj < st.docs.len() {
+        if !st.docs.get(dj).dead {
+            docs.push(st.docs.get(dj))
         }
-        let mode: str = ls_classify_dot_name(d, idx, name, docs)
-        if mode == "field" || mode == "method" {
-            return rf_rename_dotted(st, idv, name, new_name, mode)
-        }
+        dj = dj + 1
+    }
+    let mode: str = ls_classify_dot_name(d, idx, name, docs)
+    if mode == "field" || mode == "method" {
+        return rf_rename_dotted(st, idv, name, new_name, mode)
     }
     # 3. GLOBAL — the Stage 14 textual contract.
     let changes_keys: list[str] = []
@@ -5260,6 +5273,62 @@ fn main() -> int uses IO, Args, Exit, Proc, Fs {
             let start: int = ctx.pos
             let _s: int = parse_stmt(ctx)
             println("RFSTMT " + (ctx.pos - start).to_str())
+            return 0
+        }
+        if argv.get(i) == "--rf-test" && i + 2 < argv.len() {
+            # One dotted rename, raw ByteEdits printed (line:col of a/b).
+            let path: str = argv.get(i + 1)
+            let name: str = argv.get(i + 2)
+            let text: str = read_file(path)
+            let d: DocRec = DocRec {
+                uri: "file:///rf.hls", path: path, version: 1,
+                text: text, toks: ls_lex(text),
+                offs: ls_line_offsets(text),
+                syms: ls_syms_empty(), parse_err: false, err_line: 0,
+                err_col: 0, err_msg: "", dead: false, calls: [],
+                arms: []
+            }
+            let p2: ProbeOut = ls_probe_run(path)
+            d.syms = p2.syms
+            let braces: BraceMap = ls_brace_matches(d.toks)
+            let depths: list[int] = ls_tok_depths(d.toks)
+            let sregions: list[list[int]] = ls_decl_regions(d.toks,
+            braces, "struct")
+            let iregions: list[list[int]] = ls_decl_regions(d.toks,
+            braces, "impl")
+            let edits: list[ByteEdit] = []
+            let mut ti: int = 0
+            while ti < d.toks.len() {
+                let t: LTok = d.toks.get(ti)
+                if t.kind == "ident" && t.value == name {
+                    let mut hit: bool = false
+                    if ti > 0 && d.toks.get(ti - 1).kind == "sym"
+                    && d.toks.get(ti - 1).value == "." {
+                        hit = true
+                    }
+                    if !hit && ti + 1 < d.toks.len()
+                    && d.toks.get(ti + 1).kind == "sym"
+                    && d.toks.get(ti + 1).value == ":" {
+                        let mut ri: int = 0
+                        while ri < sregions.len() {
+                            let r: list[int] = sregions.get(ri)
+                            if r.get(0) < ti && ti < r.get(1) {
+                                hit = true
+                            }
+                            ri = ri + 1
+                        }
+                        if !hit {
+                            hit = ls_structlit_key_at(d.toks, depths, ti)
+                        }
+                    }
+                    if hit {
+                        println("EDIT a=" + t.off.to_str() + " b="
+                        + (t.off + t.len).to_str() + " tok_line="
+                        + t.line.to_str())
+                    }
+                }
+                ti = ti + 1
+            }
             return 0
         }
         if argv.get(i) == "--debug-walk" && i + 1 < argv.len() {
