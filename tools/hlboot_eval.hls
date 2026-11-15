@@ -77,6 +77,7 @@ import "std.str"
 import "std.env"
 import "std.base64"
 import "std.process"
+import "std.sync"
 
 # ----------------------------------------------------------------------------
 # The runtime value. Python used native objects (int/float/bool/bytes/
@@ -366,7 +367,16 @@ struct Boot {
     # monkey-patched call_fn; the port counts in the evaluator itself.
     # (fn key -> call count; armed by --cov-run.)
     cov_on: bool,
-    cov_hits: map[str, int]
+    cov_hits: map[str, int],
+    # ---- Stage 121 (v0.140.0-alpha): the debug hook surface ----
+    # dbg: the DAP adapter's hook state (tools/hls-dap.hls). Inactive
+    # by default — every non-DAP door (bin/hlboot, hls-repl) pays one
+    # flag test per hook site and nothing else. It rides Boot, NOT
+    # BootCore: a task thread's Boot is rebuilt from the core, so task
+    # threads run unhooked (the honest Stage-0 reference-debugger
+    # limit, documented in the adapter's header; the .py era hooked
+    # every thread, the native gate drives single-threaded programs).
+    dbg: DbgState
 }
 
 # BootCore — the crossing payload: everything a spawned task needs to
@@ -405,7 +415,7 @@ fn boot_core_of(boot: Boot) -> BootCore {
 }
 
 # boot_of_core(core) — the task-side rebuild (a fresh task table).
-fn boot_of_core(core: BootCore) -> Boot {
+fn boot_of_core(core: BootCore) -> Boot uses Conc {
     return Boot {
         ctx: core.ctx,
         tasks: [],
@@ -417,7 +427,8 @@ fn boot_of_core(core: BootCore) -> Boot {
         target_feature: core.target_feature,
         sandbox: core.sandbox,
         cov_on: core.cov_on,
-        cov_hits: core.cov_hits
+        cov_hits: core.cov_hits,
+        dbg: dbg_new()
     }
 }
 
@@ -1056,6 +1067,356 @@ fn env_lookup_quiet(env: list[Fr], name: str) -> V uses Conc {
 }
 
 # ----------------------------------------------------------------------------
+# The Stage 121 debug hook surface — the native twin of the .py era's
+# monkey-patched exec_stmt / call_fn. The DAP adapter (tools/hls-dap.hls)
+# arms dbg.active and runs programs through THIS evaluator; the hooks
+# maintain the frame chain, verify stops against the real statement
+# table, and park the run thread on the resume channel until the
+# adapter hands back a verb. Everything that crosses threads is a
+# channel (the runtime's clone() deep-copies structs and shares only
+# channels, so a channel is the ONE honest crossing): stops carry
+# their snapshot OUT on dbg.events, resume verbs and breakpoint
+# replacements come IN on dbg.resume. The engine itself is
+# single-threaded — the run thread owns its whole DbgState. With
+# dbg.active false (every non-DAP door: bin/hlboot, hls-repl) each
+# hook site is one flag test and nothing else changes.
+# ----------------------------------------------------------------------------
+
+# DbgFr — one frame of the debugger's chain (the .py's hook_enter
+# frame dict): the fn's table key (which is also its display name —
+# top-level fns print bare, impl methods print Struct.method), the
+# declaring file, the line the frame is ABOUT to run, and the frame's
+# live scope chain (frozen while the thread is parked).
+struct DbgFr {
+    fn_key: str,
+    file: str,
+    line: int,
+    env: list[Fr]
+}
+
+# DbgThread — the per-host-thread stop state (the .py's states dict
+# entries; the native key is thread_current_id()).
+struct DbgThread {
+    mode: int, # 0 run / 1 paused
+    cmd_verb: str, # the armed step verb: "" none; "continue"/"in"/"over"/"out"
+    cmd_depth: int, # the frame depth the verb was armed at
+    pause_req: bool,
+    reason: str,
+    frames: list[DbgFr] # the live chain
+}
+
+# DbgCmd — one resume verb from the adapter (the .py's resume fns,
+# made messages). "bps" replaces the breakpoint table and keeps the
+# thread parked; the rest release it (a step verb stays armed for the
+# next statement, exactly the .py's cmd tuple).
+struct DbgCmd {
+    verb: str, # "continue" / "in" / "over" / "out" / "pause" / "bps"
+    depth: int, # the pause depth (main reads it off the snapshot)
+    bps: map[str, list[int]] # verb "bps": the full replacement table
+}
+
+# DbgEvent — one protocol-neutral event for the adapter's main loop
+# (output lines as they are printed, stops with their snapshot; the
+# adapter appends exited / terminated / the reader's requests). FIFO
+# order on the channel IS the wire order.
+struct DbgEvent {
+    kind: str, # "output"|"stopped"|"exited"|"terminated"|"request"|"badframe"|"eof"
+    category: str, # output: "stdout" | "stderr"
+    text: str, # output: the bytes; stopped: the exception message;
+               # request/badframe: the body / the framing error detail
+    reason: str, # stopped: entry|breakpoint|step|pause|exception
+    thread: str, # stopped: the tid key
+    code: int, # exited: the exit code
+    snap: list[DbgFr] # stopped: the paused snapshot, outermost first
+}
+
+# DbgState — the engine (the .py's DebugEngine, made a plain struct
+# the hooks reach through boot.dbg; owned by the run thread alone).
+struct DbgState {
+    active: bool,
+    no_debug: bool,
+    stop_on_panic: bool,
+    stop_on_entry: bool,
+    entry_done: bool,
+    in_eval: int, # >0: evaluation runs, hooks stand down
+    bps: map[str, list[int]], # file -> verified breakpoint lines
+    threads: map[str, DbgThread],
+    panic_msg: str, # the first (deepest) panic record; "" = none
+    panic_line: int,
+    panic_tid: str,
+    panic_snap: list[DbgFr],
+    events: Chan[DbgEvent], # OUT to the adapter (shared channel)
+    resume: Chan[DbgCmd] # IN from the adapter (shared channel)
+}
+
+# dbg_new() — the inactive state every non-DAP door starts with (the
+# channels exist but nobody ever arms the engine).
+fn dbg_new() -> DbgState uses Conc {
+    return DbgState {
+        active: false,
+        no_debug: false,
+        stop_on_panic: true,
+        stop_on_entry: false,
+        entry_done: false,
+        in_eval: 0,
+        bps: map_new(),
+        threads: map_new(),
+        panic_msg: "",
+        panic_line: 0,
+        panic_tid: "",
+        panic_snap: [],
+        events: chan_new(),
+        resume: chan_new()
+    }
+}
+
+# dbg_capture_out(boot, text, is_err) — the program's print family
+# under the debugger: the bytes become output events on the wire (the
+# adapter's stdout IS the protocol; the program's stdout would corrupt
+# it). stderr tees — the event goes out AND the real stderr keeps it
+# (the .py's Tee; the adapter is transparent, never lossy).
+fn dbg_capture_out(boot: Boot, text: str, is_err: bool) -> void uses Conc, IO {
+    let mut cat: str = "stdout"
+    if is_err {
+        cat = "stderr"
+    }
+    boot.dbg.events.send(DbgEvent {
+        kind: "output", category: cat, text: text, reason: "",
+        thread: "", code: 0, snap: []
+    })
+    if is_err {
+        eprint(text)
+    }
+}
+
+# dbg_tid() — the current host thread's key.
+fn dbg_tid() -> int uses Conc {
+    return thread_current_id()
+}
+
+# dbg_thread_default() — a throwaway record for get_or fallbacks
+# (map has no plain get; every real lookup is has-guarded first, so
+# the default is never actually used — it is only evaluated).
+fn dbg_thread_default() -> DbgThread {
+    return DbgThread {
+        mode: 0, cmd_verb: "", cmd_depth: 0, pause_req: false,
+        reason: "", frames: []
+    }
+}
+
+# dbg_thread_of(dbg, tid) — the state record, created on demand.
+fn dbg_thread_of(dbg: DbgState, tid: str) -> DbgThread {
+    let st: DbgThread = DbgThread {
+        mode: 0, cmd_verb: "", cmd_depth: 0, pause_req: false,
+        reason: "", frames: []
+    }
+    dbg.threads.set(tid, st)
+    return st
+}
+
+# dbg_canon_path(p) — the lexical canonical form of a path (absolute,
+# no "//", no "." or ".." segments): the one spelling breakpoints,
+# fn-attribution files and stack frames all share, so a path written
+# three ways still matches once. (The .py used os.path.realpath; the
+# port contains lexically — the debugger never follows symlinks.)
+fn dbg_canon_path(p: str) -> str uses Proc {
+    let mut q: str = p
+    if q.len() == 0 {
+        return q
+    }
+    if q.byte_at(0) != 47 {
+        let cwd: str = cwd_get()
+        if cwd.len() > 0 {
+            if cwd.byte_at(cwd.len() - 1) == 47 {
+                q = cwd + q
+            } else {
+                q = cwd + "/" + q
+            }
+        }
+    }
+    let parts: list[str] = q.split("/")
+    let stack: list[str] = []
+    let mut i: int = 0
+    while i < parts.len() {
+        let seg: str = parts.get(i)
+        if seg == "" || seg == "." {
+            # skip
+        } else if seg == ".." {
+            if stack.len() > 0 {
+                let _pop: str = stack.pop()
+            }
+        } else {
+            stack.push(seg)
+        }
+        i = i + 1
+    }
+    let mut abs: str = ""
+    let mut j: int = 0
+    while j < stack.len() {
+        abs = abs + "/" + stack.get(j)
+        j = j + 1
+    }
+    if abs == "" {
+        abs = "/"
+    }
+    return abs
+}
+
+# dbg_on_call(boot, key) — the call_fn enter hook: push the frame and
+# register the thread (the .py's hook_enter).
+fn dbg_on_call(boot: Boot, key: str) -> void uses Conc, Proc {
+    let dbg: DbgState = boot.dbg
+    if dbg.in_eval > 0 {
+        return
+    }
+    let f: FnInfo = boot.ctx.fns.get_or(key, dummy_fn())
+    let fr: DbgFr = DbgFr {
+        fn_key: key, file: dbg_canon_path(f.src_file), line: 0, env: []
+    }
+    let tid: str = dbg_tid().to_str()
+    if !dbg.threads.has(tid) {
+        let _st: DbgThread = dbg_thread_of(dbg, tid)
+    }
+    let st: DbgThread = dbg.threads.get_or(tid, dbg_thread_default())
+    st.frames.push(fr)
+}
+
+# dbg_on_leave(boot, r) — the call_fn exit hook: pop the frame, and —
+# the one place a panic can be recorded — when the returning flow is
+# a panic and no record exists yet, snapshot the chain BEFORE the pop
+# (the .py's record_panic: the first, deepest frame wins).
+fn dbg_on_leave(boot: Boot, r: R) -> void uses Conc {
+    let dbg: DbgState = boot.dbg
+    if dbg.in_eval > 0 {
+        return
+    }
+    let tid: str = dbg_tid().to_str()
+    if !dbg.threads.has(tid) {
+        return
+    }
+    let st: DbgThread = dbg.threads.get_or(tid, dbg_thread_default())
+    if r.flow == FL_PANIC() && dbg.panic_line == 0 {
+        let mut snap: list[DbgFr] = []
+        let mut i: int = 0
+        while i < st.frames.len() {
+            snap.push(st.frames.get(i))
+            i = i + 1
+        }
+        if snap.len() > 0 {
+            let top: DbgFr = snap.get(snap.len() - 1)
+            top.line = r.line
+        }
+        dbg.panic_msg = r.msg
+        dbg.panic_line = r.line
+        dbg.panic_tid = tid
+        dbg.panic_snap = snap
+    }
+    if st.frames.len() > 0 {
+        let _p: DbgFr = st.frames.pop()
+    }
+}
+
+# dbg_park(dbg, tid, st, reason, snap, text) — the one stop
+# discipline (the .py's _go_paused + wait): publish the stopped event
+# with its snapshot, then block on the resume channel; "bps" commands
+# replace the table and keep the thread parked, anything else arms
+# the verb for the next statement (the .py's cmd tuple) and releases.
+fn dbg_park(dbg: DbgState, tid: str, st: DbgThread, reason: str,
+snap: list[DbgFr], text: str) -> void uses Conc {
+    st.mode = 1
+    st.reason = reason
+    st.cmd_verb = ""
+    st.cmd_depth = 0
+    dbg.events.send(DbgEvent {
+        kind: "stopped", category: "", text: text, reason: reason,
+        thread: tid, code: 0, snap: snap
+    })
+    let mut cmd: DbgCmd = DbgCmd {
+        verb: "continue", depth: 0, bps: dbg.bps
+    }
+    while true {
+        cmd = dbg.resume.recv()
+        if cmd.verb == "bps" {
+            dbg.bps = cmd.bps
+            continue
+        }
+        break
+    }
+    if cmd.verb == "pause" {
+        st.pause_req = true
+    } else {
+        st.cmd_verb = cmd.verb
+        st.cmd_depth = cmd.depth
+    }
+    st.mode = 0
+}
+
+# dbg_on_stmt(boot, env, si) — THE stop checkpoint, before the
+# statement runs: a stop shows the line that is ABOUT to execute (the
+# .py's hook_stmt, one law).
+fn dbg_on_stmt(boot: Boot, env: list[Fr], si: int) -> void uses Conc {
+    let dbg: DbgState = boot.dbg
+    if dbg.in_eval > 0 {
+        return
+    }
+    let tid: str = dbg_tid().to_str()
+    let s: StmtN = boot.ctx.stmts.get(si)
+    if !dbg.threads.has(tid) {
+        return
+    }
+    let st: DbgThread = dbg.threads.get_or(tid, dbg_thread_default())
+    if st.frames.len() == 0 {
+        return
+    }
+    let top: DbgFr = st.frames.get(st.frames.len() - 1)
+    top.line = s.line
+    top.env = env
+    let mut reason: str = ""
+    if dbg.stop_on_entry && !dbg.entry_done && !dbg.no_debug
+    && st.frames.len() == 1 && top.fn_key == "main" {
+        dbg.entry_done = true
+        reason = "entry"
+    }
+    if reason == "" && !dbg.no_debug {
+        if dbg.bps.has(top.file) {
+            let lines: list[int] = dbg.bps.get_or(top.file, [])
+            let mut bi: int = 0
+            while bi < lines.len() {
+                if lines.get(bi) == s.line {
+                    reason = "breakpoint"
+                }
+                bi = bi + 1
+            }
+        }
+        if reason == "" && st.cmd_verb != "" {
+            let verb: str = st.cmd_verb
+            let depth: int = st.frames.len()
+            if verb == "in" {
+                reason = "step"
+            } else if verb == "over" && depth <= st.cmd_depth {
+                reason = "step"
+            } else if verb == "out" && depth < st.cmd_depth {
+                reason = "step"
+            }
+        }
+        if reason == "" && st.pause_req {
+            st.pause_req = false
+            reason = "pause"
+        }
+    }
+    if reason == "" {
+        return
+    }
+    let mut snap: list[DbgFr] = []
+    let mut i: int = 0
+    while i < st.frames.len() {
+        snap.push(st.frames.get(i))
+        i = i + 1
+    }
+    dbg_park(dbg, tid, st, reason, snap, "")
+}
+
+# ----------------------------------------------------------------------------
 # The statement executor. `cur` is the executing fn's key — the
 # #[tail_call] return arm needs it (the interpreter's thread-local
 # fn_stack, made a parameter).
@@ -1080,6 +1441,9 @@ fn exec_stmts(boot: Boot, env: list[Fr], body: list[int], cur: str) -> R uses IO
 
 # exec_stmt(boot, env, si, cur) -> R — one statement.
 fn exec_stmt(boot: Boot, env: list[Fr], si: int, cur: str) -> R uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    if boot.dbg.active {
+        dbg_on_stmt(boot, env, si)
+    }
     let s: StmtN = boot.ctx.stmts.get(si)
     let k: str = s.kind
     if k == "expr" {
@@ -1694,8 +2058,24 @@ fn check_refine(boot: Boot, pred_text: str, val: V, what: str, line: int) -> R u
 # receiver slot for methods, parameter binding, refinement guards on
 # refined parameters, the contracts-mode requires, the body, the
 # return-side ret_pred + ensures, and the #[tail_call] trampoline.
+# Under the debug hooks this is the WRAPPER: dbg_on_call pushes the
+# frame, dbg_on_leave pops it (and records the first, deepest panic);
+# the recursion inside (foreign tail calls, the panic handler)
+# re-enters the wrapper, so the chain stays exact. The .py era wrapped
+# the interpreter's methods from outside; the port owns the seam.
 # ----------------------------------------------------------------------------
 fn call_fn(boot: Boot, key: str, args: list[V]) -> R uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    if boot.dbg.active {
+        dbg_on_call(boot, key)
+    }
+    let r: R = call_fn_inner(boot, key, args)
+    if boot.dbg.active {
+        dbg_on_leave(boot, r)
+    }
+    return r
+}
+
+fn call_fn_inner(boot: Boot, key: str, args: list[V]) -> R uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
     if boot.cov_on {
         boot.cov_hits.set(key, boot.cov_hits.get_or(key, 0) + 1)
     }
@@ -2225,19 +2605,38 @@ fn is_owned_v(v: V) -> bool {
 # ----------------------------------------------------------------------------
 fn builtin(boot: Boot, name: str, args: list[V], arg_nodes: list[int], line: int) -> R uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
     if name == "print" {
-        print(args.get(0).s)
+        if boot.dbg.active {
+            dbg_capture_out(boot, args.get(0).s, false)
+        } else {
+            print(args.get(0).s)
+        }
         return r_unit()
     }
     if name == "println" {
-        println(args.get(0).s)
+        if boot.dbg.active {
+            dbg_capture_out(boot, args.get(0).s + "\n", false)
+        } else {
+            println(args.get(0).s)
+        }
         return r_unit()
     }
+    if name == "read_byte" {
+        return r_ok(v_int(read_byte()))
+    }
     if name == "eprint" {
-        eprint(args.get(0).s)
+        if boot.dbg.active {
+            dbg_capture_out(boot, args.get(0).s, true)
+        } else {
+            eprint(args.get(0).s)
+        }
         return r_unit()
     }
     if name == "eprintln" {
-        eprintln(args.get(0).s)
+        if boot.dbg.active {
+            dbg_capture_out(boot, args.get(0).s + "\n", true)
+        } else {
+            eprintln(args.get(0).s)
+        }
         return r_unit()
     }
     if name == "isatty" {
@@ -3588,7 +3987,8 @@ fn hb_load_checked(path: str, prog_args: list[str], contracts: bool, target_feat
         target_feature: target_feature,
         sandbox: sandbox,
         cov_on: env_get("HLBOOT_COV") != "",
-        cov_hits: map_new()
+        cov_hits: map_new(),
+        dbg: dbg_new()
     }
     return boot
 }

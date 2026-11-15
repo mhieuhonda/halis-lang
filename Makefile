@@ -423,7 +423,7 @@ $(BIN)/hls-repl: tools/hls-repl.hls tools/hlboot_eval.hls tools/hlfront.hls tool
 
 # hls-dap -- in Halis (the native twin of the Python hls-dap.py that
 # retired; same CLI, same wire, same exits).
-$(BIN)/hls-dap: tools/hls-dap.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
+$(BIN)/hls-dap: tools/hls-dap.hls tools/hlboot_eval.hls tools/hlfront.hls src/hlc.hls $(wildcard src/hlc/*.hls) $(wildcard std/*.hls) $(wildcard core/*.hls) | $(BIN)/hlc
 	@mkdir -p $(BIN)
 	@echo "[hls-dap] hlc compiles the tool (self-hosted, no python)..."
 	@$(BIN)/hlc tools/hls-dap.hls $@.c

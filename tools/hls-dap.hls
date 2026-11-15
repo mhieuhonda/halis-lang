@@ -1,0 +1,2086 @@
+# ============================================================================
+# tools/hls-dap.hls — Debug Adapter Protocol server for Halis (HLS).
+# ----------------------------------------------------------------------------
+# Stage 121 (v0.140.0-alpha): VS Code extension debugger integration
+# (DAP). The native twin of the Python hls-dap.py that retired — same
+# wire, same requests, same events, same verdicts.
+#
+# The adapter speaks the Debug Adapter Protocol over stdio (the same
+# Content-Length framing the language server uses), so any DAP client
+# — VS Code first — can debug a Halis program through the Stage-0
+# evaluator: the same reference implementation bin/hlboot runs.
+#
+# Design contract (the house discipline: never guess):
+#
+#   * The program is PARSED AND CHECKED FIRST, in a probe child (the
+#     tool re-execs itself with --dap-probe and reads the exit code —
+#     the front-end's failure mode is a panic, and a panic must never
+#     kill the pipe). A program the compiler rejects never starts
+#     debugging: the launch request fails with the real checker
+#     diagnostic, the same text hlc prints.
+#   * Execution runs in a run thread through the UNTOUCHED evaluator
+#     (tools/hlboot_eval.hls) under its Stage-121 hook layer: the
+#     hooks maintain the frame chain, verify stops against the real
+#     statement table, and park on the resume channel. The evaluator
+#     itself is not modified — differential behaviour, bootstrap, and
+#     every suite stay exactly as they were (with the hooks disarmed
+#     each hook site is one flag test).
+#   * A stop is a real pause: the run thread blocks on the resume
+#     channel and nothing of the program mutates while the variables
+#     view reads the frozen snapshot.
+#   * Breakpoints are VERIFIED against the statement lines of the real
+#     AST: a line without a statement snaps DOWN to the next line that
+#     has one (the response says so), and a breakpoint in a file the
+#     program does not contain is refused (unverified) — statement to
+#     file attribution is exact (FnInfo.src_file), so a line number in
+#     one file can never stop another file's execution.
+#   * Expressions typed in the debug console (and hovers) are
+#     validated by a probe child (--dap-expr-probe — the parser's
+#     failure mode is a panic too), then parsed in-process, annotated
+#     with the checker's own dispatch rules, and evaluated by the REAL
+#     evaluator in the paused frame's real environment; a panic in the
+#     expression is an error result, never a dead session.
+#
+# Threading (the runtime's clone() deep-copies structs and shares only
+# channels, so a channel is the ONE honest crossing):
+#
+#   reader thread   stdin frames  -> DbgEvent{request|badframe|eof}
+#   run thread      the program   -> DbgEvent{output|stopped|exited|...}
+#                 <- DbgCmd{continue|in|over|out|pause|bps} on resume
+#   main thread     the ONE stdout writer (responses and events, in
+#                   arrival order on the merge channel) and the only
+#                   toucher of the session state.
+#
+# Requests: initialize, launch, setBreakpoints, setExceptionBreakpoints,
+# configurationDone, threads, stackTrace, scopes, variables, evaluate,
+# continue, next, stepIn, stepOut, pause, disconnect, terminate.
+# Events: initialized, process, output, stopped, exited, terminated.
+#
+# Launch arguments:
+#   program (required)     path to the .hls entry file
+#   args                   list of program arguments
+#   stopOnEntry            break at the first statement of main
+#   noDebug                run without stopping (output still forwarded)
+#
+# Usage: bin/hls-dap                  (DAP over stdio)
+#        bin/hls-dap --dap-probe P    (child: load+check P; exit 0/panic)
+#        bin/hls-dap --dap-expr-probe E  (child: parse E as one
+#                                     expression; exit 0/panic)
+#
+# Known limits (Stage-0 reference debugger): a pause request sent to a
+# running thread lands at its next stop (the resume channel is only
+# read while parked); breakpoints replaced while the program runs
+# apply from its next stop; task threads run unhooked (the hook state
+# rides Boot, not BootCore); `asm!` statements panic under the
+# evaluator exactly as bin/hlboot documents.
+# ============================================================================
+import "./hlboot_eval.hls"
+import "std.str"
+import "std.json"
+import "std.result"
+
+# ----------------------------------------------------------------------------
+# The session state — main-thread only.
+# ----------------------------------------------------------------------------
+
+# FrameRef — a frameId's referent (the DAP ids the stackTrace response
+# hands out; fresh per stackTrace call, like the .py's registrations).
+struct FrameRef {
+    tid: str,
+    idx: int
+}
+
+# VarHandle — a variablesReference's referent (the .py's handle
+# records: what the variables request expands).
+struct VarHandle {
+    kind: str, # "locals" | "list" | "fields" | "enum" | "tainted"
+    value: V, # the value (list/struct/enum/tainted rows)
+    elem: str, # list: the element type from the declaration
+    ty: str, # fields: the declared type
+    env: list[Fr], # locals: the frame's scope chain
+    frame_fn: str # locals: the frame's fn key (declared types)
+}
+
+# SnapRec — the registry's entry for a stopped thread: the frozen
+# snapshot plus what the stopped event said.
+struct SnapRec {
+    snap: list[DbgFr],
+    reason: str,
+    text: str,
+    paused: bool
+}
+
+# ProgInfo — everything static the debugger needs, built once from
+# the real checked tables (the .py's ProgramInfo; fn->file attribution
+# is FnInfo.src_file, so no re-parse walk is needed).
+struct ProgInfo {
+    file_lines: map[str, list[int]], # canon(file) -> sorted stmt lines
+    var_types: map[str, map[str, str]] # fn key -> name -> declared type
+}
+
+# RunArgs — the spawn payload for the run thread (plain data plus the
+# two shared channels).
+struct RunArgs {
+    program: str,
+    prog_args: list[str],
+    stop_on_entry: bool,
+    no_debug: bool,
+    stop_on_panic: bool,
+    bps: map[str, list[int]],
+    events: Chan[DbgEvent],
+    resume: Chan[DbgCmd]
+}
+
+# ReadArgs — the spawn payload for the reader thread.
+struct ReadArgs {
+    events: Chan[DbgEvent]
+}
+
+# DapSess — the main thread's world.
+struct DapSess {
+    seq: int,
+    events: Chan[DbgEvent],
+    resume: Chan[DbgCmd],
+    boot: Boot, # main's own load (ProgramInfo + evaluate; hooks OFF)
+    info: ProgInfo,
+    initialized: bool,
+    launched: bool,
+    run_started: bool,
+    program_path: str,
+    prog_args: list[str],
+    no_debug: bool,
+    stop_on_entry: bool,
+    stop_on_panic: bool,
+    bps: map[str, list[int]], # the current verified table (main's copy)
+    snaps: map[str, SnapRec], # tid -> the latest stop
+    thread_ids: map[str, int], # tid -> the DAP threadId (1 = first seen)
+    next_thread_id: int,
+    next_handle: int,
+    frame_handles: map[str, FrameRef], # map keys are str; ids stringify
+    var_handles: map[str, VarHandle],
+    eval_env: list[Fr], # the paused frame the annotation resolves in
+    eval_fn: str
+}
+
+fn dap_sess_new() -> DapSess uses Conc {
+    return DapSess {
+        seq: 0,
+        events: chan_new(),
+        resume: chan_new(),
+        boot: boot_empty(),
+        info: ProgInfo {
+            file_lines: map_new(),
+            var_types: map_new()
+        },
+        initialized: false,
+        launched: false,
+        run_started: false,
+        program_path: "",
+        prog_args: [],
+        no_debug: false,
+        stop_on_entry: false,
+        stop_on_panic: true,
+        bps: map_new(),
+        snaps: map_new(),
+        thread_ids: map_new(),
+        next_thread_id: 1,
+        next_handle: 1,
+        frame_handles: map_new(),
+        var_handles: map_new(),
+        eval_env: [],
+        eval_fn: ""
+    }
+}
+
+# boot_empty() — a placeholder until launch loads the real one (an
+# empty ctx; never evaluated).
+fn boot_empty() -> Boot uses Conc {
+    let ctx: Ctx = new_ctx("")
+    return Boot {
+        ctx: ctx,
+        tasks: [],
+        rng: 1,
+        argv: v_list([]),
+        det: false,
+        trace: false,
+        contracts: false,
+        target_feature: "",
+        sandbox: "",
+        cov_on: false,
+        cov_hits: map_new(),
+        dbg: dbg_new()
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Small text helpers.
+# ----------------------------------------------------------------------------
+
+# dap_basename(p) — everything after the last "/".
+fn dap_basename(p: str) -> str {
+    let mut i: int = p.len() - 1
+    while i >= 0 {
+        if p.byte_at(i) == 47 {
+            return p.slice(i + 1, p.len())
+        }
+        i = i - 1
+    }
+    return p
+}
+
+# dap_shorten(text) — the .py's _shorten: 220 bytes then an ellipsis.
+fn dap_shorten(text: str) -> str {
+    if text.len() <= 220 {
+        return text
+    }
+    return text.slice(0, 220) + "…"
+}
+
+# dap_quote_str(s) — the .py's json.dumps rendering of a string.
+fn dap_quote_str(s: str) -> str {
+    return json_stringify(json_str(s))
+}
+
+# dap_first_real_line(text) — the first non-empty line, trimmed.
+fn dap_first_real_line(text: str) -> str {
+    let lines: list[str] = text.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let t: str = lines.get(i).trim()
+        if t != "" {
+            return t
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# dap_strip_panic(line) — a probe child's diagnostic arrives as
+# "panic: <the real text>"; the launch refusal carries the text.
+fn dap_strip_panic(line: str) -> str {
+    if line.starts_with("panic: ") {
+        return line.slice("panic: ".len(), line.len())
+    }
+    return line
+}
+
+# dap_self() — this binary's argv[0] (the probe children re-exec it).
+fn dap_self() -> str uses Args {
+    let a: list[str] = args()
+    if a.len() == 0 {
+        return "./bin/hls-dap"
+    }
+    return a.get(0)
+}
+
+# ----------------------------------------------------------------------------
+# Child processes — the probe runners (the harness's run_capture
+# discipline, tool-local: spawn with pipes, drain, wait).
+# ----------------------------------------------------------------------------
+
+struct DapRunRes {
+    code: int, # -1: the spawn itself failed
+    out: str,
+    err: str,
+    combined: str,
+    spawned: bool
+}
+
+# dap_run_capture(prog, args) — stdout+stderr piped, stdin null.
+fn dap_run_capture(prog: str, cargs: list[str]) -> DapRunRes uses Proc {
+    let r: DapRunRes = DapRunRes {
+        code: -1, out: "", err: "", combined: "", spawned: false
+    }
+    let argv: list[str] = [prog]
+    let mut i: int = 0
+    while i < cargs.len() {
+        argv.push(cargs.get(i))
+        i = i + 1
+    }
+    let pid: int = proc_spawn(prog, argv, 2, 1, 1)
+    if pid < 1 {
+        return r
+    }
+    r.spawned = true
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    r.code = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    r.out = out
+    r.err = err
+    r.combined = out + err
+    return r
+}
+
+# ----------------------------------------------------------------------------
+# The wire — one writer (the main thread), one frame per message.
+# ----------------------------------------------------------------------------
+
+# dap_send(sess, keys, vals) — one message: seq prepended, framed,
+# written. keys/vals carry "type" and everything past it.
+# NOTE (the wire-sync writes, Stage 121 port): every eprintln in this
+# file is LOAD-BEARING on the current runtime build — without the
+# interleaving stderr writes, this thread's stdout pipe writes stall
+# until stdin EOF (reproduced minimally: reader thread blocked in
+# read(0) + main writing frames to fd 1; one stderr write per print
+# makes every frame land promptly; root cause still open — see
+# download/halis-lang-trang-thai.md for the bisect history). Keep them
+# until the runtime interaction is understood; they cost one tiny
+# write(2) per wire message.
+fn dap_send(sess: DapSess, keys: list[str], vals: list[JsonValue]) -> void uses IO {
+    eprintln("[wire-sync: send begin]")
+    sess.seq = sess.seq + 1
+    let mut k2: list[str] = ["seq"]
+    let mut v2: list[JsonValue] = [json_int(sess.seq)]
+    let mut i: int = 0
+    while i < keys.len() {
+        k2.push(keys.get(i))
+        v2.push(vals.get(i))
+        i = i + 1
+    }
+    let body: str = json_stringify(json_object(k2, v2))
+    let crlf2: str = chr(13) + "\n"
+    eprintln("[wire-sync: pre-print]")
+    print("Content-Length: " + body.len().to_str() + crlf2 + crlf2 + body)
+    eprintln("[wire-sync: post-print]")
+}
+
+# dap_respond_ok(sess, req, body_keys, body_vals) — a success response.
+fn dap_respond_ok(sess: DapSess, req: JsonValue, body_keys: list[str],
+body_vals: list[JsonValue]) -> void uses IO {
+    let id: int = dap_req_seq(req)
+    let cmd: str = dap_req_command(req)
+    let body: JsonValue = json_object(body_keys, body_vals)
+    dap_send(sess, ["type", "request_seq", "success", "command", "body"],
+    [json_str("response"), json_int(id), json_bool(true), json_str(cmd),
+     body])
+}
+
+# dap_respond_err(sess, req, message) — a failure response (the .py's
+# respond_error: an empty body plus the message).
+fn dap_respond_err(sess: DapSess, req: JsonValue, message: str) -> void uses IO {
+    let id: int = dap_req_seq(req)
+    let cmd: str = dap_req_command(req)
+    dap_send(sess,
+    ["type", "request_seq", "success", "command", "message", "body"],
+    [json_str("response"), json_int(id), json_bool(false), json_str(cmd),
+     json_str(message), json_object([], [])])
+}
+
+# dap_send_event(sess, name, body_keys, body_vals) — one event.
+fn dap_send_event(sess: DapSess, name: str, body_keys: list[str],
+body_vals: list[JsonValue]) -> void uses IO {
+    let body: JsonValue = json_object(body_keys, body_vals)
+    dap_send(sess, ["type", "event", "body"],
+    [json_str("event"), json_str(name), body])
+}
+
+# dap_req_seq / dap_req_command — the request's fields (0 / "" when
+# absent, the .py's req.get defaults).
+fn dap_req_seq(req: JsonValue) -> int {
+    let v: JsonValue = json_object_get(req, "seq")
+    if json_is_int(v) {
+        return json_int_value(v)
+    }
+    return 0
+}
+
+fn dap_req_command(req: JsonValue) -> str {
+    let v: JsonValue = json_object_get(req, "command")
+    if json_is_str(v) {
+        return json_str_value(v)
+    }
+    return ""
+}
+
+# dap_req_args(req) — the request's arguments object (a null object
+# when absent — every jstr/jint/jbool read is total).
+fn dap_req_args(req: JsonValue) -> JsonValue {
+    let v: JsonValue = json_object_get(req, "arguments")
+    if json_is_object(v) {
+        return v
+    }
+    return json_object([], [])
+}
+
+# dap_jstr(obj, key) — the string field, "" when absent.
+fn dap_jstr(obj: JsonValue, key: str) -> str {
+    let v: JsonValue = json_object_get(obj, key)
+    if json_is_str(v) {
+        return json_str_value(v)
+    }
+    return ""
+}
+
+# dap_jint(obj, key) — the integer field, 0 when absent.
+fn dap_jint(obj: JsonValue, key: str) -> int {
+    let v: JsonValue = json_object_get(obj, key)
+    if json_is_int(v) {
+        return json_int_value(v)
+    }
+    return 0
+}
+
+# dap_jbool(obj, key, dflt) — the boolean field, dflt when absent.
+fn dap_jbool(obj: JsonValue, key: str, dflt: bool) -> bool {
+    let v: JsonValue = json_object_get(obj, key)
+    if json_is_bool(v) {
+        return json_bool_value(v)
+    }
+    return dflt
+}
+
+# ----------------------------------------------------------------------------
+# The reader — stdin frames onto the merge channel (the LSP's framing
+# discipline, with the .py's DAP error semantics: garbage earns a
+# parse-error response and the session continues).
+# ----------------------------------------------------------------------------
+
+# dap_read_message() — one frame from stdin: ["ok", body] |
+# ["eof", ""] | ["err", detail]. Headers are whole lines (read_line,
+# which strips the CRLF); the BODY is read byte-exact (read_byte,
+# exactly clen bytes) — a DAP body carries no newline, so a line
+# reader would block waiting for the NEXT frame's terminator while
+# the client waits for this frame's response (the protocol deadlock
+# the .py never had, because its stream.read(n) was byte-exact).
+# "" from read_line at frame start is EOF (the runtime mirrors
+# fgets: an empty answer past the end, forever).
+fn dap_read_message() -> list[str] uses IO {
+    let mut clen: int = -1
+    let mut saw_any: bool = false
+    while true {
+        eprintln("[wire-sync: pre-readline]")
+        let line: str = taint_unwrap(read_line())
+        eprintln("[wire-sync: post-readline]")
+        if line == "" {
+            if !saw_any {
+                return ["eof", ""]
+            }
+            break
+        }
+        saw_any = true
+        if !line.contains(":") {
+            # the .py's BadFrame: garbage where headers belong
+            return ["err", "parse error: malformed frame"]
+        }
+        let colon: int = line.find(":")
+        let hname: str = line.slice(0, colon)
+        if dap_lower_ascii(hname) == "content-length" {
+            let v: str = line.slice(colon + 1, line.len()).trim()
+            if dap_is_int_str(v) {
+                let mut vnum: int = 0
+                let mut k: int = 0
+                while k < v.len() {
+                    vnum = vnum * 10 + (v.byte_at(k) - 48)
+                    k = k + 1
+                }
+                clen = vnum
+            } else {
+                return ["err", "parse error: malformed frame"]
+            }
+        }
+        if clen < -1 || clen > 268435456 {
+            return ["err", "parse error: malformed frame"]
+        }
+    }
+    if clen <= 0 {
+        return ["err", "parse error: malformed frame"]
+    }
+    let mut body: str = ""
+    while body.len() < clen {
+        let b: int = read_byte()
+        if b < 0 {
+            # a short read: the client went away mid-body
+            return ["eof", ""]
+        }
+        body = body + chr(b)
+    }
+    return ["ok", body]
+}
+
+fn dap_lower_ascii(s: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c >= 65 && c <= 90 {
+            out = out + chr(c + 32)
+        } else {
+            out = out + chr(c)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn dap_is_int_str(s: str) -> bool {
+    if s.len() == 0 {
+        return false
+    }
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c < 48 || c > 57 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# dap_reader_entry(ra) — the reader thread: frames in, events out,
+# until stdin EOF.
+fn dap_reader_entry(ra: ReadArgs) -> int uses IO, Conc {
+    while true {
+        let m: list[str] = dap_read_message()
+        if m.get(0) == "eof" {
+            ra.events.send(DbgEvent {
+                kind: "eof", category: "", text: "", reason: "",
+                thread: "", code: 0, snap: []
+            })
+            return 0
+        }
+        if m.get(0) == "err" {
+            ra.events.send(DbgEvent {
+                kind: "badframe", category: "", text: m.get(1),
+                reason: "", thread: "", code: 0, snap: []
+            })
+            continue
+        }
+        let body: str = m.get(1)
+
+        let rr: Result[JsonValue, str] = json_parse_result(body)
+        if !result_is_ok(rr) {
+            ra.events.send(DbgEvent {
+                kind: "badframe", category: "",
+                text: "parse error: invalid JSON body", reason: "",
+                thread: "", code: 0, snap: []
+            })
+            continue
+        }
+        eprintln("[wire-sync: pre-send-request]")
+        ra.events.send(DbgEvent {
+            kind: "request", category: "", text: body, reason: "",
+            thread: "", code: 0, snap: []
+        })
+        eprintln("[wire-sync: post-send-request]")
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# The run thread — the program under the hooks (the .py's run_program,
+# same laws: the panic handler first, the echo, the exit code masked).
+# ----------------------------------------------------------------------------
+
+fn dap_run_entry(ra: RunArgs) -> int
+uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let boot: Boot = hb_load_checked(ra.program, ra.prog_args, false,
+    "", "", "")
+    let dbg: DbgState = boot.dbg
+    dbg.active = true
+    dbg.no_debug = ra.no_debug
+    dbg.stop_on_panic = ra.stop_on_panic
+    dbg.stop_on_entry = ra.stop_on_entry
+    dbg.events = ra.events
+    dbg.resume = ra.resume
+    dbg.bps = ra.bps
+    let r: R = call_fn(boot, "main", [])
+    let mut code: int = 0
+    if r.flow == FL_PANIC() {
+        # The program's panic handler first (if declared), behind the
+        # reentrancy guard; an exit() inside it propagates — the
+        # evaluator's own law, restated.
+        let h: FnInfo = boot.ctx.fns.get_or("panic_handler", dummy_fn())
+        if h.name == "panic_handler" && h.attr_panic_handler {
+            let pr: R = call_fn(boot, "panic_handler", [v_str(r.msg)])
+            if pr.flow == FL_EXIT() {
+                ra.events.send(DbgEvent {
+                    kind: "exited", category: "", text: "", reason: "",
+                    thread: "", code: pr.code, snap: []
+                })
+                ra.events.send(DbgEvent {
+                    kind: "terminated", category: "", text: "",
+                    reason: "", thread: "", code: 0, snap: []
+                })
+                return 0
+            }
+        }
+        # the stderr echo: the event AND the real stderr (the tee law)
+        let text: str = "panic: " + r.msg + " (at line "
+        + r.line.to_str() + ")\n"
+        ra.events.send(DbgEvent {
+            kind: "output", category: "stderr", text: text, reason: "",
+            thread: "", code: 0, snap: []
+        })
+        eprint(text)
+        code = 101
+        if ra.stop_on_panic && !ra.no_debug && dbg.panic_line != 0 {
+            # park dead at the panic site: the stack is real (the
+            # deepest-first record), the message is real, and the next
+            # resume verb ends the session.
+            let tid: str = dbg.panic_tid
+            if !dbg.threads.has(tid) {
+                let _st: DbgThread = dbg_thread_of(dbg, tid)
+            }
+            let st: DbgThread = dbg.threads.get_or(tid,
+            dbg_thread_default())
+            dbg_park(dbg, tid, st, "exception", dbg.panic_snap,
+            dbg.panic_msg)
+        }
+    } else if r.flow == FL_EXIT() {
+        code = r.code
+    } else if r.v.k == VK_INT() {
+        code = int_and(r.v.i, 255)
+    } else {
+        code = 0
+    }
+    ra.events.send(DbgEvent {
+        kind: "exited", category: "", text: "", reason: "",
+        thread: "", code: code, snap: []
+    })
+    ra.events.send(DbgEvent {
+        kind: "terminated", category: "", text: "", reason: "",
+        thread: "", code: 0, snap: []
+    })
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# ProgramInfo — the static tables, from the real checked AST.
+# ----------------------------------------------------------------------------
+
+# dap_is_stmt_kind(k) — the kinds the evaluator actually executes (the
+# .py's STMT_KINDS frozenset; the breakpoint verifier accepts these).
+fn dap_is_stmt_kind(k: str) -> bool {
+    return k == "let" || k == "assign" || k == "if" || k == "while"
+    || k == "for" || k == "return" || k == "break" || k == "continue"
+    || k == "expr" || k == "asm"
+}
+
+# dap_collect_lines(ctx, body, out) — the executable statement lines
+# of a body, recursively (the .py's collect_stmt_lines).
+fn dap_collect_lines(ctx: Ctx, body: list[int], out: list[int]) -> void {
+    let mut i: int = 0
+    while i < body.len() {
+        let s: StmtN = ctx.stmts.get(body.get(i))
+        if dap_is_stmt_kind(s.kind) {
+            let mut dup: bool = false
+            let mut j: int = 0
+            while j < out.len() {
+                if out.get(j) == s.line {
+                    dup = true
+                }
+                j = j + 1
+            }
+            if !dup {
+                out.push(s.line)
+            }
+        }
+        if s.kind == "if" {
+            dap_collect_lines(ctx, s.body, out)
+            if s.else_body.len() > 0 {
+                dap_collect_lines(ctx, s.else_body, out)
+            }
+        } else if s.kind == "while" || s.kind == "for" {
+            dap_collect_lines(ctx, s.body, out)
+        }
+        i = i + 1
+    }
+}
+
+# dap_sort_ints(vals) — an in-place insertion sort (small lists).
+fn dap_sort_ints(vals: list[int]) -> void {
+    let mut i: int = 1
+    while i < vals.len() {
+        let v: int = vals.get(i)
+        let mut j: int = i - 1
+        while j >= 0 && vals.get(j) > v {
+            vals.set(j + 1, vals.get(j))
+            j = j - 1
+        }
+        vals.set(j + 1, v)
+        i = i + 1
+    }
+}
+
+# dap_prog_info(ctx) — the file->statement-lines table, one entry per
+# file that declares a fn (FnInfo.src_file, canonicalised).
+fn dap_prog_info(ctx: Ctx) -> ProgInfo uses IO, Proc {
+    let info: ProgInfo = ProgInfo {
+        file_lines: map_new(),
+        var_types: map_new()
+    }
+    let keys: list[str] = ctx.fns.keys()
+    let mut i: int = 0
+    while i < keys.len() {
+        let f: FnInfo = ctx.fns.get_or(keys.get(i), dummy_fn())
+        if f.src_file != "" {
+            let file: str = dbg_canon_path(f.src_file)
+            let mut lines: list[int] = []
+            if info.file_lines.has(file) {
+                lines = info.file_lines.get_or(file, [])
+            }
+            dap_collect_lines(ctx, f.body, lines)
+            dap_sort_ints(lines)
+            info.file_lines.set(file, lines)
+        }
+        i = i + 1
+    }
+    return info
+}
+
+# dap_var_types(sess, key) — the declared binding types of a fn body
+# (params first, then every let; later bindings win — the .py's
+# collect_var_types, cached in the info).
+fn dap_var_types(sess: DapSess, key: str) -> map[str, str] {
+    let info: ProgInfo = sess.info
+    if info.var_types.has(key) {
+        return info.var_types.get_or(key, map_new())
+    }
+    let vt: map[str, str] = map_new()
+    info.var_types.set(key, vt)
+    let f: FnInfo = sess.boot.ctx.fns.get_or(key, dummy_fn())
+    let mut pi: int = 0
+    while pi < f.params.len() && pi < f.ptypes.len() {
+        vt.set(f.params.get(pi), f.ptypes.get(pi))
+        pi = pi + 1
+    }
+    dap_collect_var_types(sess.boot.ctx, f.body, vt)
+    return vt
+}
+
+fn dap_collect_var_types(ctx: Ctx, body: list[int], vt: map[str, str]) -> void {
+    let mut i: int = 0
+    while i < body.len() {
+        let s: StmtN = ctx.stmts.get(body.get(i))
+        if s.kind == "let" && s.vtype != "" {
+            vt.set(s.name, s.vtype)
+        }
+        if s.kind == "if" {
+            dap_collect_var_types(ctx, s.body, vt)
+            if s.else_body.len() > 0 {
+                dap_collect_var_types(ctx, s.else_body, vt)
+            }
+        } else if s.kind == "while" || s.kind == "for" {
+            dap_collect_var_types(ctx, s.body, vt)
+        }
+        i = i + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Value display — one formatter, used by variables, evaluate and
+# hovers (the .py's display_value/display_type over the native V).
+# ----------------------------------------------------------------------------
+
+# dap_struct_name(ty) — a type string that names a plain struct
+# (`Item`, `Box[int]`); "" for builtins and empties.
+fn dap_struct_name(ty: str) -> str {
+    if ty == "" || ty.contains("[") {
+        return ""
+    }
+    if ty == "int" || ty == "float" || ty == "bool" || ty == "str"
+    || ty == "void" || ty == "list" || ty == "map" {
+        return ""
+    }
+    return ty
+}
+
+# dap_display_value(v, ty) — render a runtime value the way Halis
+# means it: bools true/false, structs `Name { field: v }`, enums
+# `Variant(payload)` — the same shape the parser accepts.
+fn dap_display_value(v: V, ty: str) -> str {
+    if v.k == VK_UNIT() {
+        return "void"
+    }
+    if v.k == VK_BOOL() {
+        if v.i != 0 {
+            return "true"
+        }
+        return "false"
+    }
+    if v.k == VK_INT() {
+        return v.i.to_str()
+    }
+    if v.k == VK_FLOAT() {
+        return fmt_float_py(v.f)
+    }
+    if v.k == VK_STR() {
+        return dap_shorten(dap_quote_str(v.s))
+    }
+    if v.k == VK_LIST() {
+        let mut head: str = ""
+        let mut i: int = 0
+        while i < v.vals.len() && i < 6 {
+            if i > 0 {
+                head = head + ", "
+            }
+            head = head + dap_display_value(v.vals.get(i), "")
+            i = i + 1
+        }
+        if v.vals.len() > 6 {
+            head = head + ", …"
+        }
+        return "[" + head + "] (len=" + v.vals.len().to_str() + ")"
+    }
+    if v.k == VK_STRUCT() {
+        let mut sname: str = dap_struct_name(ty)
+        if sname == "" {
+            sname = v.s
+        }
+        let mut items: str = ""
+        let mut i: int = 0
+        while i < v.keys.len() && i < 6 {
+            if i > 0 {
+                items = items + ", "
+            }
+            items = items + v.keys.get(i) + ": "
+            + dap_display_value(v.vals.get(i), "")
+            i = i + 1
+        }
+        if v.keys.len() > 6 {
+            items = items + ", …"
+        }
+        if v.keys.len() == 0 {
+            return "{}"
+        }
+        return sname + " { " + items + " }"
+    }
+    if v.k == VK_ENUM() {
+        let name: str = v.s + "." + v.var
+        if v.vals.len() == 0 {
+            return name
+        }
+        let mut inner: str = ""
+        let mut i: int = 0
+        while i < v.vals.len() {
+            if i > 0 {
+                inner = inner + ", "
+            }
+            inner = inner + dap_display_value(v.vals.get(i), "")
+            i = i + 1
+        }
+        return dap_shorten(name + "(" + inner + ")")
+    }
+    if v.k == VK_TAINTED() {
+        return "tainted[" + dap_display_value(v.vals.get(0), "") + "]"
+    }
+    if v.k == VK_MAP() {
+        if v.keys.len() == 0 {
+            return "{}"
+        }
+        let mut items: str = ""
+        let mut i: int = 0
+        while i < v.keys.len() && i < 6 {
+            if i > 0 {
+                items = items + ", "
+            }
+            items = items + v.keys.get(i) + ": "
+            + dap_display_value(v.vals.get(i), "")
+            i = i + 1
+        }
+        if v.keys.len() > 6 {
+            items = items + ", …"
+        }
+        return "{ " + items + " }"
+    }
+    # channels, task handles, capability tokens: the kind's own name
+    return v_type_name(v)
+}
+
+# dap_display_type(v, ty) — the declared type when it is consistent
+# with the runtime shape, else a structural name (the .py's law).
+fn dap_display_type(v: V, ty: str) -> str {
+    if v.k == VK_UNIT() {
+        return "void"
+    }
+    if v.k == VK_BOOL() {
+        return "bool"
+    }
+    if v.k == VK_INT() {
+        return "int"
+    }
+    if v.k == VK_FLOAT() {
+        return "float"
+    }
+    if v.k == VK_STR() {
+        return "str"
+    }
+    if v.k == VK_LIST() {
+        if ty.starts_with("list[") {
+            return ty
+        }
+        return "list"
+    }
+    if v.k == VK_ENUM() {
+        return v.s
+    }
+    if v.k == VK_TAINTED() {
+        if ty != "" {
+            return ty
+        }
+        return "tainted"
+    }
+    if v.k == VK_STRUCT() || v.k == VK_MAP() {
+        if v.k == VK_STRUCT() && dap_struct_name(ty) != "" {
+            return ty
+        }
+        if v.k == VK_MAP() {
+            return "map"
+        }
+        return v.s
+    }
+    if ty != "" {
+        return ty
+    }
+    return ""
+}
+
+# ----------------------------------------------------------------------------
+# The variables view — rows and children from the real declarations.
+# ----------------------------------------------------------------------------
+
+# dap_dummy_struct() — a placeholder for map get_or fallbacks.
+fn dap_dummy_struct() -> StructInfo {
+    return StructInfo {
+        name: "", fields: [], ftypes: [], fdefaults: [],
+        typeparams: [], line: 0, field_preds: map_new()
+    }
+}
+
+# dap_dummy_enum() — likewise.
+fn dap_dummy_enum() -> EnumInfo {
+    return EnumInfo {
+        name: "", variants: [], payloads: [], typeparams: [], line: 0
+    }
+}
+
+# dap_register_var(sess, handle) — a fresh variablesReference.
+fn dap_register_var(sess: DapSess, kind: str, value: V, elem: str,
+ty: str, env: list[Fr], frame_fn: str) -> int {
+    let ref: int = sess.next_handle
+    sess.next_handle = sess.next_handle + 1
+    sess.var_handles.set(ref.to_str(), VarHandle {
+        kind: kind, value: value, elem: elem, ty: ty, env: env,
+        frame_fn: frame_fn
+    })
+    return ref
+}
+
+# dap_make_var_json(sess, name, value, ty) — one variables-view row:
+# summary, annotation, and a children handle when the value expands.
+fn dap_make_var_json(sess: DapSess, name: str, value: V, ty: str) -> JsonValue {
+    let mut ref: int = 0
+    if value.k == VK_LIST() && value.vals.len() > 0 {
+        let mut elem: str = ""
+        if ty.starts_with("list[") {
+            elem = ty.slice(5, ty.len() - 1)
+        }
+        ref = dap_register_var(sess, "list", value, elem, "", [], "")
+    } else if value.k == VK_STRUCT() {
+        ref = dap_register_var(sess, "fields", value, "", ty, [], "")
+    } else if value.k == VK_ENUM() {
+        ref = dap_register_var(sess, "enum", value, "", "", [], "")
+    } else if value.k == VK_TAINTED() {
+        ref = dap_register_var(sess, "tainted", value, "", ty, [], "")
+    }
+    return json_object(["name", "value", "type", "variablesReference"],
+    [json_str(name), json_str(dap_display_value(value, ty)),
+     json_str(dap_display_type(value, ty)), json_int(ref)])
+}
+
+# dap_struct_children(sess, value, ty) — rows for a struct value:
+# the value's own fields (insertion order IS declaration order), the
+# types from the declaration when the struct is known.
+fn dap_struct_children(sess: DapSess, value: V, ty: str) -> list[JsonValue] {
+    let rows: list[JsonValue] = []
+    let mut sname: str = dap_struct_name(ty)
+    if sname == "" {
+        sname = value.s
+    }
+    let sdef: StructInfo = sess.boot.ctx.structs.get_or(sname,
+    dap_dummy_struct())
+    let mut i: int = 0
+    while i < value.keys.len() {
+        let mut fty: str = ""
+        let mut j: int = 0
+        while j < sdef.fields.len() {
+            if sdef.fields.get(j) == value.keys.get(i) {
+                fty = sdef.ftypes.get(j)
+            }
+            j = j + 1
+        }
+        rows.push(dap_make_var_json(sess, value.keys.get(i),
+        value.vals.get(i), fty))
+        i = i + 1
+    }
+    return rows
+}
+
+# dap_enum_payload_types(sess, ename, vname) — the variant's declared
+# payload types (parallel to the data list).
+fn dap_enum_payload_types(sess: DapSess, ename: str, vname: str) -> list[str] {
+    let edef: EnumInfo = sess.boot.ctx.enums.get_or(ename, dap_dummy_enum())
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < edef.variants.len() {
+        if edef.variants.get(i) == vname {
+            let ps: list[list[str]] = edef.payloads
+            if i < ps.len() {
+                return ps.get(i)
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# dap_expand_handle(sess, handle) — the rows a variablesReference
+# expands to (the .py's expand_handle).
+fn dap_expand_handle(sess: DapSess, handle: VarHandle) -> list[JsonValue] {
+    let rows: list[JsonValue] = []
+    if handle.kind == "locals" {
+        let vt: map[str, str] = dap_var_types(sess, handle.frame_fn)
+        # innermost scope first; a shadowed name reports its shadow
+        let seen: list[str] = []
+        let mut i: int = handle.env.len() - 1
+        while i >= 0 {
+            let f: Fr = handle.env.get(i)
+            let mut j: int = 0
+            while j < f.names.len() {
+                let name: str = f.names.get(j)
+                let mut dup: bool = false
+                let mut k: int = 0
+                while k < seen.len() {
+                    if seen.get(k) == name {
+                        dup = true
+                    }
+                    k = k + 1
+                }
+                if !dup {
+                    seen.push(name)
+                    rows.push(dap_make_var_json(sess, name,
+                    f.cells.get(j), vt.get_or(name, "")))
+                }
+                j = j + 1
+            }
+            i = i - 1
+        }
+        return rows
+    }
+    let v: V = handle.value
+    if handle.kind == "list" {
+        let mut i: int = 0
+        while i < v.vals.len() {
+            rows.push(dap_make_var_json(sess, i.to_str(), v.vals.get(i),
+            handle.elem))
+            i = i + 1
+        }
+        return rows
+    }
+    if handle.kind == "fields" {
+        return dap_struct_children(sess, v, handle.ty)
+    }
+    if handle.kind == "enum" {
+        let payloads: list[str] = dap_enum_payload_types(sess, v.s, v.var)
+        let mut i: int = 0
+        while i < v.vals.len() {
+            let mut pty: str = ""
+            if i < payloads.len() {
+                pty = payloads.get(i)
+            }
+            rows.push(dap_make_var_json(sess, i.to_str(), v.vals.get(i),
+            pty))
+            i = i + 1
+        }
+        return rows
+    }
+    if handle.kind == "tainted" {
+        rows.push(dap_make_var_json(sess, "value", v.vals.get(0),
+        handle.ty))
+    }
+    return rows
+}
+
+# ----------------------------------------------------------------------------
+# Console expressions — parse (probe-validated), annotate with the
+# checker's own dispatch rules, evaluate in the paused frame.
+# ----------------------------------------------------------------------------
+
+# dap_resolve_static_type(sess, ei, frame_fn) — the best-effort
+# declared type of a console subexpression (the .py's
+# resolve_static_type): the paused frame's declarations and the
+# program's own signatures; "" when unknown — never a guess.
+fn dap_resolve_static_type(sess: DapSess, ei: int, frame_fn: str) -> str {
+    let e: ExprN = sess.boot.ctx.exprs.get(ei)
+    if e.kind == "ident" {
+        let vt: map[str, str] = dap_var_types(sess, frame_fn)
+        return vt.get_or(e.name, "")
+    }
+    if e.kind == "field" {
+        let t: str = dap_resolve_static_type(sess, e.left, frame_fn)
+        let sname: str = dap_struct_name(t)
+        if sname != "" {
+            let sdef: StructInfo = sess.boot.ctx.structs.get_or(sname,
+            dap_dummy_struct())
+            let mut j: int = 0
+            while j < sdef.fields.len() {
+                if sdef.fields.get(j) == e.name {
+                    return sdef.ftypes.get(j)
+                }
+                j = j + 1
+            }
+        }
+        return ""
+    }
+    if e.kind == "index" {
+        let t: str = dap_resolve_static_type(sess, e.left, frame_fn)
+        if t.starts_with("list[") {
+            return t.slice(5, t.len() - 1)
+        }
+        return ""
+    }
+    if e.kind == "call" {
+        if e.muser && sess.boot.ctx.fns.has(e.name) {
+            let f: FnInfo = sess.boot.ctx.fns.get_or(e.name, dummy_fn())
+            if f.ret != "" && f.ret != "void" {
+                return f.ret
+            }
+        }
+        return ""
+    }
+    if e.kind == "structlit" {
+        return e.name
+    }
+    if e.kind == "enumlit" {
+        return e.enum_name
+    }
+    return ""
+}
+
+# dap_env_has(env, name) — the binding-existence walk (the .py's
+# `any(n in scope for scope in env)`).
+fn dap_env_has(env: list[Fr], name: str) -> bool {
+    let mut i: int = 0
+    while i < env.len() {
+        let f: Fr = env.get(i)
+        let mut j: int = 0
+        while j < f.names.len() {
+            if f.names.get(j) == name {
+                return true
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# dap_annotate_expr(sess, ei, frame_fn, depth) — fill in the dispatch
+# annotations the checker adds to compiled expressions (muser/mkey on
+# calls, muser/mkey/mop on methods), so the evaluator can run a
+# console expression against the paused frame. Resolution follows the
+# checker's own rules: user fns first, enum constructors only when the
+# base name is an enum TYPE and not a binding, methods through the
+# declared type when it is visible and as builtin methods otherwise.
+# Returns an error string or "" (the .py's annotate_console_expr).
+fn dap_annotate_expr(sess: DapSess, ei: int, frame_fn: str,
+depth: int) -> str {
+    if depth > 64 {
+        return "expression too deep"
+    }
+    let ctx: Ctx = sess.boot.ctx
+    let e: ExprN = ctx.exprs.get(ei)
+    let k: str = e.kind
+    if k == "int" || k == "float" || k == "bool" || k == "str"
+    || k == "ident" || k == "method" {
+        # method: a checker-shaped node cannot occur in fresh text,
+        # but be tolerant if one ever arrives
+        return ""
+    }
+    if k == "call" {
+        if ctx.fns.has(e.name) {
+            ctx.exprs[ei].muser = true
+            ctx.exprs[ei].mkey = ""
+            ctx.exprs[ei].inst_key = ""
+        } else {
+            # builtin dispatch panics with 'unknown builtin' for a
+            # name that is neither — an honest console error
+            ctx.exprs[ei].muser = false
+            ctx.exprs[ei].mkey = e.name
+            ctx.exprs[ei].inst_key = ""
+        }
+        let mut i: int = 0
+        while i < e.args.len() {
+            let err: str = dap_annotate_expr(sess, e.args.get(i),
+            frame_fn, depth + 1)
+            if err != "" {
+                return err
+            }
+            i = i + 1
+        }
+        return ""
+    }
+    if k == "fieldcall" {
+        let tgt: ExprN = ctx.exprs.get(e.left)
+        let mut ename: str = ""
+        if tgt.kind == "ident" {
+            let n: str = tgt.name
+            let bound: bool = dap_env_has_from_sess(sess, n)
+            if ctx.enums.has(n) && !bound {
+                ename = n
+            }
+        }
+        if ename != "" {
+            # Enum.Variant(args): rewrite into an enum literal (the
+            # checker's own transform)
+            ctx.exprs[ei].kind = "enumlit"
+            ctx.exprs[ei].enum_name = ename
+            ctx.exprs[ei].variant = e.name
+            ctx.exprs[ei].muser = false
+            ctx.exprs[ei].mkey = ""
+            ctx.exprs[ei].mop = ""
+            let mut i: int = 0
+            while i < e.args.len() {
+                let err: str = dap_annotate_expr(sess, e.args.get(i),
+                frame_fn, depth + 1)
+                if err != "" {
+                    return err
+                }
+                i = i + 1
+            }
+            return ""
+        }
+        let ty: str = dap_resolve_static_type(sess, e.left, frame_fn)
+        let mut mkey: str = ""
+        let sname: str = dap_struct_name(ty)
+        if sname != "" {
+            mkey = sname + "." + e.name
+        }
+        if mkey != "" && ctx.fns.has(mkey) {
+            ctx.exprs[ei].muser = true
+            ctx.exprs[ei].mkey = mkey
+            ctx.exprs[ei].inst_key = ""
+            ctx.exprs[ei].mop = ""
+        } else {
+            ctx.exprs[ei].muser = false
+            ctx.exprs[ei].mkey = ""
+            ctx.exprs[ei].inst_key = ""
+            ctx.exprs[ei].mop = e.name
+        }
+        let err: str = dap_annotate_expr(sess, e.left, frame_fn,
+        depth + 1)
+        if err != "" {
+            return err
+        }
+        let mut i: int = 0
+        while i < e.args.len() {
+            let err2: str = dap_annotate_expr(sess, e.args.get(i),
+            frame_fn, depth + 1)
+            if err2 != "" {
+                return err2
+            }
+            i = i + 1
+        }
+        return ""
+    }
+    if k == "field" {
+        return dap_annotate_expr(sess, e.left, frame_fn, depth + 1)
+    }
+    if k == "index" {
+        let err: str = dap_annotate_expr(sess, e.left, frame_fn,
+        depth + 1)
+        if err != "" {
+            return err
+        }
+        return dap_annotate_expr(sess, e.right, frame_fn, depth + 1)
+    }
+    if k == "un" || k == "qmark" {
+        return dap_annotate_expr(sess, e.left, frame_fn, depth + 1)
+    }
+    if k == "bin" {
+        let err: str = dap_annotate_expr(sess, e.left, frame_fn,
+        depth + 1)
+        if err != "" {
+            return err
+        }
+        return dap_annotate_expr(sess, e.right, frame_fn, depth + 1)
+    }
+    if k == "listlit" {
+        let mut i: int = 0
+        while i < e.args.len() {
+            let err: str = dap_annotate_expr(sess, e.args.get(i),
+            frame_fn, depth + 1)
+            if err != "" {
+                return err
+            }
+            i = i + 1
+        }
+        return ""
+    }
+    if k == "structlit" || k == "enumlit" {
+        let mut i: int = 0
+        while i < e.args.len() {
+            let err: str = dap_annotate_expr(sess, e.args.get(i),
+            frame_fn, depth + 1)
+            if err != "" {
+                return err
+            }
+            i = i + 1
+        }
+        return ""
+    }
+    if k == "match" {
+        let err: str = dap_annotate_expr(sess, e.left, frame_fn,
+        depth + 1)
+        if err != "" {
+            return err
+        }
+        let mut i: int = 0
+        while i < e.args.len() {
+            let arm: MatchArm = ctx.match_arms.get(e.args.get(i))
+            let err2: str = dap_annotate_expr(sess, arm.body, frame_fn,
+            depth + 1)
+            if err2 != "" {
+                return err2
+            }
+            i = i + 1
+        }
+        return ""
+    }
+    return ""
+}
+
+# dap_env_has_from_sess(sess, name) — whether the paused frame the
+# evaluation resolves in binds the name (the .py passed the frame's
+# env into annotate; the port parks it on the session for the walk).
+fn dap_env_has_from_sess(sess: DapSess, name: str) -> bool {
+    return dap_env_has(sess.eval_env, name)
+}
+
+# ----------------------------------------------------------------------------
+# The request handlers (the .py's, one for one).
+# ----------------------------------------------------------------------------
+
+# dap_on_initialize — the capabilities + the initialized event.
+fn dap_on_initialize(sess: DapSess, req: JsonValue) -> void uses IO {
+    sess.initialized = true
+    let filters: JsonValue = json_array([json_object(
+    ["filter", "label", "description", "default"],
+    [json_str("panics"), json_str("Uncaught Halis panics"),
+     json_str("Break when the program panics"), json_bool(true)])])
+    dap_respond_ok(sess, req, [
+    "supportsConfigurationDoneRequest", "supportsEvaluateForHovers",
+    "supportsTerminateRequest", "supportTerminateDebuggee",
+    "supportSuspendDebuggee", "exceptionBreakpointFilters"
+    ], [
+    json_bool(true), json_bool(true), json_bool(true), json_bool(true),
+    json_bool(true), filters
+    ])
+    dap_send_event(sess, "initialized", [], [])
+}
+
+# dap_on_launch — the launch law: require, find, PROBE (a program the
+# compiler rejects never starts debugging), then load in-process for
+# the static tables and the console evaluator.
+fn dap_on_launch(sess: DapSess, req: JsonValue)
+uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    if !sess.initialized {
+        dap_respond_err(sess, req, "not initialized")
+        return
+    }
+    let a: JsonValue = dap_req_args(req)
+    let program: str = dap_jstr(a, "program")
+    if program == "" {
+        dap_respond_err(sess, req, "launch requires 'program'")
+        return
+    }
+    if !file_exists(program) {
+        dap_respond_err(sess, req, "program not found: " + program)
+        return
+    }
+    let prog_args: list[str] = []
+    let args_v: JsonValue = json_object_get(a, "args")
+    if json_is_array(args_v) {
+        let mut i: int = 0
+        while i < args_v.arr.len() {
+            let x: JsonValue = args_v.arr.get(i)
+            if json_is_str(x) {
+                prog_args.push(json_str_value(x))
+            }
+            i = i + 1
+        }
+    }
+    sess.prog_args = prog_args
+    sess.stop_on_entry = dap_jbool(a, "stopOnEntry", false)
+    sess.no_debug = dap_jbool(a, "noDebug", false)
+    sess.program_path = program
+    # the probe child: load + check, its panic is the diagnostic
+    let self_path: str = dap_self()
+    let pr: DapRunRes = dap_run_capture(self_path,
+    ["--dap-probe", program])
+    if pr.code != 0 {
+        dap_respond_err(sess, req, dap_strip_panic(
+        dap_first_real_line(pr.combined)))
+        return
+    }
+    let boot: Boot = hb_load_checked(program, sess.prog_args, false,
+    "", "", "")
+    sess.boot = boot
+    sess.info = dap_prog_info(boot.ctx)
+    sess.bps = map_new()
+    sess.launched = true
+    dap_respond_ok(sess, req, [], [])
+    dap_send_event(sess, "process",
+    ["name", "systemProcessId", "isLocalProcess", "startMethod"],
+    [json_str(dap_basename(program)), json_int(proc_pid()),
+     json_bool(true), json_str("launch")])
+}
+
+# dap_on_set_breakpoints — verify against the statement lines, snap
+# DOWN to the nearest statement, refuse foreign files and past-the-end
+# lines; the verified set replaces the file's table.
+fn dap_on_set_breakpoints(sess: DapSess, req: JsonValue) -> void uses IO, Proc {
+    if !sess.launched {
+        dap_respond_err(sess, req, "no program loaded")
+        return
+    }
+    let a: JsonValue = dap_req_args(req)
+    let src: JsonValue = json_object_get(a, "source")
+    let path: str = dap_jstr(src, "path")
+    let requested: list[int] = []
+    let bps_v: JsonValue = json_object_get(a, "breakpoints")
+    if json_is_array(bps_v) {
+        let mut i: int = 0
+        while i < bps_v.arr.len() {
+            let b: JsonValue = bps_v.arr.get(i)
+            if json_is_object(b) {
+                requested.push(dap_jint(b, "line"))
+            }
+            i = i + 1
+        }
+    }
+    let rows: list[JsonValue] = []
+    let verified: list[int] = []
+    let canon: str = dbg_canon_path(path)
+    if path != "" && sess.info.file_lines.has(canon) {
+        let valid: list[int] = sess.info.file_lines.get_or(canon, [])
+        let mut ri: int = 0
+        while ri < requested.len() {
+            let line: int = requested.get(ri)
+            let mut snap: int = 0
+            let mut found: bool = false
+            let mut vi: int = 0
+            while vi < valid.len() {
+                if valid.get(vi) >= line {
+                    snap = valid.get(vi)
+                    found = true
+                    break
+                }
+                vi = vi + 1
+            }
+            if !found {
+                rows.push(json_object(
+                ["verified", "line", "message"],
+                [json_bool(false), json_int(line),
+                 json_str("no statement at or after line "
+                 + line.to_str())]))
+            } else {
+                let mut msg: str = ""
+                if snap != line {
+                    msg = "snapped to line " + snap.to_str()
+                    + " (nearest statement)"
+                } else {
+                    rows.push(json_object(["verified", "line"],
+                    [json_bool(true), json_int(snap)]))
+                }
+                if snap != line {
+                    rows.push(json_object(
+                    ["verified", "line", "message"],
+                    [json_bool(true), json_int(snap), json_str(msg)]))
+                }
+                let mut dup: bool = false
+                let mut di: int = 0
+                while di < verified.len() {
+                    if verified.get(di) == snap {
+                        dup = true
+                    }
+                    di = di + 1
+                }
+                if !dup {
+                    verified.push(snap)
+                }
+            }
+            ri = ri + 1
+        }
+        sess.bps.set(canon, verified)
+    } else {
+        let mut ri: int = 0
+        while ri < requested.len() {
+            rows.push(json_object(
+            ["verified", "line", "message"],
+            [json_bool(false), json_int(requested.get(ri)),
+             json_str("file is not part of the debugged program")]))
+            ri = ri + 1
+        }
+    }
+    dap_respond_ok(sess, req, ["breakpoints"], [json_array(rows)])
+}
+
+# dap_on_set_exception_breakpoints — the panics filter.
+fn dap_on_set_exception_breakpoints(sess: DapSess, req: JsonValue) -> void uses IO {
+    let a: JsonValue = dap_req_args(req)
+    let mut on: bool = false
+    let rows: list[JsonValue] = []
+    let filters_v: JsonValue = json_object_get(a, "filters")
+    if json_is_array(filters_v) {
+        let mut i: int = 0
+        while i < filters_v.arr.len() {
+            let f: JsonValue = filters_v.arr.get(i)
+            if json_is_str(f) {
+                if json_str_value(f) == "panics" {
+                    on = true
+                }
+                rows.push(json_object(["verified", "filter"],
+                [json_bool(true), json_str(json_str_value(f))]))
+            }
+            i = i + 1
+        }
+    }
+    sess.stop_on_panic = on
+    dap_respond_ok(sess, req, ["breakpoints"], [json_array(rows)])
+}
+
+# dap_on_configuration_done — the run thread starts here (the .py's
+# own law: breakpoints land before the program runs).
+fn dap_on_configuration_done(sess: DapSess, req: JsonValue)
+uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    dap_respond_ok(sess, req, [], [])
+    if sess.launched && !sess.run_started {
+        sess.run_started = true
+        let ra: RunArgs = RunArgs {
+            program: sess.program_path,
+            prog_args: sess.prog_args,
+            stop_on_entry: sess.stop_on_entry,
+            no_debug: sess.no_debug,
+            stop_on_panic: sess.stop_on_panic,
+            bps: sess.bps,
+            events: sess.events,
+            resume: sess.resume
+        }
+        let t: Task[int] = spawn(dap_run_entry, clone(ra))
+        let _t: Task[int] = t
+    }
+}
+
+# dap_thread_id(sess, tid) — the stable DAP threadId (1 = first seen,
+# the .py's main-thread law; single-threaded programs always answer 1).
+fn dap_thread_id(sess: DapSess, tid: str) -> int {
+    if sess.thread_ids.has(tid) {
+        return sess.thread_ids.get_or(tid, 0)
+    }
+    let id: int = sess.next_thread_id
+    sess.next_thread_id = sess.next_thread_id + 1
+    sess.thread_ids.set(tid, id)
+    return id
+}
+
+# dap_tid_of(sess, dap_id) — the reverse lookup; "" when unknown.
+fn dap_tid_of(sess: DapSess, dap_id: int) -> str {
+    let keys: list[str] = sess.thread_ids.keys()
+    let mut i: int = 0
+    while i < keys.len() {
+        if sess.thread_ids.get_or(keys.get(i), 0) == dap_id {
+            return keys.get(i)
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+# dap_on_threads — the threads the session has seen stop (the .py
+# listed every live thread; the registry holds every thread that ever
+# stopped, which for a parked session is exactly the live set).
+fn dap_on_threads(sess: DapSess, req: JsonValue) -> void uses IO {
+    let rows: list[JsonValue] = []
+    let keys: list[str] = sess.snaps.keys()
+    let mut i: int = 0
+    while i < keys.len() {
+        let id: int = dap_thread_id(sess, keys.get(i))
+        let mut name: str = "main"
+        if id != 1 {
+            name = "task-" + (id - 1).to_str()
+        }
+        rows.push(json_object(["id", "name"],
+        [json_int(id), json_str(name)]))
+        i = i + 1
+    }
+    dap_respond_ok(sess, req, ["threads"], [json_array(rows)])
+}
+
+# dap_paused_rec(sess, tid) — the registry record when the thread is
+# parked; null-shaped otherwise.
+fn dap_paused_rec(sess: DapSess, tid: str) -> SnapRec {
+    if sess.snaps.has(tid) {
+        let rec: SnapRec = sess.snaps.get_or(tid, SnapRec {
+            snap: [], reason: "", text: "", paused: false
+        })
+        if rec.paused {
+            return rec
+        }
+    }
+    return SnapRec {
+        snap: [], reason: "", text: "", paused: false
+    }
+}
+
+# dap_on_stack_trace — innermost first, real fn names, real source
+# files; a fresh set of frameIds per call (the .py's registrations).
+fn dap_on_stack_trace(sess: DapSess, req: JsonValue) -> void uses IO {
+    let a: JsonValue = dap_req_args(req)
+    let tid: str = dap_tid_of(sess, dap_jint(a, "threadId"))
+    if tid == "" {
+        dap_respond_err(sess, req, "unknown threadId "
+        + dap_jint(a, "threadId").to_str())
+        return
+    }
+    let rec: SnapRec = dap_paused_rec(sess, tid)
+    if !rec.paused {
+        dap_respond_err(sess, req, "program is running")
+        return
+    }
+    sess.frame_handles = map_new()
+    let rows: list[JsonValue] = []
+    let mut i: int = rec.snap.len() - 1
+    while i >= 0 {
+        let fr: DbgFr = rec.snap.get(i)
+        let fid: int = sess.next_handle
+        sess.next_handle = sess.next_handle + 1
+        sess.frame_handles.set(fid.to_str(), FrameRef { tid: tid, idx: i })
+        let mut sname: str = "?"
+        let mut spath: str = ""
+        if fr.file != "" {
+            sname = dap_basename(fr.file)
+            spath = fr.file
+        }
+        rows.push(json_object(
+        ["id", "name", "source", "line", "column"],
+        [json_int(fid), json_str(fr.fn_key),
+         json_object(["name", "path"], [json_str(sname),
+         json_str(spath)]),
+         json_int(fr.line), json_int(1)]))
+        i = i - 1
+    }
+    dap_respond_ok(sess, req, ["stackFrames", "totalFrames"],
+    [json_array(rows), json_int(rows.len())])
+}
+
+# dap_on_scopes — the Locals scope over the frame's frozen env.
+fn dap_on_scopes(sess: DapSess, req: JsonValue) -> void uses IO {
+    let a: JsonValue = dap_req_args(req)
+    let fid: int = dap_jint(a, "frameId")
+    if !sess.frame_handles.has(fid.to_str()) {
+        dap_respond_err(sess, req, "unknown frameId")
+        return
+    }
+    let fr_ref: FrameRef = sess.frame_handles.get_or(fid.to_str(),
+    FrameRef { tid: "", idx: 0 })
+    let rec: SnapRec = dap_paused_rec(sess, fr_ref.tid)
+    if !rec.paused {
+        dap_respond_err(sess, req, "program is running")
+        return
+    }
+    if fr_ref.idx >= rec.snap.len() {
+        dap_respond_err(sess, req, "stale frameId")
+        return
+    }
+    let fr: DbgFr = rec.snap.get(fr_ref.idx)
+    let ref: int = dap_register_var(sess, "locals", v_unit(), "", "",
+    fr.env, fr.fn_key)
+    dap_respond_ok(sess, req, ["scopes"], [json_array([json_object(
+    ["name", "presentationHint", "variablesReference", "expensive"],
+    [json_str("Locals"), json_str("locals"), json_int(ref),
+     json_bool(false)])])])
+}
+
+# dap_on_variables — expand a handle (the .py's expand_handle).
+fn dap_on_variables(sess: DapSess, req: JsonValue) -> void uses IO {
+    let a: JsonValue = dap_req_args(req)
+    let ref: int = dap_jint(a, "variablesReference")
+    if !sess.var_handles.has(ref.to_str()) {
+        dap_respond_err(sess, req, "unknown variablesReference")
+        return
+    }
+    let handle: VarHandle = sess.var_handles.get_or(ref.to_str(), VarHandle {
+        kind: "", value: v_unit(), elem: "", ty: "", env: [],
+        frame_fn: ""
+    })
+    let rows: list[JsonValue] = dap_expand_handle(sess, handle)
+    dap_respond_ok(sess, req, ["variables"], [json_array(rows)])
+}
+
+# dap_on_evaluate — validate in a probe child, parse in-process,
+# annotate with the checker's rules, evaluate in the paused frame's
+# real environment; panics are error responses, never dead sessions.
+fn dap_on_evaluate(sess: DapSess, req: JsonValue)
+uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    if !sess.launched {
+        dap_respond_err(sess, req, "no program")
+        return
+    }
+    let a: JsonValue = dap_req_args(req)
+    let expr: str = dap_jstr(a, "expression")
+    let fid: int = dap_jint(a, "frameId")
+    if !sess.frame_handles.has(fid.to_str()) {
+        dap_respond_err(sess, req, "evaluate needs a paused frame")
+        return
+    }
+    let fr_ref: FrameRef = sess.frame_handles.get_or(fid.to_str(),
+    FrameRef { tid: "", idx: 0 })
+    let rec: SnapRec = dap_paused_rec(sess, fr_ref.tid)
+    if !rec.paused {
+        dap_respond_err(sess, req, "program is running")
+        return
+    }
+    if fr_ref.idx >= rec.snap.len() {
+        dap_respond_err(sess, req, "stale frameId")
+        return
+    }
+    let fr: DbgFr = rec.snap.get(fr_ref.idx)
+    # the probe child validates the parse (the parser's failure mode
+    # is a process panic; the adapter must survive every expression)
+    let self_path: str = dap_self()
+    let pr: DapRunRes = dap_run_capture(self_path,
+    ["--dap-expr-probe", expr])
+    if pr.code != 0 {
+        dap_respond_err(sess, req, dap_strip_panic(
+        dap_first_real_line(pr.combined)))
+        return
+    }
+    # parse in-process, against the main boot's own tables
+    let ctx: Ctx = sess.boot.ctx
+    let saved_src: str = ctx.src
+    let saved_toks: list[Tok] = ctx.toks
+    let saved_pos: int = ctx.pos
+    ctx.src = expr
+    ctx.toks = []
+    ctx.pos = 0
+    lex(ctx)
+    let ei: int = parse_expr(ctx, true)
+    let full: bool = ctx.pos == ctx.toks.len() - 1
+    ctx.src = saved_src
+    ctx.toks = saved_toks
+    ctx.pos = saved_pos
+    if !full {
+        dap_respond_err(sess, req, "not a single expression: " + expr)
+        return
+    }
+    # the enum-constructor rule needs the frame's bindings: park the
+    # env on the session for the annotation walk
+    sess.eval_env = fr.env
+    sess.eval_fn = fr.fn_key
+    let err: str = dap_annotate_expr(sess, ei, fr.fn_key, 0)
+    if err != "" {
+        dap_respond_err(sess, req, err)
+        return
+    }
+    # the declared type of a bare identifier (children expand with it)
+    let mut ty: str = ""
+    let en: ExprN = ctx.exprs.get(ei)
+    if en.kind == "ident" {
+        let vt: map[str, str] = dap_var_types(sess, fr.fn_key)
+        ty = vt.get_or(en.name, "")
+    }
+    let r: R = eval_expr(sess.boot, fr.env, ei, fr.fn_key)
+    if r.flow == FL_PANIC() {
+        dap_respond_err(sess, req, "panic: " + r.msg + " (at line "
+        + r.line.to_str() + ")")
+        return
+    }
+    if r.flow != FL_OK() {
+        dap_respond_err(sess, req, "cannot evaluate: " + expr)
+        return
+    }
+    let value: V = r.v
+    let mut ref: int = 0
+    if value.k == VK_LIST() && value.vals.len() > 0 {
+        let mut elem: str = ""
+        if ty.starts_with("list[") {
+            elem = ty.slice(5, ty.len() - 1)
+        }
+        ref = dap_register_var(sess, "list", value, elem, "", [], "")
+    } else if value.k == VK_STRUCT() {
+        ref = dap_register_var(sess, "fields", value, "", ty, [], "")
+    } else if value.k == VK_ENUM() {
+        ref = dap_register_var(sess, "enum", value, "", "", [], "")
+    } else if value.k == VK_TAINTED() {
+        ref = dap_register_var(sess, "tainted", value, "", ty, [], "")
+    }
+    dap_respond_ok(sess, req, ["result", "type", "variablesReference"],
+    [json_str(dap_display_value(value, ty)),
+     json_str(dap_display_type(value, ty)), json_int(ref)])
+}
+
+# dap_on_continue — continue resumes EVERY paused thread (the .py's
+# law: the tasks are one program).
+fn dap_on_continue(sess: DapSess, req: JsonValue) -> void uses IO, Conc {
+    let a: JsonValue = dap_req_args(req)
+    let tid: str = dap_tid_of(sess, dap_jint(a, "threadId"))
+    if tid == "" {
+        dap_respond_err(sess, req, "unknown threadId "
+        + dap_jint(a, "threadId").to_str())
+        return
+    }
+    let keys: list[str] = sess.snaps.keys()
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < keys.len() {
+        let rec: SnapRec = sess.snaps.get_or(keys.get(i), SnapRec {
+            snap: [], reason: "", text: "", paused: false
+        })
+        if rec.paused {
+            rec.paused = false
+            n = n + 1
+        }
+        i = i + 1
+    }
+    if n == 0 {
+        dap_respond_err(sess, req, "program is not paused")
+        return
+    }
+    let mut ci: int = 0
+    while ci < n {
+        sess.resume.send(DbgCmd {
+            verb: "continue", depth: 0, bps: sess.bps
+        })
+        ci = ci + 1
+    }
+    dap_respond_ok(sess, req, ["allThreadsContinued"], [json_bool(true)])
+}
+
+# dap_on_step — arm one step verb (the depth is the pause depth; the
+# .py's resume_step).
+fn dap_on_step(sess: DapSess, req: JsonValue, verb: str) -> void uses IO, Conc {
+    let a: JsonValue = dap_req_args(req)
+    let tid: str = dap_tid_of(sess, dap_jint(a, "threadId"))
+    if tid == "" {
+        dap_respond_err(sess, req, "unknown threadId "
+        + dap_jint(a, "threadId").to_str())
+        return
+    }
+    let rec: SnapRec = dap_paused_rec(sess, tid)
+    if !rec.paused {
+        dap_respond_err(sess, req, "program is not paused")
+        return
+    }
+    rec.paused = false
+    sess.resume.send(DbgCmd {
+        verb: verb, depth: rec.snap.len(), bps: sess.bps
+    })
+    dap_respond_ok(sess, req, [], [])
+}
+
+# dap_on_pause — the pause verb (a running thread's pause lands at its
+# next stop: the resume channel is only read while parked — the
+# documented Stage-0 limit).
+fn dap_on_pause(sess: DapSess, req: JsonValue) -> void uses IO, Conc {
+    let a: JsonValue = dap_req_args(req)
+    let tid: str = dap_tid_of(sess, dap_jint(a, "threadId"))
+    if tid == "" {
+        dap_respond_err(sess, req, "unknown threadId "
+        + dap_jint(a, "threadId").to_str())
+        return
+    }
+    sess.resume.send(DbgCmd {
+        verb: "pause", depth: 0, bps: sess.bps
+    })
+    dap_respond_ok(sess, req, [], [])
+}
+
+# dap_on_disconnect — the reply, then the process ends (the .py's
+# os._exit: a parked run thread must not block the pipe).
+fn dap_on_disconnect(sess: DapSess, req: JsonValue) -> void uses IO, Exit {
+    dap_respond_ok(sess, req, [], [])
+    exit(0)
+}
+
+# dap_on_terminate — the reply, the terminated event, then exit.
+fn dap_on_terminate(sess: DapSess, req: JsonValue) -> void uses IO, Exit {
+    dap_respond_ok(sess, req, [], [])
+    dap_send_event(sess, "terminated", [], [])
+    exit(0)
+}
+
+# ----------------------------------------------------------------------------
+# The dispatch + the stopped/output event wiring.
+# ----------------------------------------------------------------------------
+
+# dap_handle_request(sess, body) — one request (already valid JSON).
+fn dap_handle_request(sess: DapSess, body: str)
+uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let obj: JsonValue = json_parse(body)
+    if !json_is_object(obj) {
+        return
+    }
+    let t: JsonValue = json_object_get(obj, "type")
+    if json_is_str(t) && json_str_value(t) != "request" {
+        return
+    }
+    let cmd: str = dap_req_command(obj)
+    if cmd == "initialize" {
+        dap_on_initialize(sess, obj)
+    } else if cmd == "launch" {
+        dap_on_launch(sess, obj)
+    } else if cmd == "setBreakpoints" {
+        dap_on_set_breakpoints(sess, obj)
+    } else if cmd == "setExceptionBreakpoints" {
+        dap_on_set_exception_breakpoints(sess, obj)
+    } else if cmd == "configurationDone" {
+        dap_on_configuration_done(sess, obj)
+    } else if cmd == "threads" {
+        dap_on_threads(sess, obj)
+    } else if cmd == "stackTrace" {
+        dap_on_stack_trace(sess, obj)
+    } else if cmd == "scopes" {
+        dap_on_scopes(sess, obj)
+    } else if cmd == "variables" {
+        dap_on_variables(sess, obj)
+    } else if cmd == "evaluate" {
+        dap_on_evaluate(sess, obj)
+    } else if cmd == "continue" {
+        dap_on_continue(sess, obj)
+    } else if cmd == "next" {
+        dap_on_step(sess, obj, "over")
+    } else if cmd == "stepIn" {
+        dap_on_step(sess, obj, "in")
+    } else if cmd == "stepOut" {
+        dap_on_step(sess, obj, "out")
+    } else if cmd == "pause" {
+        dap_on_pause(sess, obj)
+    } else if cmd == "disconnect" {
+        dap_on_disconnect(sess, obj)
+    } else if cmd == "terminate" {
+        dap_on_terminate(sess, obj)
+    } else {
+        dap_respond_err(sess, obj, "unknown request: " + cmd)
+    }
+}
+
+# dap_on_stopped_event(sess, ev) — register the snapshot (fresh
+# generation of handles, the .py's emit_stopped law) and wire the
+# stopped event with its per-reason dressing.
+fn dap_on_stopped_event(sess: DapSess, ev: DbgEvent) -> void uses IO {
+    let tid: str = ev.thread
+    let id: int = dap_thread_id(sess, tid)
+    sess.snaps.set(tid, SnapRec {
+        snap: ev.snap, reason: ev.reason, text: ev.text, paused: true
+    })
+    sess.frame_handles = map_new()
+    sess.var_handles = map_new()
+    let mut keys: list[str] = ["reason", "threadId", "allThreadsStopped"]
+    let mut vals: list[JsonValue] = [json_str(ev.reason), json_int(id),
+    json_bool(true)]
+    if ev.reason == "breakpoint" {
+        keys.push("description")
+        vals.push(json_str("Breakpoint hit"))
+        keys.push("text")
+        vals.push(json_str("Breakpoint hit"))
+    } else if ev.reason == "entry" {
+        keys.push("description")
+        vals.push(json_str("Stopped on program entry"))
+        keys.push("text")
+        vals.push(json_str("Stopped on program entry"))
+    } else if ev.reason == "step" {
+        keys.push("description")
+        vals.push(json_str("Step"))
+    } else if ev.reason == "pause" {
+        keys.push("description")
+        vals.push(json_str("Paused"))
+    } else if ev.reason == "exception" {
+        keys.push("description")
+        vals.push(json_str("Halis panic"))
+        keys.push("text")
+        vals.push(json_str(ev.text))
+    }
+    dap_send_event(sess, "stopped", keys, vals)
+}
+
+# ----------------------------------------------------------------------------
+# main — the probe children, then the DAP loop.
+# ----------------------------------------------------------------------------
+
+fn main() -> int
+uses IO, Fs, Proc, Conc, Clock, Args, Exit, Rand, Net {
+    let argv: list[str] = args()
+    if argv.len() >= 3 && argv.get(1) == "--dap-probe" {
+        # the launch probe: load + check; the panic text IS the
+        # diagnostic the parent reads back
+        let _boot: Boot = hb_load_checked(argv.get(2), [], false,
+        "", "", "")
+        return 0
+    }
+    if argv.len() >= 3 && argv.get(1) == "--dap-expr-probe" {
+        # the console-expression probe: one expression, full
+        # consumption; the panic text is the parse diagnostic
+        let ctx: Ctx = new_ctx(argv.get(2))
+        lex(ctx)
+        let _ei: int = parse_expr(ctx, true)
+        if ctx.pos != ctx.toks.len() - 1 {
+            panic("not a single expression: " + argv.get(2))
+        }
+        return 0
+    }
+    # the DAP session: the reader thread feeds the merge channel, the
+    # run thread joins at configurationDone, the main thread is the
+    # one writer and the only toucher of the session state.
+    let sess: DapSess = dap_sess_new()
+    let ra: ReadArgs = ReadArgs { events: sess.events }
+    let _reader: Task[int] = spawn(dap_reader_entry, clone(ra))
+    while true {
+        let ev: DbgEvent = sess.events.recv()
+        eprintln("[wire-sync: main got " + ev.kind + "]")
+        if ev.kind == "request" {
+            dap_handle_request(sess, ev.text)
+        } else if ev.kind == "badframe" {
+            # the .py's parse-error response: request_seq 0, empty
+            # command, the session continues
+            dap_send(sess,
+            ["type", "request_seq", "success", "command", "message",
+             "body"],
+            [json_str("response"), json_int(0), json_bool(false),
+             json_str(""), json_str(ev.text), json_object([], [])])
+        } else if ev.kind == "output" {
+            dap_send_event(sess, "output",
+            ["category", "output"],
+            [json_str(ev.category), json_str(ev.text)])
+        } else if ev.kind == "stopped" {
+            dap_on_stopped_event(sess, ev)
+        } else if ev.kind == "exited" {
+            dap_send_event(sess, "exited", ["exitCode"],
+            [json_int(ev.code)])
+        } else if ev.kind == "terminated" {
+            dap_send_event(sess, "terminated", [], [])
+        } else if ev.kind == "eof" {
+            # EOF shutdown: die immediately (a parked run thread must
+            # not block the pipe — the .py's os._exit law)
+            exit(0)
+        }
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# End of tools/hls-dap.hls
+# ============================================================================
