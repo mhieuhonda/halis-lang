@@ -1041,10 +1041,32 @@ fn pw_program(ctx: Ctx, out: list[str]) -> void {
 # try/except HLError produced.
 # ----------------------------------------------------------------------------
 
+# ls_rf_one_stmt — parse ONE statement from ctx.pos, the consumed
+# token count (0 = refused: eof or a top-level declaration keyword —
+# the walker stops). Runs inside the --rf-slice child; a parse panic
+# kills the child and the parent reads the refusal.
+fn ls_rf_one_stmt(ctx: Ctx, pos: int) -> int uses Args {
+    if pos >= ctx.toks.len() - 1 {
+        return 0
+    }
+    let t: Tok = ctx.toks.get(pos)
+    if t.kind == "kw" && (t.value == "fn" || t.value == "struct"
+    || t.value == "enum" || t.value == "impl" || t.value == "import"
+    || t.value == "extern") {
+        return 0
+    }
+    ctx.pos = pos
+    let _s: int = parse_stmt(ctx)
+    let consumed: int = ctx.pos - pos
+    if consumed <= 0 {
+        return 0
+    }
+    return consumed
+}
+
 # ls_probe_file(path) — the child side. Panics propagate (that IS the
 # verdict); the parent catches the exit code + stderr.
-fn ls_probe_file(path: str) -> int uses IO, Args, Fs {
-    let ctx: Ctx = hl_parse_file(path)
+fn ls_probe_file(path: str) -> int uses IO, Args, Fs {    let ctx: Ctx = hl_parse_file(path)
     let mut i: int = 0
     while i < ctx.fn_order.len() {
         let key: str = ctx.fn_order.get(i)
@@ -1244,13 +1266,18 @@ fn ls_rfind_sub(s: str, sub: str) -> int {
 
 # ls_atoi — the decimal value of a digit string (0 on anything else).
 fn ls_atoi(s: str) -> int {
-    if !is_int_str(s) {
+    # println-terminated machine lines ("RFEXPR 1\n") must trim before
+    # the digit scan — is_int_str on "1\n" is false and every
+    # sub-child count read back as 0 (the whole refactor engine
+    # answered [] on it).
+    let t: str = s.trim()
+    if !is_int_str(t) {
         return 0
     }
     let mut v: int = 0
     let mut i: int = 0
-    while i < s.len() {
-        v = v * 10 + (s.byte_at(i) - 48)
+    while i < t.len() {
+        v = v * 10 + (t.byte_at(i) - 48)
         i = i + 1
     }
     return v
@@ -3238,15 +3265,1709 @@ uses IO, Proc, Fs, Args {
     return json_array(hints)
 }
 
-fn ls_handle_rename(st: LsState, params: JsonValue) -> JsonValue
-uses IO {
-    # garbage positions answer success with empty changes.
-    return json_object(["changes"], [json_object([], [])])
+# ----------------------------------------------------------------------------
+# Rename + codeAction (Stage 115) — the refactor engines, ported whole
+# from the .py twin. The token index is the coordinate system; the
+# parser rides sub-children (a panic IS the refusal), the checker the
+# probe. Byte offsets throughout — the lexer's columns are bytes.
+# ----------------------------------------------------------------------------
+
+# ---- the bracket machinery (the .py's _brace_matches / _tok_depths) ----
+
+fn ls_is_open_sym(v: str) -> bool {
+    return v == "(" || v == "[" || v == "{"
 }
 
+fn ls_is_close_sym(v: str) -> bool {
+    return v == ")" || v == "]" || v == "}"
+}
+
+# BraceMap — the open->close pairs as parallel lists (map keys must
+# be str in this language; token indices are ints).
+struct BraceMap {
+    opens: list[int],
+    closes: list[int]
+}
+
+fn ls_brace_empty() -> BraceMap {
+    return BraceMap { opens: [], closes: [] }
+}
+
+# ls_brace_get — the close index of an open, or -1.
+fn ls_brace_get(bm: BraceMap, open: int) -> int {
+    let mut i: int = 0
+    while i < bm.opens.len() {
+        if bm.opens.get(i) == open {
+            return bm.closes.get(i)
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# ls_brace_has — is this open in the map?
+fn ls_brace_has(bm: BraceMap, open: int) -> bool {
+    return ls_brace_get(bm, open) >= 0
+}
+
+# ls_brace_matches — open-index -> close-index for ( [ {. A malformed
+# file leaves unclosed opens out; callers treat a miss as unknown.
+fn ls_brace_matches(toks: list[LTok]) -> BraceMap {
+    let out: BraceMap = ls_brace_empty()
+    let stack: list[int] = []
+    let mut i: int = 0
+    while i < toks.len() {
+        let t: LTok = toks.get(i)
+        if t.kind == "sym" {
+            if ls_is_open_sym(t.value) {
+                stack.push(i)
+            } else if ls_is_close_sym(t.value) && stack.len() > 0 {
+                let o: int = stack.pop()
+                # the pair must match (( with ) etc.) — anything else
+                # leaves the open unmatched.
+                if ls_pair_of(toks.get(o).value) == t.value {
+                    out.opens.push(o)
+                    out.closes.push(i)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn ls_pair_of(open: str) -> str {
+    if open == "(" {
+        return ")"
+    }
+    if open == "[" {
+        return "]"
+    }
+    return "}"
+}
+
+# ls_tok_depths — the bracket depth BEFORE each token (0 at file top).
+fn ls_tok_depths(toks: list[LTok]) -> list[int] {
+    let depths: list[int] = []
+    let mut d: int = 0
+    let mut i: int = 0
+    while i < toks.len() {
+        depths.push(d)
+        let t: LTok = toks.get(i)
+        if t.kind == "sym" {
+            if ls_is_open_sym(t.value) {
+                d = d + 1
+            } else if ls_is_close_sym(t.value) && d > 0 {
+                d = d - 1
+            }
+        }
+        i = i + 1
+    }
+    return depths
+}
+
+# ls_tok_covers — does token t cover byte offset off?
+fn ls_tok_covers(t: LTok, off: int) -> bool {
+    return t.off <= off && off < t.off + t.len
+}
+
+# ls_token_index_at — the index of the token covering the byte offset
+# (converted from the wire position), or -1.
+fn ls_token_index_at(toks: list[LTok], off: int) -> int {
+    let mut i: int = 0
+    while i < toks.len() {
+        if ls_tok_covers(toks.get(i), off) {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# ls_fn_spans — [start, end) token spans of every fn body (top-level
+# fns and impl methods alike): the fn keyword through its body's close
+# brace. An `extern fn` has no body and earns no span; header keywords
+# (uses/pure/extern) never end the scan, only a declaration keyword can.
+fn ls_fn_spans(toks: list[LTok], braces: BraceMap) -> list[list[int]] {
+    let spans: list[list[int]] = []
+    let n: int = toks.len()
+    let mut i: int = 0
+    while i < n {
+        let t: LTok = toks.get(i)
+        if t.kind != "kw" || t.value != "fn" {
+            i = i + 1
+            continue
+        }
+        let mut j: int = i + 1
+        let mut body: int = -1
+        while j < n {
+            let tj: LTok = toks.get(j)
+            if tj.kind == "sym" && tj.value == "{" {
+                if ls_brace_has(braces, j) {
+                    body = ls_brace_get(braces, j)
+                }
+                break
+            }
+            if tj.kind == "kw" && tj.value != "uses" && tj.value != "pure"
+            && tj.value != "extern" {
+                break
+            }
+            j = j + 1
+        }
+        if body >= 0 {
+            spans.push([i, body + 1])
+        }
+        i = i + 1
+    }
+    return spans
+}
+
+# ls_decl_regions — [start, end) spans of every `kw ... { ... }` region
+# (struct and impl bodies, per the kw asked for).
+fn ls_decl_regions(toks: list[LTok], braces: BraceMap, kw: str)
+-> list[list[int]] {
+    let regions: list[list[int]] = []
+    let n: int = toks.len()
+    let mut i: int = 0
+    while i < n {
+        let t: LTok = toks.get(i)
+        if t.kind != "kw" || t.value != kw {
+            i = i + 1
+            continue
+        }
+        let mut j: int = i + 1
+        while j < n {
+            let tj: LTok = toks.get(j)
+            if tj.kind == "sym" && tj.value == "{" {
+                if ls_brace_has(braces, j) {
+                    regions.push([i, ls_brace_get(braces, j) + 1])
+                }
+                break
+            }
+            if tj.kind == "kw" {
+                break
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return regions
+}
+
+# ls_enclosing_span — the first span containing idx, or -1 (the span
+# index; spans live in a list, list.get is the read).
+fn ls_enclosing_span(spans: list[list[int]], idx: int) -> int {
+    let mut i: int = 0
+    while i < spans.len() {
+        if spans.get(i).get(0) <= idx && idx < spans.get(i).get(1) {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# ---- the parser sub-children (a panic IS the refusal) ----
+
+# rf_parse_stmts — token indices [start, end) re-lexed from text and
+# parsed statement by statement; the consumed count of each statement
+# is returned (one entry per statement; [] = the first parse failed —
+# caller refuses). The child is this very binary with --rf-slice.
+fn rf_parse_stmts(text: str) -> list[int] uses Proc, Args, Fs {
+    ls_scratch_write(text)
+    let r: RunRes = ls_run_child([ls_self(), "--rf-slice",
+    ls_scratch_path()])
+    if r.code != 0 {
+        return []
+    }
+    let out: list[int] = []
+    let lines: list[str] = r.out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        if ls_starts(lines.get(i), "RFSTMT ") {
+            out.push(ls_atoi(lines.get(i).slice(7,
+            lines.get(i).len())))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# rf_expr_extends — the number of tokens parse_expr consumes from the
+# re-lexed text, 0 when it fails or leaves tokens behind (the eof
+# marker counts; exactly one expression, all of it).
+fn rf_expr_extends(text: str) -> int uses IO, Proc, Args, Fs {
+    ls_scratch_write(text)
+    let r: RunRes = ls_run_child([ls_self(), "--rf-expr",
+    ls_scratch_path()])
+    if r.code != 0 {
+        return 0
+    }
+    if !ls_starts(r.out, "RFEXPR ") {
+        return 0
+    }
+    return ls_atoi(r.out.slice(7, r.out.len()))
+}
+
+# rf_stmt_extends — same, for one statement.
+fn rf_stmt_extends(text: str) -> int uses Proc, Args, Fs {
+    ls_scratch_write(text)
+    let r: RunRes = ls_run_child([ls_self(), "--rf-stmt",
+    ls_scratch_path()])
+    if r.code != 0 {
+        return 0
+    }
+    if !ls_starts(r.out, "RFSTMT ") {
+        return 0
+    }
+    return ls_atoi(r.out.slice(7, r.out.len()))
+}
+
+# rf_text_checks — parse + check a whole document (the probe).
+fn rf_text_checks(text: str) -> bool uses Proc, Args, Fs {
+    ls_scratch_write(text)
+    let r: RunRes = ls_run_child([ls_self(), "--probe-file",
+    ls_scratch_path()])
+    return r.code == 0
+}
+
+# ---- byte edits (the .py's edit plumbing, byte-true) ----
+
+# ByteEdit — [a, b) bytes replaced by new_text; non-overlapping by
+# construction, applied bottom-up.
+struct ByteEdit {
+    a: int,
+    b: int,
+    new_text: str
+}
+
+# rf_apply_edits — apply byte edits bottom-up (reverse-sorted by a).
+fn rf_apply_edits(text: str, edits: list[ByteEdit]) -> str {
+    # insertion sort by a, descending — only pointer slots move.
+    let mut i: int = 1
+    while i < edits.len() {
+        let it: ByteEdit = edits.get(i)
+        let mut j: int = i - 1
+        let mut pos: int = i
+        while j >= 0 && edits.get(j).a < it.a {
+            edits.set(j + 1, edits.get(j))
+            pos = j
+            j = j - 1
+        }
+        edits.set(pos, it)
+        i = i + 1
+    }
+    let mut out: str = text
+    # sorted descending, so apply from index 0 (the LARGEST a) down —
+    # bottom-up: an edit at a larger offset never shifts one below it.
+    # (the loop used to run from the tail, applying the SMALLEST a
+    # first, and every later edit landed shifted by the splice before
+    # it — an inline's use-site replacements landed mid-identifier.)
+    let mut k: int = 0
+    while k < edits.len() {
+        let e: ByteEdit = edits.get(k)
+        out = out.slice(0, e.a) + e.new_text + out.slice(e.b, out.len())
+        k = k + 1
+    }
+    return out
+}
+
+# rf_edits_to_lsp — byte triples -> LSP TextEdits (line + utf-16 col).
+fn rf_edits_to_lsp(d: DocRec, edits: list[ByteEdit]) -> list[JsonValue] {
+    let out: list[JsonValue] = []
+    let mut i: int = 0
+    while i < edits.len() {
+        let e: ByteEdit = edits.get(i)
+        let l0: int = ls_line_of(d.offs, e.a)
+        let c0: int = ls_utf16_of_byte_col(d.text, d.offs, l0,
+        e.a - d.offs.get(l0))
+        let l1: int = ls_line_of(d.offs, e.b)
+        let c1: int = ls_utf16_of_byte_col(d.text, d.offs, l1,
+        e.b - d.offs.get(l1))
+        out.push(json_object(["range", "newText"],
+        [ls_range_json(l0, c0, l1, c1), json_str(e.new_text)]))
+        i = i + 1
+    }
+    return out
+}
+
+# ---- the local declaration engine (the .py's _collect_local_decls) ----
+
+# LocalDecl — one local binding with the exact token window the name
+# stays bound in.
+struct LocalDecl {
+    name: str,
+    kind: str, # let | for | param | bind
+    tok: int,
+    start: int,
+    end: int
+}
+
+# ls_arm_bindings — [(name_tok, bind_start, bind_end)] for every match
+# pattern binding: the paren group walked BACKWARD from each `=>`; the
+# binding holds from the arrow to the next `,` or `}` at its own depth.
+fn ls_arm_bindings(toks: list[LTok], depths: list[int])
+-> list[list[int]] {
+    let out: list[list[int]] = []
+    let n: int = toks.len()
+    let mut i: int = 0
+    while i < n {
+        let t: LTok = toks.get(i)
+        if t.kind != "sym" || t.value != "=>" {
+            i = i + 1
+            continue
+        }
+        if i == 0 || toks.get(i - 1).value != ")" {
+            i = i + 1
+            continue
+        }
+        let binds: list[int] = []
+        let mut j: int = i - 1
+        let mut depth: int = 0
+        while j >= 0 {
+            let tj: LTok = toks.get(j)
+            if tj.kind == "sym" {
+                if ls_is_close_sym(tj.value) {
+                    depth = depth + 1
+                } else if ls_is_open_sym(tj.value) {
+                    depth = depth - 1
+                    if depth == 0 {
+                        break
+                    }
+                }
+            } else if tj.kind == "ident" && depth == 1
+            && tj.value != "_" {
+                binds.push(j)
+            }
+            j = j - 1
+        }
+        let d0: int = depths.get(i)
+        let mut end: int = n
+        let mut k: int = i + 1
+        while k < n {
+            let dk: int = depths.get(k)
+            let tk: LTok = toks.get(k)
+            if dk < d0 {
+                end = k
+                break
+            }
+            if dk == d0 && tk.kind == "sym"
+            && (tk.value == "," || tk.value == "}") {
+                end = k
+                break
+            }
+            k = k + 1
+        }
+        let mut b: int = 0
+        while b < binds.len() {
+            out.push([binds.get(b), i + 1, end])
+            b = b + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ls_collect_local_decls — every local binding inside the fn window
+# [lo, hi): lets, params, for vars, match-arm payload bindings. Each
+# carries its exact token window, so resolution is scope-precise.
+fn ls_collect_local_decls(toks: list[LTok], lo: int, hi: int,
+braces: BraceMap, depths: list[int]) -> list[LocalDecl] {
+    let decls: list[LocalDecl] = []
+    # Match-arm payload bindings first — exact ranges, no scan needed.
+    let arms: list[list[int]] = ls_arm_bindings(toks, depths)
+    let mut ai: int = 0
+    while ai < arms.len() {
+        let a: list[int] = arms.get(ai)
+        if lo <= a.get(0) && a.get(0) < hi {
+            decls.push(LocalDecl {
+                name: toks.get(a.get(0)).value, kind: "bind",
+                tok: a.get(0), start: a.get(0), end: a.get(2)
+            })
+        }
+        ai = ai + 1
+    }
+    let scope: list[int] = []
+    let mut pending_names: list[str] = []
+    let mut pending_toks: list[int] = []
+    let mut pending_kinds: list[str] = []
+    let mut i: int = lo
+    while i < hi {
+        let t: LTok = toks.get(i)
+        let k: str = t.kind
+        let v: str = t.value
+        if k == "sym" && v == "{" {
+            scope.push(i)
+            if ls_brace_has(braces, i) {
+                let close: int = ls_brace_get(braces, i)
+                let mut p: int = 0
+                while p < pending_names.len() {
+                    decls.push(LocalDecl {
+                        name: pending_names.get(p),
+                        kind: pending_kinds.get(p),
+                        tok: pending_toks.get(p),
+                        start: pending_toks.get(p),
+                        end: close + 1
+                    })
+                    p = p + 1
+                }
+                pending_names = []
+                pending_toks = []
+                pending_kinds = []
+            }
+        } else if k == "sym" && v == "}" {
+            if scope.len() > 0 {
+                let _d: int = scope.pop()
+            }
+        } else if k == "kw" && v == "let" {
+            let mut j: int = i + 1
+            if j < hi && toks.get(j).kind == "kw"
+            && toks.get(j).value == "mut" {
+                j = j + 1
+            }
+            if j < hi && toks.get(j).kind == "ident" {
+                let mut end: int = hi
+                if scope.len() > 0 {
+                    let c: int = ls_brace_get(braces, scope.get(scope.len() - 1))
+                    if c >= 0 {
+                        end = c + 1
+                    }
+                }
+                decls.push(LocalDecl {
+                    name: toks.get(j).value, kind: "let", tok: j,
+                    start: j, end: end
+                })
+                i = j
+            }
+        } else if k == "kw" && v == "for" {
+            let j2: int = i + 1
+            if j2 < hi && toks.get(j2).kind == "ident" {
+                pending_names.push(toks.get(j2).value)
+                pending_toks.push(j2)
+                pending_kinds.push("for")
+                i = j2
+            }
+        } else if k == "kw" && v == "fn" && i == lo {
+            # the window's own fn — its parameters bind in the body
+            let mut j3: int = i + 1
+            if j3 < hi && toks.get(j3).kind == "ident" {
+                j3 = j3 + 1
+            }
+            if j3 < hi && toks.get(j3).kind == "sym"
+            && toks.get(j3).value == "(" {
+                let mut pd: int = 0
+                while j3 < hi {
+                    let tj: LTok = toks.get(j3)
+                    if tj.kind == "sym" {
+                        if ls_is_open_sym(tj.value) {
+                            pd = pd + 1
+                        } else if ls_is_close_sym(tj.value) {
+                            pd = pd - 1
+                            if pd == 0 {
+                                break
+                            }
+                        }
+                    } else if tj.kind == "ident" && pd == 1
+                    && j3 + 1 < hi && toks.get(j3 + 1).kind == "sym"
+                    && toks.get(j3 + 1).value == ":" {
+                        pending_names.push(tj.value)
+                        pending_toks.push(j3)
+                        pending_kinds.push("param")
+                    }
+                    j3 = j3 + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return decls
+}
+
+# ls_resolve_local — the innermost declaration of `name` covering idx.
+fn ls_resolve_local(decls: list[LocalDecl], idx: int, name: str)
+-> int {
+    let mut best: int = -1
+    let mut i: int = 0
+    while i < decls.len() {
+        let d: LocalDecl = decls.get(i)
+        if d.name == name && d.start <= idx && idx < d.end {
+            if best < 0 || d.start > decls.get(best).start {
+                best = i
+            }
+        }
+        i = i + 1
+    }
+    return best
+}
+
+# ls_scope_taken_names — names a new local binding must avoid.
+fn ls_scope_taken_names(d: DocRec, lo: int, hi: int) -> list[str] {
+    let taken: list[str] = []
+    let mut i: int = 0
+    while i < ls_keywords().len() {
+        ls_push_unique(taken, ls_keywords().get(i))
+        i = i + 1
+    }
+    i = 0
+    while i < ls_builtins().len() {
+        ls_push_unique(taken, ls_builtins().get(i))
+        i = i + 1
+    }
+    i = 0
+    while i < ls_effects().len() {
+        ls_push_unique(taken, ls_effects().get(i))
+        i = i + 1
+    }
+    # the program's top-level symbols (methods by short name)
+    let mut fi: int = 0
+    while fi < d.syms.fns.len() {
+        let key: str = d.syms.fns.get(fi).key
+        ls_push_unique(taken, key)
+        if key.contains(".") {
+            ls_push_unique(taken, ls_after_last_sep(key, "."))
+        }
+        fi = fi + 1
+    }
+    let mut si: int = 0
+    while si < d.syms.structs.len() {
+        ls_push_unique(taken, d.syms.structs.get(si).name)
+        si = si + 1
+    }
+    let mut ei: int = 0
+    while ei < d.syms.enums.len() {
+        ls_push_unique(taken, d.syms.enums.get(ei).name)
+        ei = ei + 1
+    }
+    # every identifier in the window
+    let mut j: int = lo
+    while j < hi && j < d.toks.len() {
+        if d.toks.get(j).kind == "ident" {
+            ls_push_unique(taken, d.toks.get(j).value)
+        }
+        j = j + 1
+    }
+    return taken
+}
+
+# ls_taken_has — membership (list, not set — the tool has no set).
+fn ls_taken_has(taken: list[str], s: str) -> bool {
+    let mut i: int = 0
+    while i < taken.len() {
+        if taken.get(i) == s {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# ls_fresh_name — base, or base2, base3... — the first free one.
+fn ls_fresh_name(base: str, taken: list[str]) -> str {
+    if !ls_taken_has(taken, base) {
+        return base
+    }
+    let mut n: int = 2
+    while ls_taken_has(taken, base + n.to_str()) {
+        n = n + 1
+    }
+    return base + n.to_str()
+}
+
+# ---- the rename classifier ----
+
+# ls_classify_dot_name — "" | "field" | "method" | "variant" for a
+# name reachable through a dot: the cursor sits on a `.name` access or
+# a field declaration inside a struct body. A name that is BOTH a
+# field and a method (or also a variant) classifies "" — a wrong
+# rewrite is worse than a refused one.
+fn ls_classify_dot_name(d: DocRec, idx: int, name: str,
+docs: list[DocRec]) -> str {
+    let toks: list[LTok] = d.toks
+    let on_site: bool = idx > 0 && toks.get(idx - 1).kind == "sym"
+    && toks.get(idx - 1).value == "."
+    let mut on_decl: bool = false
+    if !on_site {
+        let braces: BraceMap = ls_brace_matches(toks)
+        let regions: list[list[int]] = ls_decl_regions(toks, braces,
+        "struct")
+        let mut ri: int = 0
+        while ri < regions.len() {
+            let r: list[int] = regions.get(ri)
+            if r.get(0) < idx && idx < r.get(1) && idx + 1 < toks.len() {
+                if toks.get(idx + 1).kind == "sym"
+                && toks.get(idx + 1).value == ":" {
+                    on_decl = true
+                }
+            }
+            ri = ri + 1
+        }
+    }
+    if !on_site && !on_decl {
+        return ""
+    }
+    let mut is_field: bool = false
+    let mut is_method: bool = false
+    let mut is_variant: bool = false
+    let mut di: int = 0
+    while di < docs.len() {
+        let syms: Syms = docs.get(di).syms
+        let mut si: int = 0
+        while si < syms.structs.len() {
+            let mut fi: int = 0
+            while fi < syms.structs.get(si).fields.len() {
+                if syms.structs.get(si).fields.get(fi) == name {
+                    is_field = true
+                }
+                fi = fi + 1
+            }
+            si = si + 1
+        }
+        let mut ei: int = 0
+        while ei < syms.enums.len() {
+            let mut vi: int = 0
+            while vi < syms.enums.get(ei).variants.len() {
+                if syms.enums.get(ei).variants.get(vi) == name {
+                    is_variant = true
+                }
+                vi = vi + 1
+            }
+            ei = ei + 1
+        }
+        let mut fj: int = 0
+        while fj < syms.fns.len() {
+            if ls_ends(syms.fns.get(fj).key, "." + name) {
+                is_method = true
+            }
+            fj = fj + 1
+        }
+        di = di + 1
+    }
+    let mut count: int = 0
+    if is_field {
+        count = count + 1
+    }
+    if is_method {
+        count = count + 1
+    }
+    if is_variant {
+        count = count + 1
+    }
+    if count > 1 {
+        return ""
+    }
+    if is_field {
+        return "field"
+    }
+    if is_method {
+        return "method"
+    }
+    return ""
+}
+
+# ls_structlit_key_at — token i is a struct-literal KEY: an identifier
+# followed by `:` at the first field depth of a `{...}` group whose
+# opener is preceded by the struct's name. Match arms use `=>`, map
+# keys are strings — neither can masquerade here.
+fn ls_structlit_key_at(toks: list[LTok], depths: list[int], i: int)
+-> bool {
+    if i + 1 >= toks.len() || toks.get(i).kind != "ident" {
+        return false
+    }
+    let nxt: LTok = toks.get(i + 1)
+    if nxt.kind != "sym" || nxt.value != ":" {
+        return false
+    }
+    let d: int = depths.get(i)
+    let mut j: int = i
+    while j >= 0 {
+        let tj: LTok = toks.get(j)
+        if tj.kind == "sym" && tj.value == "{" && depths.get(j) == d - 1 {
+            return j > 0 && toks.get(j - 1).kind == "ident"
+        }
+        j = j - 1
+    }
+    return false
+}
+
+# ---- rename: the three engines ----
+
+# ls_handle_rename — scope-aware rename. LOCAL renames exactly the
+# occurrences the declaration binds; FIELD/METHOD renames the
+# declaration plus `.name` sites across open documents; everything
+# else keeps the Stage 14 textual contract. Returns the WorkspaceEdit
+# result, or json_null() AFTER sending its own error reply (the
+# dispatch must not double-send — a null return means "already
+# answered").
+fn ls_handle_rename(st: LsState, params: JsonValue, idv: JsonValue)
+-> JsonValue uses IO, Proc, Fs, Args {
+    let td: JsonValue = ls_jget(params, "textDocument")
+    let uri: str = ls_jstr(td, "uri")
+    let pos: JsonValue = ls_jget(params, "position")
+    let new_name: str = ls_jstr(params, "newName")
+    # Validate the new name — a legal identifier, never a keyword.
+    if new_name == "" {
+        ls_send_error(idv, -32602,
+        "invalid newName: must start with a letter or _")
+        return json_null()
+    }
+    let c0: int = new_name.byte_at(0)
+    if !((c0 >= 97 && c0 <= 122) || (c0 >= 65 && c0 <= 90)
+    || c0 == 95) {
+        ls_send_error(idv, -32602,
+        "invalid newName: must start with a letter or _")
+        return json_null()
+    }
+    let mut ci: int = 0
+    while ci < new_name.len() {
+        let c: int = new_name.byte_at(ci)
+        if !((c >= 97 && c <= 122) || (c >= 65 && c <= 90)
+        || (c >= 48 && c <= 57) || c == 95) {
+            ls_send_error(idv, -32602,
+            "invalid newName: only [A-Za-z0-9_] allowed")
+            return json_null()
+        }
+        ci = ci + 1
+    }
+    if ls_taken_has(ls_keywords(), new_name) {
+        ls_send_error(idv, -32602,
+        "invalid newName: " + new_name + " is a keyword")
+        return json_null()
+    }
+    let di: int = ls_find_doc(st, uri)
+    if di < 0 {
+        return json_object(["changes"], [json_object([], [])])
+    }
+    let d: DocRec = st.docs.get(di)
+    if d.parse_err || d.dead {
+        return json_object(["changes"], [json_object([], [])])
+    }
+    let line0: int = ls_jint(pos, "line")
+    let char16: int = ls_jint(pos, "character")
+    let col_byte: int = ls_byte_of_utf16_col(d.text, d.offs, line0,
+    char16)
+    let off: int = ls_linecol_to_off(d.offs, line0, col_byte)
+    let idx: int = ls_token_index_at(d.toks, off)
+    if idx < 0 {
+        return json_object(["changes"], [json_object([], [])])
+    }
+    let tok: LTok = d.toks.get(idx)
+    if tok.kind != "ident" && tok.kind != "kw" {
+        return json_object(["changes"], [json_object([], [])])
+    }
+    let name: str = tok.value
+    if ls_taken_has(ls_keywords(), name)
+    || ls_taken_has(ls_builtins(), name)
+    || ls_taken_has(ls_effects(), name) {
+        ls_send_error(idv, -32602,
+        "cannot rename keyword/builtin/effect: " + name)
+        return json_null()
+    }
+    # 1. LOCAL — the scope engine.
+    let braces: BraceMap = ls_brace_matches(d.toks)
+    let depths: list[int] = ls_tok_depths(d.toks)
+    let spans: list[list[int]] = ls_fn_spans(d.toks, braces)
+    let span_i: int = ls_enclosing_span(spans, idx)
+    if span_i >= 0 {
+        let span: list[int] = spans.get(span_i)
+        let lo: int = span.get(0)
+        let hi: int = span.get(1)
+        let decls: list[LocalDecl] = ls_collect_local_decls(d.toks,
+        lo, hi, braces, depths)
+        let decl_i: int = ls_resolve_local(decls, idx, name)
+        if decl_i >= 0 {
+            return rf_rename_local(st, idv, di, decls, decl_i,
+            new_name, lo, hi)
+        }
+        # 2. FIELD / METHOD — reachable only through a dot.
+        let docs: list[DocRec] = []
+        let mut dj: int = 0
+        while dj < st.docs.len() {
+            if !st.docs.get(dj).dead {
+                docs.push(st.docs.get(dj))
+            }
+            dj = dj + 1
+        }
+        let mode: str = ls_classify_dot_name(d, idx, name, docs)
+        if mode == "field" || mode == "method" {
+            return rf_rename_dotted(st, idv, name, new_name, mode)
+        }
+    }
+    # 3. GLOBAL — the Stage 14 textual contract.
+    let changes_keys: list[str] = []
+    let changes_vals: list[JsonValue] = []
+    let mut ui: int = 0
+    while ui < st.docs.len() {
+        let u: DocRec = st.docs.get(ui)
+        if u.dead {
+            ui = ui + 1
+            continue
+        }
+        let locs: list[JsonValue] = []
+        ls_refs_in_text(locs, u.uri, u.text, u.offs, u.toks, name)
+        if locs.len() > 0 {
+            let edits: list[JsonValue] = []
+            let mut li: int = 0
+            while li < locs.len() {
+                edits.push(json_object(["range", "newText"],
+                [json_object_get(locs.get(li), "range"),
+                json_str(new_name)]))
+                li = li + 1
+            }
+            changes_keys.push(u.uri)
+            changes_vals.push(json_array(edits))
+        }
+        ui = ui + 1
+    }
+    return json_object(["changes"],
+    [json_object(changes_keys, changes_vals)])
+}
+
+# rf_rename_local — rename one local binding precisely: every token
+# the declaration binds, nothing else. The new name must be free in
+# scope, and the finished file must still check when the original did.
+fn rf_rename_local(st: LsState, idv: JsonValue, di: int,
+decls: list[LocalDecl], decl_i: int, new_name: str, lo: int, hi: int)
+-> JsonValue uses IO, Proc, Args {
+    let d: DocRec = st.docs.get(di)
+    let decl: LocalDecl = decls.get(decl_i)
+    let taken: list[str] = ls_scope_taken_names(d, lo, hi)
+    if ls_taken_has(taken, new_name) {
+        ls_send_error(idv, -32602,
+        "name already in use in this scope: " + new_name)
+        return json_null()
+    }
+    let edits: list[ByteEdit] = []
+    let mut i: int = lo
+    while i < hi && i < d.toks.len() {
+        let t: LTok = d.toks.get(i)
+        if t.kind != "ident" || t.value != decl.name {
+            i = i + 1
+            continue
+        }
+        if i + 1 < d.toks.len() && d.toks.get(i + 1).kind == "sym"
+        && d.toks.get(i + 1).value == "(" {
+            i = i + 1
+            continue
+        }
+        if ls_resolve_local(decls, i, decl.name) != decl_i {
+            i = i + 1
+            continue
+        }
+        edits.push(ByteEdit { a: t.off, b: t.off + t.len,
+        new_text: new_name })
+        i = i + 1
+    }
+    if edits.len() == 0 {
+        return json_object(["changes"], [json_object([], [])])
+    }
+    # Re-check: only when the original file was clean.
+    if rf_text_checks(d.text) {
+        if !rf_text_checks(rf_apply_edits(d.text, edits)) {
+            ls_send_error(idv, -32602,
+            "rename refused: the result does not check")
+            return json_null()
+        }
+    }
+    return json_object(["changes"], [json_object([d.uri],
+    [json_array(rf_edits_to_lsp(d, edits))])])
+}
+
+# rf_rename_dotted — field / method rename across open documents.
+fn rf_rename_dotted(st: LsState, idv: JsonValue, name: str,
+new_name: str, mode: str) -> JsonValue uses IO, Proc, Args {
+    # Collision law: a field may not rename into a sibling field of a
+    # struct that already has both; a method likewise per impl.
+    let mut di: int = 0
+    while di < st.docs.len() {
+        let u: DocRec = st.docs.get(di)
+        if u.dead {
+            di = di + 1
+            continue
+        }
+        if mode == "field" {
+            let mut si: int = 0
+            while si < u.syms.structs.len() {
+                let st2: SymStruct = u.syms.structs.get(si)
+                let has_old: bool = ls_taken_has(st2.fields, name)
+                let has_new: bool = ls_taken_has(st2.fields, new_name)
+                if has_old && has_new {
+                    ls_send_error(idv, -32602,
+                    "field " + new_name + " already exists in struct "
+                    + st2.name)
+                    return json_null()
+                }
+                si = si + 1
+            }
+        } else {
+            let mut fi: int = 0
+            while fi < u.syms.fns.len() {
+                let key: str = u.syms.fns.get(fi).key
+                if ls_ends(key, "." + name) {
+                    let owner: str = key.slice(0,
+                    key.len() - name.len() - 1)
+                    let cand: str = owner + "." + new_name
+                    let mut fj: int = 0
+                    while fj < u.syms.fns.len() {
+                        if u.syms.fns.get(fj).key == cand {
+                            ls_send_error(idv, -32602,
+                            "method " + new_name
+                            + " already exists in impl " + owner)
+                            return json_null()
+                        }
+                        fj = fj + 1
+                    }
+                }
+                fi = fi + 1
+            }
+        }
+        di = di + 1
+    }
+    let changes_keys: list[str] = []
+    let changes_vals: list[JsonValue] = []
+    di = 0
+    while di < st.docs.len() {
+        let u: DocRec = st.docs.get(di)
+        if u.dead {
+            di = di + 1
+            continue
+        }
+        let braces: BraceMap = ls_brace_matches(u.toks)
+        let depths: list[int] = ls_tok_depths(u.toks)
+        let sregions: list[list[int]] = ls_decl_regions(u.toks, braces,
+        "struct")
+        let iregions: list[list[int]] = ls_decl_regions(u.toks, braces,
+        "impl")
+        let edits: list[ByteEdit] = []
+        let mut i: int = 0
+        while i < u.toks.len() {
+            let t: LTok = u.toks.get(i)
+            if t.kind != "ident" || t.value != name {
+                i = i + 1
+                continue
+            }
+            let mut hit: bool = false
+            if mode == "field" {
+                if i > 0 && u.toks.get(i - 1).kind == "sym"
+                && u.toks.get(i - 1).value == "." {
+                    hit = true
+                }
+                if !hit && i + 1 < u.toks.len()
+                && u.toks.get(i + 1).kind == "sym"
+                && u.toks.get(i + 1).value == ":" {
+                    let mut ri: int = 0
+                    while ri < sregions.len() {
+                        let r: list[int] = sregions.get(ri)
+                        if r.get(0) < i && i < r.get(1) {
+                            hit = true
+                        }
+                        ri = ri + 1
+                    }
+                    if !hit {
+                        hit = ls_structlit_key_at(u.toks, depths, i)
+                    }
+                }
+            } else {
+                if i > 0 && u.toks.get(i - 1).kind == "sym"
+                && u.toks.get(i - 1).value == "." {
+                    hit = true
+                }
+                if !hit && i > 0 && u.toks.get(i - 1).kind == "kw"
+                && u.toks.get(i - 1).value == "fn" {
+                    let mut ri2: int = 0
+                    while ri2 < iregions.len() {
+                        let r2: list[int] = iregions.get(ri2)
+                        if r2.get(0) < i && i < r2.get(1) {
+                            hit = true
+                        }
+                        ri2 = ri2 + 1
+                    }
+                }
+            }
+            if hit {
+                edits.push(ByteEdit { a: t.off, b: t.off + t.len,
+                new_text: new_name })
+            }
+            i = i + 1
+        }
+        if edits.len() > 0 {
+            changes_keys.push(u.uri)
+            changes_vals.push(json_array(rf_edits_to_lsp(u, edits)))
+        }
+        di = di + 1
+    }
+    return json_object(["changes"],
+    [json_object(changes_keys, changes_vals)])
+}
+
+# ---- codeAction: the extract / inline planners ----
+
+# ls_selection_window — the selection as a token window [i0, i1]
+# (inclusive), or -1s when it does not resolve. A collapsed cursor on
+# an identifier extends to the whole call when `(` follows — `f(a, b)`
+# extracts whole, because that is what "extract this" means at a call.
+fn ls_selection_window(d: DocRec, braces: BraceMap, rng: JsonValue)
+-> list[int] {
+    let offs: list[int] = d.offs
+    let start: JsonValue = ls_jget(rng, "start")
+    let end: JsonValue = ls_jget(rng, "end")
+    let sl: int = ls_jint(start, "line")
+    let el: int = ls_jint(end, "line")
+    let sc: int = ls_jint(start, "character")
+    let ec: int = ls_jint(end, "character")
+    if sl > el || (sl == el && sc > ec) {
+        return [-1, -1]
+    }
+    let a: int = ls_linecol_to_off(offs, sl,
+    ls_byte_of_utf16_col(d.text, offs, sl, sc))
+    let b: int = ls_linecol_to_off(offs, el,
+    ls_byte_of_utf16_col(d.text, offs, el, ec))
+    let mut i0: int = -1
+    let mut i1: int = -1
+    let mut i: int = 0
+    while i < d.toks.len() {
+        let t: LTok = d.toks.get(i)
+        if i0 < 0 && t.off + t.len > a {
+            i0 = i
+        }
+        if t.off < b || (t.off == b && b == a) {
+            i1 = i
+        }
+        i = i + 1
+    }
+    if i0 < 0 || i1 < 0 || i1 < i0 {
+        return [-1, -1]
+    }
+    # a collapsed cursor on an identifier followed by `(` — the whole
+    # call
+    if i0 == i1 && d.toks.get(i0).kind == "ident" && i0 + 1 < d.toks.len()
+    && d.toks.get(i0 + 1).kind == "sym"
+    && d.toks.get(i0 + 1).value == "(" {
+        let close: int = ls_brace_get(braces, i0 + 1)
+        if close > i0 {
+            i1 = close
+        }
+    }
+    return [i0, i1]
+}
+
+# ls_stmt_spans — every statement span inside the fn body [lo, hi),
+# innermost included. The body's statement list is walked with the
+# parser sub-child (one statement at a time — its consumption is the
+# statement's true extent), and every nested `{...}` group of a block
+# statement is walked in turn. Braces the grammar does not make
+# statements of — match arms, struct-literal field lists — fail the
+# parse and are skipped: exactly the places a `let` cannot go anyway.
+fn ls_stmt_spans(d: DocRec, braces: BraceMap, lo: int, hi: int)
+-> list[list[int]] uses Proc, Args, Fs {
+    # the body's open brace: the one whose close is hi - 1
+    let mut body_open: int = -1
+    let mut i: int = 0
+    while i < braces.opens.len() {
+        if braces.closes.get(i) == hi - 1 && braces.opens.get(i) >= lo {
+            body_open = braces.opens.get(i)
+        }
+        i = i + 1
+    }
+    if body_open < 0 {
+        return []
+    }
+    let out: list[list[int]] = []
+    ls_walk_stmts(d, braces, body_open + 1, hi - 1, out)
+    return out
+}
+
+# ls_walk_stmts — the recursive walk: parse one statement at a time
+# from pos (one parser sub-child per statement text); a failed parse
+# stops the walk (the caller's spans end there — exactly the .py's
+# "return" on the first exception).
+fn ls_walk_stmts(d: DocRec, braces: BraceMap, start: int, end: int,
+out: list[list[int]]) -> void uses Proc, Args, Fs {
+    let mut pos: int = start
+    let mut guard: int = 0
+    while pos < end && guard < 100000 {
+        guard = guard + 1
+        # the statement's token text, parsed by the sub-child
+        let text: str = ls_slice_text(d.text, d.toks, pos, end)
+        let consumed: int = rf_stmt_extends(text)
+        if consumed <= 0 {
+            return
+        }
+        out.push([pos, pos + consumed])
+        # recurse into the statement's nested brace groups
+        let mut k: int = pos
+        while k < pos + consumed {
+            if d.toks.get(k).kind == "sym" && d.toks.get(k).value == "{" {
+                let c: int = ls_brace_get(braces, k)
+                if c > k {
+                    ls_walk_stmts(d, braces, k + 1, c, out)
+                    k = c + 1
+                } else {
+                    k = k + 1
+                }
+            } else {
+                k = k + 1
+            }
+        }
+        pos = pos + consumed
+    }
+}
+
+# ls_slice_text — the source bytes of tokens [a, b) (b exclusive, an
+# eof-safe cap at end).
+fn ls_slice_text(text: str, toks: list[LTok], a: int, b: int) -> str {
+    if a >= b || a >= toks.len() {
+        return ""
+    }
+    let start: int = toks.get(a).off
+    let mut last: int = b - 1
+    if last >= toks.len() {
+        last = toks.len() - 1
+    }
+    let endb: int = toks.get(last).off + toks.get(last).len
+    return text.slice(start, endb)
+}
+
+# ls_assign_target_toks — token indices that are part of an assignment
+# TARGET somewhere in [lo, hi): for every statement span, the `=` at
+# the statement's own depth is the assignment's operator, and
+# everything between the statement's start and that `=` is the target
+# chain. A let's `=` introduces its initializer, not a target.
+fn ls_assign_target_toks(d: DocRec, braces: BraceMap,
+depths: list[int], spans: list[list[int]], lo: int, hi: int)
+-> list[int] {
+    let out: list[int] = []
+    let mut si: int = 0
+    while si < spans.len() {
+        let s: list[int] = spans.get(si)
+        let s0: int = s.get(0)
+        let e0: int = s.get(1)
+        if d.toks.get(s0).kind == "kw" {
+            si = si + 1
+            continue
+        }
+        let base_d: int = depths.get(s0)
+        let mut j: int = s0
+        let mut q: int = -1
+        while j < e0 {
+            if depths.get(j) < base_d {
+                break
+            }
+            if depths.get(j) == base_d && d.toks.get(j).kind == "sym"
+            && d.toks.get(j).value == "=" {
+                q = j
+                break
+            }
+            j = j + 1
+        }
+        if q >= 0 {
+            let mut kk: int = s0
+            while kk < q {
+                out.push(kk)
+                kk = kk + 1
+            }
+        }
+        si = si + 1
+    }
+    return out
+}
+
+# ls_targets_has — membership.
+fn ls_targets_has(targets: list[int], j: int) -> bool {
+    let mut i: int = 0
+    while i < targets.len() {
+        if targets.get(i) == j {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# ls_extract_candidates — the type candidates a probe may try,
+# cheapest first: primitives, the document's own struct/enum names,
+# the builtin generic wrappers over primitives, then arity-1 generics
+# of the document's own types over primitives. Capped at 64.
+fn ls_extract_candidates(d: DocRec) -> list[str] {
+    let cands: list[str] = ["int", "float", "bool", "str"]
+    let own: list[str] = []
+    let mut si: int = 0
+    while si < d.syms.structs.len() {
+        ls_push_unique(own, d.syms.structs.get(si).name)
+        si = si + 1
+    }
+    let mut ei: int = 0
+    while ei < d.syms.enums.len() {
+        ls_push_unique(own, d.syms.enums.get(ei).name)
+        ei = ei + 1
+    }
+    let mut oi: int = 0
+    while oi < own.len() {
+        ls_push_unique(cands, own.get(oi))
+        oi = oi + 1
+    }
+    let atoms: list[str] = ["int", "float", "bool", "str"]
+    let mut ai: int = 0
+    while ai < atoms.len() {
+        let a: str = atoms.get(ai)
+        ls_push_unique(cands, "list[" + a + "]")
+        ls_push_unique(cands, "map[str, " + a + "]")
+        ls_push_unique(cands, "Chan[" + a + "]")
+        ls_push_unique(cands, "tainted[" + a + "]")
+        ai = ai + 1
+    }
+    # arity-1 generics of the document's own types (the probe carries
+    # no typeparam counts — a 1-arity guess that fails the check is
+    # exactly the refusal the probe needs)
+    oi = 0
+    while oi < own.len() {
+        ai = 0
+        while ai < atoms.len() {
+            ls_push_unique(cands, own.get(oi) + "[" + atoms.get(ai) + "]")
+            ai = ai + 1
+        }
+        oi = oi + 1
+    }
+    if cands.len() > 64 {
+        let cut: list[str] = []
+        let mut ci: int = 0
+        while ci < 64 {
+            cut.push(cands.get(ci))
+            ci = ci + 1
+        }
+        return cut
+    }
+    return cands
+}
+
+# PlanRes — a planner's verdict: ok with the edits + the name, or the
+# refusal (ok=false).
+struct PlanRes {
+    ok: bool,
+    edits: list[ByteEdit],
+    name: str
+}
+
+# rf_plan_inline — the inline-variable plan. The cursor may sit on the
+# binding's name, on the `let` keyword, or on any use the declaration
+# binds. Guards: a reassigned binding, an assignment through a use, an
+# initializer naming a reassigned local, a call-bearing initializer
+# with two or more uses. The finished text is re-checked.
+fn rf_plan_inline(d: DocRec, braces: BraceMap, depths: list[int],
+spans: list[list[int]], idx: int) -> PlanRes uses IO, Proc, Args, Fs {
+    let fail: PlanRes = PlanRes { ok: false, edits: [], name: "" }
+    if idx < 0 {
+        return fail
+    }
+    let mut tok: LTok = d.toks.get(idx)
+    let mut idx2: int = idx
+    # cursor on the `let` keyword — hop to the binding name
+    if tok.kind == "kw" && tok.value == "let" {
+        let mut j: int = idx2 + 1
+        if j < d.toks.len() && d.toks.get(j).kind == "kw"
+        && d.toks.get(j).value == "mut" {
+            j = j + 1
+        }
+        if j < d.toks.len() && d.toks.get(j).kind == "ident" {
+            idx2 = j
+            tok = d.toks.get(j)
+        } else {
+            return fail
+        }
+    }
+    if tok.kind != "ident" {
+        return fail
+    }
+    let span_i: int = ls_enclosing_span(spans, idx2)
+    if span_i < 0 {
+        return fail
+    }
+    let lo: int = spans.get(span_i).get(0)
+    let hi: int = spans.get(span_i).get(1)
+    let decls: list[LocalDecl] = ls_collect_local_decls(d.toks, lo, hi,
+    braces, depths)
+    let decl_i: int = ls_resolve_local(decls, idx2, tok.value)
+    if decl_i < 0 || decls.get(decl_i).kind != "let" {
+        return fail
+    }
+    let decl: LocalDecl = decls.get(decl_i)
+    # the let's own tokens: `let [mut]? name : type = init`
+    let mut start_idx: int = decl.tok - 1
+    if start_idx >= lo && d.toks.get(start_idx).kind == "kw"
+    && d.toks.get(start_idx).value == "mut" {
+        start_idx = start_idx - 1
+    }
+    if start_idx < lo || d.toks.get(start_idx).kind != "kw"
+    || d.toks.get(start_idx).value != "let" {
+        return fail
+    }
+    # a `#[stack]` / `#[boxed]` list in front of the let belongs to it
+    let mut guard: int = 0
+    while start_idx - 1 >= lo && d.toks.get(start_idx - 1).kind == "sym"
+    && d.toks.get(start_idx - 1).value == "]" && guard < 100 {
+        guard = guard + 1
+        let mut k: int = start_idx - 1
+        let mut dd: int = 0
+        while k >= lo {
+            let tk: LTok = d.toks.get(k)
+            if tk.kind == "sym" {
+                if ls_is_close_sym(tk.value) {
+                    dd = dd + 1
+                } else if ls_is_open_sym(tk.value) {
+                    dd = dd - 1
+                    if dd == 0 {
+                        break
+                    }
+                }
+            }
+            k = k - 1
+        }
+        if k > lo && d.toks.get(k).kind == "sym"
+        && d.toks.get(k).value == "[" && k - 1 >= lo
+        && d.toks.get(k - 1).kind == "sym"
+        && d.toks.get(k - 1).value == "#" {
+            start_idx = k - 1
+        } else {
+            break
+        }
+    }
+    # the initializer: from the `=`, the parser sub-child consumes
+    # exactly the expression
+    let mut eq: int = -1
+    let mut dd2: int = 0
+    let mut j2: int = decl.tok + 1
+    while j2 < hi {
+        let tj: LTok = d.toks.get(j2)
+        if tj.kind == "sym" {
+            if ls_is_open_sym(tj.value) {
+                dd2 = dd2 + 1
+            } else if ls_is_close_sym(tj.value) {
+                if dd2 == 0 {
+                    return fail
+                }
+                dd2 = dd2 - 1
+            } else if tj.value == "=" && dd2 == 0 {
+                eq = j2
+                break
+            }
+        }
+        j2 = j2 + 1
+    }
+    let init_text: str = ls_slice_text(d.text, d.toks, eq + 1, hi)
+    let consumed: int = rf_expr_extends(init_text)
+    if consumed <= 0 {
+        return fail
+    }
+    let init_end: int = eq + consumed
+    let init_src: str = ls_slice_text(d.text, d.toks, eq + 1,
+    init_end + 1)
+    # use sites: every token the declaration binds, minus itself
+    let use_sites: list[int] = []
+    let mut i: int = lo
+    while i < hi && i < d.toks.len() {
+        let t: LTok = d.toks.get(i)
+        if t.kind != "ident" || t.value != decl.name || i == decl.tok {
+            i = i + 1
+            continue
+        }
+        if i + 1 < d.toks.len() && d.toks.get(i + 1).kind == "sym"
+        && d.toks.get(i + 1).value == "(" {
+            i = i + 1
+            continue
+        }
+        if ls_resolve_local(decls, i, decl.name) == decl_i {
+            use_sites.push(i)
+        }
+        i = i + 1
+    }
+    # guard: reassigned (the `name =` shapes the declaration binds)
+    i = lo
+    while i < hi && i < d.toks.len() {
+        if d.toks.get(i).kind == "ident" && d.toks.get(i).value == decl.name
+        && i + 1 < d.toks.len() && d.toks.get(i + 1).kind == "sym"
+        && d.toks.get(i + 1).value == "="
+        && ls_resolve_local(decls, i, decl.name) == decl_i {
+            return fail
+        }
+        i = i + 1
+    }
+    # guard: assignment through a use
+    let stmts: list[list[int]] = ls_stmt_spans(d, braces, lo, hi)
+    let targets: list[int] = ls_assign_target_toks(d, braces, depths,
+    stmts, lo, hi)
+    let mut ui: int = 0
+    while ui < use_sites.len() {
+        if ls_targets_has(targets, use_sites.get(ui)) {
+            return fail
+        }
+        ui = ui + 1
+    }
+    # guard: the initializer names a local that is reassigned
+    let assigned: list[str] = []
+    let mut ti: int = 0
+    while ti < targets.len() {
+        let tt: LTok = d.toks.get(targets.get(ti))
+        if tt.kind == "ident" {
+            ls_push_unique(assigned, tt.value)
+        }
+        ti = ti + 1
+    }
+    let mut ji: int = eq + 1
+    while ji <= init_end && ji < d.toks.len() {
+        let tj2: LTok = d.toks.get(ji)
+        if tj2.kind == "ident" && ls_taken_has(assigned, tj2.value) {
+            return fail
+        }
+        ji = ji + 1
+    }
+    # guard: a call-bearing initializer used more than once
+    let mut has_call: bool = false
+    ji = eq + 1
+    while ji <= init_end && ji + 1 < d.toks.len() {
+        if d.toks.get(ji).kind == "ident" && d.toks.get(ji + 1).kind == "sym"
+        && d.toks.get(ji + 1).value == "(" {
+            has_call = true
+        }
+        ji = ji + 1
+    }
+    if use_sites.len() >= 2 && has_call {
+        return fail
+    }
+    # paren discipline: a single token — or an initializer already
+    # wrapped in one matching paren group — splices bare
+    let mut repl: str = init_src
+    if !(init_end - eq == 1 || (d.toks.get(eq + 1).kind == "sym"
+    && d.toks.get(eq + 1).value == "("
+    && ls_brace_get(braces, eq + 1) == init_end)) {
+        repl = "(" + init_src + ")"
+    }
+    # the deletion: the let's own tokens, extended to whole lines when
+    # the lines carry nothing else
+    let del_a: int = d.toks.get(start_idx).off
+    let del_b: int = d.toks.get(init_end).off + d.toks.get(init_end).len
+    let line_a: int = d.toks.get(start_idx).line
+    let line_b: int = d.toks.get(init_end).line
+    let mut pre_clean: bool = true
+    let seg: str = d.text.slice(d.offs.get(line_a - 1), del_a)
+    if seg.trim() != "" {
+        pre_clean = false
+    }
+    let mut post_clean: bool = true
+    let mut j3: int = init_end + 1
+    while j3 < d.toks.len() && j3 < hi {
+        if d.toks.get(j3).line <= line_b {
+            post_clean = false
+            break
+        }
+        if d.toks.get(j3).line > line_b {
+            break
+        }
+        j3 = j3 + 1
+    }
+    let edits: list[ByteEdit] = []
+    if pre_clean && post_clean && line_b < d.offs.len() {
+        edits.push(ByteEdit { a: d.offs.get(line_a - 1),
+        b: d.offs.get(line_b), new_text: "" })
+    } else {
+        edits.push(ByteEdit { a: del_a, b: del_b, new_text: "" })
+    }
+    ui = 0
+    while ui < use_sites.len() {
+        let u: LTok = d.toks.get(use_sites.get(ui))
+        edits.push(ByteEdit { a: u.off, b: u.off + u.len, new_text: repl })
+        ui = ui + 1
+    }
+    # final gate: the original must check, and so must the result
+    if rf_text_checks(d.text) {
+        if !rf_text_checks(rf_apply_edits(d.text, edits)) {
+            return fail
+        }
+    }
+    return PlanRes { ok: true, edits: edits, name: decl.name }
+}
+
+# rf_plan_extract — the extract-variable plan. The pipeline, each step
+# a refusal: the selection resolves inside ONE fn; the statement is
+# found (an `=>` before the selection = a match arm — no statement to
+# anchor a `let`); the selection is not inside an assignment TARGET;
+# the selection parses as exactly one expression; the probe keeps
+# EXACTLY ONE candidate type.
+fn rf_plan_extract(d: DocRec, braces: BraceMap, depths: list[int],
+spans: list[list[int]], rng: JsonValue) -> PlanRes uses IO, Proc, Args,
+Fs {
+    let fail: PlanRes = PlanRes { ok: false, edits: [], name: "" }
+    let win: list[int] = ls_selection_window(d, braces, rng)
+    let i0: int = win.get(0)
+    let i1: int = win.get(1)
+    if i0 < 0 {
+        return fail
+    }
+    let span_i: int = ls_enclosing_span(spans, i0)
+    if span_i < 0 {
+        return fail
+    }
+    let span: list[int] = spans.get(span_i)
+    if !(span.get(0) <= i1 && i1 < span.get(1)) {
+        return fail
+    }
+    let lo: int = span.get(0)
+    let hi: int = span.get(1)
+    # the statement containing the selection
+    let stmts: list[list[int]] = ls_stmt_spans(d, braces, lo, hi)
+    let mut inner: int = -1
+    let mut si: int = 0
+    while si < stmts.len() {
+        let s: list[int] = stmts.get(si)
+        if s.get(0) <= i0 && i0 < s.get(1) {
+            if inner < 0 || s.get(0) > stmts.get(inner).get(0) {
+                inner = si
+            }
+        }
+        si = si + 1
+    }
+    if inner < 0 {
+        return fail
+    }
+    let s: int = stmts.get(inner).get(0)
+    # a `=>` before the selection = a match arm body
+    let mut j: int = s
+    while j < i0 {
+        if d.toks.get(j).kind == "sym" && d.toks.get(j).value == "=>" {
+            return fail
+        }
+        j = j + 1
+    }
+    # the assignment-target guard
+    let targets: list[int] = ls_assign_target_toks(d, braces, depths,
+    stmts, lo, hi)
+    let mut j2: int = i0
+    while j2 <= i1 {
+        if ls_targets_has(targets, j2) {
+            return fail
+        }
+        j2 = j2 + 1
+    }
+    # the selection parses as one expression, all of it
+    let sel_text: str = ls_slice_text(d.text, d.toks, i0, i1 + 1)
+    let consumed: int = rf_expr_extends(sel_text)
+    if consumed != i1 - i0 + 1 {
+        return fail
+    }
+    # names: the new binding must be free, the probe's even fresher
+    let taken: list[str] = ls_scope_taken_names(d, lo, hi)
+    let real_name: str = ls_fresh_name("extracted", taken)
+    ls_push_unique(taken, real_name)
+    let probe_name: str = ls_fresh_name("__hls_probe", taken)
+    # the statement's leading whitespace (the let rides the same line)
+    let stmt_off: int = d.toks.get(s).off
+    let mut ws: int = stmt_off - 1
+    while ws >= 0 {
+        let c: int = d.text.byte_at(ws)
+        if c == 32 || c == 9 {
+            ws = ws - 1
+        } else {
+            break
+        }
+    }
+    let wss: str = d.text.slice(ws + 1, stmt_off)
+    # the probe — one checker run per candidate type
+    let sel_a: int = d.toks.get(i0).off
+    let sel_b: int = d.toks.get(i1).off + d.toks.get(i1).len
+    let cands: list[str] = ls_extract_candidates(d)
+    let mut passing: str = ""
+    let mut n_pass: int = 0
+    let mut ci: int = 0
+    while ci < cands.len() {
+        let cand: str = cands.get(ci)
+        let mut probe: str = ""
+        if s == i0 {
+            probe = d.text.slice(0, sel_a) + "let " + probe_name + ": "
+            + cand + " = " + sel_text + "\n" + wss + probe_name
+            + d.text.slice(sel_b, d.text.len())
+        } else {
+            probe = d.text.slice(0, stmt_off) + "let " + probe_name
+            + ": " + cand + " = " + sel_text + "\n" + wss
+            + d.text.slice(stmt_off, sel_a) + probe_name
+            + d.text.slice(sel_b, d.text.len())
+        }
+        if rf_text_checks(probe) {
+            passing = cand
+            n_pass = n_pass + 1
+            if n_pass > 1 {
+                return fail
+            }
+        }
+        ci = ci + 1
+    }
+    if n_pass != 1 {
+        return fail
+    }
+    # the real edits — the shapes the probe validated, re-checked
+    let edits: list[ByteEdit] = []
+    if s == i0 {
+        edits.push(ByteEdit { a: sel_a, b: sel_b, new_text: "let "
+        + real_name + ": " + passing + " = " + sel_text + "\n" + wss
+        + real_name })
+    } else {
+        edits.push(ByteEdit { a: stmt_off, b: stmt_off, new_text: "let "
+        + real_name + ": " + passing + " = " + sel_text + "\n" + wss })
+        edits.push(ByteEdit { a: sel_a, b: sel_b, new_text: real_name })
+    }
+    if !rf_text_checks(rf_apply_edits(d.text, edits)) {
+        return fail
+    }
+    return PlanRes { ok: true, edits: edits, name: real_name }
+}
+
+# ls_handle_code_action — the two refactor generators; each ships a
+# WorkspaceEdit the client can apply as-is, and each refuses before
+# it rewrites.
 fn ls_handle_code_action(st: LsState, params: JsonValue) -> JsonValue
-uses IO {
-    return json_array([])
+uses IO, Proc, Fs, Args {
+    let td: JsonValue = ls_jget(params, "textDocument")
+    let uri: str = ls_jstr(td, "uri")
+    let di: int = ls_find_doc(st, uri)
+    if di < 0 {
+        return json_array([])
+    }
+    let d: DocRec = st.docs.get(di)
+    if d.parse_err || d.dead {
+        return json_array([])
+    }
+    let rng: JsonValue = ls_jget(params, "range")
+    if !json_is_object(rng) {
+        return json_array([])
+    }
+    let braces: BraceMap = ls_brace_matches(d.toks)
+    let depths: list[int] = ls_tok_depths(d.toks)
+    let spans: list[list[int]] = ls_fn_spans(d.toks, braces)
+    # the cursor's token (the inline plan anchors on it)
+    let start: JsonValue = ls_jget(rng, "start")
+    let sl: int = ls_jint(start, "line")
+    let sc: int = ls_jint(start, "character")
+    let off: int = ls_linecol_to_off(d.offs, sl,
+    ls_byte_of_utf16_col(d.text, d.offs, sl, sc))
+    let idx: int = ls_token_index_at(d.toks, off)
+    let actions: list[JsonValue] = []
+    let inline: PlanRes = rf_plan_inline(d, braces, depths, spans, idx)
+    if inline.ok {
+        actions.push(json_object(
+        ["title", "kind", "isPreferred", "edit"],
+        [json_str("Inline variable"), json_str("refactor.inline"),
+        json_bool(true),
+        json_object(["changes"], [json_object([uri],
+        [json_array(rf_edits_to_lsp(d, inline.edits))])])]))
+    }
+    let extract: PlanRes = rf_plan_extract(d, braces, depths, spans,
+    rng)
+    if extract.ok {
+        actions.push(json_object(
+        ["title", "kind", "isPreferred", "edit"],
+        [json_str("Extract variable"), json_str("refactor.extract"),
+        json_bool(false),
+        json_object(["changes"], [json_object([uri],
+        [json_array(rf_edits_to_lsp(d, extract.edits))])])]))
+    }
+    return json_array(actions)
 }
 
 # ----------------------------------------------------------------------------
@@ -3385,7 +5106,10 @@ Proc, Fs, Args {
         return true
     }
     if method == "textDocument/rename" {
-        ls_send_result(idv, ls_handle_rename(st, params))
+        let r: JsonValue = ls_handle_rename(st, params, idv)
+        if !json_is_null(r) {
+            ls_send_result(idv, r)
+        }
         return true
     }
     if method == "textDocument/documentSymbol" {
@@ -3489,6 +5213,54 @@ fn main() -> int uses IO, Args, Exit, Proc, Fs {
         }
         if argv.get(i) == "--probe-file" && i + 1 < argv.len() {
             return ls_probe_file(argv.get(i + 1))
+        }
+        if argv.get(i) == "--rf-slice" && i + 1 < argv.len() {
+            # The refactor engine's statement walker: LEX only (a
+            # fragment is not a program — hl_parse_file would reject
+            # it at the top level), then parse one statement at a
+            # time. One RFSTMT line per statement, its consumed token
+            # count; a panic anywhere dies and the parent refuses.
+            let src: str = read_file(argv.get(i + 1))
+            let ctx: Ctx = new_ctx(src)
+            lex(ctx)
+            let mut pos: int = 0
+            let mut guard: int = 0
+            while pos < ctx.toks.len() - 1 {
+                let consumed: int = ls_rf_one_stmt(ctx, pos)
+                if consumed <= 0 {
+                    break
+                }
+                println("RFSTMT " + consumed.to_str())
+                pos = pos + consumed
+                guard = guard + 1
+                if guard > 100000 {
+                    break
+                }
+            }
+            return 0
+        }
+        if argv.get(i) == "--rf-expr" && i + 1 < argv.len() {
+            # One expression, all of it: LEX, then parse_expr from the
+            # top — the consumed token count (a panic dies exit 101;
+            # tokens left behind still print the count, and the
+            # caller's tail check refuses).
+            let src: str = read_file(argv.get(i + 1))
+            let ctx: Ctx = new_ctx(src)
+            lex(ctx)
+            let start: int = ctx.pos
+            let _e: int = parse_expr(ctx, true)
+            println("RFEXPR " + (ctx.pos - start).to_str())
+            return 0
+        }
+        if argv.get(i) == "--rf-stmt" && i + 1 < argv.len() {
+            # One statement, its consumed token count.
+            let src: str = read_file(argv.get(i + 1))
+            let ctx: Ctx = new_ctx(src)
+            lex(ctx)
+            let start: int = ctx.pos
+            let _s: int = parse_stmt(ctx)
+            println("RFSTMT " + (ctx.pos - start).to_str())
+            return 0
         }
         if argv.get(i) == "--debug-walk" && i + 1 < argv.len() {
             let p: ProbeOut = ls_probe_run(argv.get(i + 1))
