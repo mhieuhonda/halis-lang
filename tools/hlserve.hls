@@ -513,7 +513,14 @@ fn sv_load_config_file(path: str) -> Result[JsonValue, str] uses Fs {
         } else if section == "watch" {
             if line.starts_with("dirs") {
                 let eq: int = line.find("=")
-                let arr: str = line.slice(eq + 1, line.len()).trim()
+                let mut arr: str = line.slice(eq + 1, line.len()).trim()
+                # TOML arrays carry their own brackets — strip them
+                # before the comma split, or no quoted item ever
+                # matches (cfg_watch parsed empty).
+                if arr.starts_with("[") && arr.ends_with("]")
+                && arr.len() >= 2 {
+                    arr = arr.slice(1, arr.len() - 1)
+                }
                 let items: list[str] = arr.split(",")
                 let mut j: int = 0
                 while j < items.len() {
@@ -1088,7 +1095,10 @@ fn sv_scan_hashes(dirs: list[str]) -> list[str] uses Fs {
 
 fn sv_scan_dir(dir: str) -> list[str] uses Fs {
     let out: list[str] = []
-    if !file_exists(dir) {
+    # fs_is_dir, not file_exists: the builtin is S_ISREG-only, so a
+    # directory guard on it rejected every watch dir and the scan
+    # always came back empty — the watcher saw nothing, ever.
+    if !fs_is_dir(dir) {
         return out
     }
     let entries: list[str] = fs_read_dir(dir)
@@ -1178,7 +1188,12 @@ fn sv_watch_poll(job_path: str) -> int uses Args, Fs, Proc {
     }
     sv_append_log(log, "recompiling (changed: " + str_join(names, ", ")
     + ")…")
-    let res: CompileOut = sv_compile_once(input, bundle_base, target,
+    # The output path hlwasm writes must be the FULL bundle path:
+    # a bare base resolves against the child's cwd (the server's),
+    # landing out.wasm next to the server instead of in the bundle
+    # dir the routes serve — every asset request 404'd on it.
+    let bundle_out: str = sv_join(bundle_dir, bundle_base)
+    let res: CompileOut = sv_compile_once(input, bundle_out, target,
     wasm_opt, glue)
     sv_write_state(bundle_dir, res.ok, res.message)
     if !res.ok {
@@ -1249,11 +1264,20 @@ fn sv_read_request(stream: TcpStream) -> HttpReq uses Net, Fs {
         upgrade: "", ws_key: "", accept_enc: "", content_length: 0
     }
     let mut buf: str = ""
-    let mut chunk: str = stream.read(4096)
     let mut rounds: int = 0
-    while !buf.contains(sv_crlf() + sv_crlf()) && chunk != "" && rounds < 64 {
+    # One read at a time, head-checked after each: a read past the
+    # complete head would block on the client's silence until the
+    # socket's 30s SO_RCVTIMEO — every response paid that stall (the
+    # gate saw a dead server on a 5s deadline).
+    while rounds < 64 {
+        let chunk: str = stream.read(4096)
+        if chunk == "" {
+            break
+        }
         buf = buf + chunk
-        chunk = stream.read(4096)
+        if buf.contains(sv_crlf() + sv_crlf()) {
+            break
+        }
         rounds = rounds + 1
     }
     let head_end: int = buf.find(sv_crlf() + sv_crlf())
@@ -1421,7 +1445,6 @@ Net, Proc, Conc, IO {
         }
         sv_send_response(stream, 200, "text/html; charset=utf-8", data,
         true, cfg.compress, req.accept_enc)
-        println("DBG sent")
         return
     }
 
@@ -1737,6 +1760,8 @@ fn sv_probe_parse_args(argv: list[str]) -> int uses IO {
             cfg.port = sv_to_int(argv.get(i))
         } else if arg == "--open" {
             cfg.open = true
+        } else if arg == "--https" {
+            cfg.https = true
         } else if arg == "--proxy" && i + 1 < argv.len() {
             i = i + 1
             proxies.push(argv.get(i))
@@ -1749,6 +1774,11 @@ fn sv_probe_parse_args(argv: list[str]) -> int uses IO {
         println("open=1")
     } else {
         println("open=0")
+    }
+    if cfg.https {
+        println("https=1")
+    } else {
+        println("https=0")
     }
     println("proxy=" + sv_py_list_repr(proxies))
     return 0
@@ -1971,6 +2001,19 @@ fn sv_to_str_int(s: str) -> int {
 fn main() -> int uses IO, Args, Fs, Proc, Net, Exit, Clock, Conc {
     let argv: list[str] = args()
 
+    # --watch-poll <job> — the watcher child's ONE scan (the sh loop
+    # sv_spawn_watch_loop re-arms). Must dispatch before anything
+    # else: a poll child that fell through to the server path would
+    # re-run the banner, the initial compile and a bind of its own —
+    # the port law turns it into a respawn churn of dying children.
+    let mut wp: int = 0
+    while wp < argv.len() {
+        if argv.get(wp) == "--watch-poll" && wp + 1 < argv.len() {
+            return sv_watch_poll(argv.get(wp + 1))
+        }
+        wp = wp + 1
+    }
+
     # --version
     let mut i: int = 0
     let mut no_compile: bool = false
@@ -2156,7 +2199,8 @@ fn main() -> int uses IO, Args, Fs, Proc, Net, Exit, Clock, Conc {
     # and owns the watcher; the server process itself spawns nothing).
     if !no_compile {
         println("initial compile…")
-        let first: CompileOut = sv_compile_once(input_hls, bundle_base,
+        let first: CompileOut = sv_compile_once(input_hls,
+        sv_join(bundle_dir, bundle_base),
         cfg.target, cfg.wasm_opt, cfg.glue)
         sv_write_state(bundle_dir, first.ok, first.message)
         if first.ok {

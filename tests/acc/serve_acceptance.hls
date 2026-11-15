@@ -319,7 +319,7 @@ struct SrvProc {
 # srv_spawn_server — the caller pre-builds the world; the log goes
 # next to it so the watcher's chatter is greppable.
 fn srv_spawn_server(acc: Acc, dir: str, input: str, bundle: str,
-public_dir: str, port: int) -> SrvProc uses Proc {
+public_dir: str, port: int) -> SrvProc uses Proc, Fs, Clock, Conc {
     let log: str = path_join3(dir, "server.log")
     # the pre-compile, the server's own initial compile done from
     # outside: same backend (bin/hlwasm), same arguments. The server
@@ -353,8 +353,15 @@ public_dir: str, port: int) -> SrvProc uses Proc {
     args.push("--no-compile")
     args.push("--no-watch")
     # stdout+stderr -> the log file, via sh (the .py era's
-    # subprocess redirect, same shape).
-    let mut cmd: str = "exec './bin/hlserve'"
+    # subprocess redirect, same shape). The wrapper prints its own
+    # pid to a file before the exec: proc_spawn's return is a slot
+    # index, not the OS pid, and both the watcher's keep-alive
+    # (`kill -0`) and the teardown (`kill`) need the real one. The
+    # `exec` replaces the sh with the server, so the printed pid IS
+    # the server's.
+    let pid_file: str = path_join3(dir, "server.pid")
+    let mut cmd: str = "echo $$ > '" + shell_quote(pid_file)
+    + "'; exec './bin/hlserve'"
     let mut i: int = 0
     while i < args.len() {
         cmd = cmd + " '" + shell_quote(args.get(i)) + "'"
@@ -364,7 +371,24 @@ public_dir: str, port: int) -> SrvProc uses Proc {
     let argv: list[str] = []
     argv.push("-c")
     argv.push(cmd)
-    let pid: int = proc_spawn("sh", argv, 2, 2, 2)
+    let _slot: int = proc_spawn("sh", argv, 2, 2, 2)
+    # the pid file lands within a moment of the exec; poll for it
+    # (a 2s ceiling — a server that never starts reports pid 0 and
+    # every downstream check names it).
+    let mut pid: int = 0
+    let mut tries: int = 0
+    while tries < 40 && pid == 0 {
+        if file_exists(pid_file) {
+            let txt: str = read_file(pid_file).trim()
+            if txt != "" {
+                pid = to_int_s(txt)
+            }
+        }
+        if pid == 0 {
+            thread_sleep_ms(50)
+        }
+        tries = tries + 1
+    }
     let wlog: str = path_join3(bundle_dir_of(bundle), "watch.log")
     let sp: SrvProc = SrvProc {
         pid: pid, port: port, dir: dir,
@@ -586,9 +610,11 @@ fn s5_watcher(acc: Acc) -> void uses IO, Fs, Proc, Net, Clock, Conc {
     chk(acc, "the server comes up on a free port", up && sp.pid > 0,
     "")
     # the seeded file must NOT fire (the table was seeded at
-    # construction): one debounce cycle of quiet.
+    # construction): one debounce cycle of quiet. The native server's
+    # watcher is a child process — its witness lines land in the
+    # watch log, not on the server's own stdout.
     thread_sleep_ms(1000)
-    let log1: str = read_file(sp.log)
+    let log1: str = read_file(sp.wlog)
     chk(acc, "the seeded file fires nothing",
     !log1.contains("recompiling"), log1)
     # the rewrite fires ONE recompile naming the file (the content
@@ -599,12 +625,12 @@ fn s5_watcher(acc: Acc) -> void uses IO, Fs, Proc, Net, Clock, Conc {
     let mut tries: int = 0
     while tries < 30 && !fired {
         thread_sleep_ms(200)
-        fired = read_file(sp.log).contains("recompiling")
+        fired = read_file(sp.wlog).contains("recompiling")
         tries = tries + 1
     }
     chk(acc, "the rewrite fires a recompile", fired,
-    read_file(sp.log))
-    let log2: str = read_file(sp.log)
+    read_file(sp.wlog))
+    let log2: str = read_file(sp.wlog)
     chk(acc, "the recompile names the changed file",
     log2.contains("changed: a.hls"), log2)
     srv_kill(sp.pid)
@@ -753,11 +779,11 @@ fn s9_http(acc: Acc) -> void uses IO, Fs, Proc, Net, Clock, Conc {
     let mut tries: int = 0
     while tries < 40 && !failed {
         thread_sleep_ms(200)
-        failed = read_file(sp.log).contains("compile FAILED")
+        failed = read_file(sp.wlog).contains("compile FAILED")
         tries = tries + 1
     }
     chk(acc, "the failed recompile is logged", failed,
-    read_file(sp.log))
+    read_file(sp.wlog))
     let r8: HttpResp = srv_fetch(port, "/", [])
     chk(acc, "GET / serves the failed-compile banner",
     r8.status == 200
