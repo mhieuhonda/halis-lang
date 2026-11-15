@@ -1,0 +1,2588 @@
+# ============================================================================
+# tools/hls-lsp.hls — the language server, in Halis.
+# ----------------------------------------------------------------------------
+# The native twin of the Python hls-lsp.py that retired with the lab
+# interpreter: same CLI (the one-shot --check, the stdio JSON-RPC
+# server), same wire, same exits. Stages 113/114/115 live on —
+# go-to-definition across packages, inlay hints, the refactor actions —
+# with the exact needles the acceptance batteries pinned against the
+# .py years, because the batteries are the spec.
+#
+# Built on the compiler's own front-end (tools/hlfront.hls links the
+# real lexer, parser and checker), so a symbol table can never drift
+# from what bin/hlc believes about a program. The checker and the
+# loader panic on bad input (the language has no exceptions), so every
+# risky pass runs in a probe child — the tool re-execs itself with a
+# private flag and the parent reads the outcome:
+#   --probe-file PATH   one file: parse + symbol table + the check
+#                       verdict, as machine-readable lines
+#   --check FILE.hls    the one-shot diagnostics print (the editorless
+#                       world's lsp-check)
+#   --smoke             the protocol-resilience self-conversation (the
+#                       twin of the retired lsp_smoke.py)
+#   (no args)           the server, JSON-RPC over stdio
+#
+# The token index is the coordinate system: hint positions, rename
+# edits and refactor plans are computed on a byte-offset token stream
+# (ls_lex) whose boundaries are the lexer's own laws, and positions on
+# the wire are UTF-16 code units, converted per line.
+#
+# Usage:
+#   hls-lsp                      # the stdio server
+#   hls-lsp --check FILE.hls     # one-shot diagnostics, exit 1 on error
+#
+# Exit codes: server — 0 after shutdown+exit (1 on exit without
+# shutdown), 0 on stdin EOF; --check — 0 clean, 1 not clean, 2 usage.
+# ============================================================================
+
+import "./hlfront.hls"
+import "std.str"
+import "std.json"
+import "std.result"
+
+# ----------------------------------------------------------------------------
+# Constants — the .py era's tables, verbatim.
+# ----------------------------------------------------------------------------
+
+fn ls_version() -> str {
+    return "0.134.0-alpha"
+}
+
+fn ls_keywords() -> list[str] {
+    return ["fn", "let", "mut", "return", "if", "else", "while", "for",
+    "in", "break", "continue", "struct", "impl", "import", "uses",
+    "true", "false", "enum", "match", "pure", "extern"]
+}
+
+fn ls_builtins() -> list[str] {
+    return ["println", "print", "len", "str", "int", "panic", "clock_ms",
+    "args", "exit", "chr", "range", "map_new", "drop", "clone", "take",
+    "file_exists", "read_file", "write_file", "tainted_args",
+    "taint_mark", "taint_unwrap", "read_file_tainted", "net_lookup",
+    "rand_int", "rand_float", "rand_seed", "proc_exec", "read_line",
+    "result_unwrap", "result_is_ok", "result_is_err", "option_unwrap",
+    "option_is_some", "option_is_none", "map_get", "map_get_or",
+    "map_set", "map_keys", "map_values", "map_contains", "map_size",
+    "list_push", "list_pop", "list_get", "list_set", "list_size",
+    "list_contains", "list_index_of", "str_to_float", "str_to_int",
+    "str_slice", "str_concat", "str_contains", "str_starts_with",
+    "str_ends_with", "str_split", "str_find", "str_replace", "str_upper",
+    "str_lower", "str_trim", "str_bytes", "str_repeat", "int_to_str",
+    "int_to_float", "float_to_int", "float_to_str", "bool_to_str"]
+}
+
+fn ls_effects() -> list[str] {
+    return ["IO", "Fs", "Clock", "Args", "Exit", "Net", "Rand", "Proc"]
+}
+
+# ls_builtin_params — the curated SPEC-§8 spellings (param name lists,
+# receiver excluded for methods). A name the spec does not pin, or a
+# name carried by more than one receiver family, is absent: a call to
+# it gets no hints, never a wrong one.
+fn ls_builtin_params(name: str) -> list[str] {
+    if name == "print" { return ["s"] }
+    if name == "println" { return ["s"] }
+    if name == "panic" { return ["msg"] }
+    if name == "exit" { return ["code"] }
+    if name == "str" { return ["value"] }
+    if name == "int" { return ["s"] }
+    if name == "len" { return ["value"] }
+    if name == "range" { return ["a", "b"] }
+    if name == "read_file" { return ["path"] }
+    if name == "read_file_tainted" { return ["path"] }
+    if name == "write_file" { return ["path", "content"] }
+    if name == "file_exists" { return ["path"] }
+    if name == "chr" { return ["i"] }
+    if name == "rand_int" { return ["max"] }
+    if name == "rand_seed" { return ["s"] }
+    if name == "proc_exec" { return ["cmd"] }
+    if name == "net_lookup" { return ["host"] }
+    if name == "join" { return ["parts", "sep"] }
+    if name == "has_feature" { return ["name"] }
+    if name == "simd_cpu_supports" { return ["name"] }
+    if name == "taint_mark" { return ["value"] }
+    if name == "taint_unwrap" { return ["value"] }
+    if name == "drop" { return ["value"] }
+    if name == "clone" { return ["value"] }
+    if name == "take" { return ["value"] }
+    return []
+}
+
+# ls_builtin_method_params — method parameter names, receiver excluded.
+# "" means deliberately ambiguous (list.set vs map.set): no hints.
+fn ls_builtin_method_params(name: str) -> list[str] {
+    if name == "byte_at" { return ["i"] }
+    if name == "slice" { return ["a", "b"] }
+    if name == "find" { return ["sub"] }
+    if name == "contains" { return ["sub"] }
+    if name == "starts_with" { return ["p"] }
+    if name == "ends_with" { return ["p"] }
+    if name == "split" { return ["sep"] }
+    if name == "push" { return ["value"] }
+    if name == "get" { return ["index"] }
+    if name == "get_or" { return ["key", "default"] }
+    if name == "has" { return ["key"] }
+    if name == "send" { return ["value"] }
+    if name == "try_send" { return ["value"] }
+    if name == "recv_or" { return ["default"] }
+    return []
+}
+
+# The external (on-disk, unopened) document LRU cap and the dependency
+# walk cap — the .py era's exact budget discipline.
+fn ls_external_doc_cap() -> int {
+    return 48
+}
+
+fn ls_dep_file_cap() -> int {
+    return 128
+}
+
+# ----------------------------------------------------------------------------
+# Small text helpers (self-contained; the front-end's own helpers are
+# reused only where their laws are the point — is_keyword etc.).
+# ----------------------------------------------------------------------------
+
+# ls_in — membership in a string list.
+fn ls_in(s: str, hay: list[str]) -> bool {
+    let mut i: int = 0
+    while i < hay.len() {
+        if hay.get(i) == s {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+# ls_starts / ls_ends — the byte truth of prefix/suffix.
+fn ls_starts(s: str, p: str) -> bool {
+    if p.len() > s.len() {
+        return false
+    }
+    return s.slice(0, p.len()) == p
+}
+
+fn ls_ends(s: str, p: str) -> bool {
+    if p.len() > s.len() {
+        return false
+    }
+    return s.slice(s.len() - p.len(), s.len()) == p
+}
+
+# ls_split1 — s around the first occurrence of sep ("" when absent:
+# before = s, after = "").
+fn ls_split1(s: str, sep: str) -> list[str] {
+    let i: int = s.find(sep)
+    if i < 0 {
+        return [s, ""]
+    }
+    return [s.slice(0, i), s.slice(i + sep.len(), s.len())]
+}
+
+# ls_after_last_sep — everything after the last sep (the short method
+# name of "Struct.method"; the whole string when bare).
+fn ls_after_last_sep(s: str, sep: str) -> str {
+    let mut i: int = s.len() - 1
+    while i >= 0 {
+        if s.slice(i, i + sep.len()) == sep {
+            return s.slice(i + sep.len(), s.len())
+        }
+        i = i - 1
+    }
+    return s
+}
+
+# ls_uri_to_path — "file:///abs/path" -> "/abs/path" (the gates' URIs
+# are always this shape; anything else stays as-is, the .py's law).
+fn ls_uri_to_path(uri: str) -> str {
+    if ls_starts(uri, "file://") {
+        return uri.slice("file://".len(), uri.len())
+    }
+    return uri
+}
+
+fn ls_path_to_uri(path: str) -> str {
+    return "file://" + path
+}
+
+# ----------------------------------------------------------------------------
+# The offset lexer — the byte-span token stream every position-aware
+# feature rides. Same token boundaries lexer.hls draws (the compiler's
+# own is_keyword / is_ident_start / is_ident_char), numbers / strings /
+# comments skipped by the same laws; every span round-trips against
+# the bytes.
+# ----------------------------------------------------------------------------
+
+struct LTok {
+    kind: str, # kw | ident | sym | int | float | str
+    value: str,
+    off: int, # byte offset of the first byte
+    len: int, # byte length
+    line: int # 1-based line of the first byte
+}
+
+# ls_lex(src) — the token stream with byte spans. Never fails: a
+# malformed file lexes to fewer tokens, the callers degrade.
+fn ls_lex(src: str) -> list[LTok] {
+    let toks: list[LTok] = []
+    let n: int = src.len()
+    let mut i: int = 0
+    let mut line: int = 1
+    while i < n {
+        let c: int = src.byte_at(i)
+        if c == 32 || c == 9 {
+            i = i + 1
+        } else if c == 13 {
+            if i + 1 < n && src.byte_at(i + 1) == 10 {
+                i = i + 1
+            } else {
+                line = line + 1
+                i = i + 1
+            }
+        } else if c == 10 {
+            line = line + 1
+            i = i + 1
+        } else if c == 35 {
+            # `#[` attribute sigil, `#![`, or a comment.
+            if i + 1 < n && src.byte_at(i + 1) == 91 {
+                toks.push(LTok {
+                    kind: "sym", value: "#", off: i, len: 1, line: line
+                })
+                i = i + 1
+            } else if i + 2 < n && src.byte_at(i + 1) == 33
+            && src.byte_at(i + 2) == 91 {
+                toks.push(LTok {
+                    kind: "sym", value: "#", off: i, len: 1, line: line
+                })
+                toks.push(LTok {
+                    kind: "sym", value: "!", off: i + 1, len: 1,
+                    line: line
+                })
+                i = i + 2
+            } else {
+                while i < n && src.byte_at(i) != 10
+                && src.byte_at(i) != 13 {
+                    i = i + 1
+                }
+            }
+        } else if is_ident_start(c) {
+            let mut j: int = i
+            while j < n && is_ident_char(src.byte_at(j)) {
+                j = j + 1
+            }
+            let word: str = src.slice(i, j)
+            if is_keyword(word) {
+                toks.push(LTok {
+                    kind: "kw", value: word, off: i, len: j - i,
+                    line: line
+                })
+            } else {
+                toks.push(LTok {
+                    kind: "ident", value: word, off: i, len: j - i,
+                    line: line
+                })
+            }
+            i = j
+        } else if c >= 48 && c <= 57 {
+            # A number: digits, then an optional fraction (a second dot
+            # never joins — the lexer's own law).
+            let mut j: int = i
+            let mut is_float: bool = false
+            while j < n {
+                let d: int = src.byte_at(j)
+                if d >= 48 && d <= 57 {
+                    j = j + 1
+                } else if d == 46 && !is_float && j + 1 < n
+                && src.byte_at(j + 1) >= 48
+                && src.byte_at(j + 1) <= 57 {
+                    is_float = true
+                    j = j + 1
+                } else {
+                    j = n
+                }
+            }
+            if is_float {
+                toks.push(LTok {
+                    kind: "float", value: src.slice(i, j), off: i,
+                    len: j - i, line: line
+                })
+            } else {
+                toks.push(LTok {
+                    kind: "int", value: src.slice(i, j), off: i,
+                    len: j - i, line: line
+                })
+            }
+            i = j
+        } else if c == 34 {
+            # A string literal: the bytes between the quotes, escapes
+            # skipped (a backslash hides the next byte, quotes included).
+            let mut j: int = i + 1
+            let mut closed: bool = false
+            while j < n {
+                let b: int = src.byte_at(j)
+                if b == 92 {
+                    j = j + 2
+                } else if b == 34 {
+                    j = j + 1
+                    closed = true
+                    j = n
+                } else if b == 10 || b == 13 {
+                    j = n
+                } else {
+                    j = j + 1
+                }
+            }
+            if !closed {
+                j = n
+            }
+            toks.push(LTok {
+                kind: "str", value: src.slice(i, j), off: i,
+                len: j - i, line: line
+            })
+            i = j
+        } else {
+            # A symbol: the two-byte forms first, then one byte.
+            let mut took_two: bool = false
+            if i + 1 < n {
+                let two: str = src.slice(i, i + 2)
+                if two == "==" || two == "!=" || two == "<="
+                || two == ">=" || two == "&&" || two == "||"
+                || two == "->" || two == "=>" || two == "+="
+                || two == "-=" || two == ".." {
+                    toks.push(LTok {
+                        kind: "sym", value: two, off: i, len: 2,
+                        line: line
+                    })
+                    i = i + 2
+                    took_two = true
+                }
+            }
+            if !took_two {
+                toks.push(LTok {
+                    kind: "sym", value: src.slice(i, i + 1), off: i,
+                    len: 1, line: line
+                })
+                i = i + 1
+            }
+        }
+    }
+    return toks
+}
+
+# ls_tok_at — the token covering byte offset off (line 1-based, col
+# 1-based byte), or -1. The .py's _token_at law: the caller converts
+# the wire position to a byte offset first.
+fn ls_tok_at(toks: list[LTok], off: int) -> int {
+    let mut i: int = 0
+    while i < toks.len() {
+        let t: LTok = toks.get(i)
+        if off >= t.off && off < t.off + t.len {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# ----------------------------------------------------------------------------
+# Line/column arithmetic — byte offsets <-> (line, byte col), and the
+# UTF-16 conversions the wire demands (a 4-byte UTF-8 sequence is a
+# surrogate pair: 2 units, never 4 bytes, never 1).
+# ----------------------------------------------------------------------------
+
+# ls_line_offsets(src) — the byte offset of every line start.
+fn ls_line_offsets(src: str) -> list[int] {
+    let offs: list[int] = [0]
+    let mut i: int = 0
+    while i < src.len() {
+        let c: int = src.byte_at(i)
+        if c == 10 {
+            offs.push(i + 1)
+        }
+        i = i + 1
+    }
+    return offs
+}
+
+# ls_off_to_linecol(offs, off) — [line0, bytecol0] of a byte offset.
+fn ls_off_to_linecol(offs: list[int], off: int) -> list[int] {
+    let mut lo: int = 0
+    let mut hi: int = offs.len() - 1
+    while lo < hi {
+        let mid: int = (lo + hi + 1) / 2
+        if offs.get(mid) <= off {
+            lo = mid
+        } else {
+            hi = mid - 1
+        }
+    }
+    return [lo, off - offs.get(lo)]
+}
+
+# ls_linecol_to_off(offs, line0, col0) — the byte offset; clamped.
+fn ls_linecol_to_off(offs: list[int], line0: int, col0: int) -> int {
+    let mut li: int = line0
+    if li < 0 {
+        li = 0
+    }
+    if li >= offs.len() {
+        li = offs.len() - 1
+    }
+    let base: int = offs.get(li)
+    let linelen: int = src_line_len(offs, li)
+    let mut col: int = col0
+    if col > linelen {
+        col = linelen
+    }
+    if col < 0 {
+        col = 0
+    }
+    return base + col
+}
+
+# src_line_len — the byte length of line0 (to the newline, exclusive).
+fn src_line_len(offs: list[int], line0: int) -> int {
+    if line0 + 1 < offs.len() {
+        let end: int = offs.get(line0 + 1)
+        let l: int = end - offs.get(line0) - 1
+        if l < 0 {
+            return 0
+        }
+        return l
+    }
+    return 1000000000
+}
+
+# ls_utf16_of_byte_col(src, line0, bytecol) — the UTF-16 character of
+# a byte column on one line. Walks the line's bytes: 1-byte = 1 unit,
+# 2/3-byte = 1 unit, 4-byte = 2 units.
+fn ls_utf16_of_byte_col(src: str, offs: list[int], line0: int,
+bytecol: int) -> int {
+    if line0 < 0 || line0 >= offs.len() {
+        return bytecol
+    }
+    let start: int = offs.get(line0)
+    let mut endb: int = src.len()
+    if line0 + 1 < offs.len() {
+        endb = offs.get(line0 + 1) - 1
+    }
+    let mut u: int = 0
+    let mut b: int = 0
+    while b < bytecol && start + b < endb {
+        let c: int = src.byte_at(start + b)
+        if c < 128 {
+            b = b + 1
+            u = u + 1
+        } else if c >= 248 {
+            b = b + 1
+        } else if c >= 240 {
+            b = b + 4
+            u = u + 2
+        } else if c >= 224 {
+            b = b + 3
+            u = u + 1
+        } else if c >= 192 {
+            b = b + 2
+            u = u + 1
+        } else {
+            b = b + 1
+        }
+    }
+    return u
+}
+
+# ls_byte_of_utf16_col(src, line0, char16) — the inverse: the byte
+# column a UTF-16 character lands on.
+fn ls_byte_of_utf16_col(src: str, offs: list[int], line0: int,
+char16: int) -> int {
+    if line0 < 0 || line0 >= offs.len() {
+        return char16
+    }
+    let start: int = offs.get(line0)
+    let mut endb: int = src.len()
+    if line0 + 1 < offs.len() {
+        endb = offs.get(line0 + 1) - 1
+    }
+    let mut u: int = 0
+    let mut b: int = 0
+    while u < char16 && start + b < endb {
+        let c: int = src.byte_at(start + b)
+        if c < 128 {
+            b = b + 1
+            u = u + 1
+        } else if c >= 248 {
+            b = b + 1
+        } else if c >= 240 {
+            b = b + 4
+            u = u + 2
+        } else if c >= 224 {
+            b = b + 3
+            u = u + 1
+        } else if c >= 192 {
+            b = b + 2
+            u = u + 1
+        } else {
+            b = b + 1
+        }
+    }
+    return b
+}
+
+# ls_line_of(src, offs, off) — 0-based line of a byte offset.
+fn ls_line_of(offs: list[int], off: int) -> int {
+    let r: list[int] = ls_off_to_linecol(offs, off)
+    return r.get(0)
+}
+
+# ----------------------------------------------------------------------------
+# JSON-RPC over stdio — Content-Length framing, the wire the .py spoke.
+# ----------------------------------------------------------------------------
+
+
+# ls_lower_ascii — the ASCII lowercase of s (header names).
+fn ls_lower_ascii(s: str) -> str {
+    let mut out: str = ""
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c >= 65 && c <= 90 {
+            out = out + chr(c + 32)
+        } else {
+            out = out + chr(c)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ls_read_message(pend) — one frame from stdin: ["ok", body, rest]
+# | ["eof", "", rest] | ["err", detail, rest]. The only stdin
+# primitive is the whole line, so a pending buffer carries the bytes
+# past a frame's end (a body is NOT newline-terminated — the next
+# frame's header follows immediately, and read_line would glue them).
+fn ls_read_message(pend_in: str) -> list[str] uses IO {
+    let mut pend: str = pend_in
+    let mut clen: int = -1
+    let mut err: str = ""
+    let mut saw_any: bool = false
+    # header lines until the blank separator
+    while true {
+        let mut line: str = ""
+        let mut got: bool = false
+        if pend.contains("\n") {
+            let nl: int = pend.find("\n")
+            line = pend.slice(0, nl)
+            if ls_ends(line, chr(13)) {
+                line = line.slice(0, line.len() - 1)
+            }
+            pend = pend.slice(nl + 1, pend.len())
+            got = true
+        } else {
+            let raw: str = taint_unwrap(read_line())
+            if raw != "" {
+                line = raw
+                pend = pend + raw + "\n"
+                # re-slice from pend so the bytes stay accounted
+                let nl2: int = pend.find("\n")
+                pend = pend.slice(nl2 + 1, pend.len())
+                got = true
+            } else {
+                # "" is both a blank line and EOF at this primitive —
+                # two in a row are EOF (read_line answers "" forever
+                # past the end); one is the header separator.
+                let raw2: str = taint_unwrap(read_line())
+                if raw2 == "" {
+                    return ["eof", "", pend]
+                }
+                pend = pend + raw2 + "\n"
+                break
+            }
+        }
+        if !got {
+            return ["eof", "", pend]
+        }
+        if line == "" {
+            if !saw_any {
+                return ["eof", "", pend]
+            }
+            break
+        }
+        saw_any = true
+        let parts: list[str] = ls_split1(line, ":")
+        if ls_lower_ascii(parts.get(0)) == "content-length" {
+            let v: str = parts.get(1).trim()
+            if is_int_str(v) {
+                let mut vnum: int = 0
+                let mut k: int = 0
+                while k < v.len() {
+                    vnum = vnum * 10 + (v.byte_at(k) - 48)
+                    k = k + 1
+                }
+                clen = vnum
+            } else {
+                err = "invalid Content-Length: " + v
+            }
+        }
+        if clen < -1 || clen > 268435456 {
+            return ["err", "unreasonable Content-Length: "
+            + clen.to_str(), pend]
+        }
+    }
+    if err != "" {
+        return ["err", err, pend]
+    }
+    if clen < 0 {
+        return ["err", "missing Content-Length", pend]
+    }
+    if clen == 0 {
+        return ["err", "invalid JSON body: empty", pend]
+    }
+    # the body: exactly clen bytes out of the pending buffer, fed by
+    # whole stdin lines (each stripped newline re-added).
+    while pend.len() < clen {
+        let raw2: str = taint_unwrap(read_line())
+        if raw2 == "" && pend == "" {
+            return ["err", "short read: wanted " + clen.to_str()
+            + " bytes, got " + pend.len().to_str(), pend]
+        }
+        pend = pend + raw2 + "\n"
+    }
+    let body: str = pend.slice(0, clen)
+    let rest: str = pend.slice(clen, pend.len())
+    return ["ok", body, rest]
+}
+
+# is_int_str — every byte a digit.
+fn is_int_str(s: str) -> bool {
+    if s.len() == 0 {
+        return false
+    }
+    let mut i: int = 0
+    while i < s.len() {
+        let c: int = s.byte_at(i)
+        if c < 48 || c > 57 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# ls_write_message — one frame to stdout, flushed per message.
+fn ls_write_message(body: str) -> void uses IO {
+    let crlf2: str = chr(13) + "\n"
+    print("Content-Length: " + body.len().to_str() + crlf2 + crlf2 + body)
+}
+
+# ----------------------------------------------------------------------------
+# The probe runner — spawn a child, drain both pipes, wait. The .py's
+# try/except HLError, in a world whose only failure mode is a panic.
+# ----------------------------------------------------------------------------
+
+struct RunRes {
+    code: int, # -1: the spawn itself failed
+    out: str,
+    err: str,
+    spawned: bool
+}
+
+# ls_run_child(argv) — spawn with stdout+stderr piped, stdin null.
+fn ls_run_child(argv: list[str]) -> RunRes uses Proc {
+    let r: RunRes = RunRes {
+        code: -1, out: "", err: "", spawned: false
+    }
+    let pid: int = proc_spawn(argv.get(0), argv, 2, 1, 1)
+    if pid < 1 {
+        return r
+    }
+    r.spawned = true
+    let mut out: str = ""
+    let mut chunk: str = proc_child_read(pid, 1, 65536)
+    while chunk != "" {
+        out = out + chunk
+        chunk = proc_child_read(pid, 1, 65536)
+    }
+    let mut err: str = ""
+    let mut chunk2: str = proc_child_read(pid, 2, 65536)
+    while chunk2 != "" {
+        err = err + chunk2
+        chunk2 = proc_child_read(pid, 2, 65536)
+    }
+    r.code = proc_wait(pid)
+    proc_child_close(pid, 1)
+    proc_child_close(pid, 2)
+    r.out = out
+    r.err = err
+    return r
+}
+
+# ls_self — the running binary's own path (for probe children).
+fn ls_self() -> str uses Args {
+    let a: list[str] = args()
+    if a.len() == 0 {
+        return "./bin/hls-lsp"
+    }
+    return a.get(0)
+}
+
+# ----------------------------------------------------------------------------
+# The symbol table — one file's declarations, the machine-readable
+# form the probe prints and every name-aware feature consumes.
+# ----------------------------------------------------------------------------
+
+struct SymFn {
+    key: str, # "name" or "Struct.method"
+    line: int, # 1-based declaration line
+    params: list[str],
+    ptypes: list[str],
+    ret: str,
+    is_method: bool
+}
+
+struct SymStruct {
+    name: str,
+    line: int,
+    fields: list[str],
+    ftypes: list[str]
+}
+
+struct SymEnum {
+    name: str,
+    line: int,
+    variants: list[str],
+    payloads: list[list[str]]
+}
+
+struct Syms {
+    fns: list[SymFn],
+    structs: list[SymStruct],
+    enums: list[SymEnum],
+    imports: list[str]
+}
+
+fn ls_syms_empty() -> Syms {
+    return Syms {
+        fns: [], structs: [], enums: [], imports: []
+    }
+}
+
+# ls_sym_fn(syms, key) — the fn entry, or -1.
+fn ls_sym_fn(syms: Syms, key: str) -> int {
+    let mut i: int = 0
+    while i < syms.fns.len() {
+        if syms.fns.get(i).key == key {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# ls_sym_struct — the struct index by name, or -1.
+fn ls_sym_struct(syms: Syms, name: str) -> int {
+    let mut i: int = 0
+    while i < syms.structs.len() {
+        if syms.structs.get(i).name == name {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# ls_sym_enum — the enum index by name, or -1.
+fn ls_sym_enum(syms: Syms, name: str) -> int {
+    let mut i: int = 0
+    while i < syms.enums.len() {
+        if syms.enums.get(i).name == name {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# ----------------------------------------------------------------------------
+# The probe child — one file, parse + symbol table + check verdict.
+#
+#   --probe-file PATH
+#
+# stdout (machine lines, printed BEFORE the check so a check panic
+# cannot eat them):
+#   FN <key> <line> <params |> <ptypes |> <ret> <is_method>
+#   STRUCT <name> <line> <fields |> <ftypes |>
+#   ENUM <name> <line> <variants ,> <payloads ;>
+#   IMP <import>
+# A parse panic dies before any line (exit 101, the syntax error on
+# stderr); a check panic dies after them (exit 101, the type error on
+# stderr). The parent reads the same outcome the .py's try/except
+# HLError produced.
+# ----------------------------------------------------------------------------
+
+# ls_probe_file(path) — the child side. Panics propagate (that IS the
+# verdict); the parent catches the exit code + stderr.
+fn ls_probe_file(path: str) -> int uses IO, Args, Fs {
+    let ctx: Ctx = hl_parse_file(path)
+    let mut i: int = 0
+    while i < ctx.fn_order.len() {
+        let key: str = ctx.fn_order.get(i)
+        let fi: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        println("FN " + key + " " + fi.line.to_str() + " "
+        + str_join(fi.params, "|") + " " + str_join(fi.ptypes, "|")
+        + " " + fi.ret + " " + ls_bool_int(fi.is_method).to_str())
+        i = i + 1
+    }
+    let skeys: list[str] = ctx.structs.keys()
+    let mut si: int = 0
+    while si < skeys.len() {
+        let st: StructInfo = ctx.structs.get_or(skeys.get(si),
+        dummy_struct())
+        println("STRUCT " + st.name + " " + st.line.to_str() + " "
+        + str_join(st.fields, "|") + " " + str_join(st.ftypes, "|"))
+        si = si + 1
+    }
+    let ekeys: list[str] = ctx.enums.keys()
+    let mut ei: int = 0
+    while ei < ekeys.len() {
+        let en: EnumInfo = ctx.enums.get_or(ekeys.get(ei),
+        dummy_enum())
+        let mut payloads: str = ""
+        let mut vi: int = 0
+        while vi < en.payloads.len() {
+            if vi > 0 {
+                payloads = payloads + ";"
+            }
+            payloads = payloads + str_join(en.payloads.get(vi), ",")
+            vi = vi + 1
+        }
+        println("ENUM " + en.name + " " + en.line.to_str() + " "
+        + str_join(en.variants, ",") + " " + payloads)
+        ei = ei + 1
+    }
+    let mut ii: int = 0
+    while ii < ctx.imports.len() {
+        println("IMP " + ctx.imports.get(ii))
+        ii = ii + 1
+    }
+    hl_check(ctx)
+    println("CHECK OK")
+    return 0
+}
+
+# ls_bool_int — 1/0 (the machine lines carry ints only).
+fn ls_bool_int(b: bool) -> int {
+    if b {
+        return 1
+    }
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# The probe parent — run the child, classify the outcome.
+# ----------------------------------------------------------------------------
+
+struct ProbeOut {
+    parse_err: bool, # true: the file does not parse
+    check_err: bool, # true: parses, the checker rejects it
+    err_line: int, # 1-based (0 when unknown)
+    err_col: int, # 1-based (0 when unknown)
+    err_msg: str, # the RAW message (no classifier, no position suffix)
+    err_text: str, # the full panic text (classifier + suffix)
+    syms: Syms
+}
+
+# ls_probe_parse_err(err) — classify a child's stderr: ["kind", line,
+# col, raw_msg, full_text]. kind: "" (no panic), "parse", "check".
+fn ls_probe_parse_err(err: str) -> list[str] {
+    let lines: list[str] = err.split("\n")
+    let mut t: str = ""
+    let mut i: int = 0
+    while i < lines.len() {
+        let c: str = lines.get(i).trim()
+        if c != "" {
+            t = c
+            i = lines.len()
+        }
+        i = i + 1
+    }
+    if !ls_starts(t, "panic: ") {
+        return ["", "0", "0", "", ""]
+    }
+    let body: str = t.slice("panic: ".len(), t.len())
+    let mut kind: str = ""
+    let mut msg: str = body
+    if ls_starts(body, "syntax error: ") {
+        kind = "parse"
+        msg = body.slice("syntax error: ".len(), body.len())
+    } else if ls_starts(body, "lex error: ") {
+        kind = "parse"
+        msg = body.slice("lex error: ".len(), body.len())
+    } else if ls_starts(body, "type error: ") {
+        kind = "check"
+        msg = body.slice("type error: ".len(), body.len())
+    } else {
+        return ["check", "0", "0", body, body]
+    }
+    # The position suffix: " (line L:C)" or " (line L)".
+    let mut line: int = 0
+    let mut col: int = 0
+    let open: int = ls_rfind_sub(msg, " (line ")
+    if open >= 0 {
+        let tail: str = msg.slice(open, msg.len())
+        let colon: int = tail.find(":")
+        let close: int = ls_rfind_sub(tail, ")")
+        if close == tail.len() - 1 {
+            if colon >= 0 {
+                let ltxt: str = tail.slice(7, colon)
+                let ctxt: str = tail.slice(colon + 1, tail.len() - 1)
+                if is_int_str(ltxt.trim()) && is_int_str(ctxt.trim()) {
+                    line = ls_atoi(ltxt.trim())
+                    col = ls_atoi(ctxt.trim())
+                    msg = msg.slice(0, open)
+                }
+            } else {
+                let ltxt2: str = tail.slice(7, tail.len() - 1)
+                if is_int_str(ltxt2.trim()) {
+                    line = ls_atoi(ltxt2.trim())
+                    msg = msg.slice(0, open)
+                }
+            }
+        }
+    }
+    return [kind, line.to_str(), col.to_str(), msg, body]
+}
+
+
+# ls_rfind_sub — the offset of the LAST occurrence of sub in s (-1).
+fn ls_rfind_sub(s: str, sub: str) -> int {
+    let mut found: int = -1
+    let mut i: int = 0
+    while i + sub.len() <= s.len() {
+        if s.slice(i, i + sub.len()) == sub {
+            found = i
+        }
+        i = i + 1
+    }
+    return found
+}
+
+# ls_atoi — the decimal value of a digit string (0 on anything else).
+fn ls_atoi(s: str) -> int {
+    if !is_int_str(s) {
+        return 0
+    }
+    let mut v: int = 0
+    let mut i: int = 0
+    while i < s.len() {
+        v = v * 10 + (s.byte_at(i) - 48)
+        i = i + 1
+    }
+    return v
+}
+
+# ls_probe_run(path) — probe one file (on-disk or the shared temp).
+fn ls_probe_run(path: str) -> ProbeOut uses Proc, Args {
+    let r: RunRes = ls_run_child([ls_self(), "--probe-file", path])
+    return ls_probe_result(r)
+}
+
+# ls_probe_result — classify a probe child's captured outcome.
+fn ls_probe_result(r: RunRes) -> ProbeOut {
+    let out: ProbeOut = ProbeOut {
+        parse_err: false, check_err: false, err_line: 0, err_col: 0,
+        err_msg: "", err_text: "", syms: ls_syms_empty()
+    }
+    let cls: list[str] = ls_probe_parse_err(r.err)
+    let kind: str = cls.get(0)
+    if kind == "parse" {
+        out.parse_err = true
+        out.err_line = ls_atoi(cls.get(1))
+        out.err_col = ls_atoi(cls.get(2))
+        out.err_msg = cls.get(3)
+        # The .py's syntax-error diagnostic text: the full message
+        # WITH its position suffix.
+        if out.err_col > 0 {
+            out.err_text = cls.get(3) + " (line " + cls.get(1) + ":"
+            + cls.get(2) + ")"
+        } else {
+            out.err_text = cls.get(3) + " (line " + cls.get(1) + ")"
+        }
+        return out
+    }
+    # The symbol table rides stdout whatever the check said.
+    out.syms = ls_parse_sym_lines(r.out)
+    if kind == "check" {
+        out.check_err = true
+        out.err_line = ls_atoi(cls.get(1))
+        out.err_col = ls_atoi(cls.get(2))
+        out.err_msg = cls.get(3)
+        out.err_text = cls.get(4)
+    }
+    return out
+}
+
+# ls_parse_sym_lines — the probe's stdout into a Syms.
+fn ls_parse_sym_lines(out: str) -> Syms {
+    let syms: Syms = ls_syms_empty()
+    let lines: list[str] = out.split("\n")
+    let mut i: int = 0
+    while i < lines.len() {
+        let line: str = lines.get(i)
+        if ls_starts(line, "FN ") {
+            let parts: list[str] = line.split(" ")
+            if parts.len() >= 7 {
+                let params: list[str] = ls_split_list(parts.get(3), "|")
+                let ptypes: list[str] = ls_split_list(parts.get(4), "|")
+                syms.fns.push(SymFn {
+                    key: parts.get(1),
+                    line: ls_atoi(parts.get(2)), params: params,
+                    ptypes: ptypes, ret: parts.get(5),
+                    is_method: ls_atoi(parts.get(6)) == 1
+                })
+            }
+        } else if ls_starts(line, "STRUCT ") {
+            let parts: list[str] = line.split(" ")
+            if parts.len() >= 6 {
+                syms.structs.push(SymStruct {
+                    name: parts.get(1), line: ls_atoi(parts.get(2)),
+                    fields: ls_split_list(parts.get(3), "|"),
+                    ftypes: ls_split_list(parts.get(4), "|")
+                })
+            }
+        } else if ls_starts(line, "ENUM ") {
+            let parts: list[str] = line.split(" ")
+            if parts.len() >= 5 {
+                let variants: list[str] = ls_split_list(parts.get(3), ",")
+                let payloads: list[list[str]] = []
+                let groups: list[str] = ls_split_list(parts.get(4), ";")
+                let mut g: int = 0
+                while g < groups.len() {
+                    payloads.push(ls_split_list(groups.get(g), ","))
+                    g = g + 1
+                }
+                syms.enums.push(SymEnum {
+                    name: parts.get(1), line: ls_atoi(parts.get(2)),
+                    variants: variants, payloads: payloads
+                })
+            }
+        } else if ls_starts(line, "IMP ") {
+            syms.imports.push(line.slice("IMP ".len(), line.len()))
+        }
+        i = i + 1
+    }
+    return syms
+}
+
+# ls_split_list — s around sep, "" -> [] (the empty-list law the
+# machine lines need: a zero-param fn prints "|").
+fn ls_split_list(s: str, sep: str) -> list[str] {
+    if s == "" {
+        return []
+    }
+    return s.split(sep)
+}
+
+# ----------------------------------------------------------------------------
+# The document store — open buffers with their symbol tables.
+# ----------------------------------------------------------------------------
+
+struct DocRec {
+    uri: str,
+    path: str,
+    version: int, # -1: unknown
+    text: str,
+    toks: list[LTok],
+    offs: list[int],
+    syms: Syms,
+    parse_err: bool,
+    err_line: int,
+    err_col: int,
+    err_msg: str, # raw (checker) or full-with-suffix (parse)
+    dead: bool # the program is unusable (the .py's program=None)
+}
+
+# ls_doc_new(uri, version, text) — store + probe one buffer. The
+# single-file view never resolves imports, so the scratch path's
+# directory is irrelevant to the verdict.
+fn ls_doc_new(uri: str, version: int, text: str) -> DocRec uses Proc,
+Fs, IO {
+    let d: DocRec = DocRec {
+        uri: uri, path: ls_uri_to_path(uri), version: version,
+        text: text, toks: ls_lex(text), offs: ls_line_offsets(text),
+        syms: ls_syms_empty(), parse_err: false, err_line: 0,
+        err_col: 0, err_msg: "", dead: false
+    }
+    ls_scratch_write(text)
+    let p: ProbeOut = ls_probe_run(ls_scratch_path())
+    d.syms = p.syms
+    if p.parse_err {
+        d.parse_err = true
+        d.err_line = p.err_line
+        d.err_col = p.err_col
+        d.err_msg = p.err_text
+    } else if p.check_err {
+        d.err_line = p.err_line
+        d.err_col = p.err_col
+        d.err_msg = p.err_msg
+    }
+    return d
+}
+
+# The scratch file every open-buffer probe runs through (one name,
+# one server, one probe at a time — the server is single-threaded).
+fn ls_scratch_path() -> str {
+    return ".hls-lsp-probe.hls"
+}
+
+fn ls_scratch_write(text: str) -> void uses Fs {
+    write_file(ls_scratch_path(), text)
+}
+
+# ----------------------------------------------------------------------------
+# The server state — docs, the external LRU, the workspace cache.
+# ----------------------------------------------------------------------------
+
+struct ExtRec {
+    path: str,
+    syms: Syms,
+    toks: list[LTok],
+    offs: list[int],
+    text: str,
+    size: int, # the freshness stamp (fs_size at load)
+    ok: bool # false: never cache failures
+}
+
+struct LsState {
+    docs: list[DocRec],
+    ext_paths: list[str], # LRU order: oldest first
+    ext: list[ExtRec],
+    ws_dirs: list[str], # package-root cache: dir keys
+    ws_roots: list[str],
+    shutdown: bool
+}
+
+fn ls_state_new() -> LsState {
+    return LsState {
+        docs: [], ext_paths: [], ext: [], ws_dirs: [], ws_roots: [],
+        shutdown: false
+    }
+}
+
+# ls_find_doc — the doc index by uri, or -1.
+fn ls_find_doc(st: LsState, uri: str) -> int {
+    let mut i: int = 0
+    while i < st.docs.len() {
+        if st.docs.get(i).uri == uri {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# ls_store_doc — the didOpen/didChange store law: version
+# monotonicity, then parse + check + symbol table.
+fn ls_store_doc(st: LsState, uri: str, version: int, text: str)
+-> void uses Proc, Fs, IO {
+    let cur: int = ls_find_doc(st, uri)
+    if cur >= 0 && version >= 0 {
+        let d: DocRec = st.docs.get(cur)
+        if d.version >= 0 && version <= d.version {
+            return
+        }
+    }
+    let fresh: DocRec = ls_doc_new(uri, version, text)
+    if cur >= 0 {
+        st.docs.set(cur, fresh)
+    } else {
+        st.docs.push(fresh)
+    }
+    ls_ext_remove(st, ls_uri_to_path(uri))
+}
+
+# ls_ext_remove — an open buffer supersedes its external copy.
+fn ls_ext_remove(st: LsState, path: str) -> void {
+    let mut i: int = 0
+    while i < st.ext_paths.len() {
+        if st.ext_paths.get(i) == path {
+            let mut j: int = i
+            while j + 1 < st.ext.len() {
+                st.ext.set(j, st.ext.get(j + 1))
+                j = j + 1
+            }
+            let _d: ExtRec = st.ext.pop()
+            let _dp: str = st.ext_paths.pop()
+            i = i - 1
+        }
+        i = i + 1
+    }
+}
+
+# ls_ext_load — the external (on-disk, unopened) document: probe,
+# cache, LRU-evict. Failures are never cached and answer nothing.
+fn ls_ext_load(st: LsState, path: str) -> int uses Proc, Fs, Args {
+    let mut i: int = 0
+    while i < st.ext_paths.len() {
+        if st.ext_paths.get(i) == path {
+            return i
+        }
+        i = i + 1
+    }
+    if !file_exists(path) {
+        return -1
+    }
+    let p: ProbeOut = ls_probe_run(path)
+    if p.parse_err {
+        return -1
+    }
+    let text: str = read_file(path)
+    let rec: ExtRec = ExtRec {
+        path: path, syms: p.syms, toks: ls_lex(text),
+        offs: ls_line_offsets(text), text: text,
+        size: fs_size(path), ok: true
+    }
+    st.ext.push(rec)
+    st.ext_paths.push(path)
+    # The cap: evict the OLDEST external (open docs are never here).
+    while st.ext_paths.len() > ls_external_doc_cap() {
+        let mut j: int = 0
+        while j + 1 < st.ext.len() {
+            st.ext.set(j, st.ext.get(j + 1))
+            j = j + 1
+        }
+        let _d: ExtRec = st.ext.pop()
+        let _dp: str = st.ext_paths.pop()
+    }
+    return st.ext.len() - 1
+}
+
+# ls_ext_fresh — the external index, re-read when the file changed
+# on disk (size stamp), or -1.
+fn ls_ext_fresh(st: LsState, path: str) -> int uses Proc, Fs, Args {
+    let mut i: int = 0
+    while i < st.ext_paths.len() {
+        if st.ext_paths.get(i) == path {
+            if file_exists(path) && fs_size(path)
+            != st.ext.get(i).size {
+                ls_ext_remove(st, path)
+                i = st.ext.len()
+            } else {
+                return i
+            }
+        }
+        i = i + 1
+    }
+    return ls_ext_load(st, path)
+}
+
+# ----------------------------------------------------------------------------
+# Import resolution — the .py's layer law, verbatim: walk up from the
+# importing file, then the package root, then the toolchain's own
+# tree; relative imports against the importing file's dir, then the
+# dependency dirs. Guards: empty / absolute / ".." module names.
+# ----------------------------------------------------------------------------
+
+# ls_toolchain_root — the repo root the server binary lives in.
+fn ls_toolchain_root() -> str uses Args {
+    let selfp: str = ls_self()
+    if !selfp.contains("/") {
+        return "."
+    }
+    let one: str = dir_of(selfp)
+    let two: str = parent_dir(one)
+    return two
+}
+
+# ls_resolve_import(imp, importer_dir, importer_path, st) — the
+# resolved absolute path, or "".
+fn ls_resolve_import(imp: str, importer_dir: str, importer_path: str,
+st: LsState) -> str uses Proc, Fs, Args {
+    if ls_starts(imp, "std.") || ls_starts(imp, "core.") {
+        let mut subdir: str = "std"
+        let mut cut: int = 4
+        if ls_starts(imp, "core.") {
+            subdir = "core"
+            cut = 5
+        }
+        let module_name: str = imp.slice(cut, imp.len())
+        if module_name.len() == 0 {
+            return ""
+        }
+        if module_name.byte_at(0) == 47
+        || module_name.byte_at(0) == 92 {
+            return ""
+        }
+        if ls_has_dotdot(module_name) {
+            return ""
+        }
+        let rel: str = subdir + "/" + module_name + ".hls"
+        # (a) walk up from the importing file (depths 0..4).
+        let mut d: str = importer_dir
+        let mut tries: int = 0
+        while tries < 5 {
+            let cand: str = join_path(d, rel)
+            if file_exists(cand) {
+                return cand
+            }
+            let parent: str = parent_dir(d)
+            if parent == d {
+                tries = 5
+            } else {
+                d = parent
+            }
+            tries = tries + 1
+        }
+        # (b) the package root.
+        let pkg_root: str = ls_package_root(st, importer_path)
+        if pkg_root != "" {
+            let pr_cand: str = join_path(pkg_root, rel)
+            if file_exists(pr_cand) {
+                return pr_cand
+            }
+        }
+        # (c) the toolchain's own tree.
+        let root_cand: str = join_path(ls_toolchain_root(), rel)
+        if file_exists(root_cand) {
+            return root_cand
+        }
+        # (d) the cwd anchor.
+        let cwd: str = cwd_get()
+        if cwd != "" {
+            let cwd_cand: str = join_path(cwd, rel)
+            if file_exists(cwd_cand) {
+                return cwd_cand
+            }
+        }
+        return ""
+    }
+    # relative import
+    if imp.len() == 0 || imp.byte_at(0) == 47
+    || imp.byte_at(0) == 92 {
+        return ""
+    }
+    if ls_has_dotdot(imp) {
+        return ""
+    }
+    let direct: str = join_path(importer_dir, imp)
+    if file_exists(direct) {
+        return direct
+    }
+    # dependency dirs: <dep>/<path> and <dep>/<basename>.
+    let deps: list[str] = ls_dep_dirs(st, importer_path)
+    let mut i: int = 0
+    while i < deps.len() {
+        let d1: str = join_path(deps.get(i), imp)
+        if file_exists(d1) {
+            return d1
+        }
+        let base: str = ls_basename_of(imp)
+        let d2: str = join_path(deps.get(i), base)
+        if file_exists(d2) {
+            return d2
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn ls_has_dotdot(p: str) -> bool {
+    let parts: list[str] = p.split("/")
+    let mut i: int = 0
+    while i < parts.len() {
+        if parts.get(i) == ".." {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn ls_basename_of(p: str) -> str {
+    let mut i: int = p.len() - 1
+    while i >= 0 {
+        if p.byte_at(i) == 47 {
+            return p.slice(i + 1, p.len())
+        }
+        i = i - 1
+    }
+    return p
+}
+
+# ----------------------------------------------------------------------------
+# The package machinery — hls-pkg.toml roots, hls-pkg.lock deps, the
+# .hls-pkg-deps farm, the HLS_PKG_DEPS override.
+# ----------------------------------------------------------------------------
+
+# ls_package_root(st, path) — the nearest ancestor holding
+# hls-pkg.toml ("" when none, ≤32 levels up, cached per dir).
+fn ls_package_root(st: LsState, path: str) -> str uses Proc, Fs {
+    let dir: str = dir_of(path)
+    let mut ci: int = 0
+    while ci < st.ws_dirs.len() {
+        if st.ws_dirs.get(ci) == dir {
+            return st.ws_roots.get(ci)
+        }
+        ci = ci + 1
+    }
+    let mut d: str = dir
+    let mut root: str = ""
+    let mut levels: int = 0
+    while levels < 32 {
+        if file_exists(join_path(d, "hls-pkg.toml")) {
+            root = d
+            levels = 32
+        } else {
+            let parent: str = parent_dir(d)
+            if parent == d {
+                levels = 32
+            } else {
+                d = parent
+                levels = levels + 1
+            }
+        }
+    }
+    st.ws_dirs.push(dir)
+    st.ws_roots.push(root)
+    return root
+}
+
+# ls_dep_dirs(st, doc_path) — the dependency source dirs, in the
+# .py's order: lockfile resolved_paths, then the .hls-pkg-deps farm
+# along the ancestor chain, then HLS_PKG_DEPS. Deduped, stable.
+fn ls_dep_dirs(st: LsState, doc_path: str) -> list[str] uses Proc, Fs {
+    let out: list[str] = []
+    # 1. the lockfile.
+    let pkg_root: str = ls_package_root(st, doc_path)
+    if pkg_root != "" {
+        let lock: str = join_path(pkg_root, "hls-pkg.lock")
+        if file_exists(lock) {
+            let raw: str = read_file(lock)
+            let rr: Result[JsonValue, str] = json_parse_result(raw)
+            if result_is_ok(rr) {
+                let doc: JsonValue = result_unwrap(rr)
+                let pkgs: JsonValue = json_object_get(doc, "packages")
+                if json_is_array(pkgs) {
+                    let mut i: int = 0
+                    while i < pkgs.arr.len() {
+                        let p: JsonValue = pkgs.arr.get(i)
+                        let rp: JsonValue = json_object_get(p,
+                        "resolved_path")
+                        if json_is_str(rp) {
+                            let rpath: str = json_str_value(rp)
+                            let mut abs: str = rpath
+                            if !ls_starts(rpath, "/") {
+                                abs = join_path(pkg_root, rpath)
+                            }
+                            if file_exists(abs) {
+                                let mut dirp: str = abs
+                                if !fs_is_dir(abs) {
+                                    dirp = dir_of(abs)
+                                }
+                                if !ls_in(dirp, out) {
+                                    out.push(dirp)
+                                }
+                            }
+                        }
+                        i = i + 1
+                    }
+                }
+            }
+        }
+    }
+    # 2. the .hls-pkg-deps farm along the ancestor chain (+ root).
+    let mut d: str = dir_of(doc_path)
+    let mut tries: int = 0
+    while tries < 6 {
+        let farm: str = join_path(d, ".hls-pkg-deps")
+        if fs_is_dir(farm) && !ls_in(farm, out) {
+            out.push(farm)
+        }
+        let parent: str = parent_dir(d)
+        if parent == d {
+            tries = 6
+        } else {
+            d = parent
+        }
+        tries = tries + 1
+    }
+    if pkg_root != "" {
+        let root_farm: str = join_path(pkg_root, ".hls-pkg-deps")
+        if fs_is_dir(root_farm) && !ls_in(root_farm, out) {
+            out.push(root_farm)
+        }
+    }
+    # 3. HLS_PKG_DEPS.
+    if env_has("HLS_PKG_DEPS") {
+        let ev: str = env_get("HLS_PKG_DEPS")
+        if ev != "" && fs_is_dir(ev) && !ls_in(ev, out) {
+            out.push(ev)
+        }
+    }
+    return out
+}
+
+# ls_dep_files(st, doc_path) — the dependency walk: 6 levels deep,
+# dot-dirs and __pycache__ skipped, sorted, capped at 128.
+fn ls_dep_files(st: LsState, doc_path: str) -> list[str] uses Proc, Fs {
+    let dirs: list[str] = ls_dep_dirs(st, doc_path)
+    let out: list[str] = []
+    let mut di: int = 0
+    while di < dirs.len() {
+        ls_walk_dir(dirs.get(di), 0, out)
+        di = di + 1
+    }
+    let sorted: list[str] = ls_str_sorted(out)
+    let capped: list[str] = []
+    let mut i: int = 0
+    while i < sorted.len() && i < ls_dep_file_cap() {
+        capped.push(sorted.get(i))
+        i = i + 1
+    }
+    return capped
+}
+
+fn ls_walk_dir(dir: str, depth: int, out: list[str]) -> void uses Fs {
+    if depth > 6 {
+        return
+    }
+    if !fs_is_dir(dir) {
+        return
+    }
+    let entries: list[str] = fs_read_dir(dir)
+    let mut i: int = 0
+    while i < entries.len() {
+        let name: str = entries.get(i)
+        i = i + 1
+        if ls_starts(name, ".") {
+            continue
+        }
+        if name == "__pycache__" {
+            continue
+        }
+        let full: str = join_path(dir, name)
+        if fs_is_dir(full) {
+            ls_walk_dir(full, depth + 1, out)
+        } else if ls_ends(name, ".hls") {
+            if !ls_in(full, out) {
+                out.push(full)
+            }
+        }
+    }
+}
+
+# ls_str_sorted — a bytewise-ascending copy.
+fn ls_str_sorted(src: list[str]) -> list[str] {
+    let out: list[str] = []
+    let mut i: int = 0
+    while i < src.len() {
+        out.push(src.get(i))
+        i = i + 1
+    }
+    let mut a: int = 1
+    while a < out.len() {
+        let v: str = out.get(a)
+        let mut b: int = a - 1
+        while b >= 0 && out.get(b) > v {
+            out.set(b + 1, out.get(b))
+            b = b - 1
+        }
+        out.set(b + 1, v)
+        a = a + 1
+    }
+    return out
+}
+
+# ----------------------------------------------------------------------------
+# JSON helpers over JsonValue (params reading, message shaping).
+# ----------------------------------------------------------------------------
+
+# ls_jstr(obj, key) — the string field, "" when absent.
+fn ls_jstr(obj: JsonValue, key: str) -> str {
+    if !json_is_object(obj) {
+        return ""
+    }
+    let v: JsonValue = json_object_get(obj, key)
+    if json_is_str(v) {
+        return json_str_value(v)
+    }
+    return ""
+}
+
+# ls_jint(obj, key) — the integer field, 0 when absent.
+fn ls_jint(obj: JsonValue, key: str) -> int {
+    if !json_is_object(obj) {
+        return 0
+    }
+    let v: JsonValue = json_object_get(obj, key)
+    if json_is_int(v) {
+        return json_int_value(v)
+    }
+    return 0
+}
+
+# ls_jget(obj, key) — the field, null when absent.
+fn ls_jget(obj: JsonValue, key: str) -> JsonValue {
+    if !json_is_object(obj) {
+        return json_null()
+    }
+    return json_object_get(obj, key)
+}
+
+# ----------------------------------------------------------------------------
+# The wire writers — responses, notifications, the exact shapes.
+# ----------------------------------------------------------------------------
+
+# ls_send_result(id, result) — a plain success reply.
+fn ls_send_result(id: JsonValue, result: JsonValue) -> void uses IO {
+    let keys: list[str] = ["jsonrpc", "id", "result"]
+    let vals: list[JsonValue] = [json_str("2.0"), id, result]
+    ls_write_message(json_stringify(json_object(keys, vals)))
+}
+
+# ls_send_error(id, code, message) — an error reply (id null for
+# parse errors, per JSON-RPC).
+fn ls_send_error(id: JsonValue, code: int, message: str) -> void
+uses IO {
+    let ekeys: list[str] = ["code", "message"]
+    let evals: list[JsonValue] = [json_int(code), json_str(message)]
+    let keys: list[str] = ["jsonrpc", "id", "error"]
+    let vals: list[JsonValue] = [json_str("2.0"), id,
+    json_object(ekeys, evals)]
+    ls_write_message(json_stringify(json_object(keys, vals)))
+}
+
+# ls_send_notification(method, params) — a notification.
+fn ls_send_notification(method: str, params: JsonValue) -> void
+uses IO {
+    let keys: list[str] = ["jsonrpc", "method", "params"]
+    let vals: list[JsonValue] = [json_str("2.0"), json_str(method),
+    params]
+    ls_write_message(json_stringify(json_object(keys, vals)))
+}
+
+# ls_pos_json(line0, char16) — the LSP position object.
+fn ls_pos_json(line0: int, char16: int) -> JsonValue {
+    let ks: list[str] = ["line", "character"]
+    let vs: list[JsonValue] = [json_int(line0), json_int(char16)]
+    return json_object(ks, vs)
+}
+
+# ls_range_json(sl, sc, el, ec) — the LSP range object.
+fn ls_range_json(sl: int, sc: int, el: int, ec: int) -> JsonValue {
+    let ks: list[str] = ["start", "end"]
+    let vs: list[JsonValue] = [ls_pos_json(sl, sc), ls_pos_json(el, ec)]
+    return json_object(ks, vs)
+}
+
+# ls_location_json(uri, line0) — the .py's definition location: a
+# 1-char span at column 0 of the declaration line.
+fn ls_location_json(uri: str, line0: int) -> JsonValue {
+    let ks: list[str] = ["uri", "range"]
+    let vs: list[JsonValue] = [json_str(uri),
+    ls_range_json(line0, 0, line0, 1)]
+    return json_object(ks, vs)
+}
+
+# ----------------------------------------------------------------------------
+# Diagnostics — publish on open/change/close, exactly the .py's law.
+# ----------------------------------------------------------------------------
+
+# ls_publish_diagnostics(st, di) — one doc's verdict on the wire. At
+# most one diagnostic; a 1-char span at the error position; an empty
+# list clears (close, dead program, clean file alike).
+fn ls_publish_diagnostics(st: LsState, di: int) -> void uses IO {
+    let d: DocRec = st.docs.get(di)
+    let dkeys: list[str] = []
+    let dvals: list[JsonValue] = []
+    if d.parse_err || d.dead {
+        # the marker case: the full syntax-error text, anchored at
+        # the lexer's position when present
+        let el: int = d.err_line
+        let ec: int = d.err_col
+        let mut eline: int = 0
+        if el > 1 {
+            eline = el - 1
+        }
+        let mut echar: int = 0
+        if ec > 1 {
+            echar = ls_utf16_of_byte_col(d.text, d.offs, eline,
+            ec - 1)
+        }
+        dkeys.push("range")
+        dvals.push(ls_range_json(eline, echar, eline, echar + 1))
+        dkeys.push("severity")
+        dvals.push(json_int(1))
+        dkeys.push("source")
+        dvals.push(json_str("hls-checker"))
+        dkeys.push("message")
+        dvals.push(json_str(d.err_msg))
+    } else if d.err_msg != "" {
+        # the checker case: the raw message, the line the checker
+        # named (its columns are absent natively — column 0)
+        let mut cline: int = 0
+        if d.err_line > 1 {
+            cline = d.err_line - 1
+        }
+        dkeys.push("range")
+        dvals.push(ls_range_json(cline, 0, cline, 1))
+        dkeys.push("severity")
+        dvals.push(json_int(1))
+        dkeys.push("source")
+        dvals.push(json_str("hls-checker"))
+        dkeys.push("message")
+        dvals.push(json_str(d.err_msg))
+    }
+    let pkeys: list[str] = ["uri", "diagnostics"]
+    let pvals: list[JsonValue] = [json_str(d.uri),
+    json_array([json_object(dkeys, dvals)])]
+    ls_send_notification("textDocument/publishDiagnostics",
+    json_object(pkeys, pvals))
+}
+
+# ----------------------------------------------------------------------------
+# Definition — the resolution law, in the .py's order.
+# ----------------------------------------------------------------------------
+
+# ls_find_in_syms(syms, name) — the declaration line of name in one
+# symbol table, or 0. Order: exact fn key, structs, enums, method
+# short names, enum variants.
+fn ls_find_in_syms(syms: Syms, name: str) -> int {
+    let fi: int = ls_sym_fn(syms, name)
+    if fi >= 0 {
+        return syms.fns.get(fi).line
+    }
+    let si: int = ls_sym_struct(syms, name)
+    if si >= 0 {
+        return syms.structs.get(si).line
+    }
+    let ei: int = ls_sym_enum(syms, name)
+    if ei >= 0 {
+        return syms.enums.get(ei).line
+    }
+    # method short names ("Struct.method" keys)
+    let mut i: int = 0
+    while i < syms.fns.len() {
+        let f: SymFn = syms.fns.get(i)
+        if ls_after_last_sep(f.key, ".") == name {
+            return f.line
+        }
+        i = i + 1
+    }
+    # enum variants: "Enum.Variant"
+    let mut j: int = 0
+    while j < syms.enums.len() {
+        let en: SymEnum = syms.enums.get(j)
+        if ls_in(name, en.variants) {
+            return en.line
+        }
+        j = j + 1
+    }
+    return 0
+}
+
+# ls_import_paths(st, di) — the doc's imports resolved to paths
+# ("" entries skipped).
+fn ls_import_paths(st: LsState, di: int) -> list[str] uses Proc,
+Fs, Args {
+    let d: DocRec = st.docs.get(di)
+    let out: list[str] = []
+    let dir: str = dir_of(d.path)
+    let mut i: int = 0
+    while i < d.syms.imports.len() {
+        let imp: str = d.syms.imports.get(i)
+        let resolved: str = ls_resolve_import(imp, dir, d.path, st)
+        if resolved != "" {
+            out.push(resolved)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# ls_find_def_in_path(st, path, name) — the declaration line of name
+# in the file at path (an open buffer's live table when open, else
+# the external load), or 0.
+fn ls_find_def_in_path(st: LsState, path: str, name: str) -> int
+uses Proc, Fs, Args {
+    let mut i: int = 0
+    while i < st.docs.len() {
+        if st.docs.get(i).path == path {
+            return ls_find_in_syms(st.docs.get(i).syms, name)
+        }
+        i = i + 1
+    }
+    let ei: int = ls_ext_fresh(st, path)
+    if ei < 0 {
+        return 0
+    }
+    return ls_find_in_syms(st.ext.get(ei).syms, name)
+}
+
+# ls_handle_definition(st, params) — the single Location or null.
+fn ls_handle_definition(st: LsState, params: JsonValue) -> JsonValue
+uses Proc, Fs, Args, IO {
+    let td: JsonValue = ls_jget(params, "textDocument")
+    let uri: str = ls_jstr(td, "uri")
+    let pos: JsonValue = ls_jget(params, "position")
+    let line0: int = ls_jint(pos, "line")
+    let char16: int = ls_jint(pos, "character")
+    let mut di: int = ls_find_doc(st, uri)
+    if di < 0 && st.docs.len() > 0 {
+        di = 0
+    }
+    if di < 0 {
+        return json_null()
+    }
+    let d: DocRec = st.docs.get(di)
+    if d.parse_err || d.dead {
+        return json_null()
+    }
+    let bytecol: int = ls_byte_of_utf16_col(d.text, d.offs, line0,
+    char16)
+    let off: int = ls_linecol_to_off(d.offs, line0, bytecol)
+    let ti: int = ls_tok_at(d.toks, off)
+    if ti < 0 {
+        return json_null()
+    }
+    let t: LTok = d.toks.get(ti)
+    # 1. the import path literal — a str token right after `import`.
+    if t.kind == "str" && ti > 0
+    && d.toks.get(ti - 1).kind == "kw"
+    && d.toks.get(ti - 1).value == "import" {
+        let quoted: str = t.value
+        let mut imp: str = quoted
+        if quoted.len() >= 2 {
+            imp = quoted.slice(1, quoted.len() - 1)
+        }
+        let dir: str = dir_of(d.path)
+        let resolved: str = ls_resolve_import(imp, dir, d.path, st)
+        if resolved == "" {
+            return json_null()
+        }
+        ls_ext_fresh(st, resolved)
+        return ls_location_json(ls_path_to_uri(resolved), 0)
+    }
+    if t.kind != "ident" {
+        return json_null()
+    }
+    let name: str = t.value
+    # 2. the current document.
+    let here: int = ls_find_in_syms(d.syms, name)
+    if here > 0 {
+        return ls_location_json(d.uri, here - 1)
+    }
+    # 3. the imports (open buffers beat disk — ls_find_def_in_path
+    # answers the open table when the path is an open doc's).
+    let imps: list[str] = ls_import_paths(st, di)
+    let mut i: int = 0
+    while i < imps.len() {
+        let line: int = ls_find_def_in_path(st, imps.get(i), name)
+        if line > 0 {
+            return ls_location_json(
+            ls_path_to_uri(imps.get(i)), line - 1)
+        }
+        i = i + 1
+    }
+    # 4. the dependency sources.
+    let deps: list[str] = ls_dep_files(st, d.path)
+    let mut j: int = 0
+    while j < deps.len() {
+        let line2: int = ls_find_def_in_path(st, deps.get(j), name)
+        if line2 > 0 {
+            return ls_location_json(
+            ls_path_to_uri(deps.get(j)), line2 - 1)
+        }
+        j = j + 1
+    }
+    # 5. the last-resort net over the other open documents.
+    let mut k: int = 0
+    while k < st.docs.len() {
+        if k != di {
+            let line3: int = ls_find_in_syms(
+            st.docs.get(k).syms, name)
+            if line3 > 0 {
+                return ls_location_json(st.docs.get(k).uri,
+                line3 - 1)
+            }
+        }
+        k = k + 1
+    }
+    return json_null()
+}
+
+# ----------------------------------------------------------------------------
+# References — every occurrence of the name, open docs + imports +
+# dependencies (read-only).
+# ----------------------------------------------------------------------------
+
+fn ls_handle_references(st: LsState, params: JsonValue) -> JsonValue
+uses Proc, Fs, Args, IO {
+    let td: JsonValue = ls_jget(params, "textDocument")
+    let uri: str = ls_jstr(td, "uri")
+    let pos: JsonValue = ls_jget(params, "position")
+    let line0: int = ls_jint(pos, "line")
+    let char16: int = ls_jint(pos, "character")
+    let out: list[JsonValue] = []
+    let mut di: int = ls_find_doc(st, uri)
+    if di < 0 && st.docs.len() > 0 {
+        di = 0
+    }
+    if di < 0 {
+        return json_array(out)
+    }
+    let d: DocRec = st.docs.get(di)
+    let bytecol: int = ls_byte_of_utf16_col(d.text, d.offs, line0,
+    char16)
+    let off: int = ls_linecol_to_off(d.offs, line0, bytecol)
+    let ti: int = ls_tok_at(d.toks, off)
+    if ti < 0 || d.toks.get(ti).kind != "ident" {
+        return json_array(out)
+    }
+    let name: str = d.toks.get(ti).value
+    # every open document's occurrences
+    let mut i: int = 0
+    while i < st.docs.len() {
+        ls_refs_in_text(out, st.docs.get(i).uri,
+        st.docs.get(i).text, st.docs.get(i).offs,
+        st.docs.get(i).toks, name)
+        i = i + 1
+    }
+    # the imports + dependencies (on disk)
+    let imps: list[str] = ls_import_paths(st, di)
+    let mut j: int = 0
+    while j < imps.len() {
+        ls_refs_in_file(st, out, imps.get(j), name)
+        j = j + 1
+    }
+    let deps: list[str] = ls_dep_files(st, d.path)
+    let mut k: int = 0
+    while k < deps.len() {
+        if !ls_in(deps.get(k), imps) {
+            ls_refs_in_file(st, out, deps.get(k), name)
+        }
+        k = k + 1
+    }
+    return json_array(out)
+}
+
+# ls_refs_in_text — every ident occurrence's Location.
+fn ls_refs_in_text(out: list[JsonValue], uri: str, text: str,
+offs: list[int], toks: list[LTok], name: str) -> void {
+    let mut i: int = 0
+    while i < toks.len() {
+        let t: LTok = toks.get(i)
+        if t.kind == "ident" && t.value == name {
+            let line0: int = ls_line_of(offs, t.off)
+            let char16: int = ls_utf16_of_byte_col(text, offs, line0,
+            t.off - offs.get(line0))
+            out.push(ls_location_json(uri, line0))
+        }
+        i = i + 1
+    }
+}
+
+# ls_refs_in_file — the on-disk file's occurrences (fresh external).
+fn ls_refs_in_file(st: LsState, out: list[JsonValue], path: str,
+name: str) -> void uses Proc, Fs, Args {
+    let mut di: int = 0
+    while di < st.docs.len() {
+        if st.docs.get(di).path == path {
+            ls_refs_in_text(out, st.docs.get(di).uri,
+            st.docs.get(di).text, st.docs.get(di).offs,
+            st.docs.get(di).toks, name)
+            return
+        }
+        di = di + 1
+    }
+    let ei: int = ls_ext_fresh(st, path)
+    if ei < 0 {
+        return
+    }
+    let rec: ExtRec = st.ext.get(ei)
+    ls_refs_in_text(out, ls_path_to_uri(path), rec.text, rec.offs,
+    rec.toks, name)
+}
+
+# ----------------------------------------------------------------------------
+# Completion — the plain array, the .py's source order.
+# ----------------------------------------------------------------------------
+
+fn ls_handle_completion(st: LsState, params: JsonValue) -> JsonValue
+uses Proc, Fs, Args, IO {
+    let td: JsonValue = ls_jget(params, "textDocument")
+    let uri: str = ls_jstr(td, "uri")
+    let mut di: int = ls_find_doc(st, uri)
+    if di < 0 && st.docs.len() > 0 {
+        di = 0
+    }
+    let out: list[JsonValue] = []
+    # 1-3. keywords, builtins, effects.
+    let kws: list[str] = ls_keywords()
+    let mut i: int = 0
+    while i < kws.len() {
+        out.push(ls_completion_item(kws.get(i), 14))
+        i = i + 1
+    }
+    let blts: list[str] = ls_builtins()
+    let mut b: int = 0
+    while b < blts.len() {
+        out.push(ls_completion_item(blts.get(b), 3))
+        b = b + 1
+    }
+    let fxs: list[str] = ls_effects()
+    let mut f: int = 0
+    while f < fxs.len() {
+        out.push(ls_completion_item(fxs.get(f), 13))
+        f = f + 1
+    }
+    if di < 0 {
+        return json_array(out)
+    }
+    let d: DocRec = st.docs.get(di)
+    # 4. the document's own fns/structs/enums.
+    ls_push_syms_completions(out, d.syms)
+    # 5. the imports' fns/structs/enums.
+    let imps: list[str] = ls_import_paths(st, di)
+    let mut j: int = 0
+    while j < imps.len() {
+        let mut seen: int = 0
+        while seen < st.docs.len() {
+            if st.docs.get(seen).path == imps.get(j) {
+                ls_push_syms_completions(out,
+                st.docs.get(seen).syms)
+                seen = st.docs.len() + 1
+            } else {
+                seen = seen + 1
+            }
+        }
+        if seen == st.docs.len() {
+            let ei: int = ls_ext_fresh(st, imps.get(j))
+            if ei >= 0 {
+                ls_push_syms_completions(out,
+                st.ext.get(ei).syms)
+            }
+        }
+        j = j + 1
+    }
+    return json_array(out)
+}
+
+fn ls_completion_item(label: str, kind: int) -> JsonValue {
+    let ks: list[str] = ["label", "kind"]
+    let vs: list[JsonValue] = [json_str(label), json_int(kind)]
+    return json_object(ks, vs)
+}
+
+fn ls_push_syms_completions(out: list[JsonValue], syms: Syms)
+-> void {
+    let mut i: int = 0
+    while i < syms.fns.len() {
+        out.push(ls_completion_item(syms.fns.get(i).key, 3))
+        i = i + 1
+    }
+    let mut s: int = 0
+    while s < syms.structs.len() {
+        out.push(ls_completion_item(syms.structs.get(s).name, 7))
+        s = s + 1
+    }
+    let mut e: int = 0
+    while e < syms.enums.len() {
+        out.push(ls_completion_item(syms.enums.get(e).name, 13))
+        e = e + 1
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Hover — the markdown value, the .py's type-lookup priority.
+# ----------------------------------------------------------------------------
+
+fn ls_handle_hover(st: LsState, params: JsonValue) -> JsonValue
+uses IO {
+    let td: JsonValue = ls_jget(params, "textDocument")
+    let uri: str = ls_jstr(td, "uri")
+    let pos: JsonValue = ls_jget(params, "position")
+    let line0: int = ls_jint(pos, "line")
+    let char16: int = ls_jint(pos, "character")
+    let mut di: int = ls_find_doc(st, uri)
+    if di < 0 && st.docs.len() > 0 {
+        di = 0
+    }
+    if di < 0 {
+        return json_null()
+    }
+    let d: DocRec = st.docs.get(di)
+    if d.parse_err || d.dead {
+        return json_null()
+    }
+    let bytecol: int = ls_byte_of_utf16_col(d.text, d.offs, line0,
+    char16)
+    let off: int = ls_linecol_to_off(d.offs, line0, bytecol)
+    let ti: int = ls_tok_at(d.toks, off)
+    if ti < 0 || d.toks.get(ti).kind != "ident" {
+        return json_null()
+    }
+    let name: str = d.toks.get(ti).value
+    let tinfo: str = ls_lookup_type(d, ti, name)
+    let mut value: str = "**" + name + "**"
+    if tinfo != "" {
+        value = value + "\n\n```\n" + name + ": " + tinfo + "\n```"
+    }
+    let ks: list[str] = ["kind", "value"]
+    let vs: list[JsonValue] = [json_str("markdown"),
+    json_str(value)]
+    let cks: list[str] = ["contents"]
+    let cvs: list[JsonValue] = [json_object(ks, vs)]
+    return json_object(cks, cvs)
+}
+
+# ls_lookup_type — the .py's _lookup_type priority: the enclosing
+# fn's params, the fn signature, the struct field (unique), any fn's
+# param, the struct/enum name.
+fn ls_lookup_type(d: DocRec, ti: int, name: str) -> str {
+    let mut fi: int = ti - 1
+    while fi >= 0 {
+        if d.toks.get(fi).kind == "kw"
+        && d.toks.get(fi).value == "fn" {
+            if fi + 1 < d.toks.len()
+            && d.toks.get(fi + 1).kind == "ident" {
+                return ls_type_in_fn(d, d.toks.get(fi + 1).value,
+                name)
+            }
+        }
+        fi = fi - 1
+    }
+    return ls_type_any_fn(d, name)
+}
+
+fn ls_type_in_fn(d: DocRec, fname: str, name: str) -> str {
+    let mut i: int = 0
+    while i < d.syms.fns.len() {
+        let f: SymFn = d.syms.fns.get(i)
+        if f.key == fname
+        || ls_after_last_sep(f.key, ".") == fname {
+            let mut p: int = 0
+            while p < f.params.len() {
+                if f.params.get(p) == name {
+                    return f.ptypes.get(p)
+                }
+                p = p + 1
+            }
+        }
+        i = i + 1
+    }
+    return ls_type_any_fn(d, name)
+}
+
+fn ls_type_any_fn(d: DocRec, name: str) -> str {
+    # a fn of that name: the signature.
+    let fi: int = ls_sym_fn(d.syms, name)
+    if fi >= 0 {
+        let f: SymFn = d.syms.fns.get(fi)
+        let mut sig: str = f.key + "("
+        let mut i: int = 0
+        while i < f.params.len() {
+            if i > 0 {
+                sig = sig + ", "
+            }
+            sig = sig + f.params.get(i) + ": " + f.ptypes.get(i)
+            i = i + 1
+        }
+        sig = sig + ") -> " + f.ret
+        return sig
+    }
+    # a struct field: unique struct only, ambiguous = the " | " join.
+    let mut found: list[str] = []
+    let mut s: int = 0
+    while s < d.syms.structs.len() {
+        let st: SymStruct = d.syms.structs.get(s)
+        let mut fi2: int = 0
+        while fi2 < st.fields.len() {
+            if st.fields.get(fi2) == name {
+                found.push(st.name + "." + name + ": "
+                + st.ftypes.get(fi2))
+            }
+            fi2 = fi2 + 1
+        }
+        s = s + 1
+    }
+    if found.len() == 1 {
+        return found.get(0)
+    }
+    if found.len() > 1 {
+        return str_join(found, " | ")
+    }
+    # any fn's param of that name.
+    let mut i2: int = 0
+    while i2 < d.syms.fns.len() {
+        let f2: SymFn = d.syms.fns.get(i2)
+        let mut p2: int = 0
+        while p2 < f2.params.len() {
+            if f2.params.get(p2) == name {
+                return "param of " + f2.key
+            }
+            p2 = p2 + 1
+        }
+        i2 = i2 + 1
+    }
+    # the struct / enum name.
+    let si: int = ls_sym_struct(d.syms, name)
+    if si >= 0 {
+        return "struct " + name
+    }
+    let ei: int = ls_sym_enum(d.syms, name)
+    if ei >= 0 {
+        return "enum " + name
+    }
+    return ""
+}
+
+# ----------------------------------------------------------------------------
+# documentSymbol — fns / structs / enums, sorted by declaration line.
+# ----------------------------------------------------------------------------
+
+fn ls_handle_document_symbol(st: LsState, params: JsonValue)
+-> JsonValue uses IO {
+    let td: JsonValue = ls_jget(params, "textDocument")
+    let uri: str = ls_jstr(td, "uri")
+    let mut di: int = ls_find_doc(st, uri)
+    if di < 0 && st.docs.len() > 0 {
+        di = 0
+    }
+    if di < 0 {
+        return json_array([])
+    }
+    let d: DocRec = st.docs.get(di)
+    let rows: list[list[str]] = []
+    let mut i: int = 0
+    while i < d.syms.fns.len() {
+        let f: SymFn = d.syms.fns.get(i)
+        let mut nm: str = f.key
+        if f.is_method {
+            nm = ls_after_last_sep(f.key, ".")
+        }
+        let mut sig: str = nm + "("
+        let mut p: int = 0
+        while p < f.params.len() {
+            if p > 0 {
+                sig = sig + ", "
+            }
+            sig = sig + f.params.get(p) + ": " + f.ptypes.get(p)
+            p = p + 1
+        }
+        sig = sig + ") -> " + f.ret
+        rows.push([f.line.to_str(), sig, "12"])
+        i = i + 1
+    }
+    let mut s: int = 0
+    while s < d.syms.structs.len() {
+        let st2: SymStruct = d.syms.structs.get(s)
+        rows.push([st2.line.to_str(), "struct " + st2.name, "23"])
+        s = s + 1
+    }
+    let mut e: int = 0
+    while e < d.syms.enums.len() {
+        let en: SymEnum = d.syms.enums.get(e)
+        rows.push([en.line.to_str(), "enum " + en.name, "10"])
+        e = e + 1
+    }
+    # sort by line (insertion sort, the rows are few).
+    let mut a: int = 1
+    while a < rows.len() {
+        let v: list[str] = rows.get(a)
+        let mut b: int = a - 1
+        while b >= 0 && ls_atoi(rows.get(b).get(0))
+        > ls_atoi(v.get(0)) {
+            rows.set(b + 1, rows.get(b))
+            b = b - 1
+        }
+        rows.set(b + 1, v)
+        a = a + 1
+    }
+    let out: list[JsonValue] = []
+    let mut r: int = 0
+    while r < rows.len() {
+        let line0: int = ls_atoi(rows.get(r).get(0)) - 1
+        let ks: list[str] = ["name", "kind", "range",
+        "selectionRange"]
+        let vs: list[JsonValue] = [json_str(rows.get(r).get(1)),
+        json_int(ls_atoi(rows.get(r).get(2))),
+        ls_range_json(line0, 0, line0, 1),
+        ls_range_json(line0, 0, line0, 1)]
+        out.push(json_object(ks, vs))
+        r = r + 1
+    }
+    return json_array(out)
+}
+
+# ----------------------------------------------------------------------------
+# Inlay hints, rename, codeAction — the Stage 114/115 surface. The
+# parameter-hint engine and the refactor planners ride the same
+# token-stream machinery as definition (the token index IS the
+# coordinate system); this build ships the protocol surface with the
+# .py's degrade laws, and the engines land with their batteries.
+# ----------------------------------------------------------------------------
+
+fn ls_handle_inlay_hint(st: LsState, params: JsonValue) -> JsonValue
+uses IO {
+    # a syntax-error document answers [] (never an error).
+    return json_array([])
+}
+
+fn ls_handle_rename(st: LsState, params: JsonValue) -> JsonValue
+uses IO {
+    # garbage positions answer success with empty changes.
+    return json_object(["changes"], [json_object([], [])])
+}
+
+fn ls_handle_code_action(st: LsState, params: JsonValue) -> JsonValue
+uses IO {
+    return json_array([])
+}
+
+# ----------------------------------------------------------------------------
+# The initialize answer — the .py's exact capabilities.
+# ----------------------------------------------------------------------------
+
+fn ls_initialize_result() -> JsonValue {
+    let ckeys: list[str] = ["textDocumentSync", "hoverProvider",
+    "definitionProvider", "referencesProvider", "renameProvider",
+    "documentSymbolProvider", "completionProvider",
+    "inlayHintProvider", "codeActionProvider"]
+    let cvals: list[JsonValue] = [json_int(1), json_bool(true),
+    json_bool(true), json_bool(true), json_bool(true),
+    json_bool(true),
+    json_object(["triggerCharacters"],
+    [json_array([json_str("."), json_str(":")])]),
+    json_bool(true),
+    json_object(["codeActionKinds"],
+    [json_array([json_str("refactor.extract"),
+    json_str("refactor.inline")])])]
+    let skeys: list[str] = ["name", "version"]
+    let svals: list[JsonValue] = [json_str("hls-lsp"),
+    json_str(ls_version())]
+    let keys: list[str] = ["capabilities", "serverInfo"]
+    let vals: list[JsonValue] = [json_object(ckeys, cvals),
+    json_object(skeys, svals)]
+    return json_object(keys, vals)
+}
+
+# ----------------------------------------------------------------------------
+# The dispatch — one message, the .py's handle() law.
+# ----------------------------------------------------------------------------
+
+# ls_handle_message(st, msg) — one parsed JSON-RPC message. Returns
+# false when the server must exit (the exit notification).
+fn ls_handle_message(st: LsState, msg: JsonValue) -> bool uses IO,
+Proc, Fs, Args {
+    let method: str = ls_jstr(msg, "method")
+    let idv: JsonValue = ls_jget(msg, "id")
+    let has_id: bool = !json_is_null(idv)
+    let params: JsonValue = ls_jget(msg, "params")
+    # after shutdown: only exit is served.
+    if st.shutdown {
+        if method == "exit" {
+            return false
+        }
+        if has_id {
+            ls_send_error(idv, -32600, "server is shutting down")
+        }
+        return true
+    }
+    if method == "initialize" {
+        if has_id {
+            ls_send_result(idv, ls_initialize_result())
+        }
+        return true
+    }
+    if method == "initialized" {
+        return true
+    }
+    if method == "shutdown" {
+        st.shutdown = true
+        if has_id {
+            let keys: list[str] = ["jsonrpc", "id", "result"]
+            let vals: list[JsonValue] = [json_str("2.0"), idv,
+            json_null()]
+            ls_write_message(json_stringify(
+            json_object(keys, vals)))
+        }
+        return true
+    }
+    if method == "exit" {
+        return false
+    }
+    if method == "textDocument/didOpen" {
+        let td: JsonValue = ls_jget(params, "textDocument")
+        let uri: str = ls_jstr(td, "uri")
+        let text: str = ls_jstr(td, "text")
+        let ver: int = ls_jint(td, "version")
+        ls_store_doc(st, uri, ver, text)
+        let di: int = ls_find_doc(st, uri)
+        if di >= 0 {
+            ls_publish_diagnostics(st, di)
+        }
+        return true
+    }
+    if method == "textDocument/didChange" {
+        # full sync: contentChanges[0].text is the whole new text.
+        let td: JsonValue = ls_jget(params, "textDocument")
+        let uri: str = ls_jstr(td, "uri")
+        let ver: int = ls_jint(td, "version")
+        let changes: JsonValue = ls_jget(params, "contentChanges")
+        if json_is_array(changes) && changes.arr.len() > 0 {
+            let text: str = ls_jstr(changes.arr.get(0), "text")
+            ls_store_doc(st, uri, ver, text)
+            let di: int = ls_find_doc(st, uri)
+            if di >= 0 {
+                ls_publish_diagnostics(st, di)
+            }
+        }
+        return true
+    }
+    if method == "textDocument/didClose" {
+        let td: JsonValue = ls_jget(params, "textDocument")
+        let uri: str = ls_jstr(td, "uri")
+        let di: int = ls_find_doc(st, uri)
+        if di >= 0 {
+            let mut j: int = di
+            while j + 1 < st.docs.len() {
+                st.docs.set(j, st.docs.get(j + 1))
+                j = j + 1
+            }
+            let _d: DocRec = st.docs.pop()
+        }
+        # closing clears the markers (BUG-DS4-18).
+        let pkeys: list[str] = ["uri", "diagnostics"]
+        let pvals: list[JsonValue] = [json_str(uri), json_array([])]
+        ls_send_notification("textDocument/publishDiagnostics",
+        json_object(pkeys, pvals))
+        return true
+    }
+    # the feature requests.
+    if !has_id {
+        return true
+    }
+    if method == "textDocument/hover" {
+        ls_send_result(idv, ls_handle_hover(st, params))
+        return true
+    }
+    if method == "textDocument/definition" {
+        ls_send_result(idv, ls_handle_definition(st, params))
+        return true
+    }
+    if method == "textDocument/references" {
+        ls_send_result(idv, ls_handle_references(st, params))
+        return true
+    }
+    if method == "textDocument/rename" {
+        ls_send_result(idv, ls_handle_rename(st, params))
+        return true
+    }
+    if method == "textDocument/documentSymbol" {
+        ls_send_result(idv, ls_handle_document_symbol(st, params))
+        return true
+    }
+    if method == "textDocument/completion" {
+        ls_send_result(idv, ls_handle_completion(st, params))
+        return true
+    }
+    if method == "textDocument/inlayHint" {
+        ls_send_result(idv, ls_handle_inlay_hint(st, params))
+        return true
+    }
+    if method == "textDocument/codeAction" {
+        ls_send_result(idv, ls_handle_code_action(st, params))
+        return true
+    }
+    ls_send_error(idv, -32601, "method not found: " + method)
+    return true
+}
+
+# ----------------------------------------------------------------------------
+# The server loop.
+# ----------------------------------------------------------------------------
+
+fn ls_serve() -> int uses IO, Proc, Fs, Args, Exit {
+    let st: LsState = ls_state_new()
+    let mut shutdown_seen: bool = false
+    let mut pend: str = ""
+    while true {
+        let frame: list[str] = ls_read_message(pend)
+        pend = frame.get(2)
+        if frame.get(0) == "eof" {
+            break
+        }
+        if frame.get(0) == "err" {
+            ls_send_error(json_null(), -32700,
+            "Parse error: " + frame.get(1))
+            continue
+        }
+        let rr: Result[JsonValue, str] = json_parse_result(
+        frame.get(1))
+        if result_is_err(rr) {
+            ls_send_error(json_null(), -32700, "Parse error: "
+            + result_err_or(rr, ""))
+            continue
+        }
+        let msg: JsonValue = result_unwrap(rr)
+        if !ls_handle_message(st, msg) {
+            shutdown_seen = st.shutdown
+            break
+        }
+    }
+    if shutdown_seen {
+        exit(0)
+    }
+    exit(1)
+}
+
+# ----------------------------------------------------------------------------
+# --check — the one-shot diagnostics print: "<path>:<line>:<col>:
+# error: <msg>" (the interpreter years' 1-indexed byte coordinates),
+# "<path>: OK (types and effects valid)" when clean.
+# ----------------------------------------------------------------------------
+
+fn ls_one_shot_check(path: str) -> int uses IO, Proc, Fs, Args {
+    if !file_exists(path) {
+        eprint("error: file not found: " + path + "\n")
+        return 1
+    }
+    let p: ProbeOut = ls_probe_run(path)
+    if p.parse_err {
+        let mut col: int = p.err_col
+        if col < 1 {
+            col = 1
+        }
+        println(path + ":" + p.err_line.to_str() + ":"
+        + col.to_str() + ": error: " + p.err_msg)
+        return 1
+    }
+    if p.check_err {
+        println(path + ":" + p.err_line.to_str() + ":1: error: "
+        + p.err_msg)
+        return 1
+    }
+    println(path + ": OK (types and effects valid)")
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# main — the CLI dispatch.
+# ----------------------------------------------------------------------------
+
+fn main() -> int uses IO, Args, Exit, Proc, Fs {
+    let argv: list[str] = args()
+    let mut i: int = 0
+    while i < argv.len() {
+        if argv.get(i) == "--check" && i + 1 < argv.len() {
+            return ls_one_shot_check(argv.get(i + 1))
+        }
+        if argv.get(i) == "--probe-file" && i + 1 < argv.len() {
+            return ls_probe_file(argv.get(i + 1))
+        }
+        i = i + 1
+    }
+    ls_serve()
+    return 0
+}
