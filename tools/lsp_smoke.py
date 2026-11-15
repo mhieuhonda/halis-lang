@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""lsp_smoke — protocol-level smoke test for tools/hls-lsp.py.
+"""lsp_smoke — protocol-level smoke test for bin/hls-lsp (the native
+server built from tools/hls-lsp.hls).
 
 Runs the real server as a subprocess over stdio JSON-RPC and asserts the
 resilience fixes that shipped in v0.16.0-alpha:
@@ -77,8 +78,15 @@ def main():
         frame({"jsonrpc": "2.0", "method": "exit"})
     )
 
+    # The native twin: the server is bin/hls-lsp (built from
+    # tools/hls-lsp.hls by the self-hosted kit). The .py era's
+    # sys.executable spawn retired with it.
+    server = os.path.join(os.path.dirname(HERE), "bin", "hls-lsp")
+    if not os.path.exists(server):
+        print("lsp_smoke: bin/hls-lsp not built (run make bin/hls-lsp)")
+        return 1
     proc = subprocess.Popen(
-        [sys.executable, os.path.join(HERE, "hls-lsp.py")],
+        [server],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     out, _err = proc.communicate(payload, timeout=60)
 
