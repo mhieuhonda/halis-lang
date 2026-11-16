@@ -225,7 +225,15 @@ struct JsonReader {
     container_stack: list[int],
     # The maximum byte length of a single token (default 64 KiB).
     # Tokens that exceed this are rejected with Err.
-    max_token_size: int
+    max_token_size: int,
+    # Deep-scan-33 (#35): the separator phase of the CURRENT container.
+    # 0 = container start (no comma needed, an empty close is legal),
+    # 1 = after a value/member (a comma is required before the next
+    #     element; closing is legal),
+    # 2 = after a comma (a value/member is required; closing is not).
+    # Pushed containers reset it to 0; a close sets it to 1 for the
+    # parent (a finished container IS the parent's latest value).
+    sep: int
 }
 
 # json_reader_new() -> JsonReader. Construct a fresh reader with
@@ -238,7 +246,8 @@ fn json_reader_new() -> JsonReader {
         finished: false,
         state: json_state_top(),
         container_stack: [],
-        max_token_size: json_reader_default_max_token_size()
+        max_token_size: json_reader_default_max_token_size(),
+        sep: 0
     }
 }
 
@@ -924,10 +933,19 @@ fn json_reader_try_parse_keyword(mut r: JsonReader, word: str, token: JsonToken)
 #   - OBJECT_KEY -> error (a value where a key was expected).
 #   - OBJECT_COLON -> error (a value where ':' was expected).
 fn json_reader_after_value(mut r: JsonReader) -> void {
+    # Deep-scan-33 (#35): a value that starts in ARRAY_VAL with the
+    # phase already "after a value" is a missing comma ([1 2]). (A
+    # value reaching here in OBJECT_KEY errors below as before.)
+    if r.state == json_state_array_val() && r.sep == 1 {
+        json_reader_set_err(r, "json: expected ',' between array elements")
+        return
+    }
     if r.state == json_state_object_val() {
         r.state = json_state_object_key()
+        r.sep = 1
     } else if r.state == json_state_array_val() {
-        # State stays ARRAY_VAL.
+        # State stays ARRAY_VAL; the phase is now "after a value".
+        r.sep = 1
         return
     } else if r.state == json_state_top() {
         r.state = json_state_done()
@@ -990,43 +1008,74 @@ fn json_reader_next_token(mut r: JsonReader) -> Result[Option[JsonToken], str] {
         let c: int = r.buf.byte_at(r.pos)
         # Structural tokens.
         if c == 123 {
-            # '{' — ObjectStart.
+            # '{' — ObjectStart. It is a VALUE where it appears: the
+            # same missing-comma law as scalars (deep-scan-33 #35).
+            if (r.state == json_state_array_val() || r.state == json_state_object_key())
+            && r.sep == 1 {
+                json_reader_set_err(r, "json: expected ',' before '{'")
+                return Result.Err(r.err)
+            }
             r.pos = r.pos + 1
             json_reader_push_container(r, json_container_object())
             if r.err != "" {
                 return Result.Err(r.err)
             }
             r.state = json_state_object_key()
+            r.sep = 0
             return Result.Ok(Option.Some(JsonToken.ObjectStart))
         }
         if c == 125 {
-            # '}' — ObjectEnd.
+            # '}' — ObjectEnd. Legal only in OBJECT_KEY (an empty
+            # object or a finished member): a '}' after ':' or a key
+            # ({"a":}, {"a"}) or right after a comma ({"a":1,}) is a
+            # syntax error (deep-scan-33 #35).
+            if r.state != json_state_object_key() {
+                json_reader_set_err(r, "json: expected a value before '}'")
+                return Result.Err(r.err)
+            }
+            if r.sep == 2 {
+                json_reader_set_err(r, "json: trailing ',' before '}'")
+                return Result.Err(r.err)
+            }
             r.pos = r.pos + 1
             json_reader_pop_container(r, json_container_object())
             if r.err != "" {
                 return Result.Err(r.err)
             }
             json_reader_restore_state(r)
+            r.sep = 1
             return Result.Ok(Option.Some(JsonToken.ObjectEnd))
         }
         if c == 91 {
-            # '[' — ArrayStart.
+            # '[' — ArrayStart. Value-start comma law (deep-scan-33 #35).
+            if (r.state == json_state_array_val() || r.state == json_state_object_key())
+            && r.sep == 1 {
+                json_reader_set_err(r, "json: expected ',' before '['")
+                return Result.Err(r.err)
+            }
             r.pos = r.pos + 1
             json_reader_push_container(r, json_container_array())
             if r.err != "" {
                 return Result.Err(r.err)
             }
             r.state = json_state_array_val()
+            r.sep = 0
             return Result.Ok(Option.Some(JsonToken.ArrayStart))
         }
         if c == 93 {
-            # ']' — ArrayEnd.
+            # ']' — ArrayEnd. A ']' right after a comma ([1,]) is a
+            # trailing comma (deep-scan-33 #35).
+            if r.sep == 2 {
+                json_reader_set_err(r, "json: trailing ',' before ']'")
+                return Result.Err(r.err)
+            }
             r.pos = r.pos + 1
             json_reader_pop_container(r, json_container_array())
             if r.err != "" {
                 return Result.Err(r.err)
             }
             json_reader_restore_state(r)
+            r.sep = 1
             return Result.Ok(Option.Some(JsonToken.ArrayEnd))
         }
         # Separators — skip and continue the loop.
@@ -1043,7 +1092,19 @@ fn json_reader_next_token(mut r: JsonReader) -> Result[Option[JsonToken], str] {
                 json_reader_set_err(r, "json: unexpected ',' (state=" + r.state.to_str() + ")")
                 return Result.Err(r.err)
             }
+            # Deep-scan-33 (#35): phase 0 means no element came before
+            # the comma ([,1], {,"a":1}); phase 2 means a doubled
+            # comma ([1,,2]).
+            if r.sep != 1 {
+                if r.sep == 0 {
+                    json_reader_set_err(r, "json: expected a value before ','")
+                } else {
+                    json_reader_set_err(r, "json: duplicate ','")
+                }
+                return Result.Err(r.err)
+            }
             r.pos = r.pos + 1
+            r.sep = 2
             # State stays the same (OBJECT_KEY or ARRAY_VAL).
             # Loop back to skip whitespace + look at the next token.
             continue
@@ -1079,6 +1140,13 @@ fn json_reader_next_token(mut r: JsonReader) -> Result[Option[JsonToken], str] {
             # Otherwise: emit String and use the shared state-update
             #   helper (handles OBJECT_VAL, ARRAY_VAL, TOP, DONE).
             if r.state == json_state_object_key() {
+                # Deep-scan-33 (#35): {"a":1 "b":2} — the member after
+                # a finished one needs its comma. (After a comma the
+                # phase is 2 and this key is exactly what is required.)
+                if r.sep == 1 {
+                    json_reader_set_err(r, "json: expected ',' between object members")
+                    return Result.Err(r.err)
+                }
                 r.state = json_state_object_colon()
                 return Result.Ok(Option.Some(JsonToken.Key(s)))
             }
