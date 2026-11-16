@@ -86,7 +86,7 @@ writable it stops and says so — run it under `sudo`, or point
 | Option | Meaning |
 |--------|---------|
 | `--prefix DIR` | Install under DIR (default: `/usr/local` when writable, else `~/.local`) |
-| `--ref TAG` | Install this release tag (`v1.0.1`), not the latest. Tags only — branches and commits are source builds |
+| `--ref TAG` | Install this release tag (`v1.0.2`), not the latest. Tags only — branches and commits are source builds |
 | `--no-wrapper` | Install the bare compiler with no launcher — see [below](#how-stdcore-imports-resolve) for what that costs |
 | `--uninstall` | Remove exactly what an install recorded — nothing else |
 | `-h`, `--help` | The usage text |
@@ -165,7 +165,7 @@ curl -fsSL https://raw.githubusercontent.com/mhieuhonda/halis-lang/main/install.
 for `hlc.exe` and `hlfmt.exe`. The one wrinkle is import resolution:
 `hlc` finds `std/` through the entry file's directories and the
 invoking directory, so either run it from the extracted folder
-(`cd halis-v1.0.1; .\bin\hlc.exe C:\proj\hello.hls C:\proj\hello.c`),
+(`cd halis-v1.0.2; .\bin\hlc.exe C:\proj\hello.hls C:\proj\hello.c`),
 or vendor `std/` and `core/` into your project — both are documented
 in [how imports resolve](#how-stdcore-imports-resolve). For the full
 experience, use Git Bash or MSYS2 and the installer, which sets all
@@ -207,7 +207,7 @@ tag, and the checksum pins the bytes:
 ```dockerfile
 RUN curl -fsSL \
       https://raw.githubusercontent.com/mhieuhonda/halis-lang/main/install.sh \
-      | sh -s -- --ref v1.0.1
+      | sh -s -- --ref v1.0.2
 ```
 
 ## Verifying the installation
@@ -367,7 +367,7 @@ acceptance gates an installed SDK does not.
 | `error: module not found: std.…` | The compiler ran without the launcher and without a library in reach. Either a `--no-wrapper` install (vendor `std/` and `core/`, or reinstall without the flag), or a partial vendored `std/` shadows the SDK — the missing module is named in the error. |
 | `no prebuilt toolchain for …` | Your platform is outside the release set (linux/macos/windows on x86_64/aarch64). [Build from a clone](#building-from-a-clone). |
 | `checksum mismatch` | A corrupted download or a broken mirror. Re-run; if it persists, [report it](SECURITY.md). |
-| `the vX.Y.Z archive lacks std/` | That release predates the full-SDK archives — v1.0.0 shipped the compiler alone. Install a later release: `--ref v1.0.1` or newer, or the latest. |
+| `the vX.Y.Z archive lacks std/` | That release predates the full-SDK archives — v1.0.0 shipped the compiler alone. Install a later release: `--ref v1.0.2` or newer, or the latest. |
 | `SHA256SUMS does not name …` | The release carries no archive for your platform, or `HALIS_DIST_SERVER` points at a mirror with a different layout. Pick another `--ref`, or unset the mirror. |
 | `the installed compiler did not compile the smoke program` | The binary refuses to run on this machine — wrong architecture is the usual suspect. Check `uname -m` against the archive you installed; report anything else. |
 | `$PREFIX is not writable` | Run under `sudo`, or pass `--prefix DIR` you own (the default flow already falls back to `~/.local` for non-root users). |

@@ -10,9 +10,45 @@ published [LTS policy](LTS.md): every LTS line gets **3 years of
 bug-fix support** and **5 years of security support**, counted from
 the day its base release was cut.
 
-**Current stable: v1.0.1** — released 2026-10-29, LTS line
+**Current stable: v1.0.2** — released 2026-11-16, LTS line
 `release/1.0` (opened at v1.0.0; bug fixes through **2029-10-29**,
 security fixes through **2031-10-29**).
+
+---
+
+## [v1.0.2] — 2026-11-16 — the fleet goes native
+
+The patch where Python leaves the toolchain for good. v1.0.1 still
+shipped ~70 tools as `.py` twins beside their compilers; every one of
+them — `hlboot` to `hlwasm-pack` — is now Halis running on its own
+bootstrap, the lab interpreter `hlinterp` left the tree, and the CI
+workflows build and drive binaries only. What came with the crossing:
+
+- **The debugger, native (Stage 121).** `bin/hls-dap` speaks the full
+  Debug Adapter Protocol over stdio: breakpoints (with snapping),
+  stepping, stack, variables, evaluate, exception stops on panics.
+  Two builtins carry it — `read_byte()`, the byte-exact blocking
+  stdin read a frame body needs, and `stdout_flush()`, the
+  per-message pipe flush a hosted C stdout does not do on its own.
+  The nine-section acceptance gate drives it live (85 assertions);
+  the VS Code factory launches the binary directly, no interpreter.
+- **The language server, native (Stages 113–115).** `hls-lsp` runs
+  as one native binary — definitions, hover, inlay hints, rename and
+  the refactor engines — gated by three protocol-level suites driving
+  the real server over stdio.
+- **The test estate becomes Halis.** Every Python suite and battery
+  is now a `tests/acc/*.hls` gate compiled by `hlc` itself; the suite
+  driver runs lanes in parallel, builds the tools it drives, and
+  ignites one shared Stage-0 compiler per run instead of hundreds.
+- **Faster at the hot core.** The lexer matches runs instead of
+  bytes, the evaluator pins names to their env frame, string
+  literals intern, `s = s + x` builders grow in place, lists of
+  primitives drop their per-element boxes, and the bootstrap seed
+  ignites at -O1.
+- **Fixed along the way.** The bare-metal aarch64 and riscv64 images
+  actually boot; channel refcounts ride atomics (a real race); the
+  process table takes its lock before fork; assorted gate and
+  workflow flakes that only CI could see.
 
 ---
 
