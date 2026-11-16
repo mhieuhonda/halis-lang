@@ -125,32 +125,36 @@ fn gdt_access_data_rw() -> int {
 # nibble units (not byte units) so that gdt_encode can place them with
 # one shift and gdt_decode_flags can read them back with one mask.
 #
-#     nibble bit 3   AVL          (reserved on x86-64)
-#     nibble bit 2   L            long mode
-#     nibble bit 1   D/B          default operand size
-#     nibble bit 0   G            granularity: limit is in 4-KiB units
+#     nibble bit 0   AVL          (reserved on x86-64)
+#     nibble bit 1   L            long mode
+#     nibble bit 2   D/B          default operand size
+#     nibble bit 3   G            granularity: limit is in 4-KiB units
 #
+# (deep-scan-34: the historical constants mirrored this order —
+# AVL=8/L=4/DB=2/G=1 — so every flag written was the bit-reverse of
+# what the CPU reads. Nibble bit 0 is byte-6 bit 4, per SDM Figure 3-8.)
 # Reading L as the byte's bit 3 (which is limit[19:16]) is the classic
 # encoding bug: the table loads, and every 64-bit segment behaves as if
 # it were 16-bit.
 fn gdt_flag_avail() -> int {
-    return 8
-}
-
-fn gdt_flag_long() -> int {
-    return 4
-}
-
-fn gdt_flag_default32() -> int {
-    return 2
-}
-
-fn gdt_flag_granularity() -> int {
     return 1
 }
 
-# gdt_flag_limit_mask: the limit's top nibble, which shares byte 5 with
-# the flags. Reported here so a caller can tell the two apart.
+fn gdt_flag_long() -> int {
+    return 2
+}
+
+fn gdt_flag_default32() -> int {
+    return 4
+}
+
+fn gdt_flag_granularity() -> int {
+    return 8
+}
+
+# gdt_flag_limit_mask: the limit's top nibble, which shares byte 6
+# with the flags (the flags sit ABOVE it, in the high nibble). Reported
+# here so a caller can tell the two apart.
 fn gdt_flag_limit_mask() -> int {
     return 15
 }
@@ -185,13 +189,14 @@ fn gdt_data_flags(default32: bool) -> int {
 #     byte 0-1  limit[15:0]
 #     byte 2-3  base[15:0]
 #     byte 4    base[23:16]
-#     byte 5    flags (granularity / default-size / long / AVL)
-#     byte 6    access (present / DPL / S / type)
+#     byte 5    access (present / DPL / S / type)
+#     byte 6    limit[19:16] (low nibble) + flags (high nibble:
+#               granularity / default-size / long / AVL)
 #     byte 7    base[31:24]
 #
 # so, in the 32-bit halves the pair carries, the access byte sits at
-# bits 16..23 of the high half — and the base's top byte shares a dword
-# with it.
+# bits 8..15 of the high half — and the limit's top nibble shares a byte
+# with the flags nibble right above it.
 fn gdt_encode(access: int, flags: int, base: int, limit: int) -> list[int] {
     if base < 0 || limit < 0 {
         panic("gdt_encode: base and limit must be >= 0")
@@ -200,22 +205,24 @@ fn gdt_encode(access: int, flags: int, base: int, limit: int) -> list[int] {
         panic("gdt_encode: limit above the 20 bits a descriptor holds")
     }
     let lo: int = int_and(limit, 65535) + int_shl(int_and(base, 65535), 16)
-    # The high half packs FOUR fields into its first byte, and they do
-    # not split the way the descriptor's byte boundaries suggest:
+    # The high half packs FOUR fields into two of its bytes, and they
+    # do not split the way a flat reading suggests. Per SDM Figure 3-8
+    # (deep-scan-34: the historical encoder swapped bytes 5 and 6 — the
+    # table loaded, and every descriptor then decoded wrong):
     #     hi bits  0-7    base[23:16]      (byte 4)
-    #     hi bits  8-11   limit[19:16]     (byte 5, low nibble)
-    #     hi bits 12-15   flags[7:4]       (byte 5, high nibble: AVL/L/DB/G)
-    # ...which this module expresses in NIBBLE units (see gdt_flag_long).
-    #     hi bits 16-23   access           (byte 6)
+    #     hi bits  8-15   access           (byte 5: P/DPL/S/Type)
+    #     hi bits 16-19   limit[19:16]     (byte 6, low nibble)
+    #     hi bits 20-23   flags            (byte 6, high nibble:
+    #                                       AVL/L/DB/G in nibble units)
     #     hi bits 24-31   base[31:24]      (byte 7)
-    # The limit's top nibble sits BESIDE the flags nibble inside one
-    # byte, not below it: putting it at bits 0-3 instead truncates every
-    # limit above 64 KiB to 0xFFFF, which still looks like a perfectly
-    # valid 64-KiB segment.
+    # The limit's top nibble sits BESIDE the flags nibble inside byte 6:
+    # putting the flags at bits 8-15 instead puts them in the access
+    # byte, and the access byte in the flags+limit byte — a table that
+    # loads and then faults at the first far jump.
     let hi: int = int_and(int_shr(base, 16), 255)
-    + int_shl(int_and(int_shr(limit, 16), 15), 8)
-    + int_shl(int_and(flags, 15), 12)
-    + int_shl(int_and(access, 255), 16)
+    + int_shl(int_and(access, 255), 8)
+    + int_shl(int_and(int_shr(limit, 16), 15), 16)
+    + int_shl(int_and(flags, 15), 20)
     + int_shl(int_and(int_shr(base, 24), 255), 24)
     return[lo, hi]
 }
@@ -226,11 +233,11 @@ fn gdt_encode(access: int, flags: int, base: int, limit: int) -> list[int] {
 # descriptor it found in memory (a firmware- or bootloader-supplied
 # table) and check it before loading it.
 fn gdt_decode_access(hi: int) -> int {
-    return int_and(int_shr(hi, 16), 255)
+    return int_and(int_shr(hi, 8), 255)
 }
 
 fn gdt_decode_flags(hi: int) -> int {
-    return int_and(int_shr(hi, 12), 15)
+    return int_and(int_shr(hi, 20), 15)
 }
 
 fn gdt_decode_base(lo: int, hi: int) -> int {
@@ -241,7 +248,7 @@ fn gdt_decode_base(lo: int, hi: int) -> int {
 
 fn gdt_decode_limit(lo: int, hi: int) -> int {
     return int_and(lo, 65535)
-    + int_shl(int_and(int_shr(hi, 8), 15), 16)
+    + int_shl(int_and(int_shr(hi, 16), 15), 16)
 }
 
 # gdt_is_code / gdt_is_data: the code/data bit of the access byte is
