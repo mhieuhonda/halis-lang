@@ -1466,7 +1466,7 @@ size-gate:
 size-dashboard:
 	@$(BIN)/hls-size dashboard --out BINARYSIZE.md
 
-size-acceptance: $(BIN)/acc-size bin/hlc
+size-acceptance: $(BIN)/acc-size $(BIN)/hls-size bin/hlc
 	@echo "[Stage 139 acceptance] running tests/acc/size_acceptance.hls..."
 	@$(BIN)/acc-size
 	@echo "ACCEPTANCE OK: Stage 139 -- binary-size regression dashboard (per-commit)"
