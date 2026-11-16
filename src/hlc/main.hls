@@ -183,7 +183,68 @@ fn load_file_into(ctx: Ctx, abs_path: str) -> void uses IO, Proc {
     ctx.cur_map_file = saved_map_file
 }
 
-fn main() -> int uses IO, Proc {
+# ============================================================================
+# hlc run — the one-step path
+# ----------------------------------------------------------------------------
+# `hlc run [flags] <input.hls> [args...]` collapses the three commands
+# a run always was — hlc to C, the system C compiler to a binary, the
+# binary itself — into one. The compile is the same pipeline the
+# two-argument form drives (every flag passes through); the artifacts
+# live in a private directory under the system temp (named by the
+# entry's basename and the monotonic nanosecond clock) and are removed
+# once the program has run; the binary is spawned WITHOUT a shell, so
+# the program's own argv needs no quoting story; and hlc exits with
+# the program's exit code. The helpers below are the string half;
+# run_drive (after main) is the process half.
+# ============================================================================
+
+# run_strip_ext(name) — "hello.hls" -> "hello"; a name without the
+# extension is returned as-is.
+fn run_strip_ext(name: str) -> str pure {
+    if name.len() >= 4 && name.slice(name.len() - 4, name.len()) == ".hls" {
+        return name.slice(0, name.len() - 4)
+    }
+    return name
+}
+
+# run_shell_safe(s) — the bare-word charset for the shell (alnum plus
+# - _ . / : = +); anything outside it gets quoted.
+fn run_shell_safe(s: str) -> bool pure {
+    let n: int = s.len()
+    if n == 0 {
+        return false
+    }
+    let mut i: int = 0
+    while i < n {
+        let b: int = s.byte_at(i)
+        let ok: bool = (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+        || (b >= 48 && b <= 57) || b == 45 || b == 95 || b == 46
+        || b == 47 || b == 58 || b == 61 || b == 43
+        if !ok {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# run_shell_quote(arg) — quote an argument for the two shell commands
+# the run path still needs (mkdir -p, the C compiler): bare when every
+# byte is safe, single-quoted with the '\'' escape otherwise. A path
+# is data to the shell, never code — the same law std.hlscli's twin
+# applies (the compiler cannot import std, so the law lives here too).
+fn run_shell_quote(arg: str) -> str pure {
+    if arg.len() == 0 {
+        return "''"
+    }
+    if run_shell_safe(arg) {
+        return arg
+    }
+    let parts: list[str] = arg.split("'")
+    return "'" + join(parts, "'\\''") + "'"
+}
+
+fn main() -> int uses IO, Proc, Clock {
     let argv: list[str] = args()
     # Stage 17 (v0.28.0-alpha): CLI flags — hlc [flags] <input.hls> <output.c|->
     #   --fast | -O fast   proof-driven check elision (the interval prover
@@ -220,10 +281,39 @@ fn main() -> int uses IO, Proc {
     # whole program (every function's inline/hot/cold decision,
     # annotated vs PGO vs heuristic).
     let mut opt_stats: bool = false
+    # `hlc run [flags] <input.hls> [args...]` — the one-step path (the
+    # banner above the run helpers owns the design). `run` is a
+    # subcommand only in position 1; the flag loop below stays the
+    # two-argument form's loop — in run mode it stops treating tokens
+    # as hlc's the moment the input file (or a first --) has been seen,
+    # and everything after that belongs to the program.
+    let run_mode: bool = argv.len() >= 2 && argv.get(1) == "run"
+    let prog_args: list[str] = []
+    let mut run_seen_input: bool = false
+    let mut run_flag_stop: bool = false
     let a: list[str] = []
     let mut ai: int = 1
+    if run_mode {
+        ai = 2
+    }
     while ai < argv.len() {
         let tok: str = argv.get(ai)
+        if run_mode && tok == "--" && !run_flag_stop {
+            # run mode: the FIRST -- ends hlc's flags — wherever it
+            # stands, before or after the input file; every token
+            # behind it is the program's (a later -- is one of those
+            # tokens, a literal argument).
+            run_flag_stop = true
+            ai = ai + 1
+            continue
+        }
+        if run_mode && (run_flag_stop || run_seen_input) {
+            # run mode: the input file (or a --) has been seen — every
+            # further token is the program's own argv, verbatim.
+            prog_args.push(tok)
+            ai = ai + 1
+            continue
+        }
         if tok == "--fast" {
             fast_mode = true
         } else if tok == "--contracts" {
@@ -373,6 +463,9 @@ fn main() -> int uses IO, Proc {
             }
         } else {
             a.push(tok)
+            if run_mode {
+                run_seen_input = true
+            }
         }
         ai = ai + 1
     }
@@ -429,12 +522,19 @@ fn main() -> int uses IO, Proc {
         print_audit(ctx)
         return 0
     }
-    if a.len() < 2 {
+    if run_mode && a.len() < 1 {
+        println("usage: hlc run [hlc flags] <input.hls> [args...]")
+        println("       everything after <input.hls> — or after a first -- — is the program's argv;")
+        println("       HLS_CC (else CC, else cc) builds the C, HLS_CFLAGS appends flags to that build")
+        return 1
+    }
+    if !run_mode && a.len() < 2 {
         println("usage: hlc [--fast | -O fast] [--contracts] [--pgo-generate] [--pgo-use <profile>]")
         println("              [--lto] [--lto-stats] [--lto-threshold N] [--target-feature sse4.2|avx2|neon|rvv]")
         println("              [--no-libc] [--target x86_64-unknown-none|aarch64-unknown-none|riscv64-unknown-none]")
         println("              [--debug] [--symbols <manifest>] <input.hls> <output.c|->")
         println("       hlc --audit <input.hls>")
+        println("       hlc run [hlc flags] <input.hls> [args...] — compile, build natively, run in one step")
         return 1
     }
     # Stages 93-95: the bare-metal flag combinations the triples
@@ -454,6 +554,18 @@ fn main() -> int uses IO, Proc {
             println("error: --target-feature is not available on target " + target_triple + " (bare-metal targets are integer-only: SIMD intrinsics use floating-point registers)")
             return 2
         }
+    }
+    # run mode refuses the two flags whose artifacts cannot simply be
+    # run: a bare-metal image has no OS to host it, and the no-libc
+    # link takes its own freestanding flags. Both name the
+    # two-argument form that serves them.
+    if run_mode && target_triple != "" {
+        println("error: --target is not available with run (a bare-metal image has no OS to run it on) — build it instead: hlc --target " + target_triple + " <input.hls> <output.c>")
+        return 2
+    }
+    if run_mode && no_libc {
+        println("error: --no-libc is not available with run (the freestanding link takes its own flags — see `make bootstrap-nolibc`)")
+        return 2
     }
     let entry_path: str = a.get(0)
     # RC2: a missing input file is an invocation error, not a panic —
@@ -485,7 +597,33 @@ fn main() -> int uses IO, Proc {
     # codegen: --debug's #line directives name the generated C file
     # when they hand the numbering back, so a stdout build has nothing
     # to name and is refused rather than silently mislabelled.
-    let out_path: str = a.get(1)
+    # run mode: the artifacts (the generated C and the binary) live in
+    # a private per-invocation directory under the system temp — the
+    # entry's basename plus the monotonic nanosecond clock, so two
+    # programs sharing a basename never fight over one file (a running
+    # executable refuses the overwrite anyway). TMPDIR is honoured,
+    # /tmp is the POSIX default. The mkdir rides the same shell
+    # one-shot the C compiler will; the path is quoted, never trusted.
+    let mut run_dir: str = ""
+    let mut run_bin: str = ""
+    let mut out_path: str = ""
+    if run_mode {
+        let mut tmp_root: str = env_get("TMPDIR")
+        if tmp_root == "" {
+            tmp_root = "/tmp"
+        }
+        let run_base: str = run_strip_ext(file_basename(entry_path))
+        run_dir = join_path(tmp_root, "hlc-run-" + run_base + "-" + instant_now_ns().to_str())
+        let mkdir_st: int = proc_exec("mkdir -p " + run_shell_quote(run_dir))
+        if mkdir_st != 0 {
+            println("error: run: cannot create " + run_dir + " (mkdir -p exit " + mkdir_st.to_str() + ")")
+            return 2
+        }
+        run_bin = join_path(run_dir, run_base)
+        out_path = run_bin + ".c"
+    } else {
+        out_path = a.get(1)
+    }
     if debug_mode && out_path == "-" {
         println("error: --debug needs a file output path (the C line markers must name the generated C file)")
         return 2
@@ -580,7 +718,69 @@ fn main() -> int uses IO, Proc {
     if ctx.opt_stats {
         print_opt_stats(ctx)
     }
+    # run mode: hand the C to the system compiler and run the binary —
+    # the program's exit code is hlc's. The stats above (if any asked
+    # for) have already spoken; the program's output is the last word.
+    if run_mode {
+        return run_drive(run_dir, run_bin, out_path, prog_args)
+    }
     return 0
+}
+
+# ----------------------------------------------------------------------------
+# hlc run — the back half. run_drive takes the freshly written C and
+# turns it into a running program:
+#   1. the system C compiler builds the binary — HLS_CC wins, then
+#      CC, then the POSIX default cc; each is a COMMAND LINE handed to
+#      the shell as given, so an override may carry flags of its own
+#      ("gcc -static" is a legal HLS_CC). The default -O1 is the
+#      bootstrap's own ignition level — the iteration loop favours cc
+#      time over codegen quality — and HLS_CFLAGS appends anything
+#      more (-O2, or -DHL_HAVE_LIBCURL -lcurl for net_tls_get), LAST,
+#      where a repeated flag wins.
+#   2. the binary is spawned WITHOUT a shell (proc_spawn: the
+#      program's argv is data — quoting is not the program's problem),
+#      stdio inherited (an interactive read_line works), and hlc exits
+#      with the program's exit code (proc_wait's encoding: 0..255,
+#      128+signal).
+#   3. a completed run removes the private directory. A FAILED build
+#      keeps it and names the generated C in the message — that file
+#      is exactly what a bug report wants.
+# ----------------------------------------------------------------------------
+fn run_drive(run_dir: str, run_bin: str, c_path: str, prog_args: list[str]) -> int uses IO, Proc {
+    let mut cc: str = env_get("HLS_CC")
+    if cc == "" {
+        cc = env_get("CC")
+    }
+    if cc == "" {
+        cc = "cc"
+    }
+    let mut cmd: str = cc + " -O1 -o " + run_shell_quote(run_bin) + " "
+    + run_shell_quote(c_path) + " -lm -pthread"
+    let extra: str = env_get("HLS_CFLAGS")
+    if extra != "" {
+        cmd = cmd + " " + extra
+    }
+    let cc_st: int = proc_exec(cmd)
+    if cc_st != 0 {
+        println("hlc run: the C compiler failed (exit " + cc_st.to_str() + "):")
+        println("  " + cmd)
+        println("  the generated C is kept at " + c_path)
+        return 2
+    }
+    let pid: int = proc_spawn(run_bin, prog_args, 0, 0, 0)
+    if pid < 1 {
+        println("hlc run: cannot run " + run_bin)
+        return 2
+    }
+    let code: int = proc_wait(pid)
+    # The verdict is the program's; a directory the temp cleaner owns
+    # is not worth a failed exit. Named, never fatal.
+    let rm_st: int = proc_exec("rm -rf " + run_shell_quote(run_dir))
+    if rm_st != 0 {
+        println("hlc run: warning: cannot remove " + run_dir)
+    }
+    return code
 }
 
 # Stage 20 perfection (v0.39.0-alpha): print the LTO work summary.

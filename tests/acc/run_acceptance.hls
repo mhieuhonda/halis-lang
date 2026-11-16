@@ -1,0 +1,313 @@
+# ============================================================================
+# tests/acc/run_acceptance.hls — `hlc run`, the one-step command
+# ----------------------------------------------------------------------------
+# The gate drives bin/hlc's own CLI through the front door (the harness
+# is tests/acc/harness.hls; the gate runs native, built by bin/hlc).
+# Run with `make run-acceptance`.
+#
+#  1. the one step     — a program runs, its output arrives, its exit
+#                        code is hlc's
+#  2. the argv         — everything after the input file (or a first
+#                        --) is the program's, verbatim; hlc's own
+#                        flags live before the input; no shell sits
+#                        between hlc and the program
+#  3. the refusals     — the named errors: a missing input, a bare
+#                        run, --target / --no-libc, a type error; and
+#                        the two-argument form unchanged beside them
+#  4. the world        — TMPDIR honoured and left clean, HLS_CC /
+#                        HLS_CFLAGS, a failing build keeps and names
+#                        the generated C, a source path with a space
+#  5. the stdio        — stdin inherited (an interactive read_line),
+#                        std/ imports resolve
+# ============================================================================
+
+import "./harness.hls"
+import "std.str"
+
+# ----------------------------------------------------------------------------
+# The gate's programs.
+# ----------------------------------------------------------------------------
+
+# fx_hello() — prints one line, exits 0. The simplest run there is.
+fn fx_hello() -> str {
+    let ls: list[str] = []
+    ls.push("fn main() -> int uses IO {")
+    ls.push("    println(\"one step, three commands fewer\")")
+    ls.push("    return 0")
+    ls.push("}")
+    return join(ls, "\n")
+}
+
+# fx_rc() — exits with the code in argv[1] (0 when absent).
+fn fx_rc() -> str {
+    let ls: list[str] = []
+    ls.push("fn main() -> int uses IO, Args {")
+    ls.push("    let argv: list[str] = args()")
+    ls.push("    if argv.len() > 1 {")
+    ls.push("        return int(argv.get(1))")
+    ls.push("    }")
+    ls.push("    return 0")
+    ls.push("}")
+    return join(ls, "\n")
+}
+
+# fx_echo() — prints every argv token after its own name, argN=token.
+fn fx_echo() -> str {
+    let ls: list[str] = []
+    ls.push("fn main() -> int uses IO, Args {")
+    ls.push("    let argv: list[str] = args()")
+    ls.push("    let mut i: int = 1")
+    ls.push("    while i < argv.len() {")
+    ls.push("        println(\"arg\" + i.to_str() + \"=\" + argv.get(i))")
+    ls.push("        i = i + 1")
+    ls.push("    }")
+    ls.push("    return 0")
+    ls.push("}")
+    return join(ls, "\n")
+}
+
+# fx_greet() — reads one line from stdin and echoes it (stdio must be
+# inherited for this to work). read_line is a taint source; the echo is
+# a deliberate, explicit untaint.
+fn fx_greet() -> str {
+    let ls: list[str] = []
+    ls.push("fn main() -> int uses IO {")
+    ls.push("    let line: tainted[str] = read_line()")
+    ls.push("    println(\"echo: \" + taint_unwrap(line))")
+    ls.push("    return 0")
+    ls.push("}")
+    return join(ls, "\n")
+}
+
+# fx_upper() — imports std.str (the entry-dir walk must resolve under
+# run mode exactly as it does under the two-argument form).
+fn fx_upper() -> str {
+    let ls: list[str] = []
+    ls.push("import \"std.str\"")
+    ls.push("")
+    ls.push("fn main() -> int uses IO {")
+    ls.push("    println(str_to_upper_ascii(\"halis\"))")
+    ls.push("    return 0")
+    ls.push("}")
+    return join(ls, "\n")
+}
+
+# fx_bad() — a type error: the checker's panic, before anything runs.
+fn fx_bad() -> str {
+    let ls: list[str] = []
+    ls.push("fn main() -> int uses IO {")
+    ls.push("    let x: int = \"oops\"")
+    ls.push("    return 0")
+    ls.push("}")
+    return join(ls, "\n")
+}
+
+# hlc_bin(acc) — the tree's own native compiler.
+fn hlc_bin(acc: Acc) -> str {
+    return path_join3(acc.root, "bin/hlc")
+}
+
+# ----------------------------------------------------------------------------
+# 1. the one step
+# ----------------------------------------------------------------------------
+
+fn sec1(acc: Acc) -> void uses IO, Fs, Proc {
+    section("1. the one step")
+    let hlc: str = hlc_bin(acc)
+    let hello: str = write_src(acc, "hello.hls", fx_hello())
+    let r: RunResult = run_capture(hlc, ["run", hello])
+    check(acc, "a program runs, its output arrives",
+    r.spawned && r.code == 0 && r.out.contains("one step, three commands fewer"),
+    clip(r.combined, 160))
+    let rc_src: str = write_src(acc, "rc.hls", fx_rc())
+    let r7: RunResult = run_capture(hlc, ["run", rc_src, "7"])
+    check(acc, "the program's exit code is hlc's (7)", r7.spawned && r7.code == 7, "")
+    let r42: RunResult = run_capture(hlc, ["run", rc_src, "42"])
+    check(acc, "...and 42 is 42", r42.spawned && r42.code == 42, "")
+    # a real program from the tree, not a fixture.
+    let rh: RunResult = run_capture(hlc, ["run", "examples/hello.hls"])
+    check(acc, "examples/hello.hls runs (the tree's own program)",
+    rh.spawned && rh.code == 0 && rh.out.contains("Hello, Halis!"),
+    clip(rh.combined, 160))
+}
+
+# ----------------------------------------------------------------------------
+# 2. the argv
+# ----------------------------------------------------------------------------
+
+fn sec2(acc: Acc) -> void uses IO, Fs, Proc {
+    section("2. the argv")
+    let hlc: str = hlc_bin(acc)
+    let echo: str = write_src(acc, "echo.hls", fx_echo())
+    # Everything after the input is the program's, verbatim: a space, a
+    # flag-looking token, a shell metacharacter — none of it hlc's.
+    let r: RunResult = run_capture(hlc, ["run", echo, "two words", "--looks-like-flag", "$HOME"])
+    check(acc, "the tokens after the input pass verbatim (spaces, flags, $)",
+    r.spawned && r.code == 0 && r.out.contains("arg1=two words")
+    && r.out.contains("arg2=--looks-like-flag") && r.out.contains("arg3=$HOME"),
+    clip(r.combined, 200))
+    # The first -- ends hlc's flags, wherever it stands; a second one is
+    # a literal argument.
+    let r2: RunResult = run_capture(hlc, ["run", echo, "--", "--fast"])
+    check(acc, "a first -- ends hlc's flags; --fast reaches the program",
+    r2.spawned && r2.code == 0 && r2.out.contains("arg1=--fast"),
+    clip(r2.combined, 160))
+    let r3: RunResult = run_capture(hlc, ["run", echo, "--", "--", "x"])
+    check(acc, "a second -- is a literal argument",
+    r3.spawned && r3.code == 0 && r3.out.contains("arg1=--")
+    && r3.out.contains("arg2=x"), clip(r3.combined, 160))
+    # hlc's own flags live BEFORE the input: --fast compiles the
+    # program, and a flag-looking token AFTER it is data.
+    let r4: RunResult = run_capture(hlc, ["run", "--fast", echo, "--lto"])
+    check(acc, "hlc's flags before the input, the program's after",
+    r4.spawned && r4.code == 0 && r4.out.contains("arg1=--lto"),
+    clip(r4.combined, 160))
+    # No shell sits between hlc and the program (proc_spawn, not
+    # system): a ; in an argument stays an argument.
+    let pwn: str = path_join3(acc.scratch_base, "injected")
+    let r5: RunResult = run_capture(hlc, ["run", echo, "a; touch " + pwn])
+    check(acc, "no shell interpretation of the program's argv",
+    r5.spawned && r5.code == 0 && !file_exists(pwn)
+    && r5.out.contains("arg1=a; touch " + pwn), clip(r5.combined, 200))
+}
+
+# ----------------------------------------------------------------------------
+# 3. the refusals
+# ----------------------------------------------------------------------------
+
+fn sec3(acc: Acc) -> void uses IO, Fs, Proc {
+    section("3. the refusals")
+    let hlc: str = hlc_bin(acc)
+    let missing: str = path_join3(acc.scratch_base, "not-there.hls")
+    let r: RunResult = run_capture(hlc, ["run", missing])
+    check(acc, "a missing input is an invocation error (exit 2, named)",
+    r.spawned && r.code == 2 && r.combined.contains("cannot open file"),
+    clip(r.combined, 160))
+    let r2: RunResult = run_capture(hlc, ["run"])
+    check(acc, "a bare run prints its own usage (exit 1)",
+    r2.spawned && r2.code == 1 && r2.out.contains("usage: hlc run"),
+    clip(r2.combined, 160))
+    let r3: RunResult = run_capture(hlc, ["run", "--target", "x86_64-unknown-none", "examples/hello.hls"])
+    check(acc, "--target is refused with the build-it-instead pointer",
+    r3.spawned && r3.code == 2 && r3.combined.contains("not available with run"),
+    clip(r3.combined, 200))
+    let r4: RunResult = run_capture(hlc, ["run", "--no-libc", "examples/hello.hls"])
+    check(acc, "--no-libc is refused (its link is bootstrap-nolibc's own)",
+    r4.spawned && r4.code == 2 && r4.combined.contains("not available with run"),
+    clip(r4.combined, 160))
+    # A type error is the checker's panic — the run never starts.
+    let bad: str = write_src(acc, "bad.hls", fx_bad())
+    let r5: RunResult = run_capture(hlc, ["run", bad])
+    check(acc, "a type error surfaces before anything runs",
+    r5.spawned && r5.code != 0 && r5.combined.contains("type error"),
+    clip(r5.combined, 160))
+    # The two-argument form beside it, unchanged: same compiler, same
+    # flags, byte for byte.
+    let out_c: str = path_join3(acc.scratch_base, "two-form.c")
+    let r6: RunResult = run_capture(hlc, ["examples/hello.hls", out_c])
+    check(acc, "the two-argument form still compiles (hlc in.hls out.c)",
+    r6.spawned && r6.code == 0 && file_exists(out_c), clip(r6.combined, 160))
+    let r7: RunResult = run_capture(hlc, ["--audit", "examples/hello.hls"])
+    check(acc, "--audit still works beside run",
+    r7.spawned && r7.code == 0 && r7.out.contains("Crate mode: std"),
+    clip(r7.combined, 160))
+}
+
+# ----------------------------------------------------------------------------
+# 4. the world
+# ----------------------------------------------------------------------------
+
+fn sec4(acc: Acc) -> void uses IO, Fs, Proc {
+    section("4. the world")
+    let hlc: str = hlc_bin(acc)
+    let hello: str = write_src(acc, "hello.hls", fx_hello())
+    # TMPDIR is honoured — and a completed run leaves nothing behind.
+    let world: str = scratch(acc, "tmp-world")
+    mkdirs(world)
+    env_set("TMPDIR", world)
+    let r: RunResult = run_capture(hlc, ["run", hello])
+    let entries: list[str] = fs_read_dir(world)
+    check(acc, "TMPDIR is honoured and left clean after the run",
+    r.spawned && r.code == 0 && entries.len() == 0,
+    "left behind: " + join(entries, ", "))
+    env_set("TMPDIR", "")
+    # HLS_CC is a COMMAND LINE (it may carry flags of its own);
+    # HLS_CFLAGS appends to the build.
+    env_set("HLS_CC", "cc -O0")
+    let r2: RunResult = run_capture(hlc, ["run", hello])
+    check(acc, "HLS_CC is a command line (cc -O0 runs the build)",
+    r2.spawned && r2.code == 0 && r2.out.contains("one step, three commands fewer"),
+    clip(r2.combined, 160))
+    env_set("HLS_CC", "")
+    env_set("HLS_CFLAGS", "-O2")
+    let r3: RunResult = run_capture(hlc, ["run", hello])
+    check(acc, "HLS_CFLAGS appends to the build",
+    r3.spawned && r3.code == 0, clip(r3.combined, 160))
+    env_set("HLS_CFLAGS", "")
+    # A failing build keeps the artifacts and names the generated C —
+    # the file a bug report wants.
+    let kept_world: str = scratch(acc, "kept-world")
+    mkdirs(kept_world)
+    env_set("TMPDIR", kept_world)
+    env_set("HLS_CC", "false")
+    let r4: RunResult = run_capture(hlc, ["run", hello])
+    check(acc, "a failed build exits 2 and names the C it kept",
+    r4.spawned && r4.code == 2 && r4.combined.contains("C compiler failed")
+    && r4.combined.contains("kept at"), clip(r4.combined, 200))
+    let idx: int = str_index_of(r4.combined, "kept at ")
+    let mut kept_path: str = ""
+    if idx >= 0 {
+        let tail: str = r4.combined.slice(idx + 8, r4.combined.len()).trim()
+        let nl: int = str_index_of(tail, "\n")
+        if nl >= 0 {
+            kept_path = tail.slice(0, nl)
+        } else {
+            kept_path = tail
+        }
+    }
+    check(acc, "the kept C is really there, under TMPDIR",
+    kept_path != "" && kept_path.starts_with(kept_world) && file_exists(kept_path),
+    kept_path)
+    rmrf(kept_world)
+    env_set("HLS_CC", "")
+    env_set("TMPDIR", "")
+    # A source path with a space in it survives the shell commands the
+    # run path still needs (mkdir, the C compiler).
+    let spacy: str = write_src(acc, "my prog.hls", fx_hello())
+    let r5: RunResult = run_capture(hlc, ["run", spacy])
+    check(acc, "a source path with a space runs (every shell word is quoted)",
+    r5.spawned && r5.code == 0
+    && r5.out.contains("one step, three commands fewer"),
+    clip(r5.combined, 160))
+}
+
+# ----------------------------------------------------------------------------
+# 5. the stdio
+# ----------------------------------------------------------------------------
+
+fn sec5(acc: Acc) -> void uses IO, Fs, Proc {
+    section("5. the stdio")
+    let hlc: str = hlc_bin(acc)
+    # stdin is inherited: the program reads what hlc was fed.
+    let greet: str = write_src(acc, "greet.hls", fx_greet())
+    let r: RunResult = run_feed(hlc, ["run", greet], "ping-stdin\n")
+    check(acc, "stdin is inherited (the program reads what hlc was fed)",
+    r.spawned && r.code == 0 && r.out.contains("echo: ping-stdin"),
+    clip(r.combined, 160))
+    # std/ imports resolve in run mode — the same entry-dir walk.
+    let upper: str = write_src(acc, "upper.hls", fx_upper())
+    let r2: RunResult = run_capture(hlc, ["run", upper])
+    check(acc, "std.str imports resolve under run",
+    r2.spawned && r2.code == 0 && r2.out.contains("HALIS"),
+    clip(r2.combined, 160))
+}
+
+fn main() -> int uses IO, Fs, Proc, Exit {
+    let acc: Acc = acc_new("run")
+    sec1(acc)
+    sec2(acc)
+    sec3(acc)
+    sec4(acc)
+    sec5(acc)
+    return finish(acc, "hlc run -- the one-step command (compile, build natively, run)")
+}

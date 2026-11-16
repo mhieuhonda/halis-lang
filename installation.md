@@ -321,6 +321,7 @@ cd halis-lang
 make bootstrap          # ~20 s: cc compiles the committed C snapshot, HLS takes over
 make bin/hlfmt          # the formatter, compiled by the fresh hlc
 make run F=examples/hello.hls
+bin/hlc run examples/hello.hls   # the same, as one command
 make test               # the full suite (this one needs python3)
 ```
 

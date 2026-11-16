@@ -178,6 +178,7 @@ cd halis-lang
 
 make bootstrap          # ~20 s: cc builds the seed, HLS takes over
 make run F=examples/hello.hls
+bin/hlc run examples/hello.hls   # the same, as one command
 
 make test              # ok/ + fail/ corpus, differential, bootstrap
                         # determinism, LLVM, memory stress, fmt, lint
@@ -187,6 +188,7 @@ Day-to-day commands:
 
 | Command | What it does |
 |---------|--------------|
+| `bin/hlc run [flags] prog.hls [args...]` | Compile, build natively and run in one command — everything after the input file (or a `--`) is the program's own argv, and hlc exits with its exit code. `HLS_CC` / `HLS_CFLAGS` pick the C compiler and add flags |
 | `make run F=prog.hls` | Compile to C, build natively, run |
 | `make check F=prog.hls` | Type- and effect-check without running |
 | `make audit F=prog.hls` | Capability + taint-flow report of the program |
@@ -201,7 +203,7 @@ The entire toolchain is written in Halis and compiles itself:
 
 | Tool | What it does |
 |------|--------------|
-| `hlc` | The compiler — HLS to C, LLVM IR or HLIR; checker, proof engine and optimiser included |
+| `hlc` | The compiler — HLS to C, LLVM IR or HLIR; checker, proof engine and optimiser included; `hlc run` takes a program from source to a running binary in one command |
 | `hlfmt` | Opinionated formatter with a team config file; comments preserved in every position |
 | `hllint` | Safety-first linter with `--fix` autofix and a `#[deprecated]` rule |
 | `hls-lsp` | Language server: hover, definitions, references, rename, completion, inlay hints |
