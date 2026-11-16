@@ -4621,22 +4621,26 @@ could not do before:
   claim the same vector** — two handlers for 14 means one of them is
   never entered, and the CPU's gate table can hold only one.
 * **Emits a save/restore stub per vector.** `hl_irq_stub_14` is a naked
-  function whose body is the classic push-all / call / unwind:
+  function whose body is the classic push-all / call / pop-all:
 
   ```asm
   pushq rax rbx rcx rdx rsi rdi rbp r8 r9 r10 r11     ; 88 bytes
   movl  $14, %eax            ; the vector, for the error-code cases
   movq  %rsp, %rdi           ; the saved frame, as the one parameter
   call  usf_on_page_fault
-  addq  $88, %rsp
+  popq  r11 r10 r9 r8 rbp rdi rsi rdx rcx rbx rax     ; reverse of the push
   iretq
   ```
 
-  The push order is the reverse of the pop, so `add $88, %rsp` +
-  `iretq` is correct: RSP on entry points at the saved RIP, and `iretq`
-  consumes RIP/CS/RFLAGS from there. Callee-saved registers
-  (rbx, rbp, r12-r15) are deliberately untouched — the callee preserves
-  them.
+  Nine of the eleven saved registers are caller-saved (rax, rcx, rdx,
+  rsi, rdi, r8-r11) — the SysV ABI lets the C handler clobber any of
+  them, so the stub MUST pop the saved copies back before returning;
+  an early revision discarded them with `add $88, %rsp`, and the
+  interrupted context resumed with whatever the handler had left in
+  those registers. rbx and rbp are callee-saved (the handler preserves
+  them) but ride along for a uniform sequence. After the pops, RSP
+  points at the CPU-pushed frame again and `iretq` consumes
+  RIP/CS/RFLAGS from there.
 * **Emits the binding table**, so a kernel calls one function at boot
   instead of writing a descriptor by hand:
 

@@ -1,0 +1,147 @@
+# ============================================================================
+# feat_deep_scan32_channels.hls — regression pack for the channel-family
+# codegen fixes (deep-scan-32):
+#   1. gen_spawn with a NON-literal argument (the wrapper used to embed
+#      the caller's locals in a file-scope static function — the emitted
+#      C did not compile).
+#   2. stream_send of a freshly-built str (the send used to pass the
+#      hoisted temp RAW: its loop-iteration cleanup freed the buffer
+#      while the channel still held it — use-after-free).
+#   3. stream_try_recv with a borrowed str default (the default used to
+#      cross un-owned: a pending message made the runtime release the
+#      caller's own reference).
+#   4. future_poll on Future[int] (int used to fall through to the
+#      pointer recv and came back as a cast pointer).
+#   5. await(future_ready(xs)) (the result used to take an extra
+#      retain — one leaked list per call).
+#   6. stream_flat_map_int (the worker used to leak every inner
+#      stream).
+# Every leg runs under the native compiler; the memory legs are also
+# pinned by hls-rss/ASan style runs in the acceptance corpus.
+# ============================================================================
+
+import "std.stream"
+import "std.async"
+import "std.option"
+
+fn count_gen(out: Stream[int], n: int) uses Conc {
+    let mut i: int = 0
+    while i < n {
+        stream_send(out, i)
+        i = i + 1
+    }
+    stream_close(out)
+}
+
+fn label_gen(out: Stream[str], n: int) uses Conc {
+    let mut i: int = 0
+    while i < n {
+        # A freshly-built value crossing the channel: the boundary
+        # must hand the channel its own copy.
+        stream_send(out, "msg" + i.to_str())
+        i = i + 1
+    }
+    stream_send(out, "END")
+}
+
+fn triple(x: int) -> int uses Conc {
+    return x * 3
+}
+
+fn expand(v: int) -> Stream[int] uses Conc {
+    let s: Stream[int] = stream_new(8)
+    stream_send(s, v)
+    stream_send(s, v + 1)
+    stream_close(s)
+    return s
+}
+
+fn double_it(v: int) -> int {
+    return v * 2
+}
+
+fn ch_producer(c: Chan[str]) uses Conc {
+    c.send("a" + "b")
+    c.send("END")
+}
+
+fn main() -> int uses IO, Conc {
+    # 1 + 2 + 3: gen_spawn(non-literal), str send, try_recv(default).
+    let n: int = 5
+    let s: Stream[int] = gen_spawn(count_gen, n)
+    if stream_sum_int(s) != 10 {
+        panic("gen_spawn with a variable argument lost its value")
+    }
+
+    let ls: Stream[str] = gen_spawn(label_gen, 3)
+    let fallback: str = "none"
+    let mut seen: int = 0
+    let mut last: str = ""
+    let mut open: bool = true
+    while open {
+        let v: str = stream_try_recv(ls, fallback)
+        if v == "END" {
+            open = false
+        } else {
+            if v != "none" {
+                if v.len() == 0 {
+                    panic("stream_try_recv returned a broken message")
+                }
+                seen = seen + 1
+                last = v
+            }
+            # v == "none": the generator has not sent yet — try_recv
+            # is non-blocking, so retry (the producer always sends
+            # "END", the loop terminates).
+        }
+    }
+    if seen != 3 || last != "msg2" {
+        panic("stream str round-trip lost messages: seen=" + seen.to_str())
+    }
+
+    # 4: future_poll must deliver the int payload, not a cast pointer.
+    let f: Future[int] = async_spawn(triple, 7)
+    let mut p: Option[int] = future_poll(f)
+    while !option_is_some(p) {
+        p = future_poll(f)
+    }
+    if option_unwrap(p) != 21 {
+        panic("future_poll on Future[int] lost the value")
+    }
+
+    # 5: await takes ownership of the transferred reference exactly.
+    let xs: list[int] = [5, 6, 7]
+    let fut: Future[list[int]] = future_ready(xs)
+    let got: list[int] = await(fut)
+    if got.get(0) != 5 || got.len() != 3 {
+        panic("await(future_ready) lost the payload")
+    }
+
+    # 6: flat_map drains and releases every inner stream.
+    let src: Stream[int] = gen_spawn(count_gen, 3)
+    let fm: Stream[int] = stream_flat_map_int(src, expand)
+    let total: int = stream_sum_int(fm)
+    # 0,1 then 1,2 then 2,3 -> 9
+    if total != 9 {
+        panic("stream_flat_map_int lost values: " + total.to_str())
+    }
+
+    # chan.send of fresh strings (the method twin of leg 2).
+    let ch: Chan[str] = chan_new()
+    let t: Task[void] = spawn(ch_producer, clone(ch))
+    let mut cv: str = ""
+    while cv != "END" {
+        cv = ch.recv()
+    }
+    t.join()
+
+    # double_it keeps the map combinator honest.
+    let ms: Stream[int] = gen_spawn(count_gen, 4)
+    let mapped: Stream[int] = stream_map_int(ms, double_it)
+    if stream_sum_int(mapped) != 12 {
+        panic("stream_map_int lost values")
+    }
+
+    println("deep-scan-32 channel family ok")
+    return 0
+}
