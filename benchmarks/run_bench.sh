@@ -62,9 +62,20 @@ run_native_self() {
 # "cannot write file" panic). Native paths cover both correctness and ratio.
 TIMING_BENCHES="benchmarks/conc_bench.hls benchmarks/simd_bench.hls"
 
+# hls-bench suites (Stage 124 convention): module-style files with NO
+# main — the runner is their program, so there is nothing for the three
+# legs here to run. hls-bench measures them instead; the README's
+# "watch suites" section carries the commands.
+SUITE_BENCHES="benchmarks/regression_watch.hls benchmarks/e2e_watch.hls"
+
 for f in benchmarks/*.hls; do
     name=$(basename "$f")
     echo "=== $name ==="
+    if echo "$SUITE_BENCHES" | grep -q "$name"; then
+        echo "  [suite]     (a bench_<name> suite — run it with bin/hls-bench, not as a program)"
+        echo ""
+        continue
+    fi
     if echo "$TIMING_BENCHES" | grep -q "$name"; then
         echo "  [interp]    (skipped: timing benchmark — interpreter is not representative)"
     else

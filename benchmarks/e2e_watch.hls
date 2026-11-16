@@ -1,0 +1,244 @@
+# ============================================================================
+# benchmarks/e2e_watch.hls — the workload-level companion to
+# regression_watch.hls. Same Stage-124 convention hls-bench rides:
+# a module-style file with NO main (the runner is its program), one
+# `fn bench_<name>()` per bench, an optional `fn units_<name>() -> int`
+# for the throughput unit.
+#
+# regression_watch watches the hot SHAPES (a loop, a concat, a push,
+# a byte hash, a match); this suite watches the ALGORITHMS built on
+# them — the sieve, the JSON parser, base64, CRC-32, a comparison
+# sort, split/join — the distance a whole-program regression has to
+# travel before the shape-level suite sees it:
+#
+#   bench_sieve_10k     the sieve of Eratosthenes to 10,000
+#                                        units: 10,001 slots sieved
+#   bench_json_parse    std.json parse of a 221-byte document,
+#                       10 parses per iteration with a field walk
+#                                        units: bytes parsed
+#   bench_base64_round  base64 encode + decode of an 80-byte blob,
+#                       50 rounds per iteration
+#                                        units: bytes coded (both ways)
+#   bench_crc32_100     CRC-32 over a 78-byte string, 100 rounds
+#                                        units: bytes hashed
+#   bench_sort_lcg_512  512 LCG-drawn integers pushed, sorted, checked
+#                                        units: elements ordered
+#   bench_split_join    a 7-field CSV line split and joined back,
+#                       100 rounds
+#                                        units: bytes scanned
+#
+# Every bench is deterministic and effect-free — no clock, no
+# randomness, no IO — so a regression measured here is the
+# toolchain's, not the workload's mood. The suite is NOT the tracked
+# default (regression_watch.hls is); it runs on demand:
+#
+#     bin/hls-bench --native benchmarks/e2e_watch.hls
+#     bin/hls-bench benchmarks/e2e_watch.hls        # the Stage-0 leg
+#
+# The list-literal-with-calls pattern is avoided throughout (the
+# known codegen limitation json_bench.hls documents): every list is
+# grown with .push() over a plain loop.
+# ============================================================================
+
+import "std.json"
+import "std.crypto"
+import "std.base64"
+import "std.str"
+import "std.list"
+
+# ----------------------------------------------------------------------------
+# bench_sieve_10k — the classic allocation+loop stress: a bool list
+# sieved to 10,000, every slot touched at least once. π(10000) = 1229;
+# the bench returns the count so the runner's sink keeps the whole
+# computation alive.
+# ----------------------------------------------------------------------------
+
+fn bench_sieve_10k() -> int {
+    let n: int = 10000
+    let sieve: list[bool] = []
+    let mut k: int = 0
+    while k <= n {
+        sieve.push(true)
+        k = k + 1
+    }
+    sieve.set(0, false)
+    sieve.set(1, false)
+    let mut i: int = 2
+    while i * i <= n {
+        if sieve.get(i) {
+            let mut j: int = i * i
+            while j <= n {
+                sieve.set(j, false)
+                j = j + i
+            }
+        }
+        i = i + 1
+    }
+    let mut count: int = 0
+    let mut c: int = 0
+    while c <= n {
+        if sieve.get(c) {
+            count = count + 1
+        }
+        c = c + 1
+    }
+    return count
+}
+
+fn units_sieve_10k() -> int {
+    return 10001
+}
+
+# ----------------------------------------------------------------------------
+# bench_json_parse — the std.json parser over the same 221-byte
+# people document json_bench.hls assembles, here as a fixed literal
+# so the parse is the whole cost. Ten parses per iteration, the
+# "count" field walked out of each (30 total), the same read pattern
+# a real config loader rides.
+# ----------------------------------------------------------------------------
+
+fn people_payload() -> str {
+    return "{\"count\":3,\"people\":[{\"id\":1,\"name\":\"Alice\",\"email\":\"alice@example.com\",\"active\":true},{\"id\":2,\"name\":\"Bob\",\"email\":\"bob@example.com\",\"active\":false},{\"id\":3,\"name\":\"Charlie\",\"email\":\"charlie@example.com\",\"active\":true}]}"
+}
+
+fn bench_json_parse() -> int {
+    let payload: str = people_payload()
+    let mut total: int = 0
+    let mut round: int = 0
+    while round < 10 {
+        let v: JsonValue = json_parse(payload)
+        let top: JsonValue = json_object_get(v, "count")
+        total = total + top.ival
+        round = round + 1
+    }
+    return total
+}
+
+fn units_json_parse() -> int {
+    return 10 * people_payload().len()
+}
+
+# ----------------------------------------------------------------------------
+# bench_base64_round — std.base64 both ways: 80 bytes in, the encoded
+# string out, decoded back, the length checked every round. Fifty
+# rounds per iteration.
+# ----------------------------------------------------------------------------
+
+fn b64_blob() -> str {
+    let mut s: str = ""
+    let mut i: int = 0
+    while i < 5 {
+        s = s + "0123456789abcdef"
+        i = i + 1
+    }
+    return s
+}
+
+fn bench_base64_round() -> int {
+    let blob: str = b64_blob()
+    let mut total: int = 0
+    let mut round: int = 0
+    while round < 50 {
+        let coded: str = base64_encode(blob)
+        let plain: str = base64_decode(coded)
+        total = total + plain.len()
+        round = round + 1
+    }
+    return total
+}
+
+fn units_base64_round() -> int {
+    return 50 * 2 * b64_blob().len()
+}
+
+# ----------------------------------------------------------------------------
+# bench_crc32_100 — std.crypto's CRC-32 over the 77-byte language
+# blurb crypto_bench.hls hashes, 100 rounds. The accumulator keeps the
+# call from being dead work.
+# ----------------------------------------------------------------------------
+
+fn crc_input() -> str {
+    return "Halis is a high-security, self-hosting, native-compiled programming language."
+}
+
+fn bench_crc32_100() -> int {
+    let input: str = crc_input()
+    let mut acc: int = 0
+    let mut round: int = 0
+    while round < 100 {
+        acc = acc + crypto_crc32(input)
+        round = round + 1
+    }
+    return acc
+}
+
+fn units_crc32_100() -> int {
+    return 100 * crc_input().len()
+}
+
+# ----------------------------------------------------------------------------
+# bench_sort_lcg_512 — 512 integers drawn from a plain LCG (no Rand
+# effect, the draw is a multiply and a mask), pushed into a list,
+# sorted by list_sort_int_asc, then walked once to prove the order.
+# The sort dominates; the draw and the walk keep it honest.
+# ----------------------------------------------------------------------------
+
+fn lcg_next(seed: int) -> int {
+    let s: int = (seed * 1103515245 + 12345) % 2147483648
+    if s < 0 {
+        return 0 - s
+    }
+    return s
+}
+
+fn bench_sort_lcg_512() -> int {
+    let mut xs: list[int] = []
+    let mut seed: int = 42
+    let mut i: int = 0
+    while i < 512 {
+        seed = lcg_next(seed)
+        xs.push(seed % 100000)
+        i = i + 1
+    }
+    let sorted: list[int] = list_sort_int_asc(xs)
+    let mut ok: int = 1
+    let mut j: int = 1
+    while j < sorted.len() {
+        if sorted.get(j - 1) > sorted.get(j) {
+            ok = 0
+        }
+        j = j + 1
+    }
+    return ok * sorted.get(sorted.len() - 1)
+}
+
+fn units_sort_lcg_512() -> int {
+    return 512
+}
+
+# ----------------------------------------------------------------------------
+# bench_split_join — the CSV shape: one 7-field line split on ","
+# and joined back, a hundred rounds. The join result's length rides
+# into the sink; a wrong split shows up as a wrong length.
+# ----------------------------------------------------------------------------
+
+fn csv_line() -> str {
+    return "id,name,email,active,score,tags,note"
+}
+
+fn bench_split_join() -> int {
+    let line: str = csv_line()
+    let mut total: int = 0
+    let mut round: int = 0
+    while round < 100 {
+        let parts: list[str] = line.split(",")
+        let joined: str = str_join(parts, ",")
+        total = total + joined.len()
+        round = round + 1
+    }
+    return total
+}
+
+fn units_split_join() -> int {
+    return 100 * csv_line().len()
+}
