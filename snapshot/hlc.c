@@ -5227,8 +5227,8 @@ static const hl_str HLC_LIT_1868 = { HL_RC_IMMORTAL, 26L, "    exp10 += esign * 
 static const hl_str HLC_LIT_1869 = { HL_RC_IMMORTAL, 33L, "    if (exp10 > 400) exp10 = 400;" };
 static const hl_str HLC_LIT_1870 = { HL_RC_IMMORTAL, 35L, "    if (exp10 < -400) exp10 = -400;" };
 static const hl_str HLC_LIT_1871 = { HL_RC_IMMORTAL, 23L, "    long double rr = m;" };
-static const hl_str HLC_LIT_1872 = { HL_RC_IMMORTAL, 47L, "    while (exp10 > 0) { rr /= 10.0L; exp10--; }" };
-static const hl_str HLC_LIT_1873 = { HL_RC_IMMORTAL, 47L, "    while (exp10 < 0) { rr *= 10.0L; exp10++; }" };
+static const hl_str HLC_LIT_1872 = { HL_RC_IMMORTAL, 47L, "    while (exp10 > 0) { rr *= 10.0L; exp10--; }" };
+static const hl_str HLC_LIT_1873 = { HL_RC_IMMORTAL, 47L, "    while (exp10 < 0) { rr /= 10.0L; exp10++; }" };
 static const hl_str HLC_LIT_1874 = { HL_RC_IMMORTAL, 29L, "    if (end) *end = (char*)s;" };
 static const hl_str HLC_LIT_1875 = { HL_RC_IMMORTAL, 31L, "    return (double)(sign * rr);" };
 static const hl_str HLC_LIT_1876 = { HL_RC_IMMORTAL, 45L, "static char* hl_nl_getenv(const char* name) {" };
