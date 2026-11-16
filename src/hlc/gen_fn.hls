@@ -89,13 +89,12 @@ fn gen_fn_body(ctx: Ctx, key: str) -> void {
     let sig_start: int = ctx.out.len()
     ctx.lto_fn_start.set(key, sig_start)
     ctx.out.push(fn_attr_prefix(ctx, f, key) + sig + " {")
-    # Stage 96: where the signature line sits NOW (the fn-level marker
-    # may precede it) — the PGO retro-patch must edit the signature,
-    # never the marker.
-    let mut sig_line: int = sig_start
-    if map_open {
-        sig_line = sig_start + 1
-    }
+    # Stage 96: where the signature line sits NOW. The map-open `#line`
+    # directive was pushed BEFORE sig_start was captured, so the
+    # signature is AT sig_start — an earlier +1 here patched the PGO
+    # `static inline` retro-fix onto the first BODY line under
+    # --debug --pgo-use (deep-scan-33).
+    let sig_line: int = sig_start
     emit_param_local_decls(ctx, f, inst_ptypes, param_local_names)
     # Stage 19: PGO — function-entry counter site (e:<fnkey>), emitted
     # under --pgo-generate as the first statement of the body.
@@ -525,15 +524,35 @@ fn gen_proto_lines(ctx: Ctx) -> list[str] {
             continue
         }
         let f: FnInfo = ctx.fns.get_or(key, dummy_fn())
+        # BUG-002 law (deep-scan-33): for generic methods on generic
+        # structs the targs list carries BOTH the struct's args and the
+        # method's (see check_method's all_targs); the body generator
+        # composes combined_tps — the prototype must mangle EXACTLY the
+        # same way or the emitted .c carries a prototype whose name
+        # never matches the definition (implicit-decl / link error).
+        let mut combined_tps: list[str] = []
+        if f.is_method && f.struct_of != "" {
+            let st: StructInfo = ctx.structs.get_or(f.struct_of, dummy_struct())
+            let mut si: int = 0
+            while si < st.typeparams.len() {
+                combined_tps.push(st.typeparams.get(si))
+                si = si + 1
+            }
+        }
+        let mut mi: int = 0
+        while mi < f.typeparams.len() {
+            combined_tps.push(f.typeparams.get(mi))
+            mi = mi + 1
+        }
         let ptypes_c: list[str] = []
         let mut k: int = 0
         while k < f.params.len() {
-            let inst_pt: str = instantiate_type(f.ptypes.get(k), f.typeparams, targs)
+            let inst_pt: str = instantiate_type(f.ptypes.get(k), combined_tps, targs)
             ptypes_c.push(c_type(ctx, inst_pt))
             k = k + 1
         }
-        let mut ret_str: str = instantiate_type(f.ret, f.typeparams, targs)
-        let mangled: str = c_mangled_fn_name(key, f.typeparams, targs)
+        let mut ret_str: str = instantiate_type(f.ret, combined_tps, targs)
+        let mangled: str = c_mangled_fn_name(key, combined_tps, targs)
         let mut sig: str = c_type(ctx, ret_str) + " usf_" + mangled + "("
         if ptypes_c.len() == 0 {
             sig = sig + "void)"
@@ -741,6 +760,25 @@ fn gen_fn_inst_lines(ctx: Ctx) -> list[str] {
                 }
                 ri = ri + 1
             }
+        }
+        # Deep-scan-33 (#17): the requires precondition carries over to
+        # EVERY instantiation — gen_fn_body emitted it (Stage 17 law,
+        # same -O fast soundness rule: an elided check is only sound
+        # when the precondition that proved it is enforced) but this
+        # path never did, so a generic fn's precondition was silently
+        # unenforced. cur_typeparams/cur_targs are already set, so the
+        # expression's type params instantiate correctly.
+        let mut want_req_check: bool = false
+        if ctx.contracts_mode && f.requires_e >= 0 {
+            want_req_check = true
+        }
+        if ctx.fast_mode && f.requires_e >= 0 && fn_has_elisions(ctx, f.body) {
+            want_req_check = true
+        }
+        if want_req_check {
+            let rc: str = gen_expr(ctx, f.requires_e)
+            ctx.out.push("    if (!(" + rc + ")) hl_die(\"contract violation: requires of '"
+            + f.name + "' (function precondition failed at runtime)\");")
         }
         gen_stmts(ctx, f.body, "    ")
         let mut k: int = 0

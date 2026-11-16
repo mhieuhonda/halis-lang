@@ -1072,6 +1072,13 @@ fn estimate_stack_size_stmt(ctx: Ctx, sidx: int, mut bytes: int) -> int {
         if s.else_body.len() > 0 {
             bytes = estimate_stack_size_stmts(ctx, s.else_body, bytes)
         }
+    } else if s.kind == "asm" {
+        # Deep-scan-33 (#10): every asm! operand lowers to a register
+        # variable (8 bytes) and index-lvalue writebacks add their own
+        # temps — 16 bytes per operand keeps the #[stack_size(N)]
+        # estimate an upper bound without rejecting tight frames that
+        # hold only `in` operands.
+        bytes = bytes + 16 * s.asm_operands.len()
     }
     # match is an EXPRESSION (lives in s.e / s.value); its arms are
     # walked by estimate_stack_calls (which recurses through match
@@ -1605,6 +1612,90 @@ fn esc_find(recs: list[EscRec], name: str) -> int {
     return -1
 }
 
+# Deep-scan-33 (#9): apply an event to EVERY record carrying this
+# name. Two sibling-scope `let`s of the same name each collect their
+# own record; esc_find() only reaches the first, so the second let's
+# escapes and growth uses were dropped and the shared layout key could
+# be decided "stack" while a same-named sibling escapes.
+fn esc_esc_all(recs: list[EscRec], name: str, why: str, line: int) -> void {
+    let mut i: int = 0
+    while i < recs.len() {
+        let r: EscRec = recs.get(i)
+        if r.name == name && r.esc == "" {
+            r.esc = why
+            r.esc_line = line
+        }
+        i = i + 1
+    }
+}
+
+fn esc_flag_all(recs: list[EscRec], name: str, is_push: bool, line: int) -> void {
+    let mut i: int = 0
+    while i < recs.len() {
+        let r: EscRec = recs.get(i)
+        if r.name == name {
+            if is_push && !r.push {
+                r.push = true
+                r.push_line = line
+            }
+            if !is_push && !r.pop {
+                r.pop = true
+                r.pop_line = line
+            }
+        }
+        i = i + 1
+    }
+}
+
+# Fold same-named records into identical conservative facts: OR the
+# escape/push/pop/forced/boxed flags, MAX the capacity — the emitter
+# and the decision loop both write the shared `fn::name` key, so the
+# two records must agree on every field.
+fn esc_fold(recs: list[EscRec]) -> void {
+    let mut i: int = 0
+    while i < recs.len() {
+        let a: EscRec = recs.get(i)
+        let mut j: int = i + 1
+        while j < recs.len() {
+            let b: EscRec = recs.get(j)
+            if b.name == a.name {
+                if a.esc == "" && b.esc != "" {
+                    a.esc = b.esc
+                    a.esc_line = b.esc_line
+                }
+                if b.esc == "" && a.esc != "" {
+                    b.esc = a.esc
+                    b.esc_line = a.esc_line
+                }
+                if !a.push && b.push {
+                    a.push = true
+                    a.push_line = b.push_line
+                }
+                if !b.push && a.push {
+                    b.push = true
+                    b.push_line = a.push_line
+                }
+                if !a.pop && b.pop {
+                    a.pop = true
+                    a.pop_line = b.pop_line
+                }
+                if !b.pop && a.pop {
+                    b.pop = true
+                    b.pop_line = a.pop_line
+                }
+                if b.cap > a.cap {
+                    a.cap = b.cap
+                }
+                if a.cap > b.cap {
+                    b.cap = a.cap
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
 fn esc_prim_elem(t: str) -> bool {
     return t == "int" || t == "float" || t == "bool"
 }
@@ -1652,6 +1743,7 @@ fn escape_check_fn(ctx: Ctx, key: str) -> void {
     let recs: list[EscRec] = []
     esc_collect_stmts(ctx, f.body, recs)
     esc_walk_stmts(ctx, f.body, recs)
+    esc_fold(recs)
     # Decide + record. esc_line/push_line are inside the reason strings.
     let mut i: int = 0
     while i < recs.len() {
@@ -1876,13 +1968,9 @@ fn esc_walk_assign(ctx: Ctx, s: StmtN, recs: list[EscRec]) -> void {
         # Whole-binding reassignment of a tracked binding: the new value
         # replaces the frame-resident storage — an escape (the binding
         # can no longer be a plain stack array).
-        let ri: int = esc_find(recs, ctx.exprs[tgt].name)
-        if ri >= 0 {
-            let r: EscRec = recs.get(ri)
-            if r.esc == "" {
-                r.esc = "reassigned (assignment target)"
-                r.esc_line = ctx.exprs[tgt].line
-            }
+        if esc_find(recs, ctx.exprs[tgt].name) >= 0 {
+            esc_esc_all(recs, ctx.exprs[tgt].name,
+                "reassigned (assignment target)", ctx.exprs[tgt].line)
         }
     } else if ctx.exprs[tgt].kind == "index" && ctx.exprs[ctx.exprs[tgt].left].kind == "ident" {
         # xs[i] = v — the base binding is the index base (borrow-safe);
@@ -1907,13 +1995,8 @@ fn esc_expr(ctx: Ctx, e: int, recs: list[EscRec], safe: bool, why: str) -> void 
     }
     let n: ExprN = ctx.exprs[e]
     if n.kind == "ident" {
-        let ri: int = esc_find(recs, n.name)
-        if ri >= 0 {
-            let r: EscRec = recs.get(ri)
-            if !safe && r.esc == "" {
-                r.esc = why
-                r.esc_line = n.line
-            }
+        if !safe && esc_find(recs, n.name) >= 0 {
+            esc_esc_all(recs, n.name, why, n.line)
         }
         return
     }
@@ -1925,17 +2008,9 @@ fn esc_expr(ctx: Ctx, e: int, recs: list[EscRec], safe: bool, why: str) -> void 
         } else if !n.muser && (n.mop == "list.push" || n.mop == "list.pop") && ctx.exprs[n.left].kind == "ident" {
             # push/pop on a tracked binding: a dedicated growth/shrink
             # use class (fixed capacity — cannot grow or shrink).
-            let ri: int = esc_find(recs, ctx.exprs[n.left].name)
-            if ri >= 0 {
-                let r: EscRec = recs.get(ri)
-                if n.mop == "list.push" && !r.push {
-                    r.push = true
-                    r.push_line = ctx.exprs[n.left].line
-                }
-                if n.mop == "list.pop" && !r.pop {
-                    r.pop = true
-                    r.pop_line = ctx.exprs[n.left].line
-                }
+            if esc_find(recs, ctx.exprs[n.left].name) >= 0 {
+                esc_flag_all(recs, ctx.exprs[n.left].name,
+                    n.mop == "list.push", ctx.exprs[n.left].line)
             } else {
                 esc_expr(ctx, n.left, recs, false, "receiver of '" + mname + "()'")
             }

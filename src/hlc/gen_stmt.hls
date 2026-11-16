@@ -591,7 +591,7 @@ fn gen_enumlit(ctx: Ctx, e: int) -> str {
         ctx.enum_insts.push(t)
     }
     # The constructor function name is "usf_make_" + c_type_name(t) + "" + "_" + variant.
-    let ctor_name: str = "usf_make_" + c_type_name(t) + "_" + ctx.exprs[e].variant
+    let ctor_name: str = "usf_make_" + c_esc_type_name(c_type_name(t)) + "_" + ctx.exprs[e].variant
     # The constructor stores its payloads raw, so each pointer-typed
     # payload must arrive OWNED (Stage 8-beta).
     let parts: list[str] = []
@@ -732,7 +732,7 @@ fn gen_match_expr(ctx: Ctx, e: int) -> str {
             clear_hoists(ctx)
             block.push("    }")
         } else {
-            let cond: str = tmp_name + "->tag == " + ename + "__TAG_" + arm.variant + "_" + c_type_name(scrut_t)
+            let cond: str = tmp_name + "->tag == " + ename + "__TAG_" + arm.variant + "_" + c_esc_type_name(c_type_name(scrut_t))
             block.push("    else if (" + cond + ") {")
             # Bind payload values.
             let en: EnumInfo = ctx.enums.get_or(ename, dummy_enum())
@@ -811,8 +811,15 @@ fn gen_match_expr(ctx: Ctx, e: int) -> str {
 
 # gen_qmark_expr — emit a statement expression for `expr?`.
 fn gen_qmark_expr(ctx: Ctx, e: int) -> str {
-    let inner_t: str = ctx.exprs[ctx.exprs[e].left].t
+    # Deep-scan-33 (#12): instantiate against the current generic
+    # bindings — inside a generic fn the raw left type still mentions
+    # the type parameter. Collect the enum instantiation too, so the
+    # tag macro and the release fn the block references are emitted.
+    let inner_t: str = inst_t(ctx, ctx.exprs[ctx.exprs[e].left].t)
     let ename: str = type_base(inner_t)
+    if is_ptr_t(ctx, inner_t) {
+        collect_insts(ctx, inner_t)
+    }
     let inner_c: str = gen_expr(ctx, ctx.exprs[e].left)
     let ok_v: str = ctx.exprs[e].ok_variant
     let err_v: str = ctx.exprs[e].err_variant
@@ -838,7 +845,7 @@ fn gen_qmark_expr(ctx: Ctx, e: int) -> str {
     } else {
         block.push("    " + c_type(ctx, inner_t) + " " + tmp_name + " = " + inner_c + ";")
     }
-    block.push("    if (" + tmp_name + "->tag == " + ename + "__TAG_" + err_v + "_" + c_type_name(inner_t) + ") {")
+    block.push("    if (" + tmp_name + "->tag == " + ename + "__TAG_" + err_v + "_" + c_esc_type_name(c_type_name(inner_t)) + ") {")
     block.push("        return " + retain_expr_for(ctx, inner_t, tmp_name) + ";")
     block.push("    }")
     # Success variant's payload is at data.<ok_v>.v0.
@@ -917,6 +924,12 @@ fn gen_stmt(ctx: Ctx, sidx: int, ind: str) -> void {
         # evaluation order (and the order of any element panic) is
         # exactly the interpreter's left-to-right order.
         if is_stack_var(ctx, s.name) && ctx.exprs[s.value].kind == "listlit" {
+            # Deep-scan-33 (#18): run the same hoist pass the normal
+            # let path runs BEFORE touching the element expressions, so
+            # fresh subexpressions inside elements are not dropped by
+            # the trailing clear_hoists.
+            collect_hoist(ctx, s.value)
+            hoist_all(ctx, ctx.out, ind)
             let cn: str = fresh_local(ctx, s.name)
             let et: str = list_elem_t(s.vtype)
             let cap: int = stack_cap_of(ctx, s.name)
@@ -1619,11 +1632,7 @@ fn gen_asm(ctx: Ctx, s: StmtN, ind: str) -> void {
                 # template's `movl %eax` becomes `movl %rax` (an
                 # assembler error). The initialiser is cast down, which
                 # is exactly the truncation the 32-bit instruction does.
-                let mut rty: str = cty
-                if narrow_ty != "" {
-                    rty = cty
-                }
-                ctx.out.push(ind + "register " + rty + " " + rv + " __asm__(\"" + reg + "\") = (" + rty + ")(" + gen_expr(ctx, op.expr_idx) + ");")
+                ctx.out.push(ind + "register " + cty + " " + rv + " __asm__(\"" + reg + "\") = (" + cty + ")(" + gen_expr(ctx, op.expr_idx) + ");")
             } else {
                 # out / inout / late_out — prepare the lvalue pieces
                 # once (a call in a field/index base must not be
@@ -1639,6 +1648,12 @@ fn gen_asm(ctx: Ctx, s: StmtN, ind: str) -> void {
                     temp_wb_kind.push(2)
                     temp_wb_a.push(lname)
                     temp_wb_b.push("")
+                    # Keep temp_wb_stack parallel with temp_setters: the
+                    # consumer indexes it by the setter slot, and a
+                    # missing push here shifts every later index-lvalue
+                    # writeback onto the wrong flag (deep-scan-33). Only
+                    # kind-1 writebacks read the value; 0 is inert.
+                    temp_wb_stack.push(0)
                 } else if ek == "field" {
                     let base_t: str = ctx.exprs[ctx.exprs[op.expr_idx].left].t
                     let bt: str = fresh_tmp(ctx, "hlc_asm_b")
@@ -1651,6 +1666,7 @@ fn gen_asm(ctx: Ctx, s: StmtN, ind: str) -> void {
                     temp_wb_kind.push(3)
                     temp_wb_a.push(bt)
                     temp_wb_b.push(f_c)
+                    temp_wb_stack.push(0)
                 } else {
                     # index lvalue
                     let lst_c: str = asm_list_base_c(ctx, ctx.exprs[op.expr_idx].left)
@@ -2375,35 +2391,10 @@ fn emit_param_local_decls(ctx: Ctx, f: FnInfo, inst_ptypes: list[str], param_loc
 # assertion — an elided check is only sound when the precondition that
 # proved it is enforced (see SPEC §26.4).
 fn fn_has_elisions(ctx: Ctx, stmts: list[int]) -> bool {
-    let mut i: int = 0
-    while i < stmts.len() {
-        let s: StmtN = ctx.stmts.get(stmts.get(i))
-        if stmt_exprs_have_elisions(ctx, s.value) {
-            return true
-        }
-        if stmt_exprs_have_elisions(ctx, s.cond) {
-            return true
-        }
-        if stmt_exprs_have_elisions(ctx, s.iter) {
-            return true
-        }
-        if stmt_exprs_have_elisions(ctx, s.e) {
-            return true
-        }
-        if s.target >= 0 {
-            if exprs_have_elisions(ctx, s.target) {
-                return true
-            }
-        }
-        if stmts_have_elisions(ctx, s.body) {
-            return true
-        }
-        if stmts_have_elisions(ctx, s.else_body) {
-            return true
-        }
-        i = i + 1
-    }
-    return false
+    # Deep-scan-33 (#21): this used to be a byte-identical copy of
+    # stmts_have_elisions (the checker routes both through the same
+    # statement walk) — delegate so the two can never drift apart.
+    return stmts_have_elisions(ctx, stmts)
 }
 
 fn stmts_have_elisions(ctx: Ctx, stmts: list[int]) -> bool {
