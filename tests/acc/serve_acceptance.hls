@@ -442,6 +442,31 @@ debounce_ms: int) -> void uses Fs, Proc {
     let _w: int = proc_spawn("sh", wargv, 2, 2, 2)
 }
 
+# srv_wait_seeded — the watcher's FIRST cycle seeds the hash table
+# with the CURRENT content as baseline (first_run, no event). A change
+# that lands BEFORE that seed is swallowed as the baseline itself and
+# never fires — on a fast runner the gate's fetches between arming and
+# the break all fit inside one debounce cycle, and the break loses the
+# race exactly that way (suite_05 went red on CI twice in a row on it).
+# Wait until the seed table carries the input's CURRENT hash before
+# the gate writes again.
+fn srv_wait_seeded(dir: str, input: str) -> bool uses Fs, Clock, Conc {
+    let hash_file: str = path_join3(dir, ".hlserve-hashes.txt")
+    let want: str = sha256_hex(read_file(input))
+    let mut seeded: bool = false
+    let mut tries: int = 0
+    while !seeded && tries < 50 {
+        if file_exists(hash_file) {
+            seeded = read_file(hash_file).contains(want)
+        }
+        if !seeded {
+            thread_sleep_ms(200)
+        }
+        tries = tries + 1
+    }
+    return seeded
+}
+
 # bundle_name_of — the bundle path's base name.
 fn bundle_name_of(bundle: str) -> str {
     let mut i: int = bundle.len() - 1
@@ -626,6 +651,12 @@ fn s5_watcher(acc: Acc) -> void uses IO, Fs, Proc, Net, Clock, Conc {
     # '#' is Halis's comment token — a '//' line is a syntax error,
     # and this fixture once shipped one, so the "rewrite" recompile
     # silently FAILED instead of compiling the touched file.
+    # The quiet second above is the debounce contract; the seed wait
+    # below is the ordering contract: only a seeded baseline can see
+    # the rewrite (a seed that lands after it swallows the change).
+    let seeded: bool = srv_wait_seeded(dir, input)
+    chk(acc, "the watcher seeded the baseline", seeded,
+    read_file(sp.wlog))
     write_file(input, "fn main() -> int {\n    return 0\n}\n\n"
     + "# a touch comment so the poller sees the change\n")
     let mut fired: bool = false
@@ -780,11 +811,18 @@ fn s9_http(acc: Acc) -> void uses IO, Fs, Proc, Net, Clock, Conc {
     r7.status == 404, r7.status.to_str())
 
     # the failed-compile banner: break the input, let the watcher
-    # recompile and fail, then the index carries the error.
+    # recompile and fail, then the index carries the error. The seed
+    # wait comes first — the seven fetches above fit inside one
+    # debounce cycle on a fast runner, and a break that outruns the
+    # watcher's seeding cycle becomes the baseline itself (no event,
+    # no banner, suite_05 red).
+    let seeded: bool = srv_wait_seeded(dir, input)
+    chk(acc, "the watcher seeded the baseline (e2e)", seeded,
+    read_file(sp.wlog))
     write_file(input, "fn main() -> int { return 1 + }\n")
     let mut failed: bool = false
     let mut tries: int = 0
-    while tries < 40 && !failed {
+    while tries < 60 && !failed {
         thread_sleep_ms(200)
         failed = read_file(sp.wlog).contains("compile FAILED")
         tries = tries + 1
