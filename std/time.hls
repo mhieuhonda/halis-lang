@@ -141,8 +141,10 @@ fn duration_zero() -> Duration {
     return Duration { nanos: 0 }
 }
 
-# Accessors — return the duration in the requested unit (truncated
-# towards negative infinity, like Rust's std::time::Duration).
+# Accessors — return the duration in the requested unit, truncated
+# towards zero (HLS `/` semantics). For a negative duration the whole
+# part rounds up toward zero and the subsec part carries the sign, so
+# duration_as_secs(-1.5s) = -1 and duration_subsec_nanos(-1.5s) = -5e8.
 fn duration_as_nanos(d: Duration) -> int {
     return d.nanos
 }
@@ -220,11 +222,37 @@ fn duration_mul(d: Duration, scalar: int) -> Duration {
     if d.nanos == 0 || scalar == 0 {
         return Duration { nanos: 0 }
     }
-    # Quick overflow check: |a * b| > INT64_MAX iff |a| > INT64_MAX / |b|.
+    if scalar == 1 {
+        return d
+    }
+    if d.nanos == 1 {
+        return Duration { nanos: scalar }
+    }
+    let min: int = _int64_min()
+    let max: int = _int64_max()
+    # INT64_MIN has no positive magnitude, so _int_abs would overflow.
+    # With the unit shortcuts above taken, any remaining INT64_MIN
+    # operand multiplies by |other| >= 2 (or -1) and always overflows.
+    if d.nanos == min || scalar == min {
+        panic("duration_mul: overflow (d=" + d.nanos.to_str() + " * scalar=" + scalar.to_str() + " exceeds int64)")
+    }
+    if scalar == -1 {
+        return Duration { nanos: _int_neg(d.nanos) }
+    }
+    # Magnitude overflow check. A negative product may reach exactly
+    # 2^63 (INT64_MIN is representable); a positive one only 2^63 - 1.
+    # q = floor(MAX / |s|); the negative boundary widens by one precisely
+    # when |s| divides 2^63 (remainder == |s| - 1).
+    let neg: bool = (d.nanos < 0 && scalar > 0) || (d.nanos > 0 && scalar < 0)
     let abs_d: int = _int_abs(d.nanos)
     let abs_s: int = _int_abs(scalar)
-    let max: int = _int64_max()
-    if abs_d > _int_div(max, abs_s) {
+    let q: int = _int_div(max, abs_s)
+    let r: int = _int_sub(max, _int_mul(q, abs_s))
+    let mut limit: int = q
+    if neg && r == abs_s - 1 {
+        limit = q + 1
+    }
+    if abs_d > limit {
         panic("duration_mul: overflow (d=" + d.nanos.to_str() + " * scalar=" + scalar.to_str() + " > INT64_MAX)")
     }
     return Duration { nanos: _int_mul(d.nanos, scalar) }
@@ -290,7 +318,31 @@ fn duration_to_str(d: Duration) -> str {
     if nanos < 0 {
         sign = "-"
         if nanos == _int64_min() {
-            return "-292y 5d 18h 4m 7s 963ms 477us 580ns (INT64_MIN, max negative)"
+            # |INT64_MIN| has no positive int64 representation, so decompose
+            # in the negative domain (every quotient/remainder fits) and
+            # print each component's magnitude - same layout as the normal
+            # path: 106751d 23h 47m 16s 854ms 775us 808ns.
+            let dd: int = _int_div(nanos, _ns_per_day())
+            let mut rr: int = _int_sub(nanos, _int_mul(dd, _ns_per_day()))
+            let hh: int = _int_div(rr, _ns_per_hour())
+            rr = _int_sub(rr, _int_mul(hh, _ns_per_hour()))
+            let mm: int = _int_div(rr, _ns_per_min())
+            rr = _int_sub(rr, _int_mul(mm, _ns_per_min()))
+            let ss: int = _int_div(rr, _ns_per_sec())
+            rr = _int_sub(rr, _int_mul(ss, _ns_per_sec()))
+            let mss: int = _int_div(rr, _ns_per_ms())
+            rr = _int_sub(rr, _int_mul(mss, _ns_per_ms()))
+            let uss: int = _int_div(rr, _ns_per_us())
+            let nss: int = _int_sub(rr, _int_mul(uss, _ns_per_us()))
+            let min_parts: list[str] = []
+            min_parts.push(_int_neg(dd).to_str() + "d")
+            min_parts.push(_int_neg(hh).to_str() + "h")
+            min_parts.push(_int_neg(mm).to_str() + "m")
+            min_parts.push(_int_neg(ss).to_str() + "s")
+            min_parts.push(_int_neg(mss).to_str() + "ms")
+            min_parts.push(_int_neg(uss).to_str() + "us")
+            min_parts.push(_int_neg(nss).to_str() + "ns")
+            return "-" + str_join(min_parts, " ")
         }
         nanos = _int_neg(nanos)
     }
