@@ -915,9 +915,19 @@ fmt: $(BIN)/hlfmt
 # Stage 14: linter. The linter is Halis now (tools/hllint.hls, the
 # full port of the Python years, built on the compiler's own
 # front-end through tools/hlfront.hls): hlc compiles it, cc links
-# bin/hllint, no interpreter in the loop.
+# bin/hllint, no interpreter in the loop. No F given: lint the tree's
+# own sources (src/, tools/, std/, core/) rather than erroring out on
+# a missing argument.
 lint: $(BIN)/hllint
-	@$(BIN)/hllint $(F)
+	@if [ -z "$(F)" ]; then \
+		status=0; \
+		for f in src/hlc.hls src/hlc/*.hls tools/*.hls std/*.hls core/*.hls; do \
+			$(BIN)/hllint $$f || status=1; \
+		done; \
+		exit $$status; \
+	else \
+		$(BIN)/hllint $(F); \
+	fi
 
 # Stage 14: one-shot LSP diagnostics (for non-LSP editors)
 lsp-check:
