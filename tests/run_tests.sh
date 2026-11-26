@@ -104,7 +104,15 @@ if [ -f "$SHARED_HLC_SRC" ]; then
 fi
 
 # ---- 2. run phase: lanes over the gates, output replayed in gate order -----
-SCRATCH=$(mktemp -d)
+# The scratch tree lives under bin/ (gitignored, same lifetime as the
+# build artifacts) instead of mktemp -d under /tmp: /tmp can be swept
+# by outside cleaners mid-run on shared CI hosts, which once ate the
+# per-gate verdict files of a running driver and failed all eight
+# gates with "/tmp/tmp.XXX/N.rc: No such file or directory". The repo
+# tree is the one place the driver owns for the whole run.
+SCRATCH=bin/test-run-scratch
+rm -rf "$SCRATCH"
+mkdir -p "$SCRATCH"
 trap 'rm -rf "$SCRATCH"' EXIT INT TERM HUP
 
 declare -a PID_OF=()    # lane pid -> gate index
@@ -153,6 +161,13 @@ while [ "${#PID_OF[@]}" -gt 0 ]; do
         wait "$pid" 2>/dev/null
         gi="${PID_OF[$pid]}"
         rc=$(cat "$SCRATCH/$gi.rc" 2>/dev/null || echo 1)
+        if [ ! -f "$SCRATCH/$gi.rc" ]; then
+            # The verdict file vanished: say so instead of silently
+            # grading the gate as failed with a generic error.
+            echo "  [FAIL] ${GATES[$gi]} (verdict file lost — scratch tree was swept mid-run)" \
+                >> "$SCRATCH/$gi.out" 2>/dev/null || true
+            rc=1
+        fi
         GELAPSED[$gi]=$((SECONDS - ${GSTART[$gi]:-0}))
         if [ "$rc" -eq 0 ]; then GSTATE[$gi]=1; else GSTATE[$gi]=2; fi
         unset "PID_OF[$pid]"
